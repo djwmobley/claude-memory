@@ -6,3 +6,6 @@ node_modules/
 !.env.example
 .vscode/
 .idea/
+
+# Eval harness runtime output (per-run results; baseline.json is committed)
+test/eval/last-run.json
