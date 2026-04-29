@@ -1,0 +1,7 @@
+{
+  "recall_at_1": 0.8125,
+  "recall_at_3_relaxed": 1,
+  "mrr": 0.90625,
+  "negative_precision": 1,
+  "updatedAt": "2026-04-29T17:43:03.445Z"
+}

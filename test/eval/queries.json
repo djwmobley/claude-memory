@@ -1,0 +1,146 @@
+[
+  {
+    "id": "q01",
+    "query": "HNSW ef_construction parameter pgvector",
+    "expected_top_1": "hnsw-parameters.md",
+    "expected_top_3": ["hnsw-parameters.md", "vector-indexes-postgres.md", "pgvector-setup-sql.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "frontmatter-yaml-spec.md", "api-rate-limit-strategies.md"],
+    "category": "keyword"
+  },
+  {
+    "id": "q02",
+    "query": "tsvector lexeme stemming weights PostgreSQL full text",
+    "expected_top_1": "tsvector-explained.md",
+    "expected_top_3": ["tsvector-explained.md", "sql-fts-tsvector-recipes.md", "fts-vs-vector-search.md"],
+    "must_not_appear_top_5": ["cosine-similarity-formula.md", "bash-postgres-backup-script.md", "python-embedding-batch.md"],
+    "category": "keyword"
+  },
+  {
+    "id": "q03",
+    "query": "pg_dump retention policy bash backup script",
+    "expected_top_1": "bash-postgres-backup-script.md",
+    "expected_top_3": ["bash-postgres-backup-script.md", "database-design-handbook.md", "migration-zero-downtime.md"],
+    "must_not_appear_top_5": ["cosine-similarity-formula.md", "embedding-model-selection.md", "hnsw-parameters.md"],
+    "category": "keyword"
+  },
+  {
+    "id": "q04",
+    "query": "content_hash incremental sync ON CONFLICT DO NOTHING",
+    "expected_top_1": "incremental-sync-content-hash.md",
+    "expected_top_3": ["incremental-sync-content-hash.md", "pgvector-setup-sql.md", "building-rag-tutorial.md"],
+    "must_not_appear_top_5": ["api-rate-limit-strategies.md", "cosine-similarity-formula.md", "frontmatter-yaml-spec.md"],
+    "category": "keyword"
+  },
+  {
+    "id": "q05",
+    "query": "how do you avoid re-embedding files that haven't changed between runs",
+    "expected_top_1": "incremental-sync-content-hash.md",
+    "expected_top_3": ["incremental-sync-content-hash.md", "python-embedding-batch.md", "building-rag-tutorial.md"],
+    "must_not_appear_top_5": ["api-rate-limit-strategies.md", "connection-pool-tuning.md", "bash-postgres-backup-script.md"],
+    "category": "paraphrase"
+  },
+  {
+    "id": "q06",
+    "query": "which vector index should I use when my table keeps growing with new inserts",
+    "expected_top_1": "vector-indexes-postgres.md",
+    "expected_top_3": ["vector-indexes-postgres.md", "hnsw-parameters.md", "pgvector-setup-sql.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "frontmatter-yaml-spec.md", "api-rate-limit-strategies.md"],
+    "category": "paraphrase"
+  },
+  {
+    "id": "q07",
+    "query": "splitting documents so each piece has a focused meaning for retrieval",
+    "expected_top_1": "semantic-chunking-strategies.md",
+    "expected_top_3": ["semantic-chunking-strategies.md", "rag-architecture.md", "building-rag-tutorial.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "connection-pool-tuning.md", "api-rate-limit-strategies.md"],
+    "category": "paraphrase"
+  },
+  {
+    "id": "q08",
+    "query": "why does keyword search fail when query and document use different words for the same thing",
+    "expected_top_1": "fts-vs-vector-search.md",
+    "expected_top_3": ["fts-vs-vector-search.md", "rag-architecture.md", "tsvector-explained.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "connection-pool-tuning.md", "hnsw-parameters.md"],
+    "category": "paraphrase"
+  },
+  {
+    "id": "q09",
+    "query": "comparing open source local embedding models for offline RAG deployment",
+    "expected_top_1": "embedding-model-selection.md",
+    "expected_top_3": ["embedding-model-selection.md", "rag-architecture.md", "building-rag-tutorial.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "error-handling-retry-jitter.md", "frontmatter-yaml-spec.md"],
+    "category": "paraphrase"
+  },
+  {
+    "id": "q10",
+    "query": "graphql federation schema stitching resolver gateway",
+    "expected_top_1": "",
+    "expected_top_3": [],
+    "must_not_appear_top_5": ["rag-architecture.md", "database-design-handbook.md", "building-rag-tutorial.md", "pgvector-setup-sql.md"],
+    "category": "negative"
+  },
+  {
+    "id": "q11",
+    "query": "vector search recall tradeoffs with large corpora index build time",
+    "expected_top_1": "vector-indexes-postgres.md",
+    "expected_top_3": ["vector-indexes-postgres.md", "hnsw-parameters.md", "embedding-model-selection.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "frontmatter-yaml-spec.md", "error-handling-retry-jitter.md"],
+    "category": "multi-concept"
+  },
+  {
+    "id": "q12",
+    "query": "hybrid search combining BM25 and semantic similarity for better retrieval precision",
+    "expected_top_1": "fts-vs-vector-search.md",
+    "expected_top_3": ["fts-vs-vector-search.md", "rag-architecture.md", "pgvector-setup-sql.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "connection-pool-tuning.md", "frontmatter-yaml-spec.md"],
+    "category": "multi-concept"
+  },
+  {
+    "id": "q13",
+    "query": "schema migration live database without locking reads and writes",
+    "expected_top_1": "migration-zero-downtime.md",
+    "expected_top_3": ["migration-zero-downtime.md", "database-design-handbook.md", "pgvector-setup-sql.md"],
+    "must_not_appear_top_5": ["cosine-similarity-formula.md", "embedding-model-selection.md", "python-embedding-batch.md"],
+    "category": "multi-concept"
+  },
+  {
+    "id": "q14",
+    "query": "exponential backoff jitter thundering herd retry strategy",
+    "expected_top_1": "error-handling-retry-jitter.md",
+    "expected_top_3": ["error-handling-retry-jitter.md", "api-rate-limit-strategies.md", "python-embedding-batch.md"],
+    "must_not_appear_top_5": ["tsvector-explained.md", "cosine-similarity-formula.md", "frontmatter-yaml-spec.md"],
+    "category": "multi-concept"
+  },
+  {
+    "id": "q15",
+    "query": "node postgres parameterized query $1 placeholder pool",
+    "expected_top_1": "nodejs-pg-client-patterns.md",
+    "expected_top_3": ["nodejs-pg-client-patterns.md", "connection-pool-tuning.md", "incremental-sync-content-hash.md"],
+    "must_not_appear_top_5": ["cosine-similarity-formula.md", "prompt-caching-mechanics.md", "semantic-chunking-strategies.md"],
+    "category": "code-pattern"
+  },
+  {
+    "id": "q16",
+    "query": "python aiohttp asyncio batch embedding concurrency semaphore",
+    "expected_top_1": "python-embedding-batch.md",
+    "expected_top_3": ["python-embedding-batch.md", "error-handling-retry-jitter.md", "api-rate-limit-strategies.md"],
+    "must_not_appear_top_5": ["tsvector-explained.md", "frontmatter-yaml-spec.md", "migration-zero-downtime.md"],
+    "category": "code-pattern"
+  },
+  {
+    "id": "q17",
+    "query": "sql GIN index generated tsvector column weighted fields ts_rank",
+    "expected_top_1": "sql-fts-tsvector-recipes.md",
+    "expected_top_3": ["sql-fts-tsvector-recipes.md", "tsvector-explained.md", "pgvector-setup-sql.md"],
+    "must_not_appear_top_5": ["cosine-similarity-formula.md", "api-rate-limit-strategies.md", "python-embedding-batch.md"],
+    "category": "code-pattern"
+  },
+  {
+    "id": "q18",
+    "query": "kubernetes deployment yaml horizontal pod autoscaling",
+    "expected_top_1": "",
+    "expected_top_3": [],
+    "must_not_appear_top_5": ["database-design-handbook.md", "migration-zero-downtime.md"],
+    "category": "negative"
+  }
+]

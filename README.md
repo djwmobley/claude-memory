@@ -235,6 +235,61 @@ tuned empirically on pipeline's memory store.
 
 ---
 
+## Testing
+
+Two harnesses cover different layers:
+
+**`scripts/test-chunker.js`** -- structural correctness. Six scenarios: chunk
+boundary rules (markdown headings, code fences, sentences, hard-split with
+overlap), idempotence via content_hash, partial-failure resilience under batched
+embed, and an end-to-end round-trip (loader -> DB -> Ollama -> hybrid retrieval).
+Set `OLLAMA_SKIP=1` to skip the embed-dependent assertions; structural tests
+still run.
+
+```bash
+PROJECT_ROOT=$(pwd) node scripts/test-chunker.js
+```
+
+**`test/eval/eval-retrieval.js`** -- retrieval-quality regression. 22 synthetic
+fixture markdown files in `test/eval/fixtures/`, 18 hand-labeled queries in
+`test/eval/queries.json` with expected top-1 / top-3 hits and negative
+constraints. Computes recall@1, recall@3 (relaxed), MRR, negative precision.
+Asserts each metric stays within 5% of the committed baseline at
+`test/eval/baseline.json`. Negative precision is strict (==1.0).
+
+One-time setup:
+
+```bash
+psql -U postgres -c "CREATE DATABASE claude_memory_eval_test"
+```
+
+Run:
+
+```bash
+PGUSER=postgres node test/eval/eval-retrieval.js
+```
+
+To accept a real improvement as the new baseline (after a code change that
+legitimately raises retrieval quality):
+
+```bash
+PGUSER=postgres node test/eval/eval-retrieval.js --update-baseline
+```
+
+The harness writes `test/eval/last-run.json` (gitignored) with per-query
+results for debugging. Adding a new query: append to `queries.json`, label
+expected hits by reading the relevant fixture, then `--update-baseline`. Adding
+a new fixture: drop a markdown file in `test/eval/fixtures/` with frontmatter
+(`name`, `description`, `type`); the harness loads everything in that
+directory. Existing query labels may need updating if a new fixture is now the
+better answer.
+
+CI runs the eval harness in `--ollama-skip` mode (smoke test for the SQL /
+loader path; vector-quality regression detection requires running locally with
+Ollama).
+
+---
+
 ## Maintenance posture
 
 This repo is shared in good faith but is not a maintained open-source product. There

@@ -1,0 +1,10 @@
+project:
+  name: claude-memory
+
+knowledge:
+  tier: "postgres"
+  host: "localhost"
+  port: 5432
+  database: "claude_memory_eval_test"
+  user: "postgres"
+  embedding_model: "mxbai-embed-large"

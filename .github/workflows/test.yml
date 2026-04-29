@@ -1,13 +1,16 @@
-name: Test chunker E2E
+name: Tests
 # Runs on every pull request to catch regressions before merge.
 # Postgres image is pinned to pg16 to match production instance.
 # Update the image tag AND this comment when upgrading.
 # Ollama is not available in CI; OLLAMA_SKIP=1 skips embedding
 # assertions while structural tests (chunker logic, DB schema,
-# incremental sync) still run.
+# incremental sync) still run. The eval-retrieval harness runs
+# in --ollama-skip mode -- it exercises the SQL/loader/schema path
+# but skips vector-quality regression detection. Run the full
+# harness locally to catch retrieval-quality regressions.
 on: [pull_request]
 jobs:
-  test-chunker:
+  tests:
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -34,8 +37,8 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
         working-directory: scripts
-      - name: Apply knowledge DB schema
-        run: psql -h localhost -U postgres -f scripts/setup-knowledge-db.sql
+      - name: Apply schema
+        run: psql -h localhost -U postgres -f scripts/setup.sql
         env:
           PGPASSWORD: postgres
       - name: Run chunker tests
@@ -43,3 +46,14 @@ jobs:
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost/postgres
           OLLAMA_SKIP: '1'
+      - name: Create eval test database
+        run: psql -h localhost -U postgres -c "CREATE DATABASE claude_memory_eval_test"
+        env:
+          PGPASSWORD: postgres
+      - name: Run retrieval eval (FTS-only smoke test)
+        run: node test/eval/eval-retrieval.js --ollama-skip
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          EVAL_DB_NAME: claude_memory_eval_test
