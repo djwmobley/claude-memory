@@ -1,0 +1,45 @@
+name: Test chunker E2E
+# Runs on every pull request to catch regressions before merge.
+# Postgres image is pinned to pg16 to match production instance.
+# Update the image tag AND this comment when upgrading.
+# Ollama is not available in CI; OLLAMA_SKIP=1 skips embedding
+# assertions while structural tests (chunker logic, DB schema,
+# incremental sync) still run.
+on: [pull_request]
+jobs:
+  test-chunker:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: scripts/pnpm-lock.yaml
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: scripts
+      - name: Apply knowledge DB schema
+        run: psql -h localhost -U postgres -f scripts/setup-knowledge-db.sql
+        env:
+          PGPASSWORD: postgres
+      - name: Run chunker tests
+        run: node scripts/test-chunker.js
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost/postgres
+          OLLAMA_SKIP: '1'
