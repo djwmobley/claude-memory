@@ -307,6 +307,7 @@ function runWinBin(candidates, args, opts = {}) {
 // ─── VLLM EMBED ──────────────────────────────────────────────────────────────
 
 const VLLM_MODEL = 'Qwen/Qwen3-Embedding-8B';
+const VLLM_RERANK_MODEL = 'Qwen/Qwen3-Reranker-4B';
 
 // EMBED_DIMS controls Matryoshka truncation at write time.
 // Qwen3-Embedding-8B is Matryoshka-trained: the first N leading dims are a
@@ -396,9 +397,56 @@ function vllmEmbed(texts, opts) {
   });
 }
 
+// ─── VLLM RERANK ─────────────────────────────────────────────────────────────
+
+async function vllmRerank(query, documents, opts) {
+  const baseUrl = (opts && opts.baseUrl) || process.env.VLLM_RERANK_URL || 'http://localhost:8001';
+  const parsed = new URL('/v1/rerank', baseUrl);
+  const hostname = parsed.hostname;
+  const port = parseInt(parsed.port || (parsed.protocol === 'https:' ? '443' : '80'), 10);
+  const pathname = parsed.pathname;
+
+  const body = JSON.stringify({ model: VLLM_RERANK_MODEL, query, documents });
+
+  return new Promise((resolve, reject) => {
+    const req = http.request({ hostname, port, path: pathname, method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    }, (res) => {
+      let raw = '';
+      res.on('data', (chunk) => { raw += chunk; });
+      res.on('end', () => {
+        try {
+          const parsed2 = JSON.parse(raw);
+          if (!parsed2.results || !Array.isArray(parsed2.results)) {
+            return reject(new Error(`vLLM reranker response missing results array: ${raw.slice(0, 200)}`));
+          }
+          // Build a lookup from input index -> relevance_score
+          const scoreByIndex = new Map();
+          for (const entry of parsed2.results) {
+            scoreByIndex.set(entry.index, entry.relevance_score);
+          }
+          // Return in the same order as the input documents array
+          const out = documents.map((_, i) => {
+            if (!scoreByIndex.has(i)) {
+              throw new Error(`vLLM reranker omitted document at index ${i} — cannot continue`);
+            }
+            return { index: i, score: scoreByIndex.get(i) };
+          });
+          resolve(out);
+        } catch (e) { reject(e); }
+      });
+    });
+    req.on('error', (e) => {
+      reject(new Error(`Cannot reach vLLM reranker at ${hostname}:${port} — is it running? (${e.message})`));
+    });
+    req.write(body);
+    req.end();
+  });
+}
+
 // ─── EXPORTS ────────────────────────────────────────────────────────────────
 
 module.exports = {
   findProjectRoot, loadConfig, connect, c, ollamaDefaults, projectToDbName,
-  ollamaEmbed, vllmEmbed, tryEmbed, runWinBin, quoteForCmd,
+  ollamaEmbed, vllmEmbed, tryEmbed, runWinBin, quoteForCmd, vllmRerank,
 };
