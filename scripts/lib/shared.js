@@ -81,7 +81,7 @@ function loadConfig() {
 
   // Extract a YAML section (from "key:" to next top-level key or EOF)
   const getSection = (section) => {
-    const match = content.match(new RegExp(`^${section}:.*\\n((?:[ \\t]+.*\\n?)*)`, 'm'));
+    const match = content.match(new RegExp(`^${section}:.*\\r?\\n((?:[ \\t]+.*\\r?\\n?)*)`, 'm'));
     return match ? match[1] : '';
   };
 
