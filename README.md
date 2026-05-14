@@ -247,7 +247,7 @@ Engine settings did not help. Small images (e.g. `nvidia/cuda:12.2.0-base-ubuntu
 341 MB) pulled fine. Workarounds: try `regctl image copy` or `skopeo copy` (different HTTP
 client), pull from a different network, or pivot to the native WSL install path (next item).
 
-**Native WSL vLLM install is the working path on this machine.** Instead of the
+**Native WSL vLLM install — recommended on Windows.** Instead of the
 spec's docker-compose flow, vLLM is installed directly inside WSL Ubuntu via uv:
 
 ```bash
@@ -346,7 +346,7 @@ VALUES ('<encoded_cwd>', 'precision_at_5_gate_min_chunks', '1000')
 ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value;
 ```
 
-Default: `1000` chunks. Calibrated against the initial corpus size (792 chunks as of 2026-05-14) plus near-term growth headroom. The gate is evaluated by the `/handoff:close` and `/handoff:checkpoint` skills (Phase 3.5); if the corpus is below threshold the gate is recorded as `SKIPPED` and is not a regression.
+Default: `1000` chunks. The threshold is a rough lower bound for when vector-only retrieval typically starts losing precision@5 to topical noise in the top-K candidate pool — adjust per project as your corpus and query distribution dictate. The gate is evaluated by the `/handoff:close` and `/handoff:checkpoint` skills (Phase 3.5); below the threshold the gate is recorded as `SKIPPED` and is not a regression.
 
 ---
 
