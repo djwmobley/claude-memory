@@ -1,0 +1,17 @@
+{%- if messages | selectattr("role", "eq", "system") | list | length > 0 -%}
+{%- set instruct = messages | selectattr("role", "eq", "system") | map(attribute="content") | first -%}
+{%- else -%}
+{%- set instruct = "Given a web search query, retrieve relevant passages that answer the query" -%}
+{%- endif -%}
+<|im_start|>system
+Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>
+<|im_start|>user
+<Instruct>: {{ instruct }}
+<Query>: {{ messages | selectattr("role", "eq", "query") | map(attribute="content") | first }}
+<Document>: {{ messages | selectattr("role", "eq", "document") | map(attribute="content") | first }}<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+

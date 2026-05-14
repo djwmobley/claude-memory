@@ -28,7 +28,7 @@ const fs            = require('fs');
 const os            = require('os');
 const { execFileSync } = require('child_process');
 
-const { loadConfig, connect, ollamaEmbed, vllmEmbed, c } = require('../../scripts/lib/shared');
+const { loadConfig, connect, ollamaEmbed, vllmEmbed, vllmRerank, c } = require('../../scripts/lib/shared');
 const { encodeCwd }                            = require('../../scripts/lib/encoded-cwd');
 
 // ─── CLI FLAGS ────────────────────────────────────────────────────────────────
@@ -37,6 +37,8 @@ const argv             = process.argv.slice(2);
 const FLAG_UPDATE      = argv.includes('--update-baseline');
 const FLAG_QUIET       = argv.includes('--quiet');
 const FLAG_OLLAMA_SKIP = argv.includes('--ollama-skip');
+const FLAG_RERANK = argv.includes('--rerank') || process.env.RERANK === '1';
+const RERANK_CANDIDATE_POOL = parseInt(process.env.RERANK_CANDIDATE_POOL || '20', 10);
 
 // ─── EMBED BACKEND / COLUMN ROUTING ──────────────────────────────────────────
 // When EMBED_BACKEND=vllm, embed queries with vllmEmbed.
@@ -118,6 +120,20 @@ function buildHybridSql(view, embCol) {
 `;
 }
 
+// v_memory_hits exposes `content` directly, so we include it here to avoid
+// a second round-trip for reranker candidate text.
+function buildHybridSqlPool(view, embCol, limit) {
+  return `
+  SELECT label, source_table, chunk_id, chunk_idx, content,
+         ts_rank(fts_vec, plainto_tsquery($1)) * 0.3 +
+         (1 - (${embCol} <=> $2::halfvec(4000))) * 0.7 AS score
+  FROM ${view}
+  WHERE ${embCol} IS NOT NULL
+  ORDER BY score DESC
+  LIMIT ${parseInt(limit, 10)}
+`;
+}
+
 function buildFtsOnlySql(view) {
   return `
   SELECT label, source_table, chunk_id, chunk_idx,
@@ -174,6 +190,11 @@ function stageFixtures() {
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 async function main() {
+  if (FLAG_RERANK && FLAG_OLLAMA_SKIP) {
+    console.error('ERROR: --rerank and --ollama-skip are incompatible. Reranker requires vector embeddings.');
+    process.exit(2);
+  }
+
   const runStartedAt = new Date().toISOString();
   console.log('');
   console.log(c.bold('eval-retrieval — Hybrid retrieval quality eval'));
@@ -383,8 +404,49 @@ async function main() {
         // FTS-only mode
         const res = await db.query(buildFtsOnlySql(HITS_VIEW), [query]);
         rows = res.rows;
+      } else if (FLAG_RERANK) {
+        // Reranker mode: vector recall pool -> cross-encoder rerank -> top-5
+        let qVec;
+        try {
+          const embeddings = await evalEmbed([query], config && config.knowledge);
+          qVec = `[${embeddings[0].join(',')}]`;
+        } catch (err) {
+          infraFail(`Embedding failed for query "${query}": ${err.message}`);
+        }
+        const poolRes = await db.query(buildHybridSqlPool(HITS_VIEW, 'embedding', RERANK_CANDIDATE_POOL), [query, qVec]);
+        const candidates = poolRes.rows;
+        const documents = candidates.map(r => r.content);
+        let rerankScores;
+        try {
+          rerankScores = await vllmRerank(query, documents);
+        } catch (err) {
+          infraFail(`Reranker failed for query "${query}": ${err.message}`);
+        }
+        // Sort candidates by reranker score desc, take top-5
+        const ranked = rerankScores
+          .map(s => ({ candidate: candidates[s.index], score: s.score }))
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 5);
+        rows = ranked.map(r => ({ ...r.candidate, score: r.score }));
+
+        // Log retrieval event
+        try {
+          await db.query(
+            `INSERT INTO retrieval_events (project_id, query_text, query_embedding, retrieved_at, outcome, session_id, notes)
+             VALUES ($1, $2, $3::halfvec(4000), now(), 'pending', $4, $5)`,
+            [
+              'C--Users-djwmo-dev-claude-memory',
+              query,
+              qVec,
+              runStartedAt,
+              `eval reranked top-${RERANK_CANDIDATE_POOL}→top-5`,
+            ]
+          );
+        } catch (_) {
+          // retrieval_events logging is best-effort; do not abort the eval
+        }
       } else {
-        // Embed the query using the configured backend
+        // Standard hybrid mode
         let qVec;
         try {
           const embeddings = await evalEmbed([query], config && config.knowledge);
@@ -539,6 +601,21 @@ async function main() {
       console.log(`  FTS recall@1:           ${recall_at_1.toFixed(2)}`);
       console.log(`  FTS recall@3 (relaxed): ${recall_at_3_relaxed.toFixed(2)}`);
       console.log(`  Negative precision:     ${negative_precision.toFixed(2)}`);
+    } else if (FLAG_RERANK) {
+      console.log(c.cyan('--- Reranker mode ---'));
+      console.log(c.yellow('  NOTE: --rerank mode — reporting reranker metrics only; no baseline comparison.'));
+      const precision5Positive = positiveQueries.filter(r => {
+        const top5files = r.hits.map(h => h.filename);
+        return (r.expected_top_3 && r.expected_top_3.length > 0)
+          ? r.expected_top_3.some(f => top5files.includes(f))
+          : (r.expected_top_1 && top5files.includes(r.expected_top_1));
+      });
+      const precision_at_5 = positiveN > 0 ? precision5Positive.length / positiveN : 1;
+      console.log(`  Recall@1:               ${recall_at_1.toFixed(2)}`);
+      console.log(`  Recall@3 (relaxed):     ${recall_at_3_relaxed.toFixed(2)}`);
+      console.log(`  MRR:                    ${mrr.toFixed(2)}`);
+      console.log(`  Negative precision:     ${negative_precision.toFixed(2)}`);
+      console.log(`  Precision@5:            ${precision_at_5.toFixed(2)}  (${precision5Positive.length}/${positiveN} positive queries)`);
     } else {
       metricLine('Recall@1:',           recall_at_1,        baseline.recall_at_1,         false);
       metricLine('Recall@3 (relaxed):', recall_at_3_relaxed, baseline.recall_at_3_relaxed, false);
@@ -549,7 +626,7 @@ async function main() {
     console.log('='.repeat(60));
 
     const queryWord = n === 1 ? 'query' : 'queries';
-    if (!anyRegression || FLAG_OLLAMA_SKIP) {
+    if (!anyRegression || FLAG_OLLAMA_SKIP || FLAG_RERANK) {
       console.log(c.green(`SUMMARY: ${n}/${n} ${queryWord} evaluated, all metrics within tolerance.`));
     } else {
       console.log(c.red(`SUMMARY: ${n} ${queryWord} evaluated — METRIC REGRESSION DETECTED.`));
@@ -582,7 +659,7 @@ async function main() {
     }
 
     await db.end().catch(() => {});
-    process.exit(anyRegression && !FLAG_OLLAMA_SKIP ? 1 : 0);
+    process.exit(anyRegression && !FLAG_OLLAMA_SKIP && !FLAG_RERANK ? 1 : 0);
 
   } catch (err) {
     try { await db.end(); } catch (_) {}
