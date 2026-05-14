@@ -130,6 +130,12 @@ function sha256(text) {
 async function embedPending(db, config, table, buildCtx, stats) {
   if (dryRun || !db) return;
 
+  // When EMBED_BACKEND=vllm, skip the Ollama inline embed pass entirely.
+  // The caller (eval harness or pipeline-embed index) will re-embed via vLLM
+  // after load. Trying Ollama with a Qwen3 model config would time out on
+  // per-row retries (2s + 4s + 8s × N rows). See eval-retrieval.js step 5.
+  if ((process.env.EMBED_BACKEND || '').toLowerCase() === 'vllm') return;
+
   // Allowlist guard — prevent arbitrary table names from reaching SQL
   const ALLOWED_TABLES = new Set(['memory_entry_chunks', 'session_chunks', 'policy_sections']);
   if (!ALLOWED_TABLES.has(table)) {
