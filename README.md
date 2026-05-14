@@ -235,6 +235,74 @@ tuned empirically on pipeline's memory store.
 
 ---
 
+## Gotchas
+
+Environment issues discovered during Phase 1 bring-up on Windows 11 (WSL2 Ubuntu, RTX 3090).
+
+**Docker Desktop pull pipeline on multi-GB images.** Docker Desktop 29.4.3 on Windows 11
+could not pull `vllm/vllm-openai` -- three consecutive attempts (latest tag and a pinned
+v0.20.2 tag) failed with `httpReadSeeker: failed open ... EOF` on different blobs from
+`production.cloudfront.docker.com`. Setting `"max-concurrent-downloads": 1` in Docker
+Engine settings did not help. Small images (e.g. `nvidia/cuda:12.2.0-base-ubuntu22.04`,
+341 MB) pulled fine. Workarounds: try `regctl image copy` or `skopeo copy` (different HTTP
+client), pull from a different network, or pivot to the native WSL install path (next item).
+
+**Native WSL vLLM install is the working path on this machine.** Instead of the
+spec's docker-compose flow, vLLM is installed directly inside WSL Ubuntu via uv:
+
+```bash
+# one-time inside WSL Ubuntu
+curl -LsSf https://astral.sh/uv/install.sh | sh
+~/.local/bin/uv venv --python 3.12 ~/.venv/vllm
+source ~/.venv/vllm/bin/activate
+uv pip install vllm
+sudo apt-get install -y build-essential   # required for torch.compile JIT (gcc/g++/make)
+```
+
+Launch (one model -- repeat with a different port and `--gpu-memory-utilization` for the
+reranker):
+
+```bash
+~/.venv/vllm/bin/vllm serve <model> --runner pooling --port 8000 --gpu-memory-utilization 0.40
+```
+
+Notes:
+
+- vLLM 0.20.x renamed the CLI: use `--runner pooling`, not the older `--task embed` in the
+  spec. `--convert embed` may also be useful when converting a non-pooling base model. The
+  spec lags behind the upstream CLI.
+- If `build-essential` is not installed, append `--enforce-eager` to bypass torch.compile
+  (functional but slower). Install build-essential and drop the flag for production.
+- Ubuntu WSL ships Python 3.14 by default, which is too new for current vLLM wheels. uv
+  handles this transparently by downloading its own CPython 3.12.
+
+**Windows port 8000 may already be taken.** A pre-existing Windows-side Python process
+can preempt `localhost:8000` from WSL via WSL2's localhost forwarding, returning a
+confusing 404 to clients on the Windows side even though vLLM is healthy inside WSL. Pick
+a non-default port (`8800`, `18000`) or reclaim 8000 by killing the existing listener:
+`Get-NetTCPConnection -LocalPort 8000 -State Listen` shows what owns it.
+
+**CRLF line endings break `scripts/lib/shared.js` config loading.** The YAML-parsing
+regexes in `loadConfig()` use bare `\n` and do not tolerate `\r\n`. On Windows,
+`.claude/pipeline.yml` saved by editors that default to CRLF causes `loadConfig` to
+silently fall back to defaults -- `database` resolves to `pipeline_<basename>` instead of
+whatever the YAML configured. Fast fix: convert `pipeline.yml` to LF. Proper fix: patch
+the regexes to use `\r?\n` (tracked as a follow-up).
+
+**NVIDIA Container Toolkit is not on by default in Docker Desktop.** If you use the Docker
+path on Windows, enable Docker Desktop -> Settings -> AI -> "GPU-backed inference". That
+toggle registers the `nvidia` OCI runtime and is what makes `docker run --gpus all` work.
+Without it, container starts fail with
+`nvidia-container-cli: ... libnvidia-ml.so.1: cannot open shared object file`.
+
+**WSL GPU access can get stuck.** Symptom: `nvidia-smi` inside WSL returns
+`Failed to initialize NVML: GPU access blocked by the operating system`, while the Windows
+host's `nvidia-smi` works fine. Fix: `wsl --shutdown` from PowerShell, then re-enter WSL.
+This re-initializes the `/dev/dxg` shim. Driver state on the host is fine; only the WSL
+side is wedged.
+
+---
+
 ## Testing
 
 Two harnesses cover different layers:

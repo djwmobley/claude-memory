@@ -142,5 +142,165 @@
     "expected_top_3": [],
     "must_not_appear_top_5": ["database-design-handbook.md", "migration-zero-downtime.md"],
     "category": "negative"
+  },
+  {
+    "id": "q19",
+    "query": "token offset mapping span extraction mean pooling hidden states",
+    "expected_top_1": "late-chunking-technique.md",
+    "expected_top_3": ["late-chunking-technique.md", "colbert-late-interaction.md", "matryoshka-embeddings.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "connection-pool-tuning.md", "frontmatter-yaml-spec.md"],
+    "category": "cross-chunk"
+  },
+  {
+    "id": "q20",
+    "query": "ms-marco hard negative mining training triples reranking",
+    "expected_top_1": "cross-encoder-rerankers.md",
+    "expected_top_3": ["cross-encoder-rerankers.md", "rag-eval-annotation.md", "bge-e5-model-families.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "connection-pool-tuning.md", "tsvector-explained.md"],
+    "category": "cross-chunk"
+  },
+  {
+    "id": "q21",
+    "query": "smoothing constant k=60 rank fusion sensitivity BEIR question answering",
+    "expected_top_1": "reciprocal-rank-fusion.md",
+    "expected_top_3": ["reciprocal-rank-fusion.md", "rag-fusion-strategies.md", "fts-vs-vector-search.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "frontmatter-yaml-spec.md", "connection-pool-tuning.md"],
+    "category": "cross-chunk"
+  },
+  {
+    "id": "q22",
+    "query": "vocabulary mismatch hypothetical passage generation retrieval failure modes",
+    "expected_top_1": "hyde-query-expansion.md",
+    "expected_top_3": ["hyde-query-expansion.md", "rag-fusion-strategies.md", "contextual-retrieval-blurbs.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "connection-pool-tuning.md", "pgvector-setup-sql.md"],
+    "category": "cross-chunk"
+  },
+  {
+    "id": "q23",
+    "query": "PLAID centroid quantization two-stage document scoring compression residual",
+    "expected_top_1": "colbert-late-interaction.md",
+    "expected_top_3": ["colbert-late-interaction.md", "embedding-quantization.md", "multi-vector-retrieval.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "frontmatter-yaml-spec.md", "sql-fts-tsvector-recipes.md"],
+    "category": "cross-chunk"
+  },
+  {
+    "id": "q24",
+    "query": "binary rescore INT8 Hamming distance Cohere Nomic training aware quantization",
+    "expected_top_1": "embedding-quantization.md",
+    "expected_top_3": ["embedding-quantization.md", "matryoshka-embeddings.md", "embedding-model-selection.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "connection-pool-tuning.md", "frontmatter-yaml-spec.md"],
+    "category": "cross-chunk"
+  },
+  {
+    "id": "q25",
+    "query": "anchor pair Z-score alert provider silent model swap cosine baseline shift",
+    "expected_top_1": "embedding-drift-monitoring.md",
+    "expected_top_3": ["embedding-drift-monitoring.md", "embedding-model-selection.md", "incremental-sync-content-hash.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "connection-pool-tuning.md", "tsvector-explained.md"],
+    "category": "cross-chunk"
+  },
+  {
+    "id": "q26",
+    "query": "inter-annotator Cohen kappa graded schema Krippendorff disagreement resolution",
+    "expected_top_1": "rag-eval-annotation.md",
+    "expected_top_3": ["rag-eval-annotation.md", "semantic-chunking-strategies.md", "embedding-drift-monitoring.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "connection-pool-tuning.md", "frontmatter-yaml-spec.md"],
+    "category": "cross-chunk"
+  },
+  {
+    "id": "q27",
+    "query": "dimensions parameter prefix truncation OpenAI text-embedding-3 adaptive output size",
+    "expected_top_1": "matryoshka-embeddings.md",
+    "expected_top_3": ["matryoshka-embeddings.md", "embedding-quantization.md", "embedding-model-selection.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "connection-pool-tuning.md", "tsvector-explained.md"],
+    "category": "cross-chunk"
+  },
+  {
+    "id": "q28",
+    "query": "RELU vocabulary expansion L1 regularization DistilBERT inverted index weight sparsity",
+    "expected_top_1": "splade-sparse-encoders.md",
+    "expected_top_3": ["splade-sparse-encoders.md", "fts-vs-vector-search.md", "tsvector-explained.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "connection-pool-tuning.md", "frontmatter-yaml-spec.md"],
+    "category": "cross-chunk"
+  },
+  {
+    "id": "q29",
+    "query": "CLS pooling flag embedding instruction prefix asymmetric retrieval query passage format",
+    "expected_top_1": "bge-e5-model-families.md",
+    "expected_top_3": ["bge-e5-model-families.md", "embedding-model-selection.md", "late-chunking-technique.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "connection-pool-tuning.md", "sql-fts-tsvector-recipes.md"],
+    "category": "cross-chunk"
+  },
+  {
+    "id": "q30",
+    "query": "prompt caching LLM blurb cost reduction BM25 keyword missed terms prepend context",
+    "expected_top_1": "contextual-retrieval-blurbs.md",
+    "expected_top_3": ["contextual-retrieval-blurbs.md", "hyde-query-expansion.md", "prompt-caching-mechanics.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "connection-pool-tuning.md", "frontmatter-yaml-spec.md"],
+    "category": "cross-chunk"
+  },
+  {
+    "id": "q31",
+    "query": "namespace TTL false positive threshold semantic similarity cache retrieval invalidation",
+    "expected_top_1": "semantic-cache-invalidation.md",
+    "expected_top_3": ["semantic-cache-invalidation.md", "hyde-query-expansion.md", "api-rate-limit-strategies.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "pgvector-setup-sql.md", "tsvector-explained.md"],
+    "category": "cross-chunk"
+  },
+  {
+    "id": "q32",
+    "query": "dynamic padding GPU utilization sequence length throughput A10 worker queue checkpoint",
+    "expected_top_1": "distributed-embedding-inference.md",
+    "expected_top_3": ["distributed-embedding-inference.md", "python-embedding-batch.md", "embedding-model-selection.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "frontmatter-yaml-spec.md", "tsvector-explained.md"],
+    "category": "cross-chunk"
+  },
+  {
+    "id": "q33",
+    "query": "ts_rank_cd normalization bitmask log division heap fetch generated column coalesce",
+    "expected_top_1": "tsvector-weight-classes.md",
+    "expected_top_3": ["tsvector-weight-classes.md", "tsvector-explained.md", "sql-fts-tsvector-recipes.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "connection-pool-tuning.md", "embedding-model-selection.md"],
+    "category": "cross-chunk"
+  },
+  {
+    "id": "q34",
+    "query": "MinHash LSH Jaccard blocking cross-document mention coreference incremental consolidation",
+    "expected_top_1": "knowledge-graph-entity-resolution.md",
+    "expected_top_3": ["knowledge-graph-entity-resolution.md", "fts-vs-vector-search.md", "incremental-sync-content-hash.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "connection-pool-tuning.md", "frontmatter-yaml-spec.md"],
+    "category": "cross-chunk"
+  },
+  {
+    "id": "q35",
+    "query": "parallel async ANN candidate pool cross-encoder adaptive confidence fallback query",
+    "expected_top_1": "rag-fusion-strategies.md",
+    "expected_top_3": ["rag-fusion-strategies.md", "cross-encoder-rerankers.md", "reciprocal-rank-fusion.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "frontmatter-yaml-spec.md", "tsvector-explained.md"],
+    "category": "cross-chunk"
+  },
+  {
+    "id": "q36",
+    "query": "parent-child chunk deduplication MaxDoc RAPTOR summarization tree hierarchical index",
+    "expected_top_1": "multi-vector-retrieval.md",
+    "expected_top_3": ["multi-vector-retrieval.md", "colbert-late-interaction.md", "semantic-chunking-strategies.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "connection-pool-tuning.md", "frontmatter-yaml-spec.md"],
+    "category": "cross-chunk"
+  },
+  {
+    "id": "q37",
+    "query": "WordPiece subword fragmentation BPE code identifier tokens per word ratio domain mismatch",
+    "expected_top_1": "tokenizer-vocabulary-differences.md",
+    "expected_top_3": ["tokenizer-vocabulary-differences.md", "embedding-model-selection.md", "bge-e5-model-families.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "connection-pool-tuning.md", "sql-fts-tsvector-recipes.md"],
+    "category": "cross-chunk"
+  },
+  {
+    "id": "q38",
+    "query": "Voyage RPM budget batch size 128 Cohere monthly quota Retry-After header 429",
+    "expected_top_1": "embedding-api-rate-limits.md",
+    "expected_top_3": ["embedding-api-rate-limits.md", "api-rate-limit-strategies.md", "python-embedding-batch.md"],
+    "must_not_appear_top_5": ["bash-postgres-backup-script.md", "frontmatter-yaml-spec.md", "tsvector-explained.md"],
+    "category": "cross-chunk"
   }
 ]

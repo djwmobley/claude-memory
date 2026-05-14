@@ -9,3 +9,6 @@ node_modules/
 
 # Eval harness runtime output (per-run results; baseline.json is committed)
 test/eval/last-run.json
+
+# Project-personal Claude Code settings (machine-specific permission rules)
+.claude/settings.local.json
