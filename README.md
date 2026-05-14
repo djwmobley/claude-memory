@@ -334,6 +334,20 @@ See BUNDLE-A-SPEC.md Phase 1 step 5 for the full design rationale, pgvector cons
 matrix, and why `halfvec(4000)` was chosen over binary quantization, smaller embedders, or
 a two-column hybrid approach.
 
+### Reranker precision@5 acceptance gate is corpus-size-gated
+
+Bundle A Phase 3 ships a vLLM cross-encoder reranker (`Qwen/Qwen3-Reranker-4B`) as an opt-in second-stage filter (`--rerank` flag in `test/eval/eval-retrieval.js`). The spec's `+5pp precision@5 over vector-only baseline` acceptance gate is **only meaningful once the corpus is large enough that vector-only retrieval starts losing precision@5 from topical noise in the top-K candidate pool**. On small corpora both modes saturate at 1.00 and the gate is unmeasurable.
+
+The trigger is a configurable per-project setting:
+
+```sql
+INSERT INTO project_settings (project_id, key, value)
+VALUES ('<encoded_cwd>', 'precision_at_5_gate_min_chunks', '1000')
+ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value;
+```
+
+Default: `1000` chunks. Calibrated against the initial corpus size (792 chunks as of 2026-05-14) plus near-term growth headroom. The gate is evaluated by the `/handoff:close` and `/handoff:checkpoint` skills (Phase 3.5); if the corpus is below threshold the gate is recorded as `SKIPPED` and is not a regression.
+
 ---
 
 ## Testing
