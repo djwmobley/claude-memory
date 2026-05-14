@@ -304,9 +304,101 @@ function runWinBin(candidates, args, opts = {}) {
   throw lastErr;
 }
 
+// ─── VLLM EMBED ──────────────────────────────────────────────────────────────
+
+const VLLM_MODEL = 'Qwen/Qwen3-Embedding-8B';
+
+// EMBED_DIMS controls Matryoshka truncation at write time.
+// Qwen3-Embedding-8B is Matryoshka-trained: the first N leading dims are a
+// valid embedding. pgvector 0.8.1 caps HNSW at 4000 dims for halfvec, so we
+// default to 4000 and store halfvec(4000). Set EMBED_DIMS to a smaller value
+// (e.g. 3500, 3000) if a future tuning pass finds a better trade-off.
+const EMBED_DIMS = parseInt(process.env.EMBED_DIMS || '4000', 10);
+
+/**
+ * Call a vLLM-compatible OpenAI /v1/embeddings endpoint to generate vector
+ * embeddings for one or more texts. Returns an array of embedding arrays
+ * (one per input text), matching the same signature as ollamaEmbed.
+ *
+ * @param {string[]} texts - Array of strings to embed.
+ * @param {object}   [opts] - Optional overrides (currently unused; reserved).
+ * @returns {Promise<number[][]>}
+ */
+function vllmEmbed(texts, opts) {
+  const baseUrl = process.env.VLLM_EMBED_URL || 'http://localhost:8800';
+  // Parse hostname, port, and base path from the URL.
+  let hostname = 'localhost';
+  let port = 8800;
+  let basePath = '';
+  try {
+    const parsed = new URL(baseUrl);
+    hostname = parsed.hostname;
+    port = parseInt(parsed.port) || (parsed.protocol === 'https:' ? 443 : 80);
+    basePath = parsed.pathname.replace(/\/$/, '');
+  } catch (_) {
+    // keep defaults
+  }
+  const reqPath = basePath + '/v1/embeddings';
+
+  return new Promise((resolve, reject) => {
+    // The OpenAI /v1/embeddings API accepts either a string or array for input.
+    const body = JSON.stringify({ model: VLLM_MODEL, input: texts });
+    const reqOpts = {
+      hostname,
+      port,
+      path: reqPath,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    };
+    const req = http.request(reqOpts, (res) => {
+      let data = '';
+      res.on('data', d => { data += d; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (!parsed.data || !Array.isArray(parsed.data)) {
+            return reject(new Error(`vLLM error: ${JSON.stringify(parsed).slice(0, 200)}`));
+          }
+          // Sort by index to guarantee order matches input order.
+          const sorted = [...parsed.data].sort((a, b) => a.index - b.index);
+          if (sorted.length !== texts.length) {
+            return reject(new Error(
+              `vLLM returned ${sorted.length} embeddings for ${texts.length} inputs`
+            ));
+          }
+          const embeddings = sorted.map((d, i) => {
+            const vec = d.embedding;
+            if (!Array.isArray(vec) || vec.length === 0) {
+              throw new Error(`vLLM returned empty embedding at index ${i}`);
+            }
+            let sumSquares = 0;
+            for (let j = 0; j < vec.length; j++) sumSquares += vec[j] * vec[j];
+            if (Math.sqrt(sumSquares) < 1e-9) {
+              throw new Error(`vLLM returned zero-magnitude embedding at index ${i}`);
+            }
+            // Matryoshka truncation: slice to EMBED_DIMS leading dimensions.
+            // Qwen3-Embedding-8B guarantees leading dims preserve semantic load.
+            // pgvector 0.8.1 caps halfvec HNSW at 4000 dims; default is 4000.
+            return EMBED_DIMS < vec.length ? vec.slice(0, EMBED_DIMS) : vec;
+          });
+          resolve(embeddings);
+        } catch (e) { reject(e); }
+      });
+    });
+    req.on('error', (e) => {
+      reject(new Error(`Cannot reach vLLM at ${hostname}:${port} — is it running? (${e.message})`));
+    });
+    req.write(body);
+    req.end();
+  });
+}
+
 // ─── EXPORTS ────────────────────────────────────────────────────────────────
 
 module.exports = {
   findProjectRoot, loadConfig, connect, c, ollamaDefaults, projectToDbName,
-  ollamaEmbed, tryEmbed, runWinBin, quoteForCmd,
+  ollamaEmbed, vllmEmbed, tryEmbed, runWinBin, quoteForCmd,
 };

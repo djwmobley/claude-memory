@@ -301,6 +301,39 @@ host's `nvidia-smi` works fine. Fix: `wsl --shutdown` from PowerShell, then re-e
 This re-initializes the `/dev/dxg` shim. Driver state on the host is fine; only the WSL
 side is wedged.
 
+**pgvector HNSW dimension cap (4000 for halfvec, 2000 for vector).** pgvector 0.8.1 hard-caps
+HNSW indexes: the `vector` type accepts at most **2000 dims**, and `halfvec` accepts at most
+**4000 dims**. A `vector(4096)` column cannot have any HNSW index — the CREATE INDEX fails
+with `operator class ... does not accept data type vector` or an explicit dimension cap error
+depending on the pgvector version. At small corpus sizes a sequential scan is fast enough,
+but as the corpus grows into thousands of chunks, seq scan latency becomes user-visible.
+
+The fix for a 4096-dim Qwen3 column is Matryoshka truncation: Qwen3-Embedding-8B is
+Matryoshka-trained, meaning the first N leading dimensions remain a high-quality embedding.
+Truncate from 4096 to 4000 dims using `subvector(embedding, 1, 4000)` and change the column
+type to `halfvec(4000)`. The canonical migration pattern wraps the ALTER in a transaction with
+DROP VIEW / re-apply:
+
+```sql
+-- Canonical embedding column type migration (DROP VIEW then \ir the view DDL back in)
+BEGIN;
+DROP VIEW v_memory_hits;
+ALTER TABLE memory_entry_chunks
+  ALTER COLUMN embedding TYPE halfvec(4000)
+  USING subvector(embedding, 1, 4000)::halfvec(4000);
+CREATE INDEX mem_chunks_vec_idx
+  ON memory_entry_chunks USING hnsw (embedding halfvec_cosine_ops);
+\ir scripts/sql/v_memory_hits.sql   -- single source of truth for the view definition
+COMMIT;
+```
+
+At write time, slice the vLLM output before storing: `vec.slice(0, 4000)` (or use
+`EMBED_DIMS=4000` env var with the `vllmEmbed()` helper in `scripts/lib/shared.js`).
+
+See BUNDLE-A-SPEC.md Phase 1 step 5 for the full design rationale, pgvector constraint
+matrix, and why `halfvec(4000)` was chosen over binary quantization, smaller embedders, or
+a two-column hybrid approach.
+
 ---
 
 ## Testing

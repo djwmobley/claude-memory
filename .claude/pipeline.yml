@@ -7,4 +7,6 @@ knowledge:
   port: 5432
   database: "claude_memory_eval_test"
   user: "postgres"
-  embedding_model: "mxbai-embed-large"
+  embedding_model: "Qwen/Qwen3-Embedding-8B"
+  embed_backend: vllm
+  vllm_embed_url: http://localhost:8800

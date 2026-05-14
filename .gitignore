@@ -12,3 +12,6 @@ test/eval/last-run.json
 
 # Project-personal Claude Code settings (machine-specific permission rules)
 .claude/settings.local.json
+
+# Architect directive staging files (temp content for DB row filing)
+.architect-row/

@@ -24,7 +24,7 @@
  *   - PostgreSQL with pgvector extension
  */
 
-const { loadConfig, connect, c, ollamaDefaults, ollamaEmbed, tryEmbed } = require('./lib/shared');
+const { loadConfig, connect, c, ollamaDefaults, ollamaEmbed, vllmEmbed, tryEmbed } = require('./lib/shared');
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 
@@ -32,6 +32,16 @@ const CONFIG = loadConfig();
 const OLLAMA_HOST = ollamaDefaults.host;
 const OLLAMA_PORT = ollamaDefaults.port;
 const EMBED_MODEL = CONFIG.embedding_model || ollamaDefaults.model;
+
+// ─── EMBED BACKEND ROUTING ───────────────────────────────────────────────────
+// EMBED_BACKEND=vllm  → use vllmEmbed (Qwen3-Embedding-8B, 4096-dim)
+// EMBED_BACKEND unset → use ollamaEmbed (mxbai-embed-large, 1024-dim)
+const EMBED_BACKEND = (process.env.EMBED_BACKEND || '').toLowerCase();
+const USE_VLLM = EMBED_BACKEND === 'vllm';
+
+// EMBED_COLUMN=embedding_4096 → write 4096-dim vectors to the alternate column.
+// Default is 'embedding' (the production 1024-dim column).
+const EMBED_COLUMN = process.env.EMBED_COLUMN || 'embedding';
 
 // ─── TABLE DEFINITIONS ──────────────────────────────────────────────────────
 // Each entry defines how to read, embed, and search a table.
@@ -45,7 +55,7 @@ const TABLES = [
     idCol: 'id',
     textFn: (r) => `Memory: ${r.name}\n${r.description || ''}\n\n${(r.body || '').substring(0, 5000)}`,
     selectCols: 'id, name, description, mem_type, body',
-    updateSql: 'UPDATE memory_entries SET embedding = $1 WHERE id = $2',
+    get updateSql() { return `UPDATE memory_entries SET ${EMBED_COLUMN} = $1 WHERE id = $2`; },
     label: (r) => `memory: ${r.name || '?'}`,
     snippet: (r) => r.description || (r.body || '').substring(0, 120),
     ftsCol: 'fts_vec',
@@ -59,7 +69,7 @@ const TABLES = [
     // chunks embedded during the load pass.
     textFn: (r) => `Memory: ${r.entry_name || ''}\n\n${r.content || ''}`,
     selectCols: 'id, entry_id, chunk_idx, content, (SELECT name FROM memory_entries WHERE id = entry_id) AS entry_name',
-    updateSql: 'UPDATE memory_entry_chunks SET embedding = $1 WHERE id = $2',
+    get updateSql() { return `UPDATE memory_entry_chunks SET ${EMBED_COLUMN} = $1 WHERE id = $2`; },
     label: (r) => `memory entry #${r.entry_id} chunk ${r.chunk_idx}`,
     snippet: (r) => (r.content || '').substring(0, 120),
     ftsCol: 'fts_vec',
@@ -68,8 +78,9 @@ const TABLES = [
 
 // ─── EMBED CONSTANTS ─────────────────────────────────────────────────────────
 
-// Safety guard for mxbai-embed-large 512-token cap (~4 chars/token, with margin).
-const MAX_EMBED_BYTES = 2000;
+// Safety guard: mxbai-embed-large has a 512-token cap (~4 chars/token, 2000 bytes).
+// Qwen3-Embedding-8B has 32K context; use a much larger guard (16000 bytes).
+const MAX_EMBED_BYTES = USE_VLLM ? 16000 : 2000;
 
 // ─── CHUNK-COVERED TABLES ────────────────────────────────────────────────────
 // Derived from information_schema at first use; cached for the process lifetime.
@@ -205,19 +216,27 @@ async function cmdIndex(forceAll) {
   try {
     let totalDone = 0;
 
+    // Route the embed function based on EMBED_BACKEND env var.
+    const embedFn = USE_VLLM
+      ? (texts) => vllmEmbed(texts)
+      : (texts) => ollamaEmbed(texts, CONFIG);
+
+    const backendLabel = USE_VLLM ? `vLLM (${process.env.VLLM_EMBED_URL || 'http://localhost:8800'})` : `Ollama ${EMBED_MODEL}`;
+    console.log(c.dim(`Backend: ${backendLabel} | Column: ${EMBED_COLUMN} | Max bytes: ${MAX_EMBED_BYTES}`));
+
     for (const tbl of TABLES) {
       if (!(await tableExists(client, tbl.name))) {
         console.log(c.dim(`Skipping ${tbl.name} — table does not exist.`));
         continue;
       }
-      if (!(await columnExists(client, tbl.name, 'embedding'))) {
-        console.log(c.dim(`Skipping ${tbl.name} — no embedding column. Run setup to add it.`));
+      if (!(await columnExists(client, tbl.name, EMBED_COLUMN))) {
+        console.log(c.dim(`Skipping ${tbl.name} — no ${EMBED_COLUMN} column.`));
         continue;
       }
 
       const query = forceAll
         ? `SELECT ${tbl.selectCols} FROM ${tbl.name} ORDER BY ${tbl.idCol}`
-        : `SELECT ${tbl.selectCols} FROM ${tbl.name} WHERE embedding IS NULL ORDER BY ${tbl.idCol}`;
+        : `SELECT ${tbl.selectCols} FROM ${tbl.name} WHERE ${EMBED_COLUMN} IS NULL ORDER BY ${tbl.idCol}`;
       const { rows } = await client.query(query);
 
       if (rows.length === 0) {
@@ -225,15 +244,13 @@ async function cmdIndex(forceAll) {
         continue;
       }
 
-      console.log(`${c.bold('Embedding')} ${rows.length} ${tbl.name} entries via ${EMBED_MODEL}...`);
+      console.log(`${c.bold('Embedding')} ${rows.length} ${tbl.name} entries via ${backendLabel}...`);
 
       // Pre-compute text for each row so embedFn is a pure (texts) => vectors call
       for (const row of rows) {
         row.text   = tbl.textFn(row);
         row.id     = row[tbl.idCol]; // embedWithRetry expects row.id
       }
-
-      const embedFn = (texts) => ollamaEmbed(texts, CONFIG);
 
       const result = await embedWithRetry(rows, embedFn, { batchSize: 32 });
 
@@ -274,7 +291,8 @@ async function cmdSearch(query) {
       return;
     }
 
-    const [qEmbedding] = await ollamaEmbed([query], CONFIG);
+    const embedQueryFn = USE_VLLM ? vllmEmbed : (texts) => ollamaEmbed(texts, CONFIG);
+    const [qEmbedding] = await embedQueryFn([query]);
     const vec = `[${qEmbedding.join(',')}]`;
 
     let resultNum = 0;
@@ -288,10 +306,10 @@ async function cmdSearch(query) {
     } else {
       const { rows: viewRows } = await client.query(
         `SELECT source_table, chunk_id, source_row_id, source_ordinal, chunk_idx, total_chunks, label, snippet,
-                1 - (embedding <=> $1::vector) AS cosine_similarity
+                1 - (embedding <=> $1::halfvec(4000)) AS cosine_similarity
          FROM v_memory_hits
          WHERE embedding IS NOT NULL
-         ORDER BY embedding <=> $1::vector
+         ORDER BY embedding <=> $1::halfvec(4000)
          LIMIT 5`,
         [vec]
       );
@@ -322,10 +340,10 @@ async function cmdSearch(query) {
 
       const { rows } = await client.query(
         `SELECT ${tbl.selectCols},
-                1 - (embedding <=> $1::vector) AS cosine_similarity
+                1 - (embedding <=> $1::halfvec(4000)) AS cosine_similarity
          FROM ${tbl.name}
          WHERE embedding IS NOT NULL
-         ORDER BY embedding <=> $1::vector
+         ORDER BY embedding <=> $1::halfvec(4000)
          LIMIT 5`,
         [vec]
       );
@@ -357,6 +375,7 @@ async function cmdHybrid(query) {
   try {
     let resultNum = 0;
     let qEmb = null;
+    const embedQueryFnH = USE_VLLM ? vllmEmbed : (texts) => ollamaEmbed(texts, CONFIG);
 
     // ── v_memory_hits (chunked: memory + sessions + policy) ──
     const { rows: viewExists } = await client.query(
@@ -365,12 +384,12 @@ async function cmdHybrid(query) {
     if (!viewExists.length) {
       console.log(c.yellow('  (v_memory_hits view not found — run setup to enable chunked memory search)'));
     } else {
-      if (!qEmb) { [qEmb] = await ollamaEmbed([query], CONFIG); }
+      if (!qEmb) { [qEmb] = await embedQueryFnH([query]); }
       const vec = `[${qEmb.join(',')}]`;
       const { rows: viewRows } = await client.query(
         `SELECT source_table, chunk_id, source_row_id, source_ordinal, chunk_idx, total_chunks, label, snippet,
                 ts_rank(fts_vec, plainto_tsquery($1)) * 0.3 +
-                (1 - (embedding <=> $2::vector)) * 0.7 AS score
+                (1 - (embedding <=> $2::halfvec(4000))) * 0.7 AS score
          FROM v_memory_hits
          WHERE embedding IS NOT NULL
          ORDER BY score DESC
@@ -421,28 +440,28 @@ async function cmdHybrid(query) {
       } else if (!hasFts) {
         // Vector-only (fts_vec missing — schema not updated)
         console.log(c.yellow(`  (${tbl.name}: no fts_vec column — vector-only results. Run setup to enable hybrid.)`));
-        if (!qEmb) { [qEmb] = await ollamaEmbed([query], CONFIG); }
+        if (!qEmb) { [qEmb] = await embedQueryFnH([query]); }
         const vec = `[${qEmb.join(',')}]`;
 
         const result = await client.query(
           `SELECT ${tbl.selectCols},
-                  1 - (embedding <=> $1::vector) AS score
+                  1 - (embedding <=> $1::halfvec(4000)) AS score
            FROM ${tbl.name}
            WHERE embedding IS NOT NULL
-           ORDER BY embedding <=> $1::vector
+           ORDER BY embedding <=> $1::halfvec(4000)
            LIMIT 5`,
           [vec]
         );
         rows = result.rows;
       } else {
         // Hybrid: 30% FTS + 70% vector
-        if (!qEmb) { [qEmb] = await ollamaEmbed([query], CONFIG); }
+        if (!qEmb) { [qEmb] = await embedQueryFnH([query]); }
         const vec = `[${qEmb.join(',')}]`;
 
         const result = await client.query(
           `SELECT ${tbl.selectCols},
                   ts_rank(fts_vec, plainto_tsquery($1)) * 0.3 +
-                  (1 - (embedding <=> $2::vector)) * 0.7 AS score
+                  (1 - (embedding <=> $2::halfvec(4000))) * 0.7 AS score
            FROM ${tbl.name}
            WHERE embedding IS NOT NULL
            ORDER BY score DESC

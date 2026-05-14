@@ -1,7 +1,9 @@
 {
-  "recall_at_1": 0.7222222222222222,
-  "recall_at_3_relaxed": 0.9722222222222222,
-  "mrr": 0.8296296296296296,
+  "recall_at_1": 0.7777777777777778,
+  "recall_at_3_relaxed": 1,
+  "mrr": 0.8541666666666666,
   "negative_precision": 1,
-  "updatedAt": "2026-05-14T18:14:24.807Z"
+  "neg_prec_score_threshold": 0.5,
+  "embedding_type": "halfvec(4000)",
+  "updatedAt": "2026-05-14T21:07:26.427Z"
 }
