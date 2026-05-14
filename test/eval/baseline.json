@@ -5,5 +5,13 @@
   "negative_precision": 1,
   "neg_prec_score_threshold": 0.5,
   "embedding_type": "halfvec(4000)",
-  "updatedAt": "2026-05-14T21:07:26.427Z"
+  "negative_query_nearest_fp": {
+    "q10": {
+      "filename": "rag-architecture.md",
+      "score": 0.39112420393044783,
+      "rank": 1
+    },
+    "q18": null
+  },
+  "updatedAt": "2026-05-14T22:12:18.573Z"
 }
