@@ -429,12 +429,23 @@ async function main() {
         return hit !== undefined && hit.score > NEG_PREC_SCORE_THRESHOLD;
       });
 
+      // Nearest false-positive: recorded for ALL queries (positive and negative) so
+      // cross-model comparisons can track how close must_not_appear fixtures came,
+      // independent of whether the threshold gate triggered. Summarized only for negatives.
+      let nearestFp = null;
+      for (const f of must_not_appear_top_5) {
+        const hit = hits.find(h => h.filename === f);
+        if (hit && (nearestFp === null || hit.score > nearestFp.score)) {
+          nearestFp = { filename: hit.filename, score: hit.score, rank: hit.rank };
+        }
+      }
+
       perQueryResults.push({
         id, query,
         expected_top_1, expected_top_3, must_not_appear_top_5,
         isNegative,
         hits,
-        top1Match, top3Match, mrr, noLeak,
+        top1Match, top3Match, mrr, noLeak, nearestFp,
       });
 
       const label = `Query [${id}]: ${query.slice(0, 40)}`;
@@ -468,6 +479,12 @@ async function main() {
 
     const metrics = { recall_at_1, recall_at_3_relaxed, mrr, negative_precision };
 
+    const negativeQueries = perQueryResults.filter(r => r.isNegative);
+    const negative_query_nearest_fp = {};
+    for (const r of negativeQueries) {
+      negative_query_nearest_fp[r.id] = r.nearestFp; // null if no must_not_appear fixture appeared in results
+    }
+
     // ── Step 9: Write last-run.json ──────────────────────────────────────────
 
     const lastRun = {
@@ -483,6 +500,7 @@ async function main() {
         top3Match:   r.top3Match,
         mrr:         r.mrr,
         noLeak:      r.noLeak,
+        nearestFp:   r.nearestFp,
         hits:        r.hits.map(h => ({ rank: h.rank, filename: h.filename, score: h.score })),
       })),
     };
@@ -551,6 +569,7 @@ async function main() {
           negative_precision,
           neg_prec_score_threshold: NEG_PREC_SCORE_THRESHOLD,
           embedding_type: USE_VLLM_EVAL ? 'halfvec(4000)' : 'vector(1024)',
+          negative_query_nearest_fp,
           updatedAt: runStartedAt,
         };
         fs.writeFileSync(BASELINE_FILE, JSON.stringify(newBaseline, null, 2), 'utf8');
