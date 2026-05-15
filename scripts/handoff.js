@@ -853,7 +853,7 @@ async function cmdCheckpoint(args) {
   const { entitiesWritten, assertionsWritten, edgesWritten } =
     await writeExtraction(db, projectId, payload);
 
-  // Update handoff.md (keep session_in_progress marker — do not clear it)
+  // Update handoff.md
   const stamp = new Date().toISOString();
   writeHandoffMd(handoffPath, {
     PROJECT_ID:          projectId,
@@ -868,6 +868,13 @@ async function cmdCheckpoint(args) {
     QUICK_REFERENCES:    payload.quick_references || '(none)',
   });
 
+  // Clear session_in_progress so the Phase 3.7 Stop hook treats this checkpoint
+  // as an explicit save and skips the implicit close.
+  await db.query(
+    `DELETE FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'`,
+    [projectId]
+  );
+
   // Run reranker gate (informational)
   await runRerankerGate(db, projectId, root);
 
@@ -876,7 +883,7 @@ async function cmdCheckpoint(args) {
   console.log(`\n  entities written:    ${entitiesWritten}`);
   console.log(`  assertions written:  ${assertionsWritten}`);
   console.log(`  edges written:       ${edgesWritten}`);
-  console.log(`\nDone: handoff:checkpoint — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written (session marker retained)`);
+  console.log(`\nDone: handoff:checkpoint — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written (session marker cleared)`);
 }
 
 // ── close ─────────────────────────────────────────────────────────────────────
