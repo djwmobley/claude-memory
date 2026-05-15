@@ -57,3 +57,6 @@ jobs:
           PGUSER: postgres
           PGPASSWORD: postgres
           EVAL_DB_NAME: claude_memory_eval_test
+          # Propagates into the loader subprocess that eval STEP 5 spawns;
+          # without this, the loader tries Ollama-on-localhost and fails 3x per fixture.
+          OLLAMA_SKIP: '1'
