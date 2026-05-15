@@ -24,7 +24,11 @@
  *   - PostgreSQL with pgvector extension
  */
 
-const { loadConfig, connect, c, ollamaDefaults, ollamaEmbed, vllmEmbed, tryEmbed } = require('./lib/shared');
+const {
+  loadConfig, connect, c, ollamaDefaults,
+  ollamaEmbed, vllmEmbed, tryEmbed,
+  ollamaGenerateBlurb, lateChunkEmbed,
+} = require('./lib/shared');
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 
@@ -42,6 +46,11 @@ const USE_VLLM = EMBED_BACKEND === 'vllm';
 // EMBED_COLUMN=embedding_4096 → write 4096-dim vectors to the alternate column.
 // Default is 'embedding' (the production 1024-dim column).
 const EMBED_COLUMN = process.env.EMBED_COLUMN || 'embedding';
+
+// LATE_CHUNKING=1 → use vLLM per-token pooling + client-side mean-pool for
+// memory_entry_chunks. Requires EMBED_BACKEND=vllm. When unset or 0, standard
+// pooled embedding is used for all tables.
+const LATE_CHUNKING = (process.env.LATE_CHUNKING || '0') === '1';
 
 // ─── TABLE DEFINITIONS ──────────────────────────────────────────────────────
 // Each entry defines how to read, embed, and search a table.
@@ -63,12 +72,13 @@ const TABLES = [
   {
     name: 'memory_entry_chunks',
     idCol: 'id',
-    // Embed with parent-name context to match the loader's inline embedPending
-    // path (pipeline-memory-loader.js:295, "Memory: ${name}\n\n${content}").
-    // Without the parent name, backfilled chunks have weaker embeddings than
-    // chunks embedded during the load pass.
-    textFn: (r) => `Memory: ${r.entry_name || ''}\n\n${r.content || ''}`,
-    selectCols: 'id, entry_id, chunk_idx, content, (SELECT name FROM memory_entries WHERE id = entry_id) AS entry_name',
+    // blurb column (Phase 3b): when present, prepended to content at embed time.
+    // blurb is read from DB — generated separately via `pipeline-embed.js blurbs`.
+    textFn: (r) => {
+      const prefix = r.blurb ? r.blurb + '\n\n' : '';
+      return `Memory: ${r.entry_name || ''}\n\n${prefix}${r.content || ''}`;
+    },
+    selectCols: 'id, entry_id, chunk_idx, content, blurb, (SELECT name FROM memory_entries WHERE id = entry_id) AS entry_name',
     get updateSql() { return `UPDATE memory_entry_chunks SET ${EMBED_COLUMN} = $1 WHERE id = $2`; },
     label: (r) => `memory entry #${r.entry_id} chunk ${r.chunk_idx}`,
     snippet: (r) => (r.content || '').substring(0, 120),
@@ -209,6 +219,162 @@ async function embedWithRetry(rows, embedFn, { batchSize = 32, maxRetries = 3, o
   return { embedded, skipped, failed };
 }
 
+// ─── BLURBS ──────────────────────────────────────────────────────────────────
+
+/**
+ * Generate contextual blurbs for memory_entry_chunks rows.
+ *
+ * Default: only rows where blurb IS NULL.
+ * With forceAll=true: regenerate blurbs for every row.
+ *
+ * Blurbs are persisted to memory_entry_chunks.blurb (Phase 3b column).
+ * The embed path reads blurb from DB and prepends it to chunk text.
+ */
+async function cmdBlurbs(forceAll) {
+  const client = await connect(CONFIG);
+  const start  = Date.now();
+  let processed = 0;
+  let written   = 0;
+  let failed    = 0;
+
+  try {
+    if (!(await tableExists(client, 'memory_entry_chunks'))) {
+      console.log(c.yellow('memory_entry_chunks table does not exist — nothing to do.'));
+      return;
+    }
+    if (!(await columnExists(client, 'memory_entry_chunks', 'blurb'))) {
+      console.log(c.yellow('memory_entry_chunks.blurb column does not exist — run phase3b-schema-apply.js first.'));
+      return;
+    }
+
+    const { rows } = await client.query(
+      `SELECT mc.id, mc.content, me.name AS parent_name
+       FROM memory_entry_chunks mc
+       JOIN memory_entries me ON me.id = mc.entry_id
+       WHERE mc.blurb IS NULL OR $1
+       ORDER BY mc.id`,
+      [forceAll]
+    );
+
+    if (rows.length === 0) {
+      console.log(c.green('All chunks already have blurbs. Use --all to regenerate.'));
+      return;
+    }
+
+    console.log(`${c.bold('Generating blurbs')} for ${rows.length} chunks via qwen2.5:14b...`);
+
+    for (const row of rows) {
+      processed++;
+
+      const blurb = await ollamaGenerateBlurb(row.parent_name, '', row.content, {});
+      if (blurb) {
+        await client.query(
+          `UPDATE memory_entry_chunks SET blurb = $1 WHERE id = $2`,
+          [blurb, row.id]
+        );
+        written++;
+      } else {
+        failed++;
+      }
+
+      if (processed % 10 === 0) {
+        process.stdout.write(`\r  ${processed}/${rows.length} processed (${written} written, ${failed} failed)...`);
+      }
+    }
+
+    const durationS = ((Date.now() - start) / 1000).toFixed(1);
+    console.log(`\n${c.green('Done.')} ${processed} processed, ${written} blurbs written, ${failed} failed. Duration: ${durationS}s`);
+  } finally {
+    await client.end();
+  }
+}
+
+// ─── LATE CHUNK INDEX (memory_entry_chunks) ───────────────────────────────────
+
+/**
+ * Embed memory_entry_chunks rows using vLLM late chunking.
+ *
+ * Groups chunks by parent entry. For each parent, builds an augmented document
+ * by concatenating chunk texts (with blurb prefixes where present), then calls
+ * lateChunkEmbed to produce one vector per chunk via per-token pooling.
+ *
+ * Falls back to standard pooled embed if the parent has only one chunk or if
+ * lateChunkEmbed fails.
+ *
+ * @param {object} client - pg Client
+ * @param {boolean} forceAll - embed all rows, not just NULL-embedding rows
+ * @returns {Promise<{ embedded: number, failed: number }>}
+ */
+async function cmdIndexLateChunking(client, forceAll) {
+  const tbl = TABLES.find((t) => t.name === 'memory_entry_chunks');
+  if (!tbl) return { embedded: 0, failed: 0 };
+
+  // Fetch all candidate rows grouped by entry_id
+  const query = forceAll
+    ? `SELECT ${tbl.selectCols} FROM memory_entry_chunks ORDER BY entry_id, chunk_idx`
+    : `SELECT ${tbl.selectCols} FROM memory_entry_chunks WHERE ${EMBED_COLUMN} IS NULL ORDER BY entry_id, chunk_idx`;
+
+  const { rows } = await client.query(query);
+  if (rows.length === 0) return { embedded: 0, failed: 0 };
+
+  // Group by entry_id
+  const byEntry = new Map();
+  for (const row of rows) {
+    if (!byEntry.has(row.entry_id)) byEntry.set(row.entry_id, []);
+    byEntry.get(row.entry_id).push(row);
+  }
+
+  let embedded = 0;
+  let failed   = 0;
+
+  for (const [entryId, chunks] of byEntry) {
+    if (chunks.length === 0) continue;
+
+    // Build augmented document text: concat blurb + content per chunk
+    // Track character offsets for each chunk span within augmentedText.
+    const chunkOffsets = [];
+    let augmentedText  = '';
+
+    for (const chunk of chunks) {
+      const blurbPrefix = chunk.blurb ? chunk.blurb + '\n\n' : '';
+      const chunkBody   = blurbPrefix + (chunk.content || '');
+      const start       = augmentedText.length;
+      augmentedText    += chunkBody + '\n\n';
+      chunkOffsets.push([start, start + chunkBody.length]);
+    }
+
+    try {
+      const vectors = await lateChunkEmbed(augmentedText, chunkOffsets, {});
+      for (let i = 0; i < chunks.length; i++) {
+        const vec = vectors[i];
+        if (!vec || vec.length === 0) { failed++; continue; }
+        const pgVec = `[${vec.join(',')}]`;
+        await client.query(tbl.updateSql, [pgVec, chunks[i].id]);
+        embedded++;
+      }
+    } catch (err) {
+      // Late chunking failed for this entry — fall back to standard pooled embed
+      process.stderr.write(
+        `[late-chunk] entry_id=${entryId} late chunking failed (${err.message.slice(0, 80)}), falling back to pooled embed\n`
+      );
+      for (const chunk of chunks) {
+        const text = tbl.textFn(chunk);
+        if (text.length > MAX_EMBED_BYTES) { failed++; continue; }
+        try {
+          const [vec] = await vllmEmbed([text]);
+          const pgVec = `[${vec.join(',')}]`;
+          await client.query(tbl.updateSql, [pgVec, chunk.id]);
+          embedded++;
+        } catch (_) {
+          failed++;
+        }
+      }
+    }
+  }
+
+  return { embedded, failed };
+}
+
 // ─── INDEX ───────────────────────────────────────────────────────────────────
 
 async function cmdIndex(forceAll) {
@@ -224,6 +390,10 @@ async function cmdIndex(forceAll) {
     const backendLabel = USE_VLLM ? `vLLM (${process.env.VLLM_EMBED_URL || 'http://localhost:8800'})` : `Ollama ${EMBED_MODEL}`;
     console.log(c.dim(`Backend: ${backendLabel} | Column: ${EMBED_COLUMN} | Max bytes: ${MAX_EMBED_BYTES}`));
 
+    if (LATE_CHUNKING && USE_VLLM) {
+      console.log(c.dim('Late chunking: ENABLED (memory_entry_chunks will use per-token pooling)'));
+    }
+
     for (const tbl of TABLES) {
       if (!(await tableExists(client, tbl.name))) {
         console.log(c.dim(`Skipping ${tbl.name} — table does not exist.`));
@@ -231,6 +401,23 @@ async function cmdIndex(forceAll) {
       }
       if (!(await columnExists(client, tbl.name, EMBED_COLUMN))) {
         console.log(c.dim(`Skipping ${tbl.name} — no ${EMBED_COLUMN} column.`));
+        continue;
+      }
+
+      // Late chunking path for memory_entry_chunks when LATE_CHUNKING=1 + vLLM
+      if (LATE_CHUNKING && USE_VLLM && tbl.name === 'memory_entry_chunks') {
+        const query = forceAll
+          ? `SELECT COUNT(*) FROM memory_entry_chunks`
+          : `SELECT COUNT(*) FROM memory_entry_chunks WHERE ${EMBED_COLUMN} IS NULL`;
+        const { rows: [{ count }] } = await client.query(query);
+        if (parseInt(count) === 0) {
+          console.log(c.green(`memory_entry_chunks: all entries already embedded.`));
+          continue;
+        }
+        console.log(`${c.bold('Embedding')} ${count} memory_entry_chunks via late chunking (vLLM)...`);
+        const { embedded, failed } = await cmdIndexLateChunking(client, forceAll);
+        console.log(`\n${c.green('Done.')} memory_entry_chunks: ${embedded} embedded, ${failed} failed (late chunking).`);
+        totalDone += embedded;
         continue;
       }
 
@@ -530,8 +717,18 @@ ${c.bold('pipeline-embed.js')} — Multi-table embedding index + semantic search
 ${c.dim(`Database: ${CONFIG.database} | Ollama: ${OLLAMA_HOST}:${OLLAMA_PORT} | Model: ${EMBED_MODEL}`)}
 ${c.dim(`Tables: ${TABLES.map(t => t.name).join(', ')}`)}
 
+  ${c.cyan('blurbs')}
+      Generate contextual blurbs (qwen2.5:14b via Ollama) for chunks where
+      blurb IS NULL. Persists to memory_entry_chunks.blurb. Idempotent.
+
+  ${c.cyan('blurbs --all')}
+      Regenerate blurbs for every chunk (overwrites existing blurbs).
+
   ${c.cyan('index')}
-      Embed all unembedded entries across all tables
+      Embed all unembedded entries across all tables.
+      Reads blurb column from DB and prepends to chunk text before embedding.
+      Set LATE_CHUNKING=1 + EMBED_BACKEND=vllm to use per-token pooling for
+      memory_entry_chunks (vLLM late chunking via /pooling?task=token_embed).
 
   ${c.cyan('index --all')}
       Re-embed everything (force refresh)
@@ -544,6 +741,11 @@ ${c.dim(`Tables: ${TABLES.map(t => t.name).join(', ')}`)}
 
   ${c.cyan('stats')}
       Show embedding coverage per table
+
+Operational sequence for full corpus refresh:
+  1. node scripts/pipeline-memory-loader.js memory   (load chunks; embeddings + blurbs NULL)
+  2. node scripts/pipeline-embed.js blurbs           (fill NULL blurbs via Ollama)
+  3. node scripts/pipeline-embed.js index            (embed, reading blurbs from DB)
 
 Requires: Ollama running at ${OLLAMA_HOST}:${OLLAMA_PORT}
   ollama pull ${EMBED_MODEL}
@@ -563,6 +765,8 @@ const [, , cmd, ...args] = process.argv;
   try {
     if (!cmd || cmd === 'help' || cmd === '--help') {
       help();
+    } else if (cmd === 'blurbs') {
+      await cmdBlurbs(args[0] === '--all');
     } else if (cmd === 'index') {
       await cmdIndex(args[0] === '--all');
     } else if (cmd === 'search') {

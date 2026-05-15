@@ -444,9 +444,285 @@ async function vllmRerank(query, documents, opts) {
   });
 }
 
+// ─── OLLAMA BLURB GENERATION ─────────────────────────────────────────────────
+
+/**
+ * Generate a contextual blurb for a chunk using qwen2.5:14b via Ollama.
+ *
+ * The blurb is a ≤200-token description of the chunk's topic, suitable for
+ * prepending to chunk text at embed time to give the embedder topic-anchored
+ * context.
+ *
+ * @param {string} parentName   - Name of the parent memory entry (doc name).
+ * @param {string} heading      - Section heading context (may be empty string).
+ * @param {string} content      - The chunk text.
+ * @param {object} [opts]       - Optional overrides: { model, host, port }.
+ * @returns {Promise<string|null>} Blurb string, or null on failure.
+ */
+function ollamaGenerateBlurb(parentName, heading, content, opts) {
+  const model  = (opts && opts.model)  || 'qwen2.5:14b';
+  const host   = (opts && opts.host)   || ollamaDefaults.host;
+  const port   = (opts && opts.port)   || ollamaDefaults.port;
+
+  const headingContext = heading ? ` under the section "${heading}"` : '';
+  const prompt =
+    `You are a concise technical indexer. In at most 2 sentences (≤200 tokens), ` +
+    `describe the main topic of the following chunk from the document "${parentName}"${headingContext}. ` +
+    `Output only the description — no preamble, no bullets.\n\n${content.slice(0, 1200)}`;
+
+  return new Promise((resolve) => {
+    const body = JSON.stringify({ model, prompt, stream: false, options: { num_predict: 200 } });
+    const reqOpts = {
+      hostname: host,
+      port,
+      path: '/api/generate',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    };
+    const req = http.request(reqOpts, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          const blurb = (parsed.response || '').trim();
+          resolve(blurb.length > 0 ? blurb : null);
+        } catch (_) {
+          resolve(null);
+        }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.write(body);
+    req.end();
+  });
+}
+
+// ─── VLLM TOKENIZE ───────────────────────────────────────────────────────────
+
+/**
+ * Tokenize text using vLLM's /tokenize endpoint.
+ * Returns BPE token strings (Ġ = leading space in the token stream).
+ *
+ * @param {string} text  - Text to tokenize.
+ * @param {object} [opts] - Optional overrides: { baseUrl }.
+ * @returns {Promise<{ tokens: string[], token_ids: number[] }>}
+ */
+function vllmTokenize(text, opts) {
+  const baseUrl = (opts && opts.baseUrl) || process.env.VLLM_EMBED_URL || 'http://localhost:8800';
+  let hostname = 'localhost';
+  let port = 8800;
+  let basePath = '';
+  try {
+    const parsed = new URL(baseUrl);
+    hostname = parsed.hostname;
+    port = parseInt(parsed.port) || (parsed.protocol === 'https:' ? 443 : 80);
+    basePath = parsed.pathname.replace(/\/$/, '');
+  } catch (_) {}
+
+  const body = JSON.stringify({
+    model: VLLM_MODEL,
+    prompt: text,
+    return_token_strs: true,
+    add_special_tokens: false,
+  });
+
+  return new Promise((resolve, reject) => {
+    const reqOpts = {
+      hostname,
+      port,
+      path: basePath + '/tokenize',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    };
+    const req = http.request(reqOpts, (res) => {
+      let data = '';
+      res.on('data', (d) => { data += d; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          // vLLM /tokenize returns { tokens: int[], token_strs: string[] }
+          // (tokens are numeric IDs; the BPE string forms are in token_strs)
+          if (!Array.isArray(parsed.token_strs) || !Array.isArray(parsed.tokens)) {
+            return reject(new Error(`vLLM /tokenize unexpected response: ${data.slice(0, 200)}`));
+          }
+          resolve({ tokens: parsed.token_strs, token_ids: parsed.tokens });
+        } catch (e) { reject(e); }
+      });
+    });
+    req.on('error', (e) => reject(new Error(`vLLM tokenize error: ${e.message}`)));
+    req.write(body);
+    req.end();
+  });
+}
+
+// ─── VLLM TOKEN EMBED ────────────────────────────────────────────────────────
+
+/**
+ * Obtain per-token hidden-state vectors from vLLM's /pooling endpoint
+ * using task="token_embed". Returns an array of token vectors.
+ *
+ * @param {string} text   - Text to process.
+ * @param {object} [opts] - Optional overrides: { baseUrl }.
+ * @returns {Promise<number[][]>} Array of per-token vectors.
+ */
+function vllmTokenEmbed(text, opts) {
+  const baseUrl = (opts && opts.baseUrl) || process.env.VLLM_EMBED_URL || 'http://localhost:8800';
+  let hostname = 'localhost';
+  let port = 8800;
+  let basePath = '';
+  try {
+    const parsed = new URL(baseUrl);
+    hostname = parsed.hostname;
+    port = parseInt(parsed.port) || (parsed.protocol === 'https:' ? 443 : 80);
+    basePath = parsed.pathname.replace(/\/$/, '');
+  } catch (_) {}
+
+  const body = JSON.stringify({
+    model: VLLM_MODEL,
+    input: text,
+    task: 'token_embed',
+  });
+
+  return new Promise((resolve, reject) => {
+    const reqOpts = {
+      hostname,
+      port,
+      path: basePath + '/pooling',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    };
+    const req = http.request(reqOpts, (res) => {
+      let data = '';
+      res.on('data', (d) => { data += d; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          // vLLM /pooling with token_embed returns per-token vectors in data[0].data
+          if (!parsed.data || !Array.isArray(parsed.data) || !parsed.data[0]) {
+            return reject(new Error(`vLLM /pooling token_embed unexpected response: ${data.slice(0, 200)}`));
+          }
+          const tokenVectors = parsed.data[0].data;
+          if (!Array.isArray(tokenVectors)) {
+            return reject(new Error(`vLLM /pooling token_embed: data[0].data is not an array`));
+          }
+          resolve(tokenVectors);
+        } catch (e) { reject(e); }
+      });
+    });
+    req.on('error', (e) => reject(new Error(`vLLM token embed error: ${e.message}`)));
+    req.write(body);
+    req.end();
+  });
+}
+
+// ─── LATE CHUNK EMBED ────────────────────────────────────────────────────────
+
+/**
+ * Late chunking: embed multiple chunks from a single document pass.
+ *
+ * Sends the full augmented document text to vLLM /pooling with task="token_embed"
+ * to obtain per-token hidden states, then maps chunk character offsets to token
+ * spans via /tokenize, mean-pools over each span, and L2-normalizes.
+ *
+ * Each entry in chunkOffsets is [charStart, charEnd] (character positions in text).
+ *
+ * Returns one EMBED_DIMS-truncated, L2-normalized vector per chunk.
+ *
+ * @param {string}       text          - Full document text (augmented with blurbs).
+ * @param {number[][]}   chunkOffsets  - Array of [charStart, charEnd] pairs.
+ * @param {object}       [opts]        - Optional overrides: { baseUrl }.
+ * @returns {Promise<number[][]>}      One vector per chunk (EMBED_DIMS dims).
+ */
+async function lateChunkEmbed(text, chunkOffsets, opts) {
+  // Obtain per-token vectors for the full document
+  const tokenVectors = await vllmTokenEmbed(text, opts);
+
+  // Obtain BPE token strings to map char offsets to token indices
+  const { tokens } = await vllmTokenize(text, opts);
+
+  // vLLM /pooling appends model special tokens (e.g. <|endoftext|> for Qwen3)
+  // even though /tokenize was asked to exclude them. Trim the trailing extras
+  // so per-token vectors align 1:1 with the tokenize output used for offsets.
+  // Diff > 2 indicates something more wrong than a trailing EOS — fail loud.
+  const extras = tokenVectors.length - tokens.length;
+  if (extras < 0 || extras > 2) {
+    throw new Error(
+      `lateChunkEmbed: tokenize returned ${tokens.length} tokens but pooling returned ` +
+      `${tokenVectors.length} vectors — cannot map offsets`
+    );
+  }
+  if (extras > 0) tokenVectors.length = tokens.length;
+
+  // Build char-to-token index mapping.
+  // Reconstruct character offsets for each token by walking the token strings.
+  // BPE tokens: Ġ (U+0120) represents a leading space in the original text.
+  const tokenCharStart = new Int32Array(tokens.length);
+  const tokenCharEnd   = new Int32Array(tokens.length);
+  let charPos = 0;
+  for (let i = 0; i < tokens.length; i++) {
+    // Replace BPE leading-space marker with actual space for length accounting
+    const tokenStr = tokens[i].replace(/Ġ/g, ' ');
+    tokenCharStart[i] = charPos;
+    charPos += tokenStr.length;
+    tokenCharEnd[i] = charPos;
+  }
+
+  const dim = tokenVectors[0] ? tokenVectors[0].length : 0;
+  const results = [];
+
+  for (const [cStart, cEnd] of chunkOffsets) {
+    // Find token span covering [cStart, cEnd)
+    let tStart = -1;
+    let tEnd   = -1;
+    for (let i = 0; i < tokens.length; i++) {
+      if (tStart === -1 && tokenCharEnd[i] > cStart) tStart = i;
+      if (tokenCharStart[i] < cEnd) tEnd = i + 1;
+    }
+
+    if (tStart === -1 || tEnd <= tStart) {
+      // No tokens in range — return zero vector as fallback
+      results.push(new Array(EMBED_DIMS).fill(0));
+      continue;
+    }
+
+    // Mean-pool over the token span
+    const pooled = new Float64Array(dim);
+    for (let i = tStart; i < tEnd; i++) {
+      const vec = tokenVectors[i];
+      for (let j = 0; j < dim; j++) pooled[j] += vec[j];
+    }
+    const spanLen = tEnd - tStart;
+    for (let j = 0; j < dim; j++) pooled[j] /= spanLen;
+
+    // L2-normalize
+    let sumSq = 0;
+    for (let j = 0; j < dim; j++) sumSq += pooled[j] * pooled[j];
+    const norm = Math.sqrt(sumSq);
+    const normalized = norm > 1e-9
+      ? Array.from(pooled).map((v) => v / norm)
+      : Array.from(pooled);
+
+    // Matryoshka truncation to EMBED_DIMS
+    results.push(EMBED_DIMS < normalized.length ? normalized.slice(0, EMBED_DIMS) : normalized);
+  }
+
+  return results;
+}
+
 // ─── EXPORTS ────────────────────────────────────────────────────────────────
 
 module.exports = {
   findProjectRoot, loadConfig, connect, c, ollamaDefaults, projectToDbName,
   ollamaEmbed, vllmEmbed, tryEmbed, runWinBin, quoteForCmd, vllmRerank,
+  ollamaGenerateBlurb, vllmTokenize, vllmTokenEmbed, lateChunkEmbed,
 };
