@@ -365,6 +365,15 @@ still run.
 PROJECT_ROOT=$(pwd) node scripts/test-chunker.js
 ```
 
+**`test/handoff/test-handoff.js`** -- golden-path tests for the `/handoff` skill helper.
+Runs each subcommand (init, status, close, checkpoint, resume, drop, purge) against
+`claude_memory_eval_test` with a temporary project_id and asserts row counts and file
+contents. Requires Phase 2 schema to be applied first.
+
+```bash
+node test/handoff/test-handoff.js
+```
+
 **`test/eval/eval-retrieval.js`** -- retrieval-quality regression. 22 synthetic
 fixture markdown files in `test/eval/fixtures/`, 18 hand-labeled queries in
 `test/eval/queries.json` with expected top-1 / top-3 hits and negative
@@ -402,6 +411,36 @@ better answer.
 CI runs the eval harness in `--ollama-skip` mode (smoke test for the SQL /
 loader path; vector-quality regression detection requires running locally with
 Ollama).
+
+---
+
+## `/handoff` skill install
+
+The `/handoff` skill is a set of seven Claude Code slash commands that provide
+cross-session memory continuity. The skill files live in `commands/handoff/` in
+this repo (source of truth, committed alongside the helper script). To install:
+
+```bash
+# Copy the command files to your user-scoped Claude Code commands directory
+cp commands/handoff/*.md ~/.claude/commands/handoff/
+```
+
+After install, the following slash commands become available in any project that
+has `scripts/handoff.js` on the walk-up path:
+
+| Command | Description |
+|---------|-------------|
+| `/handoff:init` | First-run provisioning: schema, handoff.md, CLAUDE.md, default contract |
+| `/handoff:status` | Read-only: counts, last close, contract names, session marker |
+| `/handoff:resume` | Load prior session context regardless of staleness threshold |
+| `/handoff:close` | End-of-session extraction: entities, assertions, edges, contract update |
+| `/handoff:checkpoint` | Mid-session save without ending the session |
+| `/handoff:drop` | Archive prior assertions (recoverable), start fresh handoff.md |
+| `/handoff:purge` | Hard delete all project memory (confirmation required) |
+
+The helper (`scripts/handoff.js`) does the heavy lifting. The Markdown files are
+thin recipes that announce `Running: handoff:<sub>` at start and
+`Done: handoff:<sub> — <one-line>` at finish.
 
 ---
 
