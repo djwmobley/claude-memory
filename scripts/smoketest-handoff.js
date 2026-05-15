@@ -25,8 +25,8 @@ const { Client } = require('pg');
 const ARGS       = process.argv.slice(2);
 const sectionArg = ARGS.find((a) => a.startsWith('--section='));
 const SECTION    = sectionArg ? sectionArg.split('=')[1] : 'all';
-if (!['all', 'lifecycle', 'hooks'].includes(SECTION)) {
-  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, all`);
+if (!['all', 'lifecycle', 'hooks', 'hardening'].includes(SECTION)) {
+  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, hardening, all`);
   process.exit(2);
 }
 
@@ -37,21 +37,25 @@ const HANDOFF_SCRIPT = path.join(PROJECT_ROOT, 'scripts', 'handoff.js');
 const TS             = Date.now();
 const SMOKE_DB       = `claude_memory_smoketest_${TS}`;
 const HOOKS_DB       = `claude_memory_hooks_${TS}`;
+const HARDEN_DB      = `claude_memory_harden_${TS}`;
 
 // Unique temp dir used as PROJECT_ROOT for subprocesses — gives a unique project_id
 // so concurrent smoketest runs don't collide.
-const TEMP_PROJECT_DIR       = path.join(os.tmpdir(), `handoff_smoke_${TS}`);
-const TEMP_PROJECT_DIR_HOOKS = path.join(os.tmpdir(), `handoff_hooks_${TS}`);
+const TEMP_PROJECT_DIR         = path.join(os.tmpdir(), `handoff_smoke_${TS}`);
+const TEMP_PROJECT_DIR_HOOKS   = path.join(os.tmpdir(), `handoff_hooks_${TS}`);
+const TEMP_PROJECT_DIR_HARDEN  = path.join(os.tmpdir(), `handoff_harden_${TS}`);
 
 // Encode TEMP_PROJECT_DIR the same way handoff.js does (encoded-cwd logic).
 function encodeCwd(p) {
   return p.replace(/[/\\]+$/, '').replace(/[^A-Za-z0-9-]/g, '-');
 }
 
-const PROJECT_ID       = encodeCwd(TEMP_PROJECT_DIR);
-const PROJECT_ID_HOOKS = encodeCwd(TEMP_PROJECT_DIR_HOOKS);
-const HANDOFF_PATH     = path.join(os.homedir(), '.claude', 'projects', PROJECT_ID, 'handoff.md');
-const HANDOFF_PATH_HOOKS = path.join(os.homedir(), '.claude', 'projects', PROJECT_ID_HOOKS, 'handoff.md');
+const PROJECT_ID         = encodeCwd(TEMP_PROJECT_DIR);
+const PROJECT_ID_HOOKS   = encodeCwd(TEMP_PROJECT_DIR_HOOKS);
+const PROJECT_ID_HARDEN  = encodeCwd(TEMP_PROJECT_DIR_HARDEN);
+const HANDOFF_PATH       = path.join(os.homedir(), '.claude', 'projects', PROJECT_ID, 'handoff.md');
+const HANDOFF_PATH_HOOKS   = path.join(os.homedir(), '.claude', 'projects', PROJECT_ID_HOOKS, 'handoff.md');
+const HANDOFF_PATH_HARDEN  = path.join(os.homedir(), '.claude', 'projects', PROJECT_ID_HARDEN, 'handoff.md');
 
 // Env passed to every subprocess invocation — redirects DB and project root.
 function makeEnv(db = SMOKE_DB, projectDir = TEMP_PROJECT_DIR) {
@@ -70,9 +74,13 @@ let lcSkipped = 0;
 let hkPassed  = 0;
 let hkFailed  = 0;
 let hkSkipped = 0;
+let hdPassed  = 0;
+let hdFailed  = 0;
+let hdSkipped = 0;
 
 const LC_TOTAL = 11;
 const HK_TOTAL = 3;
+const HD_TOTAL = 7;
 
 function lcPass(step, label) {
   console.log(`[STEP ${step}/${LC_TOTAL}] ${label} ... PASS`);
@@ -97,6 +105,21 @@ function hkPass(step, label) {
 function hkFail(step, label, reason) {
   console.log(`[HOOKS ${step}/${HK_TOTAL}] ${label} ... FAIL: ${reason}`);
   hkFailed++;
+}
+
+function hdPass(step, label) {
+  console.log(`[HARDEN ${step}/${HD_TOTAL}] ${label} ... PASS`);
+  hdPassed++;
+}
+
+function hdFail(step, label, reason) {
+  console.log(`[HARDEN ${step}/${HD_TOTAL}] ${label} ... FAIL: ${reason}`);
+  hdFailed++;
+}
+
+function hdSkip(step, label, reason) {
+  console.log(`[HARDEN ${step}/${HD_TOTAL}] ${label} ... SKIPPED — ${reason}`);
+  hdSkipped++;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -850,6 +873,320 @@ async function hooksStep3_stopHookImplicitClose() {
   }
 }
 
+// ── Hardening step implementations ───────────────────────────────────────────
+
+/**
+ * HARDEN 1/7: HANDOFF_DB rejection — invalid identifier must exit non-zero.
+ */
+async function hardenStep1_dbNameValidation() {
+  const label = 'HANDOFF_DB rejection: invalid identifier exits non-zero';
+  try {
+    // Use an invalid name with a double-quote in it.
+    const badEnv = { ...process.env, HANDOFF_DB: 'bad"name', PROJECT_ROOT: TEMP_PROJECT_DIR_HARDEN };
+    const r = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'init', '-y'], {
+      cwd:      PROJECT_ROOT,
+      env:      badEnv,
+      encoding: 'utf8',
+      timeout:  10000,
+    });
+    if (r.status === 0) {
+      hdFail(1, label, 'expected non-zero exit for invalid HANDOFF_DB, got 0');
+      return false;
+    }
+    const stderr = r.stderr || '';
+    if (!stderr.includes('Invalid HANDOFF_DB')) {
+      hdFail(1, label, `exit ${r.status} but error message not found in stderr: ${stderr.slice(0, 200)}`);
+      return false;
+    }
+    hdPass(1, label);
+    return true;
+  } catch (err) {
+    hdFail(1, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * HARDEN 2/7: Trust-boundary labels in loader-hook output.
+ */
+async function hardenStep2_trustBoundaryLabels() {
+  const label = 'Trust-boundary labels present in loader-hook additionalContext';
+  try {
+    const r = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'loader-hook'], {
+      cwd:      PROJECT_ROOT,
+      env:      { ...process.env, HANDOFF_DB: HARDEN_DB, PROJECT_ROOT: TEMP_PROJECT_DIR_HARDEN },
+      encoding: 'utf8',
+      timeout:  15000,
+    });
+
+    // loader-hook exits 0 even on no-data; stdout must be valid JSON.
+    if (r.status !== 0) {
+      hdFail(2, label, `loader-hook exited ${r.status}: ${(r.stderr || '').slice(0, 200)}`);
+      return false;
+    }
+
+    const stdout = (r.stdout || '').trim();
+    let parsed;
+    try {
+      parsed = JSON.parse(stdout);
+    } catch (_) {
+      hdFail(2, label, `stdout is not valid JSON: ${stdout.slice(0, 200)}`);
+      return false;
+    }
+
+    const ctx = parsed?.hookSpecificOutput?.additionalContext || '';
+    if (!ctx.includes('BEGIN RETRIEVED CONTEXT (untrusted)')) {
+      hdFail(2, label, `"BEGIN RETRIEVED CONTEXT (untrusted)" not found in additionalContext`);
+      return false;
+    }
+    if (!ctx.includes('END RETRIEVED CONTEXT')) {
+      hdFail(2, label, `"END RETRIEVED CONTEXT" not found in additionalContext`);
+      return false;
+    }
+
+    hdPass(2, label);
+    return true;
+  } catch (err) {
+    hdFail(2, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * HARDEN 3/7: Stdin schema rejection — two sub-tests:
+ *   A) tldr > 4000 chars exits non-zero with "tldr" in the error.
+ *   B) open_threads with 201 elements exits non-zero with "open_threads" in the error.
+ */
+async function hardenStep3_stdinSchemaRejection() {
+  const label = 'Stdin schema rejection: oversized tldr and 201-element open_threads each exit non-zero';
+  try {
+    // ── Sub-test A: oversized tldr ────────────────────────────────────────────
+    const bigPayload = JSON.stringify({ tldr: 'x'.repeat(5000) });
+    const rTldr = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'close', '--json', '-'], {
+      cwd:      PROJECT_ROOT,
+      env:      { ...process.env, HANDOFF_DB: HARDEN_DB, PROJECT_ROOT: TEMP_PROJECT_DIR_HARDEN },
+      input:    bigPayload,
+      encoding: 'utf8',
+      timeout:  15000,
+    });
+
+    if (rTldr.status === 0) {
+      hdFail(3, label, 'expected non-zero exit for oversized tldr, got 0');
+      return false;
+    }
+
+    const combinedTldr = (rTldr.stderr || '') + (rTldr.stdout || '');
+    if (!combinedTldr.includes('"tldr"')) {
+      hdFail(3, label, `tldr error message does not name "tldr" field: ${combinedTldr.slice(0, 300)}`);
+      return false;
+    }
+
+    // ── Sub-test B: 201-element open_threads ─────────────────────────────────
+    const bigThreads = JSON.stringify({ tldr: 'ok', open_threads: Array(201).fill('thread') });
+    const rThreads = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'close', '--json', '-'], {
+      cwd:      PROJECT_ROOT,
+      env:      { ...process.env, HANDOFF_DB: HARDEN_DB, PROJECT_ROOT: TEMP_PROJECT_DIR_HARDEN },
+      input:    bigThreads,
+      encoding: 'utf8',
+      timeout:  15000,
+    });
+
+    if (rThreads.status === 0) {
+      hdFail(3, label, 'expected non-zero exit for 201-element open_threads, got 0');
+      return false;
+    }
+
+    const combinedThreads = (rThreads.stderr || '') + (rThreads.stdout || '');
+    if (!combinedThreads.includes('"open_threads"')) {
+      hdFail(3, label, `open_threads error message does not name "open_threads" field: ${combinedThreads.slice(0, 300)}`);
+      return false;
+    }
+
+    hdPass(3, label);
+    return true;
+  } catch (err) {
+    hdFail(3, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * HARDEN 4/7: Multi-author detection — HANDOFF_MULTI_AUTHOR_OVERRIDE=2 triggers the notice.
+ */
+async function hardenStep4_multiAuthorDetection() {
+  const label = 'Multi-author detection: override=2 triggers stderr notice and DB flag';
+  try {
+    // Run cmdClose with a minimal valid payload and the multi-author override.
+    // We use HARDEN_DB which is already init-ed; cmdClose reads the project.
+    const payload = JSON.stringify({ tldr: 'hardentest-multiauthor' });
+    const r = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'close', '--json', '-'], {
+      cwd:      PROJECT_ROOT,
+      env:      {
+        ...process.env,
+        HANDOFF_DB: HARDEN_DB,
+        PROJECT_ROOT: TEMP_PROJECT_DIR_HARDEN,
+        HANDOFF_MULTI_AUTHOR_OVERRIDE: '2',
+      },
+      input:    payload,
+      encoding: 'utf8',
+      timeout:  15000,
+    });
+
+    if (r.status !== 0) {
+      hdFail(4, label, `cmdClose exited ${r.status}: ${(r.stderr || r.stdout || '').slice(0, 200)}`);
+      return false;
+    }
+
+    const stderr = r.stderr || '';
+    if (!stderr.includes('multi-author repo detected')) {
+      hdFail(4, label, `multi-author notice not found in stderr: ${stderr.slice(0, 300)}`);
+      return false;
+    }
+
+    // Verify the DB flag was persisted.
+    const db = await pgConnect(HARDEN_DB);
+    const { rows } = await db.query(
+      `SELECT value FROM project_settings WHERE project_id = $1 AND key = 'multi_author_detected'`,
+      [PROJECT_ID_HARDEN]
+    );
+    await db.end();
+    if (rows.length === 0 || rows[0].value !== 'true') {
+      hdFail(4, label, `multi_author_detected not set in project_settings (rows=${rows.length})`);
+      return false;
+    }
+
+    hdPass(4, label);
+    return true;
+  } catch (err) {
+    hdFail(4, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * HARDEN 5/7: /handoff:promote — inserts a test assertion, promotes it, verifies CLAUDE.md.
+ */
+async function hardenStep5_promote(tempClaudeMd) {
+  const label = '/handoff:promote: promotes assertion to CLAUDE.md with audit annotation';
+  try {
+    // Insert a test assertion directly.
+    const db = await pgConnect(HARDEN_DB);
+    const { rows } = await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, last_reinforced)
+       VALUES ($1, 'HARDEN_PROMOTE_SUBJECT', 'is', 'HARDEN_PROMOTE_VALUE', 9, 'user_stated', now())
+       RETURNING id`,
+      [PROJECT_ID_HARDEN]
+    );
+    await db.end();
+    const assertionId = rows[0].id;
+
+    const r = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'promote', String(assertionId)], {
+      cwd:      PROJECT_ROOT,
+      env:      {
+        ...process.env,
+        HANDOFF_DB:   HARDEN_DB,
+        PROJECT_ROOT: TEMP_PROJECT_DIR_HARDEN,
+      },
+      encoding: 'utf8',
+      timeout:  15000,
+    });
+
+    if (r.status !== 0) {
+      hdFail(5, label, `promote exited ${r.status}: ${(r.stderr || r.stdout || '').slice(0, 300)}`);
+      return false;
+    }
+
+    // Verify CLAUDE.md gained the fact line.
+    const claudeMdContent = fs.existsSync(tempClaudeMd)
+      ? fs.readFileSync(tempClaudeMd, 'utf8')
+      : '';
+    if (!claudeMdContent.includes('HARDEN_PROMOTE_SUBJECT')) {
+      hdFail(5, label, `CLAUDE.md does not contain the promoted fact line`);
+      return false;
+    }
+
+    // Verify promoted=true in DB.
+    const db2 = await pgConnect(HARDEN_DB);
+    const { rows: promRows } = await db2.query(
+      `SELECT promoted FROM assertions WHERE id = $1`,
+      [assertionId]
+    );
+    await db2.end();
+    if (!promRows[0].promoted) {
+      hdFail(5, label, `assertions.promoted not set to true after promote command`);
+      return false;
+    }
+
+    hdPass(5, label);
+    return { ok: true, assertionId };
+  } catch (err) {
+    hdFail(5, label, err.message);
+    return { ok: false };
+  }
+}
+
+/**
+ * HARDEN 6/7: /handoff:promote idempotency — re-running prints "already promoted".
+ */
+async function hardenStep6_promoteIdempotent(assertionId) {
+  const label = '/handoff:promote idempotency: re-running prints "already promoted"';
+  if (!assertionId) {
+    hdSkip(6, label, 'skipped due to step 5 failure');
+    return false;
+  }
+  try {
+    const r = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'promote', String(assertionId)], {
+      cwd:      PROJECT_ROOT,
+      env:      {
+        ...process.env,
+        HANDOFF_DB:   HARDEN_DB,
+        PROJECT_ROOT: TEMP_PROJECT_DIR_HARDEN,
+      },
+      encoding: 'utf8',
+      timeout:  15000,
+    });
+
+    if (r.status !== 0) {
+      hdFail(6, label, `re-promote exited ${r.status}: ${(r.stdout || '').slice(0, 200)}`);
+      return false;
+    }
+    const out = r.stdout || '';
+    if (!out.includes('already promoted')) {
+      hdFail(6, label, `"already promoted" not found in output: ${out.slice(0, 200)}`);
+      return false;
+    }
+    hdPass(6, label);
+    return true;
+  } catch (err) {
+    hdFail(6, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * HARDEN 7/7: Audit annotation format — verify the HTML comment regex.
+ */
+async function hardenStep7_auditAnnotationFormat(tempClaudeMd) {
+  const label = 'Audit annotation format matches expected regex';
+  try {
+    if (!fs.existsSync(tempClaudeMd)) {
+      hdFail(7, label, `CLAUDE.md not found at ${tempClaudeMd}`);
+      return false;
+    }
+    const content = fs.readFileSync(tempClaudeMd, 'utf8');
+    const ANNOTATION_RE = /<!-- promoted: session=[^,]+, conf=\d+, date=\d{4}-\d{2}-\d{2}, source_assertion=[^ ]+ -->/;
+    if (!ANNOTATION_RE.test(content)) {
+      hdFail(7, label, `No matching annotation comment found in CLAUDE.md:\n${content.slice(0, 400)}`);
+      return false;
+    }
+    hdPass(7, label);
+    return true;
+  } catch (err) {
+    hdFail(7, label, err.message);
+    return false;
+  }
+}
+
 // ── Section runners ───────────────────────────────────────────────────────────
 
 async function runLifecycleSection() {
@@ -921,6 +1258,52 @@ async function runHooksSection() {
   }
 }
 
+async function runHardeningSection() {
+  console.log(`\n=== HARDENING SECTION (${HD_TOTAL} steps) ===`);
+  console.log(`smoketest-handoff hardening: DB=${HARDEN_DB}  project_id=${PROJECT_ID_HARDEN}`);
+  console.log('');
+
+  // We use a temp CLAUDE.md file inside the hardening project dir so promote tests
+  // don't touch the real project CLAUDE.md.
+  const tempClaudeMd = path.join(TEMP_PROJECT_DIR_HARDEN, 'CLAUDE.md');
+
+  try {
+    // HARDEN 1: DB name validation — no DB needed.
+    await hardenStep1_dbNameValidation();
+
+    // Set up the harden DB for remaining steps.
+    await createSmokeDb(HARDEN_DB, TEMP_PROJECT_DIR_HARDEN);
+
+    // Write a minimal CLAUDE.md so promote/close can find it.
+    fs.writeFileSync(tempClaudeMd, '# claude-memory\n\n## Durable facts\n- (No durable facts promoted yet)\n', 'utf8');
+
+    const initR = runHandoff('init', ['-y'], null, HARDEN_DB, TEMP_PROJECT_DIR_HARDEN);
+    if (initR.status !== 0) {
+      console.log(`[HARDEN] init failed — aborting remaining hardening steps`);
+      console.log(initR.stderr || initR.stdout || '');
+      for (let i = 2; i <= HD_TOTAL; i++) {
+        hdFailed++;
+      }
+      return;
+    }
+    console.log(`[HARDEN] DB init OK`);
+
+    await hardenStep2_trustBoundaryLabels();
+    await hardenStep3_stdinSchemaRejection();
+    await hardenStep4_multiAuthorDetection();
+
+    const promResult = await hardenStep5_promote(tempClaudeMd);
+    const promotedId = promResult && promResult.ok ? promResult.assertionId : null;
+
+    await hardenStep6_promoteIdempotent(promotedId);
+    await hardenStep7_auditAnnotationFormat(tempClaudeMd);
+
+  } finally {
+    try { fs.rmSync(tempClaudeMd, { force: true }); } catch (_) {}
+    await dropSmokeDb(HARDEN_DB, TEMP_PROJECT_DIR_HARDEN, HANDOFF_PATH_HARDEN);
+  }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -932,24 +1315,30 @@ async function main() {
   if (SECTION === 'hooks' || SECTION === 'all') {
     await runHooksSection();
   }
+  if (SECTION === 'hardening' || SECTION === 'all') {
+    await runHardeningSection();
+  }
 
   console.log('');
 
   const lcTotal  = lcPassed + lcFailed;
   const hkTotal  = hkPassed + hkFailed;
-  const totalPass = lcPassed + hkPassed;
-  const totalAll  = lcTotal  + hkTotal;
-  const totalSkip = lcSkipped + hkSkipped;
+  const hdTotal  = hdPassed + hdFailed;
+  const totalPass = lcPassed + hkPassed + hdPassed;
+  const totalAll  = lcTotal  + hkTotal  + hdTotal;
+  const totalSkip = lcSkipped + hkSkipped + hdSkipped;
 
   if (SECTION === 'all') {
-    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal})`);
+    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal}, hardening: ${hdPassed}/${hdTotal})`);
   } else if (SECTION === 'lifecycle') {
     console.log(`smoketest: ${lcPassed}/${lcTotal} passed, ${lcSkipped} skipped (lifecycle only)`);
-  } else {
+  } else if (SECTION === 'hooks') {
     console.log(`smoketest: ${hkPassed}/${hkTotal} passed (hooks only)`);
+  } else {
+    console.log(`smoketest: ${hdPassed}/${hdTotal} passed, ${hdSkipped} skipped (hardening only)`);
   }
 
-  if (lcFailed + hkFailed > 0) process.exitCode = 1;
+  if (lcFailed + hkFailed + hdFailed > 0) process.exitCode = 1;
 }
 
 main().catch((err) => {
