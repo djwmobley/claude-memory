@@ -556,7 +556,28 @@ async function cmdLoaderHook() {
 
     const result = await cmdLoaderLoad({ silent: true, db });
 
-    await db.end();
+    // Re-connect db if cmdLoaderLoad closed it (ownDb path); re-open for the marker write.
+    // In practice cmdLoaderLoad receives our db via opts.db so it doesn't close it, but
+    // guard defensively: connectHandoff again only if needed.
+    let markerDb = db;
+    let markerDbOwned = false;
+    if (!markerDb || markerDb._ending) {
+      try {
+        markerDb = await connectHandoff();
+        markerDbOwned = true;
+      } catch (_) {
+        markerDb = null;
+      }
+    }
+
+    // Set session_in_progress marker so the Stop hook knows a close is still needed.
+    // Not set on the stale path — stale means the user is not in an auto-loaded session.
+    if (markerDb) {
+      await setSetting(markerDb, projectId, 'session_in_progress', new Date().toISOString());
+    }
+
+    if (markerDbOwned && markerDb) await markerDb.end();
+    else if (!markerDbOwned && db) await db.end();
 
     // Single-line JSON on stdout.
     process.stdout.write(
@@ -1005,6 +1026,139 @@ async function cmdPurge(args) {
   console.log(`\nDone: handoff:purge — all project memory permanently deleted`);
 }
 
+// ── loader-stop (Stop hook entry point) ──────────────────────────────────────
+
+/**
+ * Stop hook for implicit session close.
+ *
+ * Fires when Claude Code ends a session. Checks whether /handoff:close or
+ * /handoff:checkpoint ran during this session (via the session_in_progress
+ * marker set by cmdLoaderHook). If not, writes an implicit close record to
+ * handoff.md and clears the marker.
+ *
+ * Defensive contract: ALWAYS exits 0. Any error is logged to stderr and the
+ * hook exits silently — we must never break session teardown.
+ *
+ * Design note on handoff.md body preservation:
+ *   writeHandoffMd() re-renders from the full template, which would overwrite
+ *   the body (tldr, open_threads, quick_references) with whatever we pass.
+ *   For an implicit close we do NOT have a fresh extraction payload, so we
+ *   preserve the existing body by reading the current frontmatter and passing
+ *   its values back. The only fields we override are last_close (set to now)
+ *   and tldr (set to the implicit-close notice). This matches the pattern used
+ *   by cmdCheckpoint — read current fm, then call writeHandoffMd with merged
+ *   values — which is cleaner than trying to surgically edit the raw file.
+ */
+async function cmdLoaderStop() {
+  let db = null;
+  try {
+    const projectId   = resolveProjectId();
+    const handoffPath = resolveHandoffMdPath(projectId);
+
+    // Defensive: handoff.md absent means project is not provisioned — no-op.
+    if (!fs.existsSync(handoffPath)) {
+      process.exit(0);
+    }
+
+    try {
+      db = await connectHandoff();
+    } catch (err) {
+      process.stderr.write(`handoff loader-stop: DB connection failed (${err.message}) — skipping\n`);
+      process.exit(0);
+    }
+
+    // Check project-level implicit_close gate (default enabled).
+    const implicitClose = await getSetting(db, projectId, 'implicit_close', 'enabled');
+    if (implicitClose === 'disabled') {
+      await db.end();
+      process.exit(0);
+    }
+
+    // Check session_in_progress marker.
+    //   Absent → close already ran (or loader hook never fired). No-op.
+    //   Present → no explicit close ran this session. Run implicit close.
+    const sip = await getSetting(db, projectId, 'session_in_progress', null);
+    if (!sip) {
+      await db.end();
+      process.exit(0);
+    }
+
+    // session_in_progress is set — implicit close needed.
+    process.stderr.write('Running: handoff stop hook — implicit close...\n');
+
+    // Read current frontmatter to preserve all existing fields.
+    const fm   = readHandoffFrontmatter(handoffPath);
+    const root = findProjectRoot();
+
+    const stamp = new Date().toISOString();
+
+    // Preserve existing body-level values; override last_close and tldr only.
+    // open_threads and quick_references are preserved from prior close/checkpoint.
+    // session_summary sub-keys live nested in fm.session_summary (parsed by
+    // readHandoffFrontmatter), NOT at the top level of fm.
+    const ss = fm.session_summary || {};
+    const entitiesWritten   = ss.entities_written   || '0';
+    const assertionsWritten = ss.assertions_written || '0';
+    const edgesWritten      = ss.edges_written      || '0';
+    const contractName      = fm.contract           || 'default';
+    const projectName       = fm.project_name       || path.basename(root);
+
+    // Reconstruct open_threads and quick_references from the handoff.md body.
+    // writeHandoffMd expects OPEN_THREADS as bullet-prefixed lines and
+    // QUICK_REFERENCES as a plain string. We read them from the raw body rather
+    // than frontmatter (they live in the body section, not in YAML).
+    // Safest fallback: preserve the prior close values via the template.
+    // The template uses {{OPEN_THREADS}} and {{QUICK_REFERENCES}}, so we need
+    // to supply them explicitly. Read the existing file body to extract them.
+    let openThreads    = '- (none)';
+    let quickRefs      = '(none)';
+    try {
+      const raw  = fs.readFileSync(handoffPath, 'utf8');
+      const body = raw.replace(/^---[\s\S]*?---\r?\n/, '');
+      // Extract open threads block
+      const otMatch = body.match(/##\s+Open threads\r?\n([\s\S]*?)(?=\r?\n##|\r?\n$|$)/);
+      if (otMatch) openThreads = otMatch[1].trim() || '- (none)';
+      // Extract quick references block
+      const qrMatch = body.match(/##\s+Quick references\r?\n([\s\S]*?)(?=\r?\n##|\r?\n$|$)/);
+      if (qrMatch) quickRefs = qrMatch[1].trim() || '(none)';
+    } catch (_) {
+      // Body parse failed — fall back to safe defaults
+    }
+
+    writeHandoffMd(handoffPath, {
+      PROJECT_ID:          projectId,
+      LAST_CLOSE:          stamp,
+      CONTRACT:            contractName,
+      ENTITIES_WRITTEN:    entitiesWritten,
+      ASSERTIONS_WRITTEN:  assertionsWritten,
+      EDGES_WRITTEN:       edgesWritten,
+      PROJECT_NAME:        projectName,
+      TLDR:                '(implicit close — session ended without explicit /handoff:close)',
+      OPEN_THREADS:        openThreads,
+      QUICK_REFERENCES:    quickRefs,
+    });
+
+    // Clear the session_in_progress marker.
+    await db.query(
+      `DELETE FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'`,
+      [projectId]
+    );
+
+    await db.end();
+
+    process.stderr.write('Done: handoff stop hook — implicit close written, session marker cleared\n');
+    process.exit(0);
+
+  } catch (err) {
+    // Catch-all: log to stderr, never break session teardown.
+    process.stderr.write(`handoff loader-stop error: ${err.message}\n`);
+    if (db) {
+      try { await db.end(); } catch (_) { /* ignore */ }
+    }
+    process.exit(0);
+  }
+}
+
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -1016,6 +1170,7 @@ async function main() {
     resume:         () => cmdResume(),
     'loader-load':  () => cmdLoaderLoad(),
     'loader-hook':  () => cmdLoaderHook(),
+    'loader-stop':  () => cmdLoaderStop(),
     drop:           () => cmdDrop(),
     checkpoint:     () => cmdCheckpoint(rest),
     close:          () => cmdClose(rest),
