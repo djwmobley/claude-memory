@@ -192,6 +192,13 @@ setting for handoff operations only.
 default to CRLF cause `loadConfig()` to silently fall back to defaults. Save
 `pipeline.yml` with LF endings. See [Gotchas](#gotchas).
 
+**handoff.md location and `.gitignore` recommendation.** The per-project
+handoff state file lives outside the repository, under the user's Claude home
+directory (`~/.claude/projects/<encoded-cwd>/handoff.md`), so it is not
+committed by default. If you ever relocate handoff state into your repo tree,
+add it to `.gitignore` — it can contain session summaries you may not want
+in a public repository.
+
 ---
 
 ## Atomic file convention
@@ -504,9 +511,12 @@ files are thin recipes that announce `Running: handoff:<sub>` at start and
 
 ### Trust model
 
+> Full security policy, configuration-defaults exposure review, and payload
+> validation details live in [SECURITY.md](SECURITY.md).
+
 **Multi-author detection.** When `scripts/handoff.js init` or `scripts/handoff.js close`
-is run, the helper checks the repository's git log for distinct commit author emails over
-the past year. If more than one author is detected, it writes a one-line notice to stderr:
+is run, the helper runs `git log --format=%ae --since='1 year ago'` to count distinct commit
+author emails over the last year of commits. If more than one author is detected, it writes a one-line notice to stderr:
 
 ```
 [handoff] multi-author repo detected — see README#trust-model before relying on CLAUDE.md auto-promotion
@@ -518,17 +528,19 @@ repos. The flag (`multi_author_detected = true` in `project_settings`) is availa
 future policy gates. The intent is to surface the condition once per invocation so you can
 decide whether the auto-promotion path is appropriate for your threat model.
 
-**Auto-promotion and the `/handoff:promote` alternative.** `/handoff:close` can
-automatically write high-confidence assertions (`confidence >= 9`, `source = user_stated`,
-reinforced across multiple sessions) to the `## Durable facts` section of `CLAUDE.md`.
-On a public multi-author repo, PR content may flow into Claude sessions during review;
-that content can influence assertions that then get auto-promoted to the privileged
-CLAUDE.md channel. If you prefer explicit control, pass `confirm_claude_md_promotion: false`
-in every `/handoff:close` payload and use `/handoff:promote <assertion_id>` to promote
-individual assertions after manual inspection. Every promotion — auto or explicit — writes
-an HTML comment audit annotation (`<!-- promoted: session=..., conf=..., date=...,
-source_assertion=... -->`) immediately before the fact line, so the provenance of each
-entry in `## Durable facts` is traceable.
+**Auto-promotion is off by default.** Promotion of high-confidence assertions (`confidence >= 9`,
+`source = user_stated`, reinforced across multiple sessions) to the `## Durable facts`
+section of `CLAUDE.md` happens **only** when the `/handoff:close` payload explicitly
+sets `confirm_claude_md_promotion: true`. When that flag is absent or `false`, the tool
+prints the candidate list to the console and writes nothing to disk. The `/handoff:close`
+skill also instructs the assistant to ask the user for confirmation before any CLAUDE.md
+write, and its example payload defaults the flag to `false`. The `/handoff:promote <assertion_id>`
+command is the explicit single-assertion path for promoting individual assertions after manual
+inspection. Every promotion — payload-flag or explicit — writes an HTML comment audit annotation
+(`<!-- promoted: session=..., conf=..., date=..., source_assertion=... -->`) immediately before
+the fact line, so the provenance of each entry in `## Durable facts` is traceable.
+For the full exposure review, including the residual risk on a public multi-author repo,
+see [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -599,6 +611,13 @@ directory.
 CI runs the eval harness in `--ollama-skip` mode (smoke test for the SQL and
 loader path; vector-quality regression detection requires running locally with
 vLLM or Ollama).
+
+> **CI footgun warning.** `.github/workflows/test.yml` runs on every PR with
+> `OLLAMA_SKIP=1`. It exercises the SQL, loader, and schema paths, but **skips
+> all vector-quality and embedding regression detection**. A green CI run does
+> **not** mean retrieval quality is unregressed. Maintainers must run the full
+> harness locally (with Ollama or vLLM available) to catch retrieval-quality
+> regressions before relying on a change.
 
 ---
 
