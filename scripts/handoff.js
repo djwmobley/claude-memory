@@ -183,10 +183,15 @@ function readStdin() {
         }
       }
 
-      // open_threads: array of strings, each <= STRING_MAX.
+      // open_threads: array of strings, each <= STRING_MAX, array length <= 200.
       if ('open_threads' in parsed) {
         if (!Array.isArray(parsed.open_threads)) {
           return reject(new Error('stdin JSON: "open_threads" must be an array'));
+        }
+        if (parsed.open_threads.length > 200) {
+          return reject(new Error(
+            `stdin JSON: "open_threads" array length ${parsed.open_threads.length} exceeds max 200`
+          ));
         }
         for (let i = 0; i < parsed.open_threads.length; i++) {
           const item = parsed.open_threads[i];

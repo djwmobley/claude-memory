@@ -953,13 +953,16 @@ async function hardenStep2_trustBoundaryLabels() {
 }
 
 /**
- * HARDEN 3/7: Stdin schema rejection — tldr > 4000 chars exits non-zero.
+ * HARDEN 3/7: Stdin schema rejection — two sub-tests:
+ *   A) tldr > 4000 chars exits non-zero with "tldr" in the error.
+ *   B) open_threads with 201 elements exits non-zero with "open_threads" in the error.
  */
 async function hardenStep3_stdinSchemaRejection() {
-  const label = 'Stdin schema rejection: oversized tldr exits non-zero with field name in error';
+  const label = 'Stdin schema rejection: oversized tldr and 201-element open_threads each exit non-zero';
   try {
+    // ── Sub-test A: oversized tldr ────────────────────────────────────────────
     const bigPayload = JSON.stringify({ tldr: 'x'.repeat(5000) });
-    const r = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'close', '--json', '-'], {
+    const rTldr = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'close', '--json', '-'], {
       cwd:      PROJECT_ROOT,
       env:      { ...process.env, HANDOFF_DB: HARDEN_DB, PROJECT_ROOT: TEMP_PROJECT_DIR_HARDEN },
       input:    bigPayload,
@@ -967,14 +970,35 @@ async function hardenStep3_stdinSchemaRejection() {
       timeout:  15000,
     });
 
-    if (r.status === 0) {
+    if (rTldr.status === 0) {
       hdFail(3, label, 'expected non-zero exit for oversized tldr, got 0');
       return false;
     }
 
-    const combined = (r.stderr || '') + (r.stdout || '');
-    if (!combined.includes('"tldr"')) {
-      hdFail(3, label, `error message does not name "tldr" field: ${combined.slice(0, 300)}`);
+    const combinedTldr = (rTldr.stderr || '') + (rTldr.stdout || '');
+    if (!combinedTldr.includes('"tldr"')) {
+      hdFail(3, label, `tldr error message does not name "tldr" field: ${combinedTldr.slice(0, 300)}`);
+      return false;
+    }
+
+    // ── Sub-test B: 201-element open_threads ─────────────────────────────────
+    const bigThreads = JSON.stringify({ tldr: 'ok', open_threads: Array(201).fill('thread') });
+    const rThreads = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'close', '--json', '-'], {
+      cwd:      PROJECT_ROOT,
+      env:      { ...process.env, HANDOFF_DB: HARDEN_DB, PROJECT_ROOT: TEMP_PROJECT_DIR_HARDEN },
+      input:    bigThreads,
+      encoding: 'utf8',
+      timeout:  15000,
+    });
+
+    if (rThreads.status === 0) {
+      hdFail(3, label, 'expected non-zero exit for 201-element open_threads, got 0');
+      return false;
+    }
+
+    const combinedThreads = (rThreads.stderr || '') + (rThreads.stdout || '');
+    if (!combinedThreads.includes('"open_threads"')) {
+      hdFail(3, label, `open_threads error message does not name "open_threads" field: ${combinedThreads.slice(0, 300)}`);
       return false;
     }
 
