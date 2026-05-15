@@ -284,13 +284,14 @@ async function cmdStatus() {
     process.exit(1);
   }
 
-  // Counts
-  const [entRes, assRes, edgRes, rcRes] = await Promise.all([
-    db.query('SELECT COUNT(*) AS n FROM entities WHERE project_id = $1', [projectId]),
-    db.query('SELECT COUNT(*) AS n FROM assertions WHERE project_id = $1', [projectId]),
-    db.query('SELECT COUNT(*) AS n FROM edges WHERE project_id = $1', [projectId]),
-    db.query('SELECT name FROM retrieval_contract WHERE project_id = $1 ORDER BY name', [projectId]),
-  ]);
+  // Counts — sequential awaits because pg.Client is single-connection and rejects
+  // concurrent queries on pg@9 (deprecation warning on pg@8). Pool would allow
+  // concurrency, but these are four trivial COUNT/SELECT round-trips and serial
+  // is plenty fast.
+  const entRes = await db.query('SELECT COUNT(*) AS n FROM entities           WHERE project_id = $1', [projectId]);
+  const assRes = await db.query('SELECT COUNT(*) AS n FROM assertions         WHERE project_id = $1', [projectId]);
+  const edgRes = await db.query('SELECT COUNT(*) AS n FROM edges              WHERE project_id = $1', [projectId]);
+  const rcRes  = await db.query('SELECT name        FROM retrieval_contract  WHERE project_id = $1 ORDER BY name', [projectId]);
 
   // Session-in-progress marker
   const sipRes = await db.query(
