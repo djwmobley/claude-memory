@@ -1,0 +1,887 @@
+'use strict';
+
+/**
+ * handoff.js — Phase 3.5 /handoff skill helper.
+ *
+ * Subcommand router invoked by ~/.claude/commands/handoff/*.md slash-command
+ * definition files. Heavy lifting (DB queries, file IO, JSON contract evaluation)
+ * lives here; the Markdown files are thin recipes.
+ *
+ * Usage:
+ *   node scripts/handoff.js <subcommand> [flags]
+ *
+ * Subcommands:
+ *   init                    First-run provisioning for this project.
+ *   status                  Read-only: show counts, last close, contract names.
+ *   resume                  Inline SessionStart load (prints compact context summary).
+ *   drop                    Zero all assertions, archive handoff.md, create fresh one.
+ *   checkpoint --json -     Mid-session extraction (reads JSON from stdin).
+ *   close      --json -     End-of-session extraction (reads JSON from stdin).
+ *   purge      [--yes]      Hard-delete all project rows (requires confirmation or --yes).
+ *   loader-load             Same inline load as resume; used by Phase 3.6 hook.
+ *
+ * Environment:
+ *   PROJECT_ROOT            Override project root detection.
+ *   PGUSER / PGPASSWORD     Postgres credentials (standard env vars, picked up by pg).
+ *
+ * Exit codes: 0 success, 1 error, 2 usage.
+ */
+
+const fs    = require('fs');
+const path  = require('path');
+const os    = require('os');
+const readline = require('readline');
+
+const { loadConfig, connect, c, findProjectRoot } = require('./lib/shared');
+const { encodeCwd, getClaudeProjectDir }           = require('./lib/encoded-cwd');
+
+// ─── CONSTANTS ───────────────────────────────────────────────────────────────
+
+const TARGET_DB = 'claude_memory_eval_test';
+const HANDOFF_TEMPLATE = path.resolve(__dirname, '..', 'templates', 'handoff.md.tpl');
+const PROJECT_CLAUDE_MD_TEMPLATE = path.resolve(__dirname, '..', 'templates', 'project-claude-md.tpl');
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+/** Connect to the handoff DB (always claude_memory_eval_test). */
+async function connectHandoff() {
+  const cfg = loadConfig();
+  const { Client } = require('pg');
+  const client = new Client({
+    host:     cfg.host,
+    port:     cfg.port,
+    database: TARGET_DB,
+    user:     cfg.user,
+  });
+  await client.connect();
+  return client;
+}
+
+/** Resolve project_id for the current working directory. */
+function resolveProjectId() {
+  const root = findProjectRoot();
+  return encodeCwd(root);
+}
+
+/** Resolve the ~/.claude/projects/<encoded_cwd>/handoff.md path. */
+function resolveHandoffMdPath(projectId) {
+  return path.join(os.homedir(), '.claude', 'projects', projectId, 'handoff.md');
+}
+
+/** Read handoff.md frontmatter as a plain object. Returns {} if missing. */
+function readHandoffFrontmatter(handoffPath) {
+  if (!fs.existsSync(handoffPath)) return {};
+  const text = fs.readFileSync(handoffPath, 'utf8');
+  const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!match) return {};
+  const fm = {};
+  for (const line of match[1].split(/\r?\n/)) {
+    const kv = line.match(/^(\w[\w_]*):\s*(.*)$/);
+    if (!kv) continue;
+    fm[kv[1]] = kv[2].trim();
+  }
+  // Parse session_summary sub-keys
+  const ssMatch = match[1].match(/session_summary:\s*\n((?:[ \t]+.*\n?)*)/);
+  if (ssMatch) {
+    const ss = {};
+    for (const line of ssMatch[1].split(/\r?\n/)) {
+      const kv = line.match(/^\s+(\w[\w_]*):\s*(.*)$/);
+      if (kv) ss[kv[1]] = kv[2].trim();
+    }
+    fm.session_summary = ss;
+  }
+  return fm;
+}
+
+/** Render a template file by replacing {{KEY}} placeholders. */
+function renderTemplate(tplPath, vars) {
+  let text = fs.readFileSync(tplPath, 'utf8');
+  for (const [k, v] of Object.entries(vars)) {
+    text = text.replace(new RegExp(`\\{\\{${k}\\}\\}`, 'g'), v);
+  }
+  return text;
+}
+
+/** Write handoff.md from the template. Creates parent dir if needed. */
+function writeHandoffMd(handoffPath, vars) {
+  fs.mkdirSync(path.dirname(handoffPath), { recursive: true });
+  const content = renderTemplate(HANDOFF_TEMPLATE, vars);
+  fs.writeFileSync(handoffPath, content, 'utf8');
+}
+
+/** Read JSON payload from stdin (used for --json - flag). */
+function readStdin() {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    process.stdin.on('data', (d) => chunks.push(d));
+    process.stdin.on('end', () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+      } catch (e) {
+        reject(new Error(`Failed to parse JSON from stdin: ${e.message}`));
+      }
+    });
+    process.stdin.on('error', reject);
+  });
+}
+
+/** Days since an ISO timestamp string. Returns null if not parseable. */
+function daysSince(isoStr) {
+  if (!isoStr) return null;
+  const d = new Date(isoStr);
+  if (isNaN(d.getTime())) return null;
+  return Math.floor((Date.now() - d.getTime()) / 86400000);
+}
+
+/** Get a project_settings value, with a fallback default. */
+async function getSetting(db, projectId, key, defaultVal) {
+  const { rows } = await db.query(
+    'SELECT value FROM project_settings WHERE project_id = $1 AND key = $2',
+    [projectId, key]
+  );
+  return rows.length > 0 ? rows[0].value : defaultVal;
+}
+
+/** Upsert a project_settings row. */
+async function setSetting(db, projectId, key, value) {
+  await db.query(
+    `INSERT INTO project_settings (project_id, key, value) VALUES ($1, $2, $3)
+     ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
+    [projectId, key, String(value)]
+  );
+}
+
+// ─── SUBCOMMANDS ─────────────────────────────────────────────────────────────
+
+// ── init ─────────────────────────────────────────────────────────────────────
+
+async function cmdInit(args) {
+  console.log('Running: handoff:init');
+
+  const root       = findProjectRoot();
+  const projectId  = encodeCwd(root);
+  const projectDir = getClaudeProjectDir(root);
+  const handoffPath = resolveHandoffMdPath(projectId);
+  const claudeMdPath = path.join(root, 'CLAUDE.md');
+
+  let db;
+  try {
+    db = await connectHandoff();
+  } catch (err) {
+    console.error(`DB connection failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  const results = [];
+
+  // 1. Apply schema migrations idempotently (phase2-schema.sql + phase3b-schema.sql).
+  //    We apply them via pg client (not psql) so we can stay cross-platform.
+  const schemaFiles = [
+    path.resolve(__dirname, 'sql', 'phase2-schema.sql'),
+    path.resolve(__dirname, 'sql', 'phase3b-schema.sql'),
+  ];
+
+  for (const sqlFile of schemaFiles) {
+    if (!fs.existsSync(sqlFile)) {
+      results.push(`  SKIP  schema migration ${path.basename(sqlFile)} — file not found`);
+      continue;
+    }
+    let sql = fs.readFileSync(sqlFile, 'utf8');
+    // Remove psql meta-commands (\ir, \d, etc.) — not supported by pg client
+    sql = sql.replace(/^\\[a-z].*$/gm, '');
+    try {
+      await db.query(sql);
+      results.push(`  OK    schema migration: ${path.basename(sqlFile)}`);
+    } catch (err) {
+      results.push(`  WARN  schema migration ${path.basename(sqlFile)}: ${err.message}`);
+    }
+  }
+
+  // 2. Insert default project_settings rows (idempotent).
+  const defaults = {
+    staleness_days:              '7',
+    loader_token_budget:         '4000',
+    precision_at_5_gate_min_chunks: '1000',
+    implicit_close:              'enabled',
+    decay_rate_default:          '0.05',
+  };
+  for (const [key, val] of Object.entries(defaults)) {
+    await db.query(
+      `INSERT INTO project_settings (project_id, key, value) VALUES ($1, $2, $3)
+       ON CONFLICT (project_id, key) DO NOTHING`,
+      [projectId, key, val]
+    );
+  }
+  results.push(`  OK    project_settings defaults inserted (${Object.keys(defaults).length} keys, idempotent)`);
+
+  // 3. Create handoff.md if absent.
+  if (fs.existsSync(handoffPath)) {
+    results.push(`  SKIP  handoff.md already exists: ${handoffPath}`);
+  } else {
+    fs.mkdirSync(path.dirname(handoffPath), { recursive: true });
+    writeHandoffMd(handoffPath, {
+      PROJECT_ID:          projectId,
+      LAST_CLOSE:          new Date().toISOString(),
+      CONTRACT:            'default',
+      ENTITIES_WRITTEN:    '0',
+      ASSERTIONS_WRITTEN:  '0',
+      EDGES_WRITTEN:       '0',
+      PROJECT_NAME:        path.basename(root),
+      TLDR:                '(init — no sessions closed yet)',
+      OPEN_THREADS:        '- (none)',
+      QUICK_REFERENCES:    '(none)',
+    });
+    results.push(`  OK    created handoff.md: ${handoffPath}`);
+  }
+
+  // 4. Create project CLAUDE.md if absent.
+  if (fs.existsSync(claudeMdPath)) {
+    results.push(`  SKIP  CLAUDE.md already exists: ${claudeMdPath}`);
+  } else {
+    const projectName = args[0] || path.basename(root);
+    const projectDesc = args[1] || `Memory and retrieval infrastructure project.`;
+    const content = renderTemplate(PROJECT_CLAUDE_MD_TEMPLATE, {
+      PROJECT_NAME:        projectName,
+      PROJECT_DESCRIPTION: projectDesc,
+      HANDOFF_MD_PATH:     handoffPath,
+      PROJECT_ROOT:        root,
+    });
+    fs.writeFileSync(claudeMdPath, content, 'utf8');
+    results.push(`  OK    created CLAUDE.md: ${claudeMdPath}`);
+    results.push(`  NOTE  CLAUDE.md should be git-committed.`);
+  }
+
+  // 5. Insert default retrieval_contract row.
+  await db.query(
+    `INSERT INTO retrieval_contract (project_id, name, queries, updated_at)
+     VALUES ($1, 'default', $2::jsonb, now())
+     ON CONFLICT (project_id, name) DO NOTHING`,
+    [projectId, JSON.stringify({ queries: [] })]
+  );
+  results.push(`  OK    retrieval_contract 'default' row ensured`);
+
+  await db.end();
+
+  console.log('\n  init complete:');
+  for (const line of results) console.log(line);
+  console.log(`\nDone: handoff:init — project ${projectId} provisioned`);
+}
+
+// ── status ────────────────────────────────────────────────────────────────────
+
+async function cmdStatus() {
+  console.log('Running: handoff:status');
+
+  const projectId   = resolveProjectId();
+  const handoffPath = resolveHandoffMdPath(projectId);
+  const fm          = readHandoffFrontmatter(handoffPath);
+
+  let db;
+  try {
+    db = await connectHandoff();
+  } catch (err) {
+    console.error(`DB connection failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  // Counts
+  const [entRes, assRes, edgRes, rcRes] = await Promise.all([
+    db.query('SELECT COUNT(*) AS n FROM entities WHERE project_id = $1', [projectId]),
+    db.query('SELECT COUNT(*) AS n FROM assertions WHERE project_id = $1', [projectId]),
+    db.query('SELECT COUNT(*) AS n FROM edges WHERE project_id = $1', [projectId]),
+    db.query('SELECT name FROM retrieval_contract WHERE project_id = $1 ORDER BY name', [projectId]),
+  ]);
+
+  // Session-in-progress marker
+  const sipRes = await db.query(
+    "SELECT value FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'",
+    [projectId]
+  );
+
+  await db.end();
+
+  const lastClose = fm.last_close || 'never';
+  const days      = daysSince(fm.last_close);
+  const daysStr   = days !== null ? `${days} day(s) ago` : 'N/A';
+  const contracts = rcRes.rows.map((r) => r.name).join(', ') || '(none)';
+  const sip       = sipRes.rows.length > 0 ? sipRes.rows[0].value : null;
+
+  console.log('\n  === handoff status ===');
+  console.log(`  project_id:       ${projectId}`);
+  console.log(`  last_close:       ${lastClose} (${daysStr})`);
+  console.log(`  handoff.md:       ${fs.existsSync(handoffPath) ? handoffPath : '(missing)'}`);
+  console.log(`  entities:         ${entRes.rows[0].n}`);
+  console.log(`  assertions:       ${assRes.rows[0].n}`);
+  console.log(`  edges:            ${edgRes.rows[0].n}`);
+  console.log(`  contracts:        ${contracts}`);
+  console.log(`  session_active:   ${sip ? `YES (session_id=${sip})` : 'no'}`);
+
+  console.log(`\nDone: handoff:status — ${entRes.rows[0].n} entities, ${assRes.rows[0].n} assertions, ${edgRes.rows[0].n} edges`);
+}
+
+// ── loader-load (shared with resume) ─────────────────────────────────────────
+
+async function cmdLoaderLoad() {
+  const projectId   = resolveProjectId();
+  const handoffPath = resolveHandoffMdPath(projectId);
+  const fm          = readHandoffFrontmatter(handoffPath);
+
+  let db;
+  try {
+    db = await connectHandoff();
+  } catch (err) {
+    console.error(`DB connection failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  // Load retrieval_contract
+  const contractName = fm.contract || 'default';
+  const rcRes = await db.query(
+    'SELECT queries FROM retrieval_contract WHERE project_id = $1 AND name = $2',
+    [projectId, contractName]
+  );
+  const contract = rcRes.rows.length > 0 ? rcRes.rows[0].queries : { queries: [] };
+  const queries  = contract.queries || [];
+
+  const tokenBudget = parseInt(await getSetting(db, projectId, 'loader_token_budget', '4000'), 10);
+  let tokensUsed = 0;
+  const sections = [];
+
+  for (const q of queries) {
+    if (tokensUsed >= tokenBudget) break;
+    const qBudget = Math.min(q.token_budget || 500, tokenBudget - tokensUsed);
+
+    if (q.type === 'entity' || q.kind === 'entity') {
+      const { rows } = await db.query(
+        `SELECT name, entity_type, description FROM entities
+         WHERE project_id = $1 AND ($2::text IS NULL OR name = $2)
+         ORDER BY created_at DESC LIMIT 20`,
+        [projectId, q.filter?.name || null]
+      );
+      if (rows.length) {
+        const text = rows.map((r) => `- ${r.name} (${r.entity_type}): ${r.description || ''}`).join('\n');
+        sections.push(`### Entities\n${text}`);
+        tokensUsed += Math.ceil(text.length / 4);
+      }
+
+    } else if (q.type === 'assertion' || q.kind === 'assertion') {
+      const { rows } = await db.query(
+        `SELECT subject, predicate, object, confidence, source FROM assertions
+         WHERE project_id = $1
+           AND ($2::text IS NULL OR subject = $2)
+           AND confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) >= 1.0
+         ORDER BY confidence DESC, last_reinforced DESC LIMIT 30`,
+        [projectId, q.filter?.subject || null]
+      );
+      if (rows.length) {
+        const text = rows.map((r) =>
+          `- [${r.source}|conf=${r.confidence}] ${r.subject} ${r.predicate} ${r.object}`
+        ).join('\n');
+        sections.push(`### Assertions\n${text}`);
+        tokensUsed += Math.ceil(text.length / 4);
+        // Bump last_reinforced for returned rows
+        await db.query(
+          `UPDATE assertions SET last_reinforced = now()
+           WHERE project_id = $1
+             AND ($2::text IS NULL OR subject = $2)`,
+          [projectId, q.filter?.subject || null]
+        );
+      }
+
+    } else if (q.type === 'recency' || q.kind === 'recency') {
+      const { rows } = await db.query(
+        `SELECT subject, predicate, object, confidence FROM assertions
+         WHERE project_id = $1
+           AND confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) >= 1.0
+         ORDER BY last_reinforced DESC LIMIT 20`,
+        [projectId]
+      );
+      if (rows.length) {
+        const text = rows.map((r) =>
+          `- [conf=${r.confidence}] ${r.subject} ${r.predicate} ${r.object}`
+        ).join('\n');
+        sections.push(`### Recent assertions\n${text}`);
+        tokensUsed += Math.ceil(text.length / 4);
+      }
+
+    } else if (q.type === 'vector' || q.kind === 'vector') {
+      // Vector search requires Ollama or vLLM — skip gracefully if unavailable.
+      sections.push(`### Vector query (${q.query || ''}) — skipped in loader (Phase 3.6 hook)`);
+    }
+  }
+
+  await db.end();
+
+  // Print the handoff.md body
+  if (fs.existsSync(handoffPath)) {
+    const raw = fs.readFileSync(handoffPath, 'utf8');
+    const body = raw.replace(/^---[\s\S]*?---\r?\n/, '');
+    console.log('\n=== Handoff context ===');
+    console.log(body.trim());
+  }
+
+  if (sections.length) {
+    console.log('\n=== Retrieved context (contract: ' + contractName + ') ===');
+    for (const s of sections) console.log(s);
+  }
+
+  console.log(`\n  tokens used: ~${tokensUsed} / ${tokenBudget}`);
+  return { sections, tokensUsed };
+}
+
+// ── resume ────────────────────────────────────────────────────────────────────
+
+async function cmdResume() {
+  console.log('Running: handoff:resume');
+  // NOTE: Phase 3.5 inline implementation of the SessionStart loader.
+  // Phase 3.6 will refactor this into a hook; this code path stays for manual /resume use.
+  await cmdLoaderLoad();
+  console.log('\nDone: handoff:resume — context loaded inline (Phase 3.6 will add hook-based auto-load)');
+}
+
+// ── drop ──────────────────────────────────────────────────────────────────────
+
+async function cmdDrop() {
+  console.log('Running: handoff:drop');
+
+  const projectId   = resolveProjectId();
+  const handoffPath = resolveHandoffMdPath(projectId);
+
+  let db;
+  try {
+    db = await connectHandoff();
+  } catch (err) {
+    console.error(`DB connection failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  // Zero all assertions (keeps rows for SQL recovery)
+  // confidence has a CHECK >= 1.0, so we cannot set to 0.
+  // Per spec: "UPDATE assertions SET confidence = 0" — we use the minimum 1.0
+  // OR we record suppression via a separate mechanism. The spec says effective_confidence = 0.
+  // Simplest safe approach: set confidence to 1.0 and decay_rate to 999 so effective drops to ~0.
+  // Better: add a "suppressed" flag. But to stay spec-faithful with the existing schema
+  // (confidence CHECK >= 1.0), we set confidence = 1.0 AND decay_rate = 999.0 so that
+  // effective_confidence = 1 * exp(-999 * days_since_now) ≈ 0 almost immediately.
+  const dropRes = await db.query(
+    `UPDATE assertions SET confidence = 1.0, decay_rate = 999.0
+     WHERE project_id = $1`,
+    [projectId]
+  );
+  const zerodCount = dropRes.rowCount || 0;
+
+  // Archive handoff.md
+  let archivePath = null;
+  if (fs.existsSync(handoffPath)) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    archivePath = handoffPath.replace(/handoff\.md$/, `handoff.${stamp}.archived.md`);
+    fs.renameSync(handoffPath, archivePath);
+  }
+
+  // Create new empty handoff.md
+  const root = findProjectRoot();
+  writeHandoffMd(handoffPath, {
+    PROJECT_ID:          projectId,
+    LAST_CLOSE:          new Date().toISOString(),
+    CONTRACT:            'default',
+    ENTITIES_WRITTEN:    '0',
+    ASSERTIONS_WRITTEN:  '0',
+    EDGES_WRITTEN:       '0',
+    PROJECT_NAME:        path.basename(root),
+    TLDR:                '(dropped — prior session memory archived)',
+    OPEN_THREADS:        '- (none)',
+    QUICK_REFERENCES:    '(none)',
+  });
+
+  await db.end();
+
+  console.log(`\n  assertions zeroed: ${zerodCount}`);
+  if (archivePath) console.log(`  archived: ${archivePath}`);
+  console.log(`  new handoff.md: ${handoffPath}`);
+  console.log(`\nDone: handoff:drop — ${zerodCount} assertions suppressed, handoff.md archived`);
+}
+
+// ── extraction (shared by checkpoint and close) ───────────────────────────────
+
+/**
+ * Write entities/assertions/edges from a JSON payload.
+ * Returns { entitiesWritten, assertionsWritten, edgesWritten }.
+ *
+ * Payload shape (all arrays optional):
+ * {
+ *   entities: [{name, entity_type, description}],
+ *   assertions: [{subject, predicate, object, confidence, source}],
+ *   edges: [{from_entity, edge_type, to_entity, weight}],
+ *   contract: { queries: [...] },
+ *   tldr: "...",
+ *   open_threads: ["..."],
+ *   quick_references: "...",
+ *   session_id: "..."
+ * }
+ */
+async function writeExtraction(db, projectId, payload) {
+  const sessionId = payload.session_id || null;
+  let entitiesWritten   = 0;
+  let assertionsWritten = 0;
+  let edgesWritten      = 0;
+
+  // Entities
+  for (const ent of (payload.entities || [])) {
+    if (!ent.name || !ent.entity_type) continue;
+    await db.query(
+      `INSERT INTO entities (project_id, name, entity_type, description, session_id)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (project_id, name) DO UPDATE
+         SET entity_type = EXCLUDED.entity_type,
+             description = EXCLUDED.description`,
+      [projectId, ent.name, ent.entity_type, ent.description || null, sessionId]
+    );
+    entitiesWritten++;
+  }
+
+  // Assertions — no unique constraint on assertions table; plain INSERT.
+  for (const ass of (payload.assertions || [])) {
+    if (!ass.subject || !ass.predicate || !ass.object) continue;
+    const conf   = Math.min(10, Math.max(1, parseFloat(ass.confidence) || 5));
+    const source = ['user_stated', 'model_extracted', 'doc_quoted', 'retrieved_from_prior'].includes(ass.source)
+      ? ass.source : 'model_extracted';
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, session_id, last_reinforced)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, now())`,
+      [projectId, ass.subject, ass.predicate, ass.object, conf, source, sessionId]
+    );
+    assertionsWritten++;
+  }
+
+  // Edges
+  for (const edge of (payload.edges || [])) {
+    if (!edge.from_entity || !edge.edge_type || !edge.to_entity) continue;
+    const weight = parseFloat(edge.weight) || 1.0;
+    await db.query(
+      `INSERT INTO edges (project_id, from_entity, edge_type, to_entity, weight, session_id)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [projectId, edge.from_entity, edge.edge_type, edge.to_entity, weight, sessionId]
+    );
+    edgesWritten++;
+  }
+
+  // Retrieval contract upsert
+  if (payload.contract && typeof payload.contract === 'object') {
+    await db.query(
+      `INSERT INTO retrieval_contract (project_id, name, queries, updated_at)
+       VALUES ($1, 'default', $2::jsonb, now())
+       ON CONFLICT (project_id, name) DO UPDATE
+         SET queries = EXCLUDED.queries, updated_at = now()`,
+      [projectId, JSON.stringify(payload.contract)]
+    );
+  }
+
+  return { entitiesWritten, assertionsWritten, edgesWritten };
+}
+
+/** Run reranker precision@5 gate check. Informational — never blocking. */
+async function runRerankerGate(db, projectId, root) {
+  const minChunksStr = await getSetting(db, projectId, 'precision_at_5_gate_min_chunks', '1000');
+  const minChunks = parseInt(minChunksStr, 10);
+  // memory_entry_chunks links to memory_entries via entry_id; no direct project_id column.
+  // Count via join to memory_entries which does have project_id (mem_type scoped by entry).
+  // Fallback: if no project_id column on memory_entries either, count all chunks as proxy.
+  let chunkCount = 0;
+  try {
+    const { rows: chunkRows } = await db.query(
+      `SELECT COUNT(c.*) AS n
+       FROM memory_entry_chunks c
+       JOIN memory_entries e ON e.id = c.entry_id
+       WHERE e.source_file IS NOT NULL`
+    );
+    chunkCount = parseInt(chunkRows[0].n, 10);
+  } catch (_) {
+    // Table may not exist or schema differs — skip gate
+    console.log('\n  Reranker gate: SKIPPED — could not count chunks');
+    return;
+  }
+
+  if (chunkCount < minChunks) {
+    console.log(`\n  Reranker gate: SKIPPED — corpus n=${chunkCount} below threshold=${minChunks}`);
+    return;
+  }
+
+  // Corpus is above threshold — run eval harness in both modes.
+  console.log(`\n  Reranker gate: corpus n=${chunkCount} >= threshold=${minChunks} — running eval...`);
+  const evalScript = path.join(root, 'test', 'eval', 'eval-retrieval.js');
+  if (!fs.existsSync(evalScript)) {
+    console.log('  Reranker gate: SKIPPED — eval script not found at ' + evalScript);
+    return;
+  }
+
+  const { execFileSync } = require('child_process');
+
+  let vectorP5 = null;
+  let rerankP5 = null;
+
+  const runEval = (extraArgs) => {
+    try {
+      const out = execFileSync(process.execPath, [evalScript, '--quiet', ...extraArgs], {
+        cwd: root,
+        env: { ...process.env, PROJECT_ROOT: root },
+        encoding: 'utf8',
+        timeout: 120000,
+      });
+      // Parse precision@5 from output — look for "precision@5: 0.NN" or "P@5: 0.NN"
+      const m = out.match(/(?:precision@5|P@5)[^\d]+([\d.]+)/i);
+      return m ? parseFloat(m[1]) : null;
+    } catch (_) {
+      return null;
+    }
+  };
+
+  vectorP5 = runEval([]);
+  rerankP5 = runEval(['--rerank']);
+
+  if (vectorP5 === null || rerankP5 === null) {
+    console.log('  Reranker gate: could not parse precision@5 from eval output — skipping gate');
+    return;
+  }
+
+  const delta = rerankP5 - vectorP5;
+  console.log(`  Reranker gate: vector P@5=${vectorP5.toFixed(3)}, reranker P@5=${rerankP5.toFixed(3)}, Δ=${delta.toFixed(3)}`);
+  if (delta < 0.05) {
+    console.log(`  WARNING: Δ < 0.05 — reranker is not providing a meaningful lift.`);
+    console.log(`    Suggestion: (a) defer next reranker re-tune, or (b) inspect for corpus drift.`);
+  } else {
+    console.log(`  Reranker gate: PASS (Δ >= 0.05)`);
+  }
+}
+
+// ── checkpoint ───────────────────────────────────────────────────────────────
+
+async function cmdCheckpoint(args) {
+  console.log('Running: handoff:checkpoint');
+
+  const useJson = args.includes('--json') && args.includes('-');
+  const projectId   = resolveProjectId();
+  const handoffPath = resolveHandoffMdPath(projectId);
+  const root        = findProjectRoot();
+
+  let payload = {};
+  if (useJson) {
+    payload = await readStdin();
+  }
+
+  let db;
+  try {
+    db = await connectHandoff();
+  } catch (err) {
+    console.error(`DB connection failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  const { entitiesWritten, assertionsWritten, edgesWritten } =
+    await writeExtraction(db, projectId, payload);
+
+  // Update handoff.md (keep session_in_progress marker — do not clear it)
+  const stamp = new Date().toISOString();
+  writeHandoffMd(handoffPath, {
+    PROJECT_ID:          projectId,
+    LAST_CLOSE:          stamp,
+    CONTRACT:            payload.contract ? 'default' : (readHandoffFrontmatter(handoffPath).contract || 'default'),
+    ENTITIES_WRITTEN:    String(entitiesWritten),
+    ASSERTIONS_WRITTEN:  String(assertionsWritten),
+    EDGES_WRITTEN:       String(edgesWritten),
+    PROJECT_NAME:        path.basename(root),
+    TLDR:                payload.tldr || '(checkpoint)',
+    OPEN_THREADS:        (payload.open_threads || []).map((t) => `- ${t}`).join('\n') || '- (none)',
+    QUICK_REFERENCES:    payload.quick_references || '(none)',
+  });
+
+  // Run reranker gate (informational)
+  await runRerankerGate(db, projectId, root);
+
+  await db.end();
+
+  console.log(`\n  entities written:    ${entitiesWritten}`);
+  console.log(`  assertions written:  ${assertionsWritten}`);
+  console.log(`  edges written:       ${edgesWritten}`);
+  console.log(`\nDone: handoff:checkpoint — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written (session marker retained)`);
+}
+
+// ── close ─────────────────────────────────────────────────────────────────────
+
+async function cmdClose(args) {
+  console.log('Running: handoff:close');
+
+  const useJson = args.includes('--json') && args.includes('-');
+  const projectId   = resolveProjectId();
+  const handoffPath = resolveHandoffMdPath(projectId);
+  const root        = findProjectRoot();
+
+  let payload = {};
+  if (useJson) {
+    payload = await readStdin();
+  }
+
+  let db;
+  try {
+    db = await connectHandoff();
+  } catch (err) {
+    console.error(`DB connection failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  const { entitiesWritten, assertionsWritten, edgesWritten } =
+    await writeExtraction(db, projectId, payload);
+
+  // Surface CLAUDE.md promotion candidates (conf >= 9, user_stated, multi-session)
+  const { rows: candidates } = await db.query(
+    `SELECT subject, predicate, object, confidence
+     FROM assertions
+     WHERE project_id = $1
+       AND confidence >= 9
+       AND source = 'user_stated'
+       AND EXTRACT(EPOCH FROM (last_reinforced - created_at)) > 86400
+     ORDER BY confidence DESC`,
+    [projectId]
+  );
+  if (candidates.length > 0) {
+    console.log('\n  CLAUDE.md promotion candidates (confidence >= 9, user_stated, multi-session):');
+    for (const row of candidates) {
+      console.log(`    [conf=${row.confidence}] ${row.subject} ${row.predicate} ${row.object}`);
+    }
+    console.log('  Review and run /handoff:close with confirm_claude_md_promotion=true to write to CLAUDE.md.');
+  }
+
+  // Write to CLAUDE.md if requested and candidates exist
+  if (payload.confirm_claude_md_promotion && candidates.length > 0) {
+    const claudeMdPath = path.join(root, 'CLAUDE.md');
+    if (fs.existsSync(claudeMdPath)) {
+      const existing = fs.readFileSync(claudeMdPath, 'utf8');
+      const additions = candidates.map((r) =>
+        `- [conf=${r.confidence}] ${r.subject} ${r.predicate} ${r.object}`
+      ).join('\n');
+      const durableFacts = existing.includes('## Durable facts')
+        ? existing.replace(/## Durable facts\n.*?\n- \(No durable facts.*?\)\n/s,
+            `## Durable facts\n${additions}\n`)
+        : existing + `\n## Durable facts\n${additions}\n`;
+      fs.writeFileSync(claudeMdPath, durableFacts, 'utf8');
+      console.log(`\n  CLAUDE.md updated with ${candidates.length} durable fact(s).`);
+    }
+  }
+
+  // Update handoff.md
+  const stamp = new Date().toISOString();
+  writeHandoffMd(handoffPath, {
+    PROJECT_ID:          projectId,
+    LAST_CLOSE:          stamp,
+    CONTRACT:            'default',
+    ENTITIES_WRITTEN:    String(entitiesWritten),
+    ASSERTIONS_WRITTEN:  String(assertionsWritten),
+    EDGES_WRITTEN:       String(edgesWritten),
+    PROJECT_NAME:        path.basename(root),
+    TLDR:                payload.tldr || '(closed)',
+    OPEN_THREADS:        (payload.open_threads || []).map((t) => `- ${t}`).join('\n') || '- (none)',
+    QUICK_REFERENCES:    payload.quick_references || '(none)',
+  });
+
+  // Clear session_in_progress marker
+  await db.query(
+    `DELETE FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'`,
+    [projectId]
+  );
+
+  // Run reranker gate (informational)
+  await runRerankerGate(db, projectId, root);
+
+  await db.end();
+
+  console.log(`\n  entities written:    ${entitiesWritten}`);
+  console.log(`  assertions written:  ${assertionsWritten}`);
+  console.log(`  edges written:       ${edgesWritten}`);
+  console.log(`  contract:            updated`);
+  console.log(`\nDone: handoff:close — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written, session marker cleared`);
+}
+
+// ── purge ─────────────────────────────────────────────────────────────────────
+
+async function cmdPurge(args) {
+  console.log('Running: handoff:purge');
+
+  const projectId   = resolveProjectId();
+  const handoffPath = resolveHandoffMdPath(projectId);
+
+  const skipConfirm = args.includes('--yes');
+
+  if (!skipConfirm) {
+    // Interactive confirmation via stdin
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await new Promise((resolve) => {
+      rl.question(
+        `\n  WARNING: This will permanently delete ALL memory rows for project_id="${projectId}".\n  Type "yes" to confirm: `,
+        (a) => { rl.close(); resolve(a.trim()); }
+      );
+    });
+    if (answer.toLowerCase() !== 'yes') {
+      console.log('\n  Purge cancelled.');
+      console.log('\nDone: handoff:purge — cancelled (no changes made)');
+      return;
+    }
+  }
+
+  let db;
+  try {
+    db = await connectHandoff();
+  } catch (err) {
+    console.error(`DB connection failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  // Hard delete in dependency order
+  const tables = ['edges', 'assertions', 'entities', 'retrieval_contract', 'project_settings'];
+  for (const tbl of tables) {
+    await db.query(`DELETE FROM ${tbl} WHERE project_id = $1`, [projectId]);
+  }
+
+  // Delete handoff.md
+  if (fs.existsSync(handoffPath)) {
+    fs.unlinkSync(handoffPath);
+  }
+
+  await db.end();
+
+  console.log(`\n  All rows deleted for project_id="${projectId}".`);
+  console.log(`  handoff.md removed.`);
+  console.log(`\nDone: handoff:purge — all project memory permanently deleted`);
+}
+
+// ─── ROUTER ──────────────────────────────────────────────────────────────────
+
+async function main() {
+  const [, , sub, ...rest] = process.argv;
+
+  const subcommands = {
+    init:        () => cmdInit(rest),
+    status:      () => cmdStatus(),
+    resume:      () => cmdResume(),
+    'loader-load': () => cmdLoaderLoad(),
+    drop:        () => cmdDrop(),
+    checkpoint:  () => cmdCheckpoint(rest),
+    close:       () => cmdClose(rest),
+    purge:       () => cmdPurge(rest),
+  };
+
+  if (!sub || !subcommands[sub]) {
+    const available = Object.keys(subcommands).join(', ');
+    console.error(`Usage: node scripts/handoff.js <subcommand> [args]`);
+    console.error(`Subcommands: ${available}`);
+    process.exit(2);
+  }
+
+  try {
+    await subcommands[sub]();
+  } catch (err) {
+    console.error(`\nhandoff:${sub} failed: ${err.message}`);
+    if (process.env.DEBUG) console.error(err.stack);
+    process.exit(1);
+  }
+}
+
+main();
