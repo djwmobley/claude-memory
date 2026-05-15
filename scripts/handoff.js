@@ -18,7 +18,8 @@
  *   checkpoint --json -     Mid-session extraction (reads JSON from stdin).
  *   close      --json -     End-of-session extraction (reads JSON from stdin).
  *   purge      [--yes]      Hard-delete all project rows (requires confirmation or --yes).
- *   loader-load             Same inline load as resume; used by Phase 3.6 hook.
+ *   loader-load             Same inline load as resume; used directly or by tests.
+ *   loader-hook             SessionStart hook entry point (outputs JSON to stdout).
  *
  * Environment:
  *   PROJECT_ROOT            Override project root detection.
@@ -320,19 +321,48 @@ async function cmdStatus() {
   console.log(`\nDone: handoff:status — ${entRes.rows[0].n} entities, ${assRes.rows[0].n} assertions, ${edgRes.rows[0].n} edges`);
 }
 
-// ── loader-load (shared with resume) ─────────────────────────────────────────
+// ── loader-load (shared with resume and loader-hook) ─────────────────────────
 
-async function cmdLoaderLoad() {
+/**
+ * Core context-loading logic. Reads handoff.md and runs retrieval contract queries.
+ *
+ * @param {object} opts
+ * @param {boolean} [opts.silent=false]  When true, suppress console.log output (hook mode).
+ * @param {object}  [opts.db]            Pre-connected pg.Client (hook passes its own to avoid
+ *                                       a second connect/disconnect cycle).
+ * @returns {Promise<{
+ *   outputText: string,
+ *   tokensUsed: number,
+ *   sectionsCount: number,
+ *   entitiesCount: number,
+ *   assertionsCount: number,
+ *   vectorCount: number,
+ *   contractName: string,
+ *   lastClose: string|null,
+ *   daysSinceClose: number|null,
+ * }>}
+ */
+async function cmdLoaderLoad(opts = {}) {
+  const silent = opts.silent === true;
+
   const projectId   = resolveProjectId();
   const handoffPath = resolveHandoffMdPath(projectId);
   const fm          = readHandoffFrontmatter(handoffPath);
 
-  let db;
-  try {
-    db = await connectHandoff();
-  } catch (err) {
-    console.error(`DB connection failed: ${err.message}`);
-    process.exit(1);
+  const lastClose     = fm.last_close || null;
+  const daysSinceClose = daysSince(lastClose);
+
+  // Use a caller-supplied DB connection when available (avoids double connect in hook path).
+  let db = opts.db || null;
+  let ownDb = false;
+  if (!db) {
+    try {
+      db = await connectHandoff();
+      ownDb = true;
+    } catch (err) {
+      console.error(`DB connection failed: ${err.message}`);
+      process.exit(1);
+    }
   }
 
   // Load retrieval_contract
@@ -345,12 +375,16 @@ async function cmdLoaderLoad() {
   const queries  = contract.queries || [];
 
   const tokenBudget = parseInt(await getSetting(db, projectId, 'loader_token_budget', '4000'), 10);
-  let tokensUsed = 0;
-  const sections = [];
+  let tokensUsed     = 0;
+  const sections     = [];
+
+  // Per-type counters for the Done: line and hook output.
+  let entitiesCount   = 0;
+  let assertionsCount = 0;
+  let vectorCount     = 0;
 
   for (const q of queries) {
     if (tokensUsed >= tokenBudget) break;
-    const qBudget = Math.min(q.token_budget || 500, tokenBudget - tokensUsed);
 
     if (q.type === 'entity' || q.kind === 'entity') {
       const { rows } = await db.query(
@@ -362,7 +396,8 @@ async function cmdLoaderLoad() {
       if (rows.length) {
         const text = rows.map((r) => `- ${r.name} (${r.entity_type}): ${r.description || ''}`).join('\n');
         sections.push(`### Entities\n${text}`);
-        tokensUsed += Math.ceil(text.length / 4);
+        tokensUsed    += Math.ceil(text.length / 4);
+        entitiesCount += rows.length;
       }
 
     } else if (q.type === 'assertion' || q.kind === 'assertion') {
@@ -379,10 +414,11 @@ async function cmdLoaderLoad() {
           `- [${r.source}|conf=${r.confidence}] ${r.subject} ${r.predicate} ${r.object}`
         ).join('\n');
         sections.push(`### Assertions\n${text}`);
-        tokensUsed += Math.ceil(text.length / 4);
-        // Bump last_reinforced for returned rows
+        tokensUsed      += Math.ceil(text.length / 4);
+        assertionsCount += rows.length;
+        // Bump reinforcement timestamps for every retrieved assertion (spec §7).
         await db.query(
-          `UPDATE assertions SET last_reinforced = now()
+          `UPDATE assertions SET last_reinforced = now(), last_retrieved = now()
            WHERE project_id = $1
              AND ($2::text IS NULL OR subject = $2)`,
           [projectId, q.filter?.subject || null]
@@ -402,7 +438,8 @@ async function cmdLoaderLoad() {
           `- [conf=${r.confidence}] ${r.subject} ${r.predicate} ${r.object}`
         ).join('\n');
         sections.push(`### Recent assertions\n${text}`);
-        tokensUsed += Math.ceil(text.length / 4);
+        tokensUsed      += Math.ceil(text.length / 4);
+        assertionsCount += rows.length;  // recency queries roll into assertionsCount
       }
 
     } else if (q.type === 'vector' || q.kind === 'vector') {
@@ -411,33 +448,148 @@ async function cmdLoaderLoad() {
     }
   }
 
-  await db.end();
+  if (ownDb) await db.end();
 
-  // Print the handoff.md body
+  // Assemble output text (same content whether silent or not).
+  const outputParts = [];
+
   if (fs.existsSync(handoffPath)) {
-    const raw = fs.readFileSync(handoffPath, 'utf8');
+    const raw  = fs.readFileSync(handoffPath, 'utf8');
     const body = raw.replace(/^---[\s\S]*?---\r?\n/, '');
-    console.log('\n=== Handoff context ===');
-    console.log(body.trim());
+    outputParts.push('\n=== Handoff context ===');
+    outputParts.push(body.trim());
   }
 
   if (sections.length) {
-    console.log('\n=== Retrieved context (contract: ' + contractName + ') ===');
-    for (const s of sections) console.log(s);
+    outputParts.push('\n=== Retrieved context (contract: ' + contractName + ') ===');
+    outputParts.push(sections.join('\n'));
   }
 
-  console.log(`\n  tokens used: ~${tokensUsed} / ${tokenBudget}`);
-  return { sections, tokensUsed };
+  outputParts.push(`\n  tokens used: ~${tokensUsed} / ${tokenBudget}`);
+
+  const outputText = outputParts.join('\n');
+
+  if (!silent) {
+    console.log(outputText);
+  }
+
+  return {
+    outputText,
+    tokensUsed,
+    sectionsCount:   sections.length,
+    entitiesCount,
+    assertionsCount,
+    vectorCount,
+    contractName,
+    lastClose,
+    daysSinceClose,
+  };
+}
+
+// ── loader-hook (SessionStart hook entry point) ───────────────────────────────
+
+async function cmdLoaderHook() {
+  // All errors are swallowed and exit 0 — the hook must never break session start.
+  let db = null;
+  try {
+    const projectId   = resolveProjectId();
+    const handoffPath = resolveHandoffMdPath(projectId);
+
+    // Silent no-op when handoff.md is absent (non-claude-memory project or not yet init-ed).
+    if (!fs.existsSync(handoffPath)) {
+      process.exit(0);
+    }
+
+    const fm         = readHandoffFrontmatter(handoffPath);
+    const lastClose  = fm.last_close || null;
+    const daysN      = daysSince(lastClose);
+    const daysLabel  = daysN !== null ? `${daysN} days ago` : 'never';
+
+    try {
+      db = await connectHandoff();
+    } catch (err) {
+      // DB unavailable — exit silently, do not break session start.
+      process.stderr.write(`handoff loader-hook: DB connection failed (${err.message}) — skipping\n`);
+      process.exit(0);
+    }
+
+    const stalenessDays = parseInt(
+      await getSetting(db, projectId, 'staleness_days', '7'),
+      10
+    );
+
+    // ── Staleness gate ────────────────────────────────────────────────────────
+    if (daysN !== null && daysN > stalenessDays) {
+      process.stderr.write(
+        `Running: handoff loader (project=${projectId}, last=${daysLabel}, STALE — threshold=${stalenessDays})\n`
+      );
+
+      await db.end();
+
+      const staleMsg = [
+        `⚠️  Handoff context is STALE (last close: ${lastClose}, ${daysN} days ago — threshold ${stalenessDays} days).`,
+        '',
+        'The auto-loader did not inject context. To proceed, run one of:',
+        '  /handoff:status   — see counts and last-close details',
+        '  /handoff:resume   — load context anyway, despite staleness',
+        '  /handoff:drop     — archive prior session memory and start fresh',
+      ].join('\n');
+
+      // Single-line JSON on stdout — hook parser requirement.
+      process.stdout.write(
+        JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'SessionStart',
+            additionalContext: staleMsg,
+          },
+        }) + '\n'
+      );
+
+      process.stderr.write('Done: handoff loader — staleness gate triggered, no context injected\n');
+      process.exit(0);
+    }
+
+    // ── Non-stale path: load and inject context ───────────────────────────────
+    process.stderr.write(
+      `Running: handoff loader (project=${projectId}, last=${daysLabel})\n`
+    );
+
+    const result = await cmdLoaderLoad({ silent: true, db });
+
+    await db.end();
+
+    // Single-line JSON on stdout.
+    process.stdout.write(
+      JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: 'SessionStart',
+          additionalContext: result.outputText,
+        },
+      }) + '\n'
+    );
+
+    process.stderr.write(
+      `Done: handoff loader — injected ${result.assertionsCount} assertions, ${result.entitiesCount} entities, ${result.vectorCount} vector matches\n`
+    );
+
+    process.exit(0);
+
+  } catch (err) {
+    // Catch-all: log to stderr, never break session start.
+    process.stderr.write(`handoff loader-hook error: ${err.message}\n`);
+    if (db) {
+      try { await db.end(); } catch (_) { /* ignore */ }
+    }
+    process.exit(0);
+  }
 }
 
 // ── resume ────────────────────────────────────────────────────────────────────
 
 async function cmdResume() {
   console.log('Running: handoff:resume');
-  // NOTE: Phase 3.5 inline implementation of the SessionStart loader.
-  // Phase 3.6 will refactor this into a hook; this code path stays for manual /resume use.
-  await cmdLoaderLoad();
-  console.log('\nDone: handoff:resume — context loaded inline (Phase 3.6 will add hook-based auto-load)');
+  const result = await cmdLoaderLoad();
+  console.log(`\nDone: handoff:resume — injected ${result.assertionsCount} assertions, ${result.entitiesCount} entities, ${result.vectorCount} vector matches`);
 }
 
 // ── drop ──────────────────────────────────────────────────────────────────────
@@ -859,14 +1011,15 @@ async function main() {
   const [, , sub, ...rest] = process.argv;
 
   const subcommands = {
-    init:        () => cmdInit(rest),
-    status:      () => cmdStatus(),
-    resume:      () => cmdResume(),
-    'loader-load': () => cmdLoaderLoad(),
-    drop:        () => cmdDrop(),
-    checkpoint:  () => cmdCheckpoint(rest),
-    close:       () => cmdClose(rest),
-    purge:       () => cmdPurge(rest),
+    init:           () => cmdInit(rest),
+    status:         () => cmdStatus(),
+    resume:         () => cmdResume(),
+    'loader-load':  () => cmdLoaderLoad(),
+    'loader-hook':  () => cmdLoaderHook(),
+    drop:           () => cmdDrop(),
+    checkpoint:     () => cmdCheckpoint(rest),
+    close:          () => cmdClose(rest),
+    purge:          () => cmdPurge(rest),
   };
 
   if (!sub || !subcommands[sub]) {
