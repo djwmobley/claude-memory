@@ -1,4 +1,5 @@
 'use strict';
+const __startNs = process.hrtime.bigint();
 
 /**
  * handoff.js — Phase 3.5 /handoff skill helper.
@@ -36,15 +37,21 @@ const readline = require('readline');
 const { loadConfig, connect, c, findProjectRoot } = require('./lib/shared');
 const { encodeCwd, getClaudeProjectDir }           = require('./lib/encoded-cwd');
 
+process.on('exit', () => {
+  const ms = Number(process.hrtime.bigint() - __startNs) / 1e6;
+  process.stderr.write(`internal_ms=${ms.toFixed(1)}\n`);
+});
+
 // ─── CONSTANTS ───────────────────────────────────────────────────────────────
 
-const TARGET_DB = 'claude_memory_eval_test';
+// HANDOFF_DB — documented env-var override for projects that don't use the default DB name.
+const TARGET_DB = process.env.HANDOFF_DB || 'claude_memory_eval_test';
 const HANDOFF_TEMPLATE = path.resolve(__dirname, '..', 'templates', 'handoff.md.tpl');
 const PROJECT_CLAUDE_MD_TEMPLATE = path.resolve(__dirname, '..', 'templates', 'project-claude-md.tpl');
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
-/** Connect to the handoff DB (always claude_memory_eval_test). */
+/** Connect to the handoff DB (TARGET_DB, overridable via HANDOFF_DB env var). */
 async function connectHandoff() {
   const cfg = loadConfig();
   const { Client } = require('pg');
