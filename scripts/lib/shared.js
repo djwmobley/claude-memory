@@ -547,11 +547,12 @@ function vllmTokenize(text, opts) {
       res.on('end', () => {
         try {
           const parsed = JSON.parse(data);
-          // vLLM /tokenize returns { tokens: string[], token_ids: int[] }
-          if (!Array.isArray(parsed.tokens)) {
+          // vLLM /tokenize returns { tokens: int[], token_strs: string[] }
+          // (tokens are numeric IDs; the BPE string forms are in token_strs)
+          if (!Array.isArray(parsed.token_strs) || !Array.isArray(parsed.tokens)) {
             return reject(new Error(`vLLM /tokenize unexpected response: ${data.slice(0, 200)}`));
           }
-          resolve({ tokens: parsed.tokens, token_ids: parsed.token_ids || [] });
+          resolve({ tokens: parsed.token_strs, token_ids: parsed.tokens });
         } catch (e) { reject(e); }
       });
     });
@@ -649,12 +650,18 @@ async function lateChunkEmbed(text, chunkOffsets, opts) {
   // Obtain BPE token strings to map char offsets to token indices
   const { tokens } = await vllmTokenize(text, opts);
 
-  if (tokens.length !== tokenVectors.length) {
+  // vLLM /pooling appends model special tokens (e.g. <|endoftext|> for Qwen3)
+  // even though /tokenize was asked to exclude them. Trim the trailing extras
+  // so per-token vectors align 1:1 with the tokenize output used for offsets.
+  // Diff > 2 indicates something more wrong than a trailing EOS — fail loud.
+  const extras = tokenVectors.length - tokens.length;
+  if (extras < 0 || extras > 2) {
     throw new Error(
       `lateChunkEmbed: tokenize returned ${tokens.length} tokens but pooling returned ` +
       `${tokenVectors.length} vectors — cannot map offsets`
     );
   }
+  if (extras > 0) tokenVectors.length = tokens.length;
 
   // Build char-to-token index mapping.
   // Reconstruct character offsets for each token by walking the token strings.
