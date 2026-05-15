@@ -182,6 +182,12 @@ If you have no `pipeline.yml`, the standard `PG*` environment variables
 (`PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`) are checked as a
 fallback. See `scripts/lib/shared.js` for the exact fallback order.
 
+**`HANDOFF_DB` env var:** `scripts/handoff.js` targets `claude_memory_eval_test` by default.
+Set `HANDOFF_DB=your_db_name` to use a different database — useful when adopting the
+`/handoff` skill in projects that already have a Postgres DB under a different name.
+The env var is read at startup; it overrides the default and any `pipeline.yml` database
+setting for handoff operations only.
+
 **CRLF warning:** The YAML parser uses bare `\n`. On Windows, editors that
 default to CRLF cause `loadConfig()` to silently fall back to defaults. Save
 `pipeline.yml` with LF endings. See [Gotchas](#gotchas).
