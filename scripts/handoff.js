@@ -152,59 +152,246 @@ async function setSetting(db, projectId, key, value) {
   );
 }
 
+// ─── INIT PRE-FLIGHT HELPERS ──────────────────────────────────────────────────
+
+/** Check that Node.js is >= 18. Returns { ok, msg, fatal }. */
+function checkNodeVersion() {
+  const parts = process.versions.node.split('.').map(Number);
+  const major = parts[0];
+  if (major < 18) {
+    return {
+      ok: false,
+      msg: `Node ${process.versions.node} detected — requires Node >= 18. Upgrade: https://nodejs.org`,
+      fatal: true,
+    };
+  }
+  return { ok: true, msg: `Node ${process.versions.node}`, fatal: false };
+}
+
+/** Check that the pg package is installed. Returns { ok, msg, fatal }. */
+function checkPgPackage() {
+  try {
+    require('pg');
+    return { ok: true, msg: 'pg package present', fatal: false };
+  } catch (_) {
+    return {
+      ok: false,
+      msg: 'pg package not installed — run: npm install (in scripts/)',
+      fatal: true,
+    };
+  }
+}
+
+/** Check that Postgres is reachable on the system DB. Returns { ok, msg, fatal }. */
+async function checkPostgresReachable(cfg) {
+  const { Client } = require('pg');
+  const client = new Client({
+    host:     cfg.host,
+    port:     cfg.port,
+    database: 'postgres',  // system DB — always exists
+    user:     cfg.user,
+  });
+  try {
+    await client.connect();
+    await client.end();
+    return { ok: true, msg: `Postgres reachable at ${cfg.host}:${cfg.port}`, fatal: false };
+  } catch (err) {
+    return {
+      ok: false,
+      msg: `Postgres not reachable at ${cfg.host}:${cfg.port} — is it running? (${err.message})`,
+      fatal: true,
+    };
+  }
+}
+
+/**
+ * Check whether the target DB exists. If missing and autoCreate=true, create it.
+ * If missing and autoCreate=false, prompt via readline (unless args includes -y).
+ * Returns { ok, msg, fatal, created }.
+ */
+async function checkOrCreateDatabase(cfg, dbName, autoCreate) {
+  const { Client } = require('pg');
+  // Connect to system DB for pg_database check / CREATE DATABASE
+  const sysClient = new Client({
+    host:     cfg.host,
+    port:     cfg.port,
+    database: 'postgres',
+    user:     cfg.user,
+  });
+  await sysClient.connect();
+  const { rows } = await sysClient.query(
+    'SELECT 1 FROM pg_database WHERE datname = $1',
+    [dbName]
+  );
+
+  if (rows.length > 0) {
+    await sysClient.end();
+    return { ok: true, msg: `Database '${dbName}' exists`, fatal: false, created: false };
+  }
+
+  // DB does not exist — decide what to do
+  if (autoCreate) {
+    await sysClient.query(`CREATE DATABASE "${dbName}"`);
+    await sysClient.end();
+    return { ok: true, msg: `Database '${dbName}' created (auto)`, fatal: false, created: true };
+  }
+
+  // Prompt interactively
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const answer = await new Promise((resolve) => {
+    rl.question(
+      `\n  Database '${dbName}' does not exist. Create it? [y/N]: `,
+      (a) => { rl.close(); resolve(a.trim()); }
+    );
+  });
+
+  if (answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes') {
+    await sysClient.query(`CREATE DATABASE "${dbName}"`);
+    await sysClient.end();
+    return { ok: true, msg: `Database '${dbName}' created`, fatal: false, created: true };
+  }
+
+  await sysClient.end();
+  return {
+    ok: false,
+    msg: `Database '${dbName}' does not exist. Create it manually: psql -c "CREATE DATABASE ${dbName}"`,
+    fatal: true,
+    created: false,
+  };
+}
+
+/** Check Postgres server version >= 13. Returns { ok, msg, fatal }. */
+async function checkPgVersion(cfg, dbName) {
+  const { Client } = require('pg');
+  const client = new Client({
+    host:     cfg.host,
+    port:     cfg.port,
+    database: dbName,
+    user:     cfg.user,
+  });
+  try {
+    await client.connect();
+    const { rows } = await client.query('SHOW server_version_num');
+    await client.end();
+    const vnum = parseInt(rows[0].server_version_num, 10);
+    // server_version_num is e.g. 140008 for 14.8
+    const major = Math.floor(vnum / 10000);
+    if (major < 13) {
+      return {
+        ok: false,
+        msg: `Postgres ${major} detected — recommend >= 13 (version_num=${vnum})`,
+        fatal: false,  // warn only
+      };
+    }
+    return { ok: true, msg: `Postgres ${major} (version_num=${vnum})`, fatal: false };
+  } catch (err) {
+    // Non-fatal: version check failure does not block init
+    return { ok: false, msg: `Could not check Postgres version: ${err.message}`, fatal: false };
+  }
+}
+
+/** Print a single pre-flight result line. */
+function printPreflightLine(result, stepDesc) {
+  if (result.ok) {
+    console.log(`  [OK]    ${stepDesc}: ${result.msg}`);
+  } else if (!result.fatal) {
+    console.log(`  [WARN]  ${stepDesc} — ${result.msg}`);
+  } else {
+    console.log(`  [FAIL]  ${stepDesc} — ${result.msg}`);
+  }
+}
+
 // ─── SUBCOMMANDS ─────────────────────────────────────────────────────────────
 
 // ── init ─────────────────────────────────────────────────────────────────────
 
 async function cmdInit(args) {
-  console.log('Running: handoff:init');
+  console.log('Running: handoff:init\n');
 
-  const root       = findProjectRoot();
-  const projectId  = encodeCwd(root);
-  const projectDir = getClaudeProjectDir(root);
+  const root        = findProjectRoot();
+  const projectId   = encodeCwd(root);
   const handoffPath = resolveHandoffMdPath(projectId);
   const claudeMdPath = path.join(root, 'CLAUDE.md');
+  const autoCreate  = args.includes('-y');
 
-  let db;
-  try {
-    db = await connectHandoff();
-  } catch (err) {
-    console.error(`DB connection failed: ${err.message}`);
+  // ── Pre-flight checks ─────────────────────────────────────────────────────
+
+  // Step 1: Node version >= 18
+  const nodeCheck = checkNodeVersion();
+  printPreflightLine(nodeCheck, 'Node version >= 18');
+  if (nodeCheck.fatal) { process.exit(1); }
+
+  // Step 2: pg package installed
+  const pgPkgCheck = checkPgPackage();
+  printPreflightLine(pgPkgCheck, 'pg package installed');
+  if (pgPkgCheck.fatal) { process.exit(1); }
+
+  const cfg = loadConfig();
+
+  // Step 3: Postgres reachable
+  const pgReachCheck = await checkPostgresReachable(cfg);
+  printPreflightLine(pgReachCheck, `Postgres reachable at ${cfg.host}:${cfg.port}`);
+  if (pgReachCheck.fatal) { process.exit(1); }
+
+  // Step 4: Target DB exists (create if needed)
+  const dbCheck = await checkOrCreateDatabase(cfg, TARGET_DB, autoCreate);
+  printPreflightLine(dbCheck, `Database '${TARGET_DB}' present`);
+  if (dbCheck.fatal) { process.exit(1); }
+
+  // Step 5: Postgres version >= 13 (warn only)
+  const pgVerCheck = await checkPgVersion(cfg, TARGET_DB);
+  printPreflightLine(pgVerCheck, 'Postgres version >= 13');
+  // Not fatal — proceed regardless
+
+  // Step 6: handoff-core-schema.sql present on disk
+  const schemaFile = path.resolve(__dirname, 'sql', 'handoff-core-schema.sql');
+  const schemaExists = fs.existsSync(schemaFile);
+  if (schemaExists) {
+    console.log(`  [OK]    Schema file present: ${path.basename(schemaFile)}`);
+  } else {
+    console.log(`  [FAIL]  Schema file missing: ${schemaFile}`);
     process.exit(1);
   }
 
-  const results = [];
-
-  // 1. Apply schema migrations idempotently (phase2-schema.sql + phase3b-schema.sql).
-  //    We apply them via pg client (not psql) so we can stay cross-platform.
-  const schemaFiles = [
-    path.resolve(__dirname, 'sql', 'phase2-schema.sql'),
-    path.resolve(__dirname, 'sql', 'phase3b-schema.sql'),
-  ];
-
-  for (const sqlFile of schemaFiles) {
-    if (!fs.existsSync(sqlFile)) {
-      results.push(`  SKIP  schema migration ${path.basename(sqlFile)} — file not found`);
-      continue;
-    }
-    let sql = fs.readFileSync(sqlFile, 'utf8');
-    // Remove psql meta-commands (\ir, \d, etc.) — not supported by pg client
-    sql = sql.replace(/^\\[a-z].*$/gm, '');
-    try {
-      await db.query(sql);
-      results.push(`  OK    schema migration: ${path.basename(sqlFile)}`);
-    } catch (err) {
-      results.push(`  WARN  schema migration ${path.basename(sqlFile)}: ${err.message}`);
-    }
+  // Connect to target DB for the rest of init
+  let db;
+  try {
+    const { Client } = require('pg');
+    db = new Client({
+      host:     cfg.host,
+      port:     cfg.port,
+      database: TARGET_DB,
+      user:     cfg.user,
+    });
+    await db.connect();
+  } catch (err) {
+    console.log(`  [FAIL]  DB connection to '${TARGET_DB}' — ${err.message}`);
+    process.exit(1);
   }
 
-  // 2. Insert default project_settings rows (idempotent).
+  // Step 7: Apply handoff-core-schema.sql inside a transaction (fatal on error)
+  let sql = fs.readFileSync(schemaFile, 'utf8');
+  // Remove psql meta-commands (\ir, \d, etc.) — not supported by pg client
+  sql = sql.replace(/^\\[a-z].*$/gm, '');
+  try {
+    await db.query('BEGIN');
+    await db.query(sql);
+    await db.query('COMMIT');
+    console.log(`  [OK]    Schema applied: ${path.basename(schemaFile)}`);
+  } catch (err) {
+    try { await db.query('ROLLBACK'); } catch (_) { /* ignore */ }
+    await db.end();
+    console.log(`  [FAIL]  Schema apply failed — ${err.message}`);
+    console.log(`          Transaction rolled back. No FS writes made.`);
+    process.exit(1);
+  }
+
+  // Step 8: Insert default project_settings rows (idempotent)
   const defaults = {
-    staleness_days:              '7',
-    loader_token_budget:         '4000',
-    precision_at_5_gate_min_chunks: '1000',
-    implicit_close:              'enabled',
-    decay_rate_default:          '0.05',
+    staleness_days:      '7',
+    loader_token_budget: '4000',
+    implicit_close:      'enabled',
+    decay_rate_default:  '0.05',
   };
   for (const [key, val] of Object.entries(defaults)) {
     await db.query(
@@ -213,11 +400,22 @@ async function cmdInit(args) {
       [projectId, key, val]
     );
   }
-  results.push(`  OK    project_settings defaults inserted (${Object.keys(defaults).length} keys, idempotent)`);
+  console.log(`  [OK]    project_settings defaults ensured (${Object.keys(defaults).length} keys, idempotent)`);
 
-  // 3. Create handoff.md if absent.
+  // Step 9: Insert default retrieval_contract row
+  await db.query(
+    `INSERT INTO retrieval_contract (project_id, name, queries, updated_at)
+     VALUES ($1, 'default', $2::jsonb, now())
+     ON CONFLICT (project_id, name) DO NOTHING`,
+    [projectId, JSON.stringify({ queries: [] })]
+  );
+  console.log(`  [OK]    retrieval_contract 'default' row ensured`);
+
+  await db.end();
+
+  // Step 10: Write handoff.md (only if all DB steps succeeded)
   if (fs.existsSync(handoffPath)) {
-    results.push(`  SKIP  handoff.md already exists: ${handoffPath}`);
+    console.log(`  [OK]    handoff.md already exists — skipped: ${handoffPath}`);
   } else {
     fs.mkdirSync(path.dirname(handoffPath), { recursive: true });
     writeHandoffMd(handoffPath, {
@@ -232,15 +430,15 @@ async function cmdInit(args) {
       OPEN_THREADS:        '- (none)',
       QUICK_REFERENCES:    '(none)',
     });
-    results.push(`  OK    created handoff.md: ${handoffPath}`);
+    console.log(`  [OK]    handoff.md created: ${handoffPath}`);
   }
 
-  // 4. Create project CLAUDE.md if absent.
+  // Step 11: Write CLAUDE.md (only if all DB steps succeeded)
   if (fs.existsSync(claudeMdPath)) {
-    results.push(`  SKIP  CLAUDE.md already exists: ${claudeMdPath}`);
+    console.log(`  [OK]    CLAUDE.md already exists — skipped: ${claudeMdPath}`);
   } else {
-    const projectName = args[0] || path.basename(root);
-    const projectDesc = args[1] || `Memory and retrieval infrastructure project.`;
+    const projectName = args.find((a) => !a.startsWith('-')) || path.basename(root);
+    const projectDesc = `Memory and retrieval infrastructure project.`;
     const content = renderTemplate(PROJECT_CLAUDE_MD_TEMPLATE, {
       PROJECT_NAME:        projectName,
       PROJECT_DESCRIPTION: projectDesc,
@@ -248,23 +446,10 @@ async function cmdInit(args) {
       PROJECT_ROOT:        root,
     });
     fs.writeFileSync(claudeMdPath, content, 'utf8');
-    results.push(`  OK    created CLAUDE.md: ${claudeMdPath}`);
-    results.push(`  NOTE  CLAUDE.md should be git-committed.`);
+    console.log(`  [OK]    CLAUDE.md created: ${claudeMdPath}`);
+    console.log(`  [NOTE]  CLAUDE.md should be git-committed.`);
   }
 
-  // 5. Insert default retrieval_contract row.
-  await db.query(
-    `INSERT INTO retrieval_contract (project_id, name, queries, updated_at)
-     VALUES ($1, 'default', $2::jsonb, now())
-     ON CONFLICT (project_id, name) DO NOTHING`,
-    [projectId, JSON.stringify({ queries: [] })]
-  );
-  results.push(`  OK    retrieval_contract 'default' row ensured`);
-
-  await db.end();
-
-  console.log('\n  init complete:');
-  for (const line of results) console.log(line);
   console.log(`\nDone: handoff:init — project ${projectId} provisioned`);
 }
 
@@ -405,6 +590,7 @@ async function cmdLoaderLoad(opts = {}) {
         `SELECT subject, predicate, object, confidence, source FROM assertions
          WHERE project_id = $1
            AND ($2::text IS NULL OR subject = $2)
+           AND suppressed = false
            AND confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) >= 1.0
          ORDER BY confidence DESC, last_reinforced DESC LIMIT 30`,
         [projectId, q.filter?.subject || null]
@@ -429,6 +615,7 @@ async function cmdLoaderLoad(opts = {}) {
       const { rows } = await db.query(
         `SELECT subject, predicate, object, confidence FROM assertions
          WHERE project_id = $1
+           AND suppressed = false
            AND confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) >= 1.0
          ORDER BY last_reinforced DESC LIMIT 20`,
         [projectId]
@@ -629,17 +816,9 @@ async function cmdDrop() {
     process.exit(1);
   }
 
-  // Zero all assertions (keeps rows for SQL recovery)
-  // confidence has a CHECK >= 1.0, so we cannot set to 0.
-  // Per spec: "UPDATE assertions SET confidence = 0" — we use the minimum 1.0
-  // OR we record suppression via a separate mechanism. The spec says effective_confidence = 0.
-  // Simplest safe approach: set confidence to 1.0 and decay_rate to 999 so effective drops to ~0.
-  // Better: add a "suppressed" flag. But to stay spec-faithful with the existing schema
-  // (confidence CHECK >= 1.0), we set confidence = 1.0 AND decay_rate = 999.0 so that
-  // effective_confidence = 1 * exp(-999 * days_since_now) ≈ 0 almost immediately.
+  // Suppress all assertions for this project (keeps rows for recovery).
   const dropRes = await db.query(
-    `UPDATE assertions SET confidence = 1.0, decay_rate = 999.0
-     WHERE project_id = $1`,
+    `UPDATE assertions SET suppressed = true WHERE project_id = $1`,
     [projectId]
   );
   const zerodCount = dropRes.rowCount || 0;
@@ -917,6 +1096,7 @@ async function cmdClose(args) {
     `SELECT subject, predicate, object, confidence
      FROM assertions
      WHERE project_id = $1
+       AND suppressed = false
        AND confidence >= 9
        AND source = 'user_stated'
        AND EXTRACT(EPOCH FROM (last_reinforced - created_at)) > 86400

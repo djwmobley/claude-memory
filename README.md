@@ -34,8 +34,8 @@ not yet done.
 ## What shipped in Bundle A
 
 Bundle A is the substrate upgrade that brought the stack from a single-table
-mxbai-only proof of concept to a production-grade retrieval system. Six phases
-shipped sequentially; all are merged to `main` as of 2026-05-14.
+mxbai-only proof of concept to a production-grade retrieval system. Phases
+shipped sequentially; all shipped via PRs to `main`.
 
 | Phase | What it does |
 |-------|-------------|
@@ -48,6 +48,29 @@ shipped sequentially; all are merged to `main` as of 2026-05-14.
 
 For full design rationale, acceptance gates, and revision history see
 [BUNDLE-A-SPEC.md](BUNDLE-A-SPEC.md).
+
+---
+
+## Roadmap
+
+### Bundle A — Memory & Retrieval Foundation
+
+| Phase | Title | Status |
+|---|---|---|
+| 0 | Decisions backfill | Shipped |
+| 1 | Embedder upgrade + halfvec(4000) | Shipped |
+| 2 | Knowledge graph schema | Shipped |
+| 3a | Cross-encoder reranker | Shipped |
+| 3b | Contextual blurbs + late chunking | Shipped |
+| 3.5 | `/handoff` skill | Shipped |
+| 3.6 | SessionStart loader hook | Shipped |
+| 3.7 | Stop-hook safety net | Shipped |
+| 3.8 | Schema portability + init hardening | In this PR |
+
+### Beyond Bundle A (planned, undated)
+
+- **Bundle B** — Outcome capture (writing `retrieval_events.outcome`), community detection (Leiden/Louvain over the entity graph), automated entity extraction over backfilled decisions, formal "writing down the bundle" methodology for `retrieval_contract` evolution.
+- **Bundle E2** — Validator skill: 2% audit floor and validator subagent.
 
 ---
 
@@ -90,8 +113,10 @@ cd scripts && pnpm install && cd ..
 # 3. Apply base schema
 psql -d your_db_name -f scripts/setup.sql
 
-# 4. Apply Phase 2 and Phase 3b schema additions
-psql -d your_db_name -f scripts/sql/phase2-schema.sql
+# 4. Apply handoff-core schema (portable — no extensions required)
+node scripts/handoff.js init
+# Apply app-specific schema (requires pgvector)
+psql -d your_db_name -f scripts/sql/app-retrieval-events-schema.sql
 psql -d your_db_name -f scripts/sql/phase3b-schema.sql
 
 # 5. Configure (see Configuration section)
@@ -502,7 +527,8 @@ One-time setup:
 ```bash
 psql -U postgres -c "CREATE DATABASE claude_memory_eval_test"
 psql -U postgres -d claude_memory_eval_test -f scripts/setup.sql
-psql -U postgres -d claude_memory_eval_test -f scripts/sql/phase2-schema.sql
+node scripts/handoff.js init                # applies handoff-core-schema.sql
+psql -U postgres -d claude_memory_eval_test -f scripts/sql/app-retrieval-events-schema.sql
 psql -U postgres -d claude_memory_eval_test -f scripts/sql/phase3b-schema.sql
 ```
 

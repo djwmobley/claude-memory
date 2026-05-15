@@ -1,41 +1,20 @@
 -- ============================================================================
--- Bundle A — Phase 2 schema DDL.
+-- handoff-core-schema.sql
 --
--- Source: BUNDLE-A-SPEC.md v5 Section 4 ("Phase 2 DDL — retrieval_events +
--- knowledge graph + retrieval infrastructure"). Verbatim apart from this header.
+-- Portable handoff-core schema for the /handoff skill.
 --
--- All tables carry `project_id TEXT NOT NULL` with no DEFAULT. The writer must
--- set project_id explicitly to the encoded_cwd value (see scripts/lib/encoded-cwd.js).
--- For the claude-memory project: project_id = 'C--Users-djwmo-dev-claude-memory'.
+-- Applied automatically by `/handoff:init` (node scripts/handoff.js init).
+-- Pure stock Postgres — no extensions, no halfvec, no pgvector dependency.
+-- Requires Postgres >= 13. Safe to re-apply (all statements use IF NOT EXISTS
+-- or ADD COLUMN IF NOT EXISTS). Idempotent on both fresh and existing DBs.
 --
--- All statements are IF NOT EXISTS — safe to re-apply.
+-- Tables: entities, assertions, edges, retrieval_contract, project_settings.
+-- These five tables are the handoff-core — they support the /handoff skill on
+-- any Postgres instance without app-specific extensions.
+--
+-- App-specific tables (retrieval_events with halfvec(4000), memory_entry_chunks
+-- blurb column) live in separate files and are NOT applied by this script.
 -- ============================================================================
-
--- ============================================================================
--- RETRIEVAL_EVENTS — log of every retrieval call; outcome posted by Bundle B.
--- This table is created in Bundle A because the reranker (Phase 3) begins
--- writing to it. Outcome capture (the 'outcome' column) is Bundle B scope.
--- project_id = encoded_cwd value; no DEFAULT — must be set by the writer.
--- ============================================================================
-CREATE TABLE IF NOT EXISTS retrieval_events (
-  id              SERIAL PRIMARY KEY,
-  project_id      TEXT NOT NULL,
-  query_text      TEXT NOT NULL,
-  query_embedding halfvec(4000),  -- matches memory_entry_chunks.embedding type (halfvec(4000) after Phase 1 step 5)
-  retrieved_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-  outcome         TEXT DEFAULT 'pending'
-                    CHECK (outcome IN ('pending','success','failure','irrelevant')),
-  outcome_at      TIMESTAMPTZ,
-  outcome_signal  TEXT,  -- 'user_explicit'|'user_correction'|'task_completion'|'auto_decay'|'agent_self_report'
-  session_id      TEXT,
-  notes           TEXT
-);
-CREATE INDEX IF NOT EXISTS retrieval_events_project_idx
-  ON retrieval_events (project_id);
-CREATE INDEX IF NOT EXISTS retrieval_events_outcome_idx
-  ON retrieval_events (outcome) WHERE outcome = 'pending';
-CREATE INDEX IF NOT EXISTS retrieval_events_time_idx
-  ON retrieval_events (retrieved_at DESC);
 
 
 -- ============================================================================
@@ -80,6 +59,9 @@ CREATE INDEX IF NOT EXISTS entities_name_idx
 -- Reinforcement: every retrieval bumps last_reinforced = now() (live "used" event,
 -- option a — coarser but simpler than retrieve-and-reference signal).
 --
+-- suppressed: explicit suppression flag set by /handoff:drop. Rows with
+-- suppressed = true are excluded from retrieval without deletion (recoverable).
+--
 -- project_id = encoded_cwd; no DEFAULT — set by the writer.
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS assertions (
@@ -103,6 +85,9 @@ CREATE TABLE IF NOT EXISTS assertions (
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   session_id       TEXT
 );
+-- Add suppressed column if not present (idempotent — safe on both fresh and existing DBs).
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS suppressed BOOLEAN NOT NULL DEFAULT false;
+
 CREATE INDEX IF NOT EXISTS assertions_project_idx
   ON assertions (project_id);
 CREATE INDEX IF NOT EXISTS assertions_subject_idx
@@ -179,7 +164,7 @@ CREATE TABLE IF NOT EXISTS project_settings (
 );
 
 -- Known settings keys and their hardcoded defaults (used when row is absent):
---   staleness_days      default: '7'    (days before loader triggers staleness prompt)
---   decay_rate_default  default: '0.05' (per-day decay for new assertions lacking row-level override)
---   implicit_close      default: 'enabled' ('enabled'|'disabled' — Stop-hook behavior)
---   loader_token_budget default: '4000' (total tokens the SessionStart loader may inject)
+--   staleness_days      default: '7'         (days before loader triggers staleness prompt)
+--   loader_token_budget default: '4000'      (total tokens the SessionStart loader may inject)
+--   implicit_close      default: 'enabled'   ('enabled'|'disabled' — Stop-hook behavior)
+--   decay_rate_default  default: '0.05'      (per-day decay for new assertions lacking row-level override)
