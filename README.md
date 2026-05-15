@@ -492,10 +492,43 @@ has `scripts/handoff.js` on the walk-up path:
 | `/handoff:checkpoint` | Mid-session save without ending the session |
 | `/handoff:drop` | Archive prior assertions (recoverable), start fresh handoff.md |
 | `/handoff:purge` | Hard delete all project memory (confirmation required) |
+| `/handoff:promote <id>` | Explicitly promote an assertion to CLAUDE.md durable facts |
 
 The helper (`scripts/handoff.js`) does the heavy lifting. The Markdown command
 files are thin recipes that announce `Running: handoff:<sub>` at start and
 `Done: handoff:<sub> — <one-line>` at finish.
+
+---
+
+<a id="trust-model"></a>
+
+### Trust model
+
+**Multi-author detection.** When `scripts/handoff.js init` or `scripts/handoff.js close`
+is run, the helper checks the repository's git log for distinct commit author emails over
+the past year. If more than one author is detected, it writes a one-line notice to stderr:
+
+```
+[handoff] multi-author repo detected — see README#trust-model before relying on CLAUDE.md auto-promotion
+```
+
+This notice is advisory. No behavior changes today when it fires: context injection,
+assertion storage, and CLAUDE.md promotion all work exactly as they do on single-author
+repos. The flag (`multi_author_detected = true` in `project_settings`) is available for
+future policy gates. The intent is to surface the condition once per invocation so you can
+decide whether the auto-promotion path is appropriate for your threat model.
+
+**Auto-promotion and the `/handoff:promote` alternative.** `/handoff:close` can
+automatically write high-confidence assertions (`confidence >= 9`, `source = user_stated`,
+reinforced across multiple sessions) to the `## Durable facts` section of `CLAUDE.md`.
+On a public multi-author repo, PR content may flow into Claude sessions during review;
+that content can influence assertions that then get auto-promoted to the privileged
+CLAUDE.md channel. If you prefer explicit control, pass `confirm_claude_md_promotion: false`
+in every `/handoff:close` payload and use `/handoff:promote <assertion_id>` to promote
+individual assertions after manual inspection. Every promotion — auto or explicit — writes
+an HTML comment audit annotation (`<!-- promoted: session=..., conf=..., date=...,
+source_assertion=... -->`) immediately before the fact line, so the provenance of each
+entry in `## Durable facts` is traceable.
 
 ---
 

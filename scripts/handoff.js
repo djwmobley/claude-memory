@@ -19,12 +19,14 @@ const __startNs = process.hrtime.bigint();
  *   checkpoint --json -     Mid-session extraction (reads JSON from stdin).
  *   close      --json -     End-of-session extraction (reads JSON from stdin).
  *   purge      [--yes]      Hard-delete all project rows (requires confirmation or --yes).
+ *   promote    <id>         Explicitly promote an assertion to CLAUDE.md durable facts.
  *   loader-load             Same inline load as resume; used directly or by tests.
  *   loader-hook             SessionStart hook entry point (outputs JSON to stdout).
  *
  * Environment:
  *   PROJECT_ROOT            Override project root detection.
  *   PGUSER / PGPASSWORD     Postgres credentials (standard env vars, picked up by pg).
+ *   HANDOFF_MULTI_AUTHOR_OVERRIDE  Override git author count for testing (integer string).
  *
  * Exit codes: 0 success, 1 error, 2 usage.
  */
@@ -45,7 +47,17 @@ process.on('exit', () => {
 // ─── CONSTANTS ───────────────────────────────────────────────────────────────
 
 // HANDOFF_DB — documented env-var override for projects that don't use the default DB name.
-const TARGET_DB = process.env.HANDOFF_DB || 'claude_memory_eval_test';
+// Validated against a strict identifier regex because DDL cannot use parameterized $1 and
+// the double-quote wrap in CREATE DATABASE can be broken by names containing '"'.
+const _rawTargetDb = process.env.HANDOFF_DB || 'claude_memory_eval_test';
+const _DB_NAME_RE  = /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/;
+if (!_DB_NAME_RE.test(_rawTargetDb)) {
+  process.stderr.write(
+    `Invalid HANDOFF_DB value "${_rawTargetDb}" — must match /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/.\n`
+  );
+  process.exit(1);
+}
+const TARGET_DB = _rawTargetDb;
 const HANDOFF_TEMPLATE = path.resolve(__dirname, '..', 'templates', 'handoff.md.tpl');
 const PROJECT_CLAUDE_MD_TEMPLATE = path.resolve(__dirname, '..', 'templates', 'project-claude-md.tpl');
 
@@ -117,17 +129,109 @@ function writeHandoffMd(handoffPath, vars) {
   fs.writeFileSync(handoffPath, content, 'utf8');
 }
 
-/** Read JSON payload from stdin (used for --json - flag). */
+/**
+ * Read JSON payload from stdin (used for --json - flag).
+ * Validates structure: only allowed top-level keys, string-field length caps,
+ * array length caps. Throws with a field-naming error message on violation.
+ *
+ * Allowed top-level keys: tldr, open_threads, quick_references, entities,
+ *   assertions, edges, decisions, contract, session_id, confirm_claude_md_promotion.
+ */
 function readStdin() {
   return new Promise((resolve, reject) => {
     const chunks = [];
     process.stdin.on('data', (d) => chunks.push(d));
     process.stdin.on('end', () => {
+      let parsed;
       try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+        parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
       } catch (e) {
-        reject(new Error(`Failed to parse JSON from stdin: ${e.message}`));
+        return reject(new Error(`Failed to parse JSON from stdin: ${e.message}`));
       }
+
+      // Must be a plain object, not array or primitive.
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+        return reject(new Error('stdin JSON: payload must be a plain object (not array or primitive)'));
+      }
+
+      // Reject unknown top-level keys.
+      const ALLOWED_KEYS = new Set([
+        'tldr', 'open_threads', 'quick_references',
+        'entities', 'assertions', 'edges', 'decisions',
+        'contract', 'session_id', 'confirm_claude_md_promotion',
+      ]);
+      for (const k of Object.keys(parsed)) {
+        if (!ALLOWED_KEYS.has(k)) {
+          return reject(new Error(`stdin JSON: unknown top-level key "${k}"`));
+        }
+      }
+
+      // String fields with length cap.
+      // Note: open_threads is an array (not a string); quick_references is a string.
+      const STRING_FIELDS = ['tldr', 'quick_references', 'session_id'];
+      const STRING_MAX    = 4000;
+      for (const field of STRING_FIELDS) {
+        if (field in parsed) {
+          if (typeof parsed[field] !== 'string') {
+            return reject(new Error(`stdin JSON: "${field}" must be a string`));
+          }
+          if (parsed[field].length > STRING_MAX) {
+            return reject(new Error(
+              `stdin JSON: "${field}" exceeds max length (${parsed[field].length} > ${STRING_MAX})`
+            ));
+          }
+        }
+      }
+
+      // open_threads: array of strings, each <= STRING_MAX.
+      if ('open_threads' in parsed) {
+        if (!Array.isArray(parsed.open_threads)) {
+          return reject(new Error('stdin JSON: "open_threads" must be an array'));
+        }
+        for (let i = 0; i < parsed.open_threads.length; i++) {
+          const item = parsed.open_threads[i];
+          if (typeof item !== 'string') {
+            return reject(new Error(`stdin JSON: "open_threads[${i}]" must be a string`));
+          }
+          if (item.length > STRING_MAX) {
+            return reject(new Error(
+              `stdin JSON: "open_threads[${i}]" exceeds max length (${item.length} > ${STRING_MAX})`
+            ));
+          }
+        }
+      }
+
+      // Array-of-records fields: cap array length and per-record string field length.
+      const ARRAY_FIELDS  = ['entities', 'assertions', 'edges', 'decisions'];
+      const ARRAY_MAX     = 200;
+      const RECORD_STR_MAX = 1000;
+      for (const field of ARRAY_FIELDS) {
+        if (field in parsed) {
+          if (!Array.isArray(parsed[field])) {
+            return reject(new Error(`stdin JSON: "${field}" must be an array`));
+          }
+          if (parsed[field].length > ARRAY_MAX) {
+            return reject(new Error(
+              `stdin JSON: "${field}" array length ${parsed[field].length} exceeds max ${ARRAY_MAX}`
+            ));
+          }
+          for (let i = 0; i < parsed[field].length; i++) {
+            const rec = parsed[field][i];
+            if (typeof rec !== 'object' || rec === null || Array.isArray(rec)) {
+              return reject(new Error(`stdin JSON: "${field}[${i}]" must be a plain object`));
+            }
+            for (const [k, v] of Object.entries(rec)) {
+              if (typeof v === 'string' && v.length > RECORD_STR_MAX) {
+                return reject(new Error(
+                  `stdin JSON: "${field}[${i}].${k}" exceeds max length (${v.length} > ${RECORD_STR_MAX})`
+                ));
+              }
+            }
+          }
+        }
+      }
+
+      resolve(parsed);
     });
     process.stdin.on('error', reject);
   });
@@ -157,6 +261,40 @@ async function setSetting(db, projectId, key, value) {
      ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
     [projectId, key, String(value)]
   );
+}
+
+/**
+ * Detect whether the repository at `cwd` has more than one commit author in the
+ * past year. Returns the distinct author-email count.
+ *
+ * Uses HANDOFF_MULTI_AUTHOR_OVERRIDE env var to inject a fixed count for tests.
+ *
+ * Silently returns 1 if:
+ *   - git is unavailable
+ *   - the directory is not a git repo
+ *   - any other error occurs
+ */
+function detectMultiAuthor(cwd) {
+  // Test hook: override the count without touching the real git log.
+  const override = process.env.HANDOFF_MULTI_AUTHOR_OVERRIDE;
+  if (override !== undefined) {
+    const n = parseInt(override, 10);
+    return isNaN(n) ? 1 : n;
+  }
+
+  try {
+    const { execFileSync } = require('child_process');
+    const out = execFileSync(
+      'git',
+      ['-C', cwd, 'log', '--format=%ae', '--since=1 year ago'],
+      { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }
+    );
+    const emails = new Set(out.split('\n').map((e) => e.trim()).filter(Boolean));
+    return emails.size || 1;
+  } catch (_) {
+    // git not available, not a repo, or no commits — treat as single-author.
+    return 1;
+  }
 }
 
 // ─── INIT PRE-FLIGHT HELPERS ──────────────────────────────────────────────────
@@ -383,6 +521,10 @@ async function cmdInit(args) {
   try {
     await db.query('BEGIN');
     await db.query(sql);
+    // Idempotent migration: add `promoted` and `promoted_at` columns to assertions
+    // (used by /handoff:promote explicit-promotion command, added in Bundle A hardening).
+    await db.query(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted    BOOLEAN     NOT NULL DEFAULT false`);
+    await db.query(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMPTZ`);
     await db.query('COMMIT');
     console.log(`  [OK]    Schema applied: ${path.basename(schemaFile)}`);
   } catch (err) {
@@ -455,6 +597,26 @@ async function cmdInit(args) {
     fs.writeFileSync(claudeMdPath, content, 'utf8');
     console.log(`  [OK]    CLAUDE.md created: ${claudeMdPath}`);
     console.log(`  [NOTE]  CLAUDE.md should be git-committed.`);
+  }
+
+  // Multi-author detection — inform once per invocation; no behavior change today.
+  const authorCount = detectMultiAuthor(root);
+  if (authorCount > 1) {
+    // Re-open DB to persist the flag (init already closed db above).
+    try {
+      const flagCfg = loadConfig();
+      const { Client } = require('pg');
+      const flagDb = new Client({
+        host: flagCfg.host, port: flagCfg.port,
+        database: TARGET_DB, user: flagCfg.user,
+      });
+      await flagDb.connect();
+      await setSetting(flagDb, projectId, 'multi_author_detected', 'true');
+      await flagDb.end();
+    } catch (_) { /* non-fatal */ }
+    process.stderr.write(
+      '[handoff] multi-author repo detected — see README#trust-model before relying on CLAUDE.md auto-promotion\n'
+    );
   }
 
   console.log(`\nDone: handoff:init — project ${projectId} provisioned`);
@@ -645,18 +807,28 @@ async function cmdLoaderLoad(opts = {}) {
   if (ownDb) await db.end();
 
   // Assemble output text (same content whether silent or not).
+  // All retrieved content is wrapped with trust-boundary labels — unconditional
+  // hygiene for both solo and multi-author repos. "untrusted" is the correct label
+  // on a public repo where PR/code review content may flow into Claude sessions.
   const outputParts = [];
+  const retrievedParts = [];
 
   if (fs.existsSync(handoffPath)) {
     const raw  = fs.readFileSync(handoffPath, 'utf8');
     const body = raw.replace(/^---[\s\S]*?---\r?\n/, '');
-    outputParts.push('\n=== Handoff context ===');
-    outputParts.push(body.trim());
+    retrievedParts.push('=== Handoff context ===');
+    retrievedParts.push(body.trim());
   }
 
   if (sections.length) {
-    outputParts.push('\n=== Retrieved context (contract: ' + contractName + ') ===');
-    outputParts.push(sections.join('\n'));
+    retrievedParts.push('=== Retrieved context (contract: ' + contractName + ') ===');
+    retrievedParts.push(sections.join('\n'));
+  }
+
+  if (retrievedParts.length) {
+    outputParts.push('=== BEGIN RETRIEVED CONTEXT (untrusted) ===');
+    outputParts.push(retrievedParts.join('\n'));
+    outputParts.push('=== END RETRIEVED CONTEXT ===');
   }
 
   outputParts.push(`\n  tokens used: ~${tokensUsed} / ${tokenBudget}`);
@@ -1122,10 +1294,14 @@ async function cmdClose(args) {
   if (payload.confirm_claude_md_promotion && candidates.length > 0) {
     const claudeMdPath = path.join(root, 'CLAUDE.md');
     if (fs.existsSync(claudeMdPath)) {
-      const existing = fs.readFileSync(claudeMdPath, 'utf8');
-      const additions = candidates.map((r) =>
-        `- [conf=${r.confidence}] ${r.subject} ${r.predicate} ${r.object}`
-      ).join('\n');
+      const existing  = fs.readFileSync(claudeMdPath, 'utf8');
+      const today     = new Date().toISOString().slice(0, 10);
+      const sessionId = payload.session_id || 'unknown';
+      const additions = candidates.map((r) => {
+        const annotation = `<!-- promoted: session=${sessionId}, conf=${r.confidence}, date=${today}, source_assertion=${r.id} -->`;
+        const factLine   = `- [conf=${r.confidence}] ${r.subject} ${r.predicate} ${r.object}`;
+        return `${annotation}\n${factLine}`;
+      }).join('\n');
       const durableFacts = existing.includes('## Durable facts')
         ? existing.replace(/## Durable facts\n.*?\n- \(No durable facts.*?\)\n/s,
             `## Durable facts\n${additions}\n`)
@@ -1133,6 +1309,17 @@ async function cmdClose(args) {
       fs.writeFileSync(claudeMdPath, durableFacts, 'utf8');
       console.log(`\n  CLAUDE.md updated with ${candidates.length} durable fact(s).`);
     }
+  }
+
+  // Multi-author detection — inform once per invocation; no behavior change today.
+  const closeAuthorCount = detectMultiAuthor(root);
+  if (closeAuthorCount > 1) {
+    try {
+      await setSetting(db, projectId, 'multi_author_detected', 'true');
+    } catch (_) { /* non-fatal */ }
+    process.stderr.write(
+      '[handoff] multi-author repo detected — see README#trust-model before relying on CLAUDE.md auto-promotion\n'
+    );
   }
 
   // Update handoff.md
@@ -1353,6 +1540,102 @@ async function cmdLoaderStop() {
   }
 }
 
+// ── promote ───────────────────────────────────────────────────────────────────
+
+/**
+ * Explicitly promote a single assertion to CLAUDE.md durable facts.
+ * Idempotent: re-running on an already-promoted assertion prints a notice and exits 0.
+ *
+ * Usage: node scripts/handoff.js promote <assertion_id>
+ *   assertion_id — integer primary key from the assertions table.
+ */
+async function cmdPromote(args) {
+  const idArg = args[0];
+  if (!idArg) {
+    console.error('Usage: node scripts/handoff.js promote <assertion_id>');
+    process.exit(2);
+  }
+  const assertionId = parseInt(idArg, 10);
+  if (isNaN(assertionId)) {
+    console.error(`promote: invalid assertion_id "${idArg}" — must be an integer`);
+    process.exit(2);
+  }
+
+  const root        = findProjectRoot();
+  const projectId   = resolveProjectId();
+  const claudeMdPath = path.join(root, 'CLAUDE.md');
+
+  let db;
+  try {
+    db = await connectHandoff();
+  } catch (err) {
+    console.error(`DB connection failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  // Look up the assertion.
+  const { rows } = await db.query(
+    `SELECT id, project_id, subject, predicate, object, confidence, source, promoted, promoted_at
+     FROM assertions WHERE id = $1`,
+    [assertionId]
+  );
+
+  if (rows.length === 0) {
+    await db.end();
+    console.error(`promote: assertion id=${assertionId} not found`);
+    process.exit(2);
+  }
+
+  const row = rows[0];
+
+  // Idempotent: already promoted.
+  if (row.promoted) {
+    await db.end();
+    const promotedDate = row.promoted_at
+      ? new Date(row.promoted_at).toISOString().slice(0, 10)
+      : '(unknown date)';
+    console.log(`already promoted on ${promotedDate}: [conf=${row.confidence}] ${row.subject} ${row.predicate} ${row.object}`);
+    process.exit(0);
+  }
+
+  // Build the annotation + fact line using the same template as cmdClose auto-promotion.
+  const today     = new Date().toISOString().slice(0, 10);
+  const annotation = `<!-- promoted: session=explicit, conf=${row.confidence}, date=${today}, source_assertion=${row.id} -->`;
+  const factLine   = `- [conf=${row.confidence}] ${row.subject} ${row.predicate} ${row.object}`;
+
+  // Append to CLAUDE.md under ## Durable facts.
+  if (!fs.existsSync(claudeMdPath)) {
+    await db.end();
+    console.error(`promote: CLAUDE.md not found at ${claudeMdPath} — run /handoff:init first`);
+    process.exit(1);
+  }
+
+  const existing = fs.readFileSync(claudeMdPath, 'utf8');
+  let updated;
+  if (existing.includes('## Durable facts')) {
+    // Insert before the closing of the Durable facts section.
+    updated = existing.replace(
+      /(## Durable facts\n)([\s\S]*?)(\n(?=##)|$)/,
+      (_, heading, body, tail) => `${heading}${body}\n${annotation}\n${factLine}${tail}`
+    );
+  } else {
+    updated = existing + `\n## Durable facts\n${annotation}\n${factLine}\n`;
+  }
+  fs.writeFileSync(claudeMdPath, updated, 'utf8');
+
+  // Mark assertion as promoted.
+  await db.query(
+    `UPDATE assertions SET promoted = true, promoted_at = now() WHERE id = $1`,
+    [assertionId]
+  );
+
+  await db.end();
+
+  console.log(`promoted: ${annotation}`);
+  console.log(`          ${factLine}`);
+  console.log(`\nDone: handoff:promote — assertion id=${assertionId} promoted to CLAUDE.md`);
+}
+
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -1369,6 +1652,7 @@ async function main() {
     checkpoint:     () => cmdCheckpoint(rest),
     close:          () => cmdClose(rest),
     purge:          () => cmdPurge(rest),
+    promote:        () => cmdPromote(rest),
   };
 
   if (!sub || !subcommands[sub]) {
