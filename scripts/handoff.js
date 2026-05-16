@@ -654,6 +654,16 @@ async function cmdInit(args) {
     feedback_failure_delta:           '-0.75', // bias nudge per failure outcome
     feedback_irrelevant_delta:        '-0.25', // bias nudge per irrelevant outcome (smaller penalty)
     feedback_bias_clamp:              '3.0',   // max absolute value of outcome_bias ∈ [-clamp, +clamp]
+    // C3: auto-evolve retrieval_contract from retrieval_events outcome patterns (default OFF).
+    // Fully independent of feedback_loop_enabled — evolution can be evaluated even when bias
+    // feedback is disabled (uses only retrieval_events.outcome, not assertions.outcome_bias).
+    // When 'disabled', zero contract mutation occurs — cmdClose output byte-identical to pre-C3.
+    contract_evolution_enabled:       'disabled',
+    contract_evolution_window_days:   '30',    // rolling window for outcome aggregation
+    contract_evolution_min_events:    '10',    // minimum events per kind before any rule fires
+    contract_evolution_failure_threshold: '0.5', // failure+irrelevant rate that triggers budget reduction
+    contract_evolution_budget_floor:  '200',   // minimum token_budget for any kind (never reduced below)
+    contract_evolution_budget_step:   '200',   // max budget change per evolution pass (gradual, bounded)
   };
   for (const [key, val] of Object.entries(defaults)) {
     await db.query(
@@ -1740,6 +1750,199 @@ async function cmdClose(args) {
   } catch (feedbackErr) {
     // Fully non-fatal: any error here must not break cmdClose.
     process.stderr.write(`[handoff] C2 feedback application failed (non-fatal): ${feedbackErr.message}\n`);
+  }
+
+  // ── C3: Learnable contracts — auto-evolve retrieval_contract from outcome patterns ─────────────
+  //
+  // Rules engine executed at close (non-fatal, fully gated). Fires only when
+  // contract_evolution_enabled='enabled'. When not 'enabled', zero contract mutation occurs
+  // and cmdClose output/behavior is byte-identical to pre-C3.
+  //
+  // Gate is INDEPENDENT of feedback_loop_enabled: contract evolution is driven purely by
+  // retrieval_events.outcome aggregated per query kind, not by assertions.outcome_bias.
+  // This means evolution can be evaluated even when the C2 bias feedback loop is off.
+  //
+  // Evolution rule set (deterministic, documented):
+  //
+  //   RULE 1 — UNDERPERFORMING KIND BUDGET REDUCTION:
+  //     For each kind present in recent retrieval events (within the rolling window):
+  //       If kind's (failure + irrelevant) rate > failure_threshold
+  //         AND sample count >= min_events:
+  //       → Reduce that kind's token_budget by budget_step (bounded below by budget_floor).
+  //       Applied to at most one kind per pass (the worst performer) — gradual, recoverable.
+  //
+  //   RULE 2 — REALLOCATION TO BEST PERFORMER:
+  //     Simultaneously with Rule 1, if a reduction was made:
+  //       The best-performing kind (lowest failure+irrelevant rate, >= min_events) gains
+  //       the budget that was removed from the underperformer, capped so total budget stays
+  //       within the original contract envelope (sum of all kind budgets unchanged).
+  //
+  //   INVARIANTS:
+  //     - No kind is ever deleted (min budget floor enforced, not zero).
+  //     - Total token budget stays within the original envelope (±budget_step rounding).
+  //     - At most one budget reduction per close pass (gradual — bad signal is recoverable via rollback CLI).
+  //     - If the worst performer's kind is not present in the live contract, no evolution occurs.
+  //     - Evolution is skipped when any kind has fewer than min_events in the window (thin data guard).
+  //
+  // Idempotency: marker key 'contract_evolved:<sessionId>' in project_settings prevents
+  // re-evaluation for a session that has already been processed.
+  //
+  // Non-fatal: any failure inside this block is caught and logged to stderr; cmdClose continues.
+  // Rollback: use `node scripts/bundleb-w4-contract.js rollback <prior_version>` to revert.
+  try {
+    const evolutionEnabled = await getSetting(db, projectId, 'contract_evolution_enabled', 'disabled');
+    if (evolutionEnabled === 'enabled') {
+      // Resolve session id (same approach as C2 — payload takes precedence, then DB marker).
+      const evolSessionId = (typeof payload.session_id === 'string' && payload.session_id.length > 0)
+        ? payload.session_id
+        : await getSetting(db, projectId, 'session_in_progress', null);
+
+      if (!evolSessionId) {
+        process.stderr.write('[handoff] C3 evolution: no session id resolvable — skipping\n');
+      } else {
+        // Idempotency check: skip if we already processed this session.
+        const evolMarkerKey   = `contract_evolved:${evolSessionId}`;
+        const alreadyEvolved  = await getSetting(db, projectId, evolMarkerKey, null);
+        if (alreadyEvolved !== null) {
+          console.log(`  C3 evolution: already applied for session ${evolSessionId} — skipping (idempotent)`);
+        } else {
+          // Read tunable parameters.
+          const windowDays        = parseInt(await getSetting(db, projectId, 'contract_evolution_window_days',        '30'),  10);
+          const minEvents         = parseInt(await getSetting(db, projectId, 'contract_evolution_min_events',         '10'),  10);
+          const failureThreshold  = parseFloat(await getSetting(db, projectId, 'contract_evolution_failure_threshold', '0.5'));
+          const budgetFloor       = parseInt(await getSetting(db, projectId, 'contract_evolution_budget_floor',       '200'), 10);
+          const budgetStep        = parseInt(await getSetting(db, projectId, 'contract_evolution_budget_step',         '200'), 10);
+
+          // Read the active contract name from handoff.md frontmatter (mirrors loader logic).
+          const evolFm       = readHandoffFrontmatter(resolveHandoffMdPath(projectId));
+          const contractName = evolFm.contract || 'default';
+
+          // Load the live contract.
+          const { rows: rcRows } = await db.query(
+            `SELECT queries, version FROM retrieval_contract
+             WHERE project_id = $1 AND name = $2`,
+            [projectId, contractName]
+          );
+          if (rcRows.length === 0) {
+            process.stderr.write(`[handoff] C3 evolution: contract '${contractName}' not found — skipping\n`);
+          } else {
+            const liveContract = rcRows[0].queries;
+            const liveQueries  = Array.isArray(liveContract) ? liveContract : (liveContract.queries || []);
+
+            // Only proceed if the contract has at least one query with a token_budget.
+            const queriesWithBudget = liveQueries.filter((q) => typeof q.token_budget === 'number');
+            if (queriesWithBudget.length === 0) {
+              process.stderr.write(`[handoff] C3 evolution: contract '${contractName}' has no queries with token_budget — skipping\n`);
+            } else {
+              // Aggregate outcome counts per kind from retrieval_events in the rolling window.
+              // query_text encodes kinds as 'loader:contract=<name>;kinds=<k1,k2,...>;sections=<n>'.
+              // We extract individual kind tokens by splitting on commas and semicolons.
+              const { rows: evtRows } = await db.query(
+                `SELECT query_text, outcome
+                 FROM retrieval_events
+                 WHERE project_id = $1
+                   AND outcome IN ('success', 'failure', 'irrelevant')
+                   AND retrieved_at >= now() - ($2 || ' days')::interval`,
+                [projectId, String(windowDays)]
+              );
+
+              // Parse per-kind outcome counts from query_text.
+              // Format: 'loader:contract=<name>;kinds=<k1,k2,...>;sections=<n>'
+              const kindStats = {};  // kind → { success, failure, irrelevant, total }
+              for (const row of evtRows) {
+                const kindsMatch = (row.query_text || '').match(/kinds=([^;]+)/);
+                if (!kindsMatch) continue;
+                const kinds = kindsMatch[1].split(',').map((k) => k.trim()).filter(Boolean);
+                for (const kind of kinds) {
+                  if (!kindStats[kind]) kindStats[kind] = { success: 0, failure: 0, irrelevant: 0, total: 0 };
+                  if (row.outcome === 'success')    kindStats[kind].success++;
+                  if (row.outcome === 'failure')    kindStats[kind].failure++;
+                  if (row.outcome === 'irrelevant') kindStats[kind].irrelevant++;
+                  kindStats[kind].total++;
+                }
+              }
+
+              // Identify kinds that meet the minimum event threshold.
+              const qualifyingKinds = Object.entries(kindStats).filter(([, s]) => s.total >= minEvents);
+
+              if (qualifyingKinds.length === 0) {
+                console.log(`  C3 evolution: insufficient data (all kinds below min_events=${minEvents} in ${windowDays}d window) — no evolution`);
+              } else {
+                // Compute failure rate per qualifying kind.
+                const ratedKinds = qualifyingKinds.map(([kind, s]) => ({
+                  kind,
+                  total:       s.total,
+                  failureRate: (s.failure + s.irrelevant) / s.total,
+                }));
+
+                // Sort descending by failure rate (worst first).
+                ratedKinds.sort((a, b) => b.failureRate - a.failureRate);
+                const worstKind = ratedKinds[0];
+                const bestKind  = ratedKinds[ratedKinds.length - 1];
+
+                if (worstKind.failureRate <= failureThreshold) {
+                  console.log(`  C3 evolution: no kind exceeds failure threshold ${failureThreshold} (worst: ${worstKind.kind} @ ${worstKind.failureRate.toFixed(2)}) — no evolution`);
+                } else if (worstKind.kind === bestKind.kind) {
+                  console.log(`  C3 evolution: only one qualifying kind; cannot reallocate — no evolution`);
+                } else {
+                  // Find the underperformer and best performer in the live contract queries.
+                  const worstIdx = liveQueries.findIndex((q) => (q.kind || q.type) === worstKind.kind);
+                  const bestIdx  = liveQueries.findIndex((q) => (q.kind || q.type) === bestKind.kind);
+
+                  if (worstIdx === -1) {
+                    process.stderr.write(`[handoff] C3 evolution: worst kind '${worstKind.kind}' not in live contract — skipping\n`);
+                  } else {
+                    // Clone queries for mutation.
+                    const newQueries = liveQueries.map((q) => Object.assign({}, q));
+
+                    const currentBudget = typeof newQueries[worstIdx].token_budget === 'number'
+                      ? newQueries[worstIdx].token_budget : 0;
+                    const actualReduction = Math.min(budgetStep, Math.max(0, currentBudget - budgetFloor));
+
+                    if (actualReduction === 0) {
+                      console.log(`  C3 evolution: '${worstKind.kind}' already at budget floor (${budgetFloor}) — no evolution`);
+                    } else {
+                      // Apply reduction to worst kind.
+                      newQueries[worstIdx] = Object.assign({}, newQueries[worstIdx], {
+                        token_budget: currentBudget - actualReduction,
+                      });
+
+                      // Reallocate gained budget to best kind (if in contract and different from worst).
+                      if (bestIdx !== -1 && bestIdx !== worstIdx) {
+                        const bestCurrent = typeof newQueries[bestIdx].token_budget === 'number'
+                          ? newQueries[bestIdx].token_budget : 0;
+                        newQueries[bestIdx] = Object.assign({}, newQueries[bestIdx], {
+                          token_budget: bestCurrent + actualReduction,
+                        });
+                      }
+
+                      const newQueriesObj = { queries: newQueries };
+                      const changeNote = [
+                        `auto-evolve: reduced '${worstKind.kind}' by ${actualReduction}`,
+                        bestIdx !== -1 && bestIdx !== worstIdx
+                          ? ` → reallocated to '${bestKind.kind}'`
+                          : '',
+                        ` (failureRate=${worstKind.failureRate.toFixed(2)}>threshold=${failureThreshold},`,
+                        ` window=${windowDays}d, n=${worstKind.total})`,
+                      ].join('');
+
+                      await recordContractChange(db, projectId, contractName, newQueriesObj, changeNote);
+                      console.log(`  C3 evolution: applied — ${changeNote}`);
+
+                      // Write idempotency marker.
+                      await setSetting(db, projectId, evolMarkerKey, new Date().toISOString());
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  } catch (evolutionErr) {
+    // Fully non-fatal: any error here must not break cmdClose.
+    process.stderr.write(`[handoff] C3 contract evolution failed (non-fatal): ${evolutionErr.message}\n`);
   }
 
   // Clear session_in_progress marker

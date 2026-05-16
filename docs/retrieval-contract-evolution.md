@@ -163,29 +163,168 @@ node scripts/bundleb-w4-contract.js rollback 1
 
 ---
 
-## Automated / learnable contract evolution — out of scope (precondition)
+## Automated / learnable contract evolution — Bundle C3
 
-Learning the optimal contract from retrieval outcomes — automatically adjusting query order,
-token budgets, or query kinds based on whether retrievals led to useful session context — requires
-the **W1 outcome→ranking feedback loop to be closed**.
+**Status: implemented and shipped.** The precondition described in the original note (W1 loop
+closed, outcomes captured per session) was fulfilled by Bundles B W1 through C2. Bundle C3 adds
+the rules engine that automatically adjusts query `token_budget` values based on observed outcome
+patterns in `retrieval_events`. It is **fully gated** (default OFF) and **byte-identical when
+disabled**.
 
-This means: (a) retrieval outcomes (`success`/`failure`/`irrelevant`) must be reliably captured
-per session, (b) a signal-processing layer must correlate outcomes with specific query
-configurations, and (c) a controller must translate that correlation into contract updates.
+---
 
-**W1 is currently observability-only** by owner-confirmed decision: the retrieval event logger
-and outcome capture ship in W1, but the ranking/adaptation loop does not. This is not a
-technical limitation — it is a deliberate scope boundary set by the project owner. The W1
-outcome data is captured and available in `retrieval_events`, but no automated controller reads
-it to evolve the contract.
+### The closed feedback loop end-to-end
 
-**This is a recorded precondition, not a silent deferral.** Automated contract evolution is
-explicitly gated on the owner deciding to close the W1 loop. If and when that decision is made,
-the implementation path is:
+```
+Session load (C1) → retrieval_events row + retrieval_event_assertions attribution
+       ↓
+Session close (W1 outcome capture) → outcome stamped on retrieval_events rows
+       ↓
+Session close (C2) → outcome_bias on assertions nudged ± per kind feedback
+       ↓
+Session close (C3) → contract token_budget evolved from per-kind outcome rates
+       ↓
+Next session load → new budgets drive retrieval; loop restarts
+```
 
-1. Build an aggregation layer over `retrieval_events` that computes per-query outcome statistics.
-2. Build a controller that proposes contract mutations based on those statistics.
-3. Wire the controller into `/handoff:close` (or a scheduled job) so mutations are applied
-   automatically with full history recording via `recordContractChange()`.
+All three stages fire at `/handoff:close` in sequence. Each stage is independently gated.
 
-Until then, the contract evolves **manually** using the procedure above.
+---
+
+### C3 gate setting
+
+| Setting key                    | Default     | Description                                                    |
+|-------------------------------|-------------|----------------------------------------------------------------|
+| `contract_evolution_enabled`  | `'disabled'`| Master gate. `'enabled'` activates the rules engine at close. |
+| `contract_evolution_window_days` | `'30'`  | Rolling window (days) for outcome aggregation.                 |
+| `contract_evolution_min_events`  | `'10'`  | Min events per kind before any rule may fire (thin-data guard).|
+| `contract_evolution_failure_threshold` | `'0.5'` | Failure+irrelevant rate that triggers budget reduction.   |
+| `contract_evolution_budget_floor`   | `'200'` | Min `token_budget` for any kind. Never reduced below this.    |
+| `contract_evolution_budget_step`    | `'200'` | Max budget change per evolution pass (gradual, bounded).       |
+
+**Gate independence:** `contract_evolution_enabled` is completely independent of
+`feedback_loop_enabled` (C2). You can enable either or both. When both are enabled, C2 bias
+feedback and C3 budget evolution both fire at close. When C3 is `'disabled'`, **zero contract
+mutation occurs** — `cmdClose` output is byte-identical to pre-C3.
+
+Enable via project settings:
+
+```bash
+psql -d claude_memory_eval_test -c \
+  "INSERT INTO project_settings (project_id, key, value)
+   VALUES ('<your_project_id>', 'contract_evolution_enabled', 'enabled')
+   ON CONFLICT (project_id, key) DO UPDATE SET value = 'enabled'"
+```
+
+---
+
+### Evolution rule set (exact, deterministic)
+
+Two rules fire per pass. Both are bounded; at most one budget reduction occurs per close.
+
+**RULE 1 — Underperforming kind budget reduction:**
+
+For each `kind` that appears in `retrieval_events.query_text` within the rolling window
+(`kinds=<k1,k2,...>` field in the encoded query text):
+
+- Compute `failure_rate = (failure_count + irrelevant_count) / total_count`.
+- If `failure_rate > failure_threshold` AND `total_count >= min_events`:
+  - Find the kind's `token_budget` in the live contract.
+  - Compute `reduction = min(budget_step, max(0, current_budget - budget_floor))`.
+  - If `reduction > 0`: apply the reduction to the worst-performing kind (highest failure rate).
+  - **At most one kind is reduced per pass** (the single worst performer).
+
+**RULE 2 — Reallocation to best performer:**
+
+Simultaneously with Rule 1:
+
+- If a reduction was applied and the best-performing kind (lowest failure rate, qualifying) is
+  a different entry in the contract, add the `reduction` amount to the best performer's budget.
+- This keeps the total budget envelope constant.
+
+**Invariants enforced:**
+
+- No kind is ever deleted (budget floor is > 0 by default).
+- `token_budget` for the reduced kind is always `>= budget_floor`.
+- Total budget across all kinds is unchanged (reallocation is exact).
+- At most one reduction per close pass (gradual, recoverable).
+- No evolution if the worst-failing kind is not present in the live contract queries.
+- No evolution if any qualifying kind has fewer than `min_events` in the window.
+
+---
+
+### Idempotency
+
+C3 uses the same marker pattern as C2. After a successful evolution pass, the key
+`contract_evolved:<sessionId>` is written to `project_settings`. A re-run of `cmdClose` with
+the same `session_id` detects the marker and skips the rules engine entirely — no second
+contract change is written. The output will include `"C3 evolution: already applied for session
+<id> — skipping (idempotent)"`.
+
+---
+
+### Non-fatal guarantees
+
+The entire C3 block in `cmdClose` is wrapped in a `try/catch`. Any failure — DB error, missing
+contract row, malformed query text, unexpected exception — logs to stderr and returns without
+interrupting `cmdClose`. The session close always completes. The worst failure mode is a missed
+evolution pass; it is logged and retried on the next close.
+
+---
+
+### Inspecting evolution history
+
+Every evolution pass calls `recordContractChange()`, which writes a history row with a
+structured `change_note`:
+
+```
+auto-evolve: reduced '<kind>' by <amount> → reallocated to '<best_kind>'
+(failureRate=<x.xx>>threshold=<y>,  window=<d>d, n=<events>)
+```
+
+Inspect via the W4 CLI:
+
+```bash
+# List all versions and their change notes
+node scripts/bundleb-w4-contract.js list
+
+# Show the queries at a specific version
+node scripts/bundleb-w4-contract.js show 3
+
+# Compare two versions
+node scripts/bundleb-w4-contract.js diff 2 3
+```
+
+---
+
+### Rolling back an auto-evolved contract
+
+Use the existing W4 rollback CLI. Rollback is non-destructive: it creates a new version entry
+whose queries equal the target version's queries:
+
+```bash
+# Revert to version 2
+node scripts/bundleb-w4-contract.js rollback 2
+```
+
+History is always preserved. After rollback, the next evolution pass (if gate is still enabled)
+will start from the rolled-back queries. If you want to prevent re-evolution of the same
+pattern, tune the threshold or disable the gate:
+
+```bash
+psql -d claude_memory_eval_test -c \
+  "UPDATE project_settings SET value = 'disabled'
+   WHERE project_id = '<your_project_id>'
+     AND key = 'contract_evolution_enabled'"
+```
+
+---
+
+### Gate interaction summary
+
+| `feedback_loop_enabled` | `contract_evolution_enabled` | Behavior at close                                       |
+|------------------------|-----------------------------|---------------------------------------------------------|
+| `disabled`             | `disabled`                  | No feedback, no evolution. Byte-identical to pre-C2.    |
+| `enabled`              | `disabled`                  | C2 bias feedback runs; no contract mutation.            |
+| `disabled`             | `enabled`                   | C3 budget evolution runs using raw outcome counts only. |
+| `enabled`              | `enabled`                   | Both C2 bias and C3 budget evolution run (full loop).   |

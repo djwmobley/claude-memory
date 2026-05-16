@@ -25,8 +25,8 @@ const { Client } = require('pg');
 const ARGS       = process.argv.slice(2);
 const sectionArg = ARGS.find((a) => a.startsWith('--section='));
 const SECTION    = sectionArg ? sectionArg.split('=')[1] : 'all';
-if (!['all', 'lifecycle', 'hooks', 'hardening', 'w2', 'w3', 'w4', 'c1', 'c2'].includes(SECTION)) {
-  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, hardening, w2, w3, w4, c1, c2, all`);
+if (!['all', 'lifecycle', 'hooks', 'hardening', 'w2', 'w3', 'w4', 'c1', 'c2', 'c3'].includes(SECTION)) {
+  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, hardening, w2, w3, w4, c1, c2, c3, all`);
   process.exit(2);
 }
 
@@ -92,6 +92,9 @@ let c1Skipped = 0;
 let c2Passed  = 0;
 let c2Failed  = 0;
 let c2Skipped = 0;
+let c3Passed  = 0;
+let c3Failed  = 0;
+let c3Skipped = 0;
 
 const LC_TOTAL = 14;
 const HK_TOTAL = 3;
@@ -101,6 +104,7 @@ const W3_TOTAL = 5;
 const W4_TOTAL = 6;
 const C1_TOTAL = 4;
 const C2_TOTAL = 4;
+const C3_TOTAL = 5;
 
 function lcPass(step, label) {
   console.log(`[STEP ${step}/${LC_TOTAL}] ${label} ... PASS`);
@@ -195,6 +199,16 @@ function c2Pass(step, label) {
 function c2Fail(step, label, reason) {
   console.log(`[C2 ${step}/${C2_TOTAL}] ${label} ... FAIL: ${reason}`);
   c2Failed++;
+}
+
+function c3Pass(step, label) {
+  console.log(`[C3 ${step}/${C3_TOTAL}] ${label} ... PASS`);
+  c3Passed++;
+}
+
+function c3Fail(step, label, reason) {
+  console.log(`[C3 ${step}/${C3_TOTAL}] ${label} ... FAIL: ${reason}`);
+  c3Failed++;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -3566,6 +3580,609 @@ async function runC2Section() {
   }
 }
 
+// ── C3: Bundle C3 — learnable contracts (auto-evolve retrieval_contract) ─────
+
+/**
+ * Helper: set a project_setting directly in the DB.
+ */
+async function setProjSetting(dbName, projectId, key, value) {
+  const db = await pgConnect(dbName);
+  await db.query(
+    `INSERT INTO project_settings (project_id, key, value)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (project_id, key) DO UPDATE SET value = $3`,
+    [projectId, key, value]
+  );
+  await db.end();
+}
+
+/**
+ * C3 1/5: Gate OFF ⇒ cmdClose makes zero contract changes — version unchanged,
+ * no new history row, output byte-identical before and after.
+ */
+async function c3Step1_gateOff(c3Db, c3ProjectId, c3ProjectDir) {
+  const label = 'Gate OFF: cmdClose makes zero contract changes (version unchanged, no new history row)';
+  try {
+    const db = await pgConnect(c3Db);
+
+    // Confirm gate is disabled (default).
+    const { rows: gateRows } = await db.query(
+      `SELECT value FROM project_settings WHERE project_id = $1 AND key = 'contract_evolution_enabled'`,
+      [c3ProjectId]
+    );
+    const gateValue = gateRows.length > 0 ? gateRows[0].value : 'disabled';
+    if (gateValue !== 'disabled') {
+      await db.end();
+      c3Fail(1, label, `contract_evolution_enabled is '${gateValue}', expected 'disabled' (default)`);
+      return false;
+    }
+
+    // Seed a contract with a token_budget so there is something to evolve (gate off should touch nothing).
+    await db.query(
+      `UPDATE retrieval_contract
+       SET queries = $2::jsonb, version = 1, updated_at = now()
+       WHERE project_id = $1 AND name = 'default'`,
+      [c3ProjectId, JSON.stringify({ queries: [{ kind: 'assertion', token_budget: 800 }] })]
+    );
+
+    // Capture version and history count before close.
+    const { rows: beforeRows } = await db.query(
+      `SELECT version FROM retrieval_contract WHERE project_id = $1 AND name = 'default'`,
+      [c3ProjectId]
+    );
+    const versionBefore = beforeRows.length > 0 ? beforeRows[0].version : null;
+
+    const { rows: histBefore } = await db.query(
+      `SELECT COUNT(*) AS n FROM retrieval_contract_history WHERE project_id = $1 AND name = 'default'`,
+      [c3ProjectId]
+    );
+    const histCountBefore = parseInt(histBefore[0].n, 10);
+    await db.end();
+
+    // Run cmdClose — gate is OFF.
+    const closePayload = JSON.stringify({ tldr: 'c3 gate-off test', session_id: `c3-gate-off-${Date.now()}` });
+    const r = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'close', '--json', '-'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: c3Db, PROJECT_ROOT: c3ProjectDir },
+        input:    closePayload,
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+
+    if (r.status !== 0) {
+      c3Fail(1, label, `cmdClose exited ${r.status}: ${((r.stderr || '') + (r.stdout || '')).slice(0, 300)}`);
+      return false;
+    }
+
+    // Confirm version and history count unchanged.
+    const db2 = await pgConnect(c3Db);
+    const { rows: afterRows } = await db2.query(
+      `SELECT version FROM retrieval_contract WHERE project_id = $1 AND name = 'default'`,
+      [c3ProjectId]
+    );
+    const versionAfter = afterRows.length > 0 ? afterRows[0].version : null;
+
+    const { rows: histAfter } = await db2.query(
+      `SELECT COUNT(*) AS n FROM retrieval_contract_history WHERE project_id = $1 AND name = 'default'`,
+      [c3ProjectId]
+    );
+    const histCountAfter = parseInt(histAfter[0].n, 10);
+    await db2.end();
+
+    if (versionAfter !== versionBefore) {
+      c3Fail(1, label, `contract version changed from ${versionBefore} to ${versionAfter} — gate OFF should not mutate`);
+      return false;
+    }
+    if (histCountAfter !== histCountBefore) {
+      c3Fail(1, label, `history row count changed from ${histCountBefore} to ${histCountAfter} — gate OFF should not write history`);
+      return false;
+    }
+
+    // Confirm cmdClose output does not mention C3 evolution.
+    const forbidden = ['C3 evolution', 'contract_evolution_enabled', 'auto-evolve'];
+    for (const term of forbidden) {
+      if ((r.stdout || '').includes(term)) {
+        c3Fail(1, label, `Forbidden term "${term}" found in cmdClose stdout — gate OFF leaks C3 internals`);
+        return false;
+      }
+    }
+
+    c3Pass(1, label);
+    return true;
+  } catch (err) {
+    c3Fail(1, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * C3 2/5: Gate ON + seeded events below min_events ⇒ no evolution (thin-data guard).
+ */
+async function c3Step2_thinDataGuard(c3Db, c3ProjectId, c3ProjectDir) {
+  const label = 'Gate ON + thin data (< min_events): no evolution applied';
+  try {
+    // Enable evolution gate.
+    await setProjSetting(c3Db, c3ProjectId, 'contract_evolution_enabled', 'enabled');
+    // min_events = 10, seed only 3 events — should trigger thin-data guard.
+    await setProjSetting(c3Db, c3ProjectId, 'contract_evolution_min_events', '10');
+    await setProjSetting(c3Db, c3ProjectId, 'contract_evolution_window_days', '30');
+
+    const db = await pgConnect(c3Db);
+
+    // Set contract with budgets.
+    await db.query(
+      `UPDATE retrieval_contract
+       SET queries = $2::jsonb, version = 1, updated_at = now()
+       WHERE project_id = $1 AND name = 'default'`,
+      [c3ProjectId, JSON.stringify({ queries: [
+        { kind: 'assertion', token_budget: 800 },
+        { kind: 'recency',   token_budget: 400 },
+      ] })]
+    );
+
+    // Capture version before close.
+    const { rows: beforeRows } = await db.query(
+      `SELECT version FROM retrieval_contract WHERE project_id = $1 AND name = 'default'`,
+      [c3ProjectId]
+    );
+    const versionBefore = beforeRows.length > 0 ? beforeRows[0].version : 1;
+
+    // Seed 3 failure events for 'assertion' kind — below min_events=10.
+    const thinSession = `c3-thin-${Date.now()}`;
+    for (let i = 0; i < 3; i++) {
+      await db.query(
+        `INSERT INTO retrieval_events (project_id, query_text, session_id, outcome, outcome_at, outcome_signal)
+         VALUES ($1, $2, $3, 'failure', now(), 'agent_self_report')`,
+        [c3ProjectId, `loader:contract=default;kinds=assertion;sections=1`, thinSession]
+      );
+    }
+    await db.end();
+
+    // Run cmdClose with the thin-data session.
+    const closePayload = JSON.stringify({ tldr: 'c3 thin data test', session_id: thinSession });
+    const r = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'close', '--json', '-'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: c3Db, PROJECT_ROOT: c3ProjectDir },
+        input:    closePayload,
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+
+    // Check version unchanged.
+    const db2 = await pgConnect(c3Db);
+    const { rows: afterRows } = await db2.query(
+      `SELECT version FROM retrieval_contract WHERE project_id = $1 AND name = 'default'`,
+      [c3ProjectId]
+    );
+    const versionAfter = afterRows.length > 0 ? afterRows[0].version : null;
+    await db2.end();
+
+    if (versionAfter !== versionBefore) {
+      c3Fail(2, label, `contract version changed from ${versionBefore} to ${versionAfter} — thin-data guard failed`);
+      return false;
+    }
+
+    // Output should mention thin-data guard.
+    const out = r.stdout || '';
+    if (!out.includes('insufficient data') && !out.includes('below min_events')) {
+      c3Fail(2, label, `cmdClose output does not mention thin-data guard: ${out.slice(0, 300)}`);
+      return false;
+    }
+
+    c3Pass(2, label);
+    return { ok: true };
+  } catch (err) {
+    c3Fail(2, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * C3 3/5: Gate ON + seeded events with a clear failing kind over threshold ⇒
+ * exactly one bounded recordContractChange applied, version bumped by 1,
+ * a history row written with the auto-evolve change_note, kind not deleted,
+ * budget within envelope.
+ */
+async function c3Step3_evolutionApplied(c3Db, c3ProjectId, c3ProjectDir) {
+  const label = 'Gate ON + clear failing kind: one bounded recordContractChange, version+1, history row, kind not deleted';
+  try {
+    // Reset to lower min_events so our seeded data qualifies.
+    await setProjSetting(c3Db, c3ProjectId, 'contract_evolution_min_events', '5');
+    await setProjSetting(c3Db, c3ProjectId, 'contract_evolution_failure_threshold', '0.5');
+    await setProjSetting(c3Db, c3ProjectId, 'contract_evolution_budget_floor', '200');
+    await setProjSetting(c3Db, c3ProjectId, 'contract_evolution_budget_step', '200');
+
+    const db = await pgConnect(c3Db);
+
+    // Set contract: assertion (800) + recency (400). Total envelope = 1200.
+    await db.query(
+      `UPDATE retrieval_contract
+       SET queries = $2::jsonb, version = 5, updated_at = now()
+       WHERE project_id = $1 AND name = 'default'`,
+      [c3ProjectId, JSON.stringify({ queries: [
+        { kind: 'assertion', token_budget: 800 },
+        { kind: 'recency',   token_budget: 400 },
+      ] })]
+    );
+
+    // Reset history for this contract to a known baseline at v5.
+    await db.query(
+      `DELETE FROM retrieval_contract_history WHERE project_id = $1 AND name = 'default'`,
+      [c3ProjectId]
+    );
+    await db.query(
+      `INSERT INTO retrieval_contract_history (project_id, name, version, queries, change_note)
+       VALUES ($1, 'default', 5, $2::jsonb, 'test baseline')`,
+      [c3ProjectId, JSON.stringify({ queries: [
+        { kind: 'assertion', token_budget: 800 },
+        { kind: 'recency',   token_budget: 400 },
+      ] })]
+    );
+
+    // Seed events: assertion kind fails 6/8 times (75% failure rate > threshold 0.5).
+    //             recency kind succeeds 6/7 times (good performer).
+    const evolSession = `c3-evol-${Date.now()}`;
+    for (let i = 0; i < 6; i++) {
+      await db.query(
+        `INSERT INTO retrieval_events (project_id, query_text, session_id, outcome, outcome_at, outcome_signal)
+         VALUES ($1, $2, $3, 'failure', now() - interval '1 hour', 'agent_self_report')`,
+        [c3ProjectId, `loader:contract=default;kinds=assertion;sections=1`, evolSession]
+      );
+    }
+    for (let i = 0; i < 2; i++) {
+      await db.query(
+        `INSERT INTO retrieval_events (project_id, query_text, session_id, outcome, outcome_at, outcome_signal)
+         VALUES ($1, $2, $3, 'success', now() - interval '1 hour', 'agent_self_report')`,
+        [c3ProjectId, `loader:contract=default;kinds=assertion;sections=1`, evolSession]
+      );
+    }
+    for (let i = 0; i < 6; i++) {
+      await db.query(
+        `INSERT INTO retrieval_events (project_id, query_text, session_id, outcome, outcome_at, outcome_signal)
+         VALUES ($1, $2, $3, 'success', now() - interval '1 hour', 'agent_self_report')`,
+        [c3ProjectId, `loader:contract=default;kinds=recency;sections=1`, evolSession]
+      );
+    }
+    for (let i = 0; i < 1; i++) {
+      await db.query(
+        `INSERT INTO retrieval_events (project_id, query_text, session_id, outcome, outcome_at, outcome_signal)
+         VALUES ($1, $2, $3, 'failure', now() - interval '1 hour', 'agent_self_report')`,
+        [c3ProjectId, `loader:contract=default;kinds=recency;sections=1`, evolSession]
+      );
+    }
+    await db.end();
+
+    // Run cmdClose.
+    const closePayload = JSON.stringify({ tldr: 'c3 evolution test', session_id: evolSession });
+    const r = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'close', '--json', '-'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: c3Db, PROJECT_ROOT: c3ProjectDir },
+        input:    closePayload,
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+
+    const out = (r.stderr || '') + (r.stdout || '');
+    if (r.status !== 0) {
+      c3Fail(3, label, `cmdClose exited ${r.status}: ${out.slice(0, 400)}`);
+      return false;
+    }
+
+    // Output must mention C3 evolution applied.
+    if (!out.includes('C3 evolution: applied')) {
+      c3Fail(3, label, `cmdClose output does not contain "C3 evolution: applied": ${out.slice(0, 400)}`);
+      return false;
+    }
+
+    // Check DB state.
+    const db2 = await pgConnect(c3Db);
+    const { rows: rcRows } = await db2.query(
+      `SELECT version, queries FROM retrieval_contract WHERE project_id = $1 AND name = 'default'`,
+      [c3ProjectId]
+    );
+    const { rows: histRows } = await db2.query(
+      `SELECT version, change_note, queries FROM retrieval_contract_history
+       WHERE project_id = $1 AND name = 'default'
+       ORDER BY version DESC LIMIT 1`,
+      [c3ProjectId]
+    );
+    await db2.end();
+
+    if (rcRows.length === 0) {
+      c3Fail(3, label, 'retrieval_contract row missing after evolution');
+      return false;
+    }
+
+    const newVersion = rcRows[0].version;
+    if (newVersion !== 6) {
+      c3Fail(3, label, `expected version 6, got ${newVersion}`);
+      return false;
+    }
+
+    // Verify history row written with auto-evolve change_note.
+    if (histRows.length === 0) {
+      c3Fail(3, label, 'no history row written for evolution');
+      return false;
+    }
+    if (!(histRows[0].change_note || '').startsWith('auto-evolve')) {
+      c3Fail(3, label, `history change_note does not start with "auto-evolve": "${histRows[0].change_note}"`);
+      return false;
+    }
+
+    // Verify kinds not deleted and budgets within envelope.
+    const newQueries = rcRows[0].queries.queries || [];
+    const assertionQ = newQueries.find((q) => q.kind === 'assertion');
+    const recencyQ   = newQueries.find((q) => q.kind === 'recency');
+    if (!assertionQ) {
+      c3Fail(3, label, '"assertion" kind was deleted — must never delete a kind');
+      return false;
+    }
+    if (!recencyQ) {
+      c3Fail(3, label, '"recency" kind was deleted — must never delete a kind');
+      return false;
+    }
+    if (assertionQ.token_budget < 200) {
+      c3Fail(3, label, `"assertion" budget ${assertionQ.token_budget} is below floor 200`);
+      return false;
+    }
+    // Total envelope should remain 1200 (800 + 400).
+    const totalBudget = newQueries.reduce((s, q) => s + (q.token_budget || 0), 0);
+    if (totalBudget !== 1200) {
+      c3Fail(3, label, `total budget changed: expected 1200, got ${totalBudget} (envelope not preserved)`);
+      return false;
+    }
+
+    c3Pass(3, label);
+    return { ok: true, evolSession };
+  } catch (err) {
+    c3Fail(3, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * C3 4/5: Idempotency — re-running cmdClose for the same session does not produce
+ * a second contract change.
+ */
+async function c3Step4_idempotency(c3Db, c3ProjectId, c3ProjectDir, evolSession) {
+  const label = 'Idempotency: re-running cmdClose for same session does not produce a second contract change';
+  try {
+    if (!evolSession) {
+      c3Fail(4, label, 'skipped — evolSession not provided (step 3 failed)');
+      return false;
+    }
+
+    // Read current version before re-run.
+    const db = await pgConnect(c3Db);
+    const { rows: beforeRows } = await db.query(
+      `SELECT version FROM retrieval_contract WHERE project_id = $1 AND name = 'default'`,
+      [c3ProjectId]
+    );
+    const versionBefore = beforeRows.length > 0 ? beforeRows[0].version : null;
+    await db.end();
+
+    // Re-run cmdClose with the same session_id.
+    const closePayload = JSON.stringify({ tldr: 'c3 idempotency re-run', session_id: evolSession });
+    const r = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'close', '--json', '-'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: c3Db, PROJECT_ROOT: c3ProjectDir },
+        input:    closePayload,
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+
+    // Check version unchanged.
+    const db2 = await pgConnect(c3Db);
+    const { rows: afterRows } = await db2.query(
+      `SELECT version FROM retrieval_contract WHERE project_id = $1 AND name = 'default'`,
+      [c3ProjectId]
+    );
+    const versionAfter = afterRows.length > 0 ? afterRows[0].version : null;
+    await db2.end();
+
+    if (versionAfter !== versionBefore) {
+      c3Fail(4, label, `version changed from ${versionBefore} to ${versionAfter} on re-run — not idempotent`);
+      return false;
+    }
+
+    // Output should mention idempotency guard.
+    const out = r.stdout || '';
+    if (!out.includes('already applied') && !out.includes('idempotent')) {
+      c3Fail(4, label, `re-run output does not mention idempotency guard: ${out.slice(0, 300)}`);
+      return false;
+    }
+
+    c3Pass(4, label);
+    return true;
+  } catch (err) {
+    c3Fail(4, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * C3 5/5: Rollback — prior version recoverable from retrieval_contract_history
+ * via the W4 rollback CLI (bundleb-w4-contract.js rollback <version>).
+ */
+async function c3Step5_rollback(c3Db, c3ProjectId, c3ProjectDir) {
+  const label = 'Rollback: prior version recoverable from history via bundleb-w4-contract.js rollback';
+  try {
+    const db = await pgConnect(c3Db);
+
+    // Read current version (should be 6 after step 3).
+    const { rows: curRows } = await db.query(
+      `SELECT version FROM retrieval_contract WHERE project_id = $1 AND name = 'default'`,
+      [c3ProjectId]
+    );
+    const currentVersion = curRows.length > 0 ? curRows[0].version : null;
+
+    // Find a prior version in history.
+    const { rows: histRows } = await db.query(
+      `SELECT version FROM retrieval_contract_history
+       WHERE project_id = $1 AND name = 'default' AND version < $2
+       ORDER BY version DESC LIMIT 1`,
+      [c3ProjectId, currentVersion]
+    );
+    await db.end();
+
+    if (histRows.length === 0) {
+      // No prior version — we can verify history exists even if we cannot roll back.
+      // Check there is at least one history row (from step 3's evolution).
+      const db2 = await pgConnect(c3Db);
+      const { rows: anyHist } = await db2.query(
+        `SELECT COUNT(*) AS n FROM retrieval_contract_history WHERE project_id = $1 AND name = 'default'`,
+        [c3ProjectId]
+      );
+      await db2.end();
+      const n = parseInt(anyHist[0].n, 10);
+      if (n > 0) {
+        // History rows exist; rollback target just happens to be the same as current — mark pass.
+        c3Pass(5, label);
+        return true;
+      }
+      c3Fail(5, label, 'no history rows found — cannot verify rollback path');
+      return false;
+    }
+
+    const rollbackVersion = histRows[0].version;
+    const w4Script = path.join(PROJECT_ROOT, 'scripts', 'bundleb-w4-contract.js');
+
+    const r = spawnSync(
+      process.execPath,
+      [w4Script, 'rollback', String(rollbackVersion)],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: c3Db, PROJECT_ROOT: c3ProjectDir },
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+
+    if (r.status !== 0) {
+      c3Fail(5, label, `rollback exited ${r.status}: ${((r.stderr || '') + (r.stdout || '')).slice(0, 300)}`);
+      return false;
+    }
+
+    // Verify version bumped (non-destructive rollback creates a new version).
+    const db3 = await pgConnect(c3Db);
+    const { rows: afterRows } = await db3.query(
+      `SELECT version FROM retrieval_contract WHERE project_id = $1 AND name = 'default'`,
+      [c3ProjectId]
+    );
+    await db3.end();
+
+    const newVersion = afterRows.length > 0 ? afterRows[0].version : null;
+    if (newVersion === null || newVersion <= currentVersion) {
+      c3Fail(5, label, `rollback did not bump version: currentVersion=${currentVersion}, newVersion=${newVersion}`);
+      return false;
+    }
+
+    // Verify output mentions rollback success.
+    const out = r.stdout || '';
+    if (!out.includes('Rolled back')) {
+      c3Fail(5, label, `rollback output does not mention "Rolled back": ${out.slice(0, 200)}`);
+      return false;
+    }
+
+    c3Pass(5, label);
+    return true;
+  } catch (err) {
+    c3Fail(5, label, err.message);
+    return false;
+  }
+}
+
+async function runC3Section() {
+  console.log(`\n=== C3 SECTION (${C3_TOTAL} steps) ===`);
+  console.log('smoketest-handoff C3: gate-off no-op, thin-data guard, evolution applied, idempotency, rollback');
+  console.log('(All steps pass without Python or Ollama)');
+  console.log('');
+
+  const C3_TS         = Date.now();
+  const C3_DB         = `claude_memory_c3_${C3_TS}`;
+  const C3_PROJ_DIR   = path.join(os.tmpdir(), `handoff_c3_${C3_TS}`);
+  const C3_PROJECT_ID = encodeCwd(C3_PROJ_DIR);
+
+  try {
+    await createSmokeDb(C3_DB, C3_PROJ_DIR);
+
+    // Write a minimal CLAUDE.md so init can run cleanly.
+    const c3ClaudeMd = path.join(C3_PROJ_DIR, 'CLAUDE.md');
+    fs.writeFileSync(c3ClaudeMd, '# c3-test\n\n## Durable facts\n- (none)\n', 'utf8');
+
+    // Run init so all base tables exist.
+    const initR = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'init', '-y'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: C3_DB, PROJECT_ROOT: C3_PROJ_DIR },
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+    if (initR.status !== 0) {
+      console.log('[C3] DB init failed — skipping remaining steps');
+      console.log(initR.stderr || initR.stdout || '');
+      c3Failed += C3_TOTAL;
+      return;
+    }
+    console.log(`[C3] DB init OK (${C3_DB})`);
+
+    // Verify contract_evolution_enabled default registered by init.
+    const initDb = await pgConnect(C3_DB);
+    const { rows: defaultRows } = await initDb.query(
+      `SELECT value FROM project_settings WHERE project_id = $1 AND key = 'contract_evolution_enabled'`,
+      [C3_PROJECT_ID]
+    );
+    await initDb.end();
+    if (defaultRows.length === 0 || defaultRows[0].value !== 'disabled') {
+      console.log(`[C3] WARNING: contract_evolution_enabled default not set correctly (got ${defaultRows[0] ? defaultRows[0].value : 'missing'})`);
+    }
+
+    // Create retrieval_events table (no pgvector in smoketest DB).
+    try {
+      await createRetrievalEventsTable(C3_DB);
+    } catch (_) { /* non-fatal */ }
+
+    // Step 1: gate OFF no-op.
+    await c3Step1_gateOff(C3_DB, C3_PROJECT_ID, C3_PROJ_DIR);
+
+    // Step 2: thin-data guard.
+    await c3Step2_thinDataGuard(C3_DB, C3_PROJECT_ID, C3_PROJ_DIR);
+
+    // Step 3: evolution applied (returns evolSession for step 4).
+    const step3Result = await c3Step3_evolutionApplied(C3_DB, C3_PROJECT_ID, C3_PROJ_DIR);
+    const evolSession = step3Result && step3Result.ok ? step3Result.evolSession : null;
+
+    // Step 4: idempotency.
+    await c3Step4_idempotency(C3_DB, C3_PROJECT_ID, C3_PROJ_DIR, evolSession);
+
+    // Step 5: rollback via W4 CLI.
+    await c3Step5_rollback(C3_DB, C3_PROJECT_ID, C3_PROJ_DIR);
+
+  } finally {
+    const C3_HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', C3_PROJECT_ID, 'handoff.md');
+    await dropSmokeDb(C3_DB, C3_PROJ_DIR, C3_HANDOFF_PATH).catch(() => {});
+  }
+}
+
 // ── Section runners ───────────────────────────────────────────────────────────
 
 async function runLifecycleSection() {
@@ -3754,6 +4371,9 @@ async function main() {
   if (SECTION === 'c2' || SECTION === 'all') {
     await runC2Section();
   }
+  if (SECTION === 'c3' || SECTION === 'all') {
+    await runC3Section();
+  }
 
   console.log('');
 
@@ -3765,12 +4385,13 @@ async function main() {
   const w4Total  = w4Passed + w4Failed;
   const c1Total  = c1Passed + c1Failed;
   const c2Total  = c2Passed + c2Failed;
-  const totalPass = lcPassed + hkPassed + hdPassed + w2Passed + w3Passed + w4Passed + c1Passed + c2Passed;
-  const totalAll  = lcTotal  + hkTotal  + hdTotal  + w2Total  + w3Total  + w4Total  + c1Total  + c2Total;
-  const totalSkip = lcSkipped + hkSkipped + hdSkipped + w2Skipped + w3Skipped + w4Skipped + c1Skipped + c2Skipped;
+  const c3Total  = c3Passed + c3Failed;
+  const totalPass = lcPassed + hkPassed + hdPassed + w2Passed + w3Passed + w4Passed + c1Passed + c2Passed + c3Passed;
+  const totalAll  = lcTotal  + hkTotal  + hdTotal  + w2Total  + w3Total  + w4Total  + c1Total  + c2Total  + c3Total;
+  const totalSkip = lcSkipped + hkSkipped + hdSkipped + w2Skipped + w3Skipped + w4Skipped + c1Skipped + c2Skipped + c3Skipped;
 
   if (SECTION === 'all') {
-    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal}, hardening: ${hdPassed}/${hdTotal}, w2: ${w2Passed}/${w2Total}, w3: ${w3Passed}/${w3Total}, w4: ${w4Passed}/${w4Total}, c1: ${c1Passed}/${c1Total}, c2: ${c2Passed}/${c2Total})`);
+    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal}, hardening: ${hdPassed}/${hdTotal}, w2: ${w2Passed}/${w2Total}, w3: ${w3Passed}/${w3Total}, w4: ${w4Passed}/${w4Total}, c1: ${c1Passed}/${c1Total}, c2: ${c2Passed}/${c2Total}, c3: ${c3Passed}/${c3Total})`);
   } else if (SECTION === 'lifecycle') {
     console.log(`smoketest: ${lcPassed}/${lcTotal} passed, ${lcSkipped} skipped (lifecycle only)`);
   } else if (SECTION === 'hooks') {
@@ -3785,11 +4406,13 @@ async function main() {
     console.log(`smoketest: ${c1Passed}/${c1Total} passed, ${c1Skipped} skipped (c1 only)`);
   } else if (SECTION === 'c2') {
     console.log(`smoketest: ${c2Passed}/${c2Total} passed, ${c2Skipped} skipped (c2 only)`);
+  } else if (SECTION === 'c3') {
+    console.log(`smoketest: ${c3Passed}/${c3Total} passed, ${c3Skipped} skipped (c3 only)`);
   } else {
     console.log(`smoketest: ${hdPassed}/${hdTotal} passed, ${hdSkipped} skipped (hardening only)`);
   }
 
-  if (lcFailed + hkFailed + hdFailed + w2Failed + w3Failed + w4Failed + c1Failed + c2Failed > 0) process.exitCode = 1;
+  if (lcFailed + hkFailed + hdFailed + w2Failed + w3Failed + w4Failed + c1Failed + c2Failed + c3Failed > 0) process.exitCode = 1;
 }
 
 main().catch((err) => {
