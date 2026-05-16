@@ -167,6 +167,7 @@ function readStdin() {
         'tldr', 'open_threads', 'quick_references',
         'entities', 'assertions', 'edges', 'decisions',
         'contract', 'session_id', 'confirm_claude_md_promotion',
+        'retrieval_outcome', 'retrieval_outcome_notes',
       ]);
       for (const k of Object.keys(parsed)) {
         if (!ALLOWED_KEYS.has(k)) {
@@ -174,9 +175,20 @@ function readStdin() {
         }
       }
 
+      // Validate retrieval_outcome if present.
+      if ('retrieval_outcome' in parsed) {
+        const VALID_OUTCOMES = new Set(['success', 'failure', 'irrelevant']);
+        if (typeof parsed.retrieval_outcome !== 'string' || !VALID_OUTCOMES.has(parsed.retrieval_outcome)) {
+          return reject(new Error(
+            `stdin JSON: "retrieval_outcome" must be one of 'success', 'failure', 'irrelevant' ` +
+            `(got ${JSON.stringify(parsed.retrieval_outcome)}); 'pending' and other values are not accepted`
+          ));
+        }
+      }
+
       // String fields with length cap.
       // Note: open_threads is an array (not a string); quick_references is a string.
-      const STRING_FIELDS = ['tldr', 'quick_references', 'session_id'];
+      const STRING_FIELDS = ['tldr', 'quick_references', 'session_id', 'retrieval_outcome_notes'];
       const STRING_MAX    = 4000;
       for (const field of STRING_FIELDS) {
         if (field in parsed) {
@@ -550,10 +562,11 @@ async function cmdInit(args) {
 
   // Step 8: Insert default project_settings rows (idempotent)
   const defaults = {
-    staleness_days:      '7',
-    loader_token_budget: '4000',
-    implicit_close:      'enabled',
-    decay_rate_default:  '0.05',
+    staleness_days:                   '7',
+    loader_token_budget:              '4000',
+    implicit_close:                   'enabled',
+    decay_rate_default:               '0.05',
+    retrieval_outcome_timeout_days:   '14',
   };
   for (const [key, val] of Object.entries(defaults)) {
     await db.query(
@@ -815,6 +828,23 @@ async function cmdLoaderLoad(opts = {}) {
       // Vector search requires Ollama or vLLM — skip gracefully if unavailable.
       sections.push(`### Vector query (${q.query || ''}) — skipped in loader (Phase 3.6 hook)`);
     }
+  }
+
+  // ── Retrieval event logging (side-channel, non-fatal) ────────────────────────
+  // Insert one retrieval_events row per loader invocation for observability.
+  // Wrapped entirely in try/catch — never throws, never alters return value or output.
+  try {
+    const kinds = [...new Set(queries.map((q) => q.kind || q.type || 'unknown'))].join(',');
+    const queryText = `loader:contract=${contractName};kinds=${kinds};sections=${sections.length}`.slice(0, 1000);
+    const sessionId = await getSetting(db, projectId, 'session_in_progress', null);
+    const notes = `entities=${entitiesCount};assertions=${assertionsCount};vector=${vectorCount};tokens=${tokensUsed}`.slice(0, 1000);
+    await db.query(
+      `INSERT INTO retrieval_events (project_id, query_text, session_id, notes)
+       VALUES ($1, $2, $3, $4)`,
+      [projectId, queryText, sessionId || null, notes]
+    );
+  } catch (evtErr) {
+    if (!silent) console.error(`[handoff] retrieval_events insert failed (non-fatal): ${evtErr.message}`);
   }
 
   if (ownDb) await db.end();
@@ -1351,6 +1381,48 @@ async function cmdClose(args) {
     OPEN_THREADS:        (payload.open_threads || []).map((t) => `- ${t}`).join('\n') || '- (none)',
     QUICK_REFERENCES:    payload.quick_references || '(none)',
   });
+
+  // ── Retrieval outcome capture (non-fatal) ─────────────────────────────────────
+  // Must run BEFORE session_in_progress is cleared (we need the session id).
+  // Order: self-report first, then timeout-decay sweep (so just-reported rows are
+  // not also swept).
+  try {
+    // 1. Resolve session id: payload.session_id takes precedence, then the DB marker.
+    const closeSessionId = (typeof payload.session_id === 'string' && payload.session_id.length > 0)
+      ? payload.session_id
+      : await getSetting(db, projectId, 'session_in_progress', null);
+
+    // 2. Agent self-report: update pending events for this session.
+    if (payload.retrieval_outcome) {
+      if (closeSessionId) {
+        const selfRes = await db.query(
+          `UPDATE retrieval_events
+           SET outcome = $2, outcome_at = now(), outcome_signal = 'agent_self_report',
+               notes = COALESCE($3, notes)
+           WHERE project_id = $1 AND outcome = 'pending' AND session_id = $4`,
+          [projectId, payload.retrieval_outcome, payload.retrieval_outcome_notes || null, closeSessionId]
+        );
+        console.log(`  retrieval outcome: marked ${selfRes.rowCount} pending event(s) ${payload.retrieval_outcome} (signal=agent_self_report)`);
+      } else {
+        process.stderr.write('[handoff] retrieval_outcome set but no session id resolvable — self-report skipped\n');
+      }
+    }
+
+    // 3. Timeout-decay sweep: flip stale pending events to irrelevant.
+    const timeoutDays = parseInt(await getSetting(db, projectId, 'retrieval_outcome_timeout_days', '14'), 10);
+    const decayRes = await db.query(
+      `UPDATE retrieval_events
+       SET outcome = 'irrelevant', outcome_at = now(), outcome_signal = 'timeout_decay'
+       WHERE project_id = $1 AND outcome = 'pending'
+         AND retrieved_at < now() - ($2 || ' days')::interval`,
+      [projectId, String(timeoutDays)]
+    );
+    if (decayRes.rowCount > 0) {
+      console.log(`  retrieval outcome: ${decayRes.rowCount} stale pending event(s) decayed to irrelevant (signal=timeout_decay)`);
+    }
+  } catch (outcomeErr) {
+    process.stderr.write(`[handoff] retrieval outcome capture failed (non-fatal): ${outcomeErr.message}\n`);
+  }
 
   // Clear session_in_progress marker
   await db.query(

@@ -78,9 +78,9 @@ let hdPassed  = 0;
 let hdFailed  = 0;
 let hdSkipped = 0;
 
-const LC_TOTAL = 11;
+const LC_TOTAL = 14;
 const HK_TOTAL = 3;
-const HD_TOTAL = 7;
+const HD_TOTAL = 8;
 
 function lcPass(step, label) {
   console.log(`[STEP ${step}/${LC_TOTAL}] ${label} ... PASS`);
@@ -258,7 +258,7 @@ async function step2_cmdInit_fresh() {
       [PROJECT_ID]
     );
     const settingKeys = settingRows.map((r) => r.key);
-    const requiredSettings = ['decay_rate_default', 'implicit_close', 'loader_token_budget', 'staleness_days'];
+    const requiredSettings = ['decay_rate_default', 'implicit_close', 'loader_token_budget', 'staleness_days', 'retrieval_outcome_timeout_days'];
     const missingSettings = requiredSettings.filter((k) => !settingKeys.includes(k));
     await db.end();
     if (missingSettings.length > 0) {
@@ -592,6 +592,203 @@ async function step10_cmdPurge() {
     return true;
   } catch (err) {
     lcFail(10, label, err.message);
+    return false;
+  }
+}
+
+// ── W1 Retrieval events step implementations ──────────────────────────────────
+
+/**
+ * Create a minimal retrieval_events table in the given DB (no halfvec / pgvector
+ * required — embedding column is omitted for portability in the smoketest).
+ */
+async function createRetrievalEventsTable(dbName) {
+  const db = await pgConnect(dbName);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS retrieval_events (
+      id           SERIAL PRIMARY KEY,
+      project_id   TEXT NOT NULL,
+      query_text   TEXT NOT NULL,
+      retrieved_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      outcome      TEXT DEFAULT 'pending'
+                     CHECK (outcome IN ('pending','success','failure','irrelevant')),
+      outcome_at   TIMESTAMPTZ,
+      outcome_signal TEXT,
+      session_id   TEXT,
+      notes        TEXT
+    )
+  `);
+  await db.end();
+}
+
+/**
+ * LC STEP 12: After cmdResume, at least one retrieval_events row exists for the
+ * test project with outcome='pending', query_text starting 'loader:contract=',
+ * and session_id matching the session_in_progress marker.
+ */
+async function step12_retrievalEventLogged(sessionMarker) {
+  const label = 'W1 event logging: retrieval_events row created by resume with correct fields';
+  try {
+    const db = await pgConnect(SMOKE_DB);
+    const { rows } = await db.query(
+      `SELECT query_text, outcome, session_id, notes
+       FROM retrieval_events
+       WHERE project_id = $1
+       ORDER BY retrieved_at DESC LIMIT 5`,
+      [PROJECT_ID]
+    );
+    await db.end();
+
+    if (rows.length === 0) {
+      lcFail(12, label, 'No retrieval_events rows found after resume');
+      return false;
+    }
+
+    const row = rows[0];
+    if (!row.query_text.startsWith('loader:contract=')) {
+      lcFail(12, label, `query_text does not start with 'loader:contract=': "${row.query_text}"`);
+      return false;
+    }
+    if (row.outcome !== 'pending') {
+      lcFail(12, label, `outcome is '${row.outcome}', expected 'pending'`);
+      return false;
+    }
+    if (sessionMarker && row.session_id !== sessionMarker) {
+      lcFail(12, label, `session_id '${row.session_id}' does not match session marker '${sessionMarker}'`);
+      return false;
+    }
+
+    lcPass(12, label);
+    return true;
+  } catch (err) {
+    lcFail(12, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * LC STEP 13: cmdClose with retrieval_outcome='success' flips pending events for
+ * the session to outcome='success', outcome_signal='agent_self_report'.
+ */
+async function step13_selfReport() {
+  const label = 'W1 self-report: close with retrieval_outcome flips pending events';
+  try {
+    // Set a known session marker so the self-report can find the rows.
+    const sessionId = 'smoketest_w1_selfreport';
+    const db = await pgConnect(SMOKE_DB);
+    await db.query(
+      `INSERT INTO project_settings (project_id, key, value) VALUES ($1, 'session_in_progress', $2)
+       ON CONFLICT (project_id, key) DO UPDATE SET value = $2`,
+      [PROJECT_ID, sessionId]
+    );
+    // Insert a pending retrieval_events row for this session.
+    await db.query(
+      `INSERT INTO retrieval_events (project_id, query_text, session_id, outcome)
+       VALUES ($1, 'loader:contract=default;kinds=assertion;sections=2', $2, 'pending')`,
+      [PROJECT_ID, sessionId]
+    );
+    await db.end();
+
+    const payload = JSON.stringify({
+      tldr: 'Smoketest W1 self-report close',
+      open_threads: ['none'],
+      session_id: sessionId,
+      retrieval_outcome: 'success',
+      retrieval_outcome_notes: 'smoketest verification',
+    });
+
+    const r = runHandoff('close', ['--json', '-'], payload);
+    if (r.status !== 0) {
+      lcFail(13, label, `exit ${r.status}: ${(r.stderr || r.stdout || '').split('\n')[0]}`);
+      return false;
+    }
+
+    const db2 = await pgConnect(SMOKE_DB);
+    const { rows } = await db2.query(
+      `SELECT outcome, outcome_signal FROM retrieval_events
+       WHERE project_id = $1 AND session_id = $2`,
+      [PROJECT_ID, sessionId]
+    );
+    await db2.end();
+
+    if (rows.length === 0) {
+      lcFail(13, label, 'No retrieval_events rows found for session after close');
+      return false;
+    }
+    const updated = rows.find((r) => r.outcome === 'success' && r.outcome_signal === 'agent_self_report');
+    if (!updated) {
+      lcFail(13, label, `Rows not updated: ${JSON.stringify(rows)}`);
+      return false;
+    }
+
+    // Verify the close output mentions the self-report.
+    const out = (r.stdout || '') + (r.stderr || '');
+    if (!out.includes('agent_self_report')) {
+      lcFail(13, label, 'close output does not mention agent_self_report');
+      return false;
+    }
+
+    lcPass(13, label);
+    return true;
+  } catch (err) {
+    lcFail(13, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * LC STEP 14: Timeout-decay — a stale pending retrieval_events row (999 days old)
+ * is flipped to outcome='irrelevant', outcome_signal='timeout_decay' on close.
+ */
+async function step14_timeoutDecay() {
+  const label = 'W1 timeout-decay: stale pending event decayed to irrelevant on close';
+  try {
+    const db = await pgConnect(SMOKE_DB);
+    // Insert a synthetic stale pending event.
+    const { rows: insRows } = await db.query(
+      `INSERT INTO retrieval_events (project_id, query_text, outcome, retrieved_at)
+       VALUES ($1, 'loader:contract=default;kinds=entity;sections=0', 'pending',
+               now() - interval '999 days')
+       RETURNING id`,
+      [PROJECT_ID]
+    );
+    const staleId = insRows[0].id;
+    await db.end();
+
+    const payload = JSON.stringify({ tldr: 'Smoketest W1 timeout-decay close' });
+    const r = runHandoff('close', ['--json', '-'], payload);
+    if (r.status !== 0) {
+      lcFail(14, label, `exit ${r.status}: ${(r.stderr || r.stdout || '').split('\n')[0]}`);
+      return false;
+    }
+
+    const db2 = await pgConnect(SMOKE_DB);
+    const { rows } = await db2.query(
+      `SELECT outcome, outcome_signal FROM retrieval_events WHERE id = $1`,
+      [staleId]
+    );
+    await db2.end();
+
+    if (rows.length === 0) {
+      lcFail(14, label, 'Stale retrieval_events row not found after close');
+      return false;
+    }
+    if (rows[0].outcome !== 'irrelevant' || rows[0].outcome_signal !== 'timeout_decay') {
+      lcFail(14, label, `Expected irrelevant/timeout_decay, got ${rows[0].outcome}/${rows[0].outcome_signal}`);
+      return false;
+    }
+
+    // Verify the close output mentions the decay.
+    const out = (r.stdout || '') + (r.stderr || '');
+    if (!out.includes('timeout_decay')) {
+      lcFail(14, label, 'close output does not mention timeout_decay');
+      return false;
+    }
+
+    lcPass(14, label);
+    return true;
+  } catch (err) {
+    lcFail(14, label, err.message);
     return false;
   }
 }
@@ -1211,6 +1408,78 @@ async function hardenStep7_auditAnnotationFormat(tempClaudeMd) {
   }
 }
 
+/**
+ * HARDEN 8/8: readStdin rejects invalid retrieval_outcome values.
+ *   A) retrieval_outcome='pending' → rejected (not an accepted value).
+ *   B) retrieval_outcome='banana'  → rejected (unknown value).
+ *   C) retrieval_outcome='success' → accepted.
+ */
+async function hardenStep8_retrievalOutcomeValidation() {
+  const label = 'readStdin: rejects invalid retrieval_outcome values; accepts valid ones';
+  try {
+    const closeArgs = [HANDOFF_SCRIPT, 'close', '--json', '-'];
+    const spawnOpts = (input) => ({
+      cwd:      PROJECT_ROOT,
+      env:      { ...process.env, HANDOFF_DB: HARDEN_DB, PROJECT_ROOT: TEMP_PROJECT_DIR_HARDEN },
+      input,
+      encoding: 'utf8',
+      timeout:  15000,
+    });
+
+    // ── Sub-test A: retrieval_outcome='pending' must be rejected ─────────────
+    const rPending = spawnSync(
+      process.execPath, closeArgs,
+      spawnOpts(JSON.stringify({ tldr: 'test', retrieval_outcome: 'pending' }))
+    );
+    if (rPending.status === 0) {
+      hdFail(8, label, `retrieval_outcome='pending' was accepted (expected rejection)`);
+      return false;
+    }
+    const pendingOut = (rPending.stderr || '') + (rPending.stdout || '');
+    if (!pendingOut.includes('retrieval_outcome')) {
+      hdFail(8, label, `rejection for 'pending' does not name "retrieval_outcome" field: ${pendingOut.slice(0, 300)}`);
+      return false;
+    }
+
+    // ── Sub-test B: retrieval_outcome='banana' must be rejected ─────────────
+    const rBanana = spawnSync(
+      process.execPath, closeArgs,
+      spawnOpts(JSON.stringify({ tldr: 'test', retrieval_outcome: 'banana' }))
+    );
+    if (rBanana.status === 0) {
+      hdFail(8, label, `retrieval_outcome='banana' was accepted (expected rejection)`);
+      return false;
+    }
+    const bananaOut = (rBanana.stderr || '') + (rBanana.stdout || '');
+    if (!bananaOut.includes('retrieval_outcome')) {
+      hdFail(8, label, `rejection for 'banana' does not name "retrieval_outcome" field: ${bananaOut.slice(0, 300)}`);
+      return false;
+    }
+
+    // ── Sub-test C: retrieval_outcome='success' must be accepted ─────────────
+    const rSuccess = spawnSync(
+      process.execPath, closeArgs,
+      spawnOpts(JSON.stringify({ tldr: 'test', retrieval_outcome: 'success' }))
+    );
+    // May fail for DB reasons but must NOT fail for schema validation.
+    // We check: if it exits non-zero, the error must NOT mention retrieval_outcome schema.
+    if (rSuccess.status !== 0) {
+      const successOut = (rSuccess.stderr || '') + (rSuccess.stdout || '');
+      if (successOut.includes('stdin JSON') && successOut.includes('retrieval_outcome')) {
+        hdFail(8, label, `retrieval_outcome='success' was rejected at schema level — must be accepted: ${successOut.slice(0, 300)}`);
+        return false;
+      }
+      // Non-zero exit for DB / other reasons is acceptable here (schema accepted the value).
+    }
+
+    hdPass(8, label);
+    return true;
+  } catch (err) {
+    hdFail(8, label, err.message);
+    return false;
+  }
+}
+
 // ── Section runners ───────────────────────────────────────────────────────────
 
 async function runLifecycleSection() {
@@ -1231,6 +1500,14 @@ async function runLifecycleSection() {
     await step2_cmdInit_fresh();
     await step3_cmdInit_idempotent();
 
+    // W1: Create retrieval_events table in the lifecycle DB (no pgvector needed).
+    try {
+      await createRetrievalEventsTable(SMOKE_DB);
+      console.log(`[lifecycle] retrieval_events table created in ${SMOKE_DB}`);
+    } catch (rtErr) {
+      console.log(`[lifecycle] WARNING: retrieval_events table creation failed: ${rtErr.message}`);
+    }
+
     ids = await step4_inject_test_data();
     if (!ids) {
       lcFail(5, 'cmdStatus', 'skipped due to step 4 failure');
@@ -1239,11 +1516,39 @@ async function runLifecycleSection() {
       lcFail(8, 'cmdClose', 'skipped due to step 4 failure');
       lcFail(9, 'cmdDrop', 'skipped due to step 4 failure');
       lcFail(10, 'cmdPurge', 'skipped due to step 4 failure');
+      lcFail(12, 'W1 event logging', 'skipped due to step 4 failure');
+      lcFail(13, 'W1 self-report', 'skipped due to step 4 failure');
+      lcFail(14, 'W1 timeout-decay', 'skipped due to step 4 failure');
     } else {
       await step5_cmdStatus(ids);
+
+      // Set session_in_progress before resume so the event row captures it.
+      let sessionMarker = null;
+      try {
+        const dbPre = await pgConnect(SMOKE_DB);
+        sessionMarker = `smoketest_resume_session_${Date.now()}`;
+        await dbPre.query(
+          `INSERT INTO project_settings (project_id, key, value) VALUES ($1, 'session_in_progress', $2)
+           ON CONFLICT (project_id, key) DO UPDATE SET value = $2`,
+          [PROJECT_ID, sessionMarker]
+        );
+        await dbPre.end();
+      } catch (_) { sessionMarker = null; }
+
       await step6_cmdResume();
+
+      // W1 step 12: check retrieval_events row created by resume.
+      await step12_retrievalEventLogged(sessionMarker);
+
       await step7_cmdCheckpoint();
       await step8_cmdClose();
+
+      // W1 step 13: self-report via a fresh close.
+      await step13_selfReport();
+
+      // W1 step 14: timeout-decay via a fresh close with a stale event.
+      await step14_timeoutDecay();
+
       await step9_cmdDrop_assertion(ids);
       await step10_cmdPurge();
     }
@@ -1321,6 +1626,12 @@ async function runHardeningSection() {
 
     await hardenStep6_promoteIdempotent(promotedId);
     await hardenStep7_auditAnnotationFormat(tempClaudeMd);
+
+    // W1: Create retrieval_events table for validation test (no pgvector needed).
+    try {
+      await createRetrievalEventsTable(HARDEN_DB);
+    } catch (_) { /* non-fatal — hardenStep8 will report its own error */ }
+    await hardenStep8_retrievalOutcomeValidation();
 
   } finally {
     try { fs.rmSync(tempClaudeMd, { force: true }); } catch (_) {}

@@ -95,6 +95,7 @@ The table below reviews every persistent `project_settings` default for the most
 | `loader_token_budget` | `4000` | **Safe, no change.** Caps how much retrieved (untrusted) context is injected per load — effectively a volume bound on attacker-influenced text reaching the session. 4,000 is a moderate, reasonable bound. |
 | `implicit_close` | `enabled` | **Safe, no change.** Gates whether the SessionStart hook auto-closes a stale prior session (auto-extracting entities and assertions into the memory DB). Its blast radius is the queryable memory store only — which is itself always surfaced under the `(untrusted)` delimiters — and never the trusted CLAUDE.md, which is independently gated (see Trust model §3). Consistent with the project principle: smart defaults that work for the solo case today, with detection that surfaces a notice when multi-author conditions hold. |
 | `decay_rate_default` | `0.05` | **Inert today.** Reserved for future confidence decay; no code path currently consumes it. Documented here so adopters do not assume confidence decay is active. |
+| `retrieval_outcome_timeout_days` | `14` | **Safe, no change.** Observability bookkeeping only — controls when still-pending retrieval_events are swept to 'irrelevant' under the timeout_decay signal. No effect on retrieval ranking or assertion decay (Bundle B W1 is observability-only). Adjustable per project. |
 
 `confirm_claude_md_promotion` is **not** a persistent setting — it is a per-invocation `/handoff:close` payload flag, off unless explicitly set to `true` (see Trust model §3).
 
