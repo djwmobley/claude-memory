@@ -648,6 +648,12 @@ async function cmdInit(args) {
     retrieval_outcome_timeout_days:   '14',
     cluster_aware_retrieval:          'enabled',
     cluster_max_siblings:             '10',
+    // C2: outcome→ranking+decay feedback loop (default OFF — byte-identical to pre-C2 when disabled).
+    feedback_loop_enabled:            'disabled',
+    feedback_success_delta:           '0.5',   // bias nudge per success outcome
+    feedback_failure_delta:           '-0.75', // bias nudge per failure outcome
+    feedback_irrelevant_delta:        '-0.25', // bias nudge per irrelevant outcome (smaller penalty)
+    feedback_bias_clamp:              '3.0',   // max absolute value of outcome_bias ∈ [-clamp, +clamp]
   };
   for (const [key, val] of Object.entries(defaults)) {
     await db.query(
@@ -879,6 +885,11 @@ async function cmdLoaderLoad(opts = {}) {
   // C1: collect assertion ids retrieved during the contract loop for attribution.
   const retrievedAssertionIds = [];
 
+  // C2: read feedback gate once before the loop.
+  // When not 'enabled', ALL assertion query SQL is byte-identical to pre-C2 — no outcome_bias
+  // term appears anywhere in the query, so disabled mode has zero performance or behavioral impact.
+  const feedbackLoopEnabled = await getSetting(db, projectId, 'feedback_loop_enabled', 'disabled');
+
   for (const q of queries) {
     if (tokensUsed >= tokenBudget) break;
 
@@ -899,15 +910,39 @@ async function cmdLoaderLoad(opts = {}) {
       }
 
     } else if (q.type === 'assertion' || q.kind === 'assertion') {
-      const { rows } = await db.query(
-        `SELECT id, subject, predicate, object, confidence, source FROM assertions
+      // C2: When feedback_loop_enabled='enabled', factor outcome_bias into both the suppression
+      // threshold and the ORDER BY so that positive bias promotes assertions and negative bias
+      // demotes them. effective_confidence = confidence * exp(-decay_rate * age_days) + outcome_bias.
+      //
+      // Clamp design: outcome_bias is bounded by feedback_bias_clamp on write (see cmdClose).
+      // An assertion with confidence=1.0 at the floor and outcome_bias=-clamp could in theory
+      // go just below the 1.0 suppression threshold, which is the intended behavior for a
+      // repeatedly-unhelpful assertion. We use the same formula for both the WHERE filter and
+      // ORDER BY, so they are consistent.
+      //
+      // When gate is OFF: SQL is byte-identical to the pre-C2 query (no outcome_bias term).
+      let assertionQuerySql;
+      let assertionQueryParams;
+      if (feedbackLoopEnabled === 'enabled') {
+        // Gate ON: incorporate outcome_bias into effective_confidence.
+        assertionQuerySql = `SELECT id, subject, predicate, object, confidence, source FROM assertions
+         WHERE project_id = $1
+           AND ($2::text IS NULL OR subject = $2)
+           AND suppressed = false
+           AND (confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) + outcome_bias) >= 1.0
+         ORDER BY (confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) + outcome_bias) DESC, last_reinforced DESC LIMIT 30`;
+        assertionQueryParams = [projectId, q.filter?.subject || null];
+      } else {
+        // Gate OFF: byte-identical to pre-C2 query.
+        assertionQuerySql = `SELECT id, subject, predicate, object, confidence, source FROM assertions
          WHERE project_id = $1
            AND ($2::text IS NULL OR subject = $2)
            AND suppressed = false
            AND confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) >= 1.0
-         ORDER BY confidence DESC, last_reinforced DESC LIMIT 30`,
-        [projectId, q.filter?.subject || null]
-      );
+         ORDER BY confidence DESC, last_reinforced DESC LIMIT 30`;
+        assertionQueryParams = [projectId, q.filter?.subject || null];
+      }
+      const { rows } = await db.query(assertionQuerySql, assertionQueryParams);
       if (rows.length) {
         const text = rows.map((r) =>
           `- [${r.source}|conf=${r.confidence}] ${r.subject} ${r.predicate} ${r.object}`
@@ -927,14 +962,23 @@ async function cmdLoaderLoad(opts = {}) {
       }
 
     } else if (q.type === 'recency' || q.kind === 'recency') {
-      const { rows } = await db.query(
-        `SELECT id, subject, predicate, object, confidence FROM assertions
+      // C2: Same gate pattern as assertion kind — incorporate outcome_bias when enabled.
+      // Gate OFF: byte-identical to pre-C2 query. Gate ON: outcome_bias shifts threshold + rank.
+      let recencyQuerySql;
+      if (feedbackLoopEnabled === 'enabled') {
+        recencyQuerySql = `SELECT id, subject, predicate, object, confidence FROM assertions
+         WHERE project_id = $1
+           AND suppressed = false
+           AND (confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) + outcome_bias) >= 1.0
+         ORDER BY last_reinforced DESC LIMIT 20`;
+      } else {
+        recencyQuerySql = `SELECT id, subject, predicate, object, confidence FROM assertions
          WHERE project_id = $1
            AND suppressed = false
            AND confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) >= 1.0
-         ORDER BY last_reinforced DESC LIMIT 20`,
-        [projectId]
-      );
+         ORDER BY last_reinforced DESC LIMIT 20`;
+      }
+      const { rows } = await db.query(recencyQuerySql, [projectId]);
       if (rows.length) {
         const text = rows.map((r) =>
           `- [conf=${r.confidence}] ${r.subject} ${r.predicate} ${r.object}`
@@ -1608,6 +1652,94 @@ async function cmdClose(args) {
     }
   } catch (outcomeErr) {
     process.stderr.write(`[handoff] retrieval outcome capture failed (non-fatal): ${outcomeErr.message}\n`);
+  }
+
+  // ── C2: Outcome→bias feedback application (non-fatal, gated, batch at close) ────────────────
+  //
+  // Formula:
+  //   delta = sum(success_count * success_delta
+  //             + failure_count * failure_delta
+  //             + irrelevant_count * irrelevant_delta)
+  //   new_bias = CLAMP(old_bias + delta, -clamp, +clamp)
+  //
+  // Idempotency guard: we only consider retrieval_events that were outcome-set
+  // (outcome != 'pending') for THIS session. We use a processed-marker in
+  // project_settings keyed as 'feedback_applied:<sessionId>' to detect re-runs.
+  // On re-run the marker already exists → we skip silently (true idempotency).
+  // The marker is only written after a successful feedback application pass.
+  //
+  // Session resolution: same logic as the outcome capture block above — payload.session_id
+  // takes precedence, then the DB marker. Both are read before session_in_progress is cleared.
+  try {
+    const feedbackEnabled = await getSetting(db, projectId, 'feedback_loop_enabled', 'disabled');
+    if (feedbackEnabled === 'enabled') {
+      // Re-resolve session id (same approach as outcome capture, before marker is cleared).
+      const fbSessionId = (typeof payload.session_id === 'string' && payload.session_id.length > 0)
+        ? payload.session_id
+        : await getSetting(db, projectId, 'session_in_progress', null);
+
+      if (!fbSessionId) {
+        // No session id — skip silently (nothing to attribute).
+        process.stderr.write('[handoff] C2 feedback: no session id resolvable — skipping bias update\n');
+      } else {
+        // Idempotency check: if we have already applied feedback for this session, skip.
+        const markerKey = `feedback_applied:${fbSessionId}`;
+        const alreadyApplied = await getSetting(db, projectId, markerKey, null);
+        if (alreadyApplied !== null) {
+          console.log(`  C2 feedback: already applied for session ${fbSessionId} — skipping (idempotent)`);
+        } else {
+          // Read tunable deltas and clamp.
+          const successDelta    = parseFloat(await getSetting(db, projectId, 'feedback_success_delta',    '0.5'));
+          const failureDelta    = parseFloat(await getSetting(db, projectId, 'feedback_failure_delta',    '-0.75'));
+          const irrelevantDelta = parseFloat(await getSetting(db, projectId, 'feedback_irrelevant_delta', '-0.25'));
+          const biasClamp       = parseFloat(await getSetting(db, projectId, 'feedback_bias_clamp',       '3.0'));
+
+          // Aggregate per assertion: count outcomes across this session's events.
+          // Join: retrieval_events (session, non-pending) → retrieval_event_assertions → assertions.
+          const aggRes = await db.query(
+            `SELECT
+               rea.assertion_id,
+               SUM(CASE WHEN re.outcome = 'success'    THEN 1 ELSE 0 END)    AS success_count,
+               SUM(CASE WHEN re.outcome = 'failure'    THEN 1 ELSE 0 END)    AS failure_count,
+               SUM(CASE WHEN re.outcome = 'irrelevant' THEN 1 ELSE 0 END)    AS irrelevant_count
+             FROM retrieval_events re
+             JOIN retrieval_event_assertions rea ON rea.event_id = re.id
+             WHERE re.project_id = $1
+               AND re.session_id = $2
+               AND re.outcome != 'pending'
+             GROUP BY rea.assertion_id`,
+            [projectId, fbSessionId]
+          );
+
+          if (aggRes.rows.length > 0) {
+            // Apply bounded delta to each assertion's outcome_bias.
+            for (const row of aggRes.rows) {
+              const delta =
+                row.success_count    * successDelta +
+                row.failure_count    * failureDelta +
+                row.irrelevant_count * irrelevantDelta;
+              // CLAMP via GREATEST/LEAST in SQL for atomicity.
+              await db.query(
+                `UPDATE assertions
+                 SET outcome_bias = GREATEST($2::float, LEAST($3::float, outcome_bias + $4::float))
+                 WHERE id = $1`,
+                [row.assertion_id, -biasClamp, biasClamp, delta]
+              );
+            }
+            console.log(`  C2 feedback: adjusted outcome_bias for ${aggRes.rows.length} assertion(s) (session=${fbSessionId})`);
+          } else {
+            console.log(`  C2 feedback: no attributed outcomes found for session ${fbSessionId} — nothing to adjust`);
+          }
+
+          // Write idempotency marker — keyed per session so it does not collide across sessions.
+          // Value is the ISO timestamp of this application pass.
+          await setSetting(db, projectId, markerKey, new Date().toISOString());
+        }
+      }
+    }
+  } catch (feedbackErr) {
+    // Fully non-fatal: any error here must not break cmdClose.
+    process.stderr.write(`[handoff] C2 feedback application failed (non-fatal): ${feedbackErr.message}\n`);
   }
 
   // Clear session_in_progress marker

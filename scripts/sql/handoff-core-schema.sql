@@ -193,6 +193,11 @@ CREATE TABLE IF NOT EXISTS project_settings (
 --   decay_rate_default         default: '0.05'      (per-day decay for new assertions lacking row-level override)
 --   cluster_aware_retrieval    default: 'enabled'   ('enabled'|any other value — W3 cluster-aware expansion)
 --   cluster_max_siblings       default: '10'        (max same-community sibling entities added per load)
+--   feedback_loop_enabled      default: 'disabled'  ('enabled'|any other value — C2 outcome→ranking feedback loop; byte-identical when disabled)
+--   feedback_success_delta     default: '0.5'       (outcome_bias nudge per success outcome in a session)
+--   feedback_failure_delta     default: '-0.75'     (outcome_bias nudge per failure outcome in a session)
+--   feedback_irrelevant_delta  default: '-0.25'     (outcome_bias nudge per irrelevant outcome in a session)
+--   feedback_bias_clamp        default: '3.0'       (max absolute value of outcome_bias, i.e. bias ∈ [-clamp, +clamp])
 
 
 -- ============================================================================

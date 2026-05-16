@@ -25,8 +25,8 @@ const { Client } = require('pg');
 const ARGS       = process.argv.slice(2);
 const sectionArg = ARGS.find((a) => a.startsWith('--section='));
 const SECTION    = sectionArg ? sectionArg.split('=')[1] : 'all';
-if (!['all', 'lifecycle', 'hooks', 'hardening', 'w2', 'w3', 'w4', 'c1'].includes(SECTION)) {
-  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, hardening, w2, w3, w4, c1, all`);
+if (!['all', 'lifecycle', 'hooks', 'hardening', 'w2', 'w3', 'w4', 'c1', 'c2'].includes(SECTION)) {
+  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, hardening, w2, w3, w4, c1, c2, all`);
   process.exit(2);
 }
 
@@ -89,6 +89,9 @@ let w4Skipped = 0;
 let c1Passed  = 0;
 let c1Failed  = 0;
 let c1Skipped = 0;
+let c2Passed  = 0;
+let c2Failed  = 0;
+let c2Skipped = 0;
 
 const LC_TOTAL = 14;
 const HK_TOTAL = 3;
@@ -97,6 +100,7 @@ const W2_TOTAL = 3;
 const W3_TOTAL = 5;
 const W4_TOTAL = 6;
 const C1_TOTAL = 4;
+const C2_TOTAL = 4;
 
 function lcPass(step, label) {
   console.log(`[STEP ${step}/${LC_TOTAL}] ${label} ... PASS`);
@@ -181,6 +185,16 @@ function c1Pass(step, label) {
 function c1Fail(step, label, reason) {
   console.log(`[C1 ${step}/${C1_TOTAL}] ${label} ... FAIL: ${reason}`);
   c1Failed++;
+}
+
+function c2Pass(step, label) {
+  console.log(`[C2 ${step}/${C2_TOTAL}] ${label} ... PASS`);
+  c2Passed++;
+}
+
+function c2Fail(step, label, reason) {
+  console.log(`[C2 ${step}/${C2_TOTAL}] ${label} ... FAIL: ${reason}`);
+  c2Failed++;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -3107,6 +3121,451 @@ async function runC1Section() {
   }
 }
 
+// ── C2: Bundle C2 — outcome→ranking+decay feedback loop ──────────────────────
+
+/**
+ * C2 1/4: Gate OFF ⇒ loader output byte-identical to pre-C2 and outcome_bias never read.
+ *
+ * With feedback_loop_enabled='disabled' (default), loader output must be byte-identical
+ * across two consecutive calls, and must not contain any outcome_bias-related text.
+ */
+async function c2Step1_gateOffNoOp(c2Db, c2ProjectId, c2ProjectDir) {
+  const label = 'Gate OFF: loader output byte-identical, outcome_bias term never in query output';
+  try {
+    const db = await pgConnect(c2Db);
+
+    // Confirm the gate is disabled (default).
+    const { rows: settingRows } = await db.query(
+      `SELECT value FROM project_settings WHERE project_id = $1 AND key = 'feedback_loop_enabled'`,
+      [c2ProjectId]
+    );
+    const gateValue = settingRows.length > 0 ? settingRows[0].value : 'disabled';
+    if (gateValue !== 'disabled') {
+      await db.end();
+      c2Fail(1, label, `feedback_loop_enabled is '${gateValue}', expected 'disabled' (default)`);
+      return false;
+    }
+
+    // Insert a test assertion with a non-zero outcome_bias to confirm it does NOT affect output.
+    await db.query(
+      `INSERT INTO assertions
+         (project_id, subject, predicate, object, confidence, source, last_reinforced, outcome_bias)
+       VALUES ($1, 'C2_GATE_SUBJECT', 'is', 'C2_GATE_OBJECT', 7, 'user_stated', now(), 2.5)`,
+      [c2ProjectId]
+    );
+
+    // Set contract to assertion kind so loader retrieves assertions.
+    await db.query(
+      `UPDATE retrieval_contract
+       SET queries = $2::jsonb, updated_at = now()
+       WHERE project_id = $1 AND name = 'default'`,
+      [c2ProjectId, JSON.stringify({ queries: [{ kind: 'assertion' }] })]
+    );
+    await db.end();
+
+    const env = { ...process.env, HANDOFF_DB: c2Db, PROJECT_ROOT: c2ProjectDir };
+
+    // Run loader-load twice and compare output.
+    const r1 = spawnSync(
+      process.execPath, [HANDOFF_SCRIPT, 'loader-load'],
+      { cwd: PROJECT_ROOT, env, encoding: 'utf8', timeout: 30000 }
+    );
+    if (r1.status !== 0) {
+      c2Fail(1, label, `first loader-load exited ${r1.status}: ${(r1.stderr || r1.stdout || '').slice(0, 200)}`);
+      return false;
+    }
+
+    const r2 = spawnSync(
+      process.execPath, [HANDOFF_SCRIPT, 'loader-load'],
+      { cwd: PROJECT_ROOT, env, encoding: 'utf8', timeout: 30000 }
+    );
+    if (r2.status !== 0) {
+      c2Fail(1, label, `second loader-load exited ${r2.status}: ${(r2.stderr || r2.stdout || '').slice(0, 200)}`);
+      return false;
+    }
+
+    // Normalize token count line (can vary between runs due to reinforcement timestamp drift).
+    const normalize = (s) => s.replace(/tokens used: ~\d+/g, 'tokens used: ~X');
+    const out1 = normalize(r1.stdout || '');
+    const out2 = normalize(r2.stdout || '');
+    if (out1 !== out2) {
+      c2Fail(1, label, 'Two loader-load calls produced different stdout — output not stable with gate OFF');
+      return false;
+    }
+
+    // Confirm C2-internal implementation details are not mentioned in loader stdout.
+    // We check for terms that would only appear if the gate-off path leaked C2 internals.
+    const forbidden = ['outcome_bias', 'feedback_loop_enabled', 'C2 feedback'];
+    for (const term of forbidden) {
+      if ((r1.stdout || '').includes(term)) {
+        c2Fail(1, label, `Forbidden term "${term}" found in loader stdout — gate OFF leaks C2 internals`);
+        return false;
+      }
+    }
+
+    c2Pass(1, label);
+    return true;
+  } catch (err) {
+    c2Fail(1, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * C2 2/4: Gate ON + seeded session with attributed assertions and mixed outcomes ⇒
+ * outcome_bias moves in the right direction, bounded by the clamp.
+ *
+ * Seeds: two assertions with mixed outcomes across two retrieval events.
+ * Runs cmdClose (via subproc) with gate ON. Checks bias moved correctly.
+ */
+async function c2Step2_gateOnBiasAdjustment(c2Db, c2ProjectId, c2ProjectDir) {
+  const label = 'Gate ON: mixed outcomes adjust outcome_bias in correct direction, bounded by clamp';
+  try {
+    const db = await pgConnect(c2Db);
+
+    // Enable the feedback loop.
+    await db.query(
+      `INSERT INTO project_settings (project_id, key, value)
+       VALUES ($1, 'feedback_loop_enabled', 'enabled')
+       ON CONFLICT (project_id, key) DO UPDATE SET value = 'enabled'`,
+      [c2ProjectId]
+    );
+
+    // Insert two fresh assertions (outcome_bias starts at 0).
+    const { rows: aRows } = await db.query(
+      `INSERT INTO assertions
+         (project_id, subject, predicate, object, confidence, source, last_reinforced, outcome_bias)
+       VALUES ($1, 'C2_SUCCESS_SUBJECT', 'is', 'successful', 7, 'user_stated', now(), 0),
+              ($1, 'C2_FAILURE_SUBJECT', 'is', 'failing',    7, 'user_stated', now(), 0)
+       RETURNING id, subject`,
+      [c2ProjectId]
+    );
+    const successAssertionId = aRows.find((r) => r.subject === 'C2_SUCCESS_SUBJECT').id;
+    const failureAssertionId = aRows.find((r) => r.subject === 'C2_FAILURE_SUBJECT').id;
+
+    // Create a retrieval_events table entry for a test session (no pgvector, so no embedding).
+    const testSession = `c2-test-session-${Date.now()}`;
+    const { rows: evtRows } = await db.query(
+      `INSERT INTO retrieval_events (project_id, query_text, session_id, outcome, outcome_at, outcome_signal)
+       VALUES ($1, 'c2-test-query', $2, 'success',    now(), 'agent_self_report'),
+              ($1, 'c2-test-query', $2, 'failure',    now(), 'agent_self_report')
+       RETURNING id, outcome`,
+      [c2ProjectId, testSession]
+    );
+    const successEventId = evtRows.find((r) => r.outcome === 'success').id;
+    const failureEventId = evtRows.find((r) => r.outcome === 'failure').id;
+
+    // Attribute the assertions to their respective events.
+    await db.query(
+      `INSERT INTO retrieval_event_assertions (event_id, assertion_id)
+       VALUES ($1, $2), ($3, $4)`,
+      [successEventId, successAssertionId, failureEventId, failureAssertionId]
+    );
+
+    // Set session_in_progress so cmdClose can resolve the session id.
+    await db.query(
+      `INSERT INTO project_settings (project_id, key, value)
+       VALUES ($1, 'session_in_progress', $2)
+       ON CONFLICT (project_id, key) DO UPDATE SET value = $2`,
+      [c2ProjectId, testSession]
+    );
+    await db.end();
+
+    // Run cmdClose (subprocess) — this triggers the C2 feedback application block.
+    const closePayload = JSON.stringify({ tldr: 'c2 test close', session_id: testSession });
+    const r = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'close', '--json', '-'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: c2Db, PROJECT_ROOT: c2ProjectDir },
+        input:    closePayload,
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+    if (r.status !== 0) {
+      c2Fail(2, label, `cmdClose exited ${r.status}: ${((r.stderr || '') + (r.stdout || '')).slice(0, 400)}`);
+      return false;
+    }
+
+    // Check the output mentions C2 feedback adjustment.
+    const closeOut = r.stdout || '';
+    if (!closeOut.includes('C2 feedback')) {
+      c2Fail(2, label, `cmdClose output does not mention "C2 feedback" — feedback block may not have run: ${closeOut.slice(0, 400)}`);
+      return false;
+    }
+
+    // Verify bias moved in the correct direction.
+    const db2 = await pgConnect(c2Db);
+    const { rows: biasRows } = await db2.query(
+      `SELECT id, subject, outcome_bias FROM assertions WHERE id = ANY($1)`,
+      [[successAssertionId, failureAssertionId]]
+    );
+    await db2.end();
+
+    const successRow = biasRows.find((r) => r.id === successAssertionId);
+    const failureRow = biasRows.find((r) => r.id === failureAssertionId);
+
+    if (!successRow || !failureRow) {
+      c2Fail(2, label, 'Could not find test assertions in DB after cmdClose');
+      return false;
+    }
+
+    // Success event → positive delta (default 0.5) → bias should be > 0.
+    if (successRow.outcome_bias <= 0) {
+      c2Fail(2, label, `success assertion bias is ${successRow.outcome_bias}, expected > 0`);
+      return false;
+    }
+
+    // Failure event → negative delta (default -0.75) → bias should be < 0.
+    if (failureRow.outcome_bias >= 0) {
+      c2Fail(2, label, `failure assertion bias is ${failureRow.outcome_bias}, expected < 0`);
+      return false;
+    }
+
+    c2Pass(2, label);
+    return { ok: true, testSession, successAssertionId, failureAssertionId };
+  } catch (err) {
+    c2Fail(2, label, err.message);
+    return { ok: false };
+  }
+}
+
+/**
+ * C2 3/4: Gate ON ⇒ strongly-negative-bias assertion demoted in ranking;
+ * strongly-positive-bias assertion promoted.
+ *
+ * Inserts two assertions: one with outcome_bias = -2.9 (near floor), one at 0.
+ * Checks ORDER BY effective_confidence puts the negative-bias one last (or suppresses it).
+ */
+async function c2Step3_biasAffectsRanking(c2Db, c2ProjectId, c2ProjectDir) {
+  const label = 'Gate ON: negative-bias assertion ranked below positive-bias assertion in loader output';
+  try {
+    const db = await pgConnect(c2Db);
+
+    // Ensure gate is still enabled (step 2 sets it, but be defensive).
+    await db.query(
+      `INSERT INTO project_settings (project_id, key, value)
+       VALUES ($1, 'feedback_loop_enabled', 'enabled')
+       ON CONFLICT (project_id, key) DO UPDATE SET value = 'enabled'`,
+      [c2ProjectId]
+    );
+
+    // Insert two fresh assertions with distinct subjects and very different outcome_bias.
+    // Both have the same base confidence (5) and are freshly reinforced.
+    // high_bias: outcome_bias = 2.5 → effective_conf = 5 * 1 + 2.5 = 7.5
+    // low_bias: outcome_bias = -3.0 → effective_conf = 5 * 1 + (-3.0) = 2.0 (still above 1.0)
+    // suppressed_bias: outcome_bias = -4.5 → effective_conf = 5 * 1 + (-4.5) = 0.5 < 1.0 → suppressed
+    const { rows: bRows } = await db.query(
+      `INSERT INTO assertions
+         (project_id, subject, predicate, object, confidence, source, last_reinforced, outcome_bias)
+       VALUES ($1, 'C2_RANK_HIGH',       'is', 'top',       5, 'user_stated', now(),  2.5),
+              ($1, 'C2_RANK_LOW',        'is', 'bottom',    5, 'user_stated', now(), -3.0),
+              ($1, 'C2_RANK_SUPPRESSED', 'is', 'invisible', 5, 'user_stated', now(), -4.5)
+       RETURNING id, subject`,
+      [c2ProjectId]
+    );
+
+    // Set contract to assertion kind (no subject filter — retrieve all).
+    await db.query(
+      `UPDATE retrieval_contract
+       SET queries = $2::jsonb, updated_at = now()
+       WHERE project_id = $1 AND name = 'default'`,
+      [c2ProjectId, JSON.stringify({ queries: [{ kind: 'assertion' }] })]
+    );
+    await db.end();
+
+    // Run loader-load with gate ON (already set).
+    const env = { ...process.env, HANDOFF_DB: c2Db, PROJECT_ROOT: c2ProjectDir };
+    const r = spawnSync(
+      process.execPath, [HANDOFF_SCRIPT, 'loader-load'],
+      { cwd: PROJECT_ROOT, env, encoding: 'utf8', timeout: 30000 }
+    );
+    if (r.status !== 0) {
+      c2Fail(3, label, `loader-load exited ${r.status}: ${(r.stderr || r.stdout || '').slice(0, 200)}`);
+      return false;
+    }
+
+    const out = r.stdout || '';
+
+    // C2_RANK_HIGH should appear in output.
+    if (!out.includes('C2_RANK_HIGH')) {
+      c2Fail(3, label, '"C2_RANK_HIGH" not found in loader output — high-bias assertion not retrieved');
+      return false;
+    }
+
+    // C2_RANK_SUPPRESSED should NOT appear (effective_conf 0.5 < 1.0 threshold).
+    if (out.includes('C2_RANK_SUPPRESSED')) {
+      c2Fail(3, label, '"C2_RANK_SUPPRESSED" appears in loader output — suppression by outcome_bias not working');
+      return false;
+    }
+
+    // C2_RANK_HIGH should appear before C2_RANK_LOW in the output (higher effective_conf ranks first).
+    const highIdx = out.indexOf('C2_RANK_HIGH');
+    const lowIdx  = out.indexOf('C2_RANK_LOW');
+    if (lowIdx !== -1 && highIdx > lowIdx) {
+      c2Fail(3, label, `C2_RANK_LOW (idx ${lowIdx}) appears before C2_RANK_HIGH (idx ${highIdx}) — ranking inverted`);
+      return false;
+    }
+
+    c2Pass(3, label);
+    return true;
+  } catch (err) {
+    c2Fail(3, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * C2 4/4: Idempotency — re-running cmdClose for the same session does not double-apply.
+ *
+ * After step 2 ran cmdClose for testSession, reads the current bias values, then
+ * re-runs cmdClose for the same session_id and confirms bias values are unchanged.
+ */
+async function c2Step4_idempotency(c2Db, c2ProjectId, c2ProjectDir, testSession, successAssertionId, failureAssertionId) {
+  const label = 'Idempotency: re-running cmdClose for the same session does not double-apply bias';
+  if (!testSession || !successAssertionId || !failureAssertionId) {
+    c2Fail(4, label, 'skipped due to step 2 failure (no testSession/assertionIds)');
+    return false;
+  }
+  try {
+    // Read current bias values (set by step 2's cmdClose run).
+    const db = await pgConnect(c2Db);
+    const { rows: before } = await db.query(
+      `SELECT id, outcome_bias FROM assertions WHERE id = ANY($1)`,
+      [[successAssertionId, failureAssertionId]]
+    );
+
+    // Re-set session_in_progress to the same session id (cmdClose will clear it, so we need to restore).
+    await db.query(
+      `INSERT INTO project_settings (project_id, key, value)
+       VALUES ($1, 'session_in_progress', $2)
+       ON CONFLICT (project_id, key) DO UPDATE SET value = $2`,
+      [c2ProjectId, testSession]
+    );
+    await db.end();
+
+    // Re-run cmdClose for the same session.
+    const closePayload = JSON.stringify({ tldr: 'c2 idempotency re-run', session_id: testSession });
+    const r = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'close', '--json', '-'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: c2Db, PROJECT_ROOT: c2ProjectDir },
+        input:    closePayload,
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+
+    // Close may fail for other reasons but bias must not double-apply; check bias regardless.
+    const db2 = await pgConnect(c2Db);
+    const { rows: after } = await db2.query(
+      `SELECT id, outcome_bias FROM assertions WHERE id = ANY($1)`,
+      [[successAssertionId, failureAssertionId]]
+    );
+    await db2.end();
+
+    // Compare bias values before and after re-run.
+    for (const bRow of before) {
+      const aRow = after.find((a) => a.id === bRow.id);
+      if (!aRow) {
+        c2Fail(4, label, `assertion id=${bRow.id} not found after re-run`);
+        return false;
+      }
+      if (Math.abs(aRow.outcome_bias - bRow.outcome_bias) > 0.001) {
+        c2Fail(4, label,
+          `assertion id=${bRow.id}: bias changed from ${bRow.outcome_bias} to ${aRow.outcome_bias} on re-run — not idempotent`
+        );
+        return false;
+      }
+    }
+
+    // Also verify the re-run output mentions "already applied" (idempotency guard message).
+    const rerunOut = r.stdout || '';
+    if (!rerunOut.includes('already applied')) {
+      c2Fail(4, label, `re-run cmdClose output does not contain "already applied" — idempotency guard message missing`);
+      return false;
+    }
+
+    c2Pass(4, label);
+    return true;
+  } catch (err) {
+    c2Fail(4, label, err.message);
+    return false;
+  }
+}
+
+async function runC2Section() {
+  console.log(`\n=== C2 SECTION (${C2_TOTAL} steps) ===`);
+  console.log('smoketest-handoff C2: gate-off no-op, bias adjustment, ranking, idempotency');
+  console.log('(All steps pass without Python or Ollama)');
+  console.log('');
+
+  const C2_TS         = Date.now();
+  const C2_DB         = `claude_memory_c2_${C2_TS}`;
+  const C2_PROJ_DIR   = path.join(os.tmpdir(), `handoff_c2_${C2_TS}`);
+  const C2_PROJECT_ID = encodeCwd(C2_PROJ_DIR);
+
+  try {
+    await createSmokeDb(C2_DB, C2_PROJ_DIR);
+
+    // Write a minimal CLAUDE.md so init can run cleanly.
+    const c2ClaudeMd = path.join(C2_PROJ_DIR, 'CLAUDE.md');
+    fs.writeFileSync(c2ClaudeMd, '# c2-test\n\n## Durable facts\n- (none)\n', 'utf8');
+
+    // Run init so all base tables exist.
+    const initR = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'init', '-y'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: C2_DB, PROJECT_ROOT: C2_PROJ_DIR },
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+    if (initR.status !== 0) {
+      console.log('[C2] DB init failed — skipping remaining steps');
+      console.log(initR.stderr || initR.stdout || '');
+      c2Failed += C2_TOTAL;
+      return;
+    }
+    console.log(`[C2] DB init OK (${C2_DB})`);
+
+    // Create retrieval_events table (no pgvector in smoketest DB).
+    try {
+      await createRetrievalEventsTable(C2_DB);
+    } catch (_) { /* non-fatal */ }
+
+    // Create retrieval_event_assertions join table (needed for C2 feedback join).
+    try {
+      await createRetrievalEventAssertionsTable(C2_DB);
+    } catch (_) { /* non-fatal — step 2 will report failure if the table is missing */ }
+
+    // Step 1: gate OFF no-op.
+    await c2Step1_gateOffNoOp(C2_DB, C2_PROJECT_ID, C2_PROJ_DIR);
+
+    // Step 2: gate ON + bias adjustment (returns testSession + assertionIds for step 4).
+    const step2Result = await c2Step2_gateOnBiasAdjustment(C2_DB, C2_PROJECT_ID, C2_PROJ_DIR);
+    const testSession        = step2Result && step2Result.ok ? step2Result.testSession        : null;
+    const successAssertionId = step2Result && step2Result.ok ? step2Result.successAssertionId : null;
+    const failureAssertionId = step2Result && step2Result.ok ? step2Result.failureAssertionId : null;
+
+    // Step 3: ranking — gate ON, strongly-negative bias suppressed/demoted.
+    await c2Step3_biasAffectsRanking(C2_DB, C2_PROJECT_ID, C2_PROJ_DIR);
+
+    // Step 4: idempotency — re-running close for the same session does not double-apply.
+    await c2Step4_idempotency(C2_DB, C2_PROJECT_ID, C2_PROJ_DIR, testSession, successAssertionId, failureAssertionId);
+
+  } finally {
+    const C2_HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', C2_PROJECT_ID, 'handoff.md');
+    await dropSmokeDb(C2_DB, C2_PROJ_DIR, C2_HANDOFF_PATH).catch(() => {});
+  }
+}
+
 // ── Section runners ───────────────────────────────────────────────────────────
 
 async function runLifecycleSection() {
@@ -3292,6 +3751,9 @@ async function main() {
   if (SECTION === 'c1' || SECTION === 'all') {
     await runC1Section();
   }
+  if (SECTION === 'c2' || SECTION === 'all') {
+    await runC2Section();
+  }
 
   console.log('');
 
@@ -3302,12 +3764,13 @@ async function main() {
   const w3Total  = w3Passed + w3Failed;
   const w4Total  = w4Passed + w4Failed;
   const c1Total  = c1Passed + c1Failed;
-  const totalPass = lcPassed + hkPassed + hdPassed + w2Passed + w3Passed + w4Passed + c1Passed;
-  const totalAll  = lcTotal  + hkTotal  + hdTotal  + w2Total  + w3Total  + w4Total  + c1Total;
-  const totalSkip = lcSkipped + hkSkipped + hdSkipped + w2Skipped + w3Skipped + w4Skipped + c1Skipped;
+  const c2Total  = c2Passed + c2Failed;
+  const totalPass = lcPassed + hkPassed + hdPassed + w2Passed + w3Passed + w4Passed + c1Passed + c2Passed;
+  const totalAll  = lcTotal  + hkTotal  + hdTotal  + w2Total  + w3Total  + w4Total  + c1Total  + c2Total;
+  const totalSkip = lcSkipped + hkSkipped + hdSkipped + w2Skipped + w3Skipped + w4Skipped + c1Skipped + c2Skipped;
 
   if (SECTION === 'all') {
-    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal}, hardening: ${hdPassed}/${hdTotal}, w2: ${w2Passed}/${w2Total}, w3: ${w3Passed}/${w3Total}, w4: ${w4Passed}/${w4Total}, c1: ${c1Passed}/${c1Total})`);
+    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal}, hardening: ${hdPassed}/${hdTotal}, w2: ${w2Passed}/${w2Total}, w3: ${w3Passed}/${w3Total}, w4: ${w4Passed}/${w4Total}, c1: ${c1Passed}/${c1Total}, c2: ${c2Passed}/${c2Total})`);
   } else if (SECTION === 'lifecycle') {
     console.log(`smoketest: ${lcPassed}/${lcTotal} passed, ${lcSkipped} skipped (lifecycle only)`);
   } else if (SECTION === 'hooks') {
@@ -3320,11 +3783,13 @@ async function main() {
     console.log(`smoketest: ${w4Passed}/${w4Total} passed, ${w4Skipped} skipped (w4 only)`);
   } else if (SECTION === 'c1') {
     console.log(`smoketest: ${c1Passed}/${c1Total} passed, ${c1Skipped} skipped (c1 only)`);
+  } else if (SECTION === 'c2') {
+    console.log(`smoketest: ${c2Passed}/${c2Total} passed, ${c2Skipped} skipped (c2 only)`);
   } else {
     console.log(`smoketest: ${hdPassed}/${hdTotal} passed, ${hdSkipped} skipped (hardening only)`);
   }
 
-  if (lcFailed + hkFailed + hdFailed + w2Failed + w3Failed + w4Failed + c1Failed > 0) process.exitCode = 1;
+  if (lcFailed + hkFailed + hdFailed + w2Failed + w3Failed + w4Failed + c1Failed + c2Failed > 0) process.exitCode = 1;
 }
 
 main().catch((err) => {
