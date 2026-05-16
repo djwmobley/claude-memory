@@ -41,3 +41,21 @@ CREATE INDEX IF NOT EXISTS retrieval_events_outcome_idx
   ON retrieval_events (outcome) WHERE outcome = 'pending';
 CREATE INDEX IF NOT EXISTS retrieval_events_time_idx
   ON retrieval_events (retrieved_at DESC);
+
+
+-- ============================================================================
+-- RETRIEVAL_EVENT_ASSERTIONS — join table linking retrieval events to the
+-- specific assertions that were returned in each retrieval. Populated by
+-- the loader (Bundle C1); event_id references retrieval_events(id).
+--
+-- Observability-only: no query path reads this table yet. Failures writing
+-- to this table must never propagate to the loader caller.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS retrieval_event_assertions (
+  event_id      INTEGER NOT NULL REFERENCES retrieval_events(id) ON DELETE CASCADE,
+  assertion_id  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS rea_event_idx
+  ON retrieval_event_assertions (event_id);
+CREATE INDEX IF NOT EXISTS rea_assertion_idx
+  ON retrieval_event_assertions (assertion_id);
