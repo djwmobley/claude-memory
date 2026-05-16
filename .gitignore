@@ -18,3 +18,24 @@ test/eval/last-run.json
 
 # Benchmark output (local runs only)
 scripts/bench-results.csv
+
+# --- Local session scratch & private-tooling-referencing artifacts (NEVER commit) ---
+# Root-anchored on purpose: these patterns must not shadow tracked schema/findings files
+# (scripts/setup.sql, scripts/sql/*.sql, docs/findings/debate-*.md, start-vllm-reranker.sh).
+# Covers: handoff/debate/as-is scratch notes, root-level SQL/CSV dumps, vLLM launch
+# scripts, and hook log spew — these reference private orchestration tooling and/or
+# contain local DB data, and may never enter the public repo.
+/HANDOFF-*.md
+/DEBATE-*.md
+/AS-IS-*.md
+/NATE-JONES-*.md
+/*.sql
+/*.csv
+/loader_hook_*.txt
+/launch-vllm-bg.sh
+/start-vllm.sh
+/vllm-*.err
+scripts/_apply_schema.js
+scripts/decisions_backup*.csv
+.playwright-mcp/
+.claude/scheduled_tasks.lock
