@@ -148,6 +148,27 @@ CREATE TABLE IF NOT EXISTS retrieval_contract (
 CREATE INDEX IF NOT EXISTS retrieval_contract_project_idx
   ON retrieval_contract (project_id);
 
+-- Add version column to retrieval_contract for change tracking (idempotent — safe on both fresh and existing DBs).
+ALTER TABLE retrieval_contract ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1;
+
+-- ============================================================================
+-- RETRIEVAL_CONTRACT_HISTORY — audit log of every contract change.
+-- One row per version bump. Populated by recordContractChange() in handoff.js.
+-- Portable (no pgvector). Idempotent (CREATE TABLE IF NOT EXISTS).
+-- project_id = encoded_cwd; name = retrieval_contract.name.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS retrieval_contract_history (
+  id          SERIAL PRIMARY KEY,
+  project_id  TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  version     INTEGER NOT NULL,
+  queries     JSONB NOT NULL,
+  change_note TEXT,
+  changed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS retrieval_contract_history_idx
+  ON retrieval_contract_history (project_id, name, version);
+
 
 -- ============================================================================
 -- PROJECT_SETTINGS — per-project key/value configuration store.

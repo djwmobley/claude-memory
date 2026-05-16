@@ -289,6 +289,85 @@ async function setSetting(db, projectId, key, value) {
 }
 
 /**
+ * Deep-equal comparison for two retrieval contract objects.
+ * Compares via JSON.stringify (contract shape is {queries:[...]}, deterministic).
+ * Exported for unit tests.
+ *
+ * @param {object} a
+ * @param {object} b
+ * @returns {boolean}
+ */
+function queriesEqual(a, b) {
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * Record a contract change: bump the version and write a history row.
+ *
+ * Transactional:
+ *   1. SELECT current version + queries for (projectId, name).
+ *   2. If the row exists and its queries deep-equal newQueriesObj → NO-OP
+ *      (idempotent — prevents history spam on identical re-close).
+ *   3. Otherwise compute newVersion, UPSERT retrieval_contract with the new
+ *      queries/version, and INSERT a retrieval_contract_history row.
+ *
+ * Non-fatal: callers must wrap in try/catch — a history failure must not abort
+ * the operation that triggered it.
+ *
+ * @param {object}  db            — pg Client
+ * @param {string}  projectId     — encoded_cwd
+ * @param {string}  name          — contract name (e.g. 'default')
+ * @param {object}  newQueriesObj — the new contract object (e.g. {queries:[...]})
+ * @param {string|null} changeNote — human-readable note stored in history row
+ */
+async function recordContractChange(db, projectId, name, newQueriesObj, changeNote) {
+  await db.query('BEGIN');
+  try {
+    // Read current state.
+    const { rows } = await db.query(
+      `SELECT version, queries FROM retrieval_contract
+       WHERE project_id = $1 AND name = $2`,
+      [projectId, name]
+    );
+
+    const existing = rows.length > 0 ? rows[0] : null;
+
+    // Idempotent no-op: if the contract is unchanged, do nothing.
+    if (existing && queriesEqual(existing.queries, newQueriesObj)) {
+      await db.query('COMMIT');
+      return;
+    }
+
+    const newVersion = existing ? (existing.version || 0) + 1 : 1;
+
+    // Upsert the live contract row with the new queries and bumped version.
+    await db.query(
+      `INSERT INTO retrieval_contract (project_id, name, queries, version, updated_at)
+       VALUES ($1, $2, $3::jsonb, $4, now())
+       ON CONFLICT (project_id, name) DO UPDATE
+         SET queries = EXCLUDED.queries, version = EXCLUDED.version, updated_at = now()`,
+      [projectId, name, JSON.stringify(newQueriesObj), newVersion]
+    );
+
+    // Insert audit history row.
+    await db.query(
+      `INSERT INTO retrieval_contract_history (project_id, name, version, queries, change_note)
+       VALUES ($1, $2, $3, $4::jsonb, $5)`,
+      [projectId, name, newVersion, JSON.stringify(newQueriesObj), changeNote || null]
+    );
+
+    await db.query('COMMIT');
+  } catch (err) {
+    try { await db.query('ROLLBACK'); } catch (_) { /* ignore */ }
+    throw err;
+  }
+}
+
+/**
  * Detect whether the repository at `cwd` has more than one commit author in the
  * past year. Returns the distinct author-email count.
  *
@@ -579,7 +658,7 @@ async function cmdInit(args) {
   }
   console.log(`  [OK]    project_settings defaults ensured (${Object.keys(defaults).length} keys, idempotent)`);
 
-  // Step 9: Insert default retrieval_contract row
+  // Step 9: Insert default retrieval_contract row (DO NOTHING keeps it idempotent)
   await db.query(
     `INSERT INTO retrieval_contract (project_id, name, queries, updated_at)
      VALUES ($1, 'default', $2::jsonb, now())
@@ -587,6 +666,35 @@ async function cmdInit(args) {
     [projectId, JSON.stringify({ queries: [] })]
   );
   console.log(`  [OK]    retrieval_contract 'default' row ensured`);
+
+  // Idempotently ensure a v1 baseline history row exists (non-fatal).
+  // If the project is brand new, the DO NOTHING above just inserted v1 and there
+  // is no history row yet. If init is re-run, DO NOTHING above is a no-op and a
+  // baseline row may already exist — we guard with a COUNT check.
+  try {
+    const { rows: hRows } = await db.query(
+      `SELECT COUNT(*) AS n FROM retrieval_contract_history
+       WHERE project_id = $1 AND name = 'default'`,
+      [projectId]
+    );
+    if (parseInt(hRows[0].n, 10) === 0) {
+      // Fetch the contract's current version and queries for the baseline row.
+      const { rows: rcRows } = await db.query(
+        `SELECT version, queries FROM retrieval_contract WHERE project_id = $1 AND name = 'default'`,
+        [projectId]
+      );
+      if (rcRows.length > 0) {
+        await db.query(
+          `INSERT INTO retrieval_contract_history (project_id, name, version, queries, change_note)
+           VALUES ($1, 'default', $2, $3::jsonb, 'init baseline')`,
+          [projectId, rcRows[0].version, JSON.stringify(rcRows[0].queries)]
+        );
+      }
+    }
+    console.log(`  [OK]    retrieval_contract_history baseline ensured (idempotent)`);
+  } catch (histErr) {
+    console.log(`  [WARN]  retrieval_contract_history baseline failed (non-fatal): ${histErr.message}`);
+  }
 
   await db.end();
 
@@ -1197,15 +1305,14 @@ async function writeExtraction(db, projectId, payload) {
     edgesWritten++;
   }
 
-  // Retrieval contract upsert
+  // Retrieval contract change — versioned and history-recorded (non-fatal).
   if (payload.contract && typeof payload.contract === 'object') {
-    await db.query(
-      `INSERT INTO retrieval_contract (project_id, name, queries, updated_at)
-       VALUES ($1, 'default', $2::jsonb, now())
-       ON CONFLICT (project_id, name) DO UPDATE
-         SET queries = EXCLUDED.queries, updated_at = now()`,
-      [projectId, JSON.stringify(payload.contract)]
-    );
+    const changeNote = `close session=${payload.session_id || 'unknown'}`;
+    try {
+      await recordContractChange(db, projectId, 'default', payload.contract, changeNote);
+    } catch (contractErr) {
+      process.stderr.write(`[handoff] contract history record failed (non-fatal): ${contractErr.message}\n`);
+    }
   }
 
   return { entitiesWritten, assertionsWritten, edgesWritten };
@@ -1813,4 +1920,10 @@ async function main() {
   }
 }
 
-main();
+// ─── EXPORTS (for tests and CLI scripts) ─────────────────────────────────────
+// When required as a module, export helpers without running the CLI router.
+if (require.main === module) {
+  main();
+} else {
+  module.exports = { queriesEqual, recordContractChange };
+}
