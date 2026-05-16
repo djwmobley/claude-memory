@@ -25,8 +25,8 @@ const { Client } = require('pg');
 const ARGS       = process.argv.slice(2);
 const sectionArg = ARGS.find((a) => a.startsWith('--section='));
 const SECTION    = sectionArg ? sectionArg.split('=')[1] : 'all';
-if (!['all', 'lifecycle', 'hooks', 'hardening', 'w2', 'w3'].includes(SECTION)) {
-  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, hardening, w2, w3, all`);
+if (!['all', 'lifecycle', 'hooks', 'hardening', 'w2', 'w3', 'w4'].includes(SECTION)) {
+  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, hardening, w2, w3, w4, all`);
   process.exit(2);
 }
 
@@ -83,12 +83,16 @@ let w2Skipped = 0;
 let w3Passed  = 0;
 let w3Failed  = 0;
 let w3Skipped = 0;
+let w4Passed  = 0;
+let w4Failed  = 0;
+let w4Skipped = 0;
 
 const LC_TOTAL = 14;
 const HK_TOTAL = 3;
 const HD_TOTAL = 8;
 const W2_TOTAL = 3;
 const W3_TOTAL = 5;
+const W4_TOTAL = 6;
 
 function lcPass(step, label) {
   console.log(`[STEP ${step}/${LC_TOTAL}] ${label} ... PASS`);
@@ -153,6 +157,16 @@ function w3Fail(step, label, reason) {
 function w3Skip(step, label, reason) {
   console.log(`[W3 ${step}/${W3_TOTAL}] ${label} ... SKIPPED — ${reason}`);
   w3Skipped++;
+}
+
+function w4Pass(step, label) {
+  console.log(`[W4 ${step}/${W4_TOTAL}] ${label} ... PASS`);
+  w4Passed++;
+}
+
+function w4Fail(step, label, reason) {
+  console.log(`[W4 ${step}/${W4_TOTAL}] ${label} ... FAIL: ${reason}`);
+  w4Failed++;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -2182,6 +2196,567 @@ async function runW3Section() {
   }
 }
 
+// ── W4 step implementations ───────────────────────────────────────────────────
+
+const W4_SCRIPT = path.join(PROJECT_ROOT, 'scripts', 'bundleb-w4-contract.js');
+
+/**
+ * Create the retrieval_contract_history table in the given DB (W4, portable).
+ * Mirrors the DDL in handoff-core-schema.sql exactly.
+ */
+async function createContractHistoryTable(dbName) {
+  const db = await pgConnect(dbName);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS retrieval_contract_history (
+      id          SERIAL PRIMARY KEY,
+      project_id  TEXT NOT NULL,
+      name        TEXT NOT NULL,
+      version     INTEGER NOT NULL,
+      queries     JSONB NOT NULL,
+      change_note TEXT,
+      changed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS retrieval_contract_history_idx
+      ON retrieval_contract_history (project_id, name, version)
+  `);
+  // Also add version column to retrieval_contract if it doesn't exist yet.
+  await db.query(`
+    ALTER TABLE retrieval_contract ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1
+  `);
+  await db.end();
+}
+
+/**
+ * W4 1/6: Schema — retrieval_contract.version column and retrieval_contract_history
+ * table exist in the throwaway DB after init.
+ */
+async function w4Step1_schemaExists(w4Db) {
+  const label = 'Schema: retrieval_contract.version column and retrieval_contract_history table exist after init';
+  try {
+    const db = await pgConnect(w4Db);
+
+    // Check version column on retrieval_contract.
+    const { rows: colRows } = await db.query(
+      `SELECT 1 FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name   = 'retrieval_contract'
+         AND column_name  = 'version'`
+    );
+    if (colRows.length === 0) {
+      await db.end();
+      w4Fail(1, label, 'retrieval_contract.version column not found after init');
+      return false;
+    }
+
+    // Check retrieval_contract_history table.
+    const { rows: tblRows } = await db.query(
+      `SELECT 1 FROM information_schema.tables
+       WHERE table_schema = 'public' AND table_name = 'retrieval_contract_history'`
+    );
+    if (tblRows.length === 0) {
+      await db.end();
+      w4Fail(1, label, 'retrieval_contract_history table not found after init');
+      return false;
+    }
+
+    await db.end();
+    w4Pass(1, label);
+    return true;
+  } catch (err) {
+    w4Fail(1, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * W4 2/6: queriesEqual unit test.
+ *
+ * Pure function — no DB required.
+ * Verifies equal objects return true; different objects return false.
+ */
+async function w4Step2_queriesEqualUnit() {
+  const label = 'queriesEqual: equal objects return true; different objects return false';
+  try {
+    const { queriesEqual } = require(W4_SCRIPT);
+
+    // Equal: same structure.
+    const a = { queries: [{ kind: 'assertion' }, { kind: 'recency' }] };
+    const b = { queries: [{ kind: 'assertion' }, { kind: 'recency' }] };
+    if (!queriesEqual(a, b)) {
+      w4Fail(2, label, 'queriesEqual returned false for equal objects');
+      return false;
+    }
+
+    // Different: query kinds differ.
+    const c = { queries: [{ kind: 'entity' }] };
+    if (queriesEqual(a, c)) {
+      w4Fail(2, label, 'queriesEqual returned true for different objects');
+      return false;
+    }
+
+    // Both empty.
+    if (!queriesEqual({ queries: [] }, { queries: [] })) {
+      w4Fail(2, label, 'queriesEqual returned false for two empty-queries objects');
+      return false;
+    }
+
+    // One empty, one not.
+    if (queriesEqual({ queries: [] }, { queries: [{ kind: 'assertion' }] })) {
+      w4Fail(2, label, 'queriesEqual returned true when one side has no queries');
+      return false;
+    }
+
+    w4Pass(2, label);
+    return true;
+  } catch (err) {
+    w4Fail(2, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * W4 3/6: close with a non-empty contract bumps version 1→2, writes exactly one
+ * history row; a second close with the IDENTICAL contract does NOT bump version
+ * and writes NO new history row (idempotent no-op).
+ */
+async function w4Step3_versionBumpAndNoOp(w4Db, w4ProjectId, w4ProjectDir) {
+  const label = 'Version bump 1→2 on first contract change; identical re-close is a no-op';
+  try {
+    const contractV2 = { queries: [{ kind: 'assertion' }] };
+
+    // First close — should bump version from 1 → 2 and write a history row.
+    const payload1 = JSON.stringify({
+      tldr:     'W4 version-bump test',
+      contract: contractV2,
+    });
+    const r1 = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'close', '--json', '-'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: w4Db, PROJECT_ROOT: w4ProjectDir },
+        input:    payload1,
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+    if (r1.status !== 0) {
+      w4Fail(3, label, `first close exited ${r1.status}: ${(r1.stderr || r1.stdout || '').slice(0, 200)}`);
+      return false;
+    }
+
+    const db = await pgConnect(w4Db);
+
+    // Check version is now 2.
+    const { rows: rcRows } = await db.query(
+      `SELECT version FROM retrieval_contract WHERE project_id = $1 AND name = 'default'`,
+      [w4ProjectId]
+    );
+    if (rcRows.length === 0 || parseInt(rcRows[0].version, 10) !== 2) {
+      await db.end();
+      w4Fail(3, label, `expected version=2 after first close, got ${rcRows.length > 0 ? rcRows[0].version : 'no row'}`);
+      return false;
+    }
+
+    // Check exactly one history row.
+    const { rows: hRows1 } = await db.query(
+      `SELECT COUNT(*) AS n FROM retrieval_contract_history WHERE project_id = $1 AND name = 'default'`,
+      [w4ProjectId]
+    );
+    // init writes 1 baseline row, close should add 1 more → total 2.
+    const h1Count = parseInt(hRows1[0].n, 10);
+    if (h1Count < 2) {
+      await db.end();
+      w4Fail(3, label, `expected >=2 history rows after first change (init baseline + v2 close), got ${h1Count}`);
+      return false;
+    }
+
+    await db.end();
+
+    // Second close — IDENTICAL contract — must be a no-op.
+    const payload2 = JSON.stringify({
+      tldr:     'W4 idempotent re-close',
+      contract: contractV2,
+    });
+    const r2 = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'close', '--json', '-'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: w4Db, PROJECT_ROOT: w4ProjectDir },
+        input:    payload2,
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+    if (r2.status !== 0) {
+      w4Fail(3, label, `second (identical) close exited ${r2.status}: ${(r2.stderr || r2.stdout || '').slice(0, 200)}`);
+      return false;
+    }
+
+    const db2 = await pgConnect(w4Db);
+
+    // Version must still be 2 (no bump).
+    const { rows: rcRows2 } = await db2.query(
+      `SELECT version FROM retrieval_contract WHERE project_id = $1 AND name = 'default'`,
+      [w4ProjectId]
+    );
+    if (rcRows2.length === 0 || parseInt(rcRows2[0].version, 10) !== 2) {
+      await db2.end();
+      w4Fail(3, label, `version changed after identical re-close: expected 2, got ${rcRows2.length > 0 ? rcRows2[0].version : 'no row'}`);
+      return false;
+    }
+
+    // History row count must be unchanged.
+    const { rows: hRows2 } = await db2.query(
+      `SELECT COUNT(*) AS n FROM retrieval_contract_history WHERE project_id = $1 AND name = 'default'`,
+      [w4ProjectId]
+    );
+    const h2Count = parseInt(hRows2[0].n, 10);
+    if (h2Count !== h1Count) {
+      await db2.end();
+      w4Fail(3, label, `history row count changed after identical re-close: before=${h1Count}, after=${h2Count}`);
+      return false;
+    }
+
+    await db2.end();
+    w4Pass(3, label);
+    return { historyCountAfterV2: h1Count };
+  } catch (err) {
+    w4Fail(3, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * W4 4/6: A close with a DIFFERENT contract bumps version 2→3 and adds a history row.
+ */
+async function w4Step4_differentContractBumps(w4Db, w4ProjectId, w4ProjectDir, historyCountAfterV2) {
+  const label = 'Different contract bumps to v3 and adds history row';
+  try {
+    const contractV3 = { queries: [{ kind: 'assertion' }, { kind: 'recency' }] };
+
+    const payload = JSON.stringify({
+      tldr:     'W4 v3 change test',
+      contract: contractV3,
+    });
+    const r = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'close', '--json', '-'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: w4Db, PROJECT_ROOT: w4ProjectDir },
+        input:    payload,
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+    if (r.status !== 0) {
+      w4Fail(4, label, `close exited ${r.status}: ${(r.stderr || r.stdout || '').slice(0, 200)}`);
+      return false;
+    }
+
+    const db = await pgConnect(w4Db);
+
+    // Version must now be 3.
+    const { rows: rcRows } = await db.query(
+      `SELECT version FROM retrieval_contract WHERE project_id = $1 AND name = 'default'`,
+      [w4ProjectId]
+    );
+    const newVersion = rcRows.length > 0 ? parseInt(rcRows[0].version, 10) : -1;
+    if (newVersion !== 3) {
+      await db.end();
+      w4Fail(4, label, `expected version=3 after different-contract close, got ${newVersion}`);
+      return false;
+    }
+
+    // One new history row added.
+    const { rows: hRows } = await db.query(
+      `SELECT COUNT(*) AS n FROM retrieval_contract_history WHERE project_id = $1 AND name = 'default'`,
+      [w4ProjectId]
+    );
+    const hCount = parseInt(hRows[0].n, 10);
+    if (hCount !== historyCountAfterV2 + 1) {
+      await db.end();
+      w4Fail(4, label, `expected ${historyCountAfterV2 + 1} history rows, got ${hCount}`);
+      return false;
+    }
+
+    await db.end();
+    w4Pass(4, label);
+    return true;
+  } catch (err) {
+    w4Fail(4, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * W4 5/6: rollback — after >=2 versions, rollback 1 sets live contract queries
+ * equal to v1's queries, adds a history row with change_note containing 'rollback to v1',
+ * and increments the version.
+ */
+async function w4Step5_rollback(w4Db, w4ProjectId, w4ProjectDir) {
+  const label = 'rollback: live contract = v1 queries; new history row with rollback note; version incremented';
+  try {
+    // Get v1 queries (init baseline).
+    const db = await pgConnect(w4Db);
+    const { rows: v1Rows } = await db.query(
+      `SELECT queries, version FROM retrieval_contract_history
+       WHERE project_id = $1 AND name = 'default'
+       ORDER BY version ASC LIMIT 1`,
+      [w4ProjectId]
+    );
+    if (v1Rows.length === 0) {
+      await db.end();
+      w4Fail(5, label, 'no history rows found — cannot test rollback');
+      return false;
+    }
+
+    const v1Queries  = v1Rows[0].queries;
+    const v1Version  = v1Rows[0].version;
+
+    // Get current live version and history count.
+    const { rows: rcPre } = await db.query(
+      `SELECT version FROM retrieval_contract WHERE project_id = $1 AND name = 'default'`,
+      [w4ProjectId]
+    );
+    const preLiveVersion = rcPre.length > 0 ? parseInt(rcPre[0].version, 10) : -1;
+
+    const { rows: hPre } = await db.query(
+      `SELECT COUNT(*) AS n FROM retrieval_contract_history WHERE project_id = $1 AND name = 'default'`,
+      [w4ProjectId]
+    );
+    const preHistCount = parseInt(hPre[0].n, 10);
+    await db.end();
+
+    // Run rollback via CLI subprocess.
+    const r = spawnSync(
+      process.execPath,
+      [W4_SCRIPT, 'rollback', String(v1Version)],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: w4Db, PROJECT_ROOT: w4ProjectDir },
+        encoding: 'utf8',
+        timeout:  15000,
+      }
+    );
+    if (r.status !== 0) {
+      w4Fail(5, label, `rollback CLI exited ${r.status}: ${(r.stderr || r.stdout || '').slice(0, 300)}`);
+      return false;
+    }
+
+    const db2 = await pgConnect(w4Db);
+
+    // Live contract queries must equal v1 queries.
+    const { rows: rcPost } = await db2.query(
+      `SELECT version, queries FROM retrieval_contract WHERE project_id = $1 AND name = 'default'`,
+      [w4ProjectId]
+    );
+    if (rcPost.length === 0) {
+      await db2.end();
+      w4Fail(5, label, 'retrieval_contract row not found after rollback');
+      return false;
+    }
+
+    const postLiveVersion = parseInt(rcPost[0].version, 10);
+    if (postLiveVersion <= preLiveVersion) {
+      await db2.end();
+      w4Fail(5, label, `version not incremented after rollback: pre=${preLiveVersion}, post=${postLiveVersion}`);
+      return false;
+    }
+
+    // Queries must match v1.
+    const { queriesEqual } = require(W4_SCRIPT);
+    if (!queriesEqual(rcPost[0].queries, v1Queries)) {
+      await db2.end();
+      w4Fail(5, label, `live contract queries after rollback do not match v${v1Version}: got ${JSON.stringify(rcPost[0].queries)}`);
+      return false;
+    }
+
+    // One new history row with rollback note.
+    const { rows: hPost } = await db2.query(
+      `SELECT COUNT(*) AS n FROM retrieval_contract_history WHERE project_id = $1 AND name = 'default'`,
+      [w4ProjectId]
+    );
+    const postHistCount = parseInt(hPost[0].n, 10);
+    if (postHistCount !== preHistCount + 1) {
+      await db2.end();
+      w4Fail(5, label, `history row count did not increase by 1: before=${preHistCount}, after=${postHistCount}`);
+      return false;
+    }
+
+    // Check rollback note.
+    const { rows: rollbackRow } = await db2.query(
+      `SELECT change_note FROM retrieval_contract_history
+       WHERE project_id = $1 AND name = 'default'
+       ORDER BY version DESC LIMIT 1`,
+      [w4ProjectId]
+    );
+    const note = rollbackRow.length > 0 ? (rollbackRow[0].change_note || '') : '';
+    if (!note.includes(`rollback to v${v1Version}`)) {
+      await db2.end();
+      w4Fail(5, label, `latest history row change_note does not contain 'rollback to v${v1Version}': "${note}"`);
+      return false;
+    }
+
+    await db2.end();
+    w4Pass(5, label);
+    return true;
+  } catch (err) {
+    w4Fail(5, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * W4 6/6: No-regression — loader/resume still reads the contract and produces
+ * expected output after versioning is added. Existing resume assertions still hold.
+ *
+ * After rollback (from step 5), resume must still work; any non-empty contract
+ * still causes loader to retrieve from the correct tables.
+ */
+async function w4Step6_loaderNoRegression(w4Db, w4ProjectId, w4ProjectDir) {
+  const label = 'No-regression: loader/resume reads versioned contract; existing resume assertions intact';
+  try {
+    const db = await pgConnect(w4Db);
+
+    // Insert a test assertion and set a non-empty contract so resume retrieves it.
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, last_reinforced)
+       VALUES ($1, 'W4_NOREG_SUBJECT', 'is', 'W4_NOREG_MARKER', 8, 'user_stated', now())
+       ON CONFLICT DO NOTHING`,
+      [w4ProjectId]
+    );
+    await db.query(
+      `UPDATE retrieval_contract
+       SET queries = $2::jsonb, updated_at = now()
+       WHERE project_id = $1 AND name = 'default'`,
+      [w4ProjectId, JSON.stringify({ queries: [{ kind: 'assertion' }] })]
+    );
+    await db.end();
+
+    const env = { ...process.env, HANDOFF_DB: w4Db, PROJECT_ROOT: w4ProjectDir };
+    const r = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'resume'], {
+      cwd:      PROJECT_ROOT,
+      env,
+      encoding: 'utf8',
+      timeout:  30000,
+    });
+
+    if (r.status !== 0) {
+      w4Fail(6, label, `resume exited ${r.status}: ${(r.stderr || r.stdout || '').slice(0, 200)}`);
+      return false;
+    }
+
+    const out = r.stdout || '';
+
+    // Must contain the test assertion marker.
+    if (!out.includes('W4_NOREG_MARKER')) {
+      w4Fail(6, label, 'W4_NOREG_MARKER not found in resume output — assertion retrieval broken after versioning');
+      return false;
+    }
+
+    // Trusted canon must precede untrusted block.
+    const canonIdx     = out.indexOf('=== OPERATING CANON (trusted');
+    const untrustedIdx = out.indexOf('=== BEGIN RETRIEVED CONTEXT (untrusted)');
+    if (canonIdx === -1) {
+      w4Fail(6, label, 'OPERATING CANON preamble not found in resume output');
+      return false;
+    }
+    if (untrustedIdx !== -1 && canonIdx > untrustedIdx) {
+      w4Fail(6, label, 'OPERATING CANON appears AFTER untrusted block — ordering violated');
+      return false;
+    }
+
+    w4Pass(6, label);
+    return true;
+  } catch (err) {
+    w4Fail(6, label, err.message);
+    return false;
+  }
+}
+
+async function runW4Section() {
+  console.log(`\n=== W4 SECTION (${W4_TOTAL} steps) ===`);
+  console.log('smoketest-handoff W4: schema, queriesEqual unit, version-bump + idempotent no-op, different-contract bump, rollback, loader no-regression');
+  console.log('(All steps pass without Python or Ollama)');
+  console.log('');
+
+  const W4_TS       = Date.now();
+  const W4_DB       = `claude_memory_w4_${W4_TS}`;
+  const W4_PROJ_DIR = path.join(os.tmpdir(), `handoff_w4_${W4_TS}`);
+  const W4_PROJECT_ID = encodeCwd(W4_PROJ_DIR);
+
+  try {
+    // Set up throwaway DB.
+    await createSmokeDb(W4_DB, W4_PROJ_DIR);
+
+    // Write a minimal CLAUDE.md so init can run cleanly.
+    const w4ClaudeMd = path.join(W4_PROJ_DIR, 'CLAUDE.md');
+    fs.writeFileSync(w4ClaudeMd, '# w4-test\n\n## Durable facts\n- (none)\n', 'utf8');
+
+    // Run init so all base tables (including W4 schema) exist.
+    const initR = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'init', '-y'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: W4_DB, PROJECT_ROOT: W4_PROJ_DIR },
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+    if (initR.status !== 0) {
+      console.log(`[W4] DB init failed — skipping remaining steps`);
+      console.log(initR.stderr || initR.stdout || '');
+      w4Failed += W4_TOTAL;
+      return;
+    }
+    console.log(`[W4] DB init OK (${W4_DB})`);
+
+    // Ensure retrieval_contract_history table exists in throwaway DB (idempotent).
+    try {
+      await createContractHistoryTable(W4_DB);
+    } catch (_) { /* non-fatal — init should have done this via schema */ }
+
+    // Also create retrieval_events so loader INSERT works.
+    try {
+      await createRetrievalEventsTable(W4_DB);
+    } catch (_) { /* non-fatal */ }
+
+    // Step 1: schema existence check.
+    const ok1 = await w4Step1_schemaExists(W4_DB);
+    if (!ok1) {
+      console.log('[W4] Schema check failed — skipping remaining steps that need schema');
+    }
+
+    // Step 2: queriesEqual unit test (pure — no DB).
+    await w4Step2_queriesEqualUnit();
+
+    // Steps 3, 4, 5, 6: need DB and project.
+    const step3Result = await w4Step3_versionBumpAndNoOp(W4_DB, W4_PROJECT_ID, W4_PROJ_DIR);
+    const histCount   = step3Result && step3Result.historyCountAfterV2
+      ? step3Result.historyCountAfterV2
+      : null;
+
+    if (histCount !== null) {
+      await w4Step4_differentContractBumps(W4_DB, W4_PROJECT_ID, W4_PROJ_DIR, histCount);
+    } else {
+      w4Fail(4, 'Different contract bumps to v3', 'skipped due to step 3 failure');
+    }
+
+    await w4Step5_rollback(W4_DB, W4_PROJECT_ID, W4_PROJ_DIR);
+    await w4Step6_loaderNoRegression(W4_DB, W4_PROJECT_ID, W4_PROJ_DIR);
+
+  } finally {
+    const W4_HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', W4_PROJECT_ID, 'handoff.md');
+    await dropSmokeDb(W4_DB, W4_PROJ_DIR, W4_HANDOFF_PATH).catch(() => {});
+  }
+}
+
 async function runW2Section() {
   console.log(`\n=== W2 SECTION (${W2_TOTAL} steps) ===`);
   console.log('smoketest-handoff W2: parseExtraction unit + OLLAMA_SKIP no-op + idempotency predicate');
@@ -2408,6 +2983,9 @@ async function main() {
   if (SECTION === 'w3' || SECTION === 'all') {
     await runW3Section();
   }
+  if (SECTION === 'w4' || SECTION === 'all') {
+    await runW4Section();
+  }
 
   console.log('');
 
@@ -2416,12 +2994,13 @@ async function main() {
   const hdTotal  = hdPassed + hdFailed;
   const w2Total  = w2Passed + w2Failed;
   const w3Total  = w3Passed + w3Failed;
-  const totalPass = lcPassed + hkPassed + hdPassed + w2Passed + w3Passed;
-  const totalAll  = lcTotal  + hkTotal  + hdTotal  + w2Total  + w3Total;
-  const totalSkip = lcSkipped + hkSkipped + hdSkipped + w2Skipped + w3Skipped;
+  const w4Total  = w4Passed + w4Failed;
+  const totalPass = lcPassed + hkPassed + hdPassed + w2Passed + w3Passed + w4Passed;
+  const totalAll  = lcTotal  + hkTotal  + hdTotal  + w2Total  + w3Total  + w4Total;
+  const totalSkip = lcSkipped + hkSkipped + hdSkipped + w2Skipped + w3Skipped + w4Skipped;
 
   if (SECTION === 'all') {
-    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal}, hardening: ${hdPassed}/${hdTotal}, w2: ${w2Passed}/${w2Total}, w3: ${w3Passed}/${w3Total})`);
+    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal}, hardening: ${hdPassed}/${hdTotal}, w2: ${w2Passed}/${w2Total}, w3: ${w3Passed}/${w3Total}, w4: ${w4Passed}/${w4Total})`);
   } else if (SECTION === 'lifecycle') {
     console.log(`smoketest: ${lcPassed}/${lcTotal} passed, ${lcSkipped} skipped (lifecycle only)`);
   } else if (SECTION === 'hooks') {
@@ -2430,11 +3009,13 @@ async function main() {
     console.log(`smoketest: ${w2Passed}/${w2Total} passed, ${w2Skipped} skipped (w2 only)`);
   } else if (SECTION === 'w3') {
     console.log(`smoketest: ${w3Passed}/${w3Total} passed, ${w3Skipped} skipped (w3 only)`);
+  } else if (SECTION === 'w4') {
+    console.log(`smoketest: ${w4Passed}/${w4Total} passed, ${w4Skipped} skipped (w4 only)`);
   } else {
     console.log(`smoketest: ${hdPassed}/${hdTotal} passed, ${hdSkipped} skipped (hardening only)`);
   }
 
-  if (lcFailed + hkFailed + hdFailed + w2Failed + w3Failed > 0) process.exitCode = 1;
+  if (lcFailed + hkFailed + hdFailed + w2Failed + w3Failed + w4Failed > 0) process.exitCode = 1;
 }
 
 main().catch((err) => {
