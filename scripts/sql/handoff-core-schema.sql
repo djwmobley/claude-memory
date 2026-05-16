@@ -193,11 +193,17 @@ CREATE TABLE IF NOT EXISTS project_settings (
 --   decay_rate_default         default: '0.05'      (per-day decay for new assertions lacking row-level override)
 --   cluster_aware_retrieval    default: 'enabled'   ('enabled'|any other value — W3 cluster-aware expansion)
 --   cluster_max_siblings       default: '10'        (max same-community sibling entities added per load)
---   feedback_loop_enabled      default: 'disabled'  ('enabled'|any other value — C2 outcome→ranking feedback loop; byte-identical when disabled)
---   feedback_success_delta     default: '0.5'       (outcome_bias nudge per success outcome in a session)
---   feedback_failure_delta     default: '-0.75'     (outcome_bias nudge per failure outcome in a session)
---   feedback_irrelevant_delta  default: '-0.25'     (outcome_bias nudge per irrelevant outcome in a session)
---   feedback_bias_clamp        default: '3.0'       (max absolute value of outcome_bias, i.e. bias ∈ [-clamp, +clamp])
+--   feedback_loop_enabled              default: 'disabled'  ('enabled'|any other value — C2 outcome→ranking feedback loop; byte-identical when disabled)
+--   feedback_success_delta             default: '0.5'       (outcome_bias nudge per success outcome in a session)
+--   feedback_failure_delta             default: '-0.75'     (outcome_bias nudge per failure outcome in a session)
+--   feedback_irrelevant_delta          default: '-0.25'     (outcome_bias nudge per irrelevant outcome in a session)
+--   feedback_bias_clamp                default: '3.0'       (max absolute value of outcome_bias, i.e. bias ∈ [-clamp, +clamp])
+--   contract_evolution_enabled         default: 'disabled'  ('enabled'|any other value — C3 auto-evolve contract from outcome patterns; byte-identical when disabled)
+--   contract_evolution_window_days     default: '30'        (rolling window for outcome aggregation)
+--   contract_evolution_min_events      default: '10'        (min events per kind before rules fire; thin-data guard)
+--   contract_evolution_failure_threshold default: '0.5'     (failure+irrelevant rate that triggers budget reduction)
+--   contract_evolution_budget_floor    default: '200'       (minimum token_budget for any kind; never reduced below this)
+--   contract_evolution_budget_step     default: '200'       (max budget change per evolution pass; gradual and bounded)
 
 
 -- ============================================================================
