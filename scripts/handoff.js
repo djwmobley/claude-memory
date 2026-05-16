@@ -567,6 +567,8 @@ async function cmdInit(args) {
     implicit_close:                   'enabled',
     decay_rate_default:               '0.05',
     retrieval_outcome_timeout_days:   '14',
+    cluster_aware_retrieval:          'enabled',
+    cluster_max_siblings:             '10',
   };
   for (const [key, val] of Object.entries(defaults)) {
     await db.query(
@@ -763,6 +765,9 @@ async function cmdLoaderLoad(opts = {}) {
   let assertionsCount = 0;
   let vectorCount     = 0;
 
+  // W3: collect entity names retrieved during the contract loop for cluster expansion.
+  const retrievedEntityNames = [];
+
   for (const q of queries) {
     if (tokensUsed >= tokenBudget) break;
 
@@ -778,6 +783,8 @@ async function cmdLoaderLoad(opts = {}) {
         sections.push(`### Entities\n${text}`);
         tokensUsed    += Math.ceil(text.length / 4);
         entitiesCount += rows.length;
+        // W3: capture names for cluster-aware sibling expansion.
+        for (const r of rows) retrievedEntityNames.push(r.name);
       }
 
     } else if (q.type === 'assertion' || q.kind === 'assertion') {
@@ -845,6 +852,54 @@ async function cmdLoaderLoad(opts = {}) {
     );
   } catch (evtErr) {
     if (!silent) console.error(`[handoff] retrieval_events insert failed (non-fatal): ${evtErr.message}`);
+  }
+
+  // ── W3: cluster-aware sibling expansion (strictly additive, fully gated) ──────
+  // Appends a "### Related (community)" section for same-community sibling entities
+  // of the entities already retrieved. Fully wrapped in try/catch — any error causes
+  // a clean no-op fallback to pre-W3 output. No community run in entity_communities
+  // => guaranteed byte-identical pre-W3 output (no regression).
+  try {
+    const clusterSetting = await getSetting(db, projectId, 'cluster_aware_retrieval', 'enabled');
+    if (clusterSetting === 'enabled' && retrievedEntityNames.length > 0 && tokensUsed < tokenBudget) {
+      // Find the latest community run for this project.
+      const runRes = await db.query(
+        `SELECT run_id FROM entity_communities WHERE project_id = $1 ORDER BY computed_at DESC LIMIT 1`,
+        [projectId]
+      );
+      if (runRes.rows.length > 0) {
+        const latestRunId = runRes.rows[0].run_id;
+        // Find community_ids for the hit entities in this run.
+        const communityRes = await db.query(
+          `SELECT DISTINCT community_id FROM entity_communities
+           WHERE project_id = $1 AND run_id = $2 AND entity_name = ANY($3)`,
+          [projectId, latestRunId, retrievedEntityNames]
+        );
+        if (communityRes.rows.length > 0) {
+          const communityIds = communityRes.rows.map((r) => r.community_id);
+          const clusterMaxSiblings = parseInt(
+            await getSetting(db, projectId, 'cluster_max_siblings', '10'), 10
+          );
+          // Fetch sibling entities in the same communities, excluding already-retrieved ones.
+          const siblingRes = await db.query(
+            `SELECT DISTINCT entity_name FROM entity_communities
+             WHERE project_id = $1 AND run_id = $2
+               AND community_id = ANY($3)
+               AND entity_name <> ALL($4)
+             LIMIT $5`,
+            [projectId, latestRunId, communityIds, retrievedEntityNames, clusterMaxSiblings]
+          );
+          if (siblingRes.rows.length > 0 && tokensUsed < tokenBudget) {
+            const siblingText = siblingRes.rows.map((r) => `- ${r.entity_name}`).join('\n');
+            sections.push(`### Related (community)\n${siblingText}`);
+            tokensUsed += Math.ceil(siblingText.length / 4);
+          }
+        }
+      }
+    }
+  } catch (clusterErr) {
+    // Non-fatal: any error degrades gracefully to pre-W3 output (no expansion).
+    if (!silent) console.error(`[handoff] W3 cluster expansion error (non-fatal): ${clusterErr.message}`);
   }
 
   if (ownDb) await db.end();

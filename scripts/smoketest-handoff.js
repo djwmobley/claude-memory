@@ -25,8 +25,8 @@ const { Client } = require('pg');
 const ARGS       = process.argv.slice(2);
 const sectionArg = ARGS.find((a) => a.startsWith('--section='));
 const SECTION    = sectionArg ? sectionArg.split('=')[1] : 'all';
-if (!['all', 'lifecycle', 'hooks', 'hardening', 'w2'].includes(SECTION)) {
-  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, hardening, w2, all`);
+if (!['all', 'lifecycle', 'hooks', 'hardening', 'w2', 'w3'].includes(SECTION)) {
+  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, hardening, w2, w3, all`);
   process.exit(2);
 }
 
@@ -80,11 +80,15 @@ let hdSkipped = 0;
 let w2Passed  = 0;
 let w2Failed  = 0;
 let w2Skipped = 0;
+let w3Passed  = 0;
+let w3Failed  = 0;
+let w3Skipped = 0;
 
 const LC_TOTAL = 14;
 const HK_TOTAL = 3;
 const HD_TOTAL = 8;
 const W2_TOTAL = 3;
+const W3_TOTAL = 5;
 
 function lcPass(step, label) {
   console.log(`[STEP ${step}/${LC_TOTAL}] ${label} ... PASS`);
@@ -134,6 +138,21 @@ function w2Pass(step, label) {
 function w2Fail(step, label, reason) {
   console.log(`[W2 ${step}/${W2_TOTAL}] ${label} ... FAIL: ${reason}`);
   w2Failed++;
+}
+
+function w3Pass(step, label) {
+  console.log(`[W3 ${step}/${W3_TOTAL}] ${label} ... PASS`);
+  w3Passed++;
+}
+
+function w3Fail(step, label, reason) {
+  console.log(`[W3 ${step}/${W3_TOTAL}] ${label} ... FAIL: ${reason}`);
+  w3Failed++;
+}
+
+function w3Skip(step, label, reason) {
+  console.log(`[W3 ${step}/${W3_TOTAL}] ${label} ... SKIPPED — ${reason}`);
+  w3Skipped++;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -631,6 +650,34 @@ async function createRetrievalEventsTable(dbName) {
       session_id   TEXT,
       notes        TEXT
     )
+  `);
+  await db.end();
+}
+
+/**
+ * Create the entity_communities table in the given DB (W3, portable, no pgvector).
+ * Mirrors the DDL in handoff-core-schema.sql exactly.
+ */
+async function createEntityCommunitiesTable(dbName) {
+  const db = await pgConnect(dbName);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS entity_communities (
+      id            SERIAL PRIMARY KEY,
+      project_id    TEXT NOT NULL,
+      entity_name   TEXT NOT NULL,
+      community_id  INTEGER NOT NULL,
+      level         INTEGER NOT NULL DEFAULT 0,
+      run_id        TEXT NOT NULL,
+      computed_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS entity_communities_lookup_idx
+      ON entity_communities (project_id, entity_name)
+  `);
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS entity_communities_run_idx
+      ON entity_communities (project_id, run_id)
   `);
   await db.end();
 }
@@ -1673,6 +1720,468 @@ async function w2Step3_idempotencyPredicate(w2Db, w2ProjectId) {
   }
 }
 
+// ── W3 step implementations ───────────────────────────────────────────────────
+
+const W3_SCRIPT = path.join(PROJECT_ROOT, 'scripts', 'bundleb-w3-communities.js');
+
+/**
+ * W3 1/5: entity_communities table exists in a throwaway DB after init.
+ *
+ * Runs init against the W3 DB and checks the table is present.
+ * Pure Node + DB — no Python required.
+ */
+async function w3Step1_tableExists(w3Db) {
+  const label = 'entity_communities table exists after init';
+  try {
+    const db = await pgConnect(w3Db);
+    const { rows } = await db.query(
+      `SELECT 1 FROM information_schema.tables
+       WHERE table_schema = 'public' AND table_name = 'entity_communities'`
+    );
+    await db.end();
+
+    if (rows.length === 0) {
+      w3Fail(1, label, 'entity_communities table not found in DB after init');
+      return false;
+    }
+
+    w3Pass(1, label);
+    return true;
+  } catch (err) {
+    w3Fail(1, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * W3 2/5: buildGraphPayload unit test.
+ *
+ * Pure function — no DB or Python required.
+ * Verifies rows → {nodes, edges} shape, filtering of edges with missing nodes.
+ */
+async function w3Step2_buildGraphPayload() {
+  const label = 'buildGraphPayload: rows -> {nodes, edges} correct shape and edge filtering';
+  try {
+    const { buildGraphPayload } = require(W3_SCRIPT);
+
+    const nodeNames = ['EntityA', 'EntityB', 'EntityC'];
+    const edgeRows  = [
+      { from_entity: 'EntityA', to_entity: 'EntityB', weight: 1.5 },
+      { from_entity: 'EntityB', to_entity: 'EntityC', weight: 2.0 },
+      // Edge referencing a node NOT in nodeNames — must be filtered out.
+      { from_entity: 'EntityA', to_entity: 'MissingEntity', weight: 1.0 },
+    ];
+
+    const payload = buildGraphPayload(nodeNames, edgeRows);
+
+    // Nodes must be the exact input list.
+    if (!Array.isArray(payload.nodes) || payload.nodes.length !== 3) {
+      w3Fail(2, label, `nodes array has ${payload.nodes ? payload.nodes.length : 'null'} elements, expected 3`);
+      return false;
+    }
+
+    // Edges: only the 2 valid ones should appear (MissingEntity filtered out).
+    if (!Array.isArray(payload.edges) || payload.edges.length !== 2) {
+      w3Fail(2, label, `edges array has ${payload.edges ? payload.edges.length : 'null'} elements, expected 2`);
+      return false;
+    }
+
+    // Edge format must be [from, to, weight].
+    const firstEdge = payload.edges[0];
+    if (!Array.isArray(firstEdge) || firstEdge.length !== 3) {
+      w3Fail(2, label, `edge is not a [from, to, weight] triple: ${JSON.stringify(firstEdge)}`);
+      return false;
+    }
+
+    // Empty nodes / edges must produce empty payload.
+    const emptyPayload = buildGraphPayload([], []);
+    if (emptyPayload.nodes.length !== 0 || emptyPayload.edges.length !== 0) {
+      w3Fail(2, label, `empty input produced non-empty payload: ${JSON.stringify(emptyPayload)}`);
+      return false;
+    }
+
+    w3Pass(2, label);
+    return true;
+  } catch (err) {
+    w3Fail(2, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * W3 3/5: W3_SKIP=1 no-op proof.
+ *
+ * Runs bundleb-w3-communities.js with W3_SKIP=1. Asserts exit 0 and zero rows
+ * in entity_communities. No Python required.
+ */
+async function w3Step3_w3SkipNoOp(w3Db, w3ProjectId) {
+  const label = 'W3_SKIP=1: script exits 0, zero entity_communities rows';
+  try {
+    const env = {
+      ...process.env,
+      W3_SKIP:     '1',
+      HANDOFF_DB:  w3Db,
+    };
+    const r = spawnSync(process.execPath, [W3_SCRIPT], {
+      cwd:      PROJECT_ROOT,
+      env,
+      encoding: 'utf8',
+      timeout:  15000,
+    });
+
+    if (r.status !== 0) {
+      w3Fail(3, label, `exit ${r.status} — expected 0 (stdout: ${(r.stdout || '').slice(0, 200)})`);
+      return false;
+    }
+
+    const stdout = r.stdout || '';
+    if (!stdout.includes('W3_SKIP=1')) {
+      w3Fail(3, label, `stdout does not contain W3_SKIP=1 message: ${stdout.slice(0, 200)}`);
+      return false;
+    }
+
+    // Verify zero entity_communities rows.
+    const db = await pgConnect(w3Db);
+    const { rows } = await db.query(
+      `SELECT COUNT(*) AS n FROM entity_communities WHERE project_id = $1`,
+      [w3ProjectId]
+    );
+    await db.end();
+
+    if (parseInt(rows[0].n, 10) !== 0) {
+      w3Fail(3, label, `expected 0 entity_communities rows, found ${rows[0].n}`);
+      return false;
+    }
+
+    w3Pass(3, label);
+    return true;
+  } catch (err) {
+    w3Fail(3, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * W3 4/5: No-regression / degrade-safety (critical).
+ *
+ * With entity_communities EMPTY (no rows), runs resume and asserts:
+ * - Output does NOT contain "### Related (community)" — loader output is
+ *   byte-comparable to pre-W3 (empty-table no-op guarantee).
+ * - Existing resume assertions still hold: SMOKETEST markers visible, no
+ *   suppressed marker leaked, trusted canon precedes untrusted block.
+ *
+ * No Python required.
+ */
+async function w3Step4_noRegressionEmptyTable(w3Db, w3ProjectId, w3ProjectDir) {
+  const label = 'No-regression: empty entity_communities => no Related section; existing assertions intact';
+  try {
+    // Verify entity_communities has no rows (it should be empty from prior steps).
+    const db = await pgConnect(w3Db);
+    const { rows: ecRows } = await db.query(
+      `SELECT COUNT(*) AS n FROM entity_communities WHERE project_id = $1`,
+      [w3ProjectId]
+    );
+    if (parseInt(ecRows[0].n, 10) !== 0) {
+      // Rows present from a prior failed test — clean up for this test.
+      await db.query(`DELETE FROM entity_communities WHERE project_id = $1`, [w3ProjectId]);
+    }
+
+    // Insert a test entity + assertion so resume has something to return.
+    await db.query(
+      `INSERT INTO entities (project_id, name, entity_type, description)
+       VALUES ($1, 'W3_NOREG_ENTITY', 'system', 'No-regression test entity')
+       ON CONFLICT (project_id, name) DO NOTHING`,
+      [w3ProjectId]
+    );
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, last_reinforced)
+       VALUES ($1, 'W3_NOREG_SUBJECT', 'is', 'W3_NOREG_MARKER', 8, 'user_stated', now())
+       ON CONFLICT DO NOTHING`,
+      [w3ProjectId]
+    );
+
+    // Set contract to load both entity and assertion.
+    await db.query(
+      `UPDATE retrieval_contract
+       SET queries = $2::jsonb, updated_at = now()
+       WHERE project_id = $1 AND name = 'default'`,
+      [w3ProjectId, JSON.stringify({ queries: [{ kind: 'entity' }, { kind: 'assertion' }] })]
+    );
+    await db.end();
+
+    const env = { ...process.env, HANDOFF_DB: w3Db, PROJECT_ROOT: w3ProjectDir };
+    const r = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'resume'], {
+      cwd:      PROJECT_ROOT,
+      env,
+      encoding: 'utf8',
+      timeout:  30000,
+    });
+
+    if (r.status !== 0) {
+      w3Fail(4, label, `resume exited ${r.status}: ${(r.stderr || r.stdout || '').slice(0, 200)}`);
+      return false;
+    }
+
+    const out = r.stdout || '';
+
+    // CRITICAL: no Related (community) section must appear.
+    if (out.includes('### Related (community)')) {
+      w3Fail(4, label, '"### Related (community)" section appeared despite empty entity_communities — no-regression guarantee violated');
+      return false;
+    }
+
+    // Existing assertion should be visible.
+    if (!out.includes('W3_NOREG_MARKER')) {
+      w3Fail(4, label, 'W3_NOREG_MARKER not found in resume output — existing assertion retrieval broken');
+      return false;
+    }
+
+    // Trusted canon before untrusted block.
+    const canonIdx     = out.indexOf('=== OPERATING CANON (trusted');
+    const untrustedIdx = out.indexOf('=== BEGIN RETRIEVED CONTEXT (untrusted)');
+    if (canonIdx === -1) {
+      w3Fail(4, label, 'OPERATING CANON preamble not found in resume output');
+      return false;
+    }
+    if (untrustedIdx !== -1 && canonIdx > untrustedIdx) {
+      w3Fail(4, label, 'OPERATING CANON appears AFTER untrusted block — ordering violated');
+      return false;
+    }
+
+    w3Pass(4, label);
+    return true;
+  } catch (err) {
+    w3Fail(4, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * W3 5/5: Cluster expansion + cap test.
+ *
+ * Directly inserts entity rows and entity_communities rows (same community_id,
+ * fresh run_id) for a hit entity and 2 sibling entities, then runs resume and
+ * asserts:
+ * - "### Related (community)" section appears with the 2 siblings.
+ * - The hit entity is NOT duplicated in the siblings section.
+ * - cluster_max_siblings cap is honored (set cap to 1, add 2 siblings, verify only 1 appears).
+ *
+ * No Python required — uses direct SQL inserts.
+ */
+async function w3Step5_clusterExpansion(w3Db, w3ProjectId, w3ProjectDir) {
+  const label = 'Cluster expansion: Related section appears; cap honored; hit entity not duplicated';
+  try {
+    const db = await pgConnect(w3Db);
+
+    // Clean up any prior entity_communities rows for this project.
+    await db.query(`DELETE FROM entity_communities WHERE project_id = $1`, [w3ProjectId]);
+
+    // Insert the hit entity (must appear in entities table + be in the contract).
+    const HIT_ENTITY     = 'W3_HIT_ENTITY';
+    const SIBLING_A      = 'W3_SIBLING_A';
+    const SIBLING_B      = 'W3_SIBLING_B';
+    const SIBLING_CAP    = 'W3_SIBLING_CAP';  // extra sibling used for cap test
+    const RUN_ID         = new Date().toISOString();
+    const COMMUNITY_ID   = 42;
+
+    // Entities.
+    for (const name of [HIT_ENTITY, SIBLING_A, SIBLING_B, SIBLING_CAP]) {
+      await db.query(
+        `INSERT INTO entities (project_id, name, entity_type, description)
+         VALUES ($1, $2, 'system', $3)
+         ON CONFLICT (project_id, name) DO NOTHING`,
+        [w3ProjectId, name, `Test entity ${name}`]
+      );
+    }
+
+    // Contract: load the hit entity by name.
+    await db.query(
+      `UPDATE retrieval_contract
+       SET queries = $2::jsonb, updated_at = now()
+       WHERE project_id = $1 AND name = 'default'`,
+      [w3ProjectId, JSON.stringify({ queries: [{ kind: 'entity', filter: { name: HIT_ENTITY } }] })]
+    );
+
+    // entity_communities: hit entity + 3 siblings in same community.
+    for (const [name, cid] of [
+      [HIT_ENTITY, COMMUNITY_ID],
+      [SIBLING_A,  COMMUNITY_ID],
+      [SIBLING_B,  COMMUNITY_ID],
+      [SIBLING_CAP, COMMUNITY_ID],
+    ]) {
+      await db.query(
+        `INSERT INTO entity_communities (project_id, entity_name, community_id, level, run_id)
+         VALUES ($1, $2, $3, 0, $4)`,
+        [w3ProjectId, name, cid, RUN_ID]
+      );
+    }
+
+    // Ensure cluster_aware_retrieval=enabled (default, but be explicit).
+    await db.query(
+      `INSERT INTO project_settings (project_id, key, value)
+       VALUES ($1, 'cluster_aware_retrieval', 'enabled')
+       ON CONFLICT (project_id, key) DO UPDATE SET value = 'enabled'`,
+      [w3ProjectId]
+    );
+
+    await db.end();
+
+    // ── Sub-test A: basic expansion ───────────────────────────────────────────
+    const envA = { ...process.env, HANDOFF_DB: w3Db, PROJECT_ROOT: w3ProjectDir };
+    const rA = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'resume'], {
+      cwd: PROJECT_ROOT, env: envA, encoding: 'utf8', timeout: 30000,
+    });
+
+    if (rA.status !== 0) {
+      w3Fail(5, label, `resume exited ${rA.status}: ${(rA.stderr || rA.stdout || '').slice(0, 200)}`);
+      return false;
+    }
+
+    const outA = rA.stdout || '';
+
+    if (!outA.includes('### Related (community)')) {
+      w3Fail(5, label, '"### Related (community)" section not found in resume output');
+      return false;
+    }
+
+    // Siblings A and B must appear.
+    if (!outA.includes(SIBLING_A)) {
+      w3Fail(5, label, `${SIBLING_A} not found in Related (community) section`);
+      return false;
+    }
+    if (!outA.includes(SIBLING_B)) {
+      w3Fail(5, label, `${SIBLING_B} not found in Related (community) section`);
+      return false;
+    }
+
+    // Hit entity must NOT be duplicated in the Related section.
+    // It appears in the ### Entities section; the Related section should exclude it.
+    const relatedIdx = outA.indexOf('### Related (community)');
+    const afterRelated = outA.slice(relatedIdx);
+    if (afterRelated.includes(HIT_ENTITY)) {
+      w3Fail(5, label, `${HIT_ENTITY} (hit entity) appears in Related (community) section — must be excluded`);
+      return false;
+    }
+
+    // ── Sub-test B: cap enforcement ───────────────────────────────────────────
+    // Set cluster_max_siblings=1 — only 1 sibling should appear.
+    const dbCap = await pgConnect(w3Db);
+    await dbCap.query(
+      `INSERT INTO project_settings (project_id, key, value)
+       VALUES ($1, 'cluster_max_siblings', '1')
+       ON CONFLICT (project_id, key) DO UPDATE SET value = '1'`,
+      [w3ProjectId]
+    );
+    await dbCap.end();
+
+    const envB = { ...process.env, HANDOFF_DB: w3Db, PROJECT_ROOT: w3ProjectDir };
+    const rB = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'resume'], {
+      cwd: PROJECT_ROOT, env: envB, encoding: 'utf8', timeout: 30000,
+    });
+
+    if (rB.status !== 0) {
+      w3Fail(5, label, `resume (cap test) exited ${rB.status}: ${(rB.stderr || rB.stdout || '').slice(0, 200)}`);
+      return false;
+    }
+
+    const outB = rB.stdout || '';
+    if (!outB.includes('### Related (community)')) {
+      w3Fail(5, label, '"### Related (community)" section missing in cap-test resume output');
+      return false;
+    }
+
+    // Count how many of the 3 siblings appear in the Related section.
+    const relatedIdxB = outB.indexOf('### Related (community)');
+    const afterRelatedB = outB.slice(relatedIdxB);
+    const siblingCount = [SIBLING_A, SIBLING_B, SIBLING_CAP].filter((s) => afterRelatedB.includes(s)).length;
+    if (siblingCount > 1) {
+      w3Fail(5, label, `cap=1 but ${siblingCount} siblings appeared in Related section — cap not enforced`);
+      return false;
+    }
+
+    // Restore cluster_max_siblings to default.
+    const dbRestore = await pgConnect(w3Db);
+    await dbRestore.query(
+      `INSERT INTO project_settings (project_id, key, value)
+       VALUES ($1, 'cluster_max_siblings', '10')
+       ON CONFLICT (project_id, key) DO UPDATE SET value = '10'`,
+      [w3ProjectId]
+    );
+    await dbRestore.end();
+
+    w3Pass(5, label);
+    return true;
+  } catch (err) {
+    w3Fail(5, label, err.message);
+    return false;
+  }
+}
+
+async function runW3Section() {
+  console.log(`\n=== W3 SECTION (${W3_TOTAL} steps) ===`);
+  console.log('smoketest-handoff W3: table, buildGraphPayload, W3_SKIP no-op, no-regression, cluster-expansion + cap');
+  console.log('(All steps pass without Python — no Python or leidenalg required)');
+  console.log('');
+
+  const W3_TS       = Date.now();
+  const W3_DB       = `claude_memory_w3_${W3_TS}`;
+  const W3_PROJ_DIR = path.join(os.tmpdir(), `handoff_w3_${W3_TS}`);
+  const W3_PROJECT_ID = encodeCwd(W3_PROJ_DIR);
+
+  try {
+    // Set up throwaway DB first (steps 1, 3, 4, 5 need it; step 2 is pure).
+    await createSmokeDb(W3_DB, W3_PROJ_DIR);
+
+    // Write a minimal CLAUDE.md so init can run cleanly.
+    const w3ClaudeMd = path.join(W3_PROJ_DIR, 'CLAUDE.md');
+    fs.writeFileSync(w3ClaudeMd, '# w3-test\n\n## Durable facts\n- (none)\n', 'utf8');
+
+    // Run init so all base tables exist.
+    const initR = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'init', '-y'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: W3_DB, PROJECT_ROOT: W3_PROJ_DIR },
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+    if (initR.status !== 0) {
+      console.log(`[W3] DB init failed — skipping remaining steps`);
+      console.log(initR.stderr || initR.stdout || '');
+      w3Failed += W3_TOTAL;
+      return;
+    }
+    console.log(`[W3] DB init OK (${W3_DB})`);
+
+    // Also create retrieval_events in the throwaway DB so loader INSERT works.
+    // (entity_communities is created by init via handoff-core-schema.sql.)
+    try {
+      await createRetrievalEventsTable(W3_DB);
+    } catch (_) { /* non-fatal */ }
+
+    // Step 1: table existence check (entity_communities present after init).
+    await w3Step1_tableExists(W3_DB);
+
+    // Step 2: buildGraphPayload unit — pure function, no DB required.
+    await w3Step2_buildGraphPayload();
+
+    // Step 3: W3_SKIP no-op.
+    await w3Step3_w3SkipNoOp(W3_DB, W3_PROJECT_ID);
+
+    // Step 4: no-regression with empty entity_communities.
+    await w3Step4_noRegressionEmptyTable(W3_DB, W3_PROJECT_ID, W3_PROJ_DIR);
+
+    // Step 5: cluster expansion + cap.
+    await w3Step5_clusterExpansion(W3_DB, W3_PROJECT_ID, W3_PROJ_DIR);
+
+  } finally {
+    const W3_HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', W3_PROJECT_ID, 'handoff.md');
+    await dropSmokeDb(W3_DB, W3_PROJ_DIR, W3_HANDOFF_PATH).catch(() => {});
+  }
+}
+
 async function runW2Section() {
   console.log(`\n=== W2 SECTION (${W2_TOTAL} steps) ===`);
   console.log('smoketest-handoff W2: parseExtraction unit + OLLAMA_SKIP no-op + idempotency predicate');
@@ -1896,6 +2405,9 @@ async function main() {
   if (SECTION === 'w2' || SECTION === 'all') {
     await runW2Section();
   }
+  if (SECTION === 'w3' || SECTION === 'all') {
+    await runW3Section();
+  }
 
   console.log('');
 
@@ -1903,23 +2415,26 @@ async function main() {
   const hkTotal  = hkPassed + hkFailed;
   const hdTotal  = hdPassed + hdFailed;
   const w2Total  = w2Passed + w2Failed;
-  const totalPass = lcPassed + hkPassed + hdPassed + w2Passed;
-  const totalAll  = lcTotal  + hkTotal  + hdTotal  + w2Total;
-  const totalSkip = lcSkipped + hkSkipped + hdSkipped + w2Skipped;
+  const w3Total  = w3Passed + w3Failed;
+  const totalPass = lcPassed + hkPassed + hdPassed + w2Passed + w3Passed;
+  const totalAll  = lcTotal  + hkTotal  + hdTotal  + w2Total  + w3Total;
+  const totalSkip = lcSkipped + hkSkipped + hdSkipped + w2Skipped + w3Skipped;
 
   if (SECTION === 'all') {
-    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal}, hardening: ${hdPassed}/${hdTotal}, w2: ${w2Passed}/${w2Total})`);
+    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal}, hardening: ${hdPassed}/${hdTotal}, w2: ${w2Passed}/${w2Total}, w3: ${w3Passed}/${w3Total})`);
   } else if (SECTION === 'lifecycle') {
     console.log(`smoketest: ${lcPassed}/${lcTotal} passed, ${lcSkipped} skipped (lifecycle only)`);
   } else if (SECTION === 'hooks') {
     console.log(`smoketest: ${hkPassed}/${hkTotal} passed (hooks only)`);
   } else if (SECTION === 'w2') {
     console.log(`smoketest: ${w2Passed}/${w2Total} passed, ${w2Skipped} skipped (w2 only)`);
+  } else if (SECTION === 'w3') {
+    console.log(`smoketest: ${w3Passed}/${w3Total} passed, ${w3Skipped} skipped (w3 only)`);
   } else {
     console.log(`smoketest: ${hdPassed}/${hdTotal} passed, ${hdSkipped} skipped (hardening only)`);
   }
 
-  if (lcFailed + hkFailed + hdFailed + w2Failed > 0) process.exitCode = 1;
+  if (lcFailed + hkFailed + hdFailed + w2Failed + w3Failed > 0) process.exitCode = 1;
 }
 
 main().catch((err) => {
