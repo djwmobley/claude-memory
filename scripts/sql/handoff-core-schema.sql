@@ -87,6 +87,8 @@ CREATE TABLE IF NOT EXISTS assertions (
 );
 -- Add suppressed column if not present (idempotent — safe on both fresh and existing DBs).
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS suppressed BOOLEAN NOT NULL DEFAULT false;
+-- Add outcome_bias column if not present (Bundle C1 — unused by retrieval yet; observability placeholder).
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS outcome_bias FLOAT NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS assertions_project_idx
   ON assertions (project_id);

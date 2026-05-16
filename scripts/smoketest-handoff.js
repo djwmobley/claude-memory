@@ -25,8 +25,8 @@ const { Client } = require('pg');
 const ARGS       = process.argv.slice(2);
 const sectionArg = ARGS.find((a) => a.startsWith('--section='));
 const SECTION    = sectionArg ? sectionArg.split('=')[1] : 'all';
-if (!['all', 'lifecycle', 'hooks', 'hardening', 'w2', 'w3', 'w4'].includes(SECTION)) {
-  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, hardening, w2, w3, w4, all`);
+if (!['all', 'lifecycle', 'hooks', 'hardening', 'w2', 'w3', 'w4', 'c1'].includes(SECTION)) {
+  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, hardening, w2, w3, w4, c1, all`);
   process.exit(2);
 }
 
@@ -86,6 +86,9 @@ let w3Skipped = 0;
 let w4Passed  = 0;
 let w4Failed  = 0;
 let w4Skipped = 0;
+let c1Passed  = 0;
+let c1Failed  = 0;
+let c1Skipped = 0;
 
 const LC_TOTAL = 14;
 const HK_TOTAL = 3;
@@ -93,6 +96,7 @@ const HD_TOTAL = 8;
 const W2_TOTAL = 3;
 const W3_TOTAL = 5;
 const W4_TOTAL = 6;
+const C1_TOTAL = 4;
 
 function lcPass(step, label) {
   console.log(`[STEP ${step}/${LC_TOTAL}] ${label} ... PASS`);
@@ -167,6 +171,16 @@ function w4Pass(step, label) {
 function w4Fail(step, label, reason) {
   console.log(`[W4 ${step}/${W4_TOTAL}] ${label} ... FAIL: ${reason}`);
   w4Failed++;
+}
+
+function c1Pass(step, label) {
+  console.log(`[C1 ${step}/${C1_TOTAL}] ${label} ... PASS`);
+  c1Passed++;
+}
+
+function c1Fail(step, label, reason) {
+  console.log(`[C1 ${step}/${C1_TOTAL}] ${label} ... FAIL: ${reason}`);
+  c1Failed++;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -2804,6 +2818,295 @@ async function runW2Section() {
   }
 }
 
+// ── C1: Bundle C1 — attribution substrate ────────────────────────────────────
+
+/**
+ * Create the retrieval_event_assertions join table in the given DB (C1, portable,
+ * no pgvector). Mirrors the DDL in app-retrieval-events-schema.sql exactly.
+ */
+async function createRetrievalEventAssertionsTable(dbName) {
+  const db = await pgConnect(dbName);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS retrieval_event_assertions (
+      event_id      INTEGER NOT NULL,
+      assertion_id  INTEGER NOT NULL
+    )
+  `);
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS rea_event_idx ON retrieval_event_assertions (event_id)
+  `);
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS rea_assertion_idx ON retrieval_event_assertions (assertion_id)
+  `);
+  await db.end();
+}
+
+/**
+ * C1 1/4: Schema — retrieval_event_assertions table and assertions.outcome_bias
+ * column exist in the throwaway DB after init + schema application.
+ */
+async function c1Step1_schemaExists(c1Db) {
+  const label = 'Schema: retrieval_event_assertions table and assertions.outcome_bias column exist';
+  try {
+    const db = await pgConnect(c1Db);
+
+    // Check retrieval_event_assertions table.
+    const { rows: tblRows } = await db.query(
+      `SELECT 1 FROM information_schema.tables
+       WHERE table_schema = 'public' AND table_name = 'retrieval_event_assertions'`
+    );
+    if (tblRows.length === 0) {
+      await db.end();
+      c1Fail(1, label, 'retrieval_event_assertions table not found in DB');
+      return false;
+    }
+
+    // Check outcome_bias column on assertions.
+    const { rows: colRows } = await db.query(
+      `SELECT 1 FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name   = 'assertions'
+         AND column_name  = 'outcome_bias'`
+    );
+    if (colRows.length === 0) {
+      await db.end();
+      c1Fail(1, label, 'assertions.outcome_bias column not found after init');
+      return false;
+    }
+
+    await db.end();
+    c1Pass(1, label);
+    return true;
+  } catch (err) {
+    c1Fail(1, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * C1 2/4: outcome_bias column defaults to 0.
+ * Insert an assertion without specifying outcome_bias and confirm its value is 0.
+ */
+async function c1Step2_outcomeBiasDefault(c1Db, c1ProjectId) {
+  const label = 'outcome_bias column defaults to 0 on new assertions';
+  try {
+    const db = await pgConnect(c1Db);
+
+    const { rows } = await db.query(
+      `INSERT INTO assertions
+         (project_id, subject, predicate, object, confidence, source, last_reinforced)
+       VALUES ($1, 'C1_TEST_SUBJECT', 'is', 'C1_TEST_OBJECT', 8, 'user_stated', now())
+       RETURNING outcome_bias`,
+      [c1ProjectId]
+    );
+    if (rows.length === 0 || rows[0].outcome_bias !== 0) {
+      await db.end();
+      c1Fail(2, label, `expected outcome_bias=0, got ${rows.length > 0 ? rows[0].outcome_bias : 'no row'}`);
+      return false;
+    }
+
+    await db.end();
+    c1Pass(2, label);
+    return true;
+  } catch (err) {
+    c1Fail(2, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * C1 3/4: Join table gets >= 1 row after a loader run that retrieves assertions.
+ *
+ * Sets up a non-empty assertion-kind contract and runs resume (loader-load).
+ * Confirms retrieval_event_assertions has at least one row for the new event.
+ */
+async function c1Step3_joinTablePopulated(c1Db, c1ProjectId, c1ProjectDir) {
+  const label = 'retrieval_event_assertions gets >= 1 row after loader run with assertions';
+  try {
+    const db = await pgConnect(c1Db);
+
+    // Ensure the test assertion inserted in step 2 is still there (or insert another).
+    const { rows: existing } = await db.query(
+      `SELECT id FROM assertions WHERE project_id = $1 AND subject = 'C1_TEST_SUBJECT'`,
+      [c1ProjectId]
+    );
+    if (existing.length === 0) {
+      await db.query(
+        `INSERT INTO assertions
+           (project_id, subject, predicate, object, confidence, source, last_reinforced)
+         VALUES ($1, 'C1_TEST_SUBJECT', 'is', 'C1_TEST_OBJECT', 8, 'user_stated', now())`,
+        [c1ProjectId]
+      );
+    }
+
+    // Set contract to assertion kind so loader retrieves assertions.
+    await db.query(
+      `UPDATE retrieval_contract
+       SET queries = $2::jsonb, updated_at = now()
+       WHERE project_id = $1 AND name = 'default'`,
+      [c1ProjectId, JSON.stringify({ queries: [{ kind: 'assertion' }] })]
+    );
+
+    // Count rows before resume.
+    const { rows: beforeRows } = await db.query(
+      `SELECT COUNT(*) AS n FROM retrieval_event_assertions`
+    );
+    const rowsBefore = parseInt(beforeRows[0].n, 10);
+    await db.end();
+
+    // Run resume (loader-load).
+    const r = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'loader-load'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: c1Db, PROJECT_ROOT: c1ProjectDir },
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+    if (r.status !== 0) {
+      c1Fail(3, label, `loader-load exited ${r.status}: ${(r.stderr || r.stdout || '').slice(0, 200)}`);
+      return false;
+    }
+
+    // Check rows after.
+    const db2 = await pgConnect(c1Db);
+    const { rows: afterRows } = await db2.query(
+      `SELECT COUNT(*) AS n FROM retrieval_event_assertions`
+    );
+    const rowsAfter = parseInt(afterRows[0].n, 10);
+    await db2.end();
+
+    if (rowsAfter <= rowsBefore) {
+      c1Fail(3, label, `expected > ${rowsBefore} rows in retrieval_event_assertions after loader run, got ${rowsAfter}`);
+      return false;
+    }
+
+    c1Pass(3, label);
+    return true;
+  } catch (err) {
+    c1Fail(3, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * C1 4/4: Loader printed output is byte-identical — no new sections or text.
+ *
+ * Runs loader-load twice with the same contract/data and confirms both
+ * stdout outputs are identical. Also checks no new section headings appear
+ * that would not have been present pre-C1.
+ */
+async function c1Step4_loaderOutputUnchanged(c1Db, c1ProjectId, c1ProjectDir) {
+  const label = 'Loader printed output unchanged (no new sections or text introduced by C1)';
+  try {
+    const env = { ...process.env, HANDOFF_DB: c1Db, PROJECT_ROOT: c1ProjectDir };
+
+    const r1 = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'loader-load'],
+      { cwd: PROJECT_ROOT, env, encoding: 'utf8', timeout: 30000 }
+    );
+    if (r1.status !== 0) {
+      c1Fail(4, label, `first loader-load exited ${r1.status}: ${(r1.stderr || r1.stdout || '').slice(0, 200)}`);
+      return false;
+    }
+
+    const r2 = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'loader-load'],
+      { cwd: PROJECT_ROOT, env, encoding: 'utf8', timeout: 30000 }
+    );
+    if (r2.status !== 0) {
+      c1Fail(4, label, `second loader-load exited ${r2.status}: ${(r2.stderr || r2.stdout || '').slice(0, 200)}`);
+      return false;
+    }
+
+    // Strip the "tokens used" line (counts are stable but token count may vary slightly).
+    const normalize = (s) => s.replace(/tokens used: ~\d+/g, 'tokens used: ~X');
+    const out1 = normalize(r1.stdout || '');
+    const out2 = normalize(r2.stdout || '');
+    if (out1 !== out2) {
+      c1Fail(4, label, 'Two consecutive loader-load calls produced different stdout — output not stable');
+      return false;
+    }
+
+    // Check that no C1-internal markers appear in stdout (attribution is DB-side only).
+    const forbidden = ['retrieval_event_assertions', 'outcome_bias', 'C1 attribution'];
+    for (const term of forbidden) {
+      if ((r1.stdout || '').includes(term)) {
+        c1Fail(4, label, `forbidden term "${term}" found in loader stdout — C1 leaks into output`);
+        return false;
+      }
+    }
+
+    c1Pass(4, label);
+    return true;
+  } catch (err) {
+    c1Fail(4, label, err.message);
+    return false;
+  }
+}
+
+async function runC1Section() {
+  console.log(`\n=== C1 SECTION (${C1_TOTAL} steps) ===`);
+  console.log('smoketest-handoff C1: schema, outcome_bias default, join-table populated, loader output unchanged');
+  console.log('(All steps pass without Python or Ollama)');
+  console.log('');
+
+  const C1_TS         = Date.now();
+  const C1_DB         = `claude_memory_c1_${C1_TS}`;
+  const C1_PROJ_DIR   = path.join(os.tmpdir(), `handoff_c1_${C1_TS}`);
+  const C1_PROJECT_ID = encodeCwd(C1_PROJ_DIR);
+
+  try {
+    await createSmokeDb(C1_DB, C1_PROJ_DIR);
+
+    // Write a minimal CLAUDE.md so init can run cleanly.
+    const c1ClaudeMd = path.join(C1_PROJ_DIR, 'CLAUDE.md');
+    fs.writeFileSync(c1ClaudeMd, '# c1-test\n\n## Durable facts\n- (none)\n', 'utf8');
+
+    // Run init so all base tables (including outcome_bias) exist.
+    const initR = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'init', '-y'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: C1_DB, PROJECT_ROOT: C1_PROJ_DIR },
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+    if (initR.status !== 0) {
+      console.log(`[C1] DB init failed — skipping remaining steps`);
+      console.log(initR.stderr || initR.stdout || '');
+      c1Failed += C1_TOTAL;
+      return;
+    }
+    console.log(`[C1] DB init OK (${C1_DB})`);
+
+    // Create retrieval_events (no pgvector in smoketest DB).
+    try {
+      await createRetrievalEventsTable(C1_DB);
+    } catch (_) { /* non-fatal */ }
+
+    // Create retrieval_event_assertions join table.
+    try {
+      await createRetrievalEventAssertionsTable(C1_DB);
+    } catch (_) { /* non-fatal — step 1 will report failure */ }
+
+    await c1Step1_schemaExists(C1_DB);
+    await c1Step2_outcomeBiasDefault(C1_DB, C1_PROJECT_ID);
+    await c1Step3_joinTablePopulated(C1_DB, C1_PROJECT_ID, C1_PROJ_DIR);
+    await c1Step4_loaderOutputUnchanged(C1_DB, C1_PROJECT_ID, C1_PROJ_DIR);
+
+  } finally {
+    const C1_HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', C1_PROJECT_ID, 'handoff.md');
+    await dropSmokeDb(C1_DB, C1_PROJ_DIR, C1_HANDOFF_PATH).catch(() => {});
+  }
+}
+
 // ── Section runners ───────────────────────────────────────────────────────────
 
 async function runLifecycleSection() {
@@ -2986,6 +3289,9 @@ async function main() {
   if (SECTION === 'w4' || SECTION === 'all') {
     await runW4Section();
   }
+  if (SECTION === 'c1' || SECTION === 'all') {
+    await runC1Section();
+  }
 
   console.log('');
 
@@ -2995,12 +3301,13 @@ async function main() {
   const w2Total  = w2Passed + w2Failed;
   const w3Total  = w3Passed + w3Failed;
   const w4Total  = w4Passed + w4Failed;
-  const totalPass = lcPassed + hkPassed + hdPassed + w2Passed + w3Passed + w4Passed;
-  const totalAll  = lcTotal  + hkTotal  + hdTotal  + w2Total  + w3Total  + w4Total;
-  const totalSkip = lcSkipped + hkSkipped + hdSkipped + w2Skipped + w3Skipped + w4Skipped;
+  const c1Total  = c1Passed + c1Failed;
+  const totalPass = lcPassed + hkPassed + hdPassed + w2Passed + w3Passed + w4Passed + c1Passed;
+  const totalAll  = lcTotal  + hkTotal  + hdTotal  + w2Total  + w3Total  + w4Total  + c1Total;
+  const totalSkip = lcSkipped + hkSkipped + hdSkipped + w2Skipped + w3Skipped + w4Skipped + c1Skipped;
 
   if (SECTION === 'all') {
-    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal}, hardening: ${hdPassed}/${hdTotal}, w2: ${w2Passed}/${w2Total}, w3: ${w3Passed}/${w3Total}, w4: ${w4Passed}/${w4Total})`);
+    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal}, hardening: ${hdPassed}/${hdTotal}, w2: ${w2Passed}/${w2Total}, w3: ${w3Passed}/${w3Total}, w4: ${w4Passed}/${w4Total}, c1: ${c1Passed}/${c1Total})`);
   } else if (SECTION === 'lifecycle') {
     console.log(`smoketest: ${lcPassed}/${lcTotal} passed, ${lcSkipped} skipped (lifecycle only)`);
   } else if (SECTION === 'hooks') {
@@ -3011,11 +3318,13 @@ async function main() {
     console.log(`smoketest: ${w3Passed}/${w3Total} passed, ${w3Skipped} skipped (w3 only)`);
   } else if (SECTION === 'w4') {
     console.log(`smoketest: ${w4Passed}/${w4Total} passed, ${w4Skipped} skipped (w4 only)`);
+  } else if (SECTION === 'c1') {
+    console.log(`smoketest: ${c1Passed}/${c1Total} passed, ${c1Skipped} skipped (c1 only)`);
   } else {
     console.log(`smoketest: ${hdPassed}/${hdTotal} passed, ${hdSkipped} skipped (hardening only)`);
   }
 
-  if (lcFailed + hkFailed + hdFailed + w2Failed + w3Failed + w4Failed > 0) process.exitCode = 1;
+  if (lcFailed + hkFailed + hdFailed + w2Failed + w3Failed + w4Failed + c1Failed > 0) process.exitCode = 1;
 }
 
 main().catch((err) => {

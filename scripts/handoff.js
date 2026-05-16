@@ -876,6 +876,9 @@ async function cmdLoaderLoad(opts = {}) {
   // W3: collect entity names retrieved during the contract loop for cluster expansion.
   const retrievedEntityNames = [];
 
+  // C1: collect assertion ids retrieved during the contract loop for attribution.
+  const retrievedAssertionIds = [];
+
   for (const q of queries) {
     if (tokensUsed >= tokenBudget) break;
 
@@ -897,7 +900,7 @@ async function cmdLoaderLoad(opts = {}) {
 
     } else if (q.type === 'assertion' || q.kind === 'assertion') {
       const { rows } = await db.query(
-        `SELECT subject, predicate, object, confidence, source FROM assertions
+        `SELECT id, subject, predicate, object, confidence, source FROM assertions
          WHERE project_id = $1
            AND ($2::text IS NULL OR subject = $2)
            AND suppressed = false
@@ -912,6 +915,8 @@ async function cmdLoaderLoad(opts = {}) {
         sections.push(`### Assertions\n${text}`);
         tokensUsed      += Math.ceil(text.length / 4);
         assertionsCount += rows.length;
+        // C1: record retrieved assertion ids for attribution.
+        for (const r of rows) retrievedAssertionIds.push(r.id);
         // Bump reinforcement timestamps for every retrieved assertion (spec §7).
         await db.query(
           `UPDATE assertions SET last_reinforced = now(), last_retrieved = now()
@@ -923,7 +928,7 @@ async function cmdLoaderLoad(opts = {}) {
 
     } else if (q.type === 'recency' || q.kind === 'recency') {
       const { rows } = await db.query(
-        `SELECT subject, predicate, object, confidence FROM assertions
+        `SELECT id, subject, predicate, object, confidence FROM assertions
          WHERE project_id = $1
            AND suppressed = false
            AND confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) >= 1.0
@@ -937,6 +942,8 @@ async function cmdLoaderLoad(opts = {}) {
         sections.push(`### Recent assertions\n${text}`);
         tokensUsed      += Math.ceil(text.length / 4);
         assertionsCount += rows.length;  // recency queries roll into assertionsCount
+        // C1: record retrieved assertion ids for attribution.
+        for (const r of rows) retrievedAssertionIds.push(r.id);
       }
 
     } else if (q.type === 'vector' || q.kind === 'vector') {
@@ -947,17 +954,34 @@ async function cmdLoaderLoad(opts = {}) {
 
   // ── Retrieval event logging (side-channel, non-fatal) ────────────────────────
   // Insert one retrieval_events row per loader invocation for observability.
+  // C1: capture RETURNING id and bulk-insert retrieval_event_assertions rows.
   // Wrapped entirely in try/catch — never throws, never alters return value or output.
   try {
     const kinds = [...new Set(queries.map((q) => q.kind || q.type || 'unknown'))].join(',');
     const queryText = `loader:contract=${contractName};kinds=${kinds};sections=${sections.length}`.slice(0, 1000);
     const sessionId = await getSetting(db, projectId, 'session_in_progress', null);
     const notes = `entities=${entitiesCount};assertions=${assertionsCount};vector=${vectorCount};tokens=${tokensUsed}`.slice(0, 1000);
-    await db.query(
+    const evtRes = await db.query(
       `INSERT INTO retrieval_events (project_id, query_text, session_id, notes)
-       VALUES ($1, $2, $3, $4)`,
+       VALUES ($1, $2, $3, $4) RETURNING id`,
       [projectId, queryText, sessionId || null, notes]
     );
+    // C1: attribute the retrieved assertions to this event.
+    // Deduplicate ids (recency and assertion queries may overlap) and bulk-insert.
+    const eventId = evtRes.rows[0] && evtRes.rows[0].id;
+    if (eventId != null && retrievedAssertionIds.length > 0) {
+      const uniqueIds = [...new Set(retrievedAssertionIds)];
+      // Build VALUES list: ($1, $2), ($1, $3), ...
+      const params = [eventId];
+      const valuePlaceholders = uniqueIds.map((assertionId, i) => {
+        params.push(assertionId);
+        return `($1, $${i + 2})`;
+      });
+      await db.query(
+        `INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES ${valuePlaceholders.join(', ')}`,
+        params
+      );
+    }
   } catch (evtErr) {
     if (!silent) console.error(`[handoff] retrieval_events insert failed (non-fatal): ${evtErr.message}`);
   }
