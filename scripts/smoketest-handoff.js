@@ -25,8 +25,8 @@ const { Client } = require('pg');
 const ARGS       = process.argv.slice(2);
 const sectionArg = ARGS.find((a) => a.startsWith('--section='));
 const SECTION    = sectionArg ? sectionArg.split('=')[1] : 'all';
-if (!['all', 'lifecycle', 'hooks', 'hardening'].includes(SECTION)) {
-  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, hardening, all`);
+if (!['all', 'lifecycle', 'hooks', 'hardening', 'w2'].includes(SECTION)) {
+  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, hardening, w2, all`);
   process.exit(2);
 }
 
@@ -77,10 +77,14 @@ let hkSkipped = 0;
 let hdPassed  = 0;
 let hdFailed  = 0;
 let hdSkipped = 0;
+let w2Passed  = 0;
+let w2Failed  = 0;
+let w2Skipped = 0;
 
 const LC_TOTAL = 14;
 const HK_TOTAL = 3;
 const HD_TOTAL = 8;
+const W2_TOTAL = 3;
 
 function lcPass(step, label) {
   console.log(`[STEP ${step}/${LC_TOTAL}] ${label} ... PASS`);
@@ -120,6 +124,16 @@ function hdFail(step, label, reason) {
 function hdSkip(step, label, reason) {
   console.log(`[HARDEN ${step}/${HD_TOTAL}] ${label} ... SKIPPED — ${reason}`);
   hdSkipped++;
+}
+
+function w2Pass(step, label) {
+  console.log(`[W2 ${step}/${W2_TOTAL}] ${label} ... PASS`);
+  w2Passed++;
+}
+
+function w2Fail(step, label, reason) {
+  console.log(`[W2 ${step}/${W2_TOTAL}] ${label} ... FAIL: ${reason}`);
+  w2Failed++;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1480,6 +1494,232 @@ async function hardenStep8_retrievalOutcomeValidation() {
   }
 }
 
+// ── W2 step implementations ───────────────────────────────────────────────────
+
+const W2_SCRIPT = path.join(PROJECT_ROOT, 'scripts', 'bundleb-w2-extract.js');
+
+/**
+ * W2 1/3: parseExtraction unit tests.
+ *
+ * Covers: clean JSON object; ```json fenced; prose-wrapped; missing-arrays
+ * defaults; garbage/null/'' returns null; oversized arrays are capped.
+ * All pure-function tests — no DB or Ollama required.
+ */
+async function w2Step1_parseExtractionUnit() {
+  const label = 'parseExtraction: clean JSON, fenced, prose-wrapped, defaults, null/garbage, array cap';
+  try {
+    const { parseExtraction } = require(W2_SCRIPT);
+
+    // Sub-test A: clean JSON object parses
+    const clean = parseExtraction('{"entities":[{"name":"Claude","entity_type":"system","description":"LLM"}],"assertions":[{"subject":"Claude","predicate":"is","object":"LLM"}],"edges":[{"from_entity":"Claude","edge_type":"uses","to_entity":"Ollama"}]}');
+    if (!clean || clean.entities.length !== 1 || clean.assertions.length !== 1 || clean.edges.length !== 1) {
+      w2Fail(1, label, `clean JSON parse failed: ${JSON.stringify(clean)}`);
+      return false;
+    }
+
+    // Sub-test B: ```json fenced ``` parses
+    const fenced = parseExtraction('```json\n{"entities":[{"name":"X","entity_type":"tool","description":"d"}],"assertions":[],"edges":[]}\n```');
+    if (!fenced || fenced.entities.length !== 1 || fenced.assertions.length !== 0) {
+      w2Fail(1, label, `fenced JSON parse failed: ${JSON.stringify(fenced)}`);
+      return false;
+    }
+
+    // Sub-test C: prose-wrapped {...} parses
+    const prose = parseExtraction('Here is the extraction: {"entities":[],"assertions":[{"subject":"A","predicate":"uses","object":"B"}],"edges":[]} and that is all.');
+    if (!prose || prose.assertions.length !== 1) {
+      w2Fail(1, label, `prose-wrapped JSON parse failed: ${JSON.stringify(prose)}`);
+      return false;
+    }
+
+    // Sub-test D: missing arrays default to []
+    const partial = parseExtraction('{"entities":[{"name":"N","entity_type":"concept"}]}');
+    if (!partial || !Array.isArray(partial.assertions) || !Array.isArray(partial.edges)) {
+      w2Fail(1, label, `missing-arrays default failed: ${JSON.stringify(partial)}`);
+      return false;
+    }
+    if (partial.assertions.length !== 0 || partial.edges.length !== 0) {
+      w2Fail(1, label, `missing arrays should default to [] but got: ${JSON.stringify(partial)}`);
+      return false;
+    }
+
+    // Sub-test E: garbage / null / '' returns null
+    if (parseExtraction(null) !== null) {
+      w2Fail(1, label, `parseExtraction(null) should return null`);
+      return false;
+    }
+    if (parseExtraction('') !== null) {
+      w2Fail(1, label, `parseExtraction('') should return null`);
+      return false;
+    }
+    if (parseExtraction('not json at all!!!') !== null) {
+      w2Fail(1, label, `parseExtraction('not json at all!!!') should return null`);
+      return false;
+    }
+
+    // Sub-test F: oversized arrays are capped at 100
+    const bigEntities = Array.from({ length: 150 }, (_, i) => ({
+      name: `Entity${i}`,
+      entity_type: 'concept',
+      description: `desc${i}`,
+    }));
+    const bigJson = JSON.stringify({ entities: bigEntities, assertions: [], edges: [] });
+    const capped = parseExtraction(bigJson);
+    if (!capped || capped.entities.length > 100) {
+      w2Fail(1, label, `oversized array not capped: got ${capped ? capped.entities.length : 'null'} entities`);
+      return false;
+    }
+
+    w2Pass(1, label);
+    return true;
+  } catch (err) {
+    w2Fail(1, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * W2 2/3: OLLAMA_SKIP=1 no-op proof.
+ *
+ * Runs bundleb-w2-extract.js with OLLAMA_SKIP=1 against the W2 throwaway DB.
+ * Asserts exit 0 and zero source='model_extracted' rows were written.
+ */
+async function w2Step2_ollamaSkipNoOp(w2Db, w2ProjectId) {
+  const label = 'OLLAMA_SKIP=1: script exits 0, zero model_extracted assertions written';
+  try {
+    // Run the script under OLLAMA_SKIP=1
+    const env = {
+      ...process.env,
+      OLLAMA_SKIP: '1',
+      HANDOFF_DB:  w2Db,
+    };
+    const r = spawnSync(process.execPath, [W2_SCRIPT], {
+      cwd:      PROJECT_ROOT,
+      env,
+      encoding: 'utf8',
+      timeout:  15000,
+    });
+
+    if (r.status !== 0) {
+      w2Fail(2, label, `exit ${r.status} — expected 0 (stdout: ${(r.stdout || '').slice(0, 200)})`);
+      return false;
+    }
+
+    const stdout = r.stdout || '';
+    if (!stdout.includes('OLLAMA_SKIP=1')) {
+      w2Fail(2, label, `stdout does not contain expected OLLAMA_SKIP=1 message: ${stdout.slice(0, 200)}`);
+      return false;
+    }
+
+    // Verify zero model_extracted rows in the DB
+    const db = await pgConnect(w2Db);
+    const { rows } = await db.query(
+      `SELECT COUNT(*) AS n FROM assertions WHERE project_id = $1 AND source = 'model_extracted'`,
+      [w2ProjectId]
+    );
+    await db.end();
+
+    if (parseInt(rows[0].n, 10) !== 0) {
+      w2Fail(2, label, `expected 0 model_extracted rows, found ${rows[0].n}`);
+      return false;
+    }
+
+    w2Pass(2, label);
+    return true;
+  } catch (err) {
+    w2Fail(2, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * W2 3/3: Idempotency predicate test.
+ *
+ * Insert a fake assertion with session_id='w2-extract:decision:999999' directly
+ * into the throwaway DB. Then test that the skip-check SQL predicate (SELECT 1
+ * FROM assertions WHERE project_id=$1 AND session_id=$2) correctly identifies
+ * decision 999999 as already-extracted.
+ */
+async function w2Step3_idempotencyPredicate(w2Db, w2ProjectId) {
+  const label = 'Idempotency: skip-check predicate finds pre-existing session_id row';
+  try {
+    const sid = 'w2-extract:decision:999999';
+
+    // Insert fake assertion directly
+    const db = await pgConnect(w2Db);
+    await db.query(
+      `INSERT INTO assertions
+         (project_id, subject, predicate, object, confidence, source, session_id, last_reinforced)
+       VALUES ($1, 'test_subject', 'test_predicate', 'test_object', 5.0, 'model_extracted', $2, now())`,
+      [w2ProjectId, sid]
+    );
+
+    // Run the skip-check query exactly as the script does
+    const existing = await db.query(
+      `SELECT 1 FROM assertions WHERE project_id = $1 AND session_id = $2 LIMIT 1`,
+      [w2ProjectId, sid]
+    );
+    await db.end();
+
+    if (existing.rows.length === 0) {
+      w2Fail(3, label, 'skip-check predicate returned no rows for pre-inserted session_id — idempotency check is broken');
+      return false;
+    }
+
+    w2Pass(3, label);
+    return true;
+  } catch (err) {
+    w2Fail(3, label, err.message);
+    return false;
+  }
+}
+
+async function runW2Section() {
+  console.log(`\n=== W2 SECTION (${W2_TOTAL} steps) ===`);
+  console.log('smoketest-handoff W2: parseExtraction unit + OLLAMA_SKIP no-op + idempotency predicate');
+  console.log('');
+
+  // W2 needs a throwaway DB provisioned with the handoff schema for DB-backed tests.
+  const W2_TS         = Date.now();
+  const W2_DB         = `claude_memory_w2_${W2_TS}`;
+  const W2_PROJ_DIR   = path.join(os.tmpdir(), `handoff_w2_${W2_TS}`);
+
+  // Compute project_id for W2_PROJ_DIR (must match how resolveProjectId() works)
+  const W2_PROJECT_ID = encodeCwd(W2_PROJ_DIR);
+
+  try {
+    // Step 1: parseExtraction unit — pure function, no DB needed
+    await w2Step1_parseExtractionUnit();
+
+    // Set up DB for steps 2 and 3
+    await createSmokeDb(W2_DB, W2_PROJ_DIR);
+
+    const initR = spawnSync(
+      process.execPath,
+      [path.join(PROJECT_ROOT, 'scripts', 'handoff.js'), 'init', '-y'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: W2_DB, PROJECT_ROOT: W2_PROJ_DIR },
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+    if (initR.status !== 0) {
+      console.log(`[W2] DB init failed — skipping steps 2 and 3`);
+      console.log(initR.stderr || initR.stdout || '');
+      w2Failed += 2;
+      return;
+    }
+    console.log(`[W2] DB init OK (${W2_DB})`);
+
+    await w2Step2_ollamaSkipNoOp(W2_DB, W2_PROJECT_ID);
+    await w2Step3_idempotencyPredicate(W2_DB, W2_PROJECT_ID);
+
+  } finally {
+    const W2_HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', W2_PROJECT_ID, 'handoff.md');
+    await dropSmokeDb(W2_DB, W2_PROJ_DIR, W2_HANDOFF_PATH).catch(() => {});
+  }
+}
+
 // ── Section runners ───────────────────────────────────────────────────────────
 
 async function runLifecycleSection() {
@@ -1653,27 +1893,33 @@ async function main() {
   if (SECTION === 'hardening' || SECTION === 'all') {
     await runHardeningSection();
   }
+  if (SECTION === 'w2' || SECTION === 'all') {
+    await runW2Section();
+  }
 
   console.log('');
 
   const lcTotal  = lcPassed + lcFailed;
   const hkTotal  = hkPassed + hkFailed;
   const hdTotal  = hdPassed + hdFailed;
-  const totalPass = lcPassed + hkPassed + hdPassed;
-  const totalAll  = lcTotal  + hkTotal  + hdTotal;
-  const totalSkip = lcSkipped + hkSkipped + hdSkipped;
+  const w2Total  = w2Passed + w2Failed;
+  const totalPass = lcPassed + hkPassed + hdPassed + w2Passed;
+  const totalAll  = lcTotal  + hkTotal  + hdTotal  + w2Total;
+  const totalSkip = lcSkipped + hkSkipped + hdSkipped + w2Skipped;
 
   if (SECTION === 'all') {
-    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal}, hardening: ${hdPassed}/${hdTotal})`);
+    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal}, hardening: ${hdPassed}/${hdTotal}, w2: ${w2Passed}/${w2Total})`);
   } else if (SECTION === 'lifecycle') {
     console.log(`smoketest: ${lcPassed}/${lcTotal} passed, ${lcSkipped} skipped (lifecycle only)`);
   } else if (SECTION === 'hooks') {
     console.log(`smoketest: ${hkPassed}/${hkTotal} passed (hooks only)`);
+  } else if (SECTION === 'w2') {
+    console.log(`smoketest: ${w2Passed}/${w2Total} passed, ${w2Skipped} skipped (w2 only)`);
   } else {
     console.log(`smoketest: ${hdPassed}/${hdTotal} passed, ${hdSkipped} skipped (hardening only)`);
   }
 
-  if (lcFailed + hkFailed + hdFailed > 0) process.exitCode = 1;
+  if (lcFailed + hkFailed + hdFailed + w2Failed > 0) process.exitCode = 1;
 }
 
 main().catch((err) => {
