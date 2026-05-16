@@ -71,6 +71,7 @@ For full design rationale, acceptance gates, and revision history see
 
 - **Bundle B** — Outcome capture (writing `retrieval_events.outcome`), community detection (Leiden/Louvain over the entity graph), automated entity extraction over backfilled decisions, formal "writing down the bundle" methodology for `retrieval_contract` evolution.
 - **Bundle E2** — Validator skill: 2% audit floor and validator subagent.
+- **Bundle F** — Multi-workflow support: the current write path keeps one handoff summary and one active retrieval contract per project directory, so interleaving or shelving a second workflow silently displaces the first workflow's context (the stored facts remain but retrieval stops targeting them). Planned direction: per-workflow named handoff summaries and retrieval contracts, making the write path symmetric with the read path (which already resolves a contract by name). Dependency: same-subject supersession must carry workflow scope, or an unrelated task can supersede a shelved workflow's still-valid facts.
 
 ---
 
