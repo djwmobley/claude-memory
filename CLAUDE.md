@@ -1,6 +1,6 @@
-# {{PROJECT_NAME}}
+# claude-memory
 
-{{PROJECT_DESCRIPTION}}
+Memory and retrieval infrastructure project.
 
 ---
 
@@ -26,8 +26,8 @@ These rules are canon. They override convenience, time pressure, and apparent co
 
 ## Key paths
 
-- Handoff file: `{{HANDOFF_MD_PATH}}`
-- Helper script: `{{PROJECT_ROOT}}/scripts/handoff.js`
+- Handoff file: `C:\Users\djwmo\.claude\projects\C--Users-djwmo-dev-claude-memory\handoff.md`
+- Helper script: `C:\Users\djwmo\dev\claude-memory/scripts/handoff.js`
 
 ---
 

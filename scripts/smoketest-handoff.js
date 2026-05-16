@@ -383,7 +383,7 @@ async function step5_cmdStatus(ids) {
 }
 
 async function step6_cmdResume() {
-  const label = 'cmdResume — shows non-suppressed, hides suppressed';
+  const label = 'cmdResume — shows non-suppressed, hides suppressed, trusted canon precedes untrusted block';
   try {
     const r = runHandoff('resume');
     if (r.status !== 0) {
@@ -403,6 +403,18 @@ async function step6_cmdResume() {
     }
     if (out.includes('SMOKETEST_UNIQUE_MARKER_SUPPRESSED')) {
       lcFail(6, label, 'SMOKETEST_UNIQUE_MARKER_SUPPRESSED appeared in resume output — suppressed row leaked');
+      return false;
+    }
+
+    // Verify trusted canon appears BEFORE the untrusted retrieved-context block.
+    const canonIdx     = out.indexOf('=== OPERATING CANON (trusted');
+    const untrustedIdx = out.indexOf('=== BEGIN RETRIEVED CONTEXT (untrusted)');
+    if (canonIdx === -1) {
+      lcFail(6, label, 'OPERATING CANON preamble not found in resume output');
+      return false;
+    }
+    if (untrustedIdx !== -1 && canonIdx > untrustedIdx) {
+      lcFail(6, label, 'OPERATING CANON appears AFTER untrusted block — trusted-canon-first ordering violated');
       return false;
     }
 
@@ -941,6 +953,18 @@ async function hardenStep2_trustBoundaryLabels() {
     }
     if (!ctx.includes('END RETRIEVED CONTEXT')) {
       hdFail(2, label, `"END RETRIEVED CONTEXT" not found in additionalContext`);
+      return false;
+    }
+
+    // Verify trusted canon appears BEFORE the untrusted block in loader-hook output.
+    const canonIdx     = ctx.indexOf('=== OPERATING CANON (trusted');
+    const untrustedIdx = ctx.indexOf('=== BEGIN RETRIEVED CONTEXT (untrusted)');
+    if (canonIdx === -1) {
+      hdFail(2, label, `OPERATING CANON preamble not found in additionalContext`);
+      return false;
+    }
+    if (canonIdx > untrustedIdx) {
+      hdFail(2, label, `OPERATING CANON appears AFTER untrusted block in additionalContext — trusted-canon-first ordering violated`);
       return false;
     }
 
