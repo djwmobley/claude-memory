@@ -164,7 +164,34 @@ CREATE TABLE IF NOT EXISTS project_settings (
 );
 
 -- Known settings keys and their hardcoded defaults (used when row is absent):
---   staleness_days      default: '7'         (days before loader triggers staleness prompt)
---   loader_token_budget default: '4000'      (total tokens the SessionStart loader may inject)
---   implicit_close      default: 'enabled'   ('enabled'|'disabled' — Stop-hook behavior)
---   decay_rate_default  default: '0.05'      (per-day decay for new assertions lacking row-level override)
+--   staleness_days             default: '7'         (days before loader triggers staleness prompt)
+--   loader_token_budget        default: '4000'      (total tokens the SessionStart loader may inject)
+--   implicit_close             default: 'enabled'   ('enabled'|'disabled' — Stop-hook behavior)
+--   decay_rate_default         default: '0.05'      (per-day decay for new assertions lacking row-level override)
+--   cluster_aware_retrieval    default: 'enabled'   ('enabled'|any other value — W3 cluster-aware expansion)
+--   cluster_max_siblings       default: '10'        (max same-community sibling entities added per load)
+
+
+-- ============================================================================
+-- ENTITY_COMMUNITIES — community membership assignments produced by Leiden
+-- community detection (Bundle B W3). One row per entity per detection run.
+-- Populated by scripts/bundleb-w3-communities.js (gated, optional infra).
+-- If this table has no rows for a project, the loader's cluster-aware expansion
+-- is a guaranteed no-op — pre-W3 output is byte-identical (no regression).
+--
+-- Portable (no pgvector). Idempotent (CREATE TABLE IF NOT EXISTS).
+-- project_id = encoded_cwd; entity_name = entities.name (TEXT, not FK).
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS entity_communities (
+  id            SERIAL PRIMARY KEY,
+  project_id    TEXT NOT NULL,
+  entity_name   TEXT NOT NULL,
+  community_id  INTEGER NOT NULL,
+  level         INTEGER NOT NULL DEFAULT 0,
+  run_id        TEXT NOT NULL,
+  computed_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS entity_communities_lookup_idx
+  ON entity_communities (project_id, entity_name);
+CREATE INDEX IF NOT EXISTS entity_communities_run_idx
+  ON entity_communities (project_id, run_id);

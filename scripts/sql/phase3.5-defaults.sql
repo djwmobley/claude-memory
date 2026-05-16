@@ -33,3 +33,11 @@ ON CONFLICT (project_id, key) DO NOTHING;
 INSERT INTO project_settings (project_id, key, value)
 VALUES (:'project_id', 'retrieval_outcome_timeout_days', '14')
 ON CONFLICT (project_id, key) DO NOTHING;
+
+INSERT INTO project_settings (project_id, key, value)
+VALUES (:'project_id', 'cluster_aware_retrieval',        'enabled')
+ON CONFLICT (project_id, key) DO NOTHING;
+
+INSERT INTO project_settings (project_id, key, value)
+VALUES (:'project_id', 'cluster_max_siblings',           '10')
+ON CONFLICT (project_id, key) DO NOTHING;
