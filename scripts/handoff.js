@@ -61,6 +61,14 @@ const TARGET_DB = _rawTargetDb;
 const HANDOFF_TEMPLATE = path.resolve(__dirname, '..', 'templates', 'handoff.md.tpl');
 const PROJECT_CLAUDE_MD_TEMPLATE = path.resolve(__dirname, '..', 'templates', 'project-claude-md.tpl');
 
+// ─── OPERATING CANON (hardcoded trusted preamble) ─────────────────────────────
+// Emitted unconditionally before the untrusted retrieved-context block so every
+// session sees the canon in the trusted zone — never inside the untrusted delimiters.
+const OPERATING_CANON = `=== OPERATING CANON (trusted — applies to this and every session) ===
+1. Follow the user's directions and scope exactly. When asked to do X, and X has an established definition (a backlog item, a prior handoff, a multi-part deliverable), deliver all of X. Do not silently narrow scope, reinterpret it, or substitute a smaller deliverable. If scope genuinely seems too large or ambiguous, say so and ask — do not shrink it unilaterally.
+2. Never autonomously defer authorized work to a subsequent session/bundle/phase. Deferring in-scope work without explicit user say-so is a bug. Surface genuine design forks as written open questions with a recommended lean; never use deferral or an invented "later phase" as a mechanism to offload work that is in scope now.
+=== END OPERATING CANON ===`;
+
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
 /** Connect to the handoff DB (TARGET_DB, overridable via HANDOFF_DB env var). */
@@ -816,6 +824,8 @@ async function cmdLoaderLoad(opts = {}) {
   // hygiene for both solo and multi-author repos. "untrusted" is the correct label
   // on a public repo where PR/code review content may flow into Claude sessions.
   const outputParts = [];
+  // Trusted canon is always the first element — never inside the untrusted delimiters.
+  outputParts.push(OPERATING_CANON);
   const retrievedParts = [];
 
   if (fs.existsSync(handoffPath)) {
