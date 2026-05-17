@@ -404,6 +404,51 @@ function detectMultiAuthor(cwd) {
   }
 }
 
+/**
+ * Read-only git probe: determine whether the working tree at `root` has
+ * unpackaged state (dirty tree or local commits not yet pushed upstream).
+ *
+ * Returns { dirty: boolean, aheadCount: number, label: string }.
+ *
+ * Failures (git unavailable, not a repo, no upstream) are handled silently:
+ *   - git errors → dirty=false, aheadCount=0, label='clean (probe unavailable)'
+ *   - no upstream branch → aheadCount treated as 0 (not an error condition)
+ *
+ * NEVER runs a mutating git command.
+ */
+function detectUnpackagedState(root) {
+  try {
+    const { execFileSync } = require('child_process');
+    const execOpts = { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] };
+
+    // Check for dirty working tree (untracked, modified, or staged changes).
+    const statusOut = execFileSync('git', ['-C', root, 'status', '--porcelain'], execOpts);
+    const dirty = statusOut.trim().length > 0;
+
+    // Check for local commits ahead of upstream; treat no-upstream as 0.
+    let aheadCount = 0;
+    try {
+      const aheadOut = execFileSync(
+        'git', ['-C', root, 'rev-list', '--count', '@{upstream}..HEAD'], execOpts
+      );
+      aheadCount = parseInt(aheadOut.trim(), 10) || 0;
+    } catch (_) {
+      // No upstream configured — treat as 0 ahead, not an error.
+      aheadCount = 0;
+    }
+
+    const unpackaged = dirty || aheadCount > 0;
+    const parts = [];
+    if (dirty) parts.push('dirty working tree');
+    if (aheadCount > 0) parts.push(`${aheadCount} commit(s) ahead of upstream`);
+    const label = unpackaged ? parts.join(', ') : 'clean';
+    return { dirty, aheadCount, unpackaged, label };
+  } catch (_) {
+    // git unavailable, not a repo, or any other error — skip silently.
+    return { dirty: false, aheadCount: 0, unpackaged: false, label: 'clean (probe unavailable)' };
+  }
+}
+
 // ─── INIT PRE-FLIGHT HELPERS ──────────────────────────────────────────────────
 
 /** Check that Node.js is >= 18. Returns { ok, msg, fatal }. */
@@ -824,6 +869,18 @@ async function cmdStatus() {
   const contracts = rcRes.rows.map((r) => r.name).join(', ') || '(none)';
   const sip       = sipRes.rows.length > 0 ? sipRes.rows[0].value : null;
 
+  // Packaging-honesty probe (read-only — no DB writes).
+  let packagingLine = '';
+  try {
+    const statusRoot   = findProjectRoot();
+    const packState    = detectUnpackagedState(statusRoot);
+    packagingLine = packState.unpackaged
+      ? `  packaging:        UNPACKAGED (${packState.label})`
+      : `  packaging:        clean`;
+  } catch (_) {
+    // Non-fatal — skip display if probe fails for any unexpected reason.
+  }
+
   console.log('\n  === handoff status ===');
   console.log(`  project_id:       ${projectId}`);
   console.log(`  last_close:       ${lastClose} (${daysStr})`);
@@ -833,6 +890,7 @@ async function cmdStatus() {
   console.log(`  edges:            ${edgRes.rows[0].n}`);
   console.log(`  contracts:        ${contracts}`);
   console.log(`  session_active:   ${sip ? `YES (session_id=${sip})` : 'no'}`);
+  if (packagingLine) console.log(packagingLine);
 
   console.log(`\nDone: handoff:status — ${entRes.rows[0].n} entities, ${assRes.rows[0].n} assertions, ${edgRes.rows[0].n} edges`);
 }
@@ -2251,6 +2309,39 @@ async function cmdClose(args) {
   } catch (evolutionErr) {
     // Fully non-fatal: any error here must not break cmdClose.
     process.stderr.write(`[handoff] C3 contract evolution failed (non-fatal): ${evolutionErr.message}\n`);
+  }
+
+  // ── Packaging-honesty probe (non-fatal, synchronous close path only) ─────────
+  //
+  // Detects whether the session's work is already committed and pushed.
+  // Writes a 1:1 assertion (superseding the prior session's row) so the close
+  // record is "true to itself" — next-session resume will see the actual state.
+  // NEVER blocks, commits, stashes, pushes, or mutates the repository.
+  try {
+    const packState    = detectUnpackagedState(root);
+    const closeSessionId = (typeof payload.session_id === 'string' && payload.session_id.length > 0)
+      ? payload.session_id
+      : await getSetting(db, projectId, 'session_in_progress', null);
+
+    const packSubject = `${path.basename(root)} working tree`;
+    const packObject  = packState.unpackaged ? packState.label : 'clean';
+
+    await writeAssertionWithSupersession(db, projectId, {
+      subject:    packSubject,
+      predicate:  'has_unpackaged_state',
+      object:     packObject,
+      confidence: 8,
+      source:     'model_extracted',
+    }, closeSessionId, registryMode);
+
+    if (packState.unpackaged) {
+      console.log(`\n  packaging:           UNPACKAGED — ${packState.label}`);
+      console.log('  (session work is not fully committed/pushed; close record reflects actual state)');
+    } else {
+      console.log(`\n  packaging:           clean`);
+    }
+  } catch (packErr) {
+    process.stderr.write(`[handoff] packaging-honesty probe failed (non-fatal): ${packErr.message}\n`);
   }
 
   // Clear session_in_progress marker

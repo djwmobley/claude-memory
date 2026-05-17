@@ -209,6 +209,12 @@
       "added_version": "1.1"
     },
     {
+      "predicate": "has_unpackaged_state",
+      "cardinality": "1:1",
+      "description": "Current packaging state of the working tree at close time: 'clean' when all session work is committed and pushed, or a description of unpackaged state (dirty working tree, commits ahead of upstream). Supersedes prior session row so the close record is always true to itself.",
+      "added_version": "1.1"
+    },
+    {
       "predicate": "in_file",
       "cardinality": "1:N",
       "description": "File path where a subject is defined or located; a subject may be defined or present in multiple files simultaneously",

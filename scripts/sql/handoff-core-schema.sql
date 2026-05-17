@@ -136,6 +136,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS assertions_1to1_unique
       'evaluates_at',
       'false_positive',
       'fixed_in',
+      'has_unpackaged_state',
       'is_at_commit',
       'is_authoritative_db',
       'is_cleared_by',
