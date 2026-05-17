@@ -1,0 +1,32 @@
+{
+  "_meta": {
+    "registry_version": "1.0",
+    "description": "Authoritative predicate-vocabulary registry. Each entry declares the canonical predicate string, its cardinality, a human-readable description, and the registry version when the entry was added. Shape: { _meta: {...}, entries: [ { predicate, cardinality, description, added_version } ] }."
+  },
+  "entries": [
+    {
+      "predicate": "chose",
+      "cardinality": "1:1",
+      "description": "Recorded decision or choice made by a subject",
+      "added_version": "1.0"
+    },
+    {
+      "predicate": "depends_on",
+      "cardinality": "1:N",
+      "description": "Subject depends on the named object; multiple objects are valid simultaneously",
+      "added_version": "1.0"
+    },
+    {
+      "predicate": "is_status",
+      "cardinality": "1:1",
+      "description": "Current status of a project entity",
+      "added_version": "1.0"
+    },
+    {
+      "predicate": "prefers",
+      "cardinality": "1:1",
+      "description": "Stated preference of a subject",
+      "added_version": "1.0"
+    }
+  ]
+}
