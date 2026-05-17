@@ -39,3 +39,4 @@ scripts/_apply_schema.js
 scripts/decisions_backup*.csv
 .playwright-mcp/
 .claude/scheduled_tasks.lock
+/BUNDLE-A-SPEC.md
