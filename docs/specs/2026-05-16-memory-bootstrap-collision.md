@@ -662,106 +662,20 @@ path.
 
 ---
 
-## 7. Bootstrap Plan (Concrete)
+## 7. Bootstrap Plan — CLOSED (mechanisms shipped; corpus migration will not run)
 
-This section describes how to ingest the existing history corpus under the 4E recommendation
-so the store ends with one live assertion per `(subject, predicate)` for 1:1 predicates (plus
-parallel 1:N objects) plus a recoverable superseded trail, and the loose markdown files become
-deletable.
+**Mechanisms shipped.** The supersession mechanisms specified in this document — 4A two-step
+cardinality-aware write-time supersession, 4C per-row bump fix, the `history` query kind,
+`scripts/distill-corpus.js` distillation script, and the OQ-5 invariant fixture — shipped in
+PR #35 (commit `6d9ca0a`) and are the steady-state write-path behavior going forward.
 
-### 7.1 Preconditions
+**Corpus migration: SKIP.** The one-time distillation migration over the existing
+HANDOFF/markdown corpus will not be run — decided SKIP by the maintainer. The legacy corpus
+is therefore NOT distilled, and those markdown files are NOT to be deleted on the basis of
+this section.
 
-1. **The controlled predicate-vocabulary contract (assertion extraction architecture) must be
-   in place.** The seed registry (four predicates with declared cardinalities) must be loaded
-   and accessible to the write path before the supersession logic is activated.
-
-2. **Apply 4C (bump fix) first** — change `scripts/handoff.js:966-971` to `UPDATE assertions
-   SET last_reinforced=now(), last_retrieved=now() WHERE id = ANY($1::int[])` using the
-   `retrievedAssertionIds` array collected at `scripts/handoff.js:964`. Also add
-   `AND suppressed = false` per OQ-2.
-
-3. **Apply 4A (cardinality-aware write-time two-step supersession)** — rewrite
-   `scripts/handoff.js:1360-1372` to: (a) look up the predicate's cardinality from the
-   declared registry, (b) execute the appropriate suppression UPDATE (keyed on
-   `(project_id, subject, predicate)` for 1:1 or `(project_id, subject, predicate, object)`
-   for 1:N), (c) then INSERT the new row. Wrap the suppression UPDATE + INSERT in an explicit
-   transaction (`BEGIN` / `COMMIT`) per the atomicity requirement in §4A.
-
-### 7.2 Distillation migration script
-
-A standalone script (new file) processes each source file as follows:
-
-1. **Enumerate source files** — collect: `HANDOFF-2026-05-1*.md` (9 files),
-   `DEBATE-BUNDLE-A.md`, `AS-IS-INTERSESSION-MEMORY.md`. Sort ascending by the date in the
-   filename or, for files without a date in the name, by filesystem `mtime`. This enforces I-5
-   (OQ-1).
-
-2. **For each file in order — model extraction pass** — a model pass reads the file and
-   extracts assertions into the strict stdin JSON schema: `{assertions:[...], entities:[...],
-   edges:[...]}` where each assertion object carries `subject`, `predicate`, `object`,
-   `confidence`, and `source` string fields within the caps enforced by `readStdin` at
-   `scripts/handoff.js:148-263` (`ARRAY_MAX=200`, `RECORD_STR_MAX=1000`). The extraction
-   model must constrain predicates to the declared vocabulary (a precondition of §7.1 step 1).
-
-3. **For each extracted assertion** — the migration applies the cardinality-aware two-step
-   supersession SQL directly (self-contained; does not depend on the 4A-patched write path
-   having been deployed). The migration executes the suppression SQL directly against the DB
-   within a transaction, consistent with the supersession CONTRACT defined in OQ-5. This makes
-   the migration self-contained and order-independent of write-path patch sequencing.
-
-4. **After migration** — run a verification query:
-   ```sql
-   SELECT subject, predicate, COUNT(*) AS live_count
-   FROM assertions
-   WHERE project_id = $1
-     AND suppressed = false
-     AND predicate IN ('is_status', 'prefers', 'chose')
-   GROUP BY subject, predicate
-   HAVING COUNT(*) > 1;
-   ```
-   This must return zero rows (I-1 invariant for 1:1 predicates). A separate check for 1:N
-   predicates verifies that all distinct `(subject, predicate, object)` combinations are unique
-   among live rows.
-
-5. **Mark source files as ingested** — write a `.ingested` marker file alongside each source
-   file (or log a migration manifest). Do NOT delete the markdown files until the verification
-   query passes and the maintainer confirms.
-
-### 7.3 Contract extension for history retrieval
-
-Add a `kind: 'history'` query branch in the `scripts/handoff.js` loader dispatcher (after the
-existing `assertion` and `recency` branches at `scripts/handoff.js:922-990`). The query:
-
-```sql
-SELECT id, subject, predicate, object, confidence, source, created_at
-FROM assertions
-WHERE project_id = $1
-  AND ($2::text IS NULL OR subject = $2)
-  AND suppressed = true
-ORDER BY subject, predicate, created_at DESC
-LIMIT 20
-```
-
-This query does NOT bump `last_reinforced` (history retrieval should not reinforce suppressed
-rows). The history kind is opt-in via the retrieval contract; the default contract does not
-include it, so the default per-session context cost is unaffected (I-2).
-
-Add `kind: 'history'` with `filter.subject` to `retrieval_contract.queries` when historical
-audit is needed. Version the contract change via `recordContractChange`
-(`scripts/handoff.js:327`, FACT 7).
-
-### 7.4 Post-bootstrap steady state
-
-After the migration:
-- Default retrieval sees one live 1:1 assertion per `(subject, predicate)` and all live 1:N
-  parallel objects, within LIMIT-30 across all subjects.
-- Stale contradictory 1:1 variants are suppressed and invisible to default injection.
-- History is recoverable via explicit `kind: 'history'` queries.
-- The 9 HANDOFF files and supporting markdown can be archived or deleted once the maintainer
-  confirms the verification queries at §7.2 step 4 pass.
-- The thin-pointer / replace-not-append invariant (I-7) is structurally enforced by the write
-  path going forward.
-
----
+**Steady state going forward.** New writes are governed by the shipped 4A/4C write path,
+which enforces cardinality-aware supersession on every ingest. This is unaffected by the
+un-run migration.
 
 *End of spec.*
