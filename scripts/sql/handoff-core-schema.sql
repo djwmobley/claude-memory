@@ -97,6 +97,76 @@ CREATE INDEX IF NOT EXISTS assertions_subject_idx
 CREATE INDEX IF NOT EXISTS assertions_confidence_idx
   ON assertions (project_id, confidence DESC);
 
+-- ── 4A supersession indexes (defense-in-depth) ──────────────────────────────
+--
+-- These indexes enforce the cardinality-aware supersession contract as a
+-- defense-in-depth layer.  The primary atomicity guarantee is the explicit
+-- BEGIN/COMMIT transaction wrapping each suppress+INSERT pair in the write path
+-- (mechanism-a per the spec).  These indexes catch any race that escapes the
+-- transaction.
+--
+-- IMPORTANT — 1:1 index predicate list is registry-derived:
+--   The IN(...) list below enumerates every predicate whose cardinality is '1:1'
+--   in scripts/lib/predicate-registry.json at the time of this schema revision
+--   (registry_version 1.1, 38 predicates).  A test in scripts/smoketest-handoff.js
+--   (section "collision") asserts that this list is exactly the registry's current
+--   1:1 set — any registry/index drift will fail CI.  When adding a 1:1 predicate
+--   to the registry, also update this index (and the drift test will catch
+--   omissions automatically).
+--
+-- 1:1 partial unique index: at most one live row per (project_id, subject, predicate)
+-- for any predicate that the registry declares cardinality 1:1.
+CREATE UNIQUE INDEX IF NOT EXISTS assertions_1to1_unique
+  ON assertions (project_id, subject, predicate)
+  WHERE suppressed = false
+    AND predicate IN (
+      'README_roadmap_scope',
+      'added_via',
+      'affirmed',
+      'are_safe_outside_claude-memory',
+      'chose',
+      'cmdDrop_refactor',
+      'converged',
+      'created_by',
+      'currently_at',
+      'default',
+      'defaults_to',
+      'defined_as',
+      'elevates_to',
+      'evaluates_at',
+      'false_positive',
+      'fixed_in',
+      'is_at_commit',
+      'is_authoritative_db',
+      'is_cleared_by',
+      'is_direction',
+      'is_exactly',
+      'is_model',
+      'is_status',
+      'is_value',
+      'matching_algorithm',
+      'moved_to',
+      'must_mean',
+      'now_uses',
+      'orchestrates_only',
+      'phase_ordering',
+      'prefers',
+      'schema_migration_is',
+      'shipped_at',
+      'skipped',
+      'usage',
+      'user_chose',
+      'user_directed',
+      'uses_db'
+    );
+
+-- 1:N exact-duplicate index: at most one live row per (project_id, subject, predicate, object).
+-- Registry-independent: applies to all predicates equally, preventing exact-duplicate 1:N rows
+-- regardless of cardinality class.
+CREATE UNIQUE INDEX IF NOT EXISTS assertions_1ton_exact_unique
+  ON assertions (project_id, subject, predicate, object)
+  WHERE suppressed = false;
+
 
 -- ============================================================================
 -- EDGES — typed relationships between entities, extracted at /handoff:close.

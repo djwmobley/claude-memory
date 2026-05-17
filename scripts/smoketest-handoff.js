@@ -25,8 +25,8 @@ const { Client } = require('pg');
 const ARGS       = process.argv.slice(2);
 const sectionArg = ARGS.find((a) => a.startsWith('--section='));
 const SECTION    = sectionArg ? sectionArg.split('=')[1] : 'all';
-if (!['all', 'lifecycle', 'hooks', 'hardening', 'w2', 'w3', 'w4', 'c1', 'c2', 'c3', 'registry', 'queue'].includes(SECTION)) {
-  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, hardening, w2, w3, w4, c1, c2, c3, registry, queue, all`);
+if (!['all', 'lifecycle', 'hooks', 'hardening', 'w2', 'w3', 'w4', 'c1', 'c2', 'c3', 'registry', 'queue', 'collision'].includes(SECTION)) {
+  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, hardening, w2, w3, w4, c1, c2, c3, registry, queue, collision, all`);
   process.exit(2);
 }
 
@@ -99,8 +99,10 @@ let rgPassed  = 0;
 let rgFailed  = 0;
 let qPassed   = 0;
 let qFailed   = 0;
+let colPassed = 0;
+let colFailed = 0;
 
-const LC_TOTAL = 14;
+const LC_TOTAL  = 14;
 const HK_TOTAL = 3;
 const HD_TOTAL = 8;
 const W2_TOTAL = 3;
@@ -109,8 +111,9 @@ const W4_TOTAL = 6;
 const C1_TOTAL = 4;
 const C2_TOTAL = 4;
 const C3_TOTAL = 5;
-const RG_TOTAL = 7;
-const Q_TOTAL  = 4;
+const RG_TOTAL  = 7;
+const Q_TOTAL   = 4;
+const COL_TOTAL = 5;
 
 function lcPass(step, label) {
   console.log(`[STEP ${step}/${LC_TOTAL}] ${label} ... PASS`);
@@ -235,6 +238,16 @@ function qPass(step, label) {
 function qFail(step, label, reason) {
   console.log(`[QUEUE ${step}/${Q_TOTAL}] ${label} ... FAIL: ${reason}`);
   qFailed++;
+}
+
+function colPass(step, label) {
+  console.log(`[COLLISION ${step}/${COL_TOTAL}] ${label} ... PASS`);
+  colPassed++;
+}
+
+function colFail(step, label, reason) {
+  console.log(`[COLLISION ${step}/${COL_TOTAL}] ${label} ... FAIL: ${reason}`);
+  colFailed++;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -4342,28 +4355,48 @@ async function rgStep5_classifyStrictKnown() {
 }
 
 /**
- * REGISTRY 6/7: recognizedPredicates() returns the 4 seed predicates sorted.
+ * REGISTRY 6/7: recognizedPredicates() returns a sorted array containing all registry predicates.
+ * The test validates: (a) it is an array, (b) it is lexicographically sorted,
+ * (c) it contains the 4 original seed predicates, (d) length matches registry size.
+ * Updated from the original 4-seed check when the registry was extended to 84 predicates in
+ * registry_version 1.1 (PR #31).  The exact predicate list is authoritative in
+ * predicate-registry.json; this test validates structural invariants rather than enumerating
+ * all 84 names inline.
  */
 async function rgStep6_recognizedPredicates() {
-  const label = 'recognizedPredicates(): returns sorted array of the 4 seed predicates';
+  const label = 'recognizedPredicates(): sorted array; contains seed predicates; length matches registry';
   try {
-    const { recognizedPredicates } = require('./lib/predicate-registry');
+    const { recognizedPredicates, loadRegistry } = require('./lib/predicate-registry');
     const result = recognizedPredicates();
     if (!Array.isArray(result)) {
       rgFail(6, label, `expected an array, got ${typeof result}`);
       return false;
     }
-    const expected = ['chose', 'depends_on', 'is_status', 'prefers'];
-    if (result.length !== expected.length) {
-      rgFail(6, label, `expected ${expected.length} predicates, got ${result.length}: ${JSON.stringify(result)}`);
-      return false;
-    }
-    for (let i = 0; i < expected.length; i++) {
-      if (result[i] !== expected[i]) {
-        rgFail(6, label, `mismatch at index ${i}: expected "${expected[i]}", got "${result[i]}"`);
+
+    // Must be sorted lexicographically (function contract).
+    for (let i = 1; i < result.length; i++) {
+      if (result[i] < result[i - 1]) {
+        rgFail(6, label, `array not sorted at index ${i}: "${result[i - 1]}" > "${result[i]}"`);
         return false;
       }
     }
+
+    // Must contain the 4 original seed predicates.
+    const seeds = ['chose', 'depends_on', 'is_status', 'prefers'];
+    for (const s of seeds) {
+      if (!result.includes(s)) {
+        rgFail(6, label, `seed predicate "${s}" missing from recognizedPredicates()`);
+        return false;
+      }
+    }
+
+    // Length must match the registry's actual entry count.
+    const { byPredicate } = loadRegistry();
+    if (result.length !== byPredicate.size) {
+      rgFail(6, label, `length mismatch: recognizedPredicates() returned ${result.length}, registry has ${byPredicate.size}`);
+      return false;
+    }
+
     rgPass(6, label);
     return true;
   } catch (err) {
@@ -4974,6 +5007,248 @@ async function runQueueSection() {
   }
 }
 
+// ── COLLISION SECTION — OQ-5 shared invariant fixture + registry/index drift ──
+
+/**
+ * COLLISION 1/5 — write path 1:1 supersession.
+ * Two close() calls for the same (subject, predicate='is_status') but different
+ * objects. Contract: exactly one live row survives; surviving object = later ingest.
+ */
+async function colStep1_oneToOne(colDb, colProjectId, colProjectDir) {
+  const label = '1:1 predicate: later ingest supersedes earlier (write path)';
+  try {
+    const pred = 'is_status'; // 1:1 in registry
+    const closeArgs = [HANDOFF_SCRIPT, 'close', '--json', '-'];
+    const closeEnv  = { ...process.env, HANDOFF_DB: colDb, PROJECT_ROOT: colProjectDir };
+    const opts      = { cwd: PROJECT_ROOT, env: closeEnv, encoding: 'utf8', timeout: 30000 };
+
+    const r1 = spawnSync(process.execPath, closeArgs,
+      { ...opts, input: JSON.stringify({ assertions: [{ subject: 'col-a', predicate: pred, object: 'phase-1', confidence: 7, source: 'user_stated' }] }) });
+    if (r1.status !== 0) { colFail(1, label, `close-1 exited ${r1.status}: ${(r1.stderr || '').slice(0, 200)}`); return false; }
+
+    const r2 = spawnSync(process.execPath, closeArgs,
+      { ...opts, input: JSON.stringify({ assertions: [{ subject: 'col-a', predicate: pred, object: 'phase-2', confidence: 8, source: 'user_stated' }] }) });
+    if (r2.status !== 0) { colFail(1, label, `close-2 exited ${r2.status}: ${(r2.stderr || '').slice(0, 200)}`); return false; }
+
+    const db = await pgConnect(colDb);
+    const { rows: live } = await db.query(
+      `SELECT object FROM assertions WHERE project_id=$1 AND subject='col-a' AND predicate=$2 AND suppressed=false`,
+      [colProjectId, pred]);
+    if (live.length !== 1) { await db.end(); colFail(1, label, `expected 1 live row, got ${live.length}: ${JSON.stringify(live.map((r) => r.object))}`); return false; }
+    if (live[0].object !== 'phase-2') { await db.end(); colFail(1, label, `expected "phase-2", got "${live[0].object}"`); return false; }
+    const { rows: supp } = await db.query(
+      `SELECT object FROM assertions WHERE project_id=$1 AND subject='col-a' AND predicate=$2 AND suppressed=true`,
+      [colProjectId, pred]);
+    if (supp.length === 0) { await db.end(); colFail(1, label, 'no suppressed row for earlier value'); return false; }
+    await db.end();
+    colPass(1, label);
+    return true;
+  } catch (err) { colFail(1, label, err.message); return false; }
+}
+
+/**
+ * COLLISION 2/5 — write path 1:N: two different objects coexist (no suppression).
+ */
+async function colStep2_oneToN_bothLive(colDb, colProjectId, colProjectDir) {
+  const label = '1:N predicate: two different objects coexist (write path)';
+  try {
+    const pred = 'depends_on'; // 1:N in registry
+    const closeArgs = [HANDOFF_SCRIPT, 'close', '--json', '-'];
+    const closeEnv  = { ...process.env, HANDOFF_DB: colDb, PROJECT_ROOT: colProjectDir };
+    const opts      = { cwd: PROJECT_ROOT, env: closeEnv, encoding: 'utf8', timeout: 30000 };
+
+    const r1 = spawnSync(process.execPath, closeArgs,
+      { ...opts, input: JSON.stringify({ assertions: [{ subject: 'col-b', predicate: pred, object: 'dep-alpha', confidence: 7, source: 'user_stated' }] }) });
+    if (r1.status !== 0) { colFail(2, label, `close-1 exited ${r1.status}`); return false; }
+
+    const r2 = spawnSync(process.execPath, closeArgs,
+      { ...opts, input: JSON.stringify({ assertions: [{ subject: 'col-b', predicate: pred, object: 'dep-beta', confidence: 8, source: 'user_stated' }] }) });
+    if (r2.status !== 0) { colFail(2, label, `close-2 exited ${r2.status}`); return false; }
+
+    const db = await pgConnect(colDb);
+    const { rows: live } = await db.query(
+      `SELECT object FROM assertions WHERE project_id=$1 AND subject='col-b' AND predicate=$2 AND suppressed=false ORDER BY object`,
+      [colProjectId, pred]);
+    await db.end();
+    if (live.length !== 2) { colFail(2, label, `expected 2 live rows, got ${live.length}: ${JSON.stringify(live.map((r) => r.object))}`); return false; }
+    const objs = live.map((r) => r.object).sort();
+    if (!objs.includes('dep-alpha') || !objs.includes('dep-beta')) { colFail(2, label, `expected dep-alpha+dep-beta, got ${JSON.stringify(objs)}`); return false; }
+    colPass(2, label);
+    return true;
+  } catch (err) { colFail(2, label, err.message); return false; }
+}
+
+/**
+ * COLLISION 3/5 — write path 1:N exact-duplicate: two ingests of identical (s,p,o) → one live row.
+ */
+async function colStep3_oneToN_exactDup(colDb, colProjectId, colProjectDir) {
+  const label = '1:N exact duplicate → one live row (write path)';
+  try {
+    const pred = 'depends_on';
+    const closeArgs = [HANDOFF_SCRIPT, 'close', '--json', '-'];
+    const closeEnv  = { ...process.env, HANDOFF_DB: colDb, PROJECT_ROOT: colProjectDir };
+    const opts      = { cwd: PROJECT_ROOT, env: closeEnv, encoding: 'utf8', timeout: 30000 };
+
+    for (let i = 0; i < 2; i++) {
+      const r = spawnSync(process.execPath, closeArgs,
+        { ...opts, input: JSON.stringify({ assertions: [{ subject: 'col-c', predicate: pred, object: 'dep-gamma', confidence: 7, source: 'user_stated' }] }) });
+      if (r.status !== 0) { colFail(3, label, `close-${i + 1} exited ${r.status}`); return false; }
+    }
+
+    const db = await pgConnect(colDb);
+    const { rows } = await db.query(
+      `SELECT COUNT(*) AS n FROM assertions WHERE project_id=$1 AND subject='col-c' AND predicate=$2 AND object='dep-gamma' AND suppressed=false`,
+      [colProjectId, pred]);
+    await db.end();
+    const n = parseInt(rows[0].n, 10);
+    if (n !== 1) { colFail(3, label, `expected 1 live row, got ${n}`); return false; }
+    colPass(3, label);
+    return true;
+  } catch (err) { colFail(3, label, err.message); return false; }
+}
+
+/**
+ * COLLISION 4/5 — history query kind: suppressed trail returned; no bump on suppressed rows.
+ * Depends on step 1 having created col-a with a suppressed 'phase-1' row.
+ */
+async function colStep4_historyKind(colDb, colProjectId, colProjectDir) {
+  const label = 'history kind: suppressed trail visible; no bump on suppressed rows';
+  try {
+    const closeEnv  = { ...process.env, HANDOFF_DB: colDb, PROJECT_ROOT: colProjectDir };
+    const baseOpts  = { cwd: PROJECT_ROOT, env: closeEnv, encoding: 'utf8', timeout: 30000 };
+
+    // Write contract with a history query.
+    const rContract = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'close', '--json', '-'],
+      { ...baseOpts, input: JSON.stringify({ contract: { queries: [{ kind: 'history', filter: { subject: 'col-a' } }] } }) });
+    if (rContract.status !== 0) { colFail(4, label, `contract close failed: ${(rContract.stderr || '').slice(0, 200)}`); return false; }
+
+    // Resume: history section must appear with suppressed 'phase-1'.
+    const rResume = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'resume'], baseOpts);
+    if (rResume.status !== 0) { colFail(4, label, `resume failed: ${(rResume.stderr || '').slice(0, 200)}`); return false; }
+    const out = rResume.stdout || '';
+    if (!out.includes('Assertion history (suppressed trail)')) { colFail(4, label, 'history section header not found'); return false; }
+    if (!out.includes('phase-1')) { colFail(4, label, '"phase-1" not in history output'); return false; }
+
+    // No-bump check: read last_reinforced of suppressed row before + after second resume.
+    const db = await pgConnect(colDb);
+    const { rows: before } = await db.query(
+      `SELECT id, last_reinforced FROM assertions WHERE project_id=$1 AND subject='col-a' AND predicate='is_status' AND suppressed=true LIMIT 1`,
+      [colProjectId]);
+    if (before.length === 0) { await db.end(); colFail(4, label, 'no suppressed row for col-a/is_status'); return false; }
+    const lrBefore = before[0].last_reinforced;
+
+    spawnSync(process.execPath, [HANDOFF_SCRIPT, 'resume'], baseOpts); // second resume
+
+    const { rows: after } = await db.query(`SELECT last_reinforced FROM assertions WHERE id=$1`, [before[0].id]);
+    await db.end();
+    if (after.length === 0) { colFail(4, label, 'suppressed row disappeared after second resume'); return false; }
+    if (lrBefore.getTime() !== after[0].last_reinforced.getTime()) {
+      colFail(4, label, `history kind bumped suppressed row: before=${lrBefore.toISOString()} after=${after[0].last_reinforced.toISOString()}`);
+      return false;
+    }
+    colPass(4, label);
+    return true;
+  } catch (err) { colFail(4, label, err.message); return false; }
+}
+
+/**
+ * COLLISION 5/5 — Registry / 1:1-index drift guard (pure, no Postgres).
+ *
+ * The assertions_1to1_unique index in handoff-core-schema.sql enumerates a specific
+ * set of predicate strings.  This test asserts the set is exactly the current 1:1
+ * predicate set in predicate-registry.json.  Drift = CI failure.
+ */
+async function colStep5_registryIndexDrift() {
+  const label = 'registry/index drift: schema IN(...) list === registry 1:1 predicate set';
+  try {
+    const { loadRegistry: loadReg } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'predicate-registry.js'));
+    const reg = loadReg();
+    const registry1to1 = new Set();
+    for (const [pred, entry] of reg.byPredicate) {
+      if (entry.cardinality === '1:1') registry1to1.add(pred);
+    }
+
+    const schemaPath = path.join(PROJECT_ROOT, 'scripts', 'sql', 'handoff-core-schema.sql');
+    const sql = fs.readFileSync(schemaPath, 'utf8');
+
+    // Extract the IN(...) block from assertions_1to1_unique definition.
+    const m = sql.match(/assertions_1to1_unique[\s\S]*?AND\s+predicate\s+IN\s*\(([\s\S]*?)\);/);
+    if (!m) { colFail(5, label, 'assertions_1to1_unique IN(...) block not found in schema SQL'); return false; }
+
+    const inBlock = m[1];
+    const indexPredicates = new Set();
+    const re = /'([^']+)'/g;
+    let hit;
+    while ((hit = re.exec(inBlock)) !== null) indexPredicates.add(hit[1]);
+
+    const missingFromIndex = [...registry1to1].filter((p) => !indexPredicates.has(p));
+    const extraInIndex     = [...indexPredicates].filter((p) => !registry1to1.has(p));
+
+    if (missingFromIndex.length > 0 || extraInIndex.length > 0) {
+      const msgs = [];
+      if (missingFromIndex.length > 0) msgs.push(`registry 1:1 not in index: ${JSON.stringify(missingFromIndex)}`);
+      if (extraInIndex.length > 0)     msgs.push(`index predicate not 1:1 in registry: ${JSON.stringify(extraInIndex)}`);
+      colFail(5, label, msgs.join('; '));
+      return false;
+    }
+
+    colPass(5, label);
+    return true;
+  } catch (err) { colFail(5, label, err.message); return false; }
+}
+
+async function runCollisionSection() {
+  console.log(`\n=== COLLISION SECTION (${COL_TOTAL} steps) ===`);
+  console.log('smoketest-handoff collision: OQ-5 shared invariant fixture + registry/index drift guard');
+  console.log('Step 5 (drift): pure — no Postgres. Steps 1-4: require Postgres.');
+  console.log('');
+
+  // Step 5 is pure — always run it.
+  await colStep5_registryIndexDrift();
+
+  const TS       = Date.now();
+  const COL_DB   = `claude_memory_collision_${TS}`;
+  const PROJ_DIR = path.join(os.tmpdir(), `handoff_collision_${TS}`);
+  const PROJ_ID  = encodeCwd(PROJ_DIR);
+
+  let dbOk = false;
+  try {
+    await createSmokeDb(COL_DB, PROJ_DIR);
+    fs.writeFileSync(path.join(PROJ_DIR, 'CLAUDE.md'), '# collision-test\n\n## Durable facts\n- (none)\n', 'utf8');
+
+    const initR = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'init', '-y'],
+      { cwd: PROJECT_ROOT, env: { ...process.env, HANDOFF_DB: COL_DB, PROJECT_ROOT: PROJ_DIR }, encoding: 'utf8', timeout: 30000 });
+    if (initR.status !== 0) {
+      console.log('[COLLISION] DB init failed — skipping DB-backed steps 1-4');
+      console.log((initR.stderr || initR.stdout || '').slice(0, 400));
+      colFailed += 4;
+    } else {
+      console.log(`[COLLISION] DB init OK (${COL_DB})`);
+      dbOk = true;
+      try { await createRetrievalEventsTable(COL_DB); } catch (_) { /* non-fatal */ }
+    }
+  } catch (err) {
+    console.log(`[COLLISION] DB setup error: ${err.message} — skipping steps 1-4`);
+    colFailed += 4;
+  }
+
+  if (dbOk) {
+    const ok1 = await colStep1_oneToOne(COL_DB, PROJ_ID, PROJ_DIR);
+    await colStep2_oneToN_bothLive(COL_DB, PROJ_ID, PROJ_DIR);
+    await colStep3_oneToN_exactDup(COL_DB, PROJ_ID, PROJ_DIR);
+    if (ok1) {
+      await colStep4_historyKind(COL_DB, PROJ_ID, PROJ_DIR);
+    } else {
+      colFail(4, 'history kind', 'skipped — step 1 failed (no suppressed row available)');
+    }
+  }
+
+  try {
+    const HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', PROJ_ID, 'handoff.md');
+    await dropSmokeDb(COL_DB, PROJ_DIR, HANDOFF_PATH).catch(() => {});
+  } catch (_) {}
+}
+
 async function runRegistrySection() {
   console.log(`\n=== REGISTRY SECTION (${RG_TOTAL} steps) ===`);
   console.log('smoketest-handoff registry: loadRegistry, cardinalityOf, classifyPredicate, recognizedPredicates, write-path non-regression');
@@ -5186,6 +5461,9 @@ async function main() {
   if (SECTION === 'queue' || SECTION === 'all') {
     await runQueueSection();
   }
+  if (SECTION === 'collision' || SECTION === 'all') {
+    await runCollisionSection();
+  }
 
   console.log('');
 
@@ -5200,12 +5478,13 @@ async function main() {
   const c3Total  = c3Passed + c3Failed;
   const rgTotal  = rgPassed + rgFailed;
   const qTotal   = qPassed  + qFailed;
-  const totalPass = lcPassed + hkPassed + hdPassed + w2Passed + w3Passed + w4Passed + c1Passed + c2Passed + c3Passed + rgPassed + qPassed;
-  const totalAll  = lcTotal  + hkTotal  + hdTotal  + w2Total  + w3Total  + w4Total  + c1Total  + c2Total  + c3Total  + rgTotal  + qTotal;
+  const colTotal = colPassed + colFailed;
+  const totalPass = lcPassed + hkPassed + hdPassed + w2Passed + w3Passed + w4Passed + c1Passed + c2Passed + c3Passed + rgPassed + qPassed + colPassed;
+  const totalAll  = lcTotal  + hkTotal  + hdTotal  + w2Total  + w3Total  + w4Total  + c1Total  + c2Total  + c3Total  + rgTotal  + qTotal  + colTotal;
   const totalSkip = lcSkipped + hkSkipped + hdSkipped + w2Skipped + w3Skipped + w4Skipped + c1Skipped + c2Skipped + c3Skipped;
 
   if (SECTION === 'all') {
-    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal}, hardening: ${hdPassed}/${hdTotal}, w2: ${w2Passed}/${w2Total}, w3: ${w3Passed}/${w3Total}, w4: ${w4Passed}/${w4Total}, c1: ${c1Passed}/${c1Total}, c2: ${c2Passed}/${c2Total}, c3: ${c3Passed}/${c3Total}, registry: ${rgPassed}/${rgTotal}, queue: ${qPassed}/${qTotal})`);
+    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal}, hardening: ${hdPassed}/${hdTotal}, w2: ${w2Passed}/${w2Total}, w3: ${w3Passed}/${w3Total}, w4: ${w4Passed}/${w4Total}, c1: ${c1Passed}/${c1Total}, c2: ${c2Passed}/${c2Total}, c3: ${c3Passed}/${c3Total}, registry: ${rgPassed}/${rgTotal}, queue: ${qPassed}/${qTotal}, collision: ${colPassed}/${colTotal})`);
   } else if (SECTION === 'lifecycle') {
     console.log(`smoketest: ${lcPassed}/${lcTotal} passed, ${lcSkipped} skipped (lifecycle only)`);
   } else if (SECTION === 'hooks') {
@@ -5226,11 +5505,13 @@ async function main() {
     console.log(`smoketest: ${rgPassed}/${rgTotal} passed (registry only)`);
   } else if (SECTION === 'queue') {
     console.log(`smoketest: ${qPassed}/${qTotal} passed (queue only)`);
+  } else if (SECTION === 'collision') {
+    console.log(`smoketest: ${colPassed}/${colTotal} passed (collision only)`);
   } else {
     console.log(`smoketest: ${hdPassed}/${hdTotal} passed, ${hdSkipped} skipped (hardening only)`);
   }
 
-  if (lcFailed + hkFailed + hdFailed + w2Failed + w3Failed + w4Failed + c1Failed + c2Failed + c3Failed + rgFailed + qFailed > 0) process.exitCode = 1;
+  if (lcFailed + hkFailed + hdFailed + w2Failed + w3Failed + w4Failed + c1Failed + c2Failed + c3Failed + rgFailed + qFailed + colFailed > 0) process.exitCode = 1;
 }
 
 main().catch((err) => {
