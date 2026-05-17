@@ -7,6 +7,10 @@ updated retrieval contract from the conversation, writes them to Postgres, rewri
 `handoff.md`, surfaces CLAUDE.md promotion candidates, runs the reranker precision@5
 gate, and clears the `session_in_progress` marker.
 
+When `extraction_async_enabled` is set to `'true'` in project settings, the write is
+deferred: the payload is enqueued and written by the deterministic background worker
+(`node scripts/handoff.js queue-drain`). Default behavior is synchronous.
+
 ## Extraction instructions for Claude
 
 Read the conversation that just happened. Then extract:
@@ -26,7 +30,12 @@ Facts established in this session.
 
 For each assertion:
 - `subject` — entity name or topic string
-- `predicate` — verb phrase (e.g., `uses`, `is_status`, `prefers`, `chose`, `depends_on`)
+- `predicate` — **MUST be one of the declared registry predicates** (see
+  `scripts/lib/predicate-registry.json` for the authoritative vocabulary).
+  Current recognized predicates: `chose`, `depends_on`, `is_status`, `prefers`.
+  Unknown predicates are flagged (permissive mode: stderr warning, assertion kept)
+  or rejected (strict mode: assertion skipped) by the deterministic write path.
+  Do not invent new predicates; extend `predicate-registry.json` first.
 - `object` — asserted value or referenced entity
 - `confidence` — 1–10 integer:
   - 9–10: user-stated durable facts ("the DB is on localhost")
@@ -100,7 +109,7 @@ echo '<JSON_PAYLOAD>' | node "$PROJECT_ROOT/scripts/handoff.js" close --json -
     {"name": "entity-name", "entity_type": "system", "description": "..."}
   ],
   "assertions": [
-    {"subject": "X", "predicate": "uses", "object": "Y", "confidence": 8, "source": "model_extracted"}
+    {"subject": "X", "predicate": "depends_on", "object": "Y", "confidence": 8, "source": "model_extracted"}
   ],
   "edges": [
     {"from_entity": "X", "edge_type": "depends_on", "to_entity": "Y"}

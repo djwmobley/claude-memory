@@ -25,8 +25,8 @@ const { Client } = require('pg');
 const ARGS       = process.argv.slice(2);
 const sectionArg = ARGS.find((a) => a.startsWith('--section='));
 const SECTION    = sectionArg ? sectionArg.split('=')[1] : 'all';
-if (!['all', 'lifecycle', 'hooks', 'hardening', 'w2', 'w3', 'w4', 'c1', 'c2', 'c3', 'registry'].includes(SECTION)) {
-  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, hardening, w2, w3, w4, c1, c2, c3, registry, all`);
+if (!['all', 'lifecycle', 'hooks', 'hardening', 'w2', 'w3', 'w4', 'c1', 'c2', 'c3', 'registry', 'queue'].includes(SECTION)) {
+  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, hardening, w2, w3, w4, c1, c2, c3, registry, queue, all`);
   process.exit(2);
 }
 
@@ -97,6 +97,8 @@ let c3Failed  = 0;
 let c3Skipped = 0;
 let rgPassed  = 0;
 let rgFailed  = 0;
+let qPassed   = 0;
+let qFailed   = 0;
 
 const LC_TOTAL = 14;
 const HK_TOTAL = 3;
@@ -108,6 +110,7 @@ const C1_TOTAL = 4;
 const C2_TOTAL = 4;
 const C3_TOTAL = 5;
 const RG_TOTAL = 7;
+const Q_TOTAL  = 4;
 
 function lcPass(step, label) {
   console.log(`[STEP ${step}/${LC_TOTAL}] ${label} ... PASS`);
@@ -222,6 +225,16 @@ function rgPass(step, label) {
 function rgFail(step, label, reason) {
   console.log(`[REGISTRY ${step}/${RG_TOTAL}] ${label} ... FAIL: ${reason}`);
   rgFailed++;
+}
+
+function qPass(step, label) {
+  console.log(`[QUEUE ${step}/${Q_TOTAL}] ${label} ... PASS`);
+  qPassed++;
+}
+
+function qFail(step, label, reason) {
+  console.log(`[QUEUE ${step}/${Q_TOTAL}] ${label} ... FAIL: ${reason}`);
+  qFailed++;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -4471,6 +4484,496 @@ async function rgStep7_writePathNonRegression() {
   }
 }
 
+// ── Queue section ─────────────────────────────────────────────────────────────
+
+/**
+ * QUEUE 1/4: Async on — enqueue writes a queue row, zero assertions written.
+ *
+ * Sets extraction_async_enabled='true', runs cmdClose with one assertion payload.
+ * Verifies: extraction_queue has a 'pending' row; assertions table has 0 new rows.
+ */
+async function qStep1_asyncEnqueueNoDirectWrite(qDb, qProjectId, qProjectDir) {
+  const label = 'Async ON: cmdClose enqueues payload; zero assertions written directly';
+  try {
+    const db = await pgConnect(qDb);
+
+    // Enable async extraction.
+    await db.query(
+      `INSERT INTO project_settings (project_id, key, value)
+       VALUES ($1, 'extraction_async_enabled', 'true')
+       ON CONFLICT (project_id, key) DO UPDATE SET value = 'true'`,
+      [qProjectId]
+    );
+
+    // Count existing rows before close.
+    const { rows: beforeAss } = await db.query(
+      `SELECT COUNT(*) AS n FROM assertions WHERE project_id = $1`, [qProjectId]
+    );
+    const { rows: beforeQ } = await db.query(
+      `SELECT COUNT(*) AS n FROM extraction_queue WHERE project_id = $1`, [qProjectId]
+    );
+    const assertionsBefore = parseInt(beforeAss[0].n, 10);
+    const queueBefore      = parseInt(beforeQ[0].n, 10);
+    await db.end();
+
+    // Run cmdClose with a payload containing one recognized assertion.
+    const payload = JSON.stringify({
+      tldr: 'queue step 1 test',
+      session_id: `queue-step1-${Date.now()}`,
+      assertions: [
+        { subject: 'Q_SUBJ', predicate: 'is_status', object: 'Q_OBJ', confidence: 7, source: 'user_stated' },
+      ],
+    });
+
+    const r = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'close', '--json', '-'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: qDb, PROJECT_ROOT: qProjectDir },
+        input:    payload,
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+
+    if (r.status !== 0) {
+      qFail(1, label, `cmdClose exited ${r.status}: ${((r.stderr || '') + (r.stdout || '')).slice(0, 300)}`);
+      return false;
+    }
+
+    // Verify "queued for async extraction" message in stdout.
+    const out = r.stdout || '';
+    if (!out.includes('queued for async extraction')) {
+      qFail(1, label, `cmdClose output does not contain "queued for async extraction": ${out.slice(0, 300)}`);
+      return false;
+    }
+
+    // Verify: queue row added, assertions unchanged.
+    const db2 = await pgConnect(qDb);
+    const { rows: afterAss } = await db2.query(
+      `SELECT COUNT(*) AS n FROM assertions WHERE project_id = $1`, [qProjectId]
+    );
+    const { rows: afterQ } = await db2.query(
+      `SELECT COUNT(*) AS n FROM extraction_queue WHERE project_id = $1`, [qProjectId]
+    );
+    await db2.end();
+
+    const assertionsAfter = parseInt(afterAss[0].n, 10);
+    const queueAfter      = parseInt(afterQ[0].n, 10);
+
+    if (assertionsAfter !== assertionsBefore) {
+      qFail(1, label, `assertions count changed from ${assertionsBefore} to ${assertionsAfter} — async path should not write directly`);
+      return false;
+    }
+    if (queueAfter !== queueBefore + 1) {
+      qFail(1, label, `extraction_queue count changed from ${queueBefore} to ${queueAfter} — expected exactly 1 new row`);
+      return false;
+    }
+
+    qPass(1, label);
+    return true;
+  } catch (err) {
+    qFail(1, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * QUEUE 2/4: queue-drain writes the assertion and marks the row 'done'.
+ *
+ * Calls queue-drain after step 1's enqueue. Verifies the assertion is now in
+ * the assertions table and the queue row is marked 'done'.
+ */
+async function qStep2_drainWritesAssertionMarksDone(qDb, qProjectId, qProjectDir) {
+  const label = 'queue-drain: writes assertion, marks queue row done';
+  try {
+    // Run queue-drain.
+    const r = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'queue-drain'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: qDb, PROJECT_ROOT: qProjectDir },
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+
+    if (r.status !== 0) {
+      qFail(2, label, `queue-drain exited ${r.status}: ${((r.stderr || '') + (r.stdout || '')).slice(0, 300)}`);
+      return false;
+    }
+
+    const out = r.stdout || '';
+    if (!out.includes('[done]')) {
+      qFail(2, label, `queue-drain output does not contain "[done]": ${out.slice(0, 300)}`);
+      return false;
+    }
+
+    // Verify: at least one assertion now in DB (Q_SUBJ / is_status).
+    const db = await pgConnect(qDb);
+    const { rows: assRows } = await db.query(
+      `SELECT predicate, object FROM assertions WHERE project_id = $1 AND subject = 'Q_SUBJ'`,
+      [qProjectId]
+    );
+    // Verify: queue row is marked 'done'.
+    const { rows: qRows } = await db.query(
+      `SELECT status FROM extraction_queue WHERE project_id = $1 ORDER BY id DESC LIMIT 1`,
+      [qProjectId]
+    );
+    await db.end();
+
+    if (assRows.length === 0) {
+      qFail(2, label, 'Q_SUBJ assertion not found in assertions table after queue-drain');
+      return false;
+    }
+    if (qRows.length === 0 || qRows[0].status !== 'done') {
+      qFail(2, label, `queue row not marked 'done' (status=${qRows.length > 0 ? qRows[0].status : 'not found'})`);
+      return false;
+    }
+
+    qPass(2, label);
+    return true;
+  } catch (err) {
+    qFail(2, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * QUEUE 3/4: Out-of-vocab predicate in strict mode is excluded with a stderr line.
+ *
+ * Sets predicate_registry_mode='strict', enqueues a payload with one bad predicate
+ * and one good predicate, drains, verifies: bad assertion NOT written, good assertion
+ * IS written, stderr contains skip message.
+ */
+async function qStep3_strictModeSkipsBadPredicate(qDb, qProjectId, qProjectDir) {
+  const label = 'Strict mode: out-of-vocab predicate excluded at queue-drain; good predicate written';
+  try {
+    const db = await pgConnect(qDb);
+
+    // Set strict registry mode.
+    await db.query(
+      `INSERT INTO project_settings (project_id, key, value)
+       VALUES ($1, 'predicate_registry_mode', 'strict')
+       ON CONFLICT (project_id, key) DO UPDATE SET value = 'strict'`,
+      [qProjectId]
+    );
+    await db.end();
+
+    // Enqueue payload with one invalid and one valid predicate.
+    const payload = JSON.stringify({
+      tldr: 'queue step 3 strict test',
+      session_id: `queue-step3-${Date.now()}`,
+      assertions: [
+        { subject: 'Q_STRICT_BAD',  predicate: 'unknown_xyzzy_pred', object: 'bad_obj',  confidence: 5, source: 'user_stated' },
+        { subject: 'Q_STRICT_GOOD', predicate: 'prefers',            object: 'good_obj', confidence: 6, source: 'user_stated' },
+      ],
+    });
+
+    const closeR = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'close', '--json', '-'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: qDb, PROJECT_ROOT: qProjectDir },
+        input:    payload,
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+
+    if (closeR.status !== 0) {
+      qFail(3, label, `cmdClose (enqueue) exited ${closeR.status}: ${((closeR.stderr || '') + (closeR.stdout || '')).slice(0, 300)}`);
+      return false;
+    }
+
+    // Drain the queue.
+    const drainR = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'queue-drain'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: qDb, PROJECT_ROOT: qProjectDir },
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+
+    // queue-drain may exit non-zero if it marks a row as 'error' (strict predicate rejection
+    // causes write to succeed with filtered payload; this is not an error row).
+    // We check assertions table directly.
+    const drainStderr = drainR.stderr || '';
+
+    // Verify bad predicate was noted in stderr (either at enqueue or drain time).
+    const combinedStderr = (closeR.stderr || '') + drainStderr;
+    if (!combinedStderr.includes('unknown_xyzzy_pred')) {
+      qFail(3, label, `expected stderr mention of "unknown_xyzzy_pred"; got: ${combinedStderr.slice(0, 400)}`);
+      return false;
+    }
+
+    // Verify: good assertion written, bad assertion not written.
+    const db2 = await pgConnect(qDb);
+    const { rows: goodRows } = await db2.query(
+      `SELECT 1 FROM assertions WHERE project_id = $1 AND subject = 'Q_STRICT_GOOD'`,
+      [qProjectId]
+    );
+    const { rows: badRows } = await db2.query(
+      `SELECT 1 FROM assertions WHERE project_id = $1 AND subject = 'Q_STRICT_BAD'`,
+      [qProjectId]
+    );
+    await db2.end();
+
+    if (goodRows.length === 0) {
+      qFail(3, label, 'Q_STRICT_GOOD assertion not found in DB — good predicate was incorrectly excluded');
+      return false;
+    }
+    if (badRows.length > 0) {
+      qFail(3, label, 'Q_STRICT_BAD assertion found in DB — bad predicate was not excluded in strict mode');
+      return false;
+    }
+
+    qPass(3, label);
+    return true;
+  } catch (err) {
+    qFail(3, label, err.message);
+    return false;
+  }
+}
+
+/**
+ * QUEUE 4/4: Permissive mode keeps unknown predicate with a warning; sync default path
+ * (async off) still writes directly (non-regression).
+ *
+ * Sub-test A: Set predicate_registry_mode='permissive', enqueue payload with unknown
+ *   predicate, drain — unknown predicate IS written, stderr has warning.
+ * Sub-test B: Set extraction_async_enabled='false' (default), run cmdClose with
+ *   a known predicate — assertion is written directly (no queue row added).
+ */
+async function qStep4_permissiveAndSyncNonRegression(qDb, qProjectId, qProjectDir) {
+  const label = 'Permissive keeps unknown predicate with warning; sync default path writes directly (non-regression)';
+  try {
+    const db = await pgConnect(qDb);
+
+    // Sub-test A: permissive mode
+    await db.query(
+      `INSERT INTO project_settings (project_id, key, value)
+       VALUES ($1, 'predicate_registry_mode', 'permissive')
+       ON CONFLICT (project_id, key) DO UPDATE SET value = 'permissive'`,
+      [qProjectId]
+    );
+    // Keep extraction_async_enabled='true' from step 1.
+    await db.end();
+
+    const payloadA = JSON.stringify({
+      tldr: 'queue step 4a permissive test',
+      session_id: `queue-step4a-${Date.now()}`,
+      assertions: [
+        { subject: 'Q_PERM_SUBJ', predicate: 'unknown_perm_pred', object: 'perm_obj', confidence: 5, source: 'user_stated' },
+      ],
+    });
+
+    const closeA = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'close', '--json', '-'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: qDb, PROJECT_ROOT: qProjectDir },
+        input:    payloadA,
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+
+    if (closeA.status !== 0) {
+      qFail(4, label, `sub-A cmdClose exited ${closeA.status}: ${((closeA.stderr || '') + (closeA.stdout || '')).slice(0, 300)}`);
+      return false;
+    }
+
+    // Drain.
+    spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'queue-drain'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: qDb, PROJECT_ROOT: qProjectDir },
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+
+    // Verify unknown predicate was written (permissive).
+    const db2 = await pgConnect(qDb);
+    const { rows: permRows } = await db2.query(
+      `SELECT 1 FROM assertions WHERE project_id = $1 AND subject = 'Q_PERM_SUBJ' AND predicate = 'unknown_perm_pred'`,
+      [qProjectId]
+    );
+    if (permRows.length === 0) {
+      await db2.end();
+      qFail(4, label, 'Sub-A: Q_PERM_SUBJ assertion with unknown_perm_pred not found — permissive should keep it');
+      return false;
+    }
+
+    // Verify warning appeared in stderr.
+    const stderrA = (closeA.stderr || '');
+    if (!stderrA.includes('unknown_perm_pred')) {
+      await db2.end();
+      qFail(4, label, `Sub-A: expected stderr warning for "unknown_perm_pred"; got: ${stderrA.slice(0, 300)}`);
+      return false;
+    }
+
+    // Sub-test B: disable async mode; run cmdClose synchronously; verify no new queue row.
+    await db2.query(
+      `INSERT INTO project_settings (project_id, key, value)
+       VALUES ($1, 'extraction_async_enabled', 'false')
+       ON CONFLICT (project_id, key) DO UPDATE SET value = 'false'`,
+      [qProjectId]
+    );
+
+    const { rows: qBefore } = await db2.query(
+      `SELECT COUNT(*) AS n FROM extraction_queue WHERE project_id = $1 AND status = 'pending'`,
+      [qProjectId]
+    );
+    const qPendingBefore = parseInt(qBefore[0].n, 10);
+
+    const { rows: assBefore } = await db2.query(
+      `SELECT COUNT(*) AS n FROM assertions WHERE project_id = $1`,
+      [qProjectId]
+    );
+    const assCountBefore = parseInt(assBefore[0].n, 10);
+    await db2.end();
+
+    const payloadB = JSON.stringify({
+      tldr: 'queue step 4b sync non-regression',
+      session_id: `queue-step4b-${Date.now()}`,
+      assertions: [
+        { subject: 'Q_SYNC_NOREG', predicate: 'chose', object: 'sync_write', confidence: 8, source: 'user_stated' },
+      ],
+    });
+
+    const closeB = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'close', '--json', '-'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: qDb, PROJECT_ROOT: qProjectDir },
+        input:    payloadB,
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+
+    if (closeB.status !== 0) {
+      qFail(4, label, `sub-B cmdClose exited ${closeB.status}: ${((closeB.stderr || '') + (closeB.stdout || '')).slice(0, 300)}`);
+      return false;
+    }
+
+    // Verify no new pending queue row was added.
+    const db3 = await pgConnect(qDb);
+    const { rows: qAfter } = await db3.query(
+      `SELECT COUNT(*) AS n FROM extraction_queue WHERE project_id = $1 AND status = 'pending'`,
+      [qProjectId]
+    );
+    const qPendingAfter = parseInt(qAfter[0].n, 10);
+
+    // Verify assertion was written directly.
+    const { rows: assAfter } = await db3.query(
+      `SELECT 1 FROM assertions WHERE project_id = $1 AND subject = 'Q_SYNC_NOREG'`,
+      [qProjectId]
+    );
+    await db3.end();
+
+    if (qPendingAfter !== qPendingBefore) {
+      qFail(4, label, `Sub-B: pending queue rows changed from ${qPendingBefore} to ${qPendingAfter} — sync path should not enqueue`);
+      return false;
+    }
+
+    if (assAfter.length === 0) {
+      qFail(4, label, 'Sub-B: Q_SYNC_NOREG assertion not found in DB — sync default path not writing directly');
+      return false;
+    }
+
+    qPass(4, label);
+    return true;
+  } catch (err) {
+    qFail(4, label, err.message);
+    return false;
+  }
+}
+
+async function runQueueSection() {
+  console.log(`\n=== QUEUE SECTION (${Q_TOTAL} steps) ===`);
+  console.log('smoketest-handoff queue: async enqueue, queue-drain, strict-mode exclusion, permissive+non-regression');
+  console.log('(All steps pass without Python or Ollama; Postgres required)');
+  console.log('');
+
+  const Q_TS         = Date.now();
+  const Q_DB         = `claude_memory_queue_${Q_TS}`;
+  const Q_PROJ_DIR   = path.join(os.tmpdir(), `handoff_queue_${Q_TS}`);
+  const Q_PROJECT_ID = encodeCwd(Q_PROJ_DIR);
+
+  try {
+    await createSmokeDb(Q_DB, Q_PROJ_DIR);
+
+    // Write a minimal CLAUDE.md so init can run cleanly.
+    const qClaudeMd = path.join(Q_PROJ_DIR, 'CLAUDE.md');
+    fs.writeFileSync(qClaudeMd, '# queue-test\n\n## Durable facts\n- (none)\n', 'utf8');
+
+    // Run init so all base tables (including extraction_queue) exist.
+    const initR = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'init', '-y'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: Q_DB, PROJECT_ROOT: Q_PROJ_DIR },
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+    if (initR.status !== 0) {
+      console.log('[QUEUE] DB init failed — skipping remaining steps');
+      console.log(initR.stderr || initR.stdout || '');
+      qFailed += Q_TOTAL;
+      return;
+    }
+    console.log(`[QUEUE] DB init OK (${Q_DB})`);
+
+    // Verify extraction_queue table exists after init.
+    const initDb = await pgConnect(Q_DB);
+    const { rows: tblRows } = await initDb.query(
+      `SELECT 1 FROM information_schema.tables
+       WHERE table_schema = 'public' AND table_name = 'extraction_queue'`
+    );
+    await initDb.end();
+
+    if (tblRows.length === 0) {
+      console.log('[QUEUE] FAIL: extraction_queue table not found after init — aborting queue section');
+      qFailed += Q_TOTAL;
+      return;
+    }
+    console.log('[QUEUE] extraction_queue table confirmed');
+
+    // Create retrieval_events table (no pgvector in smoketest DB).
+    try {
+      await createRetrievalEventsTable(Q_DB);
+    } catch (_) { /* non-fatal */ }
+
+    // Run all 4 queue steps sequentially (each builds on prior state).
+    await qStep1_asyncEnqueueNoDirectWrite(Q_DB, Q_PROJECT_ID, Q_PROJ_DIR);
+    await qStep2_drainWritesAssertionMarksDone(Q_DB, Q_PROJECT_ID, Q_PROJ_DIR);
+    await qStep3_strictModeSkipsBadPredicate(Q_DB, Q_PROJECT_ID, Q_PROJ_DIR);
+    await qStep4_permissiveAndSyncNonRegression(Q_DB, Q_PROJECT_ID, Q_PROJ_DIR);
+
+  } catch (err) {
+    console.log(`[QUEUE] Unexpected error: ${err.message}`);
+    // Any unhandled error means the remaining steps did not run.
+  } finally {
+    const Q_HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', Q_PROJECT_ID, 'handoff.md');
+    await dropSmokeDb(Q_DB, Q_PROJ_DIR, Q_HANDOFF_PATH).catch(() => {});
+  }
+}
+
 async function runRegistrySection() {
   console.log(`\n=== REGISTRY SECTION (${RG_TOTAL} steps) ===`);
   console.log('smoketest-handoff registry: loadRegistry, cardinalityOf, classifyPredicate, recognizedPredicates, write-path non-regression');
@@ -4680,6 +5183,9 @@ async function main() {
   if (SECTION === 'registry' || SECTION === 'all') {
     await runRegistrySection();
   }
+  if (SECTION === 'queue' || SECTION === 'all') {
+    await runQueueSection();
+  }
 
   console.log('');
 
@@ -4693,12 +5199,13 @@ async function main() {
   const c2Total  = c2Passed + c2Failed;
   const c3Total  = c3Passed + c3Failed;
   const rgTotal  = rgPassed + rgFailed;
-  const totalPass = lcPassed + hkPassed + hdPassed + w2Passed + w3Passed + w4Passed + c1Passed + c2Passed + c3Passed + rgPassed;
-  const totalAll  = lcTotal  + hkTotal  + hdTotal  + w2Total  + w3Total  + w4Total  + c1Total  + c2Total  + c3Total  + rgTotal;
+  const qTotal   = qPassed  + qFailed;
+  const totalPass = lcPassed + hkPassed + hdPassed + w2Passed + w3Passed + w4Passed + c1Passed + c2Passed + c3Passed + rgPassed + qPassed;
+  const totalAll  = lcTotal  + hkTotal  + hdTotal  + w2Total  + w3Total  + w4Total  + c1Total  + c2Total  + c3Total  + rgTotal  + qTotal;
   const totalSkip = lcSkipped + hkSkipped + hdSkipped + w2Skipped + w3Skipped + w4Skipped + c1Skipped + c2Skipped + c3Skipped;
 
   if (SECTION === 'all') {
-    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal}, hardening: ${hdPassed}/${hdTotal}, w2: ${w2Passed}/${w2Total}, w3: ${w3Passed}/${w3Total}, w4: ${w4Passed}/${w4Total}, c1: ${c1Passed}/${c1Total}, c2: ${c2Passed}/${c2Total}, c3: ${c3Passed}/${c3Total}, registry: ${rgPassed}/${rgTotal})`);
+    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal}, hardening: ${hdPassed}/${hdTotal}, w2: ${w2Passed}/${w2Total}, w3: ${w3Passed}/${w3Total}, w4: ${w4Passed}/${w4Total}, c1: ${c1Passed}/${c1Total}, c2: ${c2Passed}/${c2Total}, c3: ${c3Passed}/${c3Total}, registry: ${rgPassed}/${rgTotal}, queue: ${qPassed}/${qTotal})`);
   } else if (SECTION === 'lifecycle') {
     console.log(`smoketest: ${lcPassed}/${lcTotal} passed, ${lcSkipped} skipped (lifecycle only)`);
   } else if (SECTION === 'hooks') {
@@ -4717,11 +5224,13 @@ async function main() {
     console.log(`smoketest: ${c3Passed}/${c3Total} passed, ${c3Skipped} skipped (c3 only)`);
   } else if (SECTION === 'registry') {
     console.log(`smoketest: ${rgPassed}/${rgTotal} passed (registry only)`);
+  } else if (SECTION === 'queue') {
+    console.log(`smoketest: ${qPassed}/${qTotal} passed (queue only)`);
   } else {
     console.log(`smoketest: ${hdPassed}/${hdTotal} passed, ${hdSkipped} skipped (hardening only)`);
   }
 
-  if (lcFailed + hkFailed + hdFailed + w2Failed + w3Failed + w4Failed + c1Failed + c2Failed + c3Failed + rgFailed > 0) process.exitCode = 1;
+  if (lcFailed + hkFailed + hdFailed + w2Failed + w3Failed + w4Failed + c1Failed + c2Failed + c3Failed + rgFailed + qFailed > 0) process.exitCode = 1;
 }
 
 main().catch((err) => {
