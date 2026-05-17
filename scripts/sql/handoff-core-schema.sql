@@ -19,7 +19,7 @@
 
 -- ============================================================================
 -- ENTITIES — typed named entities extracted at /handoff:close.
--- Writer: Claude (session-end extraction) and manual writes by the Principal.
+-- Writer: Claude (session-end extraction) and manual writes by the maintainer.
 -- project_id = encoded_cwd; no DEFAULT — set by the writer.
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS entities (
@@ -100,7 +100,7 @@ CREATE INDEX IF NOT EXISTS assertions_confidence_idx
 
 -- ============================================================================
 -- EDGES — typed relationships between entities, extracted at /handoff:close.
--- Writer: Claude (session-end extraction) and manual writes by the Principal.
+-- Writer: Claude (session-end extraction) and manual writes by the maintainer.
 -- project_id = encoded_cwd; no DEFAULT — set by the writer.
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS edges (
