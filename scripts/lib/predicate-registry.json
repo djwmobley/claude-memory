@@ -1,14 +1,140 @@
 {
   "_meta": {
-    "registry_version": "1.0",
+    "registry_version": "1.1",
     "description": "Authoritative predicate-vocabulary registry. Each entry declares the canonical predicate string, its cardinality, a human-readable description, and the registry version when the entry was added. Shape: { _meta: {...}, entries: [ { predicate, cardinality, description, added_version } ] }."
   },
   "entries": [
+    {
+      "predicate": "accepted_grounds",
+      "cardinality": "1:N",
+      "description": "Rationale or grounds accepted in support of a decision or rule; multiple grounds may apply simultaneously",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "activated_by",
+      "cardinality": "1:N",
+      "description": "Trigger or condition that activates a component; multiple activators may be valid at once",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "added_via",
+      "cardinality": "1:1",
+      "description": "Mechanism by which a subject was added to the system",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "affirmed",
+      "cardinality": "1:1",
+      "description": "Current affirmation status of an assertion or rule",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "applied_in",
+      "cardinality": "1:N",
+      "description": "Context or scope in which a rule or pattern is applied; may apply in multiple contexts",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "applies",
+      "cardinality": "1:N",
+      "description": "Scope or entity to which a rule or constraint applies; may apply to multiple targets",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "are",
+      "cardinality": "1:N",
+      "description": "Plural identity or collective attribute assertion; multiple objects may be simultaneously asserted",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "are_safe_outside_claude-memory",
+      "cardinality": "1:1",
+      "description": "Safety classification flag indicating whether a set of operations is safe outside the claude-memory project boundary",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "behavior",
+      "cardinality": "1:N",
+      "description": "Behavioral characteristic of a component; multiple behaviors may be simultaneously described",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "blocked_by",
+      "cardinality": "1:N",
+      "description": "Blocker preventing a subject from progressing; a subject may have multiple simultaneous blockers",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "captures",
+      "cardinality": "1:N",
+      "description": "Information or event that a component captures or records; multiple captured items may apply",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "caught",
+      "cardinality": "1:N",
+      "description": "Issue, event, or defect caught by a mechanism; multiple caught items may apply",
+      "added_version": "1.1"
+    },
     {
       "predicate": "chose",
       "cardinality": "1:1",
       "description": "Recorded decision or choice made by a subject",
       "added_version": "1.0"
+    },
+    {
+      "predicate": "cmdDrop_refactor",
+      "cardinality": "1:1",
+      "description": "Refactor note associated with a cmdDrop operation",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "converged",
+      "cardinality": "1:1",
+      "description": "Convergence status: records that a process or review has reached a stable conclusion",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "covers",
+      "cardinality": "1:N",
+      "description": "Scope or topics that a document, test, or spec covers; multiple covered items may apply",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "created_by",
+      "cardinality": "1:1",
+      "description": "Author or mechanism that created a subject",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "currently_at",
+      "cardinality": "1:1",
+      "description": "Current position, value, or state of a subject at the time of assertion",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "default",
+      "cardinality": "1:1",
+      "description": "Default value or behavior for a configuration point or parameter",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "defaults_to",
+      "cardinality": "1:1",
+      "description": "Default value or target that a parameter or option resolves to when not explicitly set",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "defined_as",
+      "cardinality": "1:1",
+      "description": "Authoritative definition of a term or concept",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "delivered",
+      "cardinality": "1:N",
+      "description": "Work items or features delivered by a sprint, bundle, or session; multiple deliverables apply simultaneously",
+      "added_version": "1.1"
     },
     {
       "predicate": "depends_on",
@@ -17,16 +143,370 @@
       "added_version": "1.0"
     },
     {
+      "predicate": "elevates_to",
+      "cardinality": "1:1",
+      "description": "Target level or role to which a subject is elevated",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "enforces",
+      "cardinality": "1:N",
+      "description": "Policies or constraints that a component enforces; may enforce multiple simultaneously",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "evaluates_at",
+      "cardinality": "1:1",
+      "description": "The point in time or processing stage at which a check or rule evaluates",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "false_positive",
+      "cardinality": "1:1",
+      "description": "Classification flag indicating a result is a false positive",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "fires_on",
+      "cardinality": "1:N",
+      "description": "Events or conditions on which a hook or trigger fires; multiple events may apply",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "fixed_in",
+      "cardinality": "1:1",
+      "description": "Version, commit, or release in which a defect was fixed",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "found_bug",
+      "cardinality": "1:N",
+      "description": "Bug or defect found in a component; a subject may have multiple bugs recorded",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "git_quirk",
+      "cardinality": "1:N",
+      "description": "Git behavioral quirk or workaround note; multiple quirks may apply to a subject",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "has",
+      "cardinality": "1:N",
+      "description": "General possession or association; a subject may have multiple objects",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "has_artifact",
+      "cardinality": "1:N",
+      "description": "Artifact associated with a subject; multiple artifacts may exist simultaneously",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "has_defect",
+      "cardinality": "1:N",
+      "description": "Defect present in a component; a component may have multiple simultaneous defects",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "in_file",
+      "cardinality": "1:N",
+      "description": "File path where a subject is defined or located; a subject may be defined or present in multiple files simultaneously",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "includes",
+      "cardinality": "1:N",
+      "description": "Items included within a set or scope; multiple included items apply simultaneously",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "is",
+      "cardinality": "1:N",
+      "description": "Identity or classification assertion; a subject may simultaneously hold multiple valid class memberships or identity labels",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "is_at_commit",
+      "cardinality": "1:1",
+      "description": "Current git commit SHA or reference for a subject",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "is_authoritative_db",
+      "cardinality": "1:1",
+      "description": "The authoritative database for a given domain or subject",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "is_blocked_by",
+      "cardinality": "1:N",
+      "description": "Blocker that prevents a subject from completing; legacy synonym for blocked_by — normalize via migration",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "is_cleared_by",
+      "cardinality": "1:1",
+      "description": "Agent or action that clears a block or condition on a subject",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "is_constraint",
+      "cardinality": "1:N",
+      "description": "A constraint that applies to a subject or system behavior; multiple constraints may apply simultaneously",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "is_designed_for",
+      "cardinality": "1:N",
+      "description": "Design intent or target use-case for a component; multiple use-cases can be simultaneously valid",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "is_direction",
+      "cardinality": "1:1",
+      "description": "Strategic or architectural direction for a subject",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "is_exactly",
+      "cardinality": "1:1",
+      "description": "Precise value or identity for a subject, stronger than is; one exact value applies",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "is_model",
+      "cardinality": "1:1",
+      "description": "Current model (AI or data model) in use for a subject",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "is_not_applied_by",
+      "cardinality": "1:N",
+      "description": "Negation: identifies agents or mechanisms that do not apply a rule; multiple non-applying agents may be simultaneously valid",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "is_over_tuned_for",
+      "cardinality": "1:N",
+      "description": "Notes that a heuristic or mechanism is over-tuned for one or more patterns simultaneously; multiple over-tuning targets can be simultaneously valid",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "is_set_by",
+      "cardinality": "1:N",
+      "description": "Agent or mechanism that sets a value for a subject; multiple sources (e.g., env, config, CLI) can be simultaneously valid setters under a precedence model",
+      "added_version": "1.1"
+    },
+    {
       "predicate": "is_status",
       "cardinality": "1:1",
       "description": "Current status of a project entity",
       "added_version": "1.0"
     },
     {
+      "predicate": "is_value",
+      "cardinality": "1:1",
+      "description": "Current value of a configuration parameter or setting",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "listens_on",
+      "cardinality": "1:N",
+      "description": "Port or interface on which a service listens; a service may listen on multiple ports or interfaces simultaneously",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "location",
+      "cardinality": "1:N",
+      "description": "Filesystem or network location of a resource; a resource may exist at multiple simultaneous locations",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "matching_algorithm",
+      "cardinality": "1:1",
+      "description": "The matching algorithm specification or reference for a subject",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "means",
+      "cardinality": "1:N",
+      "description": "Definitional statement of what a term or concept means; a term may carry multiple simultaneously-valid meanings or definitional facets",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "moved_to",
+      "cardinality": "1:1",
+      "description": "Destination to which a subject has been moved or relocated",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "must_do",
+      "cardinality": "1:N",
+      "description": "Normative requirement; a subject may have multiple simultaneous obligations",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "must_mean",
+      "cardinality": "1:1",
+      "description": "Definitional constraint specifying what a term or phrase must mean in context",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "never_uses",
+      "cardinality": "1:N",
+      "description": "Prohibition; items a subject must never use; multiple prohibitions may apply",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "no_longer_includes",
+      "cardinality": "1:N",
+      "description": "Items that a set or scope no longer includes; multiple removed items may apply",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "now_include",
+      "cardinality": "1:N",
+      "description": "Items newly included in a scope after a change; multiple new inclusions may apply simultaneously",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "now_uses",
+      "cardinality": "1:1",
+      "description": "Current tool or mechanism in use after a transition, superseding prior usage; normalize legacy rows to uses via migration",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "orchestrates_only",
+      "cardinality": "1:1",
+      "description": "Constraint that a subject is limited to an orchestration role only",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "originate_from",
+      "cardinality": "1:N",
+      "description": "Source or origin from which a subject originates; a subject can originate from multiple upstream sources simultaneously",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "phase_ordering",
+      "cardinality": "1:1",
+      "description": "The ordering constraint for phases in a multi-phase operation",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "policy",
+      "cardinality": "1:N",
+      "description": "Policy statement applicable to a subject; multiple policies may apply simultaneously",
+      "added_version": "1.1"
+    },
+    {
       "predicate": "prefers",
       "cardinality": "1:1",
       "description": "Stated preference of a subject",
       "added_version": "1.0"
+    },
+    {
+      "predicate": "README_roadmap_scope",
+      "cardinality": "1:1",
+      "description": "Scope or framing of the roadmap section in a README",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "reads",
+      "cardinality": "1:N",
+      "description": "Resources or files that a component reads; multiple read sources may apply",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "requires",
+      "cardinality": "1:N",
+      "description": "Prerequisites or requirements for a subject; multiple requirements may apply simultaneously",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "returns",
+      "cardinality": "1:N",
+      "description": "Values or types returned by a function or query; multiple return types may apply",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "schema_migration_is",
+      "cardinality": "1:1",
+      "description": "Current state of a schema migration",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "shipped_at",
+      "cardinality": "1:1",
+      "description": "Specific commit or tag at which a feature was shipped",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "shipped_in",
+      "cardinality": "1:N",
+      "description": "Bundle, version, or PR in which a feature was shipped; a feature may ship across multiple bundles",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "should",
+      "cardinality": "1:N",
+      "description": "Normative guidance (weaker than must_do); multiple guidance items may apply simultaneously",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "skip_for",
+      "cardinality": "1:N",
+      "description": "Conditions or contexts under which a step or rule should be skipped; multiple skip conditions may apply",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "skipped",
+      "cardinality": "1:1",
+      "description": "Records that a process or step was skipped and why",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "takes_arg",
+      "cardinality": "1:N",
+      "description": "Arguments accepted by a command or function; multiple arguments may be accepted",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "trigger",
+      "cardinality": "1:N",
+      "description": "Event or condition that triggers a behavior; multiple triggers may apply simultaneously",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "usage",
+      "cardinality": "1:1",
+      "description": "Primary usage pattern or description for a command or component",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "user_chose",
+      "cardinality": "1:1",
+      "description": "Legacy alias for chose — user-stated choice; normalize to chose via migration",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "user_directed",
+      "cardinality": "1:1",
+      "description": "Flag or reference indicating that a behavior or setting was explicitly directed by the user",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "uses",
+      "cardinality": "1:N",
+      "description": "Tools, libraries, or components that a subject uses; multiple simultaneous uses are valid",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "uses_db",
+      "cardinality": "1:1",
+      "description": "Database that a component uses as its primary backing store",
+      "added_version": "1.1"
     }
   ]
 }
