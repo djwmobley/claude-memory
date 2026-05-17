@@ -204,6 +204,8 @@ CREATE TABLE IF NOT EXISTS project_settings (
 --   contract_evolution_failure_threshold default: '0.5'     (failure+irrelevant rate that triggers budget reduction)
 --   contract_evolution_budget_floor    default: '200'       (minimum token_budget for any kind; never reduced below this)
 --   contract_evolution_budget_step     default: '200'       (max budget change per evolution pass; gradual and bounded)
+--   extraction_async_enabled           default: 'false'     ('true'|'false' — async extraction queue; byte-identical to synchronous when 'false')
+--   predicate_registry_mode            default: 'permissive' ('permissive'|'strict' — unrecognized-predicate enforcement)
 
 
 -- ============================================================================
@@ -229,3 +231,34 @@ CREATE INDEX IF NOT EXISTS entity_communities_lookup_idx
   ON entity_communities (project_id, entity_name);
 CREATE INDEX IF NOT EXISTS entity_communities_run_idx
   ON entity_communities (project_id, run_id);
+
+
+-- ============================================================================
+-- EXTRACTION_QUEUE — async extraction payload queue (opt-in, default OFF).
+--
+-- When extraction_async_enabled='true' in project_settings, cmdClose and
+-- cmdCheckpoint INSERT one row here instead of writing assertions/entities/edges
+-- synchronously. The deterministic background worker (queue-drain subcommand)
+-- reads pending rows, calls writeExtraction() for each, and marks them done.
+--
+-- status lifecycle: 'pending' → 'done' (on success) | 'error' (on write failure).
+-- error_detail records the write-path error message for 'error' rows.
+-- source_ref is the session_id (or null) captured at enqueue time for traceability.
+--
+-- Portable (no pgvector). Idempotent (CREATE TABLE IF NOT EXISTS + IF NOT EXISTS
+-- index). Applied automatically by `/handoff:init`.
+-- project_id = encoded_cwd; no DEFAULT — set by the writer.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS extraction_queue (
+  id           SERIAL PRIMARY KEY,
+  project_id   TEXT NOT NULL,
+  payload      JSONB NOT NULL,
+  source_ref   TEXT,
+  status       TEXT NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending', 'done', 'error')),
+  enqueued_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  processed_at TIMESTAMPTZ,
+  error_detail TEXT
+);
+CREATE INDEX IF NOT EXISTS extraction_queue_project_status_idx
+  ON extraction_queue (project_id, status);

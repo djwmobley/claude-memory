@@ -22,6 +22,7 @@ const __startNs = process.hrtime.bigint();
  *   promote    <id>         Explicitly promote an assertion to CLAUDE.md durable facts.
  *   loader-load             Same inline load as resume; used directly or by tests.
  *   loader-hook             SessionStart hook entry point (outputs JSON to stdout).
+ *   queue-drain [--max=N]   Drain pending async extraction queue rows (background worker).
  *
  * Environment:
  *   PROJECT_ROOT            Override project root detection.
@@ -39,6 +40,7 @@ const readline = require('readline');
 const { loadConfig, connect, c, findProjectRoot } = require('./lib/shared');
 const { encodeCwd, getClaudeProjectDir }           = require('./lib/encoded-cwd');
 const { classifyPredicate }                        = require('./lib/predicate-registry');
+const { validatePayload }                          = require('./lib/payload-schema');
 
 process.on('exit', () => {
   const ms = Number(process.hrtime.bigint() - __startNs) / 1e6;
@@ -665,6 +667,13 @@ async function cmdInit(args) {
     contract_evolution_failure_threshold: '0.5', // failure+irrelevant rate that triggers budget reduction
     contract_evolution_budget_floor:  '200',   // minimum token_budget for any kind (never reduced below)
     contract_evolution_budget_step:   '200',   // max budget change per evolution pass (gradual, bounded)
+    // Async extraction queue (opt-in, default OFF — byte-identical to synchronous write when disabled).
+    // When 'true', cmdClose and cmdCheckpoint enqueue the payload for the deterministic
+    // background worker (queue-drain subcommand) instead of writing synchronously.
+    extraction_async_enabled:         'false',
+    // Predicate registry enforcement mode (default 'permissive' — unrecognized predicates
+    // are flagged via stderr warning but still written; 'strict' skips them).
+    predicate_registry_mode:          'permissive',
   };
   for (const [key, val] of Object.entries(defaults)) {
     await db.query(
@@ -1521,8 +1530,96 @@ async function cmdCheckpoint(args) {
     process.exit(1);
   }
 
-  const { entitiesWritten, assertionsWritten, edgesWritten } =
-    await writeExtraction(db, projectId, payload);
+  // ── Async extraction gate (opt-in, default OFF = synchronous as before) ──────
+  // When extraction_async_enabled='true', validate the payload and enqueue it for
+  // the deterministic background worker (queue-drain subcommand) instead of writing
+  // synchronously. Default ('false') is fully unchanged from prior behavior.
+  const asyncMode      = await getSetting(db, projectId, 'extraction_async_enabled', 'false');
+  const registryMode   = await getSetting(db, projectId, 'predicate_registry_mode', 'permissive');
+
+  let entitiesWritten   = 0;
+  let assertionsWritten = 0;
+  let edgesWritten      = 0;
+
+  if (asyncMode === 'true') {
+    // Async path: validate then enqueue; do NOT write assertions/entities/edges now.
+    const validation = validatePayload(payload, registryMode);
+
+    // Emit warnings to stderr (permissive mode).
+    for (const w of validation.warnings) {
+      process.stderr.write(`[handoff] checkpoint async: ${w}\n`);
+    }
+
+    // In strict mode, filter out assertions with errors; emit each skipped assertion to stderr.
+    // We skip-and-continue — never abort the checkpoint.
+    let payloadToEnqueue = payload;
+    if (registryMode === 'strict' && validation.errors.length > 0) {
+      for (const e of validation.errors) {
+        process.stderr.write(`[handoff] checkpoint async strict: skipping assertion — ${e}\n`);
+      }
+      // Build a filtered payload with only clean assertions.
+      const badIndices = new Set(
+        validation.errors
+          .map((e) => { const m = e.match(/^assertions\[(\d+)\]/); return m ? parseInt(m[1], 10) : null; })
+          .filter((n) => n !== null)
+      );
+      payloadToEnqueue = Object.assign({}, payload, {
+        assertions: (payload.assertions || []).filter((_, i) => !badIndices.has(i)),
+      });
+    }
+
+    const sourceRef = payload.session_id || null;
+    await db.query(
+      `INSERT INTO extraction_queue (project_id, payload, source_ref, status, enqueued_at)
+       VALUES ($1, $2::jsonb, $3, 'pending', now())`,
+      [projectId, JSON.stringify(payloadToEnqueue), sourceRef]
+    );
+
+    const assertionCount = (payloadToEnqueue.assertions || []).length;
+    const entityCount    = (payloadToEnqueue.entities   || []).length;
+    const edgeCount      = (payloadToEnqueue.edges      || []).length;
+    console.log(
+      `\n  queued for async extraction: ${entityCount} entities, ${assertionCount} assertions, ${edgeCount} edges`
+    );
+    if (validation.warnings.length > 0) {
+      console.log(`  predicate warnings: ${validation.warnings.length} (see stderr)`);
+    }
+    if (registryMode === 'strict' && validation.errors.length > 0) {
+      console.log(`  predicate strict-mode skips: ${validation.errors.length} (see stderr)`);
+    }
+
+    // Update handoff.md (reflects enqueue, not yet written to DB)
+    const stamp = new Date().toISOString();
+    writeHandoffMd(handoffPath, {
+      PROJECT_ID:          projectId,
+      LAST_CLOSE:          stamp,
+      CONTRACT:            payload.contract ? 'default' : (readHandoffFrontmatter(handoffPath).contract || 'default'),
+      ENTITIES_WRITTEN:    '0 (queued)',
+      ASSERTIONS_WRITTEN:  '0 (queued)',
+      EDGES_WRITTEN:       '0 (queued)',
+      PROJECT_NAME:        path.basename(root),
+      TLDR:                payload.tldr || '(checkpoint — async queued)',
+      OPEN_THREADS:        (payload.open_threads || []).map((t) => `- ${t}`).join('\n') || '- (none)',
+      QUICK_REFERENCES:    payload.quick_references || '(none)',
+    });
+
+    // Clear session_in_progress so the Stop hook treats this checkpoint as an explicit save.
+    await db.query(
+      `DELETE FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'`,
+      [projectId]
+    );
+
+    await db.end();
+
+    console.log(`\nDone: handoff:checkpoint — payload queued for async extraction (session marker cleared)`);
+    return;
+  }
+
+  // ── Synchronous path (default) — unchanged behavior ──────────────────────────
+  const extraction = await writeExtraction(db, projectId, payload);
+  entitiesWritten   = extraction.entitiesWritten;
+  assertionsWritten = extraction.assertionsWritten;
+  edgesWritten      = extraction.edgesWritten;
 
   // Update handoff.md
   const stamp = new Date().toISOString();
@@ -1580,6 +1677,92 @@ async function cmdClose(args) {
     process.exit(1);
   }
 
+  // ── Async extraction gate (opt-in, default OFF = synchronous as before) ──────
+  // When extraction_async_enabled='true', validate the payload and enqueue it for
+  // the deterministic background worker (queue-drain subcommand). The whole payload
+  // (entities + assertions + edges + contract) goes on the queue; the worker calls
+  // writeExtraction() so behavior is equivalent, just deferred.
+  // Default ('false') is fully unchanged from prior behavior.
+  const asyncMode    = await getSetting(db, projectId, 'extraction_async_enabled', 'false');
+  const registryMode = await getSetting(db, projectId, 'predicate_registry_mode', 'permissive');
+
+  if (asyncMode === 'true') {
+    // Async path: validate then enqueue; skip synchronous writeExtraction().
+    const validation = validatePayload(payload, registryMode);
+
+    // Emit warnings to stderr (permissive mode).
+    for (const w of validation.warnings) {
+      process.stderr.write(`[handoff] close async: ${w}\n`);
+    }
+
+    // Strict mode: filter out assertions that fail vocabulary check; skip-and-continue.
+    let payloadToEnqueue = payload;
+    if (registryMode === 'strict' && validation.errors.length > 0) {
+      for (const e of validation.errors) {
+        process.stderr.write(`[handoff] close async strict: skipping assertion — ${e}\n`);
+      }
+      const badIndices = new Set(
+        validation.errors
+          .map((e) => { const m = e.match(/^assertions\[(\d+)\]/); return m ? parseInt(m[1], 10) : null; })
+          .filter((n) => n !== null)
+      );
+      payloadToEnqueue = Object.assign({}, payload, {
+        assertions: (payload.assertions || []).filter((_, i) => !badIndices.has(i)),
+      });
+    }
+
+    const sourceRef = payload.session_id || null;
+    await db.query(
+      `INSERT INTO extraction_queue (project_id, payload, source_ref, status, enqueued_at)
+       VALUES ($1, $2::jsonb, $3, 'pending', now())`,
+      [projectId, JSON.stringify(payloadToEnqueue), sourceRef]
+    );
+
+    const assertionCount = (payloadToEnqueue.assertions || []).length;
+    const entityCount    = (payloadToEnqueue.entities   || []).length;
+    const edgeCount      = (payloadToEnqueue.edges      || []).length;
+    console.log(
+      `\n  queued for async extraction: ${entityCount} entities, ${assertionCount} assertions, ${edgeCount} edges`
+    );
+    if (validation.warnings.length > 0) {
+      console.log(`  predicate warnings: ${validation.warnings.length} (see stderr)`);
+    }
+    if (registryMode === 'strict' && validation.errors.length > 0) {
+      console.log(`  predicate strict-mode skips: ${validation.errors.length} (see stderr)`);
+    }
+
+    // Update handoff.md (reflects enqueue, not yet written to DB)
+    const queueStamp = new Date().toISOString();
+    writeHandoffMd(handoffPath, {
+      PROJECT_ID:          projectId,
+      LAST_CLOSE:          queueStamp,
+      CONTRACT:            'default',
+      ENTITIES_WRITTEN:    '0 (queued)',
+      ASSERTIONS_WRITTEN:  '0 (queued)',
+      EDGES_WRITTEN:       '0 (queued)',
+      PROJECT_NAME:        path.basename(root),
+      TLDR:                payload.tldr || '(closed — async queued)',
+      OPEN_THREADS:        (payload.open_threads || []).map((t) => `- ${t}`).join('\n') || '- (none)',
+      QUICK_REFERENCES:    payload.quick_references || '(none)',
+    });
+
+    // Clear session_in_progress marker
+    await db.query(
+      `DELETE FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'`,
+      [projectId]
+    );
+
+    await db.end();
+
+    console.log(`\n  entities:    0 (queued)`);
+    console.log(`  assertions:  0 (queued)`);
+    console.log(`  edges:       0 (queued)`);
+    console.log(`  contract:    queued`);
+    console.log(`\nDone: handoff:close — payload queued for async extraction, session marker cleared`);
+    return;
+  }
+
+  // ── Synchronous path (default) — unchanged behavior ──────────────────────────
   const { entitiesWritten, assertionsWritten, edgesWritten } =
     await writeExtraction(db, projectId, payload);
 
@@ -2272,23 +2455,166 @@ async function cmdPromote(args) {
   console.log(`\nDone: handoff:promote — assertion id=${assertionId} promoted to CLAUDE.md`);
 }
 
+// ── queue-drain ───────────────────────────────────────────────────────────────
+
+/**
+ * Deterministic background worker for the async extraction queue.
+ *
+ * Usage: node scripts/handoff.js queue-drain [--max=N]
+ *
+ * Selects pending rows from extraction_queue for the resolved project (oldest
+ * first, optional row limit via --max=N). For each row:
+ *   1. Re-runs validatePayload() as a defense-in-depth check.
+ *   2. Calls writeExtraction() with the stored payload.
+ *   3. Marks the row 'done' (processed_at = now()).
+ *   On write error: marks the row 'error' with error_detail and continues —
+ *   one bad row never blocks the queue.
+ *
+ * Pure script, deterministic, no model calls. Same input → same output every run.
+ */
+async function cmdQueueDrain(args) {
+  console.log('Running: handoff:queue-drain');
+
+  const projectId = resolveProjectId();
+
+  // Parse --max=N flag (optional)
+  const maxArg = args.find((a) => a.startsWith('--max='));
+  const maxRows = maxArg ? parseInt(maxArg.slice(6), 10) : null;
+  if (maxArg && (isNaN(maxRows) || maxRows < 1)) {
+    console.error(`queue-drain: invalid --max value "${maxArg.slice(6)}" — must be a positive integer`);
+    process.exit(2);
+  }
+
+  let db;
+  try {
+    db = await connectHandoff();
+  } catch (err) {
+    console.error(`DB connection failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  // Read the registry mode from project_settings (default permissive for defense-in-depth).
+  const registryMode = await getSetting(db, projectId, 'predicate_registry_mode', 'permissive');
+
+  // Select pending rows — oldest first (FIFO). Optional row limit.
+  let selectSql = `SELECT id, payload, source_ref FROM extraction_queue
+     WHERE project_id = $1 AND status = 'pending'
+     ORDER BY enqueued_at ASC`;
+  const selectParams = [projectId];
+  if (maxRows !== null) {
+    selectSql += ` LIMIT $2`;
+    selectParams.push(maxRows);
+  }
+
+  const { rows: pendingRows } = await db.query(selectSql, selectParams);
+
+  if (pendingRows.length === 0) {
+    console.log(`\n  No pending rows in extraction_queue for project ${projectId}.`);
+    await db.end();
+    console.log('\nDone: handoff:queue-drain — 0 rows processed');
+    return;
+  }
+
+  console.log(`\n  Found ${pendingRows.length} pending row(s). Processing...`);
+
+  let doneCount  = 0;
+  let errorCount = 0;
+
+  for (const row of pendingRows) {
+    const rowId = row.id;
+    const payload = row.payload;
+
+    // Defense-in-depth: re-validate the payload before writing.
+    // This catches any rows that were enqueued with a looser mode.
+    const validation = validatePayload(payload, registryMode);
+
+    // Emit warnings regardless of mode.
+    for (const w of validation.warnings) {
+      process.stderr.write(`[queue-drain] row ${rowId}: ${w}\n`);
+    }
+
+    // In strict mode, filter bad assertions before writing (skip-and-continue).
+    let payloadToWrite = payload;
+    if (registryMode === 'strict' && validation.errors.length > 0) {
+      for (const e of validation.errors) {
+        process.stderr.write(`[queue-drain] row ${rowId} strict: skipping — ${e}\n`);
+      }
+      const badIndices = new Set(
+        validation.errors
+          .map((e) => { const m = e.match(/^assertions\[(\d+)\]/); return m ? parseInt(m[1], 10) : null; })
+          .filter((n) => n !== null)
+      );
+      payloadToWrite = Object.assign({}, payload, {
+        assertions: (payload.assertions || []).filter((_, i) => !badIndices.has(i)),
+      });
+    }
+
+    try {
+      const { entitiesWritten, assertionsWritten, edgesWritten } =
+        await writeExtraction(db, projectId, payloadToWrite);
+
+      // Mark done.
+      await db.query(
+        `UPDATE extraction_queue
+         SET status = 'done', processed_at = now()
+         WHERE id = $1`,
+        [rowId]
+      );
+
+      const skipCount = (payload.assertions || []).length - (payloadToWrite.assertions || []).length;
+      const skipNote  = skipCount > 0 ? ` (${skipCount} predicate-rejected)` : '';
+      console.log(
+        `  [done] row ${rowId} (source=${row.source_ref || 'null'}): ` +
+        `${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written${skipNote}`
+      );
+      doneCount++;
+    } catch (writeErr) {
+      // Mark error; do not rethrow — one bad row never blocks the queue.
+      const detail = writeErr.message.slice(0, 500);
+      try {
+        await db.query(
+          `UPDATE extraction_queue
+           SET status = 'error', processed_at = now(), error_detail = $2
+           WHERE id = $1`,
+          [rowId, detail]
+        );
+      } catch (markErr) {
+        process.stderr.write(`[queue-drain] row ${rowId}: failed to mark error row: ${markErr.message}\n`);
+      }
+      process.stderr.write(`[queue-drain] row ${rowId} WRITE ERROR: ${detail}\n`);
+      errorCount++;
+    }
+  }
+
+  await db.end();
+
+  console.log(`\n  Summary: ${doneCount} done, ${errorCount} error(s) out of ${pendingRows.length} processed`);
+  console.log(`\nDone: handoff:queue-drain — ${doneCount}/${pendingRows.length} rows written`);
+
+  // Non-zero exit if any errors occurred, so callers can detect partial failures.
+  if (errorCount > 0) {
+    process.exitCode = 1;
+  }
+}
+
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
 
 async function main() {
   const [, , sub, ...rest] = process.argv;
 
   const subcommands = {
-    init:           () => cmdInit(rest),
-    status:         () => cmdStatus(),
-    resume:         () => cmdResume(),
-    'loader-load':  () => cmdLoaderLoad(),
-    'loader-hook':  () => cmdLoaderHook(),
-    'loader-stop':  () => cmdLoaderStop(),
-    drop:           () => cmdDrop(),
-    checkpoint:     () => cmdCheckpoint(rest),
-    close:          () => cmdClose(rest),
-    purge:          () => cmdPurge(rest),
-    promote:        () => cmdPromote(rest),
+    init:            () => cmdInit(rest),
+    status:          () => cmdStatus(),
+    resume:          () => cmdResume(),
+    'loader-load':   () => cmdLoaderLoad(),
+    'loader-hook':   () => cmdLoaderHook(),
+    'loader-stop':   () => cmdLoaderStop(),
+    drop:            () => cmdDrop(),
+    checkpoint:      () => cmdCheckpoint(rest),
+    close:           () => cmdClose(rest),
+    purge:           () => cmdPurge(rest),
+    promote:         () => cmdPromote(rest),
+    'queue-drain':   () => cmdQueueDrain(rest),
   };
 
   if (!sub || !subcommands[sub]) {
