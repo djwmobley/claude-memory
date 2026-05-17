@@ -258,8 +258,8 @@
     },
     {
       "predicate": "is_designed_for",
-      "cardinality": "1:1",
-      "description": "Primary design intent or target use-case for a component",
+      "cardinality": "1:N",
+      "description": "Design intent or target use-case for a component; multiple use-cases can be simultaneously valid",
       "added_version": "1.1"
     },
     {
@@ -288,14 +288,14 @@
     },
     {
       "predicate": "is_over_tuned_for",
-      "cardinality": "1:1",
-      "description": "Notes that a heuristic or mechanism is over-tuned for a specific pattern or model",
+      "cardinality": "1:N",
+      "description": "Notes that a heuristic or mechanism is over-tuned for one or more patterns simultaneously; multiple over-tuning targets can be simultaneously valid",
       "added_version": "1.1"
     },
     {
       "predicate": "is_set_by",
-      "cardinality": "1:1",
-      "description": "Agent or mechanism that sets a value for a subject",
+      "cardinality": "1:N",
+      "description": "Agent or mechanism that sets a value for a subject; multiple sources (e.g., env, config, CLI) can be simultaneously valid setters under a precedence model",
       "added_version": "1.1"
     },
     {
@@ -384,8 +384,8 @@
     },
     {
       "predicate": "originate_from",
-      "cardinality": "1:1",
-      "description": "Source or origin from which a subject originates",
+      "cardinality": "1:N",
+      "description": "Source or origin from which a subject originates; a subject can originate from multiple upstream sources simultaneously",
       "added_version": "1.1"
     },
     {
