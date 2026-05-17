@@ -972,12 +972,16 @@ async function cmdLoaderLoad(opts = {}) {
         assertionsCount += rows.length;
         // C1: record retrieved assertion ids for attribution.
         for (const r of rows) retrievedAssertionIds.push(r.id);
-        // Bump reinforcement timestamps for every retrieved assertion (spec §7).
+        // 4C: Bump reinforcement timestamps ONLY for the rows actually returned
+        // (per-row precision instead of project-wide or subject-wide).  Using
+        // id = ANY($1::int[]) ensures last_reinforced reflects real retrieval
+        // frequency so decay-based eviction ranking is meaningful (spec §4C +
+        // OQ-2: AND suppressed=false prevents bumping suppressed history rows).
         await db.query(
           `UPDATE assertions SET last_reinforced = now(), last_retrieved = now()
-           WHERE project_id = $1
-             AND ($2::text IS NULL OR subject = $2)`,
-          [projectId, q.filter?.subject || null]
+           WHERE id = ANY($1::int[])
+             AND suppressed = false`,
+          [retrievedAssertionIds]
         );
       }
 
@@ -1008,6 +1012,40 @@ async function cmdLoaderLoad(opts = {}) {
         assertionsCount += rows.length;  // recency queries roll into assertionsCount
         // C1: record retrieved assertion ids for attribution.
         for (const r of rows) retrievedAssertionIds.push(r.id);
+      }
+
+    } else if (q.type === 'history' || q.kind === 'history') {
+      // 4E history kind: return suppressed rows for a given subject so the caller
+      // can inspect the superseded trail without paying the default context cost.
+      //
+      // Design decisions (per spec §7.3):
+      //   - Selects suppressed=true rows only (live rows are covered by assertion kind).
+      //   - NO bump: history retrieval must not reinforce suppressed rows (OQ-2).
+      //   - Opt-in via contract kind:'history' + filter.subject; never in default contract.
+      //   - created_at is included so the caller can reason about temporal ordering.
+      //
+      // I-2 guard: the default contract ({queries:[]}) contains no history query, so
+      // this branch is unreachable in a default session.  Including a history query in
+      // the contract is an explicit opt-in that must go through recordContractChange.
+      const historySubject = q.filter?.subject || null;
+      const { rows: hRows } = await db.query(
+        `SELECT id, subject, predicate, object, confidence, source, created_at
+         FROM assertions
+         WHERE project_id = $1
+           AND ($2::text IS NULL OR subject = $2)
+           AND suppressed = true
+         ORDER BY subject, predicate, created_at DESC
+         LIMIT 20`,
+        [projectId, historySubject]
+      );
+      if (hRows.length) {
+        const text = hRows.map((r) =>
+          `- [${r.source}|conf=${r.confidence}|suppressed|${r.created_at.toISOString()}] ${r.subject} ${r.predicate} ${r.object}`
+        ).join('\n');
+        sections.push(`### Assertion history (suppressed trail)\n${text}`);
+        tokensUsed      += Math.ceil(text.length / 4);
+        assertionsCount += hRows.length;
+        // No bump — history rows are read-only for decay purposes.
       }
 
     } else if (q.type === 'vector' || q.kind === 'vector') {
@@ -1332,6 +1370,92 @@ async function cmdDrop() {
 // ── extraction (shared by checkpoint and close) ───────────────────────────────
 
 /**
+ * 4A — Cardinality-aware write-time supersession helper.
+ *
+ * For each incoming assertion, execute the two-step suppress+INSERT within an
+ * explicit transaction so the pair is atomic (spec §4A mechanism-a):
+ *
+ *   1:1 predicate — suppress any existing live row for (project_id, subject, predicate).
+ *   1:N predicate — suppress only an exact duplicate (project_id, subject, predicate, object).
+ *   Unrecognized  — permissive fallback → treat as 1:N (classifyPredicate handles this).
+ *
+ * COHERENCE CONTRACT (OQ-5): the WHERE-key used here is the canonical supersession key.
+ * The 4D distillation migration script applies the same key directly; shared test fixtures
+ * enforce correctness of both paths.  The steady-state write path (this function) and the
+ * migration MUST NOT diverge in their key selection.
+ *
+ * @param {object} db            — pg Client
+ * @param {string} projectId     — encoded_cwd
+ * @param {object} ass           — assertion object: {subject, predicate, object, confidence, source}
+ * @param {string} sessionId     — session_id (may be null)
+ * @param {string} registryMode  — 'permissive'|'strict'
+ * @returns {boolean} true if the row was inserted; false if skipped (strict unrecognized)
+ */
+async function writeAssertionWithSupersession(db, projectId, ass, sessionId, registryMode) {
+  // Classify predicate cardinality.  strict throws for unrecognized; permissive returns 1:N.
+  let cardinality;
+  try {
+    const classification = classifyPredicate(ass.predicate, registryMode);
+    if (!classification.recognized && registryMode !== 'strict') {
+      process.stderr.write(
+        `[handoff] unrecognized predicate "${ass.predicate}" — registry permissive mode, treated 1:N (flag for registry extension)\n`
+      );
+    }
+    cardinality = classification.cardinality;
+  } catch (regErr) {
+    // strict mode: skip
+    process.stderr.write(
+      `[handoff] skipping assertion (predicate="${ass.predicate}"): ${regErr.message}\n`
+    );
+    return false;
+  }
+
+  const conf   = Math.min(10, Math.max(1, parseFloat(ass.confidence) || 5));
+  const source = ['user_stated', 'model_extracted', 'doc_quoted', 'retrieved_from_prior'].includes(ass.source)
+    ? ass.source : 'model_extracted';
+
+  // Wrap suppress+INSERT in an explicit transaction (atomicity requirement I-A mechanism-a).
+  await db.query('BEGIN');
+  try {
+    if (cardinality === '1:1') {
+      // Suppress any existing live row for this (project_id, subject, predicate) pair.
+      await db.query(
+        `UPDATE assertions SET suppressed = true
+         WHERE project_id = $1
+           AND subject    = $2
+           AND predicate  = $3
+           AND suppressed = false`,
+        [projectId, ass.subject, ass.predicate]
+      );
+    } else {
+      // 1:N: suppress only an exact (project_id, subject, predicate, object) duplicate.
+      await db.query(
+        `UPDATE assertions SET suppressed = true
+         WHERE project_id = $1
+           AND subject    = $2
+           AND predicate  = $3
+           AND object     = $4
+           AND suppressed = false`,
+        [projectId, ass.subject, ass.predicate, ass.object]
+      );
+    }
+
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, session_id, last_reinforced)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, now())`,
+      [projectId, ass.subject, ass.predicate, ass.object, conf, source, sessionId]
+    );
+
+    await db.query('COMMIT');
+  } catch (err) {
+    try { await db.query('ROLLBACK'); } catch (_) { /* ignore */ }
+    throw err;
+  }
+
+  return true;
+}
+
+/**
  * Write entities/assertions/edges from a JSON payload.
  * Returns { entitiesWritten, assertionsWritten, edgesWritten }.
  *
@@ -1367,45 +1491,18 @@ async function writeExtraction(db, projectId, payload) {
     entitiesWritten++;
   }
 
-  // Assertions — no unique constraint on assertions table; plain INSERT.
-  // Predicate-registry integration (non-regressive):
-  //   Read the mode once before the loop. Default is 'permissive' so that all
-  //   existing behavior is preserved — unrecognized predicates are still INSERTed;
-  //   only a warning is emitted to stderr. In 'strict' mode an unrecognized
-  //   predicate skips the INSERT and logs to stderr; the write continues.
+  // Assertions — 4A: cardinality-aware two-step supersession via writeAssertionWithSupersession.
+  // Each assertion is processed through suppress+INSERT within an explicit transaction
+  // (atomicity requirement I-A mechanism-a).  Predicate cardinality is looked up via
+  // classifyPredicate(predicate, registryMode); 1:1 predicates suppress any prior live row
+  // for the same (project_id, subject, predicate); 1:N predicates suppress only exact
+  // (project_id, subject, predicate, object) duplicates.
   const registryMode = await getSetting(db, projectId, 'predicate_registry_mode', 'permissive');
 
   for (const ass of (payload.assertions || [])) {
     if (!ass.subject || !ass.predicate || !ass.object) continue;
-
-    // Classify predicate against the registry before INSERT.
-    let skipAssertion = false;
-    try {
-      const classification = classifyPredicate(ass.predicate, registryMode);
-      if (!classification.recognized && registryMode !== 'strict') {
-        // Permissive: warn but continue with INSERT unchanged.
-        process.stderr.write(
-          `[handoff] unrecognized predicate "${ass.predicate}" — registry permissive mode, treated 1:N (flag for registry extension)\n`
-        );
-      }
-    } catch (regErr) {
-      // Strict mode: classifyPredicate throws for an unrecognized predicate.
-      process.stderr.write(
-        `[handoff] skipping assertion (predicate="${ass.predicate}"): ${regErr.message}\n`
-      );
-      skipAssertion = true;
-    }
-    if (skipAssertion) continue;
-
-    const conf   = Math.min(10, Math.max(1, parseFloat(ass.confidence) || 5));
-    const source = ['user_stated', 'model_extracted', 'doc_quoted', 'retrieved_from_prior'].includes(ass.source)
-      ? ass.source : 'model_extracted';
-    await db.query(
-      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, session_id, last_reinforced)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, now())`,
-      [projectId, ass.subject, ass.predicate, ass.object, conf, source, sessionId]
-    );
-    assertionsWritten++;
+    const inserted = await writeAssertionWithSupersession(db, projectId, ass, sessionId, registryMode);
+    if (inserted) assertionsWritten++;
   }
 
   // Edges
