@@ -210,8 +210,8 @@
     },
     {
       "predicate": "in_file",
-      "cardinality": "1:1",
-      "description": "File path where a subject is defined or located",
+      "cardinality": "1:N",
+      "description": "File path where a subject is defined or located; a subject may be defined or present in multiple files simultaneously",
       "added_version": "1.1"
     },
     {
@@ -222,8 +222,8 @@
     },
     {
       "predicate": "is",
-      "cardinality": "1:1",
-      "description": "Identity or classification assertion; a subject has exactly one current identity or class",
+      "cardinality": "1:N",
+      "description": "Identity or classification assertion; a subject may simultaneously hold multiple valid class memberships or identity labels",
       "added_version": "1.1"
     },
     {
@@ -252,8 +252,8 @@
     },
     {
       "predicate": "is_constraint",
-      "cardinality": "1:1",
-      "description": "A constraint that applies to a subject or system behavior",
+      "cardinality": "1:N",
+      "description": "A constraint that applies to a subject or system behavior; multiple constraints may apply simultaneously",
       "added_version": "1.1"
     },
     {
@@ -282,8 +282,8 @@
     },
     {
       "predicate": "is_not_applied_by",
-      "cardinality": "1:1",
-      "description": "Negation: identifies the agent or mechanism that does not apply a rule",
+      "cardinality": "1:N",
+      "description": "Negation: identifies agents or mechanisms that do not apply a rule; multiple non-applying agents may be simultaneously valid",
       "added_version": "1.1"
     },
     {
@@ -312,14 +312,14 @@
     },
     {
       "predicate": "listens_on",
-      "cardinality": "1:1",
-      "description": "Port or interface on which a service listens; a service has exactly one primary listening address",
+      "cardinality": "1:N",
+      "description": "Port or interface on which a service listens; a service may listen on multiple ports or interfaces simultaneously",
       "added_version": "1.1"
     },
     {
       "predicate": "location",
-      "cardinality": "1:1",
-      "description": "Filesystem or network location of a resource",
+      "cardinality": "1:N",
+      "description": "Filesystem or network location of a resource; a resource may exist at multiple simultaneous locations",
       "added_version": "1.1"
     },
     {
@@ -330,8 +330,8 @@
     },
     {
       "predicate": "means",
-      "cardinality": "1:1",
-      "description": "Definitional statement of what a term or concept means",
+      "cardinality": "1:N",
+      "description": "Definitional statement of what a term or concept means; a term may carry multiple simultaneously-valid meanings or definitional facets",
       "added_version": "1.1"
     },
     {
