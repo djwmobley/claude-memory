@@ -38,6 +38,7 @@ const readline = require('readline');
 
 const { loadConfig, connect, c, findProjectRoot } = require('./lib/shared');
 const { encodeCwd, getClaudeProjectDir }           = require('./lib/encoded-cwd');
+const { classifyPredicate }                        = require('./lib/predicate-registry');
 
 process.on('exit', () => {
   const ms = Number(process.hrtime.bigint() - __startNs) / 1e6;
@@ -1358,8 +1359,35 @@ async function writeExtraction(db, projectId, payload) {
   }
 
   // Assertions — no unique constraint on assertions table; plain INSERT.
+  // Predicate-registry integration (non-regressive):
+  //   Read the mode once before the loop. Default is 'permissive' so that all
+  //   existing behavior is preserved — unrecognized predicates are still INSERTed;
+  //   only a warning is emitted to stderr. In 'strict' mode an unrecognized
+  //   predicate skips the INSERT and logs to stderr; the write continues.
+  const registryMode = await getSetting(db, projectId, 'predicate_registry_mode', 'permissive');
+
   for (const ass of (payload.assertions || [])) {
     if (!ass.subject || !ass.predicate || !ass.object) continue;
+
+    // Classify predicate against the registry before INSERT.
+    let skipAssertion = false;
+    try {
+      const classification = classifyPredicate(ass.predicate, registryMode);
+      if (!classification.recognized && registryMode !== 'strict') {
+        // Permissive: warn but continue with INSERT unchanged.
+        process.stderr.write(
+          `[handoff] unrecognized predicate "${ass.predicate}" — registry permissive mode, treated 1:N (flag for registry extension)\n`
+        );
+      }
+    } catch (regErr) {
+      // Strict mode: classifyPredicate throws for an unrecognized predicate.
+      process.stderr.write(
+        `[handoff] skipping assertion (predicate="${ass.predicate}"): ${regErr.message}\n`
+      );
+      skipAssertion = true;
+    }
+    if (skipAssertion) continue;
+
     const conf   = Math.min(10, Math.max(1, parseFloat(ass.confidence) || 5));
     const source = ['user_stated', 'model_extracted', 'doc_quoted', 'retrieved_from_prior'].includes(ass.source)
       ? ass.source : 'model_extracted';
