@@ -59,6 +59,16 @@
 //   buildMultiPairInsert(table, col1, col2, col1Val, col2Values)
 //                                  — Returns { sql, params } for an INSERT of
 //                                    (col1Val, col2Values[0]), (col1Val, col2Values[1])...
+//   buildEpochSecondsDiffPredicate(col1, col2, operator, thresholdSeconds)
+//                                  — Returns a SQL predicate string (no params) for
+//                                    comparing (col1 - col2) in seconds vs a threshold.
+//                                    Postgres: EXTRACT(EPOCH FROM (col1-col2)) op threshold
+//                                    SQLite: (julianday(col1)-julianday(col2))*86400 op threshold
+//   buildWithinDaysPredicate(col, operator, paramOffset)
+//                                  — Returns a SQL predicate string for
+//                                    col <operator> now() - N days (N bound via param).
+//                                    Postgres: col op now() - ($N||' days')::interval
+//                                    SQLite: col op datetime('now','-'||?||' days')
 //   runInitPreflight(cfg, targetDb, autoCreate, root, printLine)
 //                                  — Runs dialect-specific pre-flight checks.
 //                                    printLine(result, stepDesc) mirrors printPreflightLine().
@@ -896,6 +906,42 @@ class SQLiteAdapter {
   }
 
   /**
+   * Build a SQL predicate for comparing the epoch-seconds difference between two
+   * timestamp columns against a fixed threshold.
+   *
+   * SQLite: `(julianday(col1) - julianday(col2)) * 86400 <operator> <thresholdSeconds>`
+   * (julianday returns fractional days; multiplied by 86400 gives seconds)
+   *
+   * Returns a plain SQL string (no params) — both columns and the threshold are
+   * embedded directly.  Caller must integrate this into a WHERE clause.
+   *
+   * @param {string} col1              — minuend column (e.g. 'last_reinforced')
+   * @param {string} col2              — subtrahend column (e.g. 'created_at')
+   * @param {string} operator          — comparison operator (e.g. '>', '>=', '<', '<=')
+   * @param {number} thresholdSeconds  — threshold in integer seconds (e.g. 86400)
+   * @returns {string}
+   */
+  buildEpochSecondsDiffPredicate(col1, col2, operator, thresholdSeconds) {
+    return `(julianday(${col1}) - julianday(${col2})) * 86400 ${operator} ${thresholdSeconds}`;
+  }
+
+  /**
+   * Build a SQL predicate for `col <operator> now() - N days` using a bound parameter.
+   *
+   * SQLite: `col <operator> datetime('now', '-' || ? || ' days')`
+   * The corresponding query param (the number of days as a string) must be bound
+   * at the position matching the `?` placeholder.
+   *
+   * @param {string} col                  — column name (e.g. 'retrieved_at')
+   * @param {string} operator             — comparison operator (e.g. '>=', '<')
+   * @param {number} _paramOffset         — ignored for SQLite (uses positional ?)
+   * @returns {string}
+   */
+  buildWithinDaysPredicate(col, operator, _paramOffset) {
+    return `${col} ${operator} datetime('now', '-' || ? || ' days')`;
+  }
+
+  /**
    * Build a SELECT for the manual-prune preview (dry-run).
    * Returns rows matching the AND-combined criteria, scoped to projectId.
    * Pinned rows are included in the result set but flagged — caller uses pinned
@@ -1252,6 +1298,42 @@ class PostgresAdapter {
               AND suppression_kind = 'downvoted_probation'`,
       params: [ids],
     };
+  }
+
+  /**
+   * Build a SQL predicate for comparing the epoch-seconds difference between two
+   * timestamp columns against a fixed threshold.
+   *
+   * Postgres: `EXTRACT(EPOCH FROM (col1 - col2)) <operator> <thresholdSeconds>`
+   * (EXTRACT(EPOCH FROM interval) returns seconds as a double precision value)
+   *
+   * Returns a plain SQL string (no params) — both columns and the threshold are
+   * embedded directly.  Caller must integrate this into a WHERE clause.
+   *
+   * @param {string} col1              — minuend column (e.g. 'last_reinforced')
+   * @param {string} col2              — subtrahend column (e.g. 'created_at')
+   * @param {string} operator          — comparison operator (e.g. '>', '>=', '<', '<=')
+   * @param {number} thresholdSeconds  — threshold in integer seconds (e.g. 86400)
+   * @returns {string}
+   */
+  buildEpochSecondsDiffPredicate(col1, col2, operator, thresholdSeconds) {
+    return `EXTRACT(EPOCH FROM (${col1} - ${col2})) ${operator} ${thresholdSeconds}`;
+  }
+
+  /**
+   * Build a SQL predicate for `col <operator> now() - N days` using a bound parameter.
+   *
+   * Postgres: `col <operator> now() - ($N || ' days')::interval`
+   * The corresponding query param (the number of days as a string) must be bound
+   * at position paramOffset in the query's param array.
+   *
+   * @param {string} col         — column name (e.g. 'retrieved_at')
+   * @param {string} operator    — comparison operator (e.g. '>=', '<')
+   * @param {number} paramOffset — 1-based position of the days param (e.g. 2 for $2)
+   * @returns {string}
+   */
+  buildWithinDaysPredicate(col, operator, paramOffset) {
+    return `${col} ${operator} now() - ($${paramOffset} || ' days')::interval`;
   }
 
   /**

@@ -34,6 +34,8 @@
  *   S8  — Abstraction invariant (static + counts): zero dialect conditionals outside composition root
  *   S9  — Do-not-touch constants: 86400 JS constants present and unchanged
  *   S10 — No-backfill guarantee (static): no UPDATE SET subject path exists in engine
+ *   S16 — Hole A fix: buildEpochSecondsDiffPredicate identical row selection on both backends
+ *   S17 — Hole B fix: buildWithinDaysPredicate (>=) identical row selection on both backends
  *
  * Usage:
  *   node scripts/test-both-backends.js
@@ -1351,11 +1353,20 @@ async function runS9() {
     pass(label3);
   } catch (err) { fail(label3, err.message); }
 
-  const label4 = 'handoff.js: timeout-decay constant ">86400" (seconds) is present (W1 path)';
+  const label4 = 'handoff.js: multi-session timeout gate uses buildEpochSecondsDiffPredicate port method with 86400 threshold (W1 path)';
   try {
-    // Line ~2000: AND EXTRACT(EPOCH FROM (last_reinforced - created_at)) > 86400
-    assertTrue(engineSrc.includes('> 86400'),
-      'handoff.js must contain > 86400 timeout-decay gate (W1 path)');
+    // After Hole A fix: the raw EXTRACT(EPOCH FROM (last_reinforced - created_at)) > 86400
+    // is now expressed through db.buildEpochSecondsDiffPredicate(..., 86400).
+    // Verify: (a) the port method is called, (b) the 86400 threshold is present,
+    // (c) the raw PG-only EXTRACT col-col form is no longer hardcoded in the engine.
+    assertTrue(engineSrc.includes('buildEpochSecondsDiffPredicate'),
+      'handoff.js must call db.buildEpochSecondsDiffPredicate() for W1 multi-session gate');
+    assertTrue(engineSrc.includes('86400'),
+      'handoff.js must pass 86400 threshold to buildEpochSecondsDiffPredicate (W1 path)');
+    // The old raw PG SQL fragment must no longer be present as a literal in the engine.
+    const holeARaw = /EXTRACT\s*\(\s*EPOCH\s+FROM\s+\(\s*last_reinforced\s*-\s*created_at\s*\)\s*\)/;
+    assertFalse(holeARaw.test(engineSrc),
+      'handoff.js must not contain raw EXTRACT(EPOCH FROM (col-col)) — moved to port method');
     pass(label4);
   } catch (err) { fail(label4, err.message); }
 }
@@ -4522,6 +4533,261 @@ async function runS15() {
   }
 }
 
+// ── S16: Hole A — buildEpochSecondsDiffPredicate both-backend adversarial ─────
+//
+// Verifies that the promotion-candidate query (CLAUDE.md multi-session gate) selects
+// identical rows on Postgres and SQLite when routed through the new port method.
+//
+// Adversarial-invariant: if the port method is reverted to the raw PG EXTRACT SQL,
+// SQLiteAdapter.query() will receive EXTRACT(EPOCH FROM (col - col)) which is NOT
+// matched by the rewriteForSQLite() regex (which only handles now()-col).  The
+// SQLite backend would then throw or silently return wrong results.  This test
+// catches that divergence because the expected row set is computed from known
+// datetime values — not from the query itself.
+
+async function runS16() {
+  console.log('\n=== S16: Hole A — buildEpochSecondsDiffPredicate: identical row selection on both backends ===');
+  console.log('Invariant: col-minus-col epoch predicate selects same rows under Postgres and SQLite.');
+
+  await bothBackends(
+    'S16.1: buildEpochSecondsDiffPredicate — rows clearly >1 day apart qualify; <1 day do not; boundary (=86400s) excluded',
+    async (db) => {
+      const PID = 's16-hole-a';
+      const isPostgres = db.dialect === 'postgres';
+      const suppFalse  = isPostgres ? 'false' : '0';
+
+      // Row A: last_reinforced is 2 days after created_at → difference = 172800s > 86400 → QUALIFIES.
+      await db.query(
+        `INSERT INTO assertions
+           (project_id, subject, predicate, object, confidence, source, suppressed,
+            created_at, last_reinforced)
+         VALUES ($1,'s16-a','knows','something',9,'user_stated',${suppFalse},
+                 $2,$3)`,
+        [PID, '2026-01-01 00:00:00', '2026-01-03 00:00:00']
+      );
+
+      // Row B: last_reinforced is 12 hours after created_at → difference = 43200s < 86400 → DOES NOT qualify.
+      await db.query(
+        `INSERT INTO assertions
+           (project_id, subject, predicate, object, confidence, source, suppressed,
+            created_at, last_reinforced)
+         VALUES ($1,'s16-b','knows','something',9,'user_stated',${suppFalse},
+                 $2,$3)`,
+        [PID, '2026-01-01 00:00:00', '2026-01-01 12:00:00']
+      );
+
+      // Row C: last_reinforced is exactly 1 day (86400s) after created_at → predicate is >, so DOES NOT qualify.
+      await db.query(
+        `INSERT INTO assertions
+           (project_id, subject, predicate, object, confidence, source, suppressed,
+            created_at, last_reinforced)
+         VALUES ($1,'s16-c','knows','something',9,'user_stated',${suppFalse},
+                 $2,$3)`,
+        [PID, '2026-01-01 00:00:00', '2026-01-02 00:00:00']
+      );
+
+      // Execute the promotion-candidate predicate via the port method — same logic as cmdClose.
+      const pred = db.buildEpochSecondsDiffPredicate('last_reinforced', 'created_at', '>', 86400);
+
+      const { rows } = await db.query(
+        `SELECT subject FROM assertions
+         WHERE project_id = $1
+           AND suppressed = ${suppFalse}
+           AND ${pred}
+         ORDER BY subject`,
+        [PID]
+      );
+
+      // Only Row A qualifies (>86400s gap). Row B (<86400s) and Row C (=86400s) must not appear.
+      assertEqual(rows.length, 1, `S16.1: expected exactly 1 qualifying row (got ${rows.length})`);
+      assertEqual(rows[0].subject, 's16-a', 'S16.1: qualifying row is s16-a (>1 day gap)');
+    }
+  );
+
+  await bothBackends(
+    'S16.2: buildEpochSecondsDiffPredicate — predicate string format is dialect-correct (no raw PG EXTRACT leaking to SQLite)',
+    async (db) => {
+      const pred = db.buildEpochSecondsDiffPredicate('last_reinforced', 'created_at', '>', 86400);
+
+      if (db.dialect === 'postgres') {
+        // Postgres: must use EXTRACT(EPOCH FROM (...))
+        assertTrue(pred.includes('EXTRACT'),
+          'S16.2 [PG]: predicate must contain EXTRACT');
+        assertTrue(pred.includes('EPOCH'),
+          'S16.2 [PG]: predicate must contain EPOCH');
+        assertTrue(pred.includes('last_reinforced - created_at'),
+          'S16.2 [PG]: predicate must reference col-col subtraction');
+      } else {
+        // SQLite: must use julianday — no EXTRACT allowed.
+        assertTrue(pred.includes('julianday'),
+          'S16.2 [SQLite]: predicate must use julianday (not EXTRACT)');
+        assertFalse(pred.includes('EXTRACT'),
+          'S16.2 [SQLite]: predicate must NOT contain raw EXTRACT (SQLite does not support it)');
+        assertTrue(pred.includes('86400'),
+          'S16.2 [SQLite]: predicate must multiply by 86400 to convert days to seconds');
+      }
+    }
+  );
+}
+
+// ── S17: Hole B — buildWithinDaysPredicate both-backend adversarial ───────────
+//
+// Verifies that the C3 contract-evolution retrieval window query (>= operator)
+// selects identical rows on Postgres and SQLite when routed through the new port method.
+//
+// Adversarial-invariant: if the port method is reverted to the raw PG SQL
+// `retrieved_at >= now() - ($N || ' days')::interval`, the rewriteIntervalSubtraction()
+// helper in SQLiteAdapter.query() only matches the `<` operator — so the `>=` case
+// slips through untranslated, producing invalid SQLite SQL.  This test catches that
+// because it asserts identical result counts from controlled datetime seeds.
+
+async function runS17() {
+  console.log('\n=== S17: Hole B — buildWithinDaysPredicate: identical row selection on both backends ===');
+  console.log('Invariant: >= interval predicate selects same rows under Postgres and SQLite.');
+
+  // Use a fixed window of 7 days relative to a reference date.
+  // All rows have hardcoded retrieved_at values relative to 'now'.
+  // We pick dates that are deterministically inside/outside/on-boundary of a 7-day window
+  // by using offsets relative to the current time at test execution.
+
+  await bothBackends(
+    'S17.1: buildWithinDaysPredicate(>=) — rows inside window qualify; outside do not; boundary included (>=)',
+    async (db) => {
+      const PID = 's17-hole-b';
+      const isPostgres = db.dialect === 'postgres';
+      const WINDOW_DAYS = 7;
+
+      // retrieval_events is in app-retrieval-events-schema.sql (not the core schema).
+      // Create a minimal version inline so both backends have the table for this test.
+      if (isPostgres) {
+        await db.query(`
+          CREATE TABLE IF NOT EXISTS retrieval_events (
+            id          SERIAL PRIMARY KEY,
+            project_id  TEXT NOT NULL,
+            query_text  TEXT NOT NULL,
+            retrieved_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            outcome     TEXT DEFAULT 'pending'
+                          CHECK (outcome IN ('pending','success','failure','irrelevant')),
+            session_id  TEXT
+          )
+        `);
+      } else {
+        await db.query(`
+          CREATE TABLE IF NOT EXISTS retrieval_events (
+            id          INTEGER PRIMARY KEY,
+            project_id  TEXT NOT NULL,
+            query_text  TEXT NOT NULL,
+            retrieved_at TEXT NOT NULL DEFAULT (datetime('now')),
+            outcome     TEXT DEFAULT 'pending',
+            session_id  TEXT
+          )
+        `);
+      }
+
+      // Derive timestamps relative to now using dialect-specific expressions.
+      // We insert three rows with retrieved_at offsets and then query with >= 7 days window.
+      //
+      // Row X: retrieved_at = now - 3 days  → inside window   → QUALIFIES
+      // Row Y: retrieved_at = now - 10 days → outside window  → DOES NOT qualify
+      // Row Z: retrieved_at = now - 7 days  → on boundary (>=) → QUALIFIES
+      //
+      // We generate the datetime values as literals so both backends get identical timestamps,
+      // avoiding divergence from "now" being called at slightly different times per row.
+
+      const nowMs  = Date.now();
+      const DAY_MS = 24 * 60 * 60 * 1000;
+
+      function toIso(ms) {
+        // Return an ISO 8601 string without timezone suffix — accepted by both PG and SQLite.
+        return new Date(ms).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
+      }
+
+      const tsInside   = toIso(nowMs - 3  * DAY_MS);  // 3 days ago
+      const tsOutside  = toIso(nowMs - 10 * DAY_MS);  // 10 days ago
+      const tsBoundary = toIso(nowMs - 7  * DAY_MS);  // exactly 7 days ago
+
+      await db.query(
+        `INSERT INTO retrieval_events (project_id, query_text, outcome, retrieved_at)
+         VALUES ($1,$2,$3,$4)`,
+        [PID, 'kind=s17-x', 'success', tsInside]
+      );
+      await db.query(
+        `INSERT INTO retrieval_events (project_id, query_text, outcome, retrieved_at)
+         VALUES ($1,$2,$3,$4)`,
+        [PID, 'kind=s17-y', 'success', tsOutside]
+      );
+      await db.query(
+        `INSERT INTO retrieval_events (project_id, query_text, outcome, retrieved_at)
+         VALUES ($1,$2,$3,$4)`,
+        [PID, 'kind=s17-z', 'success', tsBoundary]
+      );
+
+      // Execute the C3 window query via the port method — same logic as cmdClose C3 block.
+      // projectId = $1, windowDays = $2 (paramOffset=2 for Postgres).
+      const withinPred = db.buildWithinDaysPredicate('retrieved_at', '>=', 2);
+
+      const { rows } = await db.query(
+        `SELECT query_text FROM retrieval_events
+         WHERE project_id = $1
+           AND outcome IN ('success', 'failure', 'irrelevant')
+           AND ${withinPred}
+         ORDER BY query_text`,
+        [PID, String(WINDOW_DAYS)]
+      );
+
+      // Rows X (3 days ago) and Z (exactly 7 days ago, boundary-inclusive) must qualify.
+      // Row Y (10 days ago) must NOT qualify.
+      assertEqual(rows.length, 2,
+        `S17.1: expected 2 qualifying rows (inside + boundary), got ${rows.length}`);
+      const subjects = rows.map((r) => r.query_text).sort();
+      assertEqual(subjects[0], 'kind=s17-x', 'S17.1: inside-window row qualifies');
+      assertEqual(subjects[1], 'kind=s17-z', 'S17.1: boundary row qualifies (>= is inclusive)');
+    }
+  );
+
+  await bothBackends(
+    'S17.2: buildWithinDaysPredicate — predicate string format is dialect-correct (no raw PG interval leaking to SQLite)',
+    async (db) => {
+      const pred = db.buildWithinDaysPredicate('retrieved_at', '>=', 2);
+
+      if (db.dialect === 'postgres') {
+        // Postgres: must reference now() and ::interval cast syntax.
+        assertTrue(pred.includes('now()'),
+          'S17.2 [PG]: predicate must contain now()');
+        assertTrue(pred.includes("' days')::interval"),
+          "S17.2 [PG]: predicate must contain the ::interval cast");
+        assertTrue(pred.includes('$2'),
+          'S17.2 [PG]: predicate must use $2 placeholder (paramOffset=2)');
+        assertTrue(pred.startsWith('retrieved_at >='),
+          "S17.2 [PG]: predicate must start with 'retrieved_at >=' (operator preserved)");
+      } else {
+        // SQLite: must use datetime('now', ...) form — no ::interval allowed.
+        assertTrue(pred.includes("datetime('now'"),
+          "S17.2 [SQLite]: predicate must use datetime('now', ...) form");
+        assertFalse(pred.includes('::interval'),
+          'S17.2 [SQLite]: predicate must NOT contain ::interval cast');
+        assertFalse(pred.includes('now()'),
+          "S17.2 [SQLite]: predicate must NOT use bare now() — use datetime('now',...)");
+        assertTrue(pred.startsWith('retrieved_at >='),
+          "S17.2 [SQLite]: predicate must start with 'retrieved_at >=' (operator preserved)");
+      }
+    }
+  );
+
+  // Static check: the raw PG-only `>= now() - ($N || ' days')::interval` pattern
+  // must no longer appear literally in handoff.js (it is now behind the port method).
+  {
+    const label = 'S17.3 (static): raw `>= now() - ($N || \' days\')::interval` no longer literal in handoff.js';
+    try {
+      const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+      const holeBRaw  = /retrieved_at\s*>=\s*now\s*\(\s*\)\s*-\s*\(\s*\$\d+\s*\|\|\s*' days'\s*\)\s*::interval/;
+      assertFalse(holeBRaw.test(engineSrc),
+        'S17.3: handoff.js must not contain raw `>= now() - ($N || \' days\')::interval` — moved to port method');
+      pass(label);
+    } catch (err) { fail(label, err.message); }
+  }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 (async () => {
@@ -4554,6 +4820,8 @@ async function runS15() {
   await runS13();
   await runS14();
   await runS15();
+  await runS16();
+  await runS17();
 
   console.log('\n─── Results ──────────────────────────────────────');
   console.log(`PASS ${passed}  FAIL ${failed}  SKIP ${skipped}`);
