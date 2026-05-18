@@ -113,7 +113,7 @@ const W2_TOTAL = 3;
 const W3_TOTAL = 5;
 const W4_TOTAL = 6;
 const C1_TOTAL = 4;
-const C2_TOTAL = 4;
+const C2_TOTAL = 5;
 const C3_TOTAL = 5;
 const RG_TOTAL  = 7;
 const Q_TOTAL   = 4;
@@ -3601,9 +3601,157 @@ async function c2Step4_idempotency(c2Db, c2ProjectId, c2ProjectDir, testSession,
   }
 }
 
+/**
+ * C2 5/5: Pinned rows are NOT auto-downvoted by the C2 close-time feedback path.
+ *
+ * Inserts two assertions into the same negative-outcome session:
+ *   - pinnedAssertion (pinned = true)
+ *   - unpinnedAssertion (pinned = false)
+ * Both are attributed to a retrieval_event with outcome='failure' that produces a net
+ * delta well below DOWNVOTE_PROBATION_THRESHOLD (-1.5) — 4 failure events at -0.75
+ * each gives delta = -3.0, which crosses DOWNVOTE_TERMINAL_THRESHOLD.
+ * Runs cmdClose. Then asserts:
+ *   - pinnedAssertion: suppressed, suppression_kind, and invalid_at are UNCHANGED (still live).
+ *   - unpinnedAssertion: IS downvoted (suppressed=true, suppression_kind set, invalid_at set).
+ * This proves the pinned guard is what spares the pinned row, not that nothing downvoted at all.
+ */
+async function c2Step5_pinnedNotDownvoted(c2Db, c2ProjectId, c2ProjectDir) {
+  const label = 'Pinned row: NOT auto-downvoted by C2 close-time feedback; unpinned control IS downvoted';
+  try {
+    const db = await pgConnect(c2Db);
+
+    // Ensure feedback loop is enabled for this step.
+    await db.query(
+      `INSERT INTO project_settings (project_id, key, value)
+       VALUES ($1, 'feedback_loop_enabled', 'enabled')
+       ON CONFLICT (project_id, key) DO UPDATE SET value = 'enabled'`,
+      [c2ProjectId]
+    );
+
+    // Insert two assertions: one pinned, one not.
+    const { rows: aRows } = await db.query(
+      `INSERT INTO assertions
+         (project_id, subject, predicate, object, confidence, source, last_reinforced, outcome_bias, pinned)
+       VALUES ($1, 'C2_PINNED_SUBJECT',   'is', 'pinned_val',   7, 'user_stated', now(), 0, true),
+              ($1, 'C2_UNPINNED_SUBJECT', 'is', 'unpinned_val', 7, 'user_stated', now(), 0, false)
+       RETURNING id, subject`,
+      [c2ProjectId]
+    );
+    const pinnedAssertionId   = aRows.find((r) => r.subject === 'C2_PINNED_SUBJECT').id;
+    const unpinnedAssertionId = aRows.find((r) => r.subject === 'C2_UNPINNED_SUBJECT').id;
+
+    // Create a test session with 4 failure retrieval events for each assertion.
+    // 4 failures × -0.75 = -3.0 delta → crosses DOWNVOTE_TERMINAL_THRESHOLD.
+    const testSession5 = `c2-pinned-test-${Date.now()}`;
+    const evtInserts = [];
+    for (let i = 0; i < 4; i++) {
+      evtInserts.push(`($1, 'c2-pinned-query-${i}', $2, 'failure', now(), 'agent_self_report')`);
+    }
+    const { rows: evtRows } = await db.query(
+      `INSERT INTO retrieval_events (project_id, query_text, session_id, outcome, outcome_at, outcome_signal)
+       VALUES ${evtInserts.join(', ')}
+       RETURNING id`,
+      [c2ProjectId, testSession5]
+    );
+    const eventIds = evtRows.map((r) => r.id);
+
+    // Attribute both assertions to all 4 failure events.
+    const attrValues = [];
+    const attrParams = [];
+    let paramIdx = 1;
+    for (const eid of eventIds) {
+      attrValues.push(`($${paramIdx++}, $${paramIdx++})`);
+      attrParams.push(eid, pinnedAssertionId);
+      attrValues.push(`($${paramIdx++}, $${paramIdx++})`);
+      attrParams.push(eid, unpinnedAssertionId);
+    }
+    await db.query(
+      `INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES ${attrValues.join(', ')}`,
+      attrParams
+    );
+
+    // Set session_in_progress so cmdClose can resolve the session id.
+    await db.query(
+      `INSERT INTO project_settings (project_id, key, value)
+       VALUES ($1, 'session_in_progress', $2)
+       ON CONFLICT (project_id, key) DO UPDATE SET value = $2`,
+      [c2ProjectId, testSession5]
+    );
+    await db.end();
+
+    // Run cmdClose — triggers the C2 downvote path for both assertions.
+    const closePayload = JSON.stringify({ tldr: 'c2 pinned-exempt test close', session_id: testSession5 });
+    const r = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'close', '--json', '-'],
+      {
+        cwd:      PROJECT_ROOT,
+        env:      { ...process.env, HANDOFF_DB: c2Db, PROJECT_ROOT: c2ProjectDir },
+        input:    closePayload,
+        encoding: 'utf8',
+        timeout:  30000,
+      }
+    );
+    if (r.status !== 0) {
+      c2Fail(5, label, `cmdClose exited ${r.status}: ${((r.stderr || '') + (r.stdout || '')).slice(0, 400)}`);
+      return false;
+    }
+
+    // Read back the assertion state.
+    const db2 = await pgConnect(c2Db);
+    const { rows: stateRows } = await db2.query(
+      `SELECT id, subject, suppressed, suppression_kind, invalid_at FROM assertions WHERE id = ANY($1)`,
+      [[pinnedAssertionId, unpinnedAssertionId]]
+    );
+    await db2.end();
+
+    const pinnedRow   = stateRows.find((r) => r.id === pinnedAssertionId);
+    const unpinnedRow = stateRows.find((r) => r.id === unpinnedAssertionId);
+
+    if (!pinnedRow || !unpinnedRow) {
+      c2Fail(5, label, 'Could not find test assertions in DB after cmdClose');
+      return false;
+    }
+
+    // Assert: pinned row is UNCHANGED — still live.
+    if (pinnedRow.suppressed !== false) {
+      c2Fail(5, label, `pinned row unexpectedly suppressed (suppressed=${pinnedRow.suppressed})`);
+      return false;
+    }
+    if (pinnedRow.suppression_kind !== null) {
+      c2Fail(5, label, `pinned row suppression_kind should be NULL, got '${pinnedRow.suppression_kind}'`);
+      return false;
+    }
+    if (pinnedRow.invalid_at !== null) {
+      c2Fail(5, label, `pinned row invalid_at should be NULL, got '${pinnedRow.invalid_at}'`);
+      return false;
+    }
+
+    // Assert: unpinned control row IS downvoted (the guard is what spares the pinned row).
+    if (unpinnedRow.suppressed !== true) {
+      c2Fail(5, label, `unpinned control row was NOT downvoted (suppressed=${unpinnedRow.suppressed}) — pinned guard proof requires control to be downvoted`);
+      return false;
+    }
+    if (!unpinnedRow.suppression_kind) {
+      c2Fail(5, label, `unpinned control row has no suppression_kind after downvote`);
+      return false;
+    }
+    if (unpinnedRow.invalid_at === null) {
+      c2Fail(5, label, `unpinned control row invalid_at should be set after downvote, got NULL`);
+      return false;
+    }
+
+    c2Pass(5, label);
+    return true;
+  } catch (err) {
+    c2Fail(5, label, err.message);
+    return false;
+  }
+}
+
 async function runC2Section() {
   console.log(`\n=== C2 SECTION (${C2_TOTAL} steps) ===`);
-  console.log('smoketest-handoff C2: gate-off no-op, bias adjustment, ranking, idempotency');
+  console.log('smoketest-handoff C2: gate-off no-op, bias adjustment, ranking, idempotency, pinned-exempt');
   console.log('(All steps pass without Python or Ollama)');
   console.log('');
 
@@ -3662,6 +3810,9 @@ async function runC2Section() {
 
     // Step 4: idempotency — re-running close for the same session does not double-apply.
     await c2Step4_idempotency(C2_DB, C2_PROJECT_ID, C2_PROJ_DIR, testSession, successAssertionId, failureAssertionId);
+
+    // Step 5: pinned row is NOT auto-downvoted; unpinned control IS downvoted.
+    await c2Step5_pinnedNotDownvoted(C2_DB, C2_PROJECT_ID, C2_PROJ_DIR);
 
   } finally {
     const C2_HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', C2_PROJECT_ID, 'handoff.md');
@@ -5176,7 +5327,7 @@ async function colStep4_historyKind(colDb, colProjectId, colProjectDir) {
     const rResume = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'resume'], baseOpts);
     if (rResume.status !== 0) { colFail(4, label, `resume failed: ${(rResume.stderr || '').slice(0, 200)}`); return false; }
     const out = rResume.stdout || '';
-    if (!out.includes('Assertion history (suppressed trail)')) { colFail(4, label, 'history section header not found'); return false; }
+    if (!out.includes('Assertion history (suppressed/probation trail)')) { colFail(4, label, 'history section header not found'); return false; }
     if (!out.includes('phase-1')) { colFail(4, label, '"phase-1" not in history output'); return false; }
 
     // No-bump check: read last_reinforced of suppressed row before + after second resume.

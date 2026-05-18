@@ -909,9 +909,10 @@ async function cmdLoaderLoad(opts = {}) {
         assertionQueryParams = [projectId, q.filter?.subject || null];
       } else {
         // Gate OFF: rank by decayed score only (no outcome_bias term); no cutoff filter.
-        // I-6: when C2 is EXPLICITLY disabled, the gate-OFF SQL is byte-identical to the
-        // pre-C2 query except for the added invalid_at IS NULL predicate (PR-B bi-temporal
-        // extension — not a C2 change; present in both gate-ON and gate-OFF paths).
+        // I-6: when C2 is EXPLICITLY disabled, the gate-OFF SQL omits the outcome_bias term —
+        // that is the ONLY C2-driven difference vs gate-ON. The AND invalid_at IS NULL predicate
+        // is a bi-temporal extension (PR-B) present identically in both gate-ON and gate-OFF;
+        // it is NOT a C2 change.
         assertionQuerySql = `SELECT id, subject, predicate, object, confidence, source FROM assertions
          WHERE project_id = $1
            AND ($2::text IS NULL OR subject = $2)
