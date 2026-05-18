@@ -31,7 +31,7 @@ jobs:
           version: 9
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'pnpm'
           cache-dependency-path: scripts/pnpm-lock.yaml
       - name: Install dependencies
@@ -83,8 +83,7 @@ jobs:
         # Guards: resolveDialect, rewriteForSQLite, schema application, JSONB round-trip,
         # graph CTE, abstraction invariant (Section 13), PR-B bi-temporal columns,
         # canonicalization (Section 15), and manual prune (Section 16).
-        # Requires Node >= 22 for node:sqlite built-in; exits 0 with SKIP notice on Node 20.
-        # CI uses Node 20, so this step always exits 0 but still exercises all static/port checks.
+        # Requires Node >= 22 for node:sqlite built-in; CI now runs Node 22 so both halves gate.
         run: node scripts/test-sqlite-seam.js
       - name: Run both-backend behavioral parity + adversarial-invariant sweep
         # Runs the full adversarial-invariant sweep on BOTH Postgres and SQLite:
@@ -99,8 +98,7 @@ jobs:
         #   S9  Do-not-touch constants: 86400 JS constants intact (static)
         #   S10 No-backfill guarantee: no UPDATE SET subject in engine (static)
         # Postgres half always runs (service is available). SQLite half runs on Node >= 22.
-        # CI uses Node 20 — SQLite behavioral half is SKIPPED; Postgres half gates CI.
-        # When CI upgrades to Node 22+, both halves will gate automatically.
+        # CI now runs Node 22 — both halves gate; zero Node-version skips.
         run: node scripts/test-both-backends.js
         env:
           PGHOST: localhost
