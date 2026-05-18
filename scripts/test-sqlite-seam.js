@@ -1798,6 +1798,171 @@ async function runSection16() {
   });
 }
 
+// ── SECTION 17: cmdInit resilience — legacy-dupe corpus + clean-DB invariant ─
+//
+// Tests the PR-F fix: when pre-existing duplicate live 1:1 rows exist before the
+// integrity index creation attempt, the additive bi-temporal columns must still be
+// present and the index creation must be non-fatal.  On a clean DB (no legacy
+// duplicates) the indexes MUST be created and no warning is emitted.
+async function runSection17() {
+  console.log('\n=== Section 17: cmdInit resilience (PR-F) — legacy-dupe corpus + clean-DB invariant ===');
+
+  const fs_   = require('fs');
+  const path_  = require('path');
+
+  const SQLITE_SCHEMA_FILE = path_.resolve(__dirname, 'sql', 'handoff-sqlite-schema.sql');
+
+  // Helper: read the SQLite schema, strip integrity indexes from it (same logic as
+  // cmdInit Phase A), and return { coreSQL, integrityIndexSqls }.
+  function splitCoreAndIndexes(rawSQL) {
+    const INTEGRITY_INDEX_NAMES = ['assertions_1to1_unique', 'assertions_1ton_exact_unique'];
+    const integrityIndexSqls = [];
+    let coreSQL = rawSQL;
+    for (const idxName of INTEGRITY_INDEX_NAMES) {
+      const pattern = new RegExp(
+        `CREATE\\s+UNIQUE\\s+INDEX\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?${idxName}[\\s\\S]*?;`,
+        'i'
+      );
+      const m = coreSQL.match(pattern);
+      if (m) {
+        integrityIndexSqls.push({ name: idxName, sql: m[0] });
+        coreSQL = coreSQL.replace(m[0], '');
+      }
+    }
+    return { coreSQL, integrityIndexSqls };
+  }
+
+  // ── Test A: legacy-dupe corpus — additive columns present, index absent, warning ──
+
+  await test('PR-F: legacy-dupe corpus — additive bi-temporal columns present after split-phase apply', async () => {
+    // Simulate the live condition: insert duplicate live 1:1 rows BEFORE applying
+    // the integrity index, then run the split-phase schema apply.
+    // Assert: (a) valid_at/invalid_at/suppression_kind/pinned columns exist;
+    //         (b) assertions_1to1_unique index is absent (was not created);
+    //         (c) init did NOT hard-fail.
+
+    const db = await makeMemDb();
+    try {
+      const rawSQL = fs_.readFileSync(SQLITE_SCHEMA_FILE, 'utf8');
+      const { coreSQL, integrityIndexSqls } = splitCoreAndIndexes(rawSQL);
+
+      // Phase A: apply core schema (tables + additive columns, no integrity indexes).
+      await db.runSchema(coreSQL);
+
+      // Inject pre-existing duplicate live 1:1 rows (same project_id + subject + predicate
+      // + suppressed=0) to simulate a legacy-duplicate corpus.
+      // 'is_status' is a 1:1 predicate covered by assertions_1to1_unique.
+      const PID = 'legacy-dupe-test';
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+         VALUES (?, 'entity-A', 'is_status', 'v1', 7, 'user_stated', 0)`,
+        [PID]
+      );
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+         VALUES (?, 'entity-A', 'is_status', 'v2', 8, 'user_stated', 0)`,
+        [PID]
+      );
+
+      // Verify the duplicates are there (they would prevent the unique index from being created).
+      const { rows: dups } = await db.query(
+        `SELECT COUNT(*) AS n FROM assertions
+         WHERE project_id = ? AND subject = 'entity-A' AND predicate = 'is_status' AND suppressed = 0`,
+        [PID]
+      );
+      assertEqual(parseInt(dups[0].n, 10), 2, 'pre-condition: 2 duplicate live rows must exist');
+
+      // Phase B: attempt each integrity index (mirrors cmdInit Phase B).
+      const warnings = [];
+      for (const { name, sql: idxSql } of integrityIndexSqls) {
+        const result = await db.runIntegrityIndex(idxSql);
+        if (!result.ok) {
+          warnings.push(name);
+        }
+      }
+
+      // (a) Additive bi-temporal columns MUST exist (Phase A committed them).
+      const { rows: cols } = await db.query("PRAGMA table_info(assertions)");
+      const colNames = cols.map((r) => r.name);
+      for (const col of ['valid_at', 'invalid_at', 'suppression_kind', 'pinned']) {
+        assertTrue(colNames.includes(col),
+          `additive column '${col}' must exist after split-phase apply — got: ${colNames.join(', ')}`);
+      }
+
+      // (b) assertions_1to1_unique must NOT exist (legacy dupes prevented it).
+      const { rows: idxRows } = await db.query(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='assertions_1to1_unique'"
+      );
+      assertEqual(idxRows.length, 0,
+        'assertions_1to1_unique must NOT be created on a legacy-dupe corpus');
+
+      // (c) A warning was emitted for assertions_1to1_unique (runIntegrityIndex returned ok:false).
+      assertTrue(warnings.includes('assertions_1to1_unique'),
+        'runIntegrityIndex must return ok:false for assertions_1to1_unique on legacy-dupe corpus');
+
+    } finally { await db.end(); }
+  });
+
+  // ── Test B: clean DB — indexes ARE created, no failure, no warning ──
+
+  await test('PR-F: clean DB — integrity indexes created successfully, behavior unchanged', async () => {
+    // On a fresh DB with no pre-existing rows, both partial unique indexes must be
+    // created successfully (runIntegrityIndex returns ok:true) and the indexes must
+    // be present in sqlite_master.
+
+    const db = await makeMemDb();
+    try {
+      const rawSQL = fs_.readFileSync(SQLITE_SCHEMA_FILE, 'utf8');
+      const { coreSQL, integrityIndexSqls } = splitCoreAndIndexes(rawSQL);
+
+      // Phase A: apply core schema.
+      await db.runSchema(coreSQL);
+
+      // Phase B: attempt each integrity index on empty DB (no duplicates).
+      const indexResults = {};
+      for (const { name, sql: idxSql } of integrityIndexSqls) {
+        const result = await db.runIntegrityIndex(idxSql);
+        indexResults[name] = result;
+      }
+
+      // Both indexes must report ok:true.
+      for (const name of ['assertions_1to1_unique', 'assertions_1ton_exact_unique']) {
+        assertTrue(
+          indexResults[name] && indexResults[name].ok,
+          `${name} must be created successfully on a clean DB (got: ${JSON.stringify(indexResults[name])})`
+        );
+      }
+
+      // Both indexes must exist in sqlite_master.
+      for (const name of ['assertions_1to1_unique', 'assertions_1ton_exact_unique']) {
+        const { rows } = await db.query(
+          "SELECT name FROM sqlite_master WHERE type='index' AND name=?",
+          [name]
+        );
+        assertEqual(rows.length, 1,
+          `${name} must exist in sqlite_master on a clean DB`);
+      }
+
+      // Additive bi-temporal columns must also be present (Phase A).
+      const { rows: cols } = await db.query("PRAGMA table_info(assertions)");
+      const colNames = cols.map((r) => r.name);
+      for (const col of ['valid_at', 'invalid_at', 'suppression_kind', 'pinned']) {
+        assertTrue(colNames.includes(col),
+          `clean-DB: additive column '${col}' must exist`);
+      }
+
+      // Idempotency: running Phase B again on a clean DB (both indexes already exist)
+      // must also return ok:true (IF NOT EXISTS makes it a no-op).
+      for (const { name, sql: idxSql } of integrityIndexSqls) {
+        const result2 = await db.runIntegrityIndex(idxSql);
+        assertTrue(result2.ok,
+          `${name}: second runIntegrityIndex call must also succeed (idempotent)`);
+      }
+
+    } finally { await db.end(); }
+  });
+}
+
 // ── Run all sections ──────────────────────────────────────────────────────────
 (async () => {
   console.log(`\ntest-sqlite-seam.js (Node ${process.versions.node})\n`);
@@ -1818,6 +1983,7 @@ async function runSection16() {
   await runSection14();
   await runSection15();
   await runSection16();
+  await runSection17();
 
   console.log(`\n─── Results ──────────────────────────────────────`);
   console.log(`PASS ${passed}  FAIL ${failed}`);
