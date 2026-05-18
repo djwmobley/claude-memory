@@ -676,6 +676,16 @@ cardinality-aware write-time supersession, 4C per-row bump fix, the `history` qu
 `scripts/distill-corpus.js` distillation script, and the OQ-5 invariant fixture — shipped in
 PR #35 (commit `6d9ca0a`) and are the steady-state write-path behavior going forward.
 
+**Suppression model upgrade (PR #42).** The `suppressed` boolean referenced throughout this
+spec was superseded by a bi-temporal suppression scheme shipped in PR #42. The shipped
+mechanism uses `suppression_kind` (`downvoted_terminal`, `downvoted_probation`, `superseded`)
+with an `invalid_at` timestamp instead of the plain boolean. `downvoted_probation` is a
+recoverable soft-exclusion: excluded from standard retrieval, present in history, rehabilitatable
+by positive feedback — this escapes the absorbing-state trap discussed in Fork 1. Pinned rows
+(`pinned = true`) are exempt from C2 auto-suppression. The spec's `suppressed = false` / `suppressed
+= true` logic maps to this scheme: a row with `suppression_kind IS NULL` is the live equivalent
+of `suppressed = false`; a row with any `suppression_kind` set is the suppressed equivalent.
+
 **Corpus migration: SKIP.** The one-time distillation migration over the existing
 HANDOFF/markdown corpus will not be run — decided SKIP by the maintainer. The legacy corpus
 is therefore NOT distilled, and those markdown files are NOT to be deleted on the basis of
@@ -684,5 +694,10 @@ this section.
 **Steady state going forward.** New writes are governed by the shipped 4A/4C write path,
 which enforces cardinality-aware supersession on every ingest. This is unaffected by the
 un-run migration.
+
+**Subject canonicalization (PR #43).** Subject canonicalization shipped as Option 2 (prospective
+only, zero corpus mutation), honoring §7's SKIP decision. Incoming subjects are normalized at
+write time; the existing corpus is unchanged. See `docs/specs/2026-05-16-memory-bootstrap-collision.md`
+§7 for the SKIP rationale.
 
 *End of spec.*

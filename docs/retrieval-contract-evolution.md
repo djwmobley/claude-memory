@@ -202,6 +202,14 @@ All three stages fire at `/handoff:close` in sequence. Each stage is independent
 | `contract_evolution_budget_floor`   | `'200'` | Min `token_budget` for any kind. Never reduced below this.    |
 | `contract_evolution_budget_step`    | `'200'` | Max budget change per evolution pass (gradual, bounded).       |
 
+**C2 default state:** `feedback_loop_enabled` defaults to `'enabled'`. C2 bias feedback fires at
+every session close unless explicitly disabled. Suppression via C2 is bi-temporal: the
+`suppression_kind` column distinguishes `downvoted_terminal` (permanent suppression),
+`downvoted_probation` (soft exclusion from standard retrieval, rehabilitatable by positive
+feedback), and `superseded` (replaced by a newer write). The `invalid_at` timestamp records when
+suppression took effect. Pinned rows (`pinned = true`) are exempt from C2 auto-suppression;
+explicit cardinality supersession may still replace them.
+
 **Gate independence:** `contract_evolution_enabled` is completely independent of
 `feedback_loop_enabled` (C2). You can enable either or both. When both are enabled, C2 bias
 feedback and C3 budget evolution both fire at close. When C3 is `'disabled'`, **zero contract
@@ -325,6 +333,6 @@ psql -d claude_memory_eval_test -c \
 | `feedback_loop_enabled` | `contract_evolution_enabled` | Behavior at close                                       |
 |------------------------|-----------------------------|---------------------------------------------------------|
 | `disabled`             | `disabled`                  | No feedback, no evolution. Byte-identical to pre-C2.    |
-| `enabled`              | `disabled`                  | C2 bias feedback runs; no contract mutation.            |
+| `enabled` **(default)**| `disabled`                  | C2 bias feedback runs; no contract mutation.            |
 | `disabled`             | `enabled`                   | C3 budget evolution runs using raw outcome counts only. |
-| `enabled`              | `enabled`                   | Both C2 bias and C3 budget evolution run (full loop).   |
+| `enabled` **(default)**| `enabled`                   | Both C2 bias and C3 budget evolution run (full loop).   |

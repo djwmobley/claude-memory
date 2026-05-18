@@ -35,9 +35,9 @@ node "$PROJECT_ROOT/scripts/handoff.js" status
 Running: handoff:status
 
   === handoff status ===
-  project_id:       C--Users-djwmo-dev-claude-memory
+  project_id:       C--Users-username-dev-my-project
   last_close:       2026-05-14T22:30:00Z (1 day(s) ago)
-  handoff.md:       ~/.claude/projects/C--Users-djwmo-dev-claude-memory/handoff.md
+  handoff.md:       ~/.claude/projects/C--Users-username-dev-my-project/handoff.md
   entities:         23
   assertions:       47
   edges:            12

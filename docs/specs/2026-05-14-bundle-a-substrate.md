@@ -8,6 +8,13 @@ title: Bundle A — Substrate: Spec
 **Date:** 2026-05-14
 **Status:** Reference — implemented
 
+> **Storage abstraction note (PR #41):** A storage backend abstraction was shipped after this
+> spec was written. The system now runs on stock Postgres OR embedded SQLite — no pgvector
+> extension required. The `halfvec(4000)` embedding column and HNSW indexes described in this
+> spec are Postgres-specific and were removed as a hard dependency; the SQLite backend is purely
+> relational. The pgvector dependency in `app-retrieval-events-schema.sql` documented below no
+> longer applies when the SQLite backend is used.
+
 ---
 
 ## 1. Operative Scope

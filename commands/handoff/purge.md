@@ -54,7 +54,7 @@ node "$PROJECT_ROOT/scripts/handoff.js" purge --yes
 ```
 Running: handoff:purge
 
-  All rows deleted for project_id="C--Users-djwmo-dev-my-project".
+  All rows deleted for project_id="C--Users-username-dev-my-project".
   handoff.md removed.
 
 Done: handoff:purge — all project memory permanently deleted
