@@ -20,6 +20,11 @@ const __startNs = process.hrtime.bigint();
  *   close      --json -     End-of-session extraction (reads JSON from stdin).
  *   purge      [--yes]      Hard-delete all project rows (requires confirmation or --yes).
  *   promote    <id>         Explicitly promote an assertion to CLAUDE.md durable facts.
+ *   prune      [flags]      Operator manual prune: hard-delete selected assertion rows.
+ *                           Flags: --suppressed, --suppression-kind <kind>, --subject <s>,
+ *                           --older-than <days>, --include-pinned, --apply.
+ *                           Dry-run by default; --apply performs the delete.
+ *                           At least one criterion required. Manual/operator-invoked only.
  *   loader-load             Same inline load as resume; used directly or by tests.
  *   loader-hook             SessionStart hook entry point (outputs JSON to stdout).
  *   queue-drain [--max=N]   Drain pending async extraction queue rows (background worker).
@@ -2911,6 +2916,212 @@ async function cmdQueueDrain(args) {
   }
 }
 
+// ── prune ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Operator manual prune: surgically hard-delete selected assertion rows.
+ *
+ * Distinct from purge (hard-delete EVERYTHING) and drop (archive + fresh start).
+ * Operates on assertions ONLY — entities and edges are out of scope for this command.
+ * MANUAL / operator-invoked ONLY — never triggered automatically.
+ *
+ * Usage:
+ *   node scripts/handoff.js prune [--suppressed] [--suppression-kind <kind>]
+ *                                  [--subject <subject>] [--older-than <days>]
+ *                                  [--include-pinned] [--apply]
+ *
+ *   At least ONE criterion flag is required (--suppressed, --suppression-kind,
+ *   --subject, or --older-than). Running with no criteria is refused — that is
+ *   what `purge` is for.
+ *
+ * Behavior:
+ *   Dry-run (default, no --apply): prints counts and a sample of what WOULD be
+ *     deleted; makes zero DB changes.
+ *   --apply: performs the hard DELETE; second --apply is idempotent (no-op if
+ *     nothing matches).
+ *
+ * Pinned safety:
+ *   Pinned rows (pinned=true/1) are NEVER deleted unless --include-pinned is given.
+ *   Pinned rows that match the criteria are counted and reported as skipped.
+ *
+ * Criteria (AND-combined):
+ *   --suppressed                          rows where suppressed = true
+ *   --suppression-kind <kind>             rows where suppression_kind = <kind>
+ *                                         valid: superseded | downvoted_terminal |
+ *                                                downvoted_probation
+ *   --subject <raw-or-canonical>          rows where subject = canonicalize(<arg>)
+ *   --older-than <days>                   rows where last_reinforced < now()-N days
+ *
+ *   Criteria combine as AND. Always project-scoped (never touches other projects).
+ */
+async function cmdPrune(args) {
+  console.log('Running: handoff:prune');
+
+  // ── Parse flags ─────────────────────────────────────────────────────────────
+
+  const applyMode    = args.includes('--apply');
+  const includePinned = args.includes('--include-pinned');
+
+  // --suppressed (boolean flag)
+  const wantSuppressed = args.includes('--suppressed');
+
+  // --suppression-kind <kind>
+  const skIdx = args.indexOf('--suppression-kind');
+  const suppressionKind = skIdx !== -1 ? args[skIdx + 1] : undefined;
+  if (skIdx !== -1 && !suppressionKind) {
+    console.error('prune: --suppression-kind requires a value (superseded | downvoted_terminal | downvoted_probation)');
+    process.exit(2);
+  }
+  const validKinds = ['superseded', 'downvoted_terminal', 'downvoted_probation'];
+  if (suppressionKind && !validKinds.includes(suppressionKind)) {
+    console.error(`prune: invalid --suppression-kind "${suppressionKind}". Valid: ${validKinds.join(', ')}`);
+    process.exit(2);
+  }
+
+  // --subject <raw-or-canonical>
+  const subjectIdx = args.indexOf('--subject');
+  let rawSubject = subjectIdx !== -1 ? args[subjectIdx + 1] : undefined;
+  if (subjectIdx !== -1 && !rawSubject) {
+    console.error('prune: --subject requires a value');
+    process.exit(2);
+  }
+  // Canonicalize: trim + lowercase + collapse whitespace + alias-map lookup
+  const canonSubject = rawSubject != null ? canonicalize(rawSubject) : undefined;
+
+  // --older-than <days>
+  const otIdx = args.indexOf('--older-than');
+  let olderThanDays;
+  if (otIdx !== -1) {
+    const rawDays = args[otIdx + 1];
+    if (!rawDays) {
+      console.error('prune: --older-than requires a value (number of days)');
+      process.exit(2);
+    }
+    olderThanDays = Number(rawDays);
+    if (!Number.isFinite(olderThanDays) || olderThanDays <= 0) {
+      console.error(`prune: invalid --older-than value "${rawDays}" — must be a positive number`);
+      process.exit(2);
+    }
+  }
+
+  // ── At least one criterion required ─────────────────────────────────────────
+  const hasCriteria = wantSuppressed || suppressionKind != null || canonSubject != null || olderThanDays != null;
+  if (!hasCriteria) {
+    console.error(
+      'prune: at least one criterion is required (--suppressed, --suppression-kind, --subject, --older-than).\n' +
+      'To delete ALL project memory, use: handoff purge'
+    );
+    process.exit(2);
+  }
+
+  // ── Build criteria object ────────────────────────────────────────────────────
+  const criteria = {
+    suppressed:      wantSuppressed    ? true          : undefined,
+    suppressionKind: suppressionKind,
+    subject:         canonSubject,
+    olderThanDays:   olderThanDays,
+    includePinned:   includePinned,
+  };
+
+  const projectId = resolveProjectId();
+
+  console.log('');
+  console.log(`  mode          : ${applyMode ? '--apply (DELETES ENABLED)' : 'dry-run (read-only, default)'}`);
+  console.log(`  project_id    : ${projectId}`);
+  if (criteria.suppressed)      console.log(`  criterion     : suppressed = true`);
+  if (criteria.suppressionKind) console.log(`  criterion     : suppression_kind = '${criteria.suppressionKind}'`);
+  if (criteria.subject != null) console.log(`  criterion     : subject = '${criteria.subject}' (canonicalized from '${rawSubject}')`);
+  if (criteria.olderThanDays)   console.log(`  criterion     : last_reinforced < now() - ${criteria.olderThanDays} day(s)`);
+  console.log(`  include-pinned: ${includePinned}`);
+  console.log('');
+
+  let db;
+  try {
+    db = await connectHandoff();
+  } catch (err) {
+    console.error(`DB connection failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  // ── SELECT: preview what matches ──────────────────────────────────────────────
+  const { sql: selectSql, params: selectParams } = db.buildPruneSelect(criteria, projectId);
+  const { rows: matchedRows } = await db.query(selectSql, selectParams);
+
+  // Partition into pinned and non-pinned
+  const pinnedRows    = matchedRows.filter((r) => r.pinned === true || r.pinned === 1);
+  const nonPinnedRows = matchedRows.filter((r) => !(r.pinned === true || r.pinned === 1));
+
+  // In dry-run, report what would be deleted (non-pinned) and what would be skipped (pinned)
+  const toDeleteCount = includePinned ? matchedRows.length : nonPinnedRows.length;
+  const skippedPinnedCount = includePinned ? 0 : pinnedRows.length;
+
+  console.log(`  Matched rows        : ${matchedRows.length}`);
+  console.log(`  Would delete        : ${toDeleteCount}`);
+  if (skippedPinnedCount > 0) {
+    console.log(`  Skipped (pinned)    : ${skippedPinnedCount} (use --include-pinned to include)`);
+  }
+  console.log('');
+
+  if (matchedRows.length > 0) {
+    // Print a sample of up to 10 rows for operator review
+    const sampleSize = Math.min(10, toDeleteCount);
+    const sampleRows = includePinned ? matchedRows.slice(0, sampleSize) : nonPinnedRows.slice(0, sampleSize);
+    if (sampleRows.length > 0) {
+      console.log(`  Sample of rows that ${applyMode ? 'will be' : 'would be'} deleted (up to 10):`);
+      for (const row of sampleRows) {
+        const pinnedNote = (row.pinned === true || row.pinned === 1) ? ' [PINNED]' : '';
+        console.log(`    id=${row.id}  subject="${row.subject}"  predicate="${row.predicate}"  object="${String(row.object).slice(0, 60)}"${pinnedNote}`);
+      }
+      if (toDeleteCount > sampleSize) {
+        console.log(`    ... and ${toDeleteCount - sampleSize} more`);
+      }
+      console.log('');
+    }
+    if (skippedPinnedCount > 0) {
+      const pinnedSample = Math.min(5, pinnedRows.length);
+      console.log(`  Skipped pinned rows (up to 5):`);
+      for (const row of pinnedRows.slice(0, pinnedSample)) {
+        console.log(`    id=${row.id}  subject="${row.subject}"  predicate="${row.predicate}"`);
+      }
+      if (pinnedRows.length > pinnedSample) {
+        console.log(`    ... and ${pinnedRows.length - pinnedSample} more pinned rows skipped`);
+      }
+      console.log('');
+    }
+  }
+
+  if (!applyMode) {
+    await db.end();
+    if (toDeleteCount === 0) {
+      console.log('  No rows match the given criteria.');
+    } else {
+      console.log(`  Dry-run complete — no changes made.`);
+      console.log(`  Run with --apply to perform the deletion.`);
+    }
+    console.log('\nDone: handoff:prune — dry-run (no changes)');
+    return;
+  }
+
+  // ── APPLY: hard delete ────────────────────────────────────────────────────────
+  if (toDeleteCount === 0) {
+    await db.end();
+    console.log('  No rows match the given criteria — nothing to delete.');
+    console.log('\nDone: handoff:prune — 0 rows deleted (no-op)');
+    return;
+  }
+
+  const { sql: deleteSql, params: deleteParams } = db.buildPruneDelete(criteria, projectId);
+  const { rowCount: deletedCount } = await db.query(deleteSql, deleteParams);
+
+  await db.end();
+
+  console.log(`  Deleted ${deletedCount} assertion row(s).`);
+  if (skippedPinnedCount > 0) {
+    console.log(`  ${skippedPinnedCount} pinned row(s) protected from deletion (use --include-pinned to override).`);
+  }
+  console.log(`\nDone: handoff:prune — ${deletedCount} row(s) hard-deleted`);
+}
+
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -2929,6 +3140,7 @@ async function main() {
     purge:           () => cmdPurge(rest),
     promote:         () => cmdPromote(rest),
     'queue-drain':   () => cmdQueueDrain(rest),
+    prune:           () => cmdPrune(rest),
   };
 
   if (!sub || !subcommands[sub]) {

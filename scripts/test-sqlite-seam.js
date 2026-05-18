@@ -1453,6 +1453,351 @@ async function runSection15() {
   });
 }
 
+// ── SECTION 16: Manual prune — buildPruneSelect / buildPruneDelete ───────────
+async function runSection16() {
+  console.log('\n=== Section 16: Manual prune (buildPruneSelect / buildPruneDelete) ===');
+
+  // ── SQLiteAdapter method tests ────────────────────────────────────────────────
+
+  await test('SQLiteAdapter.buildPruneSelect: project_id clause always present', () => {
+    const db = new SQLiteAdapter(':memory:');
+    const { sql, params } = db.buildPruneSelect({ suppressed: true }, 'proj-1');
+    assertTrue(sql.includes('project_id = ?'), 'should contain project_id = ?');
+    assertTrue(params[0] === 'proj-1', 'first param should be project_id');
+  });
+
+  await test('SQLiteAdapter.buildPruneSelect: --suppressed adds suppressed = 1 clause', () => {
+    const db = new SQLiteAdapter(':memory:');
+    const { sql, params } = db.buildPruneSelect({ suppressed: true }, 'p');
+    assertTrue(sql.includes('suppressed = ?'), 'should contain suppressed = ?');
+    assertTrue(params.includes(1), 'params should include 1 for suppressed');
+  });
+
+  await test('SQLiteAdapter.buildPruneSelect: --suppression-kind adds suppression_kind clause', () => {
+    const db = new SQLiteAdapter(':memory:');
+    const { sql, params } = db.buildPruneSelect({ suppressionKind: 'superseded' }, 'p');
+    assertTrue(sql.includes('suppression_kind = ?'), 'should contain suppression_kind clause');
+    assertTrue(params.includes('superseded'), 'params should include kind');
+  });
+
+  await test('SQLiteAdapter.buildPruneSelect: --subject adds subject clause', () => {
+    const db = new SQLiteAdapter(':memory:');
+    const { sql, params } = db.buildPruneSelect({ subject: 'my subject' }, 'p');
+    assertTrue(sql.includes('subject = ?'), 'should contain subject clause');
+    assertTrue(params.includes('my subject'), 'params should include subject');
+  });
+
+  await test('SQLiteAdapter.buildPruneSelect: --older-than adds last_reinforced datetime clause', () => {
+    const db = new SQLiteAdapter(':memory:');
+    const { sql, params } = db.buildPruneSelect({ olderThanDays: 30 }, 'p');
+    assertTrue(
+      sql.includes("last_reinforced < datetime('now', '-' || ? || ' days')"),
+      "should contain SQLite datetime modifier clause"
+    );
+    assertTrue(params.includes('30'), "params should include '30' as string");
+  });
+
+  await test('SQLiteAdapter.buildPruneSelect: criteria AND-combine (suppressed + subject)', () => {
+    const db = new SQLiteAdapter(':memory:');
+    const { sql } = db.buildPruneSelect({ suppressed: true, subject: 's' }, 'p');
+    assertTrue(sql.includes('AND'), 'multiple criteria should join with AND');
+    assertTrue(sql.includes('suppressed = ?'), 'should include suppressed clause');
+    assertTrue(sql.includes('subject = ?'), 'should include subject clause');
+  });
+
+  await test('SQLiteAdapter.buildPruneDelete: excludes pinned=1 by default', () => {
+    const db = new SQLiteAdapter(':memory:');
+    const { sql } = db.buildPruneDelete({ suppressed: true, includePinned: false }, 'p');
+    assertTrue(sql.includes('pinned = 0'), 'default delete should exclude pinned=1');
+    assertTrue(sql.startsWith('DELETE FROM assertions'), 'should be a DELETE statement');
+  });
+
+  await test('SQLiteAdapter.buildPruneDelete: --include-pinned omits the pinned exclusion', () => {
+    const db = new SQLiteAdapter(':memory:');
+    const { sql } = db.buildPruneDelete({ suppressed: true, includePinned: true }, 'p');
+    assertTrue(!sql.includes('pinned = 0'), 'include-pinned: should NOT add pinned = 0 clause');
+  });
+
+  // ── PostgresAdapter method tests ──────────────────────────────────────────────
+
+  await test('PostgresAdapter.buildPruneSelect: project_id uses $1 placeholder', () => {
+    const { PostgresAdapter: PG } = require('./lib/db-seam');
+    const db = new PG(null);  // null pg.Client — port-method tests don't need a live connection
+    const { sql, params } = db.buildPruneSelect({ suppressed: true }, 'proj-1');
+    assertTrue(sql.includes('project_id = $1'), 'PG should use $1 for project_id');
+    assertTrue(params[0] === 'proj-1', 'first param should be project_id');
+  });
+
+  await test('PostgresAdapter.buildPruneSelect: --suppressed adds suppressed = $N (true)', () => {
+    const { PostgresAdapter: PG } = require('./lib/db-seam');
+    const db = new PG(null);
+    const { sql, params } = db.buildPruneSelect({ suppressed: true }, 'p');
+    assertTrue(sql.includes('suppressed = $2'), 'suppressed should be $2 after project_id');
+    assertTrue(params[1] === true, 'param should be boolean true for Postgres');
+  });
+
+  await test('PostgresAdapter.buildPruneSelect: --older-than adds Postgres interval clause', () => {
+    const { PostgresAdapter: PG } = require('./lib/db-seam');
+    const db = new PG(null);
+    const { sql, params } = db.buildPruneSelect({ olderThanDays: 7 }, 'p');
+    assertTrue(
+      sql.includes("now() - ($") && sql.includes("|| ' days')::interval"),
+      'PG should use interval arithmetic for older-than'
+    );
+    assertTrue(params.includes('7'), "params should include '7' as string");
+  });
+
+  await test('PostgresAdapter.buildPruneDelete: excludes pinned rows by default', () => {
+    const { PostgresAdapter: PG } = require('./lib/db-seam');
+    const db = new PG(null);
+    const { sql } = db.buildPruneDelete({ suppressed: true, includePinned: false }, 'p');
+    assertTrue(
+      sql.includes('(pinned = false OR pinned IS NULL)'),
+      'PG delete should exclude pinned via (pinned = false OR pinned IS NULL)'
+    );
+    assertTrue(sql.startsWith('DELETE FROM assertions'), 'should be a DELETE statement');
+  });
+
+  await test('PostgresAdapter.buildPruneDelete: --include-pinned omits the pinned exclusion', () => {
+    const { PostgresAdapter: PG } = require('./lib/db-seam');
+    const db = new PG(null);
+    const { sql } = db.buildPruneDelete({ suppressed: true, includePinned: true }, 'p');
+    assertTrue(!sql.includes('(pinned = false OR pinned IS NULL)'), 'include-pinned: should NOT add pinned clause');
+  });
+
+  // ── Live SQLite integration: prune end-to-end ─────────────────────────────────
+
+  await test('prune: dry-run does not delete rows', async () => {
+    const db = await makeMemDb();
+    const schema = fs.readFileSync(SCHEMA_FILE, 'utf8');
+    await db.runSchema(schema);
+    const projectId = 'prune-test-project';
+
+    // Insert 3 suppressed assertions
+    for (let i = 0; i < 3; i++) {
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+         VALUES (?, ?, ?, ?, 8, 'user_stated', 1)`,
+        [projectId, `subj${i}`, 'is', `val${i}`]
+      );
+    }
+
+    const { rows: before } = await db.query(
+      'SELECT COUNT(*) AS n FROM assertions WHERE project_id = ?', [projectId]
+    );
+    assertEqual(parseInt(before[0].n, 10), 3, 'should have 3 rows before dry-run');
+
+    // dry-run SELECT
+    const { sql: selectSql, params: selectParams } = db.buildPruneSelect({ suppressed: true }, projectId);
+    const { rows: matched } = await db.query(selectSql, selectParams);
+    assertEqual(matched.length, 3, 'buildPruneSelect should match 3 rows');
+
+    // verify no rows deleted
+    const { rows: after } = await db.query(
+      'SELECT COUNT(*) AS n FROM assertions WHERE project_id = ?', [projectId]
+    );
+    assertEqual(parseInt(after[0].n, 10), 3, 'dry-run: row count must be unchanged');
+
+    await db.end();
+  });
+
+  await test('prune: --apply deletes matched rows; second apply is a no-op', async () => {
+    const db = await makeMemDb();
+    const schema = fs.readFileSync(SCHEMA_FILE, 'utf8');
+    await db.runSchema(schema);
+    const projectId = 'prune-apply-test';
+
+    // Insert 2 suppressed + 1 live
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+       VALUES (?, 's1', 'is', 'v1', 8, 'user_stated', 1)`, [projectId]
+    );
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+       VALUES (?, 's2', 'is', 'v2', 8, 'user_stated', 1)`, [projectId]
+    );
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+       VALUES (?, 's3', 'is', 'v3', 8, 'user_stated', 0)`, [projectId]
+    );
+
+    // Apply: delete suppressed rows
+    const { sql: delSql, params: delParams } = db.buildPruneDelete(
+      { suppressed: true, includePinned: false }, projectId
+    );
+    const { rowCount: deleted1 } = await db.query(delSql, delParams);
+    assertEqual(deleted1, 2, 'first apply should delete 2 suppressed rows');
+
+    // Verify 1 live row remains
+    const { rows: remaining } = await db.query(
+      'SELECT COUNT(*) AS n FROM assertions WHERE project_id = ?', [projectId]
+    );
+    assertEqual(parseInt(remaining[0].n, 10), 1, 'one live row should remain');
+
+    // Second apply: should delete 0 (idempotent)
+    const { rowCount: deleted2 } = await db.query(delSql, delParams);
+    assertEqual(deleted2, 0, 'second apply should be a no-op (0 rows deleted)');
+
+    await db.end();
+  });
+
+  await test('prune: pinned rows NOT deleted by default; deleted with --include-pinned', async () => {
+    const db = await makeMemDb();
+    const schema = fs.readFileSync(SCHEMA_FILE, 'utf8');
+    await db.runSchema(schema);
+    const projectId = 'prune-pinned-test';
+
+    // Insert 1 suppressed+pinned and 1 suppressed+not-pinned
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed, pinned)
+       VALUES (?, 'pinned-subj', 'is', 'v', 8, 'user_stated', 1, 1)`, [projectId]
+    );
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed, pinned)
+       VALUES (?, 'norm-subj', 'is', 'v', 8, 'user_stated', 1, 0)`, [projectId]
+    );
+
+    // Default delete (without include-pinned): should delete only the non-pinned row
+    const { sql: delSql, params: delParams } = db.buildPruneDelete(
+      { suppressed: true, includePinned: false }, projectId
+    );
+    const { rowCount: deleted } = await db.query(delSql, delParams);
+    assertEqual(deleted, 1, 'default delete should skip pinned row');
+
+    const { rows: remaining } = await db.query(
+      'SELECT subject FROM assertions WHERE project_id = ?', [projectId]
+    );
+    assertEqual(remaining.length, 1, 'one row should remain (the pinned one)');
+    assertEqual(remaining[0].subject, 'pinned-subj', 'remaining row should be the pinned one');
+
+    // Now delete with include-pinned: should delete the pinned row too
+    const { sql: delAllSql, params: delAllParams } = db.buildPruneDelete(
+      { suppressed: true, includePinned: true }, projectId
+    );
+    const { rowCount: deletedAll } = await db.query(delAllSql, delAllParams);
+    assertEqual(deletedAll, 1, 'include-pinned delete should remove pinned row');
+
+    const { rows: finalRows } = await db.query(
+      'SELECT COUNT(*) AS n FROM assertions WHERE project_id = ?', [projectId]
+    );
+    assertEqual(parseInt(finalRows[0].n, 10), 0, 'no rows should remain after include-pinned delete');
+
+    await db.end();
+  });
+
+  await test('prune: project scoping — different project_id row is untouched', async () => {
+    const db = await makeMemDb();
+    const schema = fs.readFileSync(SCHEMA_FILE, 'utf8');
+    await db.runSchema(schema);
+
+    const projectA = 'prune-scope-A';
+    const projectB = 'prune-scope-B';
+
+    // Insert 1 suppressed row in each project
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+       VALUES (?, 's', 'is', 'v', 8, 'user_stated', 1)`, [projectA]
+    );
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+       VALUES (?, 's', 'is', 'v', 8, 'user_stated', 1)`, [projectB]
+    );
+
+    // Delete suppressed from projectA only
+    const { sql, params } = db.buildPruneDelete({ suppressed: true, includePinned: false }, projectA);
+    const { rowCount } = await db.query(sql, params);
+    assertEqual(rowCount, 1, 'should delete 1 row from projectA');
+
+    // projectB row should be untouched
+    const { rows: bRows } = await db.query(
+      'SELECT COUNT(*) AS n FROM assertions WHERE project_id = ?', [projectB]
+    );
+    assertEqual(parseInt(bRows[0].n, 10), 1, 'projectB row should be untouched');
+
+    await db.end();
+  });
+
+  await test('prune: --suppression-kind criterion selects only matching kind', async () => {
+    const db = await makeMemDb();
+    const schema = fs.readFileSync(SCHEMA_FILE, 'utf8');
+    await db.runSchema(schema);
+    const projectId = 'prune-kind-test';
+
+    // Insert rows with different suppression_kind
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed, suppression_kind)
+       VALUES (?, 's1', 'is', 'v', 8, 'user_stated', 1, 'superseded')`, [projectId]
+    );
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed, suppression_kind)
+       VALUES (?, 's2', 'is', 'v', 8, 'user_stated', 1, 'downvoted_terminal')`, [projectId]
+    );
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+       VALUES (?, 's3', 'is', 'v', 8, 'user_stated', 0)`, [projectId]
+    );
+
+    // Select only 'superseded' rows
+    const { sql, params } = db.buildPruneSelect({ suppressionKind: 'superseded' }, projectId);
+    const { rows } = await db.query(sql, params);
+    assertEqual(rows.length, 1, 'should select only the superseded row');
+    assertEqual(rows[0].subject, 's1', 'should be s1');
+
+    await db.end();
+  });
+
+  await test('prune: --subject criterion canonicalizes and matches stored canonical subject', async () => {
+    const db = await makeMemDb();
+    const schema = fs.readFileSync(SCHEMA_FILE, 'utf8');
+    await db.runSchema(schema);
+    const projectId = 'prune-subject-test';
+
+    // Insert row with lowercase canonical subject
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+       VALUES (?, 'my subject', 'is', 'v', 8, 'user_stated', 1)`, [projectId]
+    );
+
+    // The caller (cmdPrune) canonicalizes the input before passing to buildPruneSelect.
+    // Here we simulate that canonicalization already happened: 'MY SUBJECT' → 'my subject'
+    const { canonicalize: canon } = require('./lib/subject-canon');
+    const canonSubject = canon('MY SUBJECT');
+    assertEqual(canonSubject, 'my subject', 'canonicalize should fold to lowercase');
+
+    const { sql, params } = db.buildPruneSelect({ subject: canonSubject }, projectId);
+    const { rows } = await db.query(sql, params);
+    assertEqual(rows.length, 1, 'canonicalized subject should match stored row');
+
+    await db.end();
+  });
+
+  await test('prune: --older-than criterion uses last_reinforced column', async () => {
+    const db = await makeMemDb();
+    const schema = fs.readFileSync(SCHEMA_FILE, 'utf8');
+    await db.runSchema(schema);
+    const projectId = 'prune-older-test';
+
+    // Insert a row with a clearly old last_reinforced (2000-01-01)
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, last_reinforced)
+       VALUES (?, 'old-s', 'is', 'v', 8, 'user_stated', '2000-01-01')`, [projectId]
+    );
+    // Insert a row with a recent last_reinforced (now)
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
+       VALUES (?, 'new-s', 'is', 'v', 8, 'user_stated')`, [projectId]
+    );
+
+    // older-than 1 day: should match only the old row (2000-01-01 is way older than 1 day)
+    const { sql, params } = db.buildPruneSelect({ olderThanDays: 1 }, projectId);
+    const { rows } = await db.query(sql, params);
+    assertEqual(rows.length, 1, 'should select only the old row');
+    assertEqual(rows[0].subject, 'old-s', 'should be the old subject');
+
+    await db.end();
+  });
+}
+
 // ── Run all sections ──────────────────────────────────────────────────────────
 (async () => {
   console.log(`\ntest-sqlite-seam.js (Node ${process.versions.node})\n`);
@@ -1472,6 +1817,7 @@ async function runSection15() {
   await runSection13();
   await runSection14();
   await runSection15();
+  await runSection16();
 
   console.log(`\n─── Results ──────────────────────────────────────`);
   console.log(`PASS ${passed}  FAIL ${failed}`);

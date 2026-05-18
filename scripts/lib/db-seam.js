@@ -46,6 +46,16 @@
 //   buildProbationRehabUpdate(ids)
 //                                  — Returns { sql, params } that revives downvoted_probation rows
 //                                    (clears suppressed/invalid_at/suppression_kind).
+//   buildPruneSelect(criteria, projectId)
+//                                  — Returns { sql, params } for SELECT id, subject, predicate,
+//                                    object, pinned FROM assertions WHERE <criteria>.
+//                                    criteria: { suppressed?, suppressionKind?, subject?,
+//                                      olderThanDays?, includePinned? }.
+//                                    Project-scoped; at least one criterion enforced by caller.
+//   buildPruneDelete(criteria, projectId)
+//                                  — Returns { sql, params } for DELETE FROM assertions
+//                                    WHERE <criteria>.  Same criteria shape as buildPruneSelect.
+//                                    Never deletes pinned rows unless criteria.includePinned=true.
 //   buildMultiPairInsert(table, col1, col2, col1Val, col2Values)
 //                                  — Returns { sql, params } for an INSERT of
 //                                    (col1Val, col2Values[0]), (col1Val, col2Values[1])...
@@ -500,6 +510,84 @@ function resolveSQLiteDbPath(projectRoot) {
   return path.join(projectRoot, '.claude', 'handoff.sqlite');
 }
 
+// ─── _buildPruneClauses ───────────────────────────────────────────────────────
+//
+// Shared helper for buildPruneSelect / buildPruneDelete on both adapters.
+// Builds the WHERE clauses and params array for a manual-prune query.
+//
+// criteria:
+//   suppressed       — boolean | undefined.  If true, add: suppressed = <true/1>
+//   suppressionKind  — string | undefined.   If set, add: suppression_kind = <kind>
+//   subject          — string | undefined.   If set, add: subject = <canonical>
+//   olderThanDays    — number | undefined.   If set, add: last_reinforced < now()-N days
+//   includePinned    — boolean.  Does NOT affect the WHERE clauses here (handled
+//                      by callers for DELETE; SELECT always fetches all matching rows
+//                      so caller can count skipped-pinned separately).
+//
+// dialect: 'postgres' | 'sqlite'
+//   Postgres: $N placeholders, ($N || ' days')::interval for interval arithmetic.
+//   SQLite:   ?  placeholders, datetime('now', '-' || ? || ' days') for interval.
+//             (SQLiteAdapter.query() also runs rewriteForSQLite(), but the
+//              olderThanDays clause needs to be pre-built in dialect-native form
+//              because the rewrite targets a specific textual pattern that may not
+//              match if we emit raw Postgres syntax here.)
+//
+// Always includes: project_id = <projectId>  as the first clause.
+//
+// Returns: { clauses: string[], params: any[] }
+//   clauses — one clause per criterion; caller joins with ' AND '
+//   params  — positional params in order
+
+function _buildPruneClauses(criteria, projectId, dialect) {
+  const clauses = [];
+  const params  = [];
+
+  const pg = dialect === 'postgres';
+
+  // Helper: placeholder for the most-recently pushed param.
+  // Call AFTER params.push() so params.length is already the 1-based index.
+  function nextPh() {
+    if (pg) return `$${params.length}`;
+    return '?';
+  }
+
+  // ── 1. project_id (always first) ──────────────────────────────────────────
+  params.push(projectId);
+  clauses.push(`project_id = ${pg ? '$1' : '?'}`);
+
+  // ── 2. suppressed ─────────────────────────────────────────────────────────
+  if (criteria.suppressed === true) {
+    params.push(pg ? true : 1);
+    clauses.push(`suppressed = ${nextPh()}`);
+  }
+
+  // ── 3. suppression_kind ───────────────────────────────────────────────────
+  if (criteria.suppressionKind != null) {
+    params.push(criteria.suppressionKind);
+    clauses.push(`suppression_kind = ${nextPh()}`);
+  }
+
+  // ── 4. subject ────────────────────────────────────────────────────────────
+  if (criteria.subject != null) {
+    params.push(criteria.subject);
+    clauses.push(`subject = ${nextPh()}`);
+  }
+
+  // ── 5. older-than (by last_reinforced) ────────────────────────────────────
+  if (criteria.olderThanDays != null) {
+    const days = Number(criteria.olderThanDays);
+    if (pg) {
+      params.push(String(days));
+      clauses.push(`last_reinforced < now() - ($${params.length} || ' days')::interval`);
+    } else {
+      params.push(String(days));
+      clauses.push(`last_reinforced < datetime('now', '-' || ? || ' days')`);
+    }
+  }
+
+  return { clauses, params };
+}
+
 // ─── SQLiteAdapter ────────────────────────────────────────────────────────────
 
 class SQLiteAdapter {
@@ -723,6 +811,39 @@ class SQLiteAdapter {
   }
 
   /**
+   * Build a SELECT for the manual-prune preview (dry-run).
+   * Returns rows matching the AND-combined criteria, scoped to projectId.
+   * Pinned rows are included in the result set but flagged — caller uses pinned
+   * column to compute skip counts.  The caller applies the includePinned filter
+   * at the application layer after counting.
+   * Returns { sql, params }.
+   */
+  buildPruneSelect(criteria, projectId) {
+    const { clauses, params } = _buildPruneClauses(criteria, projectId, 'sqlite');
+    return {
+      sql: `SELECT id, subject, predicate, object, pinned FROM assertions WHERE ${clauses.join(' AND ')}`,
+      params,
+    };
+  }
+
+  /**
+   * Build a hard DELETE for the manual-prune command.
+   * Applies the AND-combined criteria scoped to projectId.
+   * Excludes pinned rows UNLESS criteria.includePinned = true.
+   * Returns { sql, params }.
+   */
+  buildPruneDelete(criteria, projectId) {
+    const { clauses, params } = _buildPruneClauses(criteria, projectId, 'sqlite');
+    if (!criteria.includePinned) {
+      clauses.push('pinned = 0');
+    }
+    return {
+      sql: `DELETE FROM assertions WHERE ${clauses.join(' AND ')}`,
+      params,
+    };
+  }
+
+  /**
    * Build a multi-row INSERT of (col1Val, col2Values[i]) pairs.
    * SQLite uses anonymous ? placeholders — cannot reuse a single $1 for col1Val;
    * each row has its own two ?s.
@@ -940,6 +1061,39 @@ class PostgresAdapter {
             WHERE id = ANY($1::int[])
               AND suppression_kind = 'downvoted_probation'`,
       params: [ids],
+    };
+  }
+
+  /**
+   * Build a SELECT for the manual-prune preview (dry-run).
+   * Returns rows matching the AND-combined criteria, scoped to projectId.
+   * Pinned rows are included in the result set — caller uses the pinned column
+   * to compute skip counts.  The caller applies the includePinned filter
+   * at the application layer after counting.
+   * Returns { sql, params }.
+   */
+  buildPruneSelect(criteria, projectId) {
+    const { clauses, params } = _buildPruneClauses(criteria, projectId, 'postgres');
+    return {
+      sql: `SELECT id, subject, predicate, object, pinned FROM assertions WHERE ${clauses.join(' AND ')}`,
+      params,
+    };
+  }
+
+  /**
+   * Build a hard DELETE for the manual-prune command.
+   * Applies the AND-combined criteria scoped to projectId.
+   * Excludes pinned rows UNLESS criteria.includePinned = true.
+   * Returns { sql, params }.
+   */
+  buildPruneDelete(criteria, projectId) {
+    const { clauses, params } = _buildPruneClauses(criteria, projectId, 'postgres');
+    if (!criteria.includePinned) {
+      clauses.push('(pinned = false OR pinned IS NULL)');
+    }
+    return {
+      sql: `DELETE FROM assertions WHERE ${clauses.join(' AND ')}`,
+      params,
     };
   }
 
