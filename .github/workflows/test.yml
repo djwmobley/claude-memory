@@ -68,9 +68,12 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
-      - name: Run smoketest graph section
-        # Focused end-to-end smoke for the graph kind wired into the existing CI job.
-        run: node scripts/smoketest-handoff.js --section=gr
+      - name: Run smoketest (all sections)
+        # Runs the full smoketest suite — all 13 sections including collision (OQ-5
+        # supersession invariant) and registry (SQL-1:1-index-vs-registry-JSON drift).
+        # Previously only --section=gr ran in CI; those two correctness properties were
+        # unproven per-PR.  The full run subsumes the former gr-only step exactly.
+        run: node scripts/smoketest-handoff.js
         env:
           PGHOST: localhost
           PGUSER: postgres
