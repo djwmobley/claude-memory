@@ -104,3 +104,8 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run pr-independence hook tests
+        # Regression guard for the scrubDataRegions zero-false-negative guarantee
+        # and the detection logic vendored from ~/.claude/hooks/pr-independence.js.
+        # Pure Node — no Postgres or Ollama required; reuses the Node 22 setup above.
+        run: node hooks/pr-independence.test.js
