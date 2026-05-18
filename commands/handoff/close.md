@@ -129,6 +129,43 @@ echo '<JSON_PAYLOAD>' | node "$PROJECT_ROOT/scripts/handoff.js" close --json -
 }
 ```
 
+## Payload staging (mandatory)
+
+Any JSON payload written to a file MUST be written to the OS temp staging directory,
+NOT anywhere under the repo working tree.  Use:
+
+```
+os.tmpdir()/claude-memory-handoff/handoff-close-payload.json
+```
+
+Concretely, on Linux/macOS:
+
+```bash
+PAYLOAD_FILE="$(node -e 'const os=require("os"),path=require("path"); \
+  const d=path.join(os.tmpdir(),"claude-memory-handoff"); \
+  require("fs").mkdirSync(d,{recursive:true}); \
+  process.stdout.write(path.join(d,"handoff-close-payload.json"))')"
+echo '<JSON_PAYLOAD>' > "$PAYLOAD_FILE"
+cat "$PAYLOAD_FILE" | node "$PROJECT_ROOT/scripts/handoff.js" close --json -
+```
+
+Or pipe directly without a file:
+
+```bash
+echo '<JSON_PAYLOAD>' | node "$PROJECT_ROOT/scripts/handoff.js" close --json -
+```
+
+**Why this matters:** `handoff.js` runs `git status --porcelain` to determine whether the
+working tree is clean. A payload file written inside the repo working tree would appear as
+an untracked file and make the probe report `dirty`, recording a false
+`has_unpackaged_state: dirty` assertion.
+
+**`has_unpackaged_state` is now code-owned:** `handoff.js` computes and writes the
+`has_unpackaged_state` assertion authoritatively using `detectUnpackagedState()` at close
+time. The model MUST NOT include a `has_unpackaged_state` entry in the `assertions` array
+of the JSON payload. If one is included, it is silently discarded and replaced by the
+authoritative code-computed value.
+
 ## Expected output
 
 ```

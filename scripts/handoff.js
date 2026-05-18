@@ -450,7 +450,19 @@ function detectUnpackagedState(root) {
 
     // Check for dirty working tree (untracked, modified, or staged changes).
     const statusOut = execFileSync('git', ['-C', root, 'status', '--porcelain'], execOpts);
-    const dirty = statusOut.trim().length > 0;
+    // Defense-in-depth: filter out any porcelain line whose path basename matches the
+    // reserved close-payload staging pattern.  This ensures that even an in-tree payload
+    // file (which should NEVER be written inside the repo — see close.md) cannot flip the
+    // snapshot to dirty.  The real fix is operator hygiene (use os.tmpdir() staging); this
+    // filter is a safety net only.
+    const PAYLOAD_STAGING_RE = /^(?:\.)?handoff-close-payload.*\.json$/i;
+    const filteredLines = statusOut.split('\n').filter((line) => {
+      if (!line.trim()) return false;
+      // Git --porcelain format: "XY filename" or "XY dir/filename" (may include quotes).
+      const filePart = line.slice(3).trim().replace(/^"(.*)"$/, '$1');
+      return !PAYLOAD_STAGING_RE.test(path.basename(filePart));
+    });
+    const dirty = filteredLines.length > 0;
 
     // Check for local commits ahead of upstream; treat no-upstream as 0.
     let aheadCount = 0;
@@ -474,6 +486,157 @@ function detectUnpackagedState(root) {
     // git unavailable, not a repo, or any other error — skip silently.
     return { dirty: false, aheadCount: 0, unpackaged: false, label: 'clean (probe unavailable)' };
   }
+}
+
+// ─── SCHEMA AUTO-APPLY (Deliverable A) ───────────────────────────────────────
+
+// Module-level cache: maps schemaFilePath → { mtime, hash } so repeated calls in one
+// process don't re-read or re-hash the SQL files.  Reset implicitly on process restart.
+const _schemaHashCache = new Map();
+
+/**
+ * Return a stable SHA-256 hex digest of a schema file's content.
+ * Caches by (filePath + mtime) so file I/O is amortized within a process run.
+ */
+function _hashSchemaFile(filePath) {
+  const crypto = require('crypto');
+  let mtime;
+  try {
+    mtime = fs.statSync(filePath).mtimeMs;
+  } catch (_) {
+    mtime = 0;
+  }
+  const cached = _schemaHashCache.get(filePath);
+  if (cached && cached.mtime === mtime) return cached.hash;
+  const content = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
+  const hash = crypto.createHash('sha256').update(content).digest('hex');
+  _schemaHashCache.set(filePath, { mtime, hash });
+  return hash;
+}
+
+/**
+ * Compute a single fingerprint covering BOTH schema files.
+ * Even if only one backend is active, hashing both files means any schema change
+ * to either file triggers a re-apply on the active backend.
+ */
+function _computeSchemaFingerprint() {
+  const pgFile     = path.resolve(__dirname, 'sql', 'handoff-core-schema.sql');
+  const sqliteFile = path.resolve(__dirname, 'sql', 'handoff-sqlite-schema.sql');
+  const crypto = require('crypto');
+  return crypto.createHash('sha256')
+    .update(_hashSchemaFile(pgFile))
+    .update(_hashSchemaFile(sqliteFile))
+    .digest('hex');
+}
+
+/**
+ * Apply the additive DDL for the active dialect's schema file.
+ *
+ * Mirrors the Phase A logic in cmdInit but factored out for reuse:
+ *   - Reads the schema file, strips psql meta-commands.
+ *   - Extracts and removes the two integrity index CREATE UNIQUE INDEX statements.
+ *   - Runs core DDL inside BEGIN/COMMIT (idempotent IF NOT EXISTS DDL).
+ *   - Runs each integrity index via db.runIntegrityIndex() (non-fatal on failure).
+ *
+ * Always uses db.query() for the additive ALTER TABLE statements so the seam
+ * handles dialect rewriting (IF NOT EXISTS → stripped + caught for SQLite).
+ *
+ * @param {object}  db         — connected StoragePort adapter
+ * @param {string}  schemaFile — absolute path to the active SQL schema file
+ * @param {object}  [opts]
+ * @param {boolean} [opts.silent=false] — suppress informational stderr output
+ */
+async function applyAdditiveSchema(db, schemaFile, { silent } = {}) {
+  if (!fs.existsSync(schemaFile)) {
+    if (!silent) process.stderr.write(`[handoff] applyAdditiveSchema: schema file not found: ${schemaFile}\n`);
+    return;
+  }
+
+  let sql = fs.readFileSync(schemaFile, 'utf8');
+  // Strip psql meta-commands (\ir, \d, etc.) — not supported by pg client.
+  sql = sql.replace(/^\\[a-z].*$/gm, '');
+
+  // Extract integrity index statements (same logic as cmdInit Phase B).
+  const INTEGRITY_INDEX_NAMES = ['assertions_1to1_unique', 'assertions_1ton_exact_unique'];
+  const integrityIndexSqls = [];
+  let coreSchemaSQL = sql;
+  for (const idxName of INTEGRITY_INDEX_NAMES) {
+    const pattern = new RegExp(
+      `CREATE\\s+UNIQUE\\s+INDEX\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?${idxName}[\\s\\S]*?;`,
+      'i'
+    );
+    const m = coreSchemaSQL.match(pattern);
+    if (m) {
+      integrityIndexSqls.push({ name: idxName, sql: m[0] });
+      coreSchemaSQL = coreSchemaSQL.replace(m[0], '');
+    }
+  }
+
+  // Phase A: core DDL inside a transaction.
+  await db.query('BEGIN');
+  try {
+    await db.runSchema(coreSchemaSQL);
+    // Idempotent migration: add promoted / promoted_at columns (Bundle A).
+    await db.query(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted    BOOLEAN     NOT NULL DEFAULT false`);
+    await db.query(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMPTZ`);
+    await db.query('COMMIT');
+  } catch (err) {
+    try { await db.query('ROLLBACK'); } catch (_) { /* ignore */ }
+    throw err;
+  }
+
+  // Phase B: integrity indexes (non-fatal on legacy-dupe corpus).
+  for (const { name, sql: idxSql } of integrityIndexSqls) {
+    const result = await db.runIntegrityIndex(idxSql);
+    if (!result.ok && !silent) {
+      process.stderr.write(`[handoff] applyAdditiveSchema: integrity index ${name} skipped (non-fatal): ${result.msg}\n`);
+    }
+  }
+}
+
+/**
+ * Cheap drift sentinel: compare the stored schema_fingerprint in project_settings
+ * against the current file hash.  If they differ (or the key is absent), apply the
+ * additive schema and upsert the fingerprint.  If they match, return immediately
+ * (hot path = one SELECT + one cached hash computation).
+ *
+ * Non-fatal: all errors are caught and logged to stderr; callers must wrap in try/catch
+ * and continue regardless.
+ *
+ * @param {object}  db        — connected StoragePort adapter
+ * @param {string}  projectId — encoded_cwd
+ * @param {object}  [opts]
+ * @param {boolean} [opts.silent=false] — suppress informational stderr output
+ */
+async function ensureSchemaCurrent(db, projectId, { silent } = {}) {
+  const fingerprint = _computeSchemaFingerprint();
+
+  // Hot path: one SELECT.
+  const { rows } = await db.query(
+    'SELECT value FROM project_settings WHERE project_id = $1 AND key = $2',
+    [projectId, 'schema_fingerprint']
+  );
+  if (rows.length > 0 && rows[0].value === fingerprint) {
+    // Schema is current — no-op.
+    return;
+  }
+
+  // Fingerprint missing or stale: apply the active dialect's schema file.
+  if (!silent) {
+    process.stderr.write('[handoff] schema drift detected — running additive schema apply\n');
+  }
+
+  // Resolve the schema file for the active dialect.
+  const schemaFileName = db.schemaFileName;
+  const schemaFile = path.resolve(__dirname, 'sql', schemaFileName);
+  await applyAdditiveSchema(db, schemaFile, { silent });
+
+  // Upsert the new fingerprint into project_settings.
+  await db.query(
+    `INSERT INTO project_settings (project_id, key, value) VALUES ($1, $2, $3)
+     ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
+    [projectId, 'schema_fingerprint', fingerprint]
+  );
 }
 
 // ─── INIT PRE-FLIGHT HELPERS ──────────────────────────────────────────────────
@@ -905,6 +1068,15 @@ async function cmdLoaderLoad(opts = {}) {
       console.error(`DB connection failed: ${err.message}`);
       process.exit(1);
     }
+  }
+
+  // Deliverable A: auto-apply additive schema on drift (non-fatal).
+  // Runs immediately after DB connect, before retrieval_contract SELECT.
+  // Any error here must NOT abort resume/load — wrap and continue.
+  try {
+    await ensureSchemaCurrent(db, projectId, { silent: opts.silent === true });
+  } catch (schemaErr) {
+    process.stderr.write('[handoff] schema auto-apply failed (non-fatal): ' + schemaErr.message + '\n');
   }
 
   // Load retrieval_contract
@@ -2038,6 +2210,56 @@ async function cmdClose(args) {
     process.exit(1);
   }
 
+  // Deliverable A: auto-apply additive schema on drift (non-fatal).
+  // Runs immediately after DB connect, before payload processing.
+  // Any error here must NOT abort close — wrap and continue.
+  try {
+    await ensureSchemaCurrent(db, projectId, { silent: false });
+  } catch (schemaErr) {
+    process.stderr.write('[handoff] schema auto-apply failed (non-fatal): ' + schemaErr.message + '\n');
+  }
+
+  // Deliverable B: deterministic has_unpackaged_state assertion.
+  // Strip any model-supplied has_unpackaged_state assertions from the payload and
+  // replace with a single authoritative code-computed one.  This applies to BOTH
+  // the async (enqueue) path and the synchronous (writeExtraction) path.
+  {
+    const originalCount = (payload.assertions || []).length;
+    const filtered = (payload.assertions || []).filter((a) => {
+      if (typeof a.predicate === 'string' &&
+          a.predicate.trim().toLowerCase() === 'has_unpackaged_state') {
+        process.stderr.write(
+          '[handoff] discarded model-supplied has_unpackaged_state assertion — packaging state is computed authoritatively\n'
+        );
+        return false;
+      }
+      return true;
+    });
+    if (filtered.length < originalCount) {
+      payload = Object.assign({}, payload, { assertions: filtered });
+    }
+
+    // Compute authoritative packaging state and inject canonical assertion.
+    try {
+      const packState = detectUnpackagedState(root);
+      const canonicalPackAssertion = {
+        subject:    path.basename(root),
+        predicate:  'has_unpackaged_state',
+        object:     packState.unpackaged ? ('dirty — ' + packState.label) : 'clean',
+        confidence: 9,
+        source:     'user_stated',
+      };
+      payload = Object.assign({}, payload, {
+        assertions: (payload.assertions || []).concat([canonicalPackAssertion]),
+      });
+    } catch (packComputeErr) {
+      // Non-fatal: if detectUnpackagedState fails, skip the canonical assertion.
+      process.stderr.write(
+        '[handoff] packaging state compute failed (non-fatal): ' + packComputeErr.message + '\n'
+      );
+    }
+  }
+
   // ── Async extraction gate (opt-in, default OFF = synchronous as before) ──────
   // When extraction_async_enabled='true', validate the payload and enqueue it for
   // the deterministic background worker (queue-drain subcommand). The whole payload
@@ -2580,29 +2802,15 @@ async function cmdClose(args) {
     process.stderr.write(`[handoff] C3 contract evolution failed (non-fatal): ${evolutionErr.message}\n`);
   }
 
-  // ── Packaging-honesty probe (non-fatal, synchronous close path only) ─────────
+  // ── Packaging-honesty display (non-fatal, synchronous close path only) ────────
   //
-  // Detects whether the session's work is already committed and pushed.
-  // Writes a 1:1 assertion (superseding the prior session's row) so the close
-  // record is "true to itself" — next-session resume will see the actual state.
+  // Detects whether the session's work is already committed and pushed, and
+  // displays the result.  The has_unpackaged_state assertion is now written
+  // authoritatively via payload.assertions (injected above, before writeExtraction)
+  // so no separate writeAssertionWithSupersession call is needed here.
   // NEVER blocks, commits, stashes, pushes, or mutates the repository.
   try {
-    const packState    = detectUnpackagedState(root);
-    const closeSessionId = (typeof payload.session_id === 'string' && payload.session_id.length > 0)
-      ? payload.session_id
-      : await getSetting(db, projectId, 'session_in_progress', null);
-
-    const packSubject = `${path.basename(root)} working tree`;
-    const packObject  = packState.unpackaged ? packState.label : 'clean';
-
-    await writeAssertionWithSupersession(db, projectId, {
-      subject:    packSubject,
-      predicate:  'has_unpackaged_state',
-      object:     packObject,
-      confidence: 8,
-      source:     'model_extracted',
-    }, closeSessionId, registryMode);
-
+    const packState = detectUnpackagedState(root);
     if (packState.unpackaged) {
       console.log(`\n  packaging:           UNPACKAGED — ${packState.label}`);
       console.log('  (session work is not fully committed/pushed; close record reflects actual state)');

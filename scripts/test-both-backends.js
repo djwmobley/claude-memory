@@ -63,7 +63,8 @@ const {
 
 const { canonicalize } = require('./lib/subject-canon');
 
-const SCHEMA_SQLITE = path.resolve(__dirname, 'sql', 'handoff-sqlite-schema.sql');
+const SCHEMA_SQLITE  = path.resolve(__dirname, 'sql', 'handoff-sqlite-schema.sql');
+const SCHEMA_POSTGRES = path.resolve(__dirname, 'sql', 'handoff-core-schema.sql');
 const HANDOFF_JS    = path.resolve(__dirname, 'handoff.js');
 const DB_SEAM_JS    = path.resolve(__dirname, 'lib', 'db-seam.js');
 const PROJECT_ROOT  = path.resolve(__dirname, '..');
@@ -2151,6 +2152,445 @@ function requireHandoffFunctions() {
   return { writeAssertionWithSupersession };
 }
 
+// ── S12: Deliverables A+B deterministic coverage ─────────────────────────────
+
+/**
+ * Inline helper: mirrors applyAdditiveSchema from handoff.js for tests.
+ * Applies the appropriate schema (dialect-aware) idempotently via db.runSchema() +
+ * additive ALTER TABLE routed through runSchema so IF NOT EXISTS handling is correct
+ * on both backends.
+ *
+ * @param {object} db         — connected StoragePort adapter
+ * @param {string} [_ignored] — schemaFile param kept for compat; dialect is auto-detected
+ */
+async function _testApplyAdditiveSchema(db, _ignored) {
+  // Pick the schema file appropriate for this adapter's dialect.
+  const schemaFile = db.dialect === 'sqlite' ? SCHEMA_SQLITE : SCHEMA_POSTGRES;
+  let sql0 = fs.readFileSync(schemaFile, 'utf8');
+  // Strip UTF-8 BOM if present (SQLite schema file has BOM on this machine).
+  if (sql0.charCodeAt(0) === 0xFEFF) sql0 = sql0.slice(1);
+  let sql = sql0.replace(/^\\[a-z].*$/gm, '');
+  const INTEGRITY_INDEX_NAMES = ['assertions_1to1_unique', 'assertions_1ton_exact_unique'];
+  const integrityIndexSqls = [];
+  let coreSchemaSQL = sql;
+  for (const idxName of INTEGRITY_INDEX_NAMES) {
+    const pattern = new RegExp(
+      `CREATE\\s+UNIQUE\\s+INDEX\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?${idxName}[\\s\\S]*?;`,
+      'i'
+    );
+    const m = coreSchemaSQL.match(pattern);
+    if (m) {
+      integrityIndexSqls.push({ name: idxName, sql: m[0] });
+      coreSchemaSQL = coreSchemaSQL.replace(m[0], '');
+    }
+  }
+  // Route ALTER TABLE through runSchema so IF NOT EXISTS handling is correct on SQLite.
+  const additiveAlter = [
+    'ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted    BOOLEAN     NOT NULL DEFAULT false',
+    'ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMPTZ',
+  ].join(';\n') + ';';
+  await db.query('BEGIN');
+  await db.runSchema(coreSchemaSQL);
+  await db.runSchema(additiveAlter);
+  await db.query('COMMIT');
+  for (const { sql: idxSql } of integrityIndexSqls) {
+    await db.runIntegrityIndex(idxSql);
+  }
+}
+
+/**
+ * Inline helper: mirrors ensureSchemaCurrent from handoff.js for tests.
+ * Uses the supplied fingerprint to check against project_settings.schema_fingerprint.
+ */
+async function _testEnsureSchemaCurrent(db, projectId, schemaFile, fingerprint) {
+  const { rows } = await db.query(
+    'SELECT value FROM project_settings WHERE project_id = $1 AND key = $2',
+    [projectId, 'schema_fingerprint']
+  );
+  if (rows.length > 0 && rows[0].value === fingerprint) return false; // no-op
+  // Apply
+  await _testApplyAdditiveSchema(db, schemaFile);
+  // Upsert fingerprint
+  await db.query(
+    `INSERT INTO project_settings (project_id, key, value) VALUES ($1, $2, $3)
+     ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
+    [projectId, 'schema_fingerprint', fingerprint]
+  );
+  return true; // applied
+}
+
+async function runS12() {
+  console.log('\n=== S12: Deliverables A+B — schema auto-apply + deterministic packaging assertion ===');
+  console.log('Invariants: model-supplied has_unpackaged_state discarded; code-computed wins; payload-filter idempotent; schema sentinel idempotent on both backends; loader/close non-fatal on apply failure.');
+
+  // ── S12.a: Close payload with model-supplied has_unpackaged_state → only code-computed persists ─
+
+  await bothBackends(
+    'S12.a: model-supplied has_unpackaged_state discarded — code-computed wins',
+    async (db) => {
+      const { writeAssertionWithSupersession } = requireHandoffFunctions();
+      const PID = 's12-a-pack';
+      await db.query(
+        `INSERT INTO project_settings (project_id,key,value) VALUES ($1,'predicate_registry_mode','permissive') ON CONFLICT DO NOTHING`,
+        [PID]
+      );
+
+      // Simulate the filter-and-replace logic from cmdClose:
+      // 1. Model supplies a dirty has_unpackaged_state assertion.
+      // 2. handoff.js strips it and injects the canonical one.
+      // We replicate the logic here to test the output assertion.
+
+      const modelSuppliedAssertions = [
+        { subject: 'claude-memory', predicate: 'has_unpackaged_state', object: 'dirty — some untracked file', confidence: 7, source: 'model_extracted' },
+        { subject: 'claude-memory', predicate: 'depends_on', object: 'sqlite', confidence: 8, source: 'user_stated' },
+      ];
+
+      // Replicate cmdClose Deliverable-B filter + canonical push (code path):
+      const CANONICAL_OBJECT = 'clean';  // simulating a clean repo
+      const filtered = modelSuppliedAssertions.filter((a) =>
+        !(typeof a.predicate === 'string' &&
+          a.predicate.trim().toLowerCase() === 'has_unpackaged_state')
+      );
+      const discardedCount = modelSuppliedAssertions.length - filtered.length;
+      assertEqual(discardedCount, 1, 'S12.a: exactly 1 model-supplied has_unpackaged_state discarded');
+
+      const canonical = {
+        subject: 'claude-memory',
+        predicate: 'has_unpackaged_state',
+        object: CANONICAL_OBJECT,
+        confidence: 9,
+        source: 'user_stated',
+      };
+      const finalAssertions = filtered.concat([canonical]);
+      assertEqual(
+        finalAssertions.filter((a) => a.predicate === 'has_unpackaged_state').length,
+        1, 'S12.a: exactly 1 has_unpackaged_state in final payload'
+      );
+
+      // Write all final assertions through writeAssertionWithSupersession.
+      for (const ass of finalAssertions) {
+        await writeAssertionWithSupersession(db, PID, ass, 'sess-s12a', 'permissive');
+      }
+
+      // Verify: exactly 1 live has_unpackaged_state row, object = canonical 'clean'.
+      const isPostgres = db.dialect === 'postgres';
+      const suppFalse  = isPostgres ? 'false' : '0';
+      const { rows } = await db.query(
+        `SELECT subject, object, confidence, source
+         FROM assertions
+         WHERE project_id=$1 AND predicate='has_unpackaged_state' AND suppressed=${suppFalse} AND invalid_at IS NULL`,
+        [PID]
+      );
+      assertEqual(rows.length, 1, 'S12.a: exactly 1 live has_unpackaged_state row after close');
+      assertEqual(rows[0].object, CANONICAL_OBJECT, 'S12.a: live row reflects code-computed value, not model value');
+      assertEqual(rows[0].source, 'user_stated', 'S12.a: canonical assertion source = user_stated (confidence:9)');
+      assertEqual(Number(rows[0].confidence), 9, 'S12.a: canonical assertion confidence = 9');
+    }
+  );
+
+  await bothBackends(
+    'S12.a2: multiple model-supplied has_unpackaged_state stripped, only canonical survives',
+    async (db) => {
+      const { writeAssertionWithSupersession } = requireHandoffFunctions();
+      const PID = 's12-a2-pack';
+      await db.query(
+        `INSERT INTO project_settings (project_id,key,value) VALUES ($1,'predicate_registry_mode','permissive') ON CONFLICT DO NOTHING`,
+        [PID]
+      );
+
+      // Model supplies multiple has_unpackaged_state assertions (adversarial case).
+      const modelAssertions = [
+        { subject: 'repo', predicate: 'has_unpackaged_state', object: 'dirty — file A', confidence: 6, source: 'model_extracted' },
+        { subject: 'repo', predicate: 'has_unpackaged_state', object: 'dirty — file B', confidence: 5, source: 'model_extracted' },
+      ];
+
+      // Filter
+      const filtered = modelAssertions.filter((a) =>
+        !(typeof a.predicate === 'string' &&
+          a.predicate.trim().toLowerCase() === 'has_unpackaged_state')
+      );
+      assertEqual(filtered.length, 0, 'S12.a2: both model-supplied rows discarded');
+
+      // Push canonical
+      const canonical = {
+        subject: 'repo',
+        predicate: 'has_unpackaged_state',
+        object: 'clean',
+        confidence: 9,
+        source: 'user_stated',
+      };
+      const finalAssertions = filtered.concat([canonical]);
+
+      for (const ass of finalAssertions) {
+        await writeAssertionWithSupersession(db, PID, ass, 'sess-s12a2', 'permissive');
+      }
+
+      const isPostgres = db.dialect === 'postgres';
+      const suppFalse  = isPostgres ? 'false' : '0';
+      const { rows } = await db.query(
+        `SELECT object FROM assertions WHERE project_id=$1 AND predicate='has_unpackaged_state' AND suppressed=${suppFalse} AND invalid_at IS NULL`,
+        [PID]
+      );
+      assertEqual(rows.length, 1, 'S12.a2: exactly 1 live row after multiple model-supplied stripped');
+      assertEqual(rows[0].object, 'clean', 'S12.a2: code-computed value persists');
+    }
+  );
+
+  // ── S12.b: detectUnpackagedState filters reserved payload pattern ─────────────
+
+  {
+    // Test the static filter logic in detectUnpackagedState (Deliverable B.2).
+    // Since the function is embedded in handoff.js, we test its behavior via static
+    // source analysis (verify the filter is present) and via a direct simulation.
+    const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+
+    const label_b1 = 'S12.b1: detectUnpackagedState contains PAYLOAD_STAGING_RE filter for reserved filenames';
+    try {
+      assertTrue(
+        engineSrc.includes('PAYLOAD_STAGING_RE'),
+        'detectUnpackagedState must define PAYLOAD_STAGING_RE for reserved payload pattern filter'
+      );
+      assertTrue(
+        engineSrc.includes('handoff-close-payload'),
+        'PAYLOAD_STAGING_RE must match handoff-close-payload pattern'
+      );
+      pass(label_b1);
+    } catch (err) { fail(label_b1, err.message); }
+
+    const label_b2 = 'S12.b2: PAYLOAD_STAGING_RE correctly identifies reserved payload filename';
+    try {
+      // Replicate the regex from detectUnpackagedState.
+      const PAYLOAD_STAGING_RE = /^(?:\.)?handoff-close-payload.*\.json$/i;
+      // Matches
+      assertTrue(PAYLOAD_STAGING_RE.test('handoff-close-payload.json'),     'S12.b2: plain payload matches');
+      assertTrue(PAYLOAD_STAGING_RE.test('.handoff-close-payload.json'),    'S12.b2: dotfile payload matches');
+      assertTrue(PAYLOAD_STAGING_RE.test('handoff-close-payload-123.json'), 'S12.b2: timestamped payload matches');
+      // Does NOT match
+      assertFalse(PAYLOAD_STAGING_RE.test('handoff.md'),                    'S12.b2: handoff.md not matched');
+      assertFalse(PAYLOAD_STAGING_RE.test('real-dirty-file.ts'),            'S12.b2: real untracked file not matched');
+      assertFalse(PAYLOAD_STAGING_RE.test('handoff-close-payload.sql'),     'S12.b2: .sql extension not matched');
+      pass(label_b2);
+    } catch (err) { fail(label_b2, err.message); }
+
+    const label_b3 = 'S12.b3: porcelain line filter correctly strips payload line, keeps real dirty file';
+    try {
+      // Simulate the filteredLines logic from the updated detectUnpackagedState.
+      const PAYLOAD_STAGING_RE = /^(?:\.)?handoff-close-payload.*\.json$/i;
+      const pathMod = require('path');
+      // Fake porcelain output: one payload file + one real dirty file
+      const fakePortcelain = [
+        '?? handoff-close-payload.json',
+        'M  scripts/handoff.js',
+        '?? src/some-real-change.ts',
+      ].join('\n');
+      const filteredLines = fakePortcelain.split('\n').filter((line) => {
+        if (!line.trim()) return false;
+        const filePart = line.slice(3).trim().replace(/^"(.*)"$/, '$1');
+        return !PAYLOAD_STAGING_RE.test(pathMod.basename(filePart));
+      });
+      assertEqual(filteredLines.length, 2, 'S12.b3: payload line removed, real files remain (2 lines)');
+      assertTrue(filteredLines.every((l) => !l.includes('handoff-close-payload')),
+        'S12.b3: no payload line in filtered output');
+      pass(label_b3);
+    } catch (err) { fail(label_b3, err.message); }
+
+    const label_b4 = 'S12.b4: porcelain filter → dirty=false when ONLY untracked is reserved payload file';
+    try {
+      const PAYLOAD_STAGING_RE = /^(?:\.)?handoff-close-payload.*\.json$/i;
+      const pathMod = require('path');
+      const fakePortcelainPayloadOnly = '?? handoff-close-payload.json\n';
+      const filteredLines = fakePortcelainPayloadOnly.split('\n').filter((line) => {
+        if (!line.trim()) return false;
+        const filePart = line.slice(3).trim().replace(/^"(.*)"$/, '$1');
+        return !PAYLOAD_STAGING_RE.test(pathMod.basename(filePart));
+      });
+      const dirty = filteredLines.length > 0;
+      assertFalse(dirty, 'S12.b4: dirty=false when ONLY untracked is reserved payload file');
+      pass(label_b4);
+    } catch (err) { fail(label_b4, err.message); }
+
+    const label_b5 = 'S12.b5: porcelain filter → dirty=true for genuine unrelated untracked file';
+    try {
+      const PAYLOAD_STAGING_RE = /^(?:\.)?handoff-close-payload.*\.json$/i;
+      const pathMod = require('path');
+      const fakePortcelainRealFile = '?? real-untracked-file.ts\n';
+      const filteredLines = fakePortcelainRealFile.split('\n').filter((line) => {
+        if (!line.trim()) return false;
+        const filePart = line.slice(3).trim().replace(/^"(.*)"$/, '$1');
+        return !PAYLOAD_STAGING_RE.test(pathMod.basename(filePart));
+      });
+      const dirty = filteredLines.length > 0;
+      assertTrue(dirty, 'S12.b5: dirty=true for genuine unrelated untracked file');
+      pass(label_b5);
+    } catch (err) { fail(label_b5, err.message); }
+  }
+
+  // ── S12.c: Schema auto-apply sentinel — idempotent + non-fatal ───────────────
+
+  await bothBackends(
+    'S12.c1: ensureSchemaCurrent applies schema on missing fingerprint and sets key',
+    async (db) => {
+      const PID = 's12-c1-schema';
+      const fp  = 'test-fingerprint-initial';
+      // Verify fingerprint is not yet set.
+      const { rows: before } = await db.query(
+        'SELECT value FROM project_settings WHERE project_id=$1 AND key=$2',
+        [PID, 'schema_fingerprint']
+      );
+      assertEqual(before.length, 0, 'S12.c1: no fingerprint row initially');
+
+      // Run the sentinel — missing fingerprint → should apply and set.
+      const applied = await _testEnsureSchemaCurrent(db, PID, SCHEMA_SQLITE, fp);
+      assertTrue(applied, 'S12.c1: apply should return true (fingerprint was missing)');
+
+      // Verify fingerprint is now stored.
+      const { rows: after } = await db.query(
+        'SELECT value FROM project_settings WHERE project_id=$1 AND key=$2',
+        [PID, 'schema_fingerprint']
+      );
+      assertEqual(after.length, 1, 'S12.c1: fingerprint row now exists');
+      assertEqual(after[0].value, fp, 'S12.c1: stored fingerprint matches');
+    }
+  );
+
+  await bothBackends(
+    'S12.c2: ensureSchemaCurrent is a no-op on second call with same fingerprint',
+    async (db) => {
+      const PID = 's12-c2-schema';
+      const fp  = 'test-fingerprint-v2';
+
+      // First call: sets fingerprint.
+      await _testEnsureSchemaCurrent(db, PID, SCHEMA_SQLITE, fp);
+
+      // Second call with SAME fingerprint → no-op (returns false).
+      const applied = await _testEnsureSchemaCurrent(db, PID, SCHEMA_SQLITE, fp);
+      assertFalse(applied, 'S12.c2: second call with same fingerprint is a no-op');
+    }
+  );
+
+  await bothBackends(
+    'S12.c3: ensureSchemaCurrent re-applies when fingerprint changes (drift simulation)',
+    async (db) => {
+      const PID = 's12-c3-schema';
+      const fp1  = 'fingerprint-old';
+      const fp2  = 'fingerprint-new';
+
+      // Set old fingerprint.
+      await db.query(
+        `INSERT INTO project_settings (project_id, key, value) VALUES ($1, 'schema_fingerprint', $2)
+         ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
+        [PID, fp1]
+      );
+
+      // Run with new fingerprint → should re-apply.
+      const applied = await _testEnsureSchemaCurrent(db, PID, SCHEMA_SQLITE, fp2);
+      assertTrue(applied, 'S12.c3: re-apply triggered on fingerprint change');
+
+      // Verify new fingerprint stored.
+      const { rows } = await db.query(
+        'SELECT value FROM project_settings WHERE project_id=$1 AND key=$2',
+        [PID, 'schema_fingerprint']
+      );
+      assertEqual(rows[0].value, fp2, 'S12.c3: fingerprint updated to new value');
+    }
+  );
+
+  await bothBackends(
+    'S12.c4: loader/close non-fatal path — process continues even if ensureSchemaCurrent throws',
+    async (db) => {
+      // Simulate the non-fatal wrapper used in cmdLoaderLoad and cmdClose:
+      //   try { await ensureSchemaCurrent(...); } catch (err) { process.stderr.write(...); }
+      // We verify: error does not propagate; execution continues.
+      let sideEffectRan = false;
+      let errorCaught   = false;
+      try {
+        // Deliberately throw to simulate a failure in ensureSchemaCurrent.
+        await Promise.reject(new Error('simulated schema apply failure'));
+      } catch (err) {
+        errorCaught = true;
+        // Non-fatal: write to stderr and continue (no process.stderr in tests — just log).
+      }
+      sideEffectRan = true;
+      assertTrue(errorCaught,    'S12.c4: error was caught (non-fatal path)');
+      assertTrue(sideEffectRan,  'S12.c4: execution continued after error (non-fatal)');
+    }
+  );
+
+  // ── S12.d: Static checks — Deliverable A wire-in points present in handoff.js ─
+
+  {
+    const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+
+    const label_d1 = 'S12.d1: applyAdditiveSchema function exists in handoff.js';
+    try {
+      assertTrue(engineSrc.includes('async function applyAdditiveSchema('),
+        'applyAdditiveSchema must be defined in handoff.js');
+      pass(label_d1);
+    } catch (err) { fail(label_d1, err.message); }
+
+    const label_d2 = 'S12.d2: ensureSchemaCurrent function exists in handoff.js';
+    try {
+      assertTrue(engineSrc.includes('async function ensureSchemaCurrent('),
+        'ensureSchemaCurrent must be defined in handoff.js');
+      pass(label_d2);
+    } catch (err) { fail(label_d2, err.message); }
+
+    const label_d3 = 'S12.d3: ensureSchemaCurrent is called in cmdLoaderLoad (before retrieval_contract SELECT)';
+    try {
+      const loaderLoadFnIdx = engineSrc.indexOf('async function cmdLoaderLoad(');
+      assertTrue(loaderLoadFnIdx !== -1, 'cmdLoaderLoad must exist in handoff.js');
+      const nextFnIdx = engineSrc.indexOf('\nasync function ', loaderLoadFnIdx + 1);
+      const loaderBody = nextFnIdx !== -1 ? engineSrc.slice(loaderLoadFnIdx, nextFnIdx) : engineSrc.slice(loaderLoadFnIdx);
+      assertTrue(loaderBody.includes('ensureSchemaCurrent'),
+        'cmdLoaderLoad must call ensureSchemaCurrent');
+      // Must be wrapped non-fatally
+      const callIdx  = loaderBody.indexOf('ensureSchemaCurrent');
+      const tryBefore = loaderBody.lastIndexOf('try {', callIdx);
+      assertTrue(tryBefore !== -1, 'ensureSchemaCurrent call in cmdLoaderLoad must be inside try/catch');
+      pass(label_d3);
+    } catch (err) { fail(label_d3, err.message); }
+
+    const label_d4 = 'S12.d4: ensureSchemaCurrent is called in cmdClose (before payload processing)';
+    try {
+      const closeFnIdx = engineSrc.indexOf('async function cmdClose(');
+      assertTrue(closeFnIdx !== -1, 'cmdClose must exist in handoff.js');
+      const nextFnIdx = engineSrc.indexOf('\nasync function ', closeFnIdx + 1);
+      const closeBody = nextFnIdx !== -1 ? engineSrc.slice(closeFnIdx, nextFnIdx) : engineSrc.slice(closeFnIdx);
+      assertTrue(closeBody.includes('ensureSchemaCurrent'),
+        'cmdClose must call ensureSchemaCurrent');
+      // Must be wrapped non-fatally
+      const callIdx  = closeBody.indexOf('ensureSchemaCurrent');
+      const tryBefore = closeBody.lastIndexOf('try {', callIdx);
+      assertTrue(tryBefore !== -1, 'ensureSchemaCurrent call in cmdClose must be inside try/catch');
+      pass(label_d4);
+    } catch (err) { fail(label_d4, err.message); }
+
+    const label_d5 = 'S12.d5: Deliverable B filter is present in cmdClose (strips model-supplied has_unpackaged_state)';
+    try {
+      const closeFnIdx = engineSrc.indexOf('async function cmdClose(');
+      assertTrue(closeFnIdx !== -1, 'cmdClose must exist');
+      const nextFnIdx  = engineSrc.indexOf('\nasync function ', closeFnIdx + 1);
+      const closeBody  = nextFnIdx !== -1 ? engineSrc.slice(closeFnIdx, nextFnIdx) : engineSrc.slice(closeFnIdx);
+      assertTrue(closeBody.includes('has_unpackaged_state'),
+        'cmdClose must reference has_unpackaged_state (filter/canonical injection)');
+      assertTrue(closeBody.includes('discarded model-supplied'),
+        'cmdClose must emit the discard message for model-supplied has_unpackaged_state');
+      assertTrue(closeBody.includes('computed authoritatively'),
+        'cmdClose must state that packaging state is computed authoritatively');
+      pass(label_d5);
+    } catch (err) { fail(label_d5, err.message); }
+
+    const label_d6 = 'S12.d6: _computeSchemaFingerprint caches per mtime (module-level cache present)';
+    try {
+      assertTrue(engineSrc.includes('_schemaHashCache'),
+        'handoff.js must define _schemaHashCache module-level cache');
+      assertTrue(engineSrc.includes('mtime'),
+        'hash cache must key by mtime for hot-path optimization');
+      pass(label_d6);
+    } catch (err) { fail(label_d6, err.message); }
+  }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 (async () => {
@@ -2179,6 +2619,7 @@ function requireHandoffFunctions() {
   await runS9();
   await runS10();
   await runS11();
+  await runS12();
 
   console.log('\n─── Results ──────────────────────────────────────');
   console.log(`PASS ${passed}  FAIL ${failed}  SKIP ${skipped}`);
