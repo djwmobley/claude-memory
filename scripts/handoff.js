@@ -42,8 +42,7 @@ const { encodeCwd, getClaudeProjectDir }           = require('./lib/encoded-cwd'
 const { classifyPredicate }                        = require('./lib/predicate-registry');
 const { validatePayload }                          = require('./lib/payload-schema');
 const {
-  resolveDialect, createClient,
-  buildInClause, buildSQLiteGraphCTE,
+  resolveDialect, createAdapter, createInitProbe,
   resolveSQLiteDbPath,
 } = require('./lib/db-seam');
 
@@ -82,12 +81,14 @@ const OPERATING_CANON = `=== OPERATING CANON (trusted — applies to this and ev
 /**
  * Connect to the handoff DB.
  *
- * Storage backend selection (seam):
+ * Composition root — the SINGLE place where dialect is resolved and an adapter
+ * is selected.  Returns a StoragePort adapter (PostgresAdapter or SQLiteAdapter).
+ * The engine (this file) never inspects the dialect after this point; it calls
+ * only port methods that are identical across both adapters.
+ *
  *   - STORAGE_BACKEND=sqlite  → embedded SQLite at <project_root>/.claude/handoff.sqlite
  *     (or HANDOFF_SQLITE_PATH env var override)
  *   - STORAGE_BACKEND=postgres or unset → Postgres at TARGET_DB (unchanged default)
- *
- * Returns a PostgresClient or SQLiteClient — both present the same async query/end API.
  */
 async function connectHandoff() {
   const cfg     = loadConfig();
@@ -96,11 +97,11 @@ async function connectHandoff() {
   if (dialect === 'sqlite') {
     const root   = findProjectRoot();
     const dbPath = resolveSQLiteDbPath(root);
-    return createClient('sqlite', { dbPath });
+    return createAdapter('sqlite', { dbPath });
   }
 
-  // Postgres path (default) — behavior unchanged from pre-seam.
-  return createClient('postgres', {
+  // Postgres path (default) — behavior byte-identical to pre-abstraction.
+  return createAdapter('postgres', {
     host:     cfg.host,
     port:     cfg.port,
     database: TARGET_DB,
@@ -485,128 +486,6 @@ function checkNodeVersion() {
   return { ok: true, msg: `Node ${process.versions.node}`, fatal: false };
 }
 
-/** Check that the pg package is installed. Returns { ok, msg, fatal }. */
-function checkPgPackage() {
-  try {
-    require('pg');
-    return { ok: true, msg: 'pg package present', fatal: false };
-  } catch (_) {
-    return {
-      ok: false,
-      msg: 'pg package not installed — run: npm install (in scripts/)',
-      fatal: true,
-    };
-  }
-}
-
-/** Check that Postgres is reachable on the system DB. Returns { ok, msg, fatal }. */
-async function checkPostgresReachable(cfg) {
-  const { Client } = require('pg');
-  const client = new Client({
-    host:     cfg.host,
-    port:     cfg.port,
-    database: 'postgres',  // system DB — always exists
-    user:     cfg.user,
-  });
-  try {
-    await client.connect();
-    await client.end();
-    return { ok: true, msg: `Postgres reachable at ${cfg.host}:${cfg.port}`, fatal: false };
-  } catch (err) {
-    return {
-      ok: false,
-      msg: `Postgres not reachable at ${cfg.host}:${cfg.port} — is it running? (${err.message})`,
-      fatal: true,
-    };
-  }
-}
-
-/**
- * Check whether the target DB exists. If missing and autoCreate=true, create it.
- * If missing and autoCreate=false, prompt via readline (unless args includes -y).
- * Returns { ok, msg, fatal, created }.
- */
-async function checkOrCreateDatabase(cfg, dbName, autoCreate) {
-  const { Client } = require('pg');
-  // Connect to system DB for pg_database check / CREATE DATABASE
-  const sysClient = new Client({
-    host:     cfg.host,
-    port:     cfg.port,
-    database: 'postgres',
-    user:     cfg.user,
-  });
-  await sysClient.connect();
-  const { rows } = await sysClient.query(
-    'SELECT 1 FROM pg_database WHERE datname = $1',
-    [dbName]
-  );
-
-  if (rows.length > 0) {
-    await sysClient.end();
-    return { ok: true, msg: `Database '${dbName}' exists`, fatal: false, created: false };
-  }
-
-  // DB does not exist — decide what to do
-  if (autoCreate) {
-    await sysClient.query(`CREATE DATABASE "${dbName}"`);
-    await sysClient.end();
-    return { ok: true, msg: `Database '${dbName}' created (auto)`, fatal: false, created: true };
-  }
-
-  // Prompt interactively
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const answer = await new Promise((resolve) => {
-    rl.question(
-      `\n  Database '${dbName}' does not exist. Create it? [y/N]: `,
-      (a) => { rl.close(); resolve(a.trim()); }
-    );
-  });
-
-  if (answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes') {
-    await sysClient.query(`CREATE DATABASE "${dbName}"`);
-    await sysClient.end();
-    return { ok: true, msg: `Database '${dbName}' created`, fatal: false, created: true };
-  }
-
-  await sysClient.end();
-  return {
-    ok: false,
-    msg: `Database '${dbName}' does not exist. Create it manually: psql -c "CREATE DATABASE ${dbName}"`,
-    fatal: true,
-    created: false,
-  };
-}
-
-/** Check Postgres server version >= 13. Returns { ok, msg, fatal }. */
-async function checkPgVersion(cfg, dbName) {
-  const { Client } = require('pg');
-  const client = new Client({
-    host:     cfg.host,
-    port:     cfg.port,
-    database: dbName,
-    user:     cfg.user,
-  });
-  try {
-    await client.connect();
-    const { rows } = await client.query('SHOW server_version_num');
-    await client.end();
-    const vnum = parseInt(rows[0].server_version_num, 10);
-    // server_version_num is e.g. 140008 for 14.8
-    const major = Math.floor(vnum / 10000);
-    if (major < 13) {
-      return {
-        ok: false,
-        msg: `Postgres ${major} detected — recommend >= 13 (version_num=${vnum})`,
-        fatal: false,  // warn only
-      };
-    }
-    return { ok: true, msg: `Postgres ${major} (version_num=${vnum})`, fatal: false };
-  } catch (err) {
-    // Non-fatal: version check failure does not block init
-    return { ok: false, msg: `Could not check Postgres version: ${err.message}`, fatal: false };
-  }
-}
-
 /** Print a single pre-flight result line. */
 function printPreflightLine(result, stepDesc) {
   if (result.ok) {
@@ -631,45 +510,28 @@ async function cmdInit(args) {
   const claudeMdPath = path.join(root, 'CLAUDE.md');
   const autoCreate  = args.includes('-y');
 
-  const cfg     = loadConfig();
-  const dialect = resolveDialect(cfg);
+  const cfg = loadConfig();
 
   // ── Pre-flight checks ─────────────────────────────────────────────────────
 
-  // Step 1: Node version >= 18
+  // Step 1: Node version >= 18 (dialect-independent)
   const nodeCheck = checkNodeVersion();
   printPreflightLine(nodeCheck, 'Node version >= 18');
   if (nodeCheck.fatal) { process.exit(1); }
 
-  if (dialect === 'postgres') {
-    // Step 2 (Postgres only): pg package installed
-    const pgPkgCheck = checkPgPackage();
-    printPreflightLine(pgPkgCheck, 'pg package installed');
-    if (pgPkgCheck.fatal) { process.exit(1); }
-
-    // Step 3 (Postgres only): Postgres reachable
-    const pgReachCheck = await checkPostgresReachable(cfg);
-    printPreflightLine(pgReachCheck, `Postgres reachable at ${cfg.host}:${cfg.port}`);
-    if (pgReachCheck.fatal) { process.exit(1); }
-
-    // Step 4 (Postgres only): Target DB exists (create if needed)
-    const dbCheck = await checkOrCreateDatabase(cfg, TARGET_DB, autoCreate);
-    printPreflightLine(dbCheck, `Database '${TARGET_DB}' present`);
-    if (dbCheck.fatal) { process.exit(1); }
-
-    // Step 5 (Postgres only): Postgres version >= 13 (warn only)
-    const pgVerCheck = await checkPgVersion(cfg, TARGET_DB);
-    printPreflightLine(pgVerCheck, 'Postgres version >= 13');
-    // Not fatal — proceed regardless
-  } else {
-    // SQLite path: log the backend choice and db file path.
-    const dbPath = resolveSQLiteDbPath(root);
-    console.log(`  [OK]    Storage backend: SQLite (node:sqlite, embedded)`);
-    console.log(`  [OK]    SQLite database: ${dbPath}`);
+  // Steps 2-5: dialect-specific pre-flight — fully encapsulated inside the
+  // probe adapter. createInitProbe() resolves dialect once and returns the
+  // appropriate adapter. No dialect conditionals in this function.
+  const probeAdapter = createInitProbe(cfg);
+  try {
+    await probeAdapter.runInitPreflight(cfg, TARGET_DB, autoCreate, root, printPreflightLine);
+  } catch (err) {
+    // fatal errors thrown by runInitPreflight are already printed by printPreflightLine
+    process.exit(1);
   }
 
-  // Step 6: schema file present on disk (dialect-specific)
-  const schemaFileName = dialect === 'sqlite' ? 'handoff-sqlite-schema.sql' : 'handoff-core-schema.sql';
+  // Step 6: schema file present on disk — adapter knows the correct filename.
+  const schemaFileName = probeAdapter.schemaFileName;
   const schemaFile = path.resolve(__dirname, 'sql', schemaFileName);
   const schemaExists = fs.existsSync(schemaFile);
   if (schemaExists) {
@@ -679,24 +541,10 @@ async function cmdInit(args) {
     process.exit(1);
   }
 
-  // Connect to target DB (dialect-aware via seam)
+  // Connect to target DB — adapter handles dialect-specific connection setup.
   let db;
   try {
-    if (dialect === 'sqlite') {
-      const dbPath = resolveSQLiteDbPath(root);
-      db = await createClient('sqlite', { dbPath });
-    } else {
-      const { Client } = require('pg');
-      const pgClient = new Client({
-        host:     cfg.host,
-        port:     cfg.port,
-        database: TARGET_DB,
-        user:     cfg.user,
-      });
-      const { PostgresClient } = require('./lib/db-seam');
-      db = new PostgresClient(pgClient);
-      await db.connect();
-    }
+    db = await probeAdapter.connectForInit(cfg, TARGET_DB, root);
   } catch (err) {
     console.log(`  [FAIL]  DB connection failed — ${err.message}`);
     process.exit(1);
@@ -1077,25 +925,12 @@ async function cmdLoaderLoad(opts = {}) {
         for (const r of rows) retrievedAssertionIds.push(r.id);
         // 4C: Bump reinforcement timestamps ONLY for the rows actually returned
         // (per-row precision instead of project-wide or subject-wide).
-        // Postgres: id = ANY($1::int[]) — passes array directly.
-        // SQLite:   no native array params; expand to IN (?,?,?) via buildInClause.
         // OQ-2: AND suppressed=false prevents bumping suppressed history rows.
-        if (db.dialect === 'sqlite') {
-          const { clause: inClause, params: inParams } = buildInClause('id', retrievedAssertionIds);
-          if (retrievedAssertionIds.length > 0) {
-            await db.query(
-              `UPDATE assertions SET last_reinforced = datetime('now'), last_retrieved = datetime('now')
-               WHERE ${inClause} AND suppressed = 0`,
-              inParams
-            );
-          }
-        } else {
-          await db.query(
-            `UPDATE assertions SET last_reinforced = now(), last_retrieved = now()
-             WHERE id = ANY($1::int[])
-               AND suppressed = false`,
-            [retrievedAssertionIds]
-          );
+        // Dialect-specific SQL (IN vs ANY, now() vs datetime('now')) is
+        // encapsulated inside db.buildBumpAssertions() — no conditionals here.
+        const bumpStmt = db.buildBumpAssertions(retrievedAssertionIds);
+        if (bumpStmt) {
+          await db.query(bumpStmt.sql, bumpStmt.params);
         }
       }
 
@@ -1217,204 +1052,13 @@ async function cmdLoaderLoad(opts = {}) {
               await getSetting(db, projectId, 'graph_max_nodes', '25'), 10
             );
 
-            // Build direction-aware edge join clause.
-            // 'out': from_entity → to_entity (follow outgoing edges)
-            // 'in':  to_entity → from_entity (follow incoming edges)
-            // 'both': union of both directions
-            //
-            // Recursive CTE structure:
-            //   base:      seed entities at depth 0
-            //   recursive: join edges in chosen direction, depth + 1, cycle prevention
-            // Aggregate reached nodes excluding seeds themselves.
-            // All parameterized — no string interpolation of user values.
-
-            let cteReachSql;
-            if (direction === 'in') {
-              cteReachSql = `
-                WITH RECURSIVE graph_traverse(entity_name, depth, weight, from_e, edge_type, to_e, path) AS (
-                  -- Base: seeds at depth 0
-                  SELECT
-                    unnest($2::text[]) AS entity_name,
-                    0                  AS depth,
-                    1.0::float         AS weight,
-                    ''::text           AS from_e,
-                    ''::text           AS edge_type,
-                    ''::text           AS to_e,
-                    ARRAY[unnest($2::text[])] AS path
-                  UNION ALL
-                  -- Recursive: follow edges INBOUND (to_entity → from_entity)
-                  SELECT
-                    e.from_entity      AS entity_name,
-                    t.depth + 1        AS depth,
-                    e.weight           AS weight,
-                    e.from_entity      AS from_e,
-                    e.edge_type        AS edge_type,
-                    e.to_entity        AS to_e,
-                    t.path || e.from_entity AS path
-                  FROM edges e
-                  JOIN graph_traverse t ON e.to_entity = t.entity_name
-                  WHERE e.project_id = $1
-                    AND t.depth + 1 <= $3
-                    AND NOT (e.from_entity = ANY(t.path))
-                )
-                SELECT
-                  entity_name,
-                  MIN(depth) AS min_depth,
-                  MAX(weight) AS max_weight,
-                  (array_agg(from_e ORDER BY depth ASC, weight DESC))[1] AS rep_from,
-                  (array_agg(edge_type ORDER BY depth ASC, weight DESC))[1] AS rep_edge_type,
-                  (array_agg(to_e ORDER BY depth ASC, weight DESC))[1] AS rep_to
-                FROM graph_traverse
-                WHERE depth > 0
-                  AND NOT (entity_name = ANY($2::text[]))
-                GROUP BY entity_name
-                ORDER BY min_depth ASC, max_weight DESC, entity_name ASC
-                LIMIT $4
-              `;
-            } else if (direction === 'both') {
-              // PostgreSQL recursive CTEs do not allow two recursive references to the
-              // working table in a single WITH RECURSIVE. Use two separate CTEs (out + in)
-              // and UNION their results before aggregating.
-              cteReachSql = `
-                WITH RECURSIVE
-                gt_out(entity_name, depth, weight, from_e, edge_type, to_e, path) AS (
-                  -- Base: seeds at depth 0 (outbound traversal)
-                  SELECT
-                    unnest($2::text[]) AS entity_name,
-                    0                  AS depth,
-                    1.0::float         AS weight,
-                    ''::text           AS from_e,
-                    ''::text           AS edge_type,
-                    ''::text           AS to_e,
-                    ARRAY[unnest($2::text[])] AS path
-                  UNION ALL
-                  -- Recursive: follow edges OUTBOUND (from_entity → to_entity)
-                  SELECT
-                    e.to_entity        AS entity_name,
-                    t.depth + 1        AS depth,
-                    e.weight           AS weight,
-                    e.from_entity      AS from_e,
-                    e.edge_type        AS edge_type,
-                    e.to_entity        AS to_e,
-                    t.path || e.to_entity AS path
-                  FROM edges e
-                  JOIN gt_out t ON e.from_entity = t.entity_name
-                  WHERE e.project_id = $1
-                    AND t.depth + 1 <= $3
-                    AND NOT (e.to_entity = ANY(t.path))
-                ),
-                gt_in(entity_name, depth, weight, from_e, edge_type, to_e, path) AS (
-                  -- Base: seeds at depth 0 (inbound traversal)
-                  SELECT
-                    unnest($2::text[]) AS entity_name,
-                    0                  AS depth,
-                    1.0::float         AS weight,
-                    ''::text           AS from_e,
-                    ''::text           AS edge_type,
-                    ''::text           AS to_e,
-                    ARRAY[unnest($2::text[])] AS path
-                  UNION ALL
-                  -- Recursive: follow edges INBOUND (to_entity → from_entity)
-                  SELECT
-                    e.from_entity      AS entity_name,
-                    t.depth + 1        AS depth,
-                    e.weight           AS weight,
-                    e.from_entity      AS from_e,
-                    e.edge_type        AS edge_type,
-                    e.to_entity        AS to_e,
-                    t.path || e.from_entity AS path
-                  FROM edges e
-                  JOIN gt_in t ON e.to_entity = t.entity_name
-                  WHERE e.project_id = $1
-                    AND t.depth + 1 <= $3
-                    AND NOT (e.from_entity = ANY(t.path))
-                ),
-                combined AS (
-                  SELECT entity_name, depth, weight, from_e, edge_type, to_e
-                  FROM gt_out WHERE depth > 0 AND NOT (entity_name = ANY($2::text[]))
-                  UNION ALL
-                  SELECT entity_name, depth, weight, from_e, edge_type, to_e
-                  FROM gt_in  WHERE depth > 0 AND NOT (entity_name = ANY($2::text[]))
-                )
-                SELECT
-                  entity_name,
-                  MIN(depth) AS min_depth,
-                  MAX(weight) AS max_weight,
-                  (array_agg(from_e ORDER BY depth ASC, weight DESC))[1] AS rep_from,
-                  (array_agg(edge_type ORDER BY depth ASC, weight DESC))[1] AS rep_edge_type,
-                  (array_agg(to_e ORDER BY depth ASC, weight DESC))[1] AS rep_to
-                FROM combined
-                GROUP BY entity_name
-                ORDER BY min_depth ASC, max_weight DESC, entity_name ASC
-                LIMIT $4
-              `;
-            } else {
-              // Default: 'out' — follow outgoing edges from_entity → to_entity
-              cteReachSql = `
-                WITH RECURSIVE graph_traverse(entity_name, depth, weight, from_e, edge_type, to_e, path) AS (
-                  -- Base: seeds at depth 0
-                  SELECT
-                    unnest($2::text[]) AS entity_name,
-                    0                  AS depth,
-                    1.0::float         AS weight,
-                    ''::text           AS from_e,
-                    ''::text           AS edge_type,
-                    ''::text           AS to_e,
-                    ARRAY[unnest($2::text[])] AS path
-                  UNION ALL
-                  -- Recursive: follow edges OUTBOUND (from_entity → to_entity)
-                  SELECT
-                    e.to_entity        AS entity_name,
-                    t.depth + 1        AS depth,
-                    e.weight           AS weight,
-                    e.from_entity      AS from_e,
-                    e.edge_type        AS edge_type,
-                    e.to_entity        AS to_e,
-                    t.path || e.to_entity AS path
-                  FROM edges e
-                  JOIN graph_traverse t ON e.from_entity = t.entity_name
-                  WHERE e.project_id = $1
-                    AND t.depth + 1 <= $3
-                    AND NOT (e.to_entity = ANY(t.path))
-                )
-                SELECT
-                  entity_name,
-                  MIN(depth) AS min_depth,
-                  MAX(weight) AS max_weight,
-                  (array_agg(from_e ORDER BY depth ASC, weight DESC))[1] AS rep_from,
-                  (array_agg(edge_type ORDER BY depth ASC, weight DESC))[1] AS rep_edge_type,
-                  (array_agg(to_e ORDER BY depth ASC, weight DESC))[1] AS rep_to
-                FROM graph_traverse
-                WHERE depth > 0
-                  AND NOT (entity_name = ANY($2::text[]))
-                GROUP BY entity_name
-                ORDER BY min_depth ASC, max_weight DESC, entity_name ASC
-                LIMIT $4
-              `;
-            }
-
-            // ── Dialect-aware graph query execution ──────────────────────
-            // Postgres: pass seeds as a text[] array param — the CTE uses
-            //   unnest($2::text[]) and NOT (col = ANY($2::text[])).
-            // SQLite: no native array type; use buildSQLiteGraphCTE() which
-            //   expands each seed as an individual UNION ALL base row and
-            //   uses INSTR(path, '|' || entity || '|') for cycle prevention.
-            //   Traversal semantics (depth clamp <=5, node cap) are identical.
-            let graphRows;
-            if (db.dialect === 'sqlite') {
-              const { sql: sqliteCte, params: sqliteParams } =
-                buildSQLiteGraphCTE(direction, seeds, maxDepth, maxNodes, projectId);
-              const sqliteRes = await db.query(sqliteCte, sqliteParams);
-              graphRows = sqliteRes.rows;
-            } else {
-              const pgRes = await db.query(cteReachSql, [
-                projectId,
-                seeds,
-                maxDepth,
-                maxNodes,
-              ]);
-              graphRows = pgRes.rows;
-            }
+            // Build + execute the graph CTE.
+            // Dialect-specific SQL construction (ARRAY path for Postgres vs.
+            // delimited-string path for SQLite) is fully encapsulated in the
+            // adapter's buildGraphCTE() method — no conditionals in the engine.
+            const { sql: cteSql, params: cteParams } =
+              db.buildGraphCTE(direction, seeds, maxDepth, maxNodes, projectId);
+            const { rows: graphRows } = await db.query(cteSql, cteParams);
 
             if (graphRows.length > 0 && tokensUsed < tokenBudget) {
               const graphText = graphRows.map((r) =>
@@ -1457,33 +1101,14 @@ async function cmdLoaderLoad(opts = {}) {
     );
     // C1: attribute the retrieved assertions to this event.
     // Deduplicate ids (recency and assertion queries may overlap) and bulk-insert.
+    // Dialect-specific multi-row VALUES formatting is encapsulated in buildMultiPairInsert().
     const eventId = evtRes.rows[0] && evtRes.rows[0].id;
     if (eventId != null && retrievedAssertionIds.length > 0) {
       const uniqueIds = [...new Set(retrievedAssertionIds)];
-      if (db.dialect === 'sqlite') {
-        // SQLite: anonymous ? placeholders cannot be repeated. Build one row per insert
-        // or use a flat VALUES list with all params expanded. Flat expansion is cleaner.
-        const params = [];
-        const valuePlaceholders = uniqueIds.map((assertionId) => {
-          params.push(eventId, assertionId);
-          return '(?, ?)';
-        });
-        await db.query(
-          `INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES ${valuePlaceholders.join(', ')}`,
-          params
-        );
-      } else {
-        // Postgres: Build VALUES list: ($1, $2), ($1, $3), ... — $1 is reused for eventId.
-        const params = [eventId];
-        const valuePlaceholders = uniqueIds.map((assertionId, i) => {
-          params.push(assertionId);
-          return `($1, $${i + 2})`;
-        });
-        await db.query(
-          `INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES ${valuePlaceholders.join(', ')}`,
-          params
-        );
-      }
+      const insertStmt = db.buildMultiPairInsert(
+        'retrieval_event_assertions', 'event_id', 'assertion_id', eventId, uniqueIds
+      );
+      await db.query(insertStmt.sql, insertStmt.params);
     }
   } catch (evtErr) {
     if (!silent) console.error(`[handoff] retrieval_events insert failed (non-fatal): ${evtErr.message}`);
@@ -1505,54 +1130,20 @@ async function cmdLoaderLoad(opts = {}) {
       if (runRes.rows.length > 0) {
         const latestRunId = runRes.rows[0].run_id;
         // Find community_ids for the hit entities in this run.
-        // Dialect split: Postgres uses entity_name = ANY($3); SQLite uses IN (?,?,?).
-        let communityRes;
-        if (db.dialect === 'sqlite') {
-          const { clause: nameInClause, params: nameInParams } = buildInClause('entity_name', retrievedEntityNames);
-          communityRes = await db.query(
-            `SELECT DISTINCT community_id FROM entity_communities
-             WHERE project_id = ? AND run_id = ? AND ${nameInClause}`,
-            [projectId, latestRunId, ...nameInParams]
-          );
-        } else {
-          communityRes = await db.query(
-            `SELECT DISTINCT community_id FROM entity_communities
-             WHERE project_id = $1 AND run_id = $2 AND entity_name = ANY($3)`,
-            [projectId, latestRunId, retrievedEntityNames]
-          );
-        }
+        // buildCommunityIdsQuery() encapsulates the dialect-specific array lookup.
+        const cidQ = db.buildCommunityIdsQuery(projectId, latestRunId, retrievedEntityNames);
+        const communityRes = await db.query(cidQ.sql, cidQ.params);
         if (communityRes.rows.length > 0) {
           const communityIds = communityRes.rows.map((r) => r.community_id);
           const clusterMaxSiblings = parseInt(
             await getSetting(db, projectId, 'cluster_max_siblings', '10'), 10
           );
           // Fetch sibling entities in the same communities, excluding already-retrieved ones.
-          // Dialect split: Postgres uses ANY($3) and <> ALL($4); SQLite uses IN/NOT IN.
-          let siblingRes;
-          if (db.dialect === 'sqlite') {
-            const { clause: cidInClause, params: cidInParams }     = buildInClause('community_id', communityIds);
-            const { clause: nameNotInClause, params: nameNotInParams } =
-              retrievedEntityNames.length > 0
-                ? { clause: `entity_name NOT IN (${retrievedEntityNames.map(() => '?').join(', ')})`, params: retrievedEntityNames.slice() }
-                : { clause: '1=1', params: [] };
-            siblingRes = await db.query(
-              `SELECT DISTINCT entity_name FROM entity_communities
-               WHERE project_id = ? AND run_id = ?
-                 AND ${cidInClause}
-                 AND ${nameNotInClause}
-               LIMIT ?`,
-              [projectId, latestRunId, ...cidInParams, ...nameNotInParams, clusterMaxSiblings]
-            );
-          } else {
-            siblingRes = await db.query(
-              `SELECT DISTINCT entity_name FROM entity_communities
-               WHERE project_id = $1 AND run_id = $2
-                 AND community_id = ANY($3)
-                 AND entity_name <> ALL($4)
-               LIMIT $5`,
-              [projectId, latestRunId, communityIds, retrievedEntityNames, clusterMaxSiblings]
-            );
-          }
+          // buildSiblingsQuery() encapsulates the dialect-specific IN/ANY and NOT IN/<>ALL.
+          const sibQ = db.buildSiblingsQuery(
+            projectId, latestRunId, communityIds, retrievedEntityNames, clusterMaxSiblings
+          );
+          const siblingRes = await db.query(sibQ.sql, sibQ.params);
           if (siblingRes.rows.length > 0 && tokensUsed < tokenBudget) {
             const siblingText = siblingRes.rows.map((r) => `- ${r.entity_name}`).join('\n');
             sections.push(`### Related (community)\n${siblingText}`);

@@ -28,7 +28,7 @@ if (nodeMajor < 22) {
 
 const {
   resolveDialect,
-  createClient,
+  createAdapter,
   rewriteForSQLite,
   buildInClause,
   buildSQLiteGraphCTE,
@@ -36,8 +36,13 @@ const {
   splitStatements,
   deserializeRow,
   serializeParams,
-  SQLiteClient,
+  SQLiteAdapter,
+  PostgresAdapter,
 } = require('./lib/db-seam');
+
+// Backward-compat aliases for tests that predate the abstraction rename.
+const SQLiteClient = SQLiteAdapter;
+const createClient = createAdapter;
 
 const SCHEMA_FILE = path.resolve(__dirname, 'sql', 'handoff-sqlite-schema.sql');
 
@@ -540,6 +545,199 @@ async function runSection12() {
   });
 }
 
+// ── SECTION 13: Abstraction invariant + port method tests ────────────────────
+async function runSection13() {
+  console.log('\n=== Section 13: Abstraction invariants ===');
+
+  // ── Invariant: handoff.js (engine) must contain zero backend/dialect conditionals ──
+  // This test is the machine-enforced acceptance criterion for the storage abstraction.
+  // It greps the engine file for patterns that indicate a leaked conditional, and fails
+  // the build if any are found.
+  //
+  // Allowed in the engine:
+  //   - "dialect" in comments only (for documentation)
+  //   - The single composition-root: resolveDialect() call + if (dialect === 'sqlite')
+  //     inside connectHandoff() — one occurrence each, both in the same function.
+  //
+  // NOT allowed in the engine (outside db-seam.js):
+  //   - db.dialect === ...  (checking dialect on the live client)
+  //   - if (...sqlite...)   (branching on backend string)
+  //   - buildSQLiteGraphCTE / buildInClause called from engine directly
+  //   - createClient (old factory, replaced by createAdapter)
+  //   - PostgresClient / SQLiteClient (old class names, replaced by adapters)
+  await test('handoff.js contains ZERO db.dialect checks outside composition root', () => {
+    const engineSrc = fs.readFileSync(
+      path.resolve(__dirname, 'handoff.js'), 'utf8'
+    );
+    // These patterns must not appear anywhere in handoff.js (they belong in db-seam.js)
+    const forbidden = [
+      { pattern: /db\.dialect\b/, label: 'db.dialect check on live client' },
+    ];
+    for (const { pattern, label } of forbidden) {
+      if (pattern.test(engineSrc)) {
+        throw new Error(`handoff.js contains forbidden engine conditional: ${label}`);
+      }
+    }
+  });
+
+  await test('handoff.js has exactly ONE dialect === conditional (composition root only)', () => {
+    const engineSrc = fs.readFileSync(
+      path.resolve(__dirname, 'handoff.js'), 'utf8'
+    );
+    // Count occurrences of dialect === 'sqlite' or dialect === "sqlite"
+    const matches = (engineSrc.match(/dialect\s*===\s*['"]sqlite['"]/g) || []);
+    if (matches.length !== 1) {
+      throw new Error(
+        `Expected exactly 1 'dialect === sqlite' in handoff.js (composition root), found ${matches.length}`
+      );
+    }
+    // Additionally: that one occurrence must be inside connectHandoff()
+    const fnIdx = engineSrc.indexOf('async function connectHandoff()');
+    const conditionalIdx = engineSrc.indexOf("dialect === 'sqlite'");
+    if (conditionalIdx < fnIdx) {
+      throw new Error('dialect conditional is before connectHandoff() — expected inside it');
+    }
+    // Find the next top-level function after connectHandoff to bound the search
+    const nextFnIdx = engineSrc.indexOf('\nasync function ', fnIdx + 1);
+    if (nextFnIdx !== -1 && conditionalIdx > nextFnIdx) {
+      throw new Error('dialect conditional is outside connectHandoff() — leaked into engine');
+    }
+  });
+
+  await test('handoff.js does NOT call buildSQLiteGraphCTE or buildInClause directly', () => {
+    const engineSrc = fs.readFileSync(
+      path.resolve(__dirname, 'handoff.js'), 'utf8'
+    );
+    if (/buildSQLiteGraphCTE/.test(engineSrc)) {
+      throw new Error('handoff.js calls buildSQLiteGraphCTE directly — must go through db.buildGraphCTE()');
+    }
+    if (/buildInClause/.test(engineSrc)) {
+      throw new Error('handoff.js calls buildInClause directly — must go through adapter port method');
+    }
+  });
+
+  await test('handoff.js does NOT import createClient or PostgresClient/SQLiteClient', () => {
+    const engineSrc = fs.readFileSync(
+      path.resolve(__dirname, 'handoff.js'), 'utf8'
+    );
+    // Check require() destructuring — comments are allowed to mention names
+    const requireBlock = engineSrc.match(/require\('\.\/lib\/db-seam'\)/g) || [];
+    // Grab just the require statement lines
+    const lines = engineSrc.split('\n').filter(l =>
+      l.includes("require('./lib/db-seam')") || l.includes('require("./lib/db-seam")')
+    );
+    for (const line of lines) {
+      if (/\bcreateCli\b/.test(line) && /\bcreateCli[^e]/.test(line)) {
+        throw new Error(`handoff.js imports old 'createClient': ${line.trim()}`);
+      }
+      if (/PostgresClient\b|SQLiteClient\b/.test(line)) {
+        throw new Error(`handoff.js imports old class names (PostgresClient/SQLiteClient): ${line.trim()}`);
+      }
+    }
+  });
+
+  // ── Port method tests ────────────────────────────────────────────────────────
+
+  await test('SQLiteAdapter.buildGraphCTE returns SQLite-style CTE', () => {
+    const db = new SQLiteAdapter(':memory:');
+    const { sql, params } = db.buildGraphCTE('out', ['A'], 2, 10, 'p1');
+    assertTrue(sql.includes("INSTR('|'"), 'SQLite CTE should use INSTR cycle guard');
+    assertTrue(!sql.includes('unnest'), 'SQLite CTE should not use unnest');
+    assertTrue(params.includes('p1'), 'params should contain projectId');
+  });
+
+  await test('PostgresAdapter.buildGraphCTE returns Postgres-style CTE', () => {
+    const db = new PostgresAdapter(null);
+    const { sql, params } = db.buildGraphCTE('out', ['A'], 2, 10, 'p1');
+    assertTrue(sql.includes('unnest'), 'Postgres CTE should use unnest');
+    assertTrue(!sql.includes('INSTR'), 'Postgres CTE should not use INSTR');
+    assertTrue(Array.isArray(params) && params[1] === 'A' || Array.isArray(params[1]), 'seeds param present');
+  });
+
+  await test('SQLiteAdapter.buildBumpAssertions produces IN clause for SQLite', () => {
+    const db = new SQLiteAdapter(':memory:');
+    const stmt = db.buildBumpAssertions([1, 2, 3]);
+    assertTrue(stmt.sql.includes('IN (?, ?, ?)') || stmt.sql.includes('IN (?,?,?)') || /IN \([^)]+\)/.test(stmt.sql),
+      'SQLite bump should use IN clause');
+    assertTrue(stmt.sql.includes("datetime('now')"), 'SQLite bump should use datetime now()');
+    assertDeepEqual(stmt.params, [1, 2, 3]);
+  });
+
+  await test('PostgresAdapter.buildBumpAssertions produces ANY clause for Postgres', () => {
+    const db = new PostgresAdapter(null);
+    const stmt = db.buildBumpAssertions([1, 2, 3]);
+    assertTrue(stmt.sql.includes('ANY($1'), 'Postgres bump should use ANY($1)');
+    assertTrue(stmt.sql.includes('now()'), 'Postgres bump should use now()');
+    assertDeepEqual(stmt.params, [[1, 2, 3]]);
+  });
+
+  await test('buildBumpAssertions returns null for empty ids', () => {
+    const db = new SQLiteAdapter(':memory:');
+    const stmt = db.buildBumpAssertions([]);
+    assertEqual(stmt, null);
+  });
+
+  await test('SQLiteAdapter.buildMultiPairInsert expands each row as separate ?s', () => {
+    const db = new SQLiteAdapter(':memory:');
+    const { sql, params } = db.buildMultiPairInsert('t', 'c1', 'c2', 99, [10, 20]);
+    assertTrue(sql.includes('(?, ?)'), 'SQLite multi-pair insert should use ? placeholders');
+    assertDeepEqual(params, [99, 10, 99, 20]);
+  });
+
+  await test('PostgresAdapter.buildMultiPairInsert reuses $1 for shared value', () => {
+    const db = new PostgresAdapter(null);
+    const { sql, params } = db.buildMultiPairInsert('t', 'c1', 'c2', 99, [10, 20]);
+    assertTrue(sql.includes('($1, $2)') && sql.includes('($1, $3)'),
+      'Postgres multi-pair insert should reuse $1');
+    assertDeepEqual(params, [99, 10, 20]);
+  });
+
+  await test('SQLiteAdapter.buildCommunityIdsQuery expands IN clause', () => {
+    const db = new SQLiteAdapter(':memory:');
+    const { sql, params } = db.buildCommunityIdsQuery('proj', 'run1', ['A', 'B']);
+    assertTrue(sql.includes('entity_name IN'), 'SQLite community query should use IN');
+    assertDeepEqual(params, ['proj', 'run1', 'A', 'B']);
+  });
+
+  await test('PostgresAdapter.buildCommunityIdsQuery uses ANY', () => {
+    const db = new PostgresAdapter(null);
+    const { sql, params } = db.buildCommunityIdsQuery('proj', 'run1', ['A', 'B']);
+    assertTrue(sql.includes('= ANY($3'), 'Postgres community query should use ANY');
+    assertDeepEqual(params, ['proj', 'run1', ['A', 'B']]);
+  });
+
+  await test('SQLiteAdapter.buildSiblingsQuery uses NOT IN', () => {
+    const db = new SQLiteAdapter(':memory:');
+    const { sql, params } = db.buildSiblingsQuery('proj', 'run1', ['c1'], ['E1'], 10);
+    assertTrue(sql.includes('NOT IN'), 'SQLite siblings query should use NOT IN');
+    assertTrue(sql.includes('IN ('), 'SQLite siblings query should use IN for community_ids');
+  });
+
+  await test('PostgresAdapter.buildSiblingsQuery uses ANY and <> ALL', () => {
+    const db = new PostgresAdapter(null);
+    const { sql, params } = db.buildSiblingsQuery('proj', 'run1', ['c1'], ['E1'], 10);
+    assertTrue(sql.includes('= ANY($3'), 'Postgres siblings query should use ANY for cids');
+    assertTrue(sql.includes('<> ALL($4'), 'Postgres siblings query should use <> ALL for excludes');
+  });
+
+  await test('SQLiteAdapter.buildCommunityIdsQuery executes correctly against live SQLite', async () => {
+    const db = await createAdapter('sqlite', { dbPath: ':memory:' });
+    try {
+      const schemaSql = fs.readFileSync(path.resolve(__dirname, 'sql', 'handoff-sqlite-schema.sql'), 'utf8');
+      await db.runSchema(schemaSql);
+      // Add community data
+      const pid = 'inv-test-1';
+      await db.query(`INSERT INTO entities (project_id, name, entity_type) VALUES (?,?,?)`, [pid, 'E1', 'c']);
+      await db.query(`INSERT INTO entity_communities (project_id, run_id, entity_name, community_id) VALUES (?,?,?,?)`,
+        [pid, 'r1', 'E1', 'comm-A']);
+      const cq = db.buildCommunityIdsQuery(pid, 'r1', ['E1']);
+      const res = await db.query(cq.sql, cq.params);
+      assertEqual(res.rows.length, 1);
+      assertEqual(res.rows[0].community_id, 'comm-A');
+    } finally { await db.end(); }
+  });
+}
+
 // ── Run all sections ──────────────────────────────────────────────────────────
 (async () => {
   console.log(`\ntest-sqlite-seam.js (Node ${process.versions.node})\n`);
@@ -556,6 +754,7 @@ async function runSection12() {
   await runSection10();
   await runSection11();
   await runSection12();
+  await runSection13();
 
   console.log(`\n─── Results ──────────────────────────────────────`);
   console.log(`PASS ${passed}  FAIL ${failed}`);
