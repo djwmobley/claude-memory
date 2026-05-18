@@ -103,7 +103,7 @@ Each distinct live predicate is tested against `recognizedPredicates()` from `sc
 PASS: all live predicates are in the registry.
 ```
 
-After this migration is applied, the post-condition check is expected to pass for all predicates in the `C--Users-djwmo-dev-claude-memory` project.
+After this migration is applied, the post-condition check is expected to pass for all predicates in the target project.
 
 ---
 

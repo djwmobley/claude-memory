@@ -26,8 +26,8 @@ These rules are canon. They override convenience, time pressure, and apparent co
 
 ## Key paths
 
-- Handoff file: `C:\Users\djwmo\.claude\projects\C--Users-djwmo-dev-claude-memory\handoff.md`
-- Helper script: `C:\Users\djwmo\dev\claude-memory/scripts/handoff.js`
+- Handoff file: `~/.claude/projects/<encoded-cwd>/handoff.md` (populated by `/handoff:init`)
+- Helper script: `<repo-root>/scripts/handoff.js`
 
 ---
 
