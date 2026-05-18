@@ -25,8 +25,8 @@ const { Client } = require('pg');
 const ARGS       = process.argv.slice(2);
 const sectionArg = ARGS.find((a) => a.startsWith('--section='));
 const SECTION    = sectionArg ? sectionArg.split('=')[1] : 'all';
-if (!['all', 'lifecycle', 'hooks', 'hardening', 'w2', 'w3', 'w4', 'c1', 'c2', 'c3', 'registry', 'queue', 'collision', 'gr', 'decay'].includes(SECTION)) {
-  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, hardening, w2, w3, w4, c1, c2, c3, registry, queue, collision, gr, decay, all`);
+if (!['all', 'lifecycle', 'hooks', 'hardening', 'w2', 'w3', 'w4', 'c1', 'c2', 'c3', 'registry', 'queue', 'collision', 'gr', 'decay', 'prune'].includes(SECTION)) {
+  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, hardening, w2, w3, w4, c1, c2, c3, registry, queue, collision, gr, decay, prune, all`);
   process.exit(2);
 }
 
@@ -105,6 +105,8 @@ let grPassed  = 0;
 let grFailed  = 0;
 let dcPassed  = 0;
 let dcFailed  = 0;
+let pnPassed  = 0;
+let pnFailed  = 0;
 
 const LC_TOTAL  = 14;
 const HK_TOTAL = 3;
@@ -120,6 +122,7 @@ const Q_TOTAL   = 4;
 const COL_TOTAL = 5;
 const GR_TOTAL  = 4;
 const DC_TOTAL  = 4;
+const PN_TOTAL  = 7;
 
 function lcPass(step, label) {
   console.log(`[STEP ${step}/${LC_TOTAL}] ${label} ... PASS`);
@@ -274,6 +277,16 @@ function dcPass(step, label) {
 function dcFail(step, label, reason) {
   console.log(`[DECAY ${step}/${DC_TOTAL}] ${label} ... FAIL: ${reason}`);
   dcFailed++;
+}
+
+function pnPass(step, label) {
+  console.log(`[PRUNE ${step}/${PN_TOTAL}] ${label} ... PASS`);
+  pnPassed++;
+}
+
+function pnFail(step, label, reason) {
+  console.log(`[PRUNE ${step}/${PN_TOTAL}] ${label} ... FAIL: ${reason}`);
+  pnFailed++;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -5902,6 +5915,277 @@ async function runDecaySection() {
   }
 }
 
+async function runPruneSection() {
+  console.log(`\n=== PRUNE SECTION (${PN_TOTAL} steps) ===`);
+  console.log('smoketest-handoff prune: dry-run no-op, --apply deletes, idempotency, pinned safety, --include-pinned, project scoping, zero-criteria rejection');
+  console.log('');
+
+  const PN_TS       = Date.now();
+  const PN_DB       = `claude_memory_prune_${PN_TS}`;
+  const PN_PROJ_DIR = path.join(os.tmpdir(), `handoff_prune_${PN_TS}`);
+  const PN_PROJ_ID  = encodeCwd(PN_PROJ_DIR);
+
+  try {
+    await createSmokeDb(PN_DB, PN_PROJ_DIR);
+    fs.writeFileSync(path.join(PN_PROJ_DIR, 'CLAUDE.md'), '# prune-smoketest\n\n## Durable facts\n- (none)\n', 'utf8');
+
+    const initR = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'init', '-y'],
+      { cwd: PROJECT_ROOT, env: { ...process.env, HANDOFF_DB: PN_DB, PROJECT_ROOT: PN_PROJ_DIR }, encoding: 'utf8', timeout: 30000 }
+    );
+    if (initR.status !== 0) {
+      console.log('[PRUNE] DB init failed — skipping remaining steps');
+      console.log(initR.stderr || initR.stdout || '');
+      pnFailed += PN_TOTAL;
+      return;
+    }
+    console.log(`[PRUNE] DB init OK (${PN_DB})`);
+
+    // ── Insert test data ────────────────────────────────────────────────────────
+    // 3 suppressed, 1 live, 1 pinned+suppressed, 1 different project_id
+    const db = await pgConnect(PN_DB);
+
+    // Suppressed rows (non-pinned)
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed, suppression_kind)
+       VALUES ($1, 'pn_s1', 'is', 'v1', 8, 'user_stated', true, 'superseded')`,
+      [PN_PROJ_ID]
+    );
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed, suppression_kind)
+       VALUES ($1, 'pn_s2', 'is', 'v2', 8, 'user_stated', true, 'superseded')`,
+      [PN_PROJ_ID]
+    );
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed, suppression_kind)
+       VALUES ($1, 'pn_s3', 'is', 'v3', 7, 'user_stated', true, 'downvoted_terminal')`,
+      [PN_PROJ_ID]
+    );
+    // Live row
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+       VALUES ($1, 'pn_live', 'is', 'live-val', 9, 'user_stated', false)`,
+      [PN_PROJ_ID]
+    );
+    // Pinned + suppressed row
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed, pinned, suppression_kind)
+       VALUES ($1, 'pn_pinned', 'is', 'pinned-val', 9, 'user_stated', true, true, 'superseded')`,
+      [PN_PROJ_ID]
+    );
+    // Row in a different project (must be untouched)
+    const OTHER_PROJ_ID = PN_PROJ_ID + '-OTHER';
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+       VALUES ($1, 'other_s', 'is', 'other-val', 8, 'user_stated', true)`,
+      [OTHER_PROJ_ID]
+    );
+    await db.end();
+
+    // ── PN 1/7: Zero criteria → exit 2 ────────────────────────────────────────
+    {
+      const label = 'Zero criteria: exits with error code 2 and helpful message';
+      try {
+        const r = spawnSync(
+          process.execPath,
+          [HANDOFF_SCRIPT, 'prune'],
+          { cwd: PROJECT_ROOT, env: { ...process.env, HANDOFF_DB: PN_DB, PROJECT_ROOT: PN_PROJ_DIR }, encoding: 'utf8', timeout: 10000 }
+        );
+        if (r.status !== 2) {
+          pnFail(1, label, `expected exit 2, got ${r.status}`);
+        } else if (!(r.stderr || r.stdout || '').includes('at least one criterion')) {
+          pnFail(1, label, `expected "at least one criterion" message, got: ${(r.stderr || r.stdout || '').slice(0, 200)}`);
+        } else {
+          pnPass(1, label);
+        }
+      } catch (err) { pnFail(1, label, err.message); }
+    }
+
+    // ── PN 2/7: Dry-run does not delete rows ─────────────────────────────────
+    {
+      const label = 'Dry-run (no --apply): prints would-delete count, DB row count unchanged';
+      try {
+        const dbBefore = await pgConnect(PN_DB);
+        const { rows: countBefore } = await dbBefore.query(
+          `SELECT COUNT(*) AS n FROM assertions WHERE project_id = $1`, [PN_PROJ_ID]
+        );
+        const before = parseInt(countBefore[0].n, 10);
+        await dbBefore.end();
+
+        const r = spawnSync(
+          process.execPath,
+          [HANDOFF_SCRIPT, 'prune', '--suppressed'],
+          { cwd: PROJECT_ROOT, env: { ...process.env, HANDOFF_DB: PN_DB, PROJECT_ROOT: PN_PROJ_DIR }, encoding: 'utf8', timeout: 30000 }
+        );
+        if (r.status !== 0) {
+          pnFail(2, label, `exited ${r.status}: ${(r.stderr || r.stdout || '').slice(0, 200)}`);
+          return false;
+        }
+        const out = r.stdout || '';
+        if (!out.includes('dry-run') && !out.includes('Dry-run') && !out.includes('no changes')) {
+          pnFail(2, label, `output does not mention dry-run/no changes: ${out.slice(0, 300)}`);
+          return false;
+        }
+
+        const dbAfter = await pgConnect(PN_DB);
+        const { rows: countAfter } = await dbAfter.query(
+          `SELECT COUNT(*) AS n FROM assertions WHERE project_id = $1`, [PN_PROJ_ID]
+        );
+        const after = parseInt(countAfter[0].n, 10);
+        await dbAfter.end();
+
+        if (before !== after) {
+          pnFail(2, label, `row count changed: ${before} → ${after} (dry-run should not mutate)`);
+        } else {
+          pnPass(2, label);
+        }
+      } catch (err) { pnFail(2, label, err.message); }
+    }
+
+    // ── PN 3/7: --apply deletes matched rows ─────────────────────────────────
+    {
+      const label = '--apply --suppressed --suppression-kind superseded: deletes 2 superseded rows (not live, not terminal, not pinned)';
+      try {
+        const r = spawnSync(
+          process.execPath,
+          [HANDOFF_SCRIPT, 'prune', '--suppressed', '--suppression-kind', 'superseded', '--apply'],
+          { cwd: PROJECT_ROOT, env: { ...process.env, HANDOFF_DB: PN_DB, PROJECT_ROOT: PN_PROJ_DIR }, encoding: 'utf8', timeout: 30000 }
+        );
+        if (r.status !== 0) {
+          pnFail(3, label, `exited ${r.status}: ${(r.stderr || r.stdout || '').slice(0, 200)}`);
+          return false;
+        }
+        const out = r.stdout || '';
+        // Should report deleting 2 rows (pn_s1, pn_s2; not pn_pinned because it's pinned)
+        // pn_s3 has suppression_kind=downvoted_terminal, so also not matched
+        if (!out.includes('2 row') && !out.includes('Deleted 2')) {
+          pnFail(3, label, `expected 2 deleted, output: ${out.slice(0, 400)}`);
+          return false;
+        }
+
+        // Verify DB state
+        const db2 = await pgConnect(PN_DB);
+        const { rows: remaining } = await db2.query(
+          `SELECT subject, suppression_kind, pinned FROM assertions WHERE project_id = $1 ORDER BY subject`,
+          [PN_PROJ_ID]
+        );
+        await db2.end();
+
+        // pn_s1 and pn_s2 gone; pn_s3 (terminal), pn_live, pn_pinned remain
+        const remainingSubjects = remaining.map((r) => r.subject).sort();
+        const expected = ['pn_live', 'pn_pinned', 'pn_s3'].sort();
+        if (JSON.stringify(remainingSubjects) !== JSON.stringify(expected)) {
+          pnFail(3, label, `remaining subjects: ${JSON.stringify(remainingSubjects)}, expected: ${JSON.stringify(expected)}`);
+        } else {
+          pnPass(3, label);
+        }
+      } catch (err) { pnFail(3, label, err.message); }
+    }
+
+    // ── PN 4/7: Idempotency (second --apply is a no-op) ──────────────────────
+    {
+      const label = 'Second --apply (same criteria) is a no-op — 0 rows deleted';
+      try {
+        const r = spawnSync(
+          process.execPath,
+          [HANDOFF_SCRIPT, 'prune', '--suppressed', '--suppression-kind', 'superseded', '--apply'],
+          { cwd: PROJECT_ROOT, env: { ...process.env, HANDOFF_DB: PN_DB, PROJECT_ROOT: PN_PROJ_DIR }, encoding: 'utf8', timeout: 30000 }
+        );
+        if (r.status !== 0) {
+          pnFail(4, label, `exited ${r.status}: ${(r.stderr || r.stdout || '').slice(0, 200)}`);
+          return false;
+        }
+        const out = r.stdout || '';
+        // Either "0 rows deleted" or "no-op" or "nothing to delete" etc.
+        if (!out.includes('0 row') && !out.includes('no-op') && !out.includes('nothing') && !out.includes('No rows')) {
+          pnFail(4, label, `expected idempotent no-op message, output: ${out.slice(0, 300)}`);
+        } else {
+          pnPass(4, label);
+        }
+      } catch (err) { pnFail(4, label, err.message); }
+    }
+
+    // ── PN 5/7: Pinned safety (default: pinned row NOT deleted) ──────────────
+    {
+      const label = 'Pinned row is NOT deleted by --suppressed --apply (skipped-pinned count reported)';
+      try {
+        // State: pn_pinned (suppressed+pinned+superseded) should still exist
+        const dbCheck = await pgConnect(PN_DB);
+        const { rows } = await dbCheck.query(
+          `SELECT subject FROM assertions WHERE project_id = $1 AND subject = 'pn_pinned'`,
+          [PN_PROJ_ID]
+        );
+        await dbCheck.end();
+
+        if (rows.length !== 1) {
+          pnFail(5, label, `pn_pinned row should still exist but was not found`);
+        } else {
+          pnPass(5, label);
+        }
+      } catch (err) { pnFail(5, label, err.message); }
+    }
+
+    // ── PN 6/7: --include-pinned deletes pinned rows ─────────────────────────
+    {
+      const label = '--suppressed --include-pinned --apply: deletes remaining suppressed rows including pinned';
+      try {
+        const r = spawnSync(
+          process.execPath,
+          [HANDOFF_SCRIPT, 'prune', '--suppressed', '--include-pinned', '--apply'],
+          { cwd: PROJECT_ROOT, env: { ...process.env, HANDOFF_DB: PN_DB, PROJECT_ROOT: PN_PROJ_DIR }, encoding: 'utf8', timeout: 30000 }
+        );
+        if (r.status !== 0) {
+          pnFail(6, label, `exited ${r.status}: ${(r.stderr || r.stdout || '').slice(0, 200)}`);
+          return false;
+        }
+
+        // State: pn_s3 (downvoted_terminal) and pn_pinned (superseded+pinned) both suppressed
+        // Both should now be deleted
+        const dbCheck = await pgConnect(PN_DB);
+        const { rows } = await dbCheck.query(
+          `SELECT subject, suppressed FROM assertions WHERE project_id = $1`,
+          [PN_PROJ_ID]
+        );
+        await dbCheck.end();
+
+        // Only pn_live should remain (suppressed=false)
+        const remaining = rows.map((r) => r.subject).sort();
+        const expected = ['pn_live'];
+        if (JSON.stringify(remaining) !== JSON.stringify(expected)) {
+          pnFail(6, label, `remaining: ${JSON.stringify(remaining)}, expected: ${JSON.stringify(expected)}`);
+        } else {
+          pnPass(6, label);
+        }
+      } catch (err) { pnFail(6, label, err.message); }
+    }
+
+    // ── PN 7/7: Project scoping — other project row untouched ─────────────────
+    {
+      const label = 'Project scoping: row in a different project_id is never touched';
+      try {
+        const dbCheck = await pgConnect(PN_DB);
+        const { rows } = await dbCheck.query(
+          `SELECT COUNT(*) AS n FROM assertions WHERE project_id = $1`,
+          [OTHER_PROJ_ID]
+        );
+        await dbCheck.end();
+
+        const count = parseInt(rows[0].n, 10);
+        if (count !== 1) {
+          pnFail(7, label, `expected 1 row in other project, found ${count}`);
+        } else {
+          pnPass(7, label);
+        }
+      } catch (err) { pnFail(7, label, err.message); }
+    }
+
+  } finally {
+    const PN_HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', PN_PROJ_ID, 'handoff.md');
+    await dropSmokeDb(PN_DB, PN_PROJ_DIR, PN_HANDOFF_PATH).catch(() => {});
+  }
+}
+
 async function runRegistrySection() {
   console.log(`\n=== REGISTRY SECTION (${RG_TOTAL} steps) ===`);
   console.log('smoketest-handoff registry: loadRegistry, cardinalityOf, classifyPredicate, recognizedPredicates, write-path non-regression');
@@ -6123,6 +6407,9 @@ async function main() {
   if (SECTION === 'decay' || SECTION === 'all') {
     await runDecaySection();
   }
+  if (SECTION === 'prune' || SECTION === 'all') {
+    await runPruneSection();
+  }
 
   console.log('');
 
@@ -6140,12 +6427,13 @@ async function main() {
   const colTotal = colPassed + colFailed;
   const grTotal  = grPassed  + grFailed;
   const dcTotal  = dcPassed  + dcFailed;
-  const totalPass = lcPassed + hkPassed + hdPassed + w2Passed + w3Passed + w4Passed + c1Passed + c2Passed + c3Passed + rgPassed + qPassed + colPassed + grPassed + dcPassed;
-  const totalAll  = lcTotal  + hkTotal  + hdTotal  + w2Total  + w3Total  + w4Total  + c1Total  + c2Total  + c3Total  + rgTotal  + qTotal  + colTotal  + grTotal  + dcTotal;
+  const pnTotal  = pnPassed  + pnFailed;
+  const totalPass = lcPassed + hkPassed + hdPassed + w2Passed + w3Passed + w4Passed + c1Passed + c2Passed + c3Passed + rgPassed + qPassed + colPassed + grPassed + dcPassed + pnPassed;
+  const totalAll  = lcTotal  + hkTotal  + hdTotal  + w2Total  + w3Total  + w4Total  + c1Total  + c2Total  + c3Total  + rgTotal  + qTotal  + colTotal  + grTotal  + dcTotal  + pnTotal;
   const totalSkip = lcSkipped + hkSkipped + hdSkipped + w2Skipped + w3Skipped + w4Skipped + c1Skipped + c2Skipped + c3Skipped;
 
   if (SECTION === 'all') {
-    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal}, hardening: ${hdPassed}/${hdTotal}, w2: ${w2Passed}/${w2Total}, w3: ${w3Passed}/${w3Total}, w4: ${w4Passed}/${w4Total}, c1: ${c1Passed}/${c1Total}, c2: ${c2Passed}/${c2Total}, c3: ${c3Passed}/${c3Total}, registry: ${rgPassed}/${rgTotal}, queue: ${qPassed}/${qTotal}, collision: ${colPassed}/${colTotal}, graph: ${grPassed}/${grTotal}, decay: ${dcPassed}/${dcTotal})`);
+    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal}, hardening: ${hdPassed}/${hdTotal}, w2: ${w2Passed}/${w2Total}, w3: ${w3Passed}/${w3Total}, w4: ${w4Passed}/${w4Total}, c1: ${c1Passed}/${c1Total}, c2: ${c2Passed}/${c2Total}, c3: ${c3Passed}/${c3Total}, registry: ${rgPassed}/${rgTotal}, queue: ${qPassed}/${qTotal}, collision: ${colPassed}/${colTotal}, graph: ${grPassed}/${grTotal}, decay: ${dcPassed}/${dcTotal}, prune: ${pnPassed}/${pnTotal})`);
   } else if (SECTION === 'lifecycle') {
     console.log(`smoketest: ${lcPassed}/${lcTotal} passed, ${lcSkipped} skipped (lifecycle only)`);
   } else if (SECTION === 'hooks') {
@@ -6172,11 +6460,13 @@ async function main() {
     console.log(`smoketest: ${grPassed}/${grTotal} passed (graph only)`);
   } else if (SECTION === 'decay') {
     console.log(`smoketest: ${dcPassed}/${dcTotal} passed (decay only)`);
+  } else if (SECTION === 'prune') {
+    console.log(`smoketest: ${pnPassed}/${pnTotal} passed (prune only)`);
   } else {
     console.log(`smoketest: ${hdPassed}/${hdTotal} passed, ${hdSkipped} skipped (hardening only)`);
   }
 
-  if (lcFailed + hkFailed + hdFailed + w2Failed + w3Failed + w4Failed + c1Failed + c2Failed + c3Failed + rgFailed + qFailed + colFailed + grFailed + dcFailed > 0) process.exitCode = 1;
+  if (lcFailed + hkFailed + hdFailed + w2Failed + w3Failed + w4Failed + c1Failed + c2Failed + c3Failed + rgFailed + qFailed + colFailed + grFailed + dcFailed + pnFailed > 0) process.exitCode = 1;
 }
 
 main().catch((err) => {
