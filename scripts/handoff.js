@@ -51,6 +51,13 @@ const {
   resolveSQLiteDbPath,
 } = require('./lib/db-seam');
 const { canonicalize }                             = require('./lib/subject-canon');
+const {
+  MARKER_FILENAME,
+  findProjectRootByMarker,
+  readMarker,
+  writeMarker,
+} = require('./lib/project-marker');
+const { ensureProjectIdentity }                    = require('./lib/project-identity');
 
 process.on('exit', () => {
   const ms = Number(process.hrtime.bigint() - __startNs) / 1e6;
@@ -115,13 +122,36 @@ async function connectHandoff() {
   });
 }
 
-/** Resolve project_id for the current working directory. */
+/**
+ * Resolve project_id for the current working directory.
+ *
+ * LEGACY FALLBACK: this function is used by subcommands that do not connect
+ * to the DB (status, drop, purge, etc.) and by cmdInit. It returns the best
+ * available id WITHOUT running the one-shot migration.
+ *
+ * Resolution order:
+ *   1. If a .claude-memory marker exists at/above cwd → return the UUID.
+ *   2. Otherwise fall back to encodeCwd(root) for backward compatibility.
+ *
+ * For the authoritative identity (with migration), use ensureProjectIdentity()
+ * which is wired into cmdLoaderLoad and cmdClose.
+ */
 function resolveProjectId() {
+  // Honor PROJECT_ROOT env var to match the behavior of findProjectRoot() and
+  // ensureProjectIdentity() — subprocesses that set PROJECT_ROOT must not have
+  // their marker walk start from the node process's cwd (which may be the repo
+  // root and therefore find the wrong marker).
+  const startDir = process.env.PROJECT_ROOT || process.cwd();
+  const markerRoot = findProjectRootByMarker(startDir);
+  if (markerRoot) {
+    const marker = readMarker(markerRoot);
+    if (marker) return marker.uuid;
+  }
   const root = findProjectRoot();
   return encodeCwd(root);
 }
 
-/** Resolve the ~/.claude/projects/<encoded_cwd>/handoff.md path. */
+/** Resolve the ~/.claude/projects/<projectId>/handoff.md path. */
 function resolveHandoffMdPath(projectId) {
   return path.join(os.homedir(), '.claude', 'projects', projectId, 'handoff.md');
 }
@@ -675,8 +705,37 @@ function printPreflightLine(result, stepDesc) {
 async function cmdInit(args) {
   console.log('Running: handoff:init\n');
 
-  const root        = findProjectRoot();
-  const projectId   = encodeCwd(root);
+  // Determine project root: prefer the .claude-memory marker if present, else
+  // fall back to the .git walk (same as legacy behavior for the init case).
+  // Honor PROJECT_ROOT env var as the starting point, matching findProjectRoot().
+  const initCwd    = process.env.PROJECT_ROOT || process.cwd();
+  const markerRoot = findProjectRootByMarker(initCwd);
+  const root       = markerRoot || findProjectRoot();
+
+  // Resolve or mint the project marker so projectId is UUID-based.
+  // cmdInit is special: it doesn't have a live DB yet, so we can't call
+  // ensureProjectIdentity. Instead we read an existing marker or mint a new one.
+  let projectId;
+  {
+    const existingMarker = readMarker(root);
+    if (existingMarker) {
+      projectId = existingMarker.uuid;
+      console.log(`  [OK]    .claude-memory marker present: uuid=${projectId}`);
+    } else {
+      // Mint a new marker.
+      let newMarker;
+      try {
+        newMarker = writeMarker(root);
+      } catch (markerErr) {
+        console.log(`  [FAIL]  Could not write .claude-memory marker — ${markerErr.message}`);
+        process.exit(1);
+      }
+      projectId = newMarker.uuid;
+      console.log(`  [OK]    .claude-memory marker created: uuid=${projectId}`);
+      console.log(`          Path: ${path.join(root, MARKER_FILENAME)}`);
+    }
+  }
+
   const handoffPath = resolveHandoffMdPath(projectId);
   const claudeMdPath = path.join(root, 'CLAUDE.md');
   const autoCreate  = args.includes('-y');
@@ -1054,13 +1113,6 @@ async function cmdStatus() {
 async function cmdLoaderLoad(opts = {}) {
   const silent = opts.silent === true;
 
-  const projectId   = resolveProjectId();
-  const handoffPath = resolveHandoffMdPath(projectId);
-  const fm          = readHandoffFrontmatter(handoffPath);
-
-  const lastClose     = fm.last_close || null;
-  const daysSinceClose = daysSince(lastClose);
-
   // Use a caller-supplied DB connection when available (avoids double connect in hook path).
   let db = opts.db || null;
   let ownDb = false;
@@ -1074,11 +1126,32 @@ async function cmdLoaderLoad(opts = {}) {
     }
   }
 
+  // ── Identity resolution (MUST run before ensureSchemaCurrent) ────────────
+  // Ordering constraint: project_id (which keys the schema_fingerprint row)
+  // cannot be known until identity is resolved. ensureProjectIdentity is
+  // the FIRST internal-check step; ensureSchemaCurrent follows immediately.
+  let projectId;
+  try {
+    const identity = await ensureProjectIdentity(db, { silent });
+    projectId = identity.projectId;
+  } catch (idErr) {
+    // ensureProjectIdentity calls process.exit(1) on fatal errors.
+    // This catch is a belt-and-suspenders guard for unexpected throws.
+    process.stderr.write('[handoff] identity resolution failed (unexpected): ' + idErr.message + '\n');
+    process.exit(1);
+  }
+
+  const handoffPath = resolveHandoffMdPath(projectId);
+  const fm          = readHandoffFrontmatter(handoffPath);
+
+  const lastClose     = fm.last_close || null;
+  const daysSinceClose = daysSince(lastClose);
+
   // Deliverable A: auto-apply additive schema on drift (non-fatal).
-  // Runs immediately after DB connect, before retrieval_contract SELECT.
+  // Runs immediately after identity resolution, before retrieval_contract SELECT.
   // Any error here must NOT abort resume/load — wrap and continue.
   try {
-    await ensureSchemaCurrent(db, projectId, { silent: opts.silent === true });
+    await ensureSchemaCurrent(db, projectId, { silent });
   } catch (schemaErr) {
     process.stderr.write('[handoff] schema auto-apply failed (non-fatal): ' + schemaErr.message + '\n');
   }
@@ -2197,9 +2270,6 @@ async function cmdClose(args) {
   console.log('Running: handoff:close');
 
   const useJson = args.includes('--json') && args.includes('-');
-  const projectId   = resolveProjectId();
-  const handoffPath = resolveHandoffMdPath(projectId);
-  const root        = findProjectRoot();
 
   let payload = {};
   if (useJson) {
@@ -2214,8 +2284,26 @@ async function cmdClose(args) {
     process.exit(1);
   }
 
+  // ── Identity resolution (MUST run before ensureSchemaCurrent) ────────────
+  // Ordering constraint: project_id (which keys the schema_fingerprint row)
+  // cannot be known until identity is resolved. ensureProjectIdentity is
+  // the FIRST internal-check step; ensureSchemaCurrent follows immediately.
+  let projectId;
+  let root;
+  try {
+    const identity = await ensureProjectIdentity(db, { silent: false });
+    projectId = identity.projectId;
+    root      = identity.root;
+  } catch (idErr) {
+    // ensureProjectIdentity calls process.exit(1) on fatal errors.
+    process.stderr.write('[handoff] identity resolution failed (unexpected): ' + idErr.message + '\n');
+    process.exit(1);
+  }
+
+  const handoffPath = resolveHandoffMdPath(projectId);
+
   // Deliverable A: auto-apply additive schema on drift (non-fatal).
-  // Runs immediately after DB connect, before payload processing.
+  // Runs immediately after identity resolution, before payload processing.
   // Any error here must NOT abort close — wrap and continue.
   try {
     await ensureSchemaCurrent(db, projectId, { silent: false });

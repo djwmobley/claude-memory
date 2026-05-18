@@ -2824,6 +2824,757 @@ async function runS12() {
   );
 }
 
+// ── S13: PR-3a — Marker-borne project identity + one-shot migration ───────────
+//
+// Covers: I1–I7; the 3 idempotency states; conservation under seeded multi-table corpus;
+// collision abort; fatal-on-inconsistency; handoff.md copy-verify-delete ordering;
+// identity stability; VCS-agnosticism.
+
+async function runS13() {
+  console.log('\n=== S13: PR-3a — Marker identity + one-shot migration invariants ===');
+  console.log('Invariants: I1-I7; idempotency states; conservation; collision; fatal-on-inconsistency; VCS-agnosticism.');
+
+  // ── Local helpers ────────────────────────────────────────────────────────
+
+  // Import the modules under test (lazy, inside the section).
+  const {
+    MARKER_FILENAME,
+    findProjectRootByMarker,
+    readMarker,
+    writeMarker,
+    isValidUUID,
+  } = require('./lib/project-marker');
+
+  const {
+    ensureProjectIdentity,
+    PROJECT_ID_TABLES,
+    dumpRecoverySnapshot,
+    getSnapshotDir,
+    verifyByteIdentical,
+    runOneShot,
+  } = require('./lib/project-identity');
+
+  const { encodeCwd } = require('./lib/encoded-cwd');
+
+  // Helper: seed multi-table corpus under a given projectId on the given DB adapter.
+  async function seedCorpus(db, projectId, opts = {}) {
+    const rows = opts.rows || 3;
+    const isPostgres = db.dialect === 'postgres';
+    const suppFalse  = isPostgres ? 'false' : '0';
+    const nowExpr    = isPostgres ? 'now()' : "datetime('now')";
+
+    for (let i = 0; i < rows; i++) {
+      // entities
+      try {
+        await db.query(
+          `INSERT INTO entities (project_id, name, entity_type, description) VALUES ($1,$2,$3,$4)
+           ON CONFLICT (project_id, name) DO NOTHING`,
+          [projectId, `entity-${i}`, 'concept', `desc ${i}`]
+        );
+      } catch (_) {}
+      // assertions
+      try {
+        await db.query(
+          `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+           VALUES ($1,$2,'is_status',$3,7,'user_stated',${suppFalse})`,
+          [projectId, `subj-${i}`, `val-${i}`]
+        );
+      } catch (_) {}
+      // edges
+      try {
+        await db.query(
+          `INSERT INTO edges (project_id, from_entity, edge_type, to_entity) VALUES ($1,$2,'depends_on',$3)`,
+          [projectId, `entity-${i}`, `entity-${(i+1) % rows}`]
+        );
+      } catch (_) {}
+    }
+    // retrieval_contract (upsert 1 row)
+    try {
+      await db.query(
+        `INSERT INTO retrieval_contract (project_id, name, queries${isPostgres ? '' : ''})
+         VALUES ($1,'default','{"queries":[]}')
+         ON CONFLICT (project_id, name) DO NOTHING`,
+        [projectId]
+      );
+    } catch (_) {}
+    // project_settings (a few keys)
+    for (const k of ['staleness_days', 'loader_token_budget']) {
+      try {
+        await db.query(
+          `INSERT INTO project_settings (project_id, key, value) VALUES ($1,$2,$3)
+           ON CONFLICT (project_id, key) DO NOTHING`,
+          [projectId, k, '7']
+        );
+      } catch (_) {}
+    }
+  }
+
+  // Helper: count rows across ALL project-id tables for a given id.
+  async function totalCount(db, projectId) {
+    let total = 0;
+    for (const table of PROJECT_ID_TABLES) {
+      try {
+        const { rows } = await db.query(
+          `SELECT COUNT(*) AS n FROM ${table} WHERE project_id=$1`, [projectId]
+        );
+        total += parseInt(rows[0] && (rows[0].n || rows[0].count || 0), 10);
+      } catch (_) {}
+    }
+    return total;
+  }
+
+  // ── S13.1: Marker module — readMarker / writeMarker basics ───────────────
+
+  await bothBackends(
+    'S13.1: writeMarker mints valid UUID; readMarker returns it; double-write throws',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-1-'));
+      try {
+        const marker1 = writeMarker(tmpDir);
+        assertTrue(isValidUUID(marker1.uuid), 'S13.1: minted UUID is valid v4');
+        assertEqual(marker1.schema_version, 1, 'S13.1: schema_version = 1');
+        assertTrue(typeof marker1.created_at === 'string', 'S13.1: created_at is string');
+
+        const read = readMarker(tmpDir);
+        assertTrue(read !== null, 'S13.1: readMarker returns non-null');
+        assertEqual(read.uuid, marker1.uuid, 'S13.1: round-trip UUID matches');
+
+        // Double-write should throw.
+        let threw = false;
+        try { writeMarker(tmpDir); } catch (_) { threw = true; }
+        assertTrue(threw, 'S13.1: writeMarker throws if marker already exists');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  await bothBackends(
+    'S13.1b: findProjectRootByMarker returns correct root; null when absent',
+    async (db) => {
+      const tmpParent = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-1b-'));
+      try {
+        // Create a nested dir.
+        const nested = path.join(tmpParent, 'sub', 'deep');
+        fs.mkdirSync(nested, { recursive: true });
+
+        // No marker yet.
+        const noResult = findProjectRootByMarker(nested);
+        assertTrue(noResult === null, 'S13.1b: null when no marker in tree');
+
+        // Write marker at parent.
+        writeMarker(tmpParent);
+        const found = findProjectRootByMarker(nested);
+        assertEqual(found, tmpParent, 'S13.1b: found marker root from nested dir');
+      } finally {
+        try { fs.rmSync(tmpParent, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S13.2: STATE 4 — Fresh project (no marker, no legacy rows) ───────────
+
+  await bothBackends(
+    'S13.2: STATE 4 — fresh project mints marker, returns UUID as projectId',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-2-'));
+      try {
+        // No marker, no rows — genuinely fresh project.
+        const identity = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+        assertTrue(isValidUUID(identity.projectId), 'S13.2: projectId is valid UUID');
+        assertEqual(identity.root, tmpDir, 'S13.2: root is tmpDir');
+        assertTrue(identity.isNewProject, 'S13.2: isNewProject = true');
+
+        // Marker file must exist now.
+        const marker = readMarker(tmpDir);
+        assertTrue(marker !== null, 'S13.2: marker file written by ensureProjectIdentity');
+        assertEqual(marker.uuid, identity.projectId, 'S13.2: marker UUID matches returned projectId');
+
+        // DB has zero rows for this UUID.
+        const cnt = await totalCount(db, identity.projectId);
+        assertEqual(cnt, 0, 'S13.2: no rows under new UUID (fresh project)');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S13.3: STATE 1 — Already migrated (hot path) ─────────────────────────
+
+  await bothBackends(
+    'S13.3: STATE 1 — already-migrated project: no-op, UUID returned, no DB writes',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-3-'));
+      try {
+        // First call: mints marker.
+        const id1 = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+        // Seed some rows under the UUID.
+        await seedCorpus(db, id1.projectId, { rows: 2 });
+
+        // Second call: should be a no-op (STATE 1 hot path).
+        const id2 = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+        assertEqual(id2.projectId, id1.projectId, 'S13.3: same UUID on second call');
+        assertFalse(id2.isNewProject, 'S13.3: isNewProject = false on second call');
+
+        // Row count unchanged.
+        const cnt = await totalCount(db, id1.projectId);
+        assertTrue(cnt > 0, 'S13.3: rows still present after no-op call');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S13.4: STATE 3 — Standard migration (legacy rows, no marker) ──────────
+
+  await bothBackends(
+    'S13.4: STATE 3 — legacy rows, no marker → full one-shot migration; conservation holds',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-4-'));
+      try {
+        // Simulate a legacy project: rows under encodeCwd(tmpDir) but no marker.
+        const legacyId = encodeCwd(tmpDir);
+        await seedCorpus(db, legacyId, { rows: 3 });
+        const legacyCount = await totalCount(db, legacyId);
+        assertTrue(legacyCount > 0, 'S13.4: legacy rows seeded');
+
+        // No marker present.
+        assertTrue(readMarker(tmpDir) === null, 'S13.4: no marker before migration');
+
+        // Run identity resolution — should trigger STATE 3.
+        const identity = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+        assertTrue(isValidUUID(identity.projectId), 'S13.4: UUID returned');
+        assertFalse(identity.isNewProject, 'S13.4: isNewProject = false (migration, not fresh)');
+
+        // Marker must now exist.
+        const marker = readMarker(tmpDir);
+        assertTrue(marker !== null, 'S13.4: marker written by migration');
+        assertEqual(marker.uuid, identity.projectId, 'S13.4: marker UUID matches returned projectId');
+
+        // Conservation: count under new UUID == original legacy count.
+        const newCount    = await totalCount(db, identity.projectId);
+        const legacyAfter = await totalCount(db, legacyId);
+        assertEqual(newCount, legacyCount, 'S13.4: conservation — count(new UUID) == count(legacy before)');
+        assertEqual(legacyAfter, 0, 'S13.4: conservation — count(legacy after) == 0');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S13.5: STATE 2 — Resume migration (marker written, rows still legacy) ──
+
+  await bothBackends(
+    'S13.5: STATE 2 — marker present, rows still legacy → migration resumes, conservation holds',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-5-'));
+      try {
+        // Simulate crash between marker-write and DB-commit: marker exists but rows are under legacy id.
+        const marker      = writeMarker(tmpDir);
+        const legacyId    = encodeCwd(tmpDir);
+        await seedCorpus(db, legacyId, { rows: 2 });
+        const legacyCount = await totalCount(db, legacyId);
+
+        // Run identity resolution — STATE 2 path.
+        const identity = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+        assertEqual(identity.projectId, marker.uuid, 'S13.5: same UUID from existing marker');
+
+        // Conservation.
+        const newCount    = await totalCount(db, identity.projectId);
+        const legacyAfter = await totalCount(db, legacyId);
+        assertEqual(newCount, legacyCount, 'S13.5: conservation — count(new UUID) == count(legacy before)');
+        assertEqual(legacyAfter, 0, 'S13.5: conservation — count(legacy after) == 0');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S13.6: I3 Conservation under multi-table corpus ──────────────────────
+
+  await bothBackends(
+    'S13.6: I3 — conservation holds across all project_id tables simultaneously',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-6-'));
+      try {
+        const legacyId = encodeCwd(tmpDir);
+        // Seed all tables with rows.
+        await seedCorpus(db, legacyId, { rows: 5 });
+        // Per-table before counts.
+        const beforeCounts = {};
+        for (const table of PROJECT_ID_TABLES) {
+          try {
+            const { rows } = await db.query(
+              `SELECT COUNT(*) AS n FROM ${table} WHERE project_id=$1`, [legacyId]
+            );
+            beforeCounts[table] = parseInt(rows[0] && (rows[0].n || rows[0].count || 0), 10);
+          } catch (_) { beforeCounts[table] = 0; }
+        }
+
+        const identity = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+
+        // Per-table conservation check.
+        for (const table of PROJECT_ID_TABLES) {
+          try {
+            const { rows: newRows } = await db.query(
+              `SELECT COUNT(*) AS n FROM ${table} WHERE project_id=$1`, [identity.projectId]
+            );
+            const newCount = parseInt(newRows[0] && (newRows[0].n || newRows[0].count || 0), 10);
+            const { rows: legRows } = await db.query(
+              `SELECT COUNT(*) AS n FROM ${table} WHERE project_id=$1`, [legacyId]
+            );
+            const legCount = parseInt(legRows[0] && (legRows[0].n || legRows[0].count || 0), 10);
+            assertEqual(newCount, beforeCounts[table],
+              `S13.6: conservation in ${table}: new=${newCount} expected=${beforeCounts[table]}`);
+            assertEqual(legCount, 0,
+              `S13.6: no legacy rows remain in ${table}: got ${legCount}`);
+          } catch (tableErr) {
+            // Table absent — skip (beforeCount was 0 too).
+          }
+        }
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S13.7: I4 Collision abort ────────────────────────────────────────────
+
+  await bothBackends(
+    'S13.7: I4 — collision abort: pre-existing UUID rows prevent migration; legacy data intact',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-7-'));
+      try {
+        // Mint marker first (so we know the UUID), then seed BOTH legacy AND UUID rows.
+        const marker   = writeMarker(tmpDir);
+        const legacyId = encodeCwd(tmpDir);
+        // Seed legacy rows (simulates STATE 2 intermediate state).
+        await seedCorpus(db, legacyId, { rows: 2 });
+        // Also seed rows under the UUID (simulates a collision / shared DB).
+        await seedCorpus(db, marker.uuid, { rows: 1 });
+
+        const legacyBefore = await totalCount(db, legacyId);
+        const uuidBefore   = await totalCount(db, marker.uuid);
+        assertTrue(legacyBefore > 0, 'S13.7: legacy rows present');
+        assertTrue(uuidBefore > 0,   'S13.7: collision rows present');
+
+        // ensureProjectIdentity should call fatalExit and exit(1).
+        // We test this via runOneShot directly with a custom fatalExit that throws instead.
+        let fatalCalled = false;
+        let fatalMsg    = '';
+
+        try {
+          await runOneShot(
+            db,
+            legacyId,
+            marker.uuid,
+            path.join(os.homedir(), '.claude', 'projects', legacyId, 'handoff.md'),
+            path.join(os.homedir(), '.claude', 'projects', marker.uuid, 'handoff.md'),
+            (msg) => { fatalCalled = true; fatalMsg = msg; throw new Error(msg); }
+          );
+        } catch (_) {}
+
+        assertTrue(fatalCalled, 'S13.7: fatalExit called on collision');
+        assertTrue(/collision/i.test(fatalMsg), 'S13.7: fatal message mentions collision');
+
+        // Legacy data must remain intact (migration was aborted before any DB write).
+        const legacyAfter = await totalCount(db, legacyId);
+        assertEqual(legacyAfter, legacyBefore, 'S13.7: legacy data intact after collision abort');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S13.8: I5 Idempotency — all three interrupt states ──────────────────
+
+  await bothBackends(
+    'S13.8a: I5 — state (a) idempotency: legacy rows, no marker → migrate → re-run is no-op',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-8a-'));
+      try {
+        const legacyId = encodeCwd(tmpDir);
+        await seedCorpus(db, legacyId, { rows: 2 });
+
+        // First call: migration.
+        const id1 = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+        const cnt1 = await totalCount(db, id1.projectId);
+
+        // Second call: must be no-op (STATE 1).
+        const id2 = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+        assertEqual(id2.projectId, id1.projectId, 'S13.8a: same UUID on idempotent re-run');
+        const cnt2 = await totalCount(db, id1.projectId);
+        assertEqual(cnt2, cnt1, 'S13.8a: row count unchanged on re-run');
+
+        // Legacy must be zero.
+        const legacyAfter = await totalCount(db, legacyId);
+        assertEqual(legacyAfter, 0, 'S13.8a: legacy rows remain zero after re-run');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  await bothBackends(
+    'S13.8b: I5 — state (b): marker written, rows still legacy → migration completes → re-run is no-op',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-8b-'));
+      try {
+        // Simulate crash between marker-write and DB-commit.
+        const marker   = writeMarker(tmpDir);
+        const legacyId = encodeCwd(tmpDir);
+        await seedCorpus(db, legacyId, { rows: 2 });
+
+        // Run (completes migration).
+        const id1 = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+        assertEqual(id1.projectId, marker.uuid, 'S13.8b: UUID from marker');
+        const cnt1 = await totalCount(db, id1.projectId);
+
+        // Re-run (no-op).
+        const id2 = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+        assertEqual(id2.projectId, marker.uuid, 'S13.8b: same UUID on re-run');
+        const cnt2 = await totalCount(db, id1.projectId);
+        assertEqual(cnt2, cnt1, 'S13.8b: count unchanged on re-run');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  await bothBackends(
+    'S13.8c: I5 — state (c): marker present, rows already UUID → no-op (isNewProject=false)',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-8c-'));
+      try {
+        // Fully migrated state.
+        const marker = writeMarker(tmpDir);
+        await seedCorpus(db, marker.uuid, { rows: 2 });
+
+        const identity = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+        assertEqual(identity.projectId, marker.uuid, 'S13.8c: UUID from marker');
+        assertFalse(identity.isNewProject, 'S13.8c: isNewProject = false');
+
+        // Rows unchanged.
+        const cnt = await totalCount(db, marker.uuid);
+        assertTrue(cnt > 0, 'S13.8c: rows present after no-op');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S13.9: I6 Fatal-on-inconsistency ────────────────────────────────────
+  // Strategy: wrap the real DB adapter with a proxy that intercepts the
+  // in-transaction COUNT(*) query for the NEW uuid and returns 0 (simulating
+  // a partial-write corruption). This forces the conservation check to throw,
+  // which causes ROLLBACK + fatalExit. We verify: fatalCalled=true AND legacy
+  // data is intact after the rolled-back transaction.
+
+  await bothBackends(
+    'S13.9: I6 — simulated conservation mismatch → rollback + fatalExit; legacy data intact',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-9-'));
+      try {
+        const marker   = writeMarker(tmpDir);
+        const uuid     = marker.uuid;
+        const legacyId = encodeCwd(tmpDir);
+        await seedCorpus(db, legacyId, { rows: 2 });
+        const legacyBefore = await totalCount(db, legacyId);
+
+        // Build a DB proxy that intercepts COUNT(*) queries for the new UUID
+        // (the in-transaction conservation SELECT) and returns 0, simulating
+        // a conservation violation. All other queries pass through unmodified.
+        let sabotageActive = true;  // disarm after fatalExit path completes
+        const dbProxy = {
+          query(sql, params) {
+            // Intercept: SELECT COUNT(*) AS n FROM <table> WHERE project_id = $1
+            // where $1 is the new UUID AND we're inside the transaction.
+            if (
+              sabotageActive &&
+              /SELECT COUNT\(\*\) AS n FROM \w+ WHERE project_id = \$1/i.test(sql) &&
+              Array.isArray(params) && params[0] === uuid
+            ) {
+              // Return 0 rows (simulates conservation failure).
+              return Promise.resolve({ rows: [{ n: '0', count: '0' }] });
+            }
+            return db.query(sql, params);
+          },
+        };
+
+        let fatalCalled = false;
+        try {
+          await runOneShot(
+            dbProxy,
+            legacyId,
+            uuid,
+            path.join(os.tmpdir(), `cm-s139-legacy-${uuid}.md`),
+            path.join(os.tmpdir(), `cm-s139-new-${uuid}.md`),
+            (msg) => { fatalCalled = true; sabotageActive = false; throw new Error(msg); }
+          );
+        } catch (_) {}
+
+        // Core invariant I6: fatalExit was called AND legacy data is rolled back.
+        assertTrue(fatalCalled, 'S13.9: fatalExit called on conservation violation');
+        const legacyAfter = await totalCount(db, legacyId);
+        assertEqual(legacyAfter, legacyBefore, 'S13.9: legacy data intact after conservation failure');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S13.10: I7 handoff.md ordering ─────────────────────────────────────
+
+  await bothBackends(
+    'S13.10: I7 — handoff.md: copy→verify→DB-commit→delete ordering; new file exists after migration',
+    async (db) => {
+      const tmpDir     = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-10-'));
+      const tmpHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-10h-'));
+      try {
+        const legacyId  = encodeCwd(tmpDir);
+        // Create a fake legacy handoff.md.
+        const legacyHandoffDir  = path.join(tmpHomeDir, '.claude', 'projects', legacyId);
+        const legacyHandoffPath = path.join(legacyHandoffDir, 'handoff.md');
+        fs.mkdirSync(legacyHandoffDir, { recursive: true });
+        fs.writeFileSync(legacyHandoffPath, '# Handoff\nlegacy content\n', 'utf8');
+
+        // Seed legacy DB rows.
+        await seedCorpus(db, legacyId, { rows: 2 });
+
+        // We call runOneShot directly, providing the temp home-dir-rooted handoff paths.
+        const marker            = writeMarker(tmpDir);
+        const newHandoffDir     = path.join(tmpHomeDir, '.claude', 'projects', marker.uuid);
+        const newHandoffPath    = path.join(newHandoffDir, 'handoff.md');
+
+        let fatalCalled = false;
+        await runOneShot(
+          db,
+          legacyId,
+          marker.uuid,
+          legacyHandoffPath,
+          newHandoffPath,
+          (msg) => { fatalCalled = true; throw new Error(msg); }
+        );
+
+        assertFalse(fatalCalled, 'S13.10: no fatal error during migration');
+        // New handoff.md must exist and be byte-identical to the original.
+        assertTrue(fs.existsSync(newHandoffPath), 'S13.10: new handoff.md exists at UUID-keyed path');
+        // Legacy file must be deleted.
+        assertFalse(fs.existsSync(legacyHandoffPath), 'S13.10: legacy handoff.md deleted after DB commit');
+        // Content correct.
+        const content = fs.readFileSync(newHandoffPath, 'utf8');
+        assertTrue(content.includes('legacy content'), 'S13.10: new handoff.md content preserved');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+        try { fs.rmSync(tmpHomeDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  await bothBackends(
+    'S13.10b: I7 crash-recovery — crash after DB-commit but before legacy-delete is idempotent',
+    async (db) => {
+      const tmpDir     = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-10b-'));
+      const tmpHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-10bh-'));
+      try {
+        const legacyId      = encodeCwd(tmpDir);
+        const legacyHandoffDir = path.join(tmpHomeDir, '.claude', 'projects', legacyId);
+        const legacyHandoffPath = path.join(legacyHandoffDir, 'handoff.md');
+        fs.mkdirSync(legacyHandoffDir, { recursive: true });
+        fs.writeFileSync(legacyHandoffPath, '# Handoff\ncrash-recovery test\n', 'utf8');
+
+        await seedCorpus(db, legacyId, { rows: 2 });
+        const legacyCount = await totalCount(db, legacyId);
+
+        const marker         = writeMarker(tmpDir);
+        const newHandoffPath = path.join(tmpHomeDir, '.claude', 'projects', marker.uuid, 'handoff.md');
+
+        // Simulate a crash after DB commit but before legacy-delete:
+        // run the migration but then put the legacy file back (simulate crash before delete).
+        await runOneShot(
+          db,
+          legacyId,
+          marker.uuid,
+          legacyHandoffPath,
+          newHandoffPath,
+          (msg) => { throw new Error(msg); }
+        );
+        // Simulate legacy file surviving (crash before delete).
+        const newContent = fs.readFileSync(newHandoffPath, 'utf8');
+        // Restore legacy path if it was deleted.
+        if (!fs.existsSync(legacyHandoffPath)) {
+          fs.mkdirSync(legacyHandoffDir, { recursive: true });
+          fs.writeFileSync(legacyHandoffPath, newContent, 'utf8');
+        }
+
+        // Now rows are under UUID, marker exists, legacy file also exists.
+        // Re-run: STATE 1 (rows already under UUID) → no-op.
+        const id2 = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+        assertEqual(id2.projectId, marker.uuid, 'S13.10b: same UUID after idempotent re-run');
+        const cnt2 = await totalCount(db, marker.uuid);
+        assertEqual(cnt2, legacyCount, 'S13.10b: count preserved on re-run');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+        try { fs.rmSync(tmpHomeDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S13.11: Identity stability — same marker via two different path spellings ─
+
+  await bothBackends(
+    'S13.11: identity stability — two different absolute paths resolving same marker → same UUID',
+    async (db) => {
+      // Use a real temp dir and reference it by two absolute path spellings.
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-11-'));
+      try {
+        // Write the marker once.
+        const marker = writeMarker(tmpDir);
+
+        // Path 1: tmpDir as-is.
+        const found1 = findProjectRootByMarker(tmpDir);
+        assertTrue(found1 !== null, 'S13.11: marker found from original path');
+
+        // Path 2: a subdirectory under tmpDir (simulating "deeper cwd").
+        const subDir = path.join(tmpDir, 'src', 'deep');
+        fs.mkdirSync(subDir, { recursive: true });
+        const found2 = findProjectRootByMarker(subDir);
+        assertTrue(found2 !== null, 'S13.11: marker found from subdirectory');
+        assertEqual(found1, found2, 'S13.11: both paths resolve to same root directory');
+
+        // Both must yield the same UUID.
+        const uuid1 = readMarker(found1).uuid;
+        const uuid2 = readMarker(found2).uuid;
+        assertEqual(uuid1, uuid2, 'S13.11: same UUID regardless of starting path');
+        assertEqual(uuid1, marker.uuid, 'S13.11: UUID matches original marker');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S13.12: VCS-agnosticism ──────────────────────────────────────────────
+
+  await bothBackends(
+    'S13.12: VCS-agnosticism — no .git present: identity works correctly',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-12a-'));
+      try {
+        // No .git anywhere in the temp dir tree.
+        const identity = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+        assertTrue(isValidUUID(identity.projectId), 'S13.12: UUID issued with no .git present');
+        assertTrue(identity.isNewProject, 'S13.12: recognized as new project');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  await bothBackends(
+    'S13.12b: VCS-agnosticism — .git is a FILE (worktree-style): identity does not care',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-12b-'));
+      try {
+        // Write a .git FILE (worktree style: "gitdir: ../real/.git").
+        fs.writeFileSync(path.join(tmpDir, '.git'), 'gitdir: ../real/.git\n', 'utf8');
+        // No .claude-memory marker yet.
+        const identity = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+        assertTrue(isValidUUID(identity.projectId), 'S13.12b: UUID issued with .git as file');
+        // The marker must have been written at tmpDir (identity doesn't care about .git).
+        const marker = readMarker(tmpDir);
+        assertTrue(marker !== null, 'S13.12b: marker written at correct root');
+        assertEqual(marker.uuid, identity.projectId, 'S13.12b: marker UUID matches projectId');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  await bothBackends(
+    'S13.12c: VCS-agnosticism — fabricated .svn / .hg / $tf present: identity ignores them',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-12c-'));
+      try {
+        // Create fake VCS directories.
+        fs.mkdirSync(path.join(tmpDir, '.svn'), { recursive: true });
+        fs.mkdirSync(path.join(tmpDir, '.hg'),  { recursive: true });
+        fs.writeFileSync(path.join(tmpDir, '$tf'), 'fake tf\n', 'utf8');
+
+        // Identity must still work — none of these should be consulted.
+        const identity = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+        assertTrue(isValidUUID(identity.projectId), 'S13.12c: UUID issued; VCS artifacts ignored');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S13.13: I1 Recovery snapshot written before any mutation ─────────────
+
+  await bothBackends(
+    'S13.13: I1 — recovery snapshot written to OS temp before any DB mutation',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-13-'));
+      try {
+        const legacyId = encodeCwd(tmpDir);
+        await seedCorpus(db, legacyId, { rows: 2 });
+
+        // Compute the exact safeLegacy prefix that dumpRecoverySnapshot embeds in
+        // the filename: legacyId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 60).
+        // Snapshot filename pattern: snapshot-<safeLegacy>-<timestamp>.json
+        // Filtering BOTH before and after lists by this prefix isolates THIS
+        // test's snapshots and is deterministic regardless of accumulated state
+        // from S13.10 or any prior run in the shared OS-temp snapshot dir.
+        const safeLegacy = legacyId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 60);
+        const snapshotPrefix = `snapshot-${safeLegacy}-`;
+
+        const snapshotDir = getSnapshotDir();
+        const ownSnapshots = (dir) =>
+          fs.existsSync(dir)
+            ? fs.readdirSync(dir).filter((f) => f.startsWith(snapshotPrefix))
+            : [];
+
+        const filesBefore = ownSnapshots(snapshotDir);
+
+        await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+
+        const filesAfter = ownSnapshots(snapshotDir);
+        assertTrue(filesAfter.length > filesBefore.length, 'S13.13: new snapshot file(s) created during migration');
+        // Verify snapshot file is valid JSON with the expected structure.
+        const newFiles = filesAfter.filter((f) => !filesBefore.includes(f));
+        assertTrue(newFiles.length > 0, 'S13.13: at least one new snapshot file');
+        const snapContent = JSON.parse(fs.readFileSync(path.join(snapshotDir, newFiles[0]), 'utf8'));
+        assertEqual(snapContent.legacy_id, legacyId, 'S13.13: snapshot records correct legacy_id');
+        assertTrue(typeof snapContent.tables === 'object', 'S13.13: snapshot has tables object');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S13.14: verifyByteIdentical helper ──────────────────────────────────
+
+  await bothBackends(
+    'S13.14: verifyByteIdentical — correct for identical and differing files',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s13-14-'));
+      try {
+        const f1 = path.join(tmpDir, 'a.txt');
+        const f2 = path.join(tmpDir, 'b.txt');
+        const f3 = path.join(tmpDir, 'c.txt');
+        fs.writeFileSync(f1, 'hello world\n', 'utf8');
+        fs.writeFileSync(f2, 'hello world\n', 'utf8');
+        fs.writeFileSync(f3, 'different\n',   'utf8');
+        assertTrue(verifyByteIdentical(f1, f2), 'S13.14: identical files → true');
+        assertFalse(verifyByteIdentical(f1, f3), 'S13.14: different files → false');
+        assertFalse(verifyByteIdentical(f1, path.join(tmpDir, 'nonexistent.txt')), 'S13.14: nonexistent → false');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 (async () => {
@@ -2853,6 +3604,7 @@ async function runS12() {
   await runS10();
   await runS11();
   await runS12();
+  await runS13();
 
   console.log('\n─── Results ──────────────────────────────────────');
   console.log(`PASS ${passed}  FAIL ${failed}  SKIP ${skipped}`);

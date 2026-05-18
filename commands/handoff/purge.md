@@ -25,11 +25,14 @@ If the user does not confirm, do not run the command.
 ## How to invoke (after confirmation)
 
 ```bash
-# Detect project root
+# Detect project root — prefer .claude-memory marker, fall back to .git
 PROJECT_ROOT=$(pwd)
-while [ ! -d "$PROJECT_ROOT/.git" ] && [ "$PROJECT_ROOT" != "/" ]; do
+while [ ! -f "$PROJECT_ROOT/.claude-memory" ] && [ ! -d "$PROJECT_ROOT/.git" ] && [ "$PROJECT_ROOT" != "/" ]; do
   PROJECT_ROOT=$(dirname "$PROJECT_ROOT")
 done
+if [ "$PROJECT_ROOT" = "/" ] && [ ! -f "$PROJECT_ROOT/.claude-memory" ] && [ ! -d "$PROJECT_ROOT/.git" ]; then
+  PROJECT_ROOT=$(pwd)
+fi
 
 if [ ! -f "$PROJECT_ROOT/scripts/handoff.js" ]; then
   echo "Error: scripts/handoff.js not found — is this a claude-memory project?"

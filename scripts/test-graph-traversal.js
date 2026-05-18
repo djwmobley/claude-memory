@@ -28,6 +28,7 @@ const fs            = require('fs');
 const os            = require('os');
 const path          = require('path');
 const { Client }    = require('pg');
+const { readMarker } = require('./lib/project-marker');
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
 
@@ -94,6 +95,18 @@ function fail(section, step, label, reason) {
 
 function encodeCwd(p) {
   return p.replace(/[/\\]+$/, '').replace(/[^A-Za-z0-9-]/g, '-');
+}
+
+/**
+ * Read the .claude-memory marker UUID from a directory.
+ * Returns the UUID string if present and valid, or the encodeCwd fallback otherwise.
+ *
+ * @param {string} dir
+ * @returns {string}
+ */
+function markerUUIDOrFallback(dir) {
+  const m = readMarker(dir);
+  return (m && m.uuid) ? m.uuid : encodeCwd(dir);
 }
 
 async function pgConnect(database = 'postgres') {
@@ -910,10 +923,11 @@ async function runSectionA() {
   const TS_A   = Date.now();
   const A_DB   = `claude_memory_graphtest_A_${TS_A}`;
   const A_DIR  = path.join(os.tmpdir(), `graphtest_A_${TS_A}`);
-  const A_PID  = encodeCwd(A_DIR);
 
   try {
     await bootstrapDb(A_DB, A_DIR);
+    // Read the UUID minted by cmdInit (PR #53 marker-identity model).
+    const A_PID  = markerUUIDOrFallback(A_DIR);
     console.log(`[A] DB: ${A_DB}  project_id: ${A_PID}`);
 
     await sectionA_linearChain(A_DB, A_PID, A_DIR);
@@ -1345,10 +1359,11 @@ async function runSectionB() {
   const TS_B  = Date.now();
   const B_DB  = `claude_memory_graphtest_B_${TS_B}`;
   const B_DIR = path.join(os.tmpdir(), `graphtest_B_${TS_B}`);
-  const B_PID = encodeCwd(B_DIR);
 
   try {
     await bootstrapDb(B_DB, B_DIR);
+    // Read the UUID minted by cmdInit (PR #53 marker-identity model).
+    const B_PID = markerUUIDOrFallback(B_DIR);
     console.log(`[B] DB: ${B_DB}  project_id: ${B_PID}`);
 
     await sectionB_entitySeedFallback(B_DB, B_PID, B_DIR);
@@ -1525,10 +1540,11 @@ async function runSectionC() {
   const TS_C  = Date.now();
   const C_DB  = `claude_memory_graphtest_C_${TS_C}`;
   const C_DIR = path.join(os.tmpdir(), `graphtest_C_${TS_C}`);
-  const C_PID = encodeCwd(C_DIR);
 
   try {
     await bootstrapDb(C_DB, C_DIR);
+    // Read the UUID minted by cmdInit (PR #53 marker-identity model).
+    const C_PID = markerUUIDOrFallback(C_DIR);
     console.log(`[C] DB: ${C_DB}  project_id: ${C_PID}`);
     await sectionC_organicCloseResume(C_DB, C_PID, C_DIR);
   } finally {
@@ -1549,10 +1565,11 @@ async function runSectionD() {
   const TS_D  = Date.now();
   const D_DB  = `claude_memory_graphtest_D_${TS_D}`;
   const D_DIR = path.join(os.tmpdir(), `graphtest_D_${TS_D}`);
-  const D_PID = encodeCwd(D_DIR);
 
   try {
     await bootstrapDb(D_DB, D_DIR);
+    // Read the UUID minted by cmdInit (PR #53 marker-identity model).
+    const D_PID = markerUUIDOrFallback(D_DIR);
     console.log(`[D] DB: ${D_DB}  project_id: ${D_PID}`);
 
     // ── D-1: Organic corpus ───────────────────────────────────────────────────
