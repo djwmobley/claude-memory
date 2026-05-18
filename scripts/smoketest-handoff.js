@@ -3412,14 +3412,19 @@ async function c2Step2_gateOnBiasAdjustment(c2Db, c2ProjectId, c2ProjectDir) {
 }
 
 /**
- * C2 3/4: Gate ON ⇒ strongly-negative-bias assertion demoted in ranking;
- * strongly-positive-bias assertion promoted.
+ * C2 3/4: Gate ON ⇒ outcome_bias orders assertions HIGH > LOW > LOWEST
+ * (ranking-only; no row is dropped by a threshold).
  *
- * Inserts two assertions: one with outcome_bias = -2.9 (near floor), one at 0.
- * Checks ORDER BY effective_confidence puts the negative-bias one last (or suppresses it).
+ * Post-Commit B the old >= 1.0 effective_confidence cutoff is removed — outcome_bias
+ * is a ranking signal only. All three assertions must appear in loader output (corpus
+ * is well below the LIMIT 30 floor, so top-N guarantee applies). The only contract
+ * enforced here is strict ORDER BY effective_confidence desc:
+ *   C2_RANK_HIGH   (bias +2.5) → effective_conf 7.5  — appears first
+ *   C2_RANK_LOW    (bias -3.0) → effective_conf 2.0  — appears second
+ *   C2_RANK_LOWEST (bias -4.5) → effective_conf 0.5  — appears last (not dropped)
  */
 async function c2Step3_biasAffectsRanking(c2Db, c2ProjectId, c2ProjectDir) {
-  const label = 'Gate ON: negative-bias assertion ranked below positive-bias assertion in loader output';
+  const label = 'Gate ON: outcome_bias orders assertions HIGH > LOW > LOWEST under gate ON (ranking-only; no row dropped)';
   try {
     const db = await pgConnect(c2Db);
 
@@ -3431,17 +3436,18 @@ async function c2Step3_biasAffectsRanking(c2Db, c2ProjectId, c2ProjectDir) {
       [c2ProjectId]
     );
 
-    // Insert two fresh assertions with distinct subjects and very different outcome_bias.
-    // Both have the same base confidence (5) and are freshly reinforced.
-    // high_bias: outcome_bias = 2.5 → effective_conf = 5 * 1 + 2.5 = 7.5
-    // low_bias: outcome_bias = -3.0 → effective_conf = 5 * 1 + (-3.0) = 2.0 (still above 1.0)
-    // suppressed_bias: outcome_bias = -4.5 → effective_conf = 5 * 1 + (-4.5) = 0.5 < 1.0 → suppressed
+    // Insert three fresh assertions with distinct subjects and very different outcome_bias.
+    // All have the same base confidence (5) and are freshly reinforced (decay factor ≈ 1).
+    // C2_RANK_HIGH:   outcome_bias = +2.5 → effective_conf ≈ 7.5  — ranks first
+    // C2_RANK_LOW:    outcome_bias = -3.0 → effective_conf ≈ 2.0  — ranks second
+    // C2_RANK_LOWEST: outcome_bias = -4.5 → effective_conf ≈ 0.5  — ranks last (still returned;
+    //                 no threshold cutoff post-Commit B; top-N floor guarantees its presence)
     const { rows: bRows } = await db.query(
       `INSERT INTO assertions
          (project_id, subject, predicate, object, confidence, source, last_reinforced, outcome_bias)
-       VALUES ($1, 'C2_RANK_HIGH',       'is', 'top',       5, 'user_stated', now(),  2.5),
-              ($1, 'C2_RANK_LOW',        'is', 'bottom',    5, 'user_stated', now(), -3.0),
-              ($1, 'C2_RANK_SUPPRESSED', 'is', 'invisible', 5, 'user_stated', now(), -4.5)
+       VALUES ($1, 'C2_RANK_HIGH',   'is', 'top',     5, 'user_stated', now(),  2.5),
+              ($1, 'C2_RANK_LOW',    'is', 'bottom',  5, 'user_stated', now(), -3.0),
+              ($1, 'C2_RANK_LOWEST', 'is', 'lowest',  5, 'user_stated', now(), -4.5)
        RETURNING id, subject`,
       [c2ProjectId]
     );
@@ -3468,23 +3474,30 @@ async function c2Step3_biasAffectsRanking(c2Db, c2ProjectId, c2ProjectDir) {
 
     const out = r.stdout || '';
 
-    // C2_RANK_HIGH should appear in output.
+    // All three markers must be present — no row is excluded by a threshold (ranking-only).
     if (!out.includes('C2_RANK_HIGH')) {
       c2Fail(3, label, '"C2_RANK_HIGH" not found in loader output — high-bias assertion not retrieved');
       return false;
     }
-
-    // C2_RANK_SUPPRESSED should NOT appear (effective_conf 0.5 < 1.0 threshold).
-    if (out.includes('C2_RANK_SUPPRESSED')) {
-      c2Fail(3, label, '"C2_RANK_SUPPRESSED" appears in loader output — suppression by outcome_bias not working');
+    if (!out.includes('C2_RANK_LOW')) {
+      c2Fail(3, label, '"C2_RANK_LOW" not found in loader output — medium-bias assertion not retrieved');
+      return false;
+    }
+    if (!out.includes('C2_RANK_LOWEST')) {
+      c2Fail(3, label, '"C2_RANK_LOWEST" not found in loader output — lowest-bias assertion missing (top-N floor broken)');
       return false;
     }
 
-    // C2_RANK_HIGH should appear before C2_RANK_LOW in the output (higher effective_conf ranks first).
-    const highIdx = out.indexOf('C2_RANK_HIGH');
-    const lowIdx  = out.indexOf('C2_RANK_LOW');
-    if (lowIdx !== -1 && highIdx > lowIdx) {
+    // Assert strict ranking order: HIGH before LOW before LOWEST (outcome_bias drives ORDER BY).
+    const highIdx   = out.indexOf('C2_RANK_HIGH');
+    const lowIdx    = out.indexOf('C2_RANK_LOW');
+    const lowestIdx = out.indexOf('C2_RANK_LOWEST');
+    if (highIdx > lowIdx) {
       c2Fail(3, label, `C2_RANK_LOW (idx ${lowIdx}) appears before C2_RANK_HIGH (idx ${highIdx}) — ranking inverted`);
+      return false;
+    }
+    if (lowIdx > lowestIdx) {
+      c2Fail(3, label, `C2_RANK_LOWEST (idx ${lowestIdx}) appears before C2_RANK_LOW (idx ${lowIdx}) — ranking inverted`);
       return false;
     }
 
@@ -3633,7 +3646,7 @@ async function runC2Section() {
     const successAssertionId = step2Result && step2Result.ok ? step2Result.successAssertionId : null;
     const failureAssertionId = step2Result && step2Result.ok ? step2Result.failureAssertionId : null;
 
-    // Step 3: ranking — gate ON, strongly-negative bias suppressed/demoted.
+    // Step 3: ranking — gate ON, outcome_bias orders HIGH > LOW > LOWEST (ranking-only; no row dropped).
     await c2Step3_biasAffectsRanking(C2_DB, C2_PROJECT_ID, C2_PROJ_DIR);
 
     // Step 4: idempotency — re-running close for the same session does not double-apply.
