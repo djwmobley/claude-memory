@@ -3519,23 +3519,31 @@ async function runS13() {
         const legacyId = encodeCwd(tmpDir);
         await seedCorpus(db, legacyId, { rows: 2 });
 
-        const snapshotDirBefore = getSnapshotDir();
-        // Clear any pre-existing snapshots for this legacyId pattern.
-        // (We just observe that a new snapshot file appears after migration.)
-        const filesBefore = fs.existsSync(snapshotDirBefore)
-          ? fs.readdirSync(snapshotDirBefore).filter((f) => f.includes(legacyId.slice(0, 20).replace(/[^A-Za-z0-9_-]/g, '_')))
-          : [];
+        // Compute the exact safeLegacy prefix that dumpRecoverySnapshot embeds in
+        // the filename: legacyId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 60).
+        // Snapshot filename pattern: snapshot-<safeLegacy>-<timestamp>.json
+        // Filtering BOTH before and after lists by this prefix isolates THIS
+        // test's snapshots and is deterministic regardless of accumulated state
+        // from S13.10 or any prior run in the shared OS-temp snapshot dir.
+        const safeLegacy = legacyId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 60);
+        const snapshotPrefix = `snapshot-${safeLegacy}-`;
+
+        const snapshotDir = getSnapshotDir();
+        const ownSnapshots = (dir) =>
+          fs.existsSync(dir)
+            ? fs.readdirSync(dir).filter((f) => f.startsWith(snapshotPrefix))
+            : [];
+
+        const filesBefore = ownSnapshots(snapshotDir);
 
         await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
 
-        const filesAfter = fs.existsSync(snapshotDirBefore)
-          ? fs.readdirSync(snapshotDirBefore)
-          : [];
+        const filesAfter = ownSnapshots(snapshotDir);
         assertTrue(filesAfter.length > filesBefore.length, 'S13.13: new snapshot file(s) created during migration');
         // Verify snapshot file is valid JSON with the expected structure.
         const newFiles = filesAfter.filter((f) => !filesBefore.includes(f));
         assertTrue(newFiles.length > 0, 'S13.13: at least one new snapshot file');
-        const snapContent = JSON.parse(fs.readFileSync(path.join(snapshotDirBefore, newFiles[0]), 'utf8'));
+        const snapContent = JSON.parse(fs.readFileSync(path.join(snapshotDir, newFiles[0]), 'utf8'));
         assertEqual(snapContent.legacy_id, legacyId, 'S13.13: snapshot records correct legacy_id');
         assertTrue(typeof snapContent.tables === 'object', 'S13.13: snapshot has tables object');
       } finally {
