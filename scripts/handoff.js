@@ -41,6 +41,11 @@ const { loadConfig, connect, c, findProjectRoot } = require('./lib/shared');
 const { encodeCwd, getClaudeProjectDir }           = require('./lib/encoded-cwd');
 const { classifyPredicate }                        = require('./lib/predicate-registry');
 const { validatePayload }                          = require('./lib/payload-schema');
+const {
+  resolveDialect, createClient,
+  buildInClause, buildSQLiteGraphCTE,
+  resolveSQLiteDbPath,
+} = require('./lib/db-seam');
 
 process.on('exit', () => {
   const ms = Number(process.hrtime.bigint() - __startNs) / 1e6;
@@ -74,18 +79,33 @@ const OPERATING_CANON = `=== OPERATING CANON (trusted — applies to this and ev
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
-/** Connect to the handoff DB (TARGET_DB, overridable via HANDOFF_DB env var). */
+/**
+ * Connect to the handoff DB.
+ *
+ * Storage backend selection (seam):
+ *   - STORAGE_BACKEND=sqlite  → embedded SQLite at <project_root>/.claude/handoff.sqlite
+ *     (or HANDOFF_SQLITE_PATH env var override)
+ *   - STORAGE_BACKEND=postgres or unset → Postgres at TARGET_DB (unchanged default)
+ *
+ * Returns a PostgresClient or SQLiteClient — both present the same async query/end API.
+ */
 async function connectHandoff() {
-  const cfg = loadConfig();
-  const { Client } = require('pg');
-  const client = new Client({
+  const cfg     = loadConfig();
+  const dialect = resolveDialect(cfg);
+
+  if (dialect === 'sqlite') {
+    const root   = findProjectRoot();
+    const dbPath = resolveSQLiteDbPath(root);
+    return createClient('sqlite', { dbPath });
+  }
+
+  // Postgres path (default) — behavior unchanged from pre-seam.
+  return createClient('postgres', {
     host:     cfg.host,
     port:     cfg.port,
     database: TARGET_DB,
     user:     cfg.user,
   });
-  await client.connect();
-  return client;
 }
 
 /** Resolve project_id for the current working directory. */
@@ -611,6 +631,9 @@ async function cmdInit(args) {
   const claudeMdPath = path.join(root, 'CLAUDE.md');
   const autoCreate  = args.includes('-y');
 
+  const cfg     = loadConfig();
+  const dialect = resolveDialect(cfg);
+
   // ── Pre-flight checks ─────────────────────────────────────────────────────
 
   // Step 1: Node version >= 18
@@ -618,30 +641,36 @@ async function cmdInit(args) {
   printPreflightLine(nodeCheck, 'Node version >= 18');
   if (nodeCheck.fatal) { process.exit(1); }
 
-  // Step 2: pg package installed
-  const pgPkgCheck = checkPgPackage();
-  printPreflightLine(pgPkgCheck, 'pg package installed');
-  if (pgPkgCheck.fatal) { process.exit(1); }
+  if (dialect === 'postgres') {
+    // Step 2 (Postgres only): pg package installed
+    const pgPkgCheck = checkPgPackage();
+    printPreflightLine(pgPkgCheck, 'pg package installed');
+    if (pgPkgCheck.fatal) { process.exit(1); }
 
-  const cfg = loadConfig();
+    // Step 3 (Postgres only): Postgres reachable
+    const pgReachCheck = await checkPostgresReachable(cfg);
+    printPreflightLine(pgReachCheck, `Postgres reachable at ${cfg.host}:${cfg.port}`);
+    if (pgReachCheck.fatal) { process.exit(1); }
 
-  // Step 3: Postgres reachable
-  const pgReachCheck = await checkPostgresReachable(cfg);
-  printPreflightLine(pgReachCheck, `Postgres reachable at ${cfg.host}:${cfg.port}`);
-  if (pgReachCheck.fatal) { process.exit(1); }
+    // Step 4 (Postgres only): Target DB exists (create if needed)
+    const dbCheck = await checkOrCreateDatabase(cfg, TARGET_DB, autoCreate);
+    printPreflightLine(dbCheck, `Database '${TARGET_DB}' present`);
+    if (dbCheck.fatal) { process.exit(1); }
 
-  // Step 4: Target DB exists (create if needed)
-  const dbCheck = await checkOrCreateDatabase(cfg, TARGET_DB, autoCreate);
-  printPreflightLine(dbCheck, `Database '${TARGET_DB}' present`);
-  if (dbCheck.fatal) { process.exit(1); }
+    // Step 5 (Postgres only): Postgres version >= 13 (warn only)
+    const pgVerCheck = await checkPgVersion(cfg, TARGET_DB);
+    printPreflightLine(pgVerCheck, 'Postgres version >= 13');
+    // Not fatal — proceed regardless
+  } else {
+    // SQLite path: log the backend choice and db file path.
+    const dbPath = resolveSQLiteDbPath(root);
+    console.log(`  [OK]    Storage backend: SQLite (node:sqlite, embedded)`);
+    console.log(`  [OK]    SQLite database: ${dbPath}`);
+  }
 
-  // Step 5: Postgres version >= 13 (warn only)
-  const pgVerCheck = await checkPgVersion(cfg, TARGET_DB);
-  printPreflightLine(pgVerCheck, 'Postgres version >= 13');
-  // Not fatal — proceed regardless
-
-  // Step 6: handoff-core-schema.sql present on disk
-  const schemaFile = path.resolve(__dirname, 'sql', 'handoff-core-schema.sql');
+  // Step 6: schema file present on disk (dialect-specific)
+  const schemaFileName = dialect === 'sqlite' ? 'handoff-sqlite-schema.sql' : 'handoff-core-schema.sql';
+  const schemaFile = path.resolve(__dirname, 'sql', schemaFileName);
   const schemaExists = fs.existsSync(schemaFile);
   if (schemaExists) {
     console.log(`  [OK]    Schema file present: ${path.basename(schemaFile)}`);
@@ -650,31 +679,39 @@ async function cmdInit(args) {
     process.exit(1);
   }
 
-  // Connect to target DB for the rest of init
+  // Connect to target DB (dialect-aware via seam)
   let db;
   try {
-    const { Client } = require('pg');
-    db = new Client({
-      host:     cfg.host,
-      port:     cfg.port,
-      database: TARGET_DB,
-      user:     cfg.user,
-    });
-    await db.connect();
+    if (dialect === 'sqlite') {
+      const dbPath = resolveSQLiteDbPath(root);
+      db = await createClient('sqlite', { dbPath });
+    } else {
+      const { Client } = require('pg');
+      const pgClient = new Client({
+        host:     cfg.host,
+        port:     cfg.port,
+        database: TARGET_DB,
+        user:     cfg.user,
+      });
+      const { PostgresClient } = require('./lib/db-seam');
+      db = new PostgresClient(pgClient);
+      await db.connect();
+    }
   } catch (err) {
-    console.log(`  [FAIL]  DB connection to '${TARGET_DB}' — ${err.message}`);
+    console.log(`  [FAIL]  DB connection failed — ${err.message}`);
     process.exit(1);
   }
 
-  // Step 7: Apply handoff-core-schema.sql inside a transaction (fatal on error)
+  // Step 7: Apply schema inside a transaction (fatal on error)
   let sql = fs.readFileSync(schemaFile, 'utf8');
   // Remove psql meta-commands (\ir, \d, etc.) — not supported by pg client
   sql = sql.replace(/^\\[a-z].*$/gm, '');
   try {
     await db.query('BEGIN');
-    await db.query(sql);
+    await db.runSchema(sql);
     // Idempotent migration: add `promoted` and `promoted_at` columns to assertions
     // (used by /handoff:promote explicit-promotion command, added in Bundle A hardening).
+    // For Postgres: BOOLEAN / TIMESTAMPTZ. For SQLite: INTEGER / TEXT (seam rewrites DDL).
     await db.query(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted    BOOLEAN     NOT NULL DEFAULT false`);
     await db.query(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMPTZ`);
     await db.query('COMMIT');
@@ -1039,16 +1076,27 @@ async function cmdLoaderLoad(opts = {}) {
         // C1: record retrieved assertion ids for attribution.
         for (const r of rows) retrievedAssertionIds.push(r.id);
         // 4C: Bump reinforcement timestamps ONLY for the rows actually returned
-        // (per-row precision instead of project-wide or subject-wide).  Using
-        // id = ANY($1::int[]) ensures last_reinforced reflects real retrieval
-        // frequency so decay-based eviction ranking is meaningful (spec §4C +
-        // OQ-2: AND suppressed=false prevents bumping suppressed history rows).
-        await db.query(
-          `UPDATE assertions SET last_reinforced = now(), last_retrieved = now()
-           WHERE id = ANY($1::int[])
-             AND suppressed = false`,
-          [retrievedAssertionIds]
-        );
+        // (per-row precision instead of project-wide or subject-wide).
+        // Postgres: id = ANY($1::int[]) — passes array directly.
+        // SQLite:   no native array params; expand to IN (?,?,?) via buildInClause.
+        // OQ-2: AND suppressed=false prevents bumping suppressed history rows.
+        if (db.dialect === 'sqlite') {
+          const { clause: inClause, params: inParams } = buildInClause('id', retrievedAssertionIds);
+          if (retrievedAssertionIds.length > 0) {
+            await db.query(
+              `UPDATE assertions SET last_reinforced = datetime('now'), last_retrieved = datetime('now')
+               WHERE ${inClause} AND suppressed = 0`,
+              inParams
+            );
+          }
+        } else {
+          await db.query(
+            `UPDATE assertions SET last_reinforced = now(), last_retrieved = now()
+             WHERE id = ANY($1::int[])
+               AND suppressed = false`,
+            [retrievedAssertionIds]
+          );
+        }
       }
 
     } else if (q.type === 'recency' || q.kind === 'recency') {
@@ -1345,12 +1393,28 @@ async function cmdLoaderLoad(opts = {}) {
               `;
             }
 
-            const { rows: graphRows } = await db.query(cteReachSql, [
-              projectId,
-              seeds,
-              maxDepth,
-              maxNodes,
-            ]);
+            // ── Dialect-aware graph query execution ──────────────────────
+            // Postgres: pass seeds as a text[] array param — the CTE uses
+            //   unnest($2::text[]) and NOT (col = ANY($2::text[])).
+            // SQLite: no native array type; use buildSQLiteGraphCTE() which
+            //   expands each seed as an individual UNION ALL base row and
+            //   uses INSTR(path, '|' || entity || '|') for cycle prevention.
+            //   Traversal semantics (depth clamp <=5, node cap) are identical.
+            let graphRows;
+            if (db.dialect === 'sqlite') {
+              const { sql: sqliteCte, params: sqliteParams } =
+                buildSQLiteGraphCTE(direction, seeds, maxDepth, maxNodes, projectId);
+              const sqliteRes = await db.query(sqliteCte, sqliteParams);
+              graphRows = sqliteRes.rows;
+            } else {
+              const pgRes = await db.query(cteReachSql, [
+                projectId,
+                seeds,
+                maxDepth,
+                maxNodes,
+              ]);
+              graphRows = pgRes.rows;
+            }
 
             if (graphRows.length > 0 && tokensUsed < tokenBudget) {
               const graphText = graphRows.map((r) =>
@@ -1396,16 +1460,30 @@ async function cmdLoaderLoad(opts = {}) {
     const eventId = evtRes.rows[0] && evtRes.rows[0].id;
     if (eventId != null && retrievedAssertionIds.length > 0) {
       const uniqueIds = [...new Set(retrievedAssertionIds)];
-      // Build VALUES list: ($1, $2), ($1, $3), ...
-      const params = [eventId];
-      const valuePlaceholders = uniqueIds.map((assertionId, i) => {
-        params.push(assertionId);
-        return `($1, $${i + 2})`;
-      });
-      await db.query(
-        `INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES ${valuePlaceholders.join(', ')}`,
-        params
-      );
+      if (db.dialect === 'sqlite') {
+        // SQLite: anonymous ? placeholders cannot be repeated. Build one row per insert
+        // or use a flat VALUES list with all params expanded. Flat expansion is cleaner.
+        const params = [];
+        const valuePlaceholders = uniqueIds.map((assertionId) => {
+          params.push(eventId, assertionId);
+          return '(?, ?)';
+        });
+        await db.query(
+          `INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES ${valuePlaceholders.join(', ')}`,
+          params
+        );
+      } else {
+        // Postgres: Build VALUES list: ($1, $2), ($1, $3), ... — $1 is reused for eventId.
+        const params = [eventId];
+        const valuePlaceholders = uniqueIds.map((assertionId, i) => {
+          params.push(assertionId);
+          return `($1, $${i + 2})`;
+        });
+        await db.query(
+          `INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES ${valuePlaceholders.join(', ')}`,
+          params
+        );
+      }
     }
   } catch (evtErr) {
     if (!silent) console.error(`[handoff] retrieval_events insert failed (non-fatal): ${evtErr.message}`);
@@ -1427,25 +1505,54 @@ async function cmdLoaderLoad(opts = {}) {
       if (runRes.rows.length > 0) {
         const latestRunId = runRes.rows[0].run_id;
         // Find community_ids for the hit entities in this run.
-        const communityRes = await db.query(
-          `SELECT DISTINCT community_id FROM entity_communities
-           WHERE project_id = $1 AND run_id = $2 AND entity_name = ANY($3)`,
-          [projectId, latestRunId, retrievedEntityNames]
-        );
+        // Dialect split: Postgres uses entity_name = ANY($3); SQLite uses IN (?,?,?).
+        let communityRes;
+        if (db.dialect === 'sqlite') {
+          const { clause: nameInClause, params: nameInParams } = buildInClause('entity_name', retrievedEntityNames);
+          communityRes = await db.query(
+            `SELECT DISTINCT community_id FROM entity_communities
+             WHERE project_id = ? AND run_id = ? AND ${nameInClause}`,
+            [projectId, latestRunId, ...nameInParams]
+          );
+        } else {
+          communityRes = await db.query(
+            `SELECT DISTINCT community_id FROM entity_communities
+             WHERE project_id = $1 AND run_id = $2 AND entity_name = ANY($3)`,
+            [projectId, latestRunId, retrievedEntityNames]
+          );
+        }
         if (communityRes.rows.length > 0) {
           const communityIds = communityRes.rows.map((r) => r.community_id);
           const clusterMaxSiblings = parseInt(
             await getSetting(db, projectId, 'cluster_max_siblings', '10'), 10
           );
           // Fetch sibling entities in the same communities, excluding already-retrieved ones.
-          const siblingRes = await db.query(
-            `SELECT DISTINCT entity_name FROM entity_communities
-             WHERE project_id = $1 AND run_id = $2
-               AND community_id = ANY($3)
-               AND entity_name <> ALL($4)
-             LIMIT $5`,
-            [projectId, latestRunId, communityIds, retrievedEntityNames, clusterMaxSiblings]
-          );
+          // Dialect split: Postgres uses ANY($3) and <> ALL($4); SQLite uses IN/NOT IN.
+          let siblingRes;
+          if (db.dialect === 'sqlite') {
+            const { clause: cidInClause, params: cidInParams }     = buildInClause('community_id', communityIds);
+            const { clause: nameNotInClause, params: nameNotInParams } =
+              retrievedEntityNames.length > 0
+                ? { clause: `entity_name NOT IN (${retrievedEntityNames.map(() => '?').join(', ')})`, params: retrievedEntityNames.slice() }
+                : { clause: '1=1', params: [] };
+            siblingRes = await db.query(
+              `SELECT DISTINCT entity_name FROM entity_communities
+               WHERE project_id = ? AND run_id = ?
+                 AND ${cidInClause}
+                 AND ${nameNotInClause}
+               LIMIT ?`,
+              [projectId, latestRunId, ...cidInParams, ...nameNotInParams, clusterMaxSiblings]
+            );
+          } else {
+            siblingRes = await db.query(
+              `SELECT DISTINCT entity_name FROM entity_communities
+               WHERE project_id = $1 AND run_id = $2
+                 AND community_id = ANY($3)
+                 AND entity_name <> ALL($4)
+               LIMIT $5`,
+              [projectId, latestRunId, communityIds, retrievedEntityNames, clusterMaxSiblings]
+            );
+          }
           if (siblingRes.rows.length > 0 && tokensUsed < tokenBudget) {
             const siblingText = siblingRes.rows.map((r) => `- ${r.entity_name}`).join('\n');
             sections.push(`### Related (community)\n${siblingText}`);

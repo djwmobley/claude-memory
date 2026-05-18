@@ -100,6 +100,9 @@ function loadConfig() {
   const user = getInSection('knowledge', 'user') || defaults.user;
   const embedding_model = getInSection('knowledge', 'embedding_model') || null;
   const num_ctx = getInSection('knowledge', 'num_ctx') || null;
+  // storage_backend: 'postgres' (default) or 'sqlite' — read from top-level key.
+  // Used by db-seam.js to select the embedded SQLite backend when set to 'sqlite'.
+  const storage_backend = getTopLevel('storage_backend') || null;
 
   return {
     host,
@@ -107,6 +110,7 @@ function loadConfig() {
     database,
     user,
     project: resolvedProjectName,
+    storage_backend,
     // knowledge: nested object mirrors routing-config.js shape for cross-script consistency
     knowledge: { tier, host, port, database, user, embedding_model, num_ctx },
     root,
