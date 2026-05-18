@@ -60,3 +60,18 @@ jobs:
           # Propagates into the loader subprocess that eval STEP 5 spawns;
           # without this, the loader tries Ollama-on-localhost and fails 3x per fixture.
           OLLAMA_SKIP: '1'
+      - name: Run graph edge-traversal tests
+        # Exhaustive harness for kind:'graph' recursive-CTE retrieval feature.
+        # Creates/drops throwaway DBs; uses the same Postgres service as the other steps.
+        run: node scripts/test-graph-traversal.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: Run smoketest graph section
+        # Focused end-to-end smoke for the graph kind wired into the existing CI job.
+        run: node scripts/smoketest-handoff.js --section=gr
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres

@@ -25,8 +25,8 @@ const { Client } = require('pg');
 const ARGS       = process.argv.slice(2);
 const sectionArg = ARGS.find((a) => a.startsWith('--section='));
 const SECTION    = sectionArg ? sectionArg.split('=')[1] : 'all';
-if (!['all', 'lifecycle', 'hooks', 'hardening', 'w2', 'w3', 'w4', 'c1', 'c2', 'c3', 'registry', 'queue', 'collision'].includes(SECTION)) {
-  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, hardening, w2, w3, w4, c1, c2, c3, registry, queue, collision, all`);
+if (!['all', 'lifecycle', 'hooks', 'hardening', 'w2', 'w3', 'w4', 'c1', 'c2', 'c3', 'registry', 'queue', 'collision', 'gr'].includes(SECTION)) {
+  console.error(`Unknown --section value: ${SECTION}. Valid: lifecycle, hooks, hardening, w2, w3, w4, c1, c2, c3, registry, queue, collision, gr, all`);
   process.exit(2);
 }
 
@@ -101,6 +101,8 @@ let qPassed   = 0;
 let qFailed   = 0;
 let colPassed = 0;
 let colFailed = 0;
+let grPassed  = 0;
+let grFailed  = 0;
 
 const LC_TOTAL  = 14;
 const HK_TOTAL = 3;
@@ -114,6 +116,7 @@ const C3_TOTAL = 5;
 const RG_TOTAL  = 7;
 const Q_TOTAL   = 4;
 const COL_TOTAL = 5;
+const GR_TOTAL  = 4;
 
 function lcPass(step, label) {
   console.log(`[STEP ${step}/${LC_TOTAL}] ${label} ... PASS`);
@@ -248,6 +251,16 @@ function colPass(step, label) {
 function colFail(step, label, reason) {
   console.log(`[COLLISION ${step}/${COL_TOTAL}] ${label} ... FAIL: ${reason}`);
   colFailed++;
+}
+
+function grPass(step, label) {
+  console.log(`[GRAPH ${step}/${GR_TOTAL}] ${label} ... PASS`);
+  grPassed++;
+}
+
+function grFail(step, label, reason) {
+  console.log(`[GRAPH ${step}/${GR_TOTAL}] ${label} ... FAIL: ${reason}`);
+  grFailed++;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -5249,6 +5262,262 @@ async function runCollisionSection() {
   } catch (_) {}
 }
 
+// ── Graph section — focused end-to-end graph kind integration ────────────────
+
+/**
+ * GRAPH 1/4: Smoke — loader-load with a graph contract exits 0 and produces the section.
+ */
+async function grStep1_basicTraversal(grDb, grProjectId, grProjectDir) {
+  const label = 'Basic traversal: seed→hop1→hop2 appears in ### Related (graph) section';
+  try {
+    const db = await pgConnect(grDb);
+
+    // Insert edges: GR_A → GR_B → GR_C.
+    await db.query(
+      `INSERT INTO edges (project_id, from_entity, edge_type, to_entity, weight)
+       VALUES ($1, 'GR_A', 'depends_on', 'GR_B', 1.0),
+              ($1, 'GR_B', 'depends_on', 'GR_C', 1.0)`,
+      [grProjectId]
+    );
+
+    // Set graph contract with explicit seed.
+    await db.query(
+      `UPDATE retrieval_contract SET queries = $2::jsonb, updated_at = now()
+       WHERE project_id = $1 AND name = 'default'`,
+      [grProjectId, JSON.stringify({ queries: [
+        { kind: 'graph', filter: { seed: 'GR_A', direction: 'out', max_depth: 2 } },
+      ] })]
+    );
+    await db.end();
+
+    const r = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'loader-load'],
+      { cwd: PROJECT_ROOT, env: { ...process.env, HANDOFF_DB: grDb, PROJECT_ROOT: grProjectDir }, encoding: 'utf8', timeout: 30000 }
+    );
+
+    if (r.status !== 0) { grFail(1, label, `loader-load exited ${r.status}: ${((r.stderr || '') + (r.stdout || '')).slice(0, 200)}`); return; }
+
+    const out = r.stdout || '';
+    if (!out.includes('### Related (graph)')) { grFail(1, label, 'Graph section header not found'); return; }
+    if (!out.includes('- GR_B (')) { grFail(1, label, 'GR_B (hop 1) not found in graph section'); return; }
+    if (!out.includes('- GR_C (')) { grFail(1, label, 'GR_C (hop 2) not found in graph section'); return; }
+
+    grPass(1, label);
+  } catch (err) { grFail(1, label, err.message); }
+}
+
+/**
+ * GRAPH 2/4: Gate OFF → byte-identical to no-graph-query baseline.
+ */
+async function grStep2_gateOff(grDb, grProjectId, grProjectDir) {
+  const label = 'Gate OFF (graph_retrieval_enabled=disabled): byte-identical to no-graph baseline';
+  try {
+    const db = await pgConnect(grDb);
+
+    // Disable gate.
+    await db.query(
+      `INSERT INTO project_settings (project_id, key, value) VALUES ($1, 'graph_retrieval_enabled', 'disabled')
+       ON CONFLICT (project_id, key) DO UPDATE SET value = 'disabled'`,
+      [grProjectId]
+    );
+
+    // Contract with graph query.
+    await db.query(
+      `UPDATE retrieval_contract SET queries = $2::jsonb, updated_at = now()
+       WHERE project_id = $1 AND name = 'default'`,
+      [grProjectId, JSON.stringify({ queries: [{ kind: 'graph', filter: { seed: 'GR_A', direction: 'out', max_depth: 2 } }] })]
+    );
+    await db.end();
+
+    const rDisabled = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'loader-load'],
+      { cwd: PROJECT_ROOT, env: { ...process.env, HANDOFF_DB: grDb, PROJECT_ROOT: grProjectDir }, encoding: 'utf8', timeout: 30000 }
+    );
+    if (rDisabled.status !== 0) { grFail(2, label, `gate-disabled: exited ${rDisabled.status}`); return; }
+
+    // No-graph baseline: empty contract.
+    const db2 = await pgConnect(grDb);
+    await db2.query(
+      `UPDATE retrieval_contract SET queries = $2::jsonb, updated_at = now()
+       WHERE project_id = $1 AND name = 'default'`,
+      [grProjectId, JSON.stringify({ queries: [] })]
+    );
+    // Re-enable gate so it doesn't affect future tests.
+    await db2.query(
+      `INSERT INTO project_settings (project_id, key, value) VALUES ($1, 'graph_retrieval_enabled', 'enabled')
+       ON CONFLICT (project_id, key) DO UPDATE SET value = 'enabled'`,
+      [grProjectId]
+    );
+    await db2.end();
+
+    const rNoGraph = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'loader-load'],
+      { cwd: PROJECT_ROOT, env: { ...process.env, HANDOFF_DB: grDb, PROJECT_ROOT: grProjectDir }, encoding: 'utf8', timeout: 30000 }
+    );
+    if (rNoGraph.status !== 0) { grFail(2, label, `no-graph: exited ${rNoGraph.status}`); return; }
+
+    if ((rDisabled.stdout || '').includes('### Related (graph)')) {
+      grFail(2, label, 'Graph section present with gate disabled');
+      return;
+    }
+
+    const normalize = (s) => s.replace(/tokens used: ~\d+/g, 'tokens used: ~X');
+    if (normalize(rDisabled.stdout || '') !== normalize(rNoGraph.stdout || '')) {
+      grFail(2, label, 'gate-disabled output differs from no-graph baseline');
+      return;
+    }
+
+    grPass(2, label);
+  } catch (err) { grFail(2, label, err.message); }
+}
+
+/**
+ * GRAPH 3/4: Cycle terminates — no infinite loop.
+ */
+async function grStep3_cycleTerminates(grDb, grProjectId, grProjectDir) {
+  const label = 'Cycle GR_CYCLE_A→GR_CYCLE_B→GR_CYCLE_A: terminates cleanly (no infinite loop)';
+  try {
+    const db = await pgConnect(grDb);
+
+    await db.query(
+      `INSERT INTO edges (project_id, from_entity, edge_type, to_entity, weight)
+       VALUES ($1, 'GR_CYCLE_A', 'depends_on', 'GR_CYCLE_B', 1.0),
+              ($1, 'GR_CYCLE_B', 'depends_on', 'GR_CYCLE_A', 1.0)`,
+      [grProjectId]
+    );
+
+    await db.query(
+      `UPDATE retrieval_contract SET queries = $2::jsonb, updated_at = now()
+       WHERE project_id = $1 AND name = 'default'`,
+      [grProjectId, JSON.stringify({ queries: [{ kind: 'graph', filter: { seed: 'GR_CYCLE_A', direction: 'out', max_depth: 5 } }] })]
+    );
+    await db.end();
+
+    const start = Date.now();
+    const r = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'loader-load'],
+      { cwd: PROJECT_ROOT, env: { ...process.env, HANDOFF_DB: grDb, PROJECT_ROOT: grProjectDir }, encoding: 'utf8', timeout: 30000 }
+    );
+    const elapsed = Date.now() - start;
+
+    if (r.status !== 0) { grFail(3, label, `loader-load exited ${r.status}: ${((r.stderr || '') + (r.stdout || '')).slice(0, 200)}`); return; }
+    if (elapsed > 10000) { grFail(3, label, `took ${elapsed}ms — possible cycle hang`); return; }
+
+    const out = r.stdout || '';
+    const graphSection = out.includes('### Related (graph)')
+      ? out.split('### Related (graph)')[1]?.split('\n\n')[0] || ''
+      : '';
+    if (graphSection.includes('- GR_CYCLE_A (')) {
+      grFail(3, label, 'GR_CYCLE_A (seed) appears as reached node — cycle prevention failed');
+      return;
+    }
+
+    grPass(3, label);
+  } catch (err) { grFail(3, label, err.message); }
+}
+
+/**
+ * GRAPH 4/4: Default contract has no graph query → output byte-identical between runs.
+ * This is the regression guard for the default session path.
+ */
+async function grStep4_defaultContractRegression(grDb, grProjectId, grProjectDir) {
+  const label = 'Default contract (no graph query): output byte-identical run-to-run (regression guard)';
+  try {
+    const db = await pgConnect(grDb);
+
+    // Reset to a plain assertion contract (no graph kind).
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, last_reinforced)
+       VALUES ($1, 'GR_REG', 'is_status', 'test', 8, 'user_stated', now())
+       ON CONFLICT DO NOTHING`,
+      [grProjectId]
+    );
+    await db.query(
+      `UPDATE retrieval_contract SET queries = $2::jsonb, updated_at = now()
+       WHERE project_id = $1 AND name = 'default'`,
+      [grProjectId, JSON.stringify({ queries: [{ kind: 'assertion' }] })]
+    );
+    await db.end();
+
+    const opts = { cwd: PROJECT_ROOT, env: { ...process.env, HANDOFF_DB: grDb, PROJECT_ROOT: grProjectDir }, encoding: 'utf8', timeout: 30000 };
+    const r1 = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'loader-load'], opts);
+    const r2 = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'loader-load'], opts);
+
+    if (r1.status !== 0 || r2.status !== 0) { grFail(4, label, `loader-load failed: ${r1.status}/${r2.status}`); return; }
+
+    const normalize = (s) => s.replace(/tokens used: ~\d+/g, 'tokens used: ~X');
+    if (normalize(r1.stdout || '') !== normalize(r2.stdout || '')) {
+      grFail(4, label, 'Two runs of no-graph contract produced different output — regression');
+      return;
+    }
+    if ((r1.stdout || '').includes('### Related (graph)')) {
+      grFail(4, label, 'Graph section present in no-graph contract output — regression');
+      return;
+    }
+
+    grPass(4, label);
+  } catch (err) { grFail(4, label, err.message); }
+}
+
+async function runGraphSection() {
+  console.log(`\n=== GRAPH SECTION (${GR_TOTAL} steps) ===`);
+  console.log('smoketest-handoff graph: basic traversal, gate-off regression, cycle, default-contract regression');
+  console.log('');
+
+  const GR_TS       = Date.now();
+  const GR_DB       = `claude_memory_graph_${GR_TS}`;
+  const GR_PROJ_DIR = path.join(os.tmpdir(), `handoff_graph_${GR_TS}`);
+  const GR_PROJ_ID  = encodeCwd(GR_PROJ_DIR);
+
+  try {
+    await createSmokeDb(GR_DB, GR_PROJ_DIR);
+    fs.writeFileSync(path.join(GR_PROJ_DIR, 'CLAUDE.md'), '# graph-smoketest\n\n## Durable facts\n- (none)\n', 'utf8');
+
+    const initR = spawnSync(
+      process.execPath,
+      [HANDOFF_SCRIPT, 'init', '-y'],
+      { cwd: PROJECT_ROOT, env: { ...process.env, HANDOFF_DB: GR_DB, PROJECT_ROOT: GR_PROJ_DIR }, encoding: 'utf8', timeout: 30000 }
+    );
+    if (initR.status !== 0) {
+      console.log('[GRAPH] DB init failed — skipping remaining steps');
+      console.log(initR.stderr || initR.stdout || '');
+      grFailed += GR_TOTAL;
+      return;
+    }
+    console.log(`[GRAPH] DB init OK (${GR_DB})`);
+
+    // Verify graph settings registered by init.
+    const initDb = await pgConnect(GR_DB);
+    for (const key of ['graph_retrieval_enabled', 'graph_max_depth', 'graph_max_nodes']) {
+      const { rows } = await initDb.query(
+        `SELECT value FROM project_settings WHERE project_id = $1 AND key = $2`,
+        [GR_PROJ_ID, key]
+      );
+      if (rows.length === 0) {
+        console.log(`[GRAPH] WARNING: ${key} default not registered by init`);
+      } else {
+        console.log(`[GRAPH] ${key} = ${rows[0].value} (OK)`);
+      }
+    }
+    await initDb.end();
+
+    try { await createRetrievalEventsTable(GR_DB); } catch (_) { /* non-fatal */ }
+
+    await grStep1_basicTraversal(GR_DB, GR_PROJ_ID, GR_PROJ_DIR);
+    await grStep2_gateOff(GR_DB, GR_PROJ_ID, GR_PROJ_DIR);
+    await grStep3_cycleTerminates(GR_DB, GR_PROJ_ID, GR_PROJ_DIR);
+    await grStep4_defaultContractRegression(GR_DB, GR_PROJ_ID, GR_PROJ_DIR);
+
+  } finally {
+    const GR_HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', GR_PROJ_ID, 'handoff.md');
+    await dropSmokeDb(GR_DB, GR_PROJ_DIR, GR_HANDOFF_PATH).catch(() => {});
+  }
+}
+
 async function runRegistrySection() {
   console.log(`\n=== REGISTRY SECTION (${RG_TOTAL} steps) ===`);
   console.log('smoketest-handoff registry: loadRegistry, cardinalityOf, classifyPredicate, recognizedPredicates, write-path non-regression');
@@ -5464,6 +5733,9 @@ async function main() {
   if (SECTION === 'collision' || SECTION === 'all') {
     await runCollisionSection();
   }
+  if (SECTION === 'gr' || SECTION === 'all') {
+    await runGraphSection();
+  }
 
   console.log('');
 
@@ -5479,12 +5751,13 @@ async function main() {
   const rgTotal  = rgPassed + rgFailed;
   const qTotal   = qPassed  + qFailed;
   const colTotal = colPassed + colFailed;
-  const totalPass = lcPassed + hkPassed + hdPassed + w2Passed + w3Passed + w4Passed + c1Passed + c2Passed + c3Passed + rgPassed + qPassed + colPassed;
-  const totalAll  = lcTotal  + hkTotal  + hdTotal  + w2Total  + w3Total  + w4Total  + c1Total  + c2Total  + c3Total  + rgTotal  + qTotal  + colTotal;
+  const grTotal  = grPassed  + grFailed;
+  const totalPass = lcPassed + hkPassed + hdPassed + w2Passed + w3Passed + w4Passed + c1Passed + c2Passed + c3Passed + rgPassed + qPassed + colPassed + grPassed;
+  const totalAll  = lcTotal  + hkTotal  + hdTotal  + w2Total  + w3Total  + w4Total  + c1Total  + c2Total  + c3Total  + rgTotal  + qTotal  + colTotal  + grTotal;
   const totalSkip = lcSkipped + hkSkipped + hdSkipped + w2Skipped + w3Skipped + w4Skipped + c1Skipped + c2Skipped + c3Skipped;
 
   if (SECTION === 'all') {
-    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal}, hardening: ${hdPassed}/${hdTotal}, w2: ${w2Passed}/${w2Total}, w3: ${w3Passed}/${w3Total}, w4: ${w4Passed}/${w4Total}, c1: ${c1Passed}/${c1Total}, c2: ${c2Passed}/${c2Total}, c3: ${c3Passed}/${c3Total}, registry: ${rgPassed}/${rgTotal}, queue: ${qPassed}/${qTotal}, collision: ${colPassed}/${colTotal})`);
+    console.log(`smoketest: ${totalPass}/${totalAll} passed, ${totalSkip} skipped (lifecycle: ${lcPassed}/${lcTotal}, hooks: ${hkPassed}/${hkTotal}, hardening: ${hdPassed}/${hdTotal}, w2: ${w2Passed}/${w2Total}, w3: ${w3Passed}/${w3Total}, w4: ${w4Passed}/${w4Total}, c1: ${c1Passed}/${c1Total}, c2: ${c2Passed}/${c2Total}, c3: ${c3Passed}/${c3Total}, registry: ${rgPassed}/${rgTotal}, queue: ${qPassed}/${qTotal}, collision: ${colPassed}/${colTotal}, graph: ${grPassed}/${grTotal})`);
   } else if (SECTION === 'lifecycle') {
     console.log(`smoketest: ${lcPassed}/${lcTotal} passed, ${lcSkipped} skipped (lifecycle only)`);
   } else if (SECTION === 'hooks') {
@@ -5507,11 +5780,13 @@ async function main() {
     console.log(`smoketest: ${qPassed}/${qTotal} passed (queue only)`);
   } else if (SECTION === 'collision') {
     console.log(`smoketest: ${colPassed}/${colTotal} passed (collision only)`);
+  } else if (SECTION === 'gr') {
+    console.log(`smoketest: ${grPassed}/${grTotal} passed (graph only)`);
   } else {
     console.log(`smoketest: ${hdPassed}/${hdTotal} passed, ${hdSkipped} skipped (hardening only)`);
   }
 
-  if (lcFailed + hkFailed + hdFailed + w2Failed + w3Failed + w4Failed + c1Failed + c2Failed + c3Failed + rgFailed + qFailed + colFailed > 0) process.exitCode = 1;
+  if (lcFailed + hkFailed + hdFailed + w2Failed + w3Failed + w4Failed + c1Failed + c2Failed + c3Failed + rgFailed + qFailed + colFailed + grFailed > 0) process.exitCode = 1;
 }
 
 main().catch((err) => {
