@@ -57,7 +57,10 @@ const {
   readMarker,
   writeMarker,
 } = require('./lib/project-marker');
-const { ensureProjectIdentity }                    = require('./lib/project-identity');
+const {
+  ensureProjectIdentity,
+  reconcileLegacySettings,
+} = require('./lib/project-identity');
 
 process.on('exit', () => {
   const ms = Number(process.hrtime.bigint() - __startNs) / 1e6;
@@ -451,7 +454,11 @@ function detectMultiAuthor(cwd) {
     const out = execFileSync(
       'git',
       ['-C', cwd, 'log', '--format=%ae', '--since=1 year ago'],
-      { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }
+      {
+        encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'],
+        // Pass PROJECT_ROOT so any transitive subprocess resolves the correct project root.
+        env: { ...process.env, PROJECT_ROOT: cwd },
+      }
     );
     const emails = new Set(out.split('\n').map((e) => e.trim()).filter(Boolean));
     return emails.size || 1;
@@ -476,7 +483,11 @@ function detectMultiAuthor(cwd) {
 function detectUnpackagedState(root) {
   try {
     const { execFileSync } = require('child_process');
-    const execOpts = { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] };
+    // Pass PROJECT_ROOT so any transitive subprocess resolves the correct project root.
+    const execOpts = {
+      encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, PROJECT_ROOT: root },
+    };
 
     // Check for dirty working tree (untracked, modified, or staged changes).
     const statusOut = execFileSync('git', ['-C', root, 'status', '--porcelain'], execOpts);
@@ -2298,6 +2309,18 @@ async function cmdClose(args) {
     // ensureProjectIdentity calls process.exit(1) on fatal errors.
     process.stderr.write('[handoff] identity resolution failed (unexpected): ' + idErr.message + '\n');
     process.exit(1);
+  }
+
+  // ── Item 6: Idempotent legacy-settings reconciliation ────────────────────
+  // Remove orphaned project_settings rows keyed to the legacy encodeCwd(root) id
+  // for this project ONLY — strictly scoped, idempotent, snapshot-first.
+  // Non-fatal: any error is logged and ignored so close can proceed.
+  try {
+    const { encodeCwd: _encodeCwd } = require('./lib/encoded-cwd');
+    const legacyIdForReconcile = _encodeCwd(root);
+    await reconcileLegacySettings(db, legacyIdForReconcile, projectId, { silent: true });
+  } catch (reconcileErr) {
+    process.stderr.write('[handoff] legacy reconcile (non-fatal): ' + reconcileErr.message + '\n');
   }
 
   const handoffPath = resolveHandoffMdPath(projectId);

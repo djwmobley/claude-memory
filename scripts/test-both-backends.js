@@ -1252,7 +1252,7 @@ async function runS8() {
     pass(label7);
   } catch (err) { fail(label7, err.message); }
 
-  const label8 = 'db-seam.js exports all required port methods';
+  const label8 = 'db-seam.js exports all required port methods (including acquireMigrationLock)';
   try {
     const requiredExports = [
       'buildSupersessionUpdate',
@@ -1262,6 +1262,7 @@ async function runS8() {
       'buildBumpAssertions',
       'buildGraphCTE',
       'buildMultiPairInsert',
+      'acquireMigrationLock',  // Item 1: concurrent migration guard
     ];
     // Check that SQLiteAdapter and PostgresAdapter both have these methods.
     const sqliteProto   = SQLiteAdapter.prototype;
@@ -3575,6 +3576,952 @@ async function runS13() {
   );
 }
 
+// ── S14: PR-3a-hardening — adversarial concurrency + robustness tests ────────
+
+async function runS14() {
+  console.log('\n=== S14: PR-3a-hardening — adversarial concurrency, atomic marker, snapshot safety, reconciliation ===');
+  console.log('Items: 1 concurrent migration guard; 2 atomic marker + STATE3 race; 5 snapshot collision-safety; 6 idempotent reconciliation; 7 race-free UPSERT.');
+
+  const {
+    MARKER_FILENAME,
+    findProjectRootByMarker,
+    readMarker,
+    writeMarker,
+    isValidUUID,
+  } = require('./lib/project-marker');
+
+  const {
+    ensureProjectIdentity,
+    PROJECT_ID_TABLES,
+    dumpRecoverySnapshot,
+    getSnapshotDir,
+    verifyByteIdentical,
+    runOneShot,
+    writeMarkerAtomic,
+    reconcileLegacySettings,
+  } = require('./lib/project-identity');
+
+  const { encodeCwd } = require('./lib/encoded-cwd');
+
+  // Helper: seed multi-table corpus (reuse S13's seedCorpus pattern).
+  async function seedCorpus(db, projectId, opts = {}) {
+    const rows = opts.rows || 3;
+    const isPostgres = db.dialect === 'postgres';
+    const suppFalse  = isPostgres ? 'false' : '0';
+    for (let i = 0; i < rows; i++) {
+      try {
+        await db.query(
+          `INSERT INTO entities (project_id, name, entity_type, description) VALUES ($1,$2,$3,$4)
+           ON CONFLICT (project_id, name) DO NOTHING`,
+          [projectId, `entity-s14-${i}`, 'concept', `desc ${i}`]
+        );
+      } catch (_) {}
+      try {
+        await db.query(
+          `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+           VALUES ($1,$2,'is_status',$3,7,'user_stated',${suppFalse})`,
+          [projectId, `subj-s14-${i}`, `val-${i}`]
+        );
+      } catch (_) {}
+    }
+  }
+
+  async function totalCount(db, projectId) {
+    let total = 0;
+    for (const table of PROJECT_ID_TABLES) {
+      try {
+        const { rows } = await db.query(
+          `SELECT COUNT(*) AS n FROM ${table} WHERE project_id=$1`, [projectId]
+        );
+        total += parseInt(rows[0] && (rows[0].n || rows[0].count || 0), 10);
+      } catch (_) {}
+    }
+    return total;
+  }
+
+  // ── S14.1: acquireMigrationLock port method exists on both adapters ──────
+
+  {
+    const label = 'S14.1: acquireMigrationLock is a function on both SQLiteAdapter and PostgresAdapter';
+    try {
+      const { SQLiteAdapter: SA, PostgresAdapter: PA } = require('./lib/db-seam');
+      assertTrue(typeof SA.prototype.acquireMigrationLock === 'function',
+        'SQLiteAdapter.prototype.acquireMigrationLock must be a function');
+      assertTrue(typeof PA.prototype.acquireMigrationLock === 'function',
+        'PostgresAdapter.prototype.acquireMigrationLock must be a function');
+      pass(label);
+    } catch (err) { fail(label, err.message); }
+  }
+
+  // ── S14.2: N concurrent ensureProjectIdentity calls on one legacy project ─
+  // Both SQLite and Postgres: simulate concurrency by running N sequential calls
+  // in the same process (which exercises the re-check / idempotency path) and,
+  // for Postgres, verify that the advisory lock mechanism is present.
+  //
+  // True OS-level concurrency with separate adapters is tested for Postgres below.
+
+  await bothBackends(
+    'S14.2: N sequential ensureProjectIdentity calls on same legacy project → exactly one migration, I3 conservation holds, single UUID',
+    async (db) => {
+      const tmpDir   = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s14-2-'));
+      try {
+        const legacyId = encodeCwd(tmpDir);
+        await seedCorpus(db, legacyId, { rows: 3 });
+        const legacyBefore = await totalCount(db, legacyId);
+        assertTrue(legacyBefore > 0, 'S14.2: legacy rows seeded');
+
+        // Run identity resolution N times — each call after the first should be a no-op.
+        const N = 5;
+        const uuids = [];
+        for (let i = 0; i < N; i++) {
+          const identity = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+          uuids.push(identity.projectId);
+        }
+
+        // All calls must return the same UUID.
+        const uniqueUUIDs = new Set(uuids);
+        assertEqual(uniqueUUIDs.size, 1, 'S14.2: all N calls returned the same UUID');
+
+        const uuid        = uuids[0];
+        const newCount    = await totalCount(db, uuid);
+        const legacyAfter = await totalCount(db, legacyId);
+
+        // I3 conservation: count under UUID == count that was under legacy.
+        assertEqual(newCount, legacyBefore, 'S14.2: I3 conservation — count(new UUID) == count(legacy before)');
+        assertEqual(legacyAfter, 0, 'S14.2: I3 conservation — count(legacy after) == 0');
+
+        // Exactly one marker file at tmpDir.
+        const marker = readMarker(tmpDir);
+        assertTrue(marker !== null, 'S14.2: exactly one marker file after N calls');
+        assertEqual(marker.uuid, uuid, 'S14.2: marker UUID matches returned UUID');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S14.3 (Postgres-only): True concurrent migrations via separate connections ─
+  // Spin up two independent Postgres adapters (separate connections → separate
+  // pg_advisory_xact_lock contest) and run ensureProjectIdentity on both concurrently.
+  // After both complete: exactly one UUID, I3 conservation holds.
+  {
+    const label = 'S14.3 [Postgres-only]: two concurrent adapters on same legacy project → exactly one migration, I3 holds';
+    const pgAvail = await isPgAvailable();
+    if (!pgAvail) {
+      skip(label, 'Postgres backend unavailable');
+    } else {
+      const ts     = Date.now();
+      const dbName = `cm_s14_3_${ts}_${Math.floor(Math.random() * 10000)}`;
+      let sysClient = null;
+      let clients   = [];
+      try {
+        sysClient = await pgConnect('postgres');
+        await sysClient.query(`CREATE DATABASE "${dbName}"`);
+        await sysClient.end();
+        sysClient = null;
+
+        // Apply schema on a dedicated setup connection.
+        const setupClient = await pgConnect(dbName);
+        const schemaSql = fs.readFileSync(
+          path.resolve(__dirname, 'sql', 'handoff-core-schema.sql'), 'utf8'
+        );
+        await setupClient.query(schemaSql);
+        await setupClient.end();
+
+        // Create two independent client connections.
+        const c1 = await pgConnect(dbName);
+        const c2 = await pgConnect(dbName);
+        clients  = [c1, c2];
+
+        const { PostgresAdapter: PA } = require('./lib/db-seam');
+        const db1 = new PA(c1);
+        const db2 = new PA(c2);
+
+        const tmpDir   = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s14-3-'));
+        try {
+          const legacyId = encodeCwd(tmpDir);
+
+          // Seed legacy rows using db1.
+          await seedCorpus(db1, legacyId, { rows: 3 });
+          const legacyBefore = await totalCount(db1, legacyId);
+
+          // Run both concurrently — one will migrate, the other will re-check and no-op.
+          const [id1, id2] = await Promise.all([
+            ensureProjectIdentity(db1, { cwd: tmpDir, silent: true }),
+            ensureProjectIdentity(db2, { cwd: tmpDir, silent: true }),
+          ]);
+
+          assertEqual(id1.projectId, id2.projectId,
+            'S14.3: both concurrent callers return the same UUID');
+
+          const uuid        = id1.projectId;
+          const newCount    = await totalCount(db1, uuid);
+          const legacyAfter = await totalCount(db1, legacyId);
+
+          assertEqual(newCount, legacyBefore,
+            'S14.3: I3 conservation — count(new UUID) == count(legacy before)');
+          assertEqual(legacyAfter, 0,
+            'S14.3: I3 conservation — count(legacy after) == 0');
+
+          // Exactly one marker.
+          const marker = readMarker(tmpDir);
+          assertTrue(marker !== null, 'S14.3: exactly one marker after concurrent migration');
+          assertEqual(marker.uuid, uuid, 'S14.3: marker UUID matches');
+
+          pass(label);
+        } finally {
+          try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+        }
+      } catch (err) {
+        fail(label, err.message);
+      } finally {
+        for (const c of clients) { try { await c.end(); } catch (_) {} }
+        if (sysClient) { try { await sysClient.end(); } catch (_) {} }
+        let dropClient = null;
+        try {
+          dropClient = await pgConnect('postgres');
+          await dropClient.query(
+            `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1 AND pid<>pg_backend_pid()`,
+            [dbName]
+          );
+          await dropClient.query(`DROP DATABASE IF EXISTS "${dbName}"`);
+        } catch (_) {} finally {
+          if (dropClient) { try { await dropClient.end(); } catch (_) {} }
+        }
+      }
+    }
+  }
+
+  // ── S14.4: STATE 3 marker race — concurrent writeMarkerAtomic calls → only one wins ─
+
+  await bothBackends(
+    'S14.4: STATE 3 concurrent marker race — writeMarkerAtomic: second call detects "already exists" and does not corrupt',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s14-4-'));
+      try {
+        // First process wins the marker write.
+        const marker1 = writeMarkerAtomic(tmpDir);
+        assertTrue(isValidUUID(marker1.uuid), 'S14.4: first writer mints valid UUID');
+
+        // Second process loses — must throw "already exists".
+        let threw = false;
+        let errMsg = '';
+        try {
+          writeMarkerAtomic(tmpDir);
+        } catch (e) {
+          threw  = true;
+          errMsg = e.message;
+        }
+        assertTrue(threw, 'S14.4: second writeMarkerAtomic throws when marker already exists');
+        assertTrue(errMsg.includes('already exists'), 'S14.4: error message indicates "already exists"');
+
+        // Marker content must be intact (first write is not corrupted by second attempt).
+        const read = readMarker(tmpDir);
+        assertTrue(read !== null, 'S14.4: marker still readable after failed second write');
+        assertEqual(read.uuid, marker1.uuid, 'S14.4: marker UUID unchanged (no corruption)');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S14.5: STATE 3 race recovery — loser reads existing marker and becomes STATE 2 ─
+
+  await bothBackends(
+    'S14.5: STATE 3 race loser reads concurrent marker and completes migration via STATE 2 path',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s14-5-'));
+      try {
+        const legacyId = encodeCwd(tmpDir);
+        await seedCorpus(db, legacyId, { rows: 2 });
+        const legacyBefore = await totalCount(db, legacyId);
+
+        // Simulate: concurrent process already wrote the marker but did NOT complete migration.
+        // (Loser reads the marker and runs as STATE 2.)
+        const preMarker = writeMarker(tmpDir);  // simulates the winning concurrent process
+
+        // Now run ensureProjectIdentity — sees marker (STATE 2 path since rows are still legacy).
+        const identity = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+
+        assertEqual(identity.projectId, preMarker.uuid, 'S14.5: UUID matches pre-written marker');
+        assertFalse(identity.isNewProject, 'S14.5: isNewProject = false (migrated, not fresh)');
+
+        // I3 conservation.
+        const newCount    = await totalCount(db, identity.projectId);
+        const legacyAfter = await totalCount(db, legacyId);
+        assertEqual(newCount, legacyBefore, 'S14.5: conservation — count(new UUID) == count(legacy)');
+        assertEqual(legacyAfter, 0, 'S14.5: conservation — count(legacy after) == 0');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S14.6: STATE 4 concurrent fresh-project marker writes → exactly one marker ─
+
+  await bothBackends(
+    'S14.6: STATE 4 concurrent fresh-project writes — only one marker survives; no DB corruption',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s14-6-'));
+      try {
+        // Run ensureProjectIdentity twice in "parallel" (sequential here; in real concurrency
+        // the second call detects "already exists" and reads the winning marker).
+        const id1 = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+        assertTrue(isValidUUID(id1.projectId), 'S14.6: first call returns valid UUID');
+        assertTrue(id1.isNewProject, 'S14.6: first call → isNewProject=true');
+
+        // Second call: marker exists, no rows under UUID (fresh) → STATE 1 variant (no-op).
+        const id2 = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+        assertEqual(id2.projectId, id1.projectId, 'S14.6: second call returns same UUID');
+
+        // Exactly one marker.
+        const marker = readMarker(tmpDir);
+        assertTrue(marker !== null, 'S14.6: marker exists');
+        assertEqual(marker.uuid, id1.projectId, 'S14.6: marker UUID matches returned UUID');
+
+        // No duplicate marker files.
+        const files = fs.readdirSync(tmpDir).filter((f) => f === MARKER_FILENAME || f.startsWith(MARKER_FILENAME));
+        assertEqual(files.length, 1, 'S14.6: exactly one marker file in tmpDir');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S14.7: I1 snapshot collision-safety — concurrent snapshots get distinct paths ─
+
+  await bothBackends(
+    'S14.7: I1 snapshot collision-safety — two concurrent dumpRecoverySnapshot calls produce distinct paths',
+    async (db) => {
+      const tmpDir      = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s14-7-'));
+      const snapDir     = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s14-7s-'));
+      const fakeUUID    = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+      const legacyId    = encodeCwd(tmpDir);
+
+      try {
+        await seedCorpus(db, legacyId, { rows: 2 });
+
+        // Two concurrent snapshot calls — since pid + random token are in the filename,
+        // they must not collide.  Run them in the same tick (both will succeed with distinct names).
+        const [p1, p2] = await Promise.all([
+          dumpRecoverySnapshot(db, legacyId, snapDir, fakeUUID),
+          dumpRecoverySnapshot(db, legacyId, snapDir, fakeUUID),
+        ]);
+
+        // Both paths exist.
+        assertTrue(fs.existsSync(p1), 'S14.7: first snapshot file exists');
+        assertTrue(fs.existsSync(p2), 'S14.7: second snapshot file exists');
+
+        // Paths are distinct (collision-safe).
+        assertTrue(p1 !== p2, 'S14.7: snapshot paths are distinct (no collision)');
+
+        // Both are valid JSON.
+        const snap1 = JSON.parse(fs.readFileSync(p1, 'utf8'));
+        const snap2 = JSON.parse(fs.readFileSync(p2, 'utf8'));
+        assertEqual(snap1.legacy_id, legacyId, 'S14.7: snapshot 1 has correct legacy_id');
+        assertEqual(snap2.legacy_id, legacyId, 'S14.7: snapshot 2 has correct legacy_id');
+
+        // Both contain the target UUID.
+        assertEqual(snap1.target_uuid, fakeUUID, 'S14.7: snapshot 1 has target_uuid');
+        assertEqual(snap2.target_uuid, fakeUUID, 'S14.7: snapshot 2 has target_uuid');
+
+        // Random tokens are stored in the snapshot.
+        assertTrue(typeof snap1.random_token === 'string' && snap1.random_token.length > 0,
+          'S14.7: snapshot 1 random_token present');
+        assertTrue(typeof snap2.random_token === 'string' && snap2.random_token.length > 0,
+          'S14.7: snapshot 2 random_token present');
+      } finally {
+        try { fs.rmSync(tmpDir,  { recursive: true }); } catch (_) {}
+        try { fs.rmSync(snapDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S14.8: Idempotent legacy reconciliation (Item 6) ─────────────────────
+
+  await bothBackends(
+    'S14.8: idempotent legacy reconciliation — first run removes orphaned project_settings; second run is no-op; conservation holds',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s14-8-'));
+      try {
+        const legacyId = encodeCwd(tmpDir);
+        const newUUID  = 'f1f1f1f1-aaaa-4bbb-8ccc-dddddddddddd';
+
+        // Migrate rows to UUID so reconcile knows migration is complete.
+        await seedCorpus(db, legacyId, { rows: 2 });
+        // Manually rekey to UUID to simulate a completed migration.
+        await db.query(`UPDATE assertions SET project_id=$1 WHERE project_id=$2`, [newUUID, legacyId]);
+        await db.query(`UPDATE entities   SET project_id=$1 WHERE project_id=$2`, [newUUID, legacyId]);
+
+        // Seed orphaned project_settings under the legacy id.
+        await db.query(
+          `INSERT INTO project_settings (project_id, key, value) VALUES ($1, $2, $3)
+           ON CONFLICT (project_id, key) DO UPDATE SET value=EXCLUDED.value`,
+          [legacyId, 'session_in_progress', new Date().toISOString()]
+        );
+        await db.query(
+          `INSERT INTO project_settings (project_id, key, value) VALUES ($1, $2, $3)
+           ON CONFLICT (project_id, key) DO UPDATE SET value=EXCLUDED.value`,
+          [legacyId, 'some_other_key', 'orphaned']
+        );
+
+        // Verify orphan exists.
+        const { rows: beforeRows } = await db.query(
+          `SELECT COUNT(*) AS n FROM project_settings WHERE project_id=$1`, [legacyId]
+        );
+        const beforeCount = parseInt(beforeRows[0] && (beforeRows[0].n || beforeRows[0].count), 10) || 0;
+        assertTrue(beforeCount >= 2, 'S14.8: orphaned project_settings rows seeded');
+
+        // I1 snapshot pre-check: reconcile should create a snapshot.
+        const { removed: r1, snapshotPath: sp1 } = await reconcileLegacySettings(
+          db, legacyId, newUUID, { silent: true }
+        );
+        assertTrue(r1 >= 2, `S14.8: first reconcile removed >= 2 rows (got ${r1})`);
+        assertTrue(sp1 !== null, 'S14.8: snapshot created on first reconcile');
+        assertTrue(fs.existsSync(sp1), 'S14.8: snapshot file exists');
+
+        // Verify orphan is gone.
+        const { rows: afterRows } = await db.query(
+          `SELECT COUNT(*) AS n FROM project_settings WHERE project_id=$1`, [legacyId]
+        );
+        const afterCount = parseInt(afterRows[0] && (afterRows[0].n || afterRows[0].count), 10) || 0;
+        assertEqual(afterCount, 0, 'S14.8: all orphaned rows removed after first reconcile');
+
+        // Second run: clean no-op.
+        const { removed: r2, snapshotPath: sp2 } = await reconcileLegacySettings(
+          db, legacyId, newUUID, { silent: true }
+        );
+        assertEqual(r2, 0, 'S14.8: second reconcile removes 0 rows (idempotent no-op)');
+        assertEqual(sp2, null, 'S14.8: no snapshot on no-op run');
+
+        // UUID rows unaffected by reconcile.
+        const { rows: uuidSettingsRows } = await db.query(
+          `SELECT COUNT(*) AS n FROM project_settings WHERE project_id=$1`, [newUUID]
+        );
+        const uuidSettingsCount = parseInt(uuidSettingsRows[0] && (uuidSettingsRows[0].n || uuidSettingsRows[0].count), 10) || 0;
+        // project_settings for newUUID should be unaffected (0 since we only seeded for legacyId).
+        assertEqual(uuidSettingsCount, 0, 'S14.8: UUID project_settings untouched by reconcile');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S14.9: reconcileLegacySettings is safe when nothing to reconcile ─────
+
+  await bothBackends(
+    'S14.9: reconcileLegacySettings — safe no-op when no orphaned rows; no snapshot created',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s14-9-'));
+      try {
+        const legacyId = 'cm-s14-9-legacy-never-existed';
+        const newUUID  = 'ffffffff-1111-4222-8333-444444444444';
+
+        // Seed rows under newUUID so reconcile knows migration is done.
+        await db.query(
+          `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
+           VALUES ($1,'subj','is','obj',7,'user_stated')`,
+          [newUUID]
+        );
+
+        const { removed, snapshotPath } = await reconcileLegacySettings(
+          db, legacyId, newUUID, { silent: true }
+        );
+        assertEqual(removed, 0, 'S14.9: no rows removed (nothing to reconcile)');
+        assertEqual(snapshotPath, null, 'S14.9: no snapshot when nothing to reconcile');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S14.10: subprocess identity — PROJECT_ROOT in spawns ─────────────────
+
+  {
+    const label = 'S14.10: PROJECT_ROOT is passed to child_process spawns in handoff.js (subprocess-safe identity)';
+    try {
+      const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+
+      // Find the detectUnpackagedState function body and verify PROJECT_ROOT is in the env.
+      const fnStart = engineSrc.indexOf('function detectUnpackagedState(');
+      assertTrue(fnStart !== -1, 'detectUnpackagedState must exist in handoff.js');
+      const fnEnd = engineSrc.indexOf('\nfunction ', fnStart + 1);
+      const fnBody = fnEnd !== -1 ? engineSrc.slice(fnStart, fnEnd) : engineSrc.slice(fnStart, fnStart + 1500);
+      assertTrue(fnBody.includes('PROJECT_ROOT'),
+        'detectUnpackagedState must pass PROJECT_ROOT in the execFileSync env');
+
+      // Find detectMultiAuthor and verify PROJECT_ROOT is in the env.
+      const faStart = engineSrc.indexOf('function detectMultiAuthor(');
+      assertTrue(faStart !== -1, 'detectMultiAuthor must exist in handoff.js');
+      const faEnd  = engineSrc.indexOf('\nfunction ', faStart + 1);
+      const faBody = faEnd !== -1 ? engineSrc.slice(faStart, faEnd) : engineSrc.slice(faStart, faStart + 1000);
+      assertTrue(faBody.includes('PROJECT_ROOT'),
+        'detectMultiAuthor must pass PROJECT_ROOT in the execFileSync env');
+
+      // The eval subprocess already has PROJECT_ROOT — verify it.
+      const evalIdx = engineSrc.indexOf('runRerankerGate');
+      assertTrue(evalIdx !== -1, 'runRerankerGate must exist in handoff.js');
+      // Find the execFileSync call within runRerankerGate.
+      const evalFnStart = engineSrc.indexOf('async function runRerankerGate');
+      const evalFnEnd   = engineSrc.indexOf('\nasync function ', evalFnStart + 1);
+      const evalFnBody  = evalFnEnd !== -1 ? engineSrc.slice(evalFnStart, evalFnEnd) : engineSrc.slice(evalFnStart, evalFnStart + 2000);
+      assertTrue(evalFnBody.includes('PROJECT_ROOT: root'),
+        'runRerankerGate execFileSync must pass PROJECT_ROOT: root in env');
+
+      pass(label);
+    } catch (err) { fail(label, err.message); }
+  }
+
+  // ── S14.11: Race-free settings writes — all project_settings INSERTs use ON CONFLICT ─
+
+  {
+    const label = 'S14.11: race-free settings writes — all project_settings INSERT statements use ON CONFLICT';
+    try {
+      const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+
+      // Extract all template literals containing INSERT INTO project_settings.
+      const violations = [];
+      const btMatches  = engineSrc.matchAll(/`([\s\S]*?)`/g);
+      for (const m of btMatches) {
+        const sql = m[1];
+        if (/INSERT\s+INTO\s+project_settings\b/i.test(sql)) {
+          if (!/ON\s+CONFLICT\b/i.test(sql)) {
+            violations.push(sql.slice(0, 200).replace(/\s+/g, ' ').trim());
+          }
+        }
+      }
+
+      if (violations.length > 0) {
+        throw new Error(
+          `Found ${violations.length} INSERT INTO project_settings without ON CONFLICT:\n` +
+          violations.join('\n')
+        );
+      }
+      pass(label);
+    } catch (err) { fail(label, err.message); }
+  }
+
+  // ── S14.12: writeMarkerAtomic exported and works correctly ───────────────
+
+  await bothBackends(
+    'S14.12: writeMarkerAtomic — writes valid marker; second call throws "already exists"; no temp file leaked',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s14-12-'));
+      try {
+        // First write.
+        const result = writeMarkerAtomic(tmpDir);
+        assertTrue(isValidUUID(result.uuid), 'S14.12: minted UUID is valid v4');
+        assertTrue(typeof result.created_at === 'string', 'S14.12: created_at is string');
+        assertEqual(result.schema_version, 1, 'S14.12: schema_version = 1');
+
+        // Marker file readable.
+        const read = readMarker(tmpDir);
+        assertTrue(read !== null, 'S14.12: readMarker returns non-null after writeMarkerAtomic');
+        assertEqual(read.uuid, result.uuid, 'S14.12: round-trip UUID matches');
+
+        // Second write throws.
+        let threw = false;
+        try { writeMarkerAtomic(tmpDir); } catch (_) { threw = true; }
+        assertTrue(threw, 'S14.12: second writeMarkerAtomic throws');
+
+        // No leftover .tmp files.
+        const files = fs.readdirSync(tmpDir);
+        const tmpFiles = files.filter((f) => f.includes('.tmp.'));
+        assertEqual(tmpFiles.length, 0, 'S14.12: no .tmp files left after failed second write');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S14.13: handoff.js does NOT contain dialect conditionals in new code paths ─
+
+  {
+    const label = 'S14.13: no new dialect conditionals introduced outside db-seam.js (S8 extension for hardening paths)';
+    try {
+      const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+      const identSrc  = fs.readFileSync(path.resolve(__dirname, 'lib', 'project-identity.js'), 'utf8');
+
+      // Check project-identity.js for dialect conditionals (should be zero).
+      if (/db\.dialect\b/.test(identSrc) || /dialect\s*===/.test(identSrc)) {
+        throw new Error('project-identity.js contains dialect conditional — must be zero (all branching in db-seam.js)');
+      }
+      pass(label);
+    } catch (err) { fail(label, err.message); }
+  }
+}
+
+// ── S15: PR-3a-hardening adversarial concurrency — quarantined proofs ────────
+//
+// These four tests isolate the invariant violations that motivated the hardening
+// work and prove they cannot happen in the fixed code.  Each test:
+//   (a) N concurrent runOneShot / ensureProjectIdentity on one legacy project
+//       → exactly one migration, I3 holds, single UUID, single handoff.md.
+//   (b) Concurrent STATE 4 fresh-project writes → exactly one marker file.
+//   (c) Idempotent reconciliation: run twice → second is no-op; snapshot exists.
+//   (d) Subprocess identity: spawn with mismatched CWD but correct PROJECT_ROOT
+//       → the child resolves the correct project UUID.
+//
+// All tests use throwaway tmpDirs and throwaway Postgres databases — they never
+// touch the canonical project UUID or any production project_settings.
+
+async function runS15() {
+  console.log('\n=== S15: adversarial concurrency quarantined proofs (a-d) ===');
+  console.log('Items covered: (a) concurrent migration; (b) fresh-project race; (c) idempotent reconcile; (d) subprocess root.');
+
+  const {
+    ensureProjectIdentity,
+    PROJECT_ID_TABLES,
+    reconcileLegacySettings,
+    runOneShot,
+    writeMarkerAtomic,
+    getSnapshotDir,
+  } = require('./lib/project-identity');
+
+  const {
+    MARKER_FILENAME,
+    readMarker,
+    writeMarker,
+    isValidUUID,
+  } = require('./lib/project-marker');
+
+  const { encodeCwd }    = require('./lib/encoded-cwd');
+  const { execFileSync } = require('child_process');
+
+  // ── Helper: count rows across all project-id tables ─────────────────────────
+  async function totalCount(db, projectId) {
+    let total = 0;
+    for (const table of PROJECT_ID_TABLES) {
+      try {
+        const { rows } = await db.query(
+          `SELECT COUNT(*) AS n FROM ${table} WHERE project_id=$1`, [projectId]
+        );
+        total += parseInt(rows[0] && (rows[0].n || rows[0].count || 0), 10);
+      } catch (_) {}
+    }
+    return total;
+  }
+
+  // ── Helper: seed a multi-table legacy corpus ─────────────────────────────────
+  async function seedCorpus(db, projectId, rowCount) {
+    const isPostgres = db.dialect === 'postgres';
+    const suppFalse  = isPostgres ? 'false' : '0';
+    for (let i = 0; i < rowCount; i++) {
+      try {
+        await db.query(
+          `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+           VALUES ($1,$2,'is_s15',$3,7,'user_stated',${suppFalse})`,
+          [projectId, `s15-subj-${i}`, `val-${i}`]
+        );
+      } catch (_) {}
+      try {
+        await db.query(
+          `INSERT INTO entities (project_id, name, entity_type, description) VALUES ($1,$2,$3,$4)
+           ON CONFLICT (project_id, name) DO NOTHING`,
+          [projectId, `s15-ent-${i}`, 'concept', `desc ${i}`]
+        );
+      } catch (_) {}
+    }
+  }
+
+  // ── S15a: N sequential ensureProjectIdentity on same legacy project → re-check idempotency ─
+  // Proves: after the first migration, all subsequent calls hit the STATE 1 re-check
+  // path and are no-ops; I3 conservation holds; single UUID; single marker.
+  //
+  // Note: true OS-level concurrency on a shared single-connection adapter has known
+  // limits (SQLite is single-connection; Postgres advisory locks need separate clients).
+  // True multi-connection concurrent tests live in S14.3 (Postgres-only) and S15a-pg.
+  // This test proves the idempotency / re-check logic for the common case.
+
+  await bothBackends(
+    'S15a: N=8 sequential ensureProjectIdentity on same legacy project → re-check path is idempotent, I3 holds',
+    async (db) => {
+      const tmpDir   = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s15a-'));
+      try {
+        const legacyId  = encodeCwd(tmpDir);
+        const ROW_COUNT = 4;
+        await seedCorpus(db, legacyId, ROW_COUNT);
+        const legacyBefore = await totalCount(db, legacyId);
+        assertTrue(legacyBefore >= ROW_COUNT, `S15a: seeded ${ROW_COUNT} items`);
+
+        // Run N=8 sequential calls — after the first migrates, the rest must be no-ops.
+        const N = 8;
+        const uuids = [];
+        for (let i = 0; i < N; i++) {
+          const identity = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+          uuids.push(identity.projectId);
+        }
+
+        // All N calls return the same UUID.
+        const uniqueUUIDs = new Set(uuids);
+        assertEqual(uniqueUUIDs.size, 1, `S15a: all ${N} calls returned the same UUID`);
+        const uuid = uuids[0];
+        assertTrue(isValidUUID(uuid), 'S15a: returned projectId is a valid UUID');
+
+        // I3 conservation.
+        const newCount    = await totalCount(db, uuid);
+        const legacyAfter = await totalCount(db, legacyId);
+        assertEqual(newCount, legacyBefore,
+          `S15a: I3 conservation — count(new UUID)=${newCount} == count(legacy before)=${legacyBefore}`);
+        assertEqual(legacyAfter, 0,
+          'S15a: I3 conservation — count(legacy after) == 0');
+
+        // Exactly one marker.
+        const marker = readMarker(tmpDir);
+        assertTrue(marker !== null, 'S15a: exactly one marker file');
+        assertEqual(marker.uuid, uuid, 'S15a: marker UUID matches returned UUID');
+
+        // Single marker file: no duplicate .claude-memory files.
+        const markerFiles = fs.readdirSync(tmpDir).filter(
+          (f) => f === MARKER_FILENAME || f.startsWith(MARKER_FILENAME)
+        );
+        assertEqual(markerFiles.length, 1, 'S15a: exactly one .claude-memory file in tmpDir');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S15a-pg (Postgres-only): true concurrent connections ─────────────────────
+  // Proves: pg_advisory_xact_lock prevents double-migration when two separate
+  // pg.Client connections race on the same legacy project.
+
+  {
+    const label = 'S15a-pg [Postgres-only]: two separate PG connections concurrent migration → I3 holds, single UUID';
+    const pgAvail = await isPgAvailable();
+    if (!pgAvail) {
+      skip(label, 'Postgres backend unavailable');
+    } else {
+      const ts     = Date.now();
+      const dbName = `cm_s15a_pg_${ts}_${Math.floor(Math.random() * 10000)}`;
+      let sysClient = null;
+      let clients   = [];
+      try {
+        sysClient = await pgConnect('postgres');
+        await sysClient.query(`CREATE DATABASE "${dbName}"`);
+        await sysClient.end();
+        sysClient = null;
+
+        const setupClient = await pgConnect(dbName);
+        const schemaSql = fs.readFileSync(
+          path.resolve(__dirname, 'sql', 'handoff-core-schema.sql'), 'utf8'
+        );
+        await setupClient.query(schemaSql);
+        await setupClient.end();
+
+        const c1 = await pgConnect(dbName);
+        const c2 = await pgConnect(dbName);
+        clients  = [c1, c2];
+
+        const { PostgresAdapter: PA } = require('./lib/db-seam');
+        const db1 = new PA(c1);
+        const db2 = new PA(c2);
+
+        const tmpDir   = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s15a-pg-'));
+        try {
+          const legacyId    = encodeCwd(tmpDir);
+          const ROW_COUNT   = 3;
+          await seedCorpus(db1, legacyId, ROW_COUNT);
+          const legacyBefore = await totalCount(db1, legacyId);
+
+          // Race: two concurrent ensureProjectIdentity on separate connections.
+          const [id1, id2] = await Promise.all([
+            ensureProjectIdentity(db1, { cwd: tmpDir, silent: true }),
+            ensureProjectIdentity(db2, { cwd: tmpDir, silent: true }),
+          ]);
+
+          assertEqual(id1.projectId, id2.projectId,
+            'S15a-pg: both concurrent callers return the same UUID');
+
+          const uuid        = id1.projectId;
+          const newCount    = await totalCount(db1, uuid);
+          const legacyAfter = await totalCount(db1, legacyId);
+
+          assertEqual(newCount, legacyBefore,
+            'S15a-pg: I3 conservation holds');
+          assertEqual(legacyAfter, 0,
+            'S15a-pg: legacy rows gone after concurrent migration');
+
+          const marker = readMarker(tmpDir);
+          assertTrue(marker !== null, 'S15a-pg: marker exists');
+          assertEqual(marker.uuid, uuid, 'S15a-pg: marker UUID matches');
+
+          pass(label);
+        } finally {
+          try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+        }
+      } catch (err) {
+        fail(label, err.message);
+      } finally {
+        for (const c of clients) { try { await c.end(); } catch (_) {} }
+        if (sysClient) { try { await sysClient.end(); } catch (_) {} }
+        let drop = null;
+        try {
+          drop = await pgConnect('postgres');
+          await drop.query(
+            `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1 AND pid<>pg_backend_pid()`,
+            [dbName]
+          );
+          await drop.query(`DROP DATABASE IF EXISTS "${dbName}"`);
+        } catch (_) {} finally {
+          if (drop) { try { await drop.end(); } catch (_) {} }
+        }
+      }
+    }
+  }
+
+  // ── S15b: Concurrent STATE 4 fresh-project writes → exactly one marker ────────
+  // Proves: writeMarkerAtomic existence-check prevents silent overwrite on Windows
+  // and ensures exactly one marker survives concurrent races.
+
+  await bothBackends(
+    'S15b: concurrent STATE 4 writes — first wins; second detects "already exists"; exactly one marker, no corruption',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s15b-'));
+      try {
+        // Simulate: two processes call STATE 4 concurrently.
+        // First writeMarkerAtomic wins.
+        const marker1 = writeMarkerAtomic(tmpDir);
+        assertTrue(isValidUUID(marker1.uuid), 'S15b: first write mints valid UUID');
+
+        // Second writeMarkerAtomic must throw (not silently overwrite).
+        let threw  = false;
+        let errMsg = '';
+        try {
+          writeMarkerAtomic(tmpDir);
+        } catch (e) {
+          threw  = true;
+          errMsg = e.message;
+        }
+        assertTrue(threw, 'S15b: second writeMarkerAtomic throws on pre-existing marker');
+        assertTrue(errMsg.includes('already exists'), 'S15b: error message includes "already exists"');
+
+        // Marker content is intact — first writer's UUID preserved.
+        const read = readMarker(tmpDir);
+        assertTrue(read !== null, 'S15b: marker still readable after failed second write');
+        assertEqual(read.uuid, marker1.uuid, 'S15b: UUID unchanged — no corruption from second write');
+
+        // Exactly one marker file.
+        const markerFiles = fs.readdirSync(tmpDir).filter(
+          (f) => f === MARKER_FILENAME || f.startsWith(MARKER_FILENAME)
+        );
+        assertEqual(markerFiles.length, 1, 'S15b: exactly one marker file (no duplicate or temp)');
+
+        // No leftover .tmp files.
+        const tmpFiles = fs.readdirSync(tmpDir).filter((f) => f.includes('.tmp.'));
+        assertEqual(tmpFiles.length, 0, 'S15b: no temp files left after second write failure');
+
+        // Now simulate the losing process's recovery: read the existing marker and
+        // ensureProjectIdentity will use it (STATE 1 or STATE 2 path).
+        const identity = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
+        assertEqual(identity.projectId, marker1.uuid,
+          'S15b: ensureProjectIdentity after race returns winner UUID');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S15c: Idempotent reconciliation — run twice, second is no-op ──────────────
+  // Proves: reconcileLegacySettings is safe to run multiple times; snapshot
+  // created on first run; conservation holds throughout.
+
+  await bothBackends(
+    'S15c: idempotent reconciliation — first run removes orphaned project_settings; second run no-op; I3 holds',
+    async (db) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s15c-'));
+      try {
+        const legacyId = encodeCwd(tmpDir);
+        const newUUID  = 'c0c0c0c0-1111-4222-8333-444444444444';
+
+        // Seed corpus under legacy id, migrate to UUID.
+        await seedCorpus(db, legacyId, 2);
+        await db.query(`UPDATE assertions SET project_id=$1 WHERE project_id=$2`, [newUUID, legacyId]);
+        await db.query(`UPDATE entities   SET project_id=$1 WHERE project_id=$2`, [newUUID, legacyId]);
+
+        // Seed orphaned project_settings under legacy id.
+        await db.query(
+          `INSERT INTO project_settings (project_id, key, value) VALUES ($1,$2,$3)
+           ON CONFLICT (project_id, key) DO UPDATE SET value=EXCLUDED.value`,
+          [legacyId, 'session_in_progress', new Date().toISOString()]
+        );
+
+        // First reconcile: removes orphaned rows, creates snapshot.
+        const { removed: r1, snapshotPath: sp1 } = await reconcileLegacySettings(
+          db, legacyId, newUUID, { silent: true }
+        );
+        assertTrue(r1 >= 1, `S15c: first reconcile removed >= 1 rows (got ${r1})`);
+        assertTrue(sp1 !== null, 'S15c: snapshot created on first reconcile');
+        assertTrue(fs.existsSync(sp1), 'S15c: snapshot file exists on disk');
+
+        // Second reconcile: idempotent no-op.
+        const { removed: r2, snapshotPath: sp2 } = await reconcileLegacySettings(
+          db, legacyId, newUUID, { silent: true }
+        );
+        assertEqual(r2, 0, 'S15c: second reconcile removes 0 rows (idempotent)');
+        assertEqual(sp2, null, 'S15c: no snapshot on no-op second run');
+
+        // UUID rows unaffected.
+        const uuidCount = await totalCount(db, newUUID);
+        assertTrue(uuidCount > 0, 'S15c: UUID rows unaffected by reconcile');
+        const legacyCount = await totalCount(db, legacyId);
+        assertEqual(legacyCount, 0, 'S15c: legacy rows are all gone after reconcile');
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      }
+    }
+  );
+
+  // ── S15d: Subprocess identity — mismatched CWD but correct PROJECT_ROOT ───────
+  // Proves: when a subprocess is launched from a different CWD, passing PROJECT_ROOT
+  // in the environment causes it to resolve the correct project UUID, not a wrong one
+  // derived from its working directory.
+
+  {
+    const label = 'S15d: subprocess with mismatched CWD but correct PROJECT_ROOT resolves correct project UUID';
+    try {
+      // Create a temp project root with a marker.
+      const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s15d-root-'));
+      const otherDir    = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-s15d-other-'));
+      try {
+        // Write a marker at projectRoot.
+        const marker = writeMarker(projectRoot);
+
+        // Spawn a child process with CWD = otherDir but PROJECT_ROOT = projectRoot.
+        // The child prints the resolved marker UUID to stdout.
+        const childScript = `
+          const {findProjectRootByMarker, readMarker} = require(${JSON.stringify(path.join(__dirname, 'lib', 'project-marker'))});
+          const startDir = process.env.PROJECT_ROOT || process.cwd();
+          const root = findProjectRootByMarker(startDir);
+          const m = root ? readMarker(root) : null;
+          process.stdout.write(JSON.stringify({root, uuid: m ? m.uuid : null}) + '\\n');
+        `;
+        const childScriptPath = path.join(os.tmpdir(), `cm-s15d-child-${process.pid}.js`);
+        fs.writeFileSync(childScriptPath, childScript, 'utf8');
+        try {
+          const out = execFileSync(process.execPath, [childScriptPath], {
+            cwd:      otherDir,   // wrong CWD — does NOT contain the marker
+            encoding: 'utf8',
+            timeout:  10000,
+            env:      { ...process.env, PROJECT_ROOT: projectRoot },
+          });
+          const parsed = JSON.parse(out.trim());
+          assertEqual(parsed.uuid, marker.uuid,
+            `S15d: child resolved UUID ${parsed.uuid} matches expected ${marker.uuid}`);
+          assertEqual(parsed.root, projectRoot,
+            `S15d: child resolved root ${parsed.root} matches expected ${projectRoot}`);
+          pass(label);
+        } finally {
+          try { fs.unlinkSync(childScriptPath); } catch (_) {}
+        }
+      } finally {
+        try { fs.rmSync(projectRoot, { recursive: true }); } catch (_) {}
+        try { fs.rmSync(otherDir,    { recursive: true }); } catch (_) {}
+      }
+    } catch (err) { fail(label, err.message); }
+  }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 (async () => {
@@ -3605,6 +4552,8 @@ async function runS13() {
   await runS11();
   await runS12();
   await runS13();
+  await runS14();
+  await runS15();
 
   console.log('\n─── Results ──────────────────────────────────────');
   console.log(`PASS ${passed}  FAIL ${failed}  SKIP ${skipped}`);

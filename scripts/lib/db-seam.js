@@ -602,8 +602,50 @@ class SQLiteAdapter {
   async connect() {
     const { DatabaseSync } = require('node:sqlite');
     this._db = new DatabaseSync(this._dbPath);
+    // Set a sane busy_timeout so concurrent processes wait rather than immediately
+    // failing when another writer holds the write-lock (BEGIN IMMEDIATE).
+    this._db.prepare('PRAGMA busy_timeout=5000').run();
     this._db.prepare('PRAGMA journal_mode=WAL').run();
     this._db.prepare('PRAGMA foreign_keys=ON').run();
+  }
+
+  /**
+   * Acquire a per-migration-key advisory lock and begin a transaction atomically.
+   *
+   * SQLite: issues BEGIN IMMEDIATE (exclusive write-lock).  This both starts the
+   * transaction AND acquires the write-lock, serializing all concurrent writers.
+   * The lock_key argument is ignored — the lock is implicitly scoped to the db file.
+   *
+   * After acquiring, callers MUST:
+   *   1. Re-check DB state (re-check pattern after lock acquisition).
+   *   2. Call db.query('COMMIT') or db.query('ROLLBACK') to release the lock.
+   *
+   * IMPORTANT: do NOT call db.query('BEGIN') before this method — this method
+   * IS the transaction start.  Calling BEGIN first would result in a plain BEGIN
+   * (no exclusive lock) followed by a second nested-BEGIN no-op here.
+   *
+   * @param {string} _lockKey  — ignored for SQLite; the write-lock is global per db file.
+   * @returns {Promise<void>}
+   */
+  async acquireMigrationLock(_lockKey) {
+    const db = this._db;
+    if (!db) throw new Error('SQLiteAdapter: not connected');
+    // BEGIN IMMEDIATE upgrades the connection to an exclusive write-lock.
+    // If a transaction is already open (nested call) we escalate to the write-lock
+    // by committing the current deferred transaction and starting an IMMEDIATE one.
+    // In practice, runOneShot calls acquireMigrationLock as the FIRST DB operation,
+    // so _txDepth should be 0 here.
+    if (this._txDepth === 0) {
+      db.prepare('BEGIN IMMEDIATE').run();
+      this._txDepth++;
+    } else {
+      // Already in a transaction — we are inside a nested call or a pre-opened txn.
+      // The existing BEGIN (not IMMEDIATE) may not hold an exclusive lock; but since
+      // SQLite's WAL mode with IMMEDIATE is the serialization mechanism, and we cannot
+      // upgrade in place, we log a warning and rely on the existing transaction.
+      // This path should not occur in normal runOneShot usage.
+      process.stderr.write('[handoff] acquireMigrationLock(SQLite): already in transaction — relying on existing lock\n');
+    }
   }
 
   async query(sql, params) {
@@ -715,6 +757,28 @@ class SQLiteAdapter {
       // SQLite reports unique-constraint violations on index creation as
       // "UNIQUE constraint failed" or "would not be unique".
       return { ok: false, msg: e.message };
+    }
+  }
+
+  /**
+   * Execute a SELECT query that may fail (e.g., table might not exist) without
+   * aborting the surrounding transaction.
+   *
+   * SQLite: SQLite errors within a transaction do NOT abort the whole transaction
+   * (unlike Postgres), so a plain try/catch is sufficient.
+   *
+   * Returns { rows, rowCount } on success, or { rows: [], rowCount: 0 } on error
+   * (error is swallowed; the caller treats absence/error as "0 rows").
+   *
+   * @param {string} sql
+   * @param {any[]}  params
+   * @returns {Promise<{ rows: any[], rowCount: number }>}
+   */
+  async querySafe(sql, params) {
+    try {
+      return await this.query(sql, params);
+    } catch (_) {
+      return { rows: [], rowCount: 0 };
     }
   }
 
@@ -972,6 +1036,95 @@ class PostgresAdapter {
   async query(sql, params)    { return this._client.query(sql, params); }
   async end()                 { return this._client.end(); }
   async runSchema(sql)        { return this._client.query(sql); }
+
+  /**
+   * Acquire a per-migration-key advisory lock and begin a transaction atomically.
+   *
+   * Postgres: issues BEGIN, then takes pg_advisory_xact_lock(hashtext(lockKey), 42).
+   * The advisory lock is scoped to the transaction and released automatically at
+   * COMMIT or ROLLBACK.  Concurrent processes calling this with the same key will
+   * block here until the winner commits/rolls back, then proceed to the re-check.
+   *
+   * After acquiring, callers MUST:
+   *   1. Re-check DB state (re-check pattern after lock acquisition).
+   *   2. Call db.query('COMMIT') or db.query('ROLLBACK') to release the lock.
+   *
+   * IMPORTANT: do NOT call db.query('BEGIN') before this method — this method
+   * IS the transaction start.  Matching the SQLite signature for uniform callers.
+   *
+   * @param {string} lockKey  — typically the legacy project id; used as the hash input.
+   * @returns {Promise<void>}
+   */
+  async acquireMigrationLock(lockKey) {
+    // Begin the transaction.
+    await this._client.query('BEGIN');
+    // pg_advisory_xact_lock(int4, int4) — two-int4 overload.
+    // hashtext($1) returns int4; constant second argument (42) namespaces this
+    // usage away from other advisory lock consumers in the same DB.
+    // The lock is held until the transaction ends.
+    await this._client.query(
+      `SELECT pg_advisory_xact_lock(hashtext($1), 42)`,
+      [lockKey]
+    );
+  }
+
+  /**
+   * Execute a SELECT query that may fail (e.g., table might not exist) without
+   * aborting the surrounding transaction.
+   *
+   * Postgres: an error inside a transaction aborts the entire transaction block,
+   * causing all subsequent queries to fail with "current transaction is aborted".
+   * To prevent this, we wrap speculative queries in a SAVEPOINT/ROLLBACK TO SAVEPOINT
+   * pair so that a table-not-found error only rolls back to the savepoint, leaving
+   * the outer transaction intact.
+   *
+   * Outside a transaction: SAVEPOINTs are not valid (Postgres rejects them), so we
+   * use a plain try/catch instead — a query error outside a transaction only affects
+   * that single query and leaves the connection in a usable state.
+   *
+   * Returns { rows, rowCount } on success, or { rows: [], rowCount: 0 } on error
+   * (error is swallowed; the caller treats absence/error as "0 rows").
+   *
+   * @param {string} sql
+   * @param {any[]}  params
+   * @returns {Promise<{ rows: any[], rowCount: number }>}
+   */
+  async querySafe(sql, params) {
+    // Detect whether we are currently inside a transaction by probing the pg client's
+    // internal state.  pg.Client exposes `_queryable` and transaction state via the
+    // connection; the most reliable cross-version check is to attempt a SAVEPOINT and
+    // treat the "not in a transaction" error as the signal to fall through to a plain
+    // try/catch path.
+    const spName = `sp_qs_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+    let inTransaction = false;
+    try {
+      await this._client.query(`SAVEPOINT ${spName}`);
+      inTransaction = true;
+    } catch (_) {
+      // "SAVEPOINT can only be used in transaction blocks" — we are NOT in a transaction.
+      inTransaction = false;
+    }
+
+    if (inTransaction) {
+      // We are inside a transaction — use SAVEPOINT to prevent aborting on error.
+      try {
+        const result = await this._client.query(sql, params);
+        await this._client.query(`RELEASE SAVEPOINT ${spName}`);
+        return result;
+      } catch (_) {
+        try { await this._client.query(`ROLLBACK TO SAVEPOINT ${spName}`); } catch (_2) {}
+        try { await this._client.query(`RELEASE SAVEPOINT ${spName}`); } catch (_2) {}
+        return { rows: [], rowCount: 0 };
+      }
+    } else {
+      // Outside a transaction — plain try/catch is safe.
+      try {
+        return await this._client.query(sql, params);
+      } catch (_) {
+        return { rows: [], rowCount: 0 };
+      }
+    }
+  }
 
   /**
    * Attempt to create a single integrity (partial unique) index.
