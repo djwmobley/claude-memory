@@ -556,13 +556,60 @@ async function cmdInit(args) {
     process.exit(1);
   }
 
-  // Step 7: Apply schema inside a transaction (fatal on error)
+  // Step 7: Apply schema in two phases — separated to ensure additive/table DDL
+  // commits even when a legacy-duplicate corpus prevents integrity index creation.
+  //
+  // Phase A (transactional): tables, regular indexes, additive ALTER TABLE ADD COLUMN
+  //   statements.  These are safe to run idempotently and never fail due to existing
+  //   data.  Committed atomically; fatal on failure.
+  //
+  // Phase B (non-transactional, non-fatal): partial unique integrity indexes
+  //   (assertions_1to1_unique, assertions_1ton_exact_unique).  These can fail on a
+  //   legacy-duplicate corpus because existing rows violate the uniqueness constraint.
+  //   Each index is attempted individually via db.runIntegrityIndex().  Failure is
+  //   non-fatal: a clear actionable warning is printed and init continues to success.
+  //   On a clean DB (no legacy duplicates) both indexes are created and no warning
+  //   is emitted — behavior is identical to the pre-fix path.
+  //
+  //   State when index is NOT created (legacy-dupe corpus):
+  //     - The additive bi-temporal columns (valid_at, invalid_at, suppression_kind,
+  //       pinned) ARE present — Phase A guarantees this.
+  //     - Supersession correctness is still enforced transactionally in
+  //       writeAssertionWithSupersession (BEGIN/suppress+INSERT/COMMIT).
+  //     - The missing index is a defense-in-depth layer, not the primary guarantee.
+  //     - The blocking rows are LIVE duplicates (suppressed=false). The `prune
+  //       --suppressed` command targets only suppressed=true rows and will NOT
+  //       resolve this condition. Resolving live-duplicate rows is corpus-dedupe
+  //       work — precisely the §7 SKIP (WILL-NOT-RUN) decision — and requires
+  //       explicit operator authorization, not a routine command.
   let sql = fs.readFileSync(schemaFile, 'utf8');
   // Remove psql meta-commands (\ir, \d, etc.) — not supported by pg client
   sql = sql.replace(/^\\[a-z].*$/gm, '');
+
+  // Extract the two integrity index CREATE UNIQUE INDEX statements by name so they
+  // can be run separately in Phase B.  Each is a single statement ending with `;`.
+  // The regex matches from `CREATE UNIQUE INDEX IF NOT EXISTS <name>` to the closing `;`.
+  const INTEGRITY_INDEX_NAMES = ['assertions_1to1_unique', 'assertions_1ton_exact_unique'];
+  const integrityIndexSqls = [];
+  let coreSchemaSQL = sql;
+  for (const idxName of INTEGRITY_INDEX_NAMES) {
+    // Match the full CREATE UNIQUE INDEX statement for this index name.
+    // Uses a non-greedy match to the next `;` after the index name.
+    const pattern = new RegExp(
+      `CREATE\\s+UNIQUE\\s+INDEX\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?${idxName}[\\s\\S]*?;`,
+      'i'
+    );
+    const m = coreSchemaSQL.match(pattern);
+    if (m) {
+      integrityIndexSqls.push({ name: idxName, sql: m[0] });
+      coreSchemaSQL = coreSchemaSQL.replace(m[0], '');
+    }
+  }
+
+  // Phase A: apply core schema (no integrity indexes) inside a transaction.
   try {
     await db.query('BEGIN');
-    await db.runSchema(sql);
+    await db.runSchema(coreSchemaSQL);
     // Idempotent migration: add `promoted` and `promoted_at` columns to assertions
     // (used by /handoff:promote explicit-promotion command, added in Bundle A hardening).
     // For Postgres: BOOLEAN / TIMESTAMPTZ. For SQLite: INTEGER / TEXT (seam rewrites DDL).
@@ -576,6 +623,28 @@ async function cmdInit(args) {
     console.log(`  [FAIL]  Schema apply failed — ${err.message}`);
     console.log(`          Transaction rolled back. No FS writes made.`);
     process.exit(1);
+  }
+
+  // Phase B: attempt each integrity index individually (non-fatal on legacy-dupe corpus).
+  for (const { name, sql: idxSql } of integrityIndexSqls) {
+    const result = await db.runIntegrityIndex(idxSql);
+    if (!result.ok) {
+      console.log(`  [WARN]  Integrity index NOT created: ${name}`);
+      console.log(`          Reason: ${result.msg}`);
+      console.log(`          This means the DB contains pre-existing duplicate live rows`);
+      console.log(`          (same project_id/subject/predicate with suppressed=false) that`);
+      console.log(`          violate the uniqueness constraint — a legacy-duplicate corpus.`);
+      console.log(`          The blocking rows are LIVE duplicates (suppressed=false).`);
+      console.log(`          prune --suppressed targets only suppressed=true rows and will`);
+      console.log(`          NOT resolve this — do not run it for this condition.`);
+      console.log(`          Resolving live-duplicate rows is corpus-dedupe work (§7 SKIP,`);
+      console.log(`          WILL-NOT-RUN) and requires explicit operator authorization.`);
+      console.log(`          Until that decision is taken, handoff init succeeds WITHOUT`);
+      console.log(`          this index. Supersession correctness is still enforced`);
+      console.log(`          transactionally in writeAssertionWithSupersession`);
+      console.log(`          (BEGIN/suppress+INSERT/COMMIT). The missing index is`);
+      console.log(`          defense-in-depth only.`);
+    }
   }
 
   // Step 8: Insert default project_settings rows (idempotent)

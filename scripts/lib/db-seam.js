@@ -697,6 +697,27 @@ class SQLiteAdapter {
     }
   }
 
+  /**
+   * Attempt to create a single integrity (partial unique) index.
+   * Non-fatal: if the index creation fails because existing rows violate the
+   * uniqueness constraint (legacy duplicate corpus), returns { ok: false, msg }.
+   * On success (index created or already exists), returns { ok: true }.
+   * Never throws — the caller decides how to surface the result.
+   */
+  async runIntegrityIndex(sql) {
+    const db = this._db;
+    if (!db) throw new Error('SQLiteAdapter: not connected');
+    const rewritten = rewriteForSQLite(sql.trim());
+    try {
+      db.prepare(rewritten).run();
+      return { ok: true, msg: 'index created' };
+    } catch (e) {
+      // SQLite reports unique-constraint violations on index creation as
+      // "UNIQUE constraint failed" or "would not be unique".
+      return { ok: false, msg: e.message };
+    }
+  }
+
   async end() {
     if (this._db) { try { this._db.close(); } catch (_) {} this._db = null; }
   }
@@ -951,6 +972,22 @@ class PostgresAdapter {
   async query(sql, params)    { return this._client.query(sql, params); }
   async end()                 { return this._client.end(); }
   async runSchema(sql)        { return this._client.query(sql); }
+
+  /**
+   * Attempt to create a single integrity (partial unique) index.
+   * Non-fatal: if the index creation fails because existing rows violate the
+   * uniqueness constraint (legacy duplicate corpus), returns { ok: false, msg }.
+   * On success (index created or already exists), returns { ok: true }.
+   * Never throws — the caller decides how to surface the result.
+   */
+  async runIntegrityIndex(sql) {
+    try {
+      await this._client.query(sql.trim());
+      return { ok: true, msg: 'index created' };
+    } catch (e) {
+      return { ok: false, msg: e.message };
+    }
+  }
 
   get dialect() { return 'postgres'; }
 
