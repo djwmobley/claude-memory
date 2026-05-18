@@ -17,6 +17,7 @@
 const { spawnSync } = require('child_process');
 const fs   = require('fs');
 const os   = require('os');
+const { readMarker } = require('./lib/project-marker');
 const path = require('path');
 const { Client } = require('pg');
 
@@ -50,12 +51,51 @@ function encodeCwd(p) {
   return p.replace(/[/\\]+$/, '').replace(/[^A-Za-z0-9-]/g, '-');
 }
 
-const PROJECT_ID         = encodeCwd(TEMP_PROJECT_DIR);
-const PROJECT_ID_HOOKS   = encodeCwd(TEMP_PROJECT_DIR_HOOKS);
-const PROJECT_ID_HARDEN  = encodeCwd(TEMP_PROJECT_DIR_HARDEN);
-const HANDOFF_PATH       = path.join(os.homedir(), '.claude', 'projects', PROJECT_ID, 'handoff.md');
-const HANDOFF_PATH_HOOKS   = path.join(os.homedir(), '.claude', 'projects', PROJECT_ID_HOOKS, 'handoff.md');
-const HANDOFF_PATH_HARDEN  = path.join(os.homedir(), '.claude', 'projects', PROJECT_ID_HARDEN, 'handoff.md');
+// Project IDs: resolved after cmdInit runs. Initially the legacy-encoded form;
+// updated to the marker UUID once cmdInit mints the .claude-memory marker.
+// Use mutable let so step2 (cmdInit) can update them to the UUID form.
+let PROJECT_ID         = encodeCwd(TEMP_PROJECT_DIR);
+let PROJECT_ID_HOOKS   = encodeCwd(TEMP_PROJECT_DIR_HOOKS);
+let PROJECT_ID_HARDEN  = encodeCwd(TEMP_PROJECT_DIR_HARDEN);
+let HANDOFF_PATH       = path.join(os.homedir(), '.claude', 'projects', PROJECT_ID, 'handoff.md');
+let HANDOFF_PATH_HOOKS   = path.join(os.homedir(), '.claude', 'projects', PROJECT_ID_HOOKS, 'handoff.md');
+let HANDOFF_PATH_HARDEN  = path.join(os.homedir(), '.claude', 'projects', PROJECT_ID_HARDEN, 'handoff.md');
+
+/**
+ * Read the .claude-memory marker UUID from a directory.
+ * Returns the UUID string if present and valid, or null otherwise.
+ *
+ * @param {string} dir
+ * @returns {string|null}
+ */
+function markerUUID(dir) {
+  const m = readMarker(dir);
+  return (m && m.uuid) ? m.uuid : null;
+}
+
+/**
+ * After cmdInit runs for a project dir, read the .claude-memory marker UUID and
+ * update the project-id and handoff-path variables for that section.
+ *
+ * @param {'main'|'hooks'|'harden'} which
+ */
+function updateProjectIdFromMarker(which) {
+  const dirs = { main: TEMP_PROJECT_DIR, hooks: TEMP_PROJECT_DIR_HOOKS, harden: TEMP_PROJECT_DIR_HARDEN };
+  const dir = dirs[which];
+  if (!dir) return;
+  const uuid = markerUUID(dir);
+  if (!uuid) return;  // No marker — keep legacy form.
+  if (which === 'main') {
+    PROJECT_ID   = uuid;
+    HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', PROJECT_ID, 'handoff.md');
+  } else if (which === 'hooks') {
+    PROJECT_ID_HOOKS   = uuid;
+    HANDOFF_PATH_HOOKS = path.join(os.homedir(), '.claude', 'projects', PROJECT_ID_HOOKS, 'handoff.md');
+  } else if (which === 'harden') {
+    PROJECT_ID_HARDEN   = uuid;
+    HANDOFF_PATH_HARDEN = path.join(os.homedir(), '.claude', 'projects', PROJECT_ID_HARDEN, 'handoff.md');
+  }
+}
 
 // Env passed to every subprocess invocation — redirects DB and project root.
 function makeEnv(db = SMOKE_DB, projectDir = TEMP_PROJECT_DIR) {
@@ -398,6 +438,9 @@ async function step2_cmdInit_fresh() {
       lcFail(2, label, `exit ${r.status}: ${(r.stderr || r.stdout || '').split('\n')[0]}`);
       return false;
     }
+
+    // After cmdInit mints the .claude-memory marker, update PROJECT_ID to the UUID.
+    updateProjectIdFromMarker('main');
 
     const lines = (r.stdout || '').split('\n').filter((l) => l.match(/\s+\[(OK|WARN)\]\s+/));
     if (lines.length < 9) {
@@ -2260,7 +2303,7 @@ async function runW3Section() {
   const W3_TS       = Date.now();
   const W3_DB       = `claude_memory_w3_${W3_TS}`;
   const W3_PROJ_DIR = path.join(os.tmpdir(), `handoff_w3_${W3_TS}`);
-  const W3_PROJECT_ID = encodeCwd(W3_PROJ_DIR);
+  let W3_PROJECT_ID = encodeCwd(W3_PROJ_DIR);
 
   try {
     // Set up throwaway DB first (steps 1, 3, 4, 5 need it; step 2 is pure).
@@ -2287,6 +2330,7 @@ async function runW3Section() {
       w3Failed += W3_TOTAL;
       return;
     }
+    W3_PROJECT_ID = markerUUID(W3_PROJ_DIR) || W3_PROJECT_ID;
     console.log(`[W3] DB init OK (${W3_DB})`);
 
     // Also create retrieval_events in the throwaway DB so loader INSERT works.
@@ -2808,7 +2852,7 @@ async function runW4Section() {
   const W4_TS       = Date.now();
   const W4_DB       = `claude_memory_w4_${W4_TS}`;
   const W4_PROJ_DIR = path.join(os.tmpdir(), `handoff_w4_${W4_TS}`);
-  const W4_PROJECT_ID = encodeCwd(W4_PROJ_DIR);
+  let W4_PROJECT_ID = encodeCwd(W4_PROJ_DIR);
 
   try {
     // Set up throwaway DB.
@@ -2835,6 +2879,7 @@ async function runW4Section() {
       w4Failed += W4_TOTAL;
       return;
     }
+    W4_PROJECT_ID = markerUUID(W4_PROJ_DIR) || W4_PROJECT_ID;
     console.log(`[W4] DB init OK (${W4_DB})`);
 
     // Ensure retrieval_contract_history table exists in throwaway DB (idempotent).
@@ -3164,7 +3209,7 @@ async function runC1Section() {
   const C1_TS         = Date.now();
   const C1_DB         = `claude_memory_c1_${C1_TS}`;
   const C1_PROJ_DIR   = path.join(os.tmpdir(), `handoff_c1_${C1_TS}`);
-  const C1_PROJECT_ID = encodeCwd(C1_PROJ_DIR);
+  let C1_PROJECT_ID = encodeCwd(C1_PROJ_DIR);
 
   try {
     await createSmokeDb(C1_DB, C1_PROJ_DIR);
@@ -3190,6 +3235,7 @@ async function runC1Section() {
       c1Failed += C1_TOTAL;
       return;
     }
+    C1_PROJECT_ID = markerUUID(C1_PROJ_DIR) || C1_PROJECT_ID;
     console.log(`[C1] DB init OK (${C1_DB})`);
 
     // Create retrieval_events (no pgvector in smoketest DB).
@@ -3771,7 +3817,7 @@ async function runC2Section() {
   const C2_TS         = Date.now();
   const C2_DB         = `claude_memory_c2_${C2_TS}`;
   const C2_PROJ_DIR   = path.join(os.tmpdir(), `handoff_c2_${C2_TS}`);
-  const C2_PROJECT_ID = encodeCwd(C2_PROJ_DIR);
+  let C2_PROJECT_ID = encodeCwd(C2_PROJ_DIR);
 
   try {
     await createSmokeDb(C2_DB, C2_PROJ_DIR);
@@ -3797,6 +3843,7 @@ async function runC2Section() {
       c2Failed += C2_TOTAL;
       return;
     }
+    C2_PROJECT_ID = markerUUID(C2_PROJ_DIR) || C2_PROJECT_ID;
     console.log(`[C2] DB init OK (${C2_DB})`);
 
     // Create retrieval_events table (no pgvector in smoketest DB).
@@ -4370,7 +4417,7 @@ async function runC3Section() {
   const C3_TS         = Date.now();
   const C3_DB         = `claude_memory_c3_${C3_TS}`;
   const C3_PROJ_DIR   = path.join(os.tmpdir(), `handoff_c3_${C3_TS}`);
-  const C3_PROJECT_ID = encodeCwd(C3_PROJ_DIR);
+  let C3_PROJECT_ID = encodeCwd(C3_PROJ_DIR);
 
   try {
     await createSmokeDb(C3_DB, C3_PROJ_DIR);
@@ -4396,6 +4443,7 @@ async function runC3Section() {
       c3Failed += C3_TOTAL;
       return;
     }
+    C3_PROJECT_ID = markerUUID(C3_PROJ_DIR) || C3_PROJECT_ID;
     console.log(`[C3] DB init OK (${C3_DB})`);
 
     // Verify contract_evolution_enabled default registered by init.
@@ -4634,7 +4682,7 @@ async function rgStep7_writePathNonRegression() {
   const RG_TS         = Date.now();
   const RG_DB         = `claude_memory_rg_${RG_TS}`;
   const RG_PROJ_DIR   = path.join(os.tmpdir(), `handoff_rg_${RG_TS}`);
-  const RG_PROJECT_ID = encodeCwd(RG_PROJ_DIR);
+  let RG_PROJECT_ID = encodeCwd(RG_PROJ_DIR);
 
   try {
     await createSmokeDb(RG_DB, RG_PROJ_DIR);
@@ -4659,6 +4707,7 @@ async function rgStep7_writePathNonRegression() {
       rgPass(7, `${label} (infra unavailable — DB sub-test skipped)`);
       return true;
     }
+    RG_PROJECT_ID = markerUUID(RG_PROJ_DIR) || RG_PROJECT_ID;
 
     // Close with a payload containing one unknown predicate and one known predicate.
     // In permissive mode (default, no project_settings override), both should INSERT.
@@ -5162,7 +5211,7 @@ async function runQueueSection() {
   const Q_TS         = Date.now();
   const Q_DB         = `claude_memory_queue_${Q_TS}`;
   const Q_PROJ_DIR   = path.join(os.tmpdir(), `handoff_queue_${Q_TS}`);
-  const Q_PROJECT_ID = encodeCwd(Q_PROJ_DIR);
+  let Q_PROJECT_ID = encodeCwd(Q_PROJ_DIR);
 
   try {
     await createSmokeDb(Q_DB, Q_PROJ_DIR);
@@ -5188,6 +5237,7 @@ async function runQueueSection() {
       qFailed += Q_TOTAL;
       return;
     }
+    Q_PROJECT_ID = markerUUID(Q_PROJ_DIR) || Q_PROJECT_ID;
     console.log(`[QUEUE] DB init OK (${Q_DB})`);
 
     // Verify extraction_queue table exists after init.
@@ -5427,7 +5477,7 @@ async function runCollisionSection() {
   const TS       = Date.now();
   const COL_DB   = `claude_memory_collision_${TS}`;
   const PROJ_DIR = path.join(os.tmpdir(), `handoff_collision_${TS}`);
-  const PROJ_ID  = encodeCwd(PROJ_DIR);
+  let PROJ_ID  = encodeCwd(PROJ_DIR);
 
   let dbOk = false;
   try {
@@ -5441,6 +5491,7 @@ async function runCollisionSection() {
       console.log((initR.stderr || initR.stdout || '').slice(0, 400));
       colFailed += 4;
     } else {
+      PROJ_ID = markerUUID(PROJ_DIR) || PROJ_ID;
       console.log(`[COLLISION] DB init OK (${COL_DB})`);
       dbOk = true;
       try { await createRetrievalEventsTable(COL_DB); } catch (_) { /* non-fatal */ }
@@ -5676,7 +5727,7 @@ async function runGraphSection() {
   const GR_TS       = Date.now();
   const GR_DB       = `claude_memory_graph_${GR_TS}`;
   const GR_PROJ_DIR = path.join(os.tmpdir(), `handoff_graph_${GR_TS}`);
-  const GR_PROJ_ID  = encodeCwd(GR_PROJ_DIR);
+  let GR_PROJ_ID  = encodeCwd(GR_PROJ_DIR);
 
   try {
     await createSmokeDb(GR_DB, GR_PROJ_DIR);
@@ -5693,6 +5744,7 @@ async function runGraphSection() {
       grFailed += GR_TOTAL;
       return;
     }
+    GR_PROJ_ID = markerUUID(GR_PROJ_DIR) || GR_PROJ_ID;
     console.log(`[GRAPH] DB init OK (${GR_DB})`);
 
     // Verify graph settings registered by init.
@@ -5731,7 +5783,7 @@ async function runDecaySection() {
   const DC_TS       = Date.now();
   const DC_DB       = `claude_memory_decay_${DC_TS}`;
   const DC_PROJ_DIR = path.join(os.tmpdir(), `handoff_decay_${DC_TS}`);
-  const DC_PROJ_ID  = encodeCwd(DC_PROJ_DIR);
+  let DC_PROJ_ID  = encodeCwd(DC_PROJ_DIR);
 
   try {
     await createSmokeDb(DC_DB, DC_PROJ_DIR);
@@ -5748,6 +5800,7 @@ async function runDecaySection() {
       dcFailed += DC_TOTAL;
       return;
     }
+    DC_PROJ_ID = markerUUID(DC_PROJ_DIR) || DC_PROJ_ID;
     console.log(`[DECAY] DB init OK (${DC_DB})`);
 
     try { await createRetrievalEventsTable(DC_DB); } catch (_) { /* non-fatal */ }
@@ -5923,7 +5976,7 @@ async function runPruneSection() {
   const PN_TS       = Date.now();
   const PN_DB       = `claude_memory_prune_${PN_TS}`;
   const PN_PROJ_DIR = path.join(os.tmpdir(), `handoff_prune_${PN_TS}`);
-  const PN_PROJ_ID  = encodeCwd(PN_PROJ_DIR);
+  let PN_PROJ_ID  = encodeCwd(PN_PROJ_DIR);
 
   try {
     await createSmokeDb(PN_DB, PN_PROJ_DIR);
@@ -5940,6 +5993,7 @@ async function runPruneSection() {
       pnFailed += PN_TOTAL;
       return;
     }
+    PN_PROJ_ID = markerUUID(PN_PROJ_DIR) || PN_PROJ_ID;
     console.log(`[PRUNE] DB init OK (${PN_DB})`);
 
     // ── Insert test data ────────────────────────────────────────────────────────
@@ -6297,6 +6351,8 @@ async function runHooksSection() {
       hkFailed += HK_TOTAL;
       return;
     }
+    // After cmdInit mints the marker, update PROJECT_ID_HOOKS to the UUID.
+    updateProjectIdFromMarker('hooks');
     console.log(`[HOOKS] DB init OK`);
 
     await hooksStep1_stalenessGate();
@@ -6336,6 +6392,8 @@ async function runHardeningSection() {
       }
       return;
     }
+    // After cmdInit mints the marker, update PROJECT_ID_HARDEN to the UUID.
+    updateProjectIdFromMarker('harden');
     console.log(`[HARDEN] DB init OK`);
 
     await hardenStep2_trustBoundaryLabels();

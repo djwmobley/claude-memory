@@ -15,14 +15,19 @@ It is idempotent: safe to run on a project that is already initialized.
 
 ## How to invoke
 
-Find the project root (walk up from `pwd` looking for `.git`), then run:
+Find the project root (walk up from `pwd` looking for `.claude-memory` marker first,
+then fall back to `.git`), then run:
 
 ```bash
-# Detect project root
+# Detect project root — prefer .claude-memory marker, fall back to .git
 PROJECT_ROOT=$(pwd)
-while [ ! -d "$PROJECT_ROOT/.git" ] && [ "$PROJECT_ROOT" != "/" ]; do
+while [ ! -f "$PROJECT_ROOT/.claude-memory" ] && [ ! -d "$PROJECT_ROOT/.git" ] && [ "$PROJECT_ROOT" != "/" ]; do
   PROJECT_ROOT=$(dirname "$PROJECT_ROOT")
 done
+# If we stopped at root without finding either, reset to cwd (engine handles provisioning)
+if [ "$PROJECT_ROOT" = "/" ] && [ ! -f "$PROJECT_ROOT/.claude-memory" ] && [ ! -d "$PROJECT_ROOT/.git" ]; then
+  PROJECT_ROOT=$(pwd)
+fi
 
 # Verify this is a claude-memory project
 if [ ! -f "$PROJECT_ROOT/scripts/handoff.js" ]; then

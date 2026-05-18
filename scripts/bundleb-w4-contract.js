@@ -39,6 +39,10 @@ const { Client } = require('pg');
 const { loadConfig, findProjectRoot } = require('./lib/shared');
 const { encodeCwd }                   = require('./lib/encoded-cwd');
 const { queriesEqual, recordContractChange } = require('./handoff');
+const {
+  findProjectRootByMarker,
+  readMarker,
+} = require('./lib/project-marker');
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 
@@ -54,8 +58,18 @@ const TARGET_DB = _rawTargetDb;
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
-/** Resolve project_id for the current working directory (mirrors handoff.js). */
+/**
+ * Resolve project_id for the current working directory.
+ * Mirrors the resolution logic in handoff.js: check for a .claude-memory marker
+ * first (UUID-based identity), fall back to encodeCwd(root) for legacy projects.
+ */
 function resolveProjectId() {
+  const startDir = process.env.PROJECT_ROOT || process.cwd();
+  const markerRoot = findProjectRootByMarker(startDir);
+  if (markerRoot) {
+    const marker = readMarker(markerRoot);
+    if (marker) return marker.uuid;
+  }
   const root = findProjectRoot();
   return encodeCwd(root);
 }
