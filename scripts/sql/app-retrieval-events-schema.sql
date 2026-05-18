@@ -1,20 +1,20 @@
 -- ============================================================================
 -- app-retrieval-events-schema.sql
 --
--- claude-memory-specific schema: retrieval_events table with halfvec(4000)
--- query embedding column.
+-- claude-memory-specific schema: retrieval_events and retrieval_event_assertions.
 --
--- NOT applied by `/handoff:init`. This file requires the pgvector extension
--- and is intended only for the claude-memory application setup path.
---
--- Apply manually:
+-- NOT applied by `/handoff:init`. Apply manually:
 --   psql -d claude_memory_eval_test -f scripts/sql/app-retrieval-events-schema.sql
 --
--- Or wire into your existing pipeline setup (e.g., scripts/run-migrations.js
--- if one exists). See BUNDLE-A-SPEC.md section 4 for context.
+-- NOTE: The query_embedding halfvec(4000) column and CREATE EXTENSION vector
+-- have been removed. query_embedding was never written or read by the handoff
+-- engine (the retrieval_events INSERT writes only query_text/session_id/notes;
+-- the vector retrieval kind is an explicit stub). Removing it eliminates a
+-- dead pgvector dependency that misled adopters into requiring the extension.
+-- See PR feat/storage-seam-sqlite for the investigation trail.
+--
+-- Pure stock Postgres (>= 13) from this point forward -- no extensions needed.
 -- ============================================================================
-
-CREATE EXTENSION IF NOT EXISTS vector;
 
 -- ============================================================================
 -- RETRIEVAL_EVENTS — log of every retrieval call; outcome posted by Bundle B.
@@ -26,7 +26,10 @@ CREATE TABLE IF NOT EXISTS retrieval_events (
   id              SERIAL PRIMARY KEY,
   project_id      TEXT NOT NULL,
   query_text      TEXT NOT NULL,
-  query_embedding halfvec(4000),  -- matches memory_entry_chunks.embedding type (halfvec(4000) after Phase 1 step 5)
+  -- query_embedding column removed: halfvec(4000) was never written or read.
+  -- The handoff engine's retrieval_events INSERT writes only query_text,
+  -- session_id, and notes. The vector retrieval kind is a stub (Phase 3.6).
+  -- Removing this eliminates the dead pgvector extension dependency.
   retrieved_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   outcome         TEXT DEFAULT 'pending'
                     CHECK (outcome IN ('pending','success','failure','irrelevant')),
