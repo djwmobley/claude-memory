@@ -587,8 +587,10 @@ async function cmdInit(args) {
     graph_retrieval_enabled:          'enabled',
     graph_max_depth:                  '2',
     graph_max_nodes:                  '25',
-    // C2: outcome→ranking+decay feedback loop (default OFF — byte-identical to pre-C2 when disabled).
-    feedback_loop_enabled:            'disabled',
+    // C2: outcome→ranking+decay feedback loop (default ON as of PR-B).
+    // When explicitly set to any value other than 'enabled', gate-OFF SQL remains
+    // byte-identical in structure (no outcome_bias term); see I-6 in the spec.
+    feedback_loop_enabled:            'enabled',
     feedback_success_delta:           '0.5',   // bias nudge per success outcome
     feedback_failure_delta:           '-0.75', // bias nudge per failure outcome
     feedback_irrelevant_delta:        '-0.25', // bias nudge per irrelevant outcome (smaller penalty)
@@ -855,9 +857,9 @@ async function cmdLoaderLoad(opts = {}) {
   const retrievedAssertionIds = [];
 
   // C2: read feedback gate once before the loop.
-  // When not 'enabled', ALL assertion query SQL is byte-identical to pre-C2 — no outcome_bias
-  // term appears anywhere in the query, so disabled mode has zero performance or behavioral impact.
-  const feedbackLoopEnabled = await getSetting(db, projectId, 'feedback_loop_enabled', 'disabled');
+  // Default is now 'enabled' (PR-B default-on).  When explicitly set to any other value,
+  // gate-OFF SQL has no outcome_bias term — byte-identical in structure to pre-C2 (I-6).
+  const feedbackLoopEnabled = await getSetting(db, projectId, 'feedback_loop_enabled', 'enabled');
 
   for (const q of queries) {
     if (tokensUsed >= tokenBudget) break;
@@ -897,19 +899,25 @@ async function cmdLoaderLoad(opts = {}) {
       let assertionQueryParams;
       if (feedbackLoopEnabled === 'enabled') {
         // Gate ON: rank by decayed score + outcome_bias; no cutoff filter.
+        // PR-B: also exclude bi-temporally invalidated rows (invalid_at IS NULL = still live).
         assertionQuerySql = `SELECT id, subject, predicate, object, confidence, source FROM assertions
          WHERE project_id = $1
            AND ($2::text IS NULL OR subject = $2)
            AND suppressed = false
+           AND invalid_at IS NULL
          ORDER BY (confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) + outcome_bias) DESC, last_reinforced DESC LIMIT 30`;
         assertionQueryParams = [projectId, q.filter?.subject || null];
       } else {
         // Gate OFF: rank by decayed score only (no outcome_bias term); no cutoff filter.
-        // ORDER BY is now the decayed expression, not the pre-C2 plain confidence order.
+        // I-6: when C2 is EXPLICITLY disabled, the gate-OFF SQL omits the outcome_bias term —
+        // that is the ONLY C2-driven difference vs gate-ON. The AND invalid_at IS NULL predicate
+        // is a bi-temporal extension (PR-B) present identically in both gate-ON and gate-OFF;
+        // it is NOT a C2 change.
         assertionQuerySql = `SELECT id, subject, predicate, object, confidence, source FROM assertions
          WHERE project_id = $1
            AND ($2::text IS NULL OR subject = $2)
            AND suppressed = false
+           AND invalid_at IS NULL
          ORDER BY confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) DESC, last_reinforced DESC LIMIT 30`;
         assertionQueryParams = [projectId, q.filter?.subject || null];
       }
@@ -942,15 +950,19 @@ async function cmdLoaderLoad(opts = {}) {
       let recencyQuerySql;
       if (feedbackLoopEnabled === 'enabled') {
         // Gate ON: no cutoff filter; recency order unchanged.
+        // PR-B: exclude bi-temporally invalidated rows (invalid_at IS NULL = still live).
         recencyQuerySql = `SELECT id, subject, predicate, object, confidence FROM assertions
          WHERE project_id = $1
            AND suppressed = false
+           AND invalid_at IS NULL
          ORDER BY last_reinforced DESC LIMIT 20`;
       } else {
         // Gate OFF: no cutoff filter; recency order unchanged.
+        // PR-B: invalid_at IS NULL applies in both gate states.
         recencyQuerySql = `SELECT id, subject, predicate, object, confidence FROM assertions
          WHERE project_id = $1
            AND suppressed = false
+           AND invalid_at IS NULL
          ORDER BY last_reinforced DESC LIMIT 20`;
       }
       const { rows } = await db.query(recencyQuerySql, [projectId]);
@@ -966,12 +978,17 @@ async function cmdLoaderLoad(opts = {}) {
       }
 
     } else if (q.type === 'history' || q.kind === 'history') {
-      // 4E history kind: return suppressed rows for a given subject so the caller
-      // can inspect the superseded trail without paying the default context cost.
+      // 4E history kind: return suppressed / bi-temporally invalidated rows for a given
+      // subject so the caller can inspect the superseded trail + probation rows without
+      // paying the default context cost.
       //
-      // Design decisions (per spec §7.3):
-      //   - Selects suppressed=true rows only (live rows are covered by assertion kind).
-      //   - NO bump: history retrieval must not reinforce suppressed rows (OQ-2).
+      // PR-B additions:
+      //   - Includes rows with suppressed=true OR invalid_at IS NOT NULL (catches
+      //     downvoted_probation rows that are excluded from standard retrieval).
+      //   - suppression_kind and invalid_at are included in the formatted output.
+      //   - NO bump: history retrieval must not reinforce non-live rows (OQ-2).
+      //
+      // Design decisions (per spec §7.3 + PR-B Fork 1):
       //   - Opt-in via contract kind:'history' + filter.subject; never in default contract.
       //   - created_at is included so the caller can reason about temporal ordering.
       //
@@ -980,20 +997,25 @@ async function cmdLoaderLoad(opts = {}) {
       // the contract is an explicit opt-in that must go through recordContractChange.
       const historySubject = q.filter?.subject || null;
       const { rows: hRows } = await db.query(
-        `SELECT id, subject, predicate, object, confidence, source, created_at
+        `SELECT id, subject, predicate, object, confidence, source, created_at,
+                suppression_kind, invalid_at
          FROM assertions
          WHERE project_id = $1
            AND ($2::text IS NULL OR subject = $2)
-           AND suppressed = true
+           AND (suppressed = true OR invalid_at IS NOT NULL)
          ORDER BY subject, predicate, created_at DESC
          LIMIT 20`,
         [projectId, historySubject]
       );
       if (hRows.length) {
-        const text = hRows.map((r) =>
-          `- [${r.source}|conf=${r.confidence}|suppressed|${r.created_at.toISOString()}] ${r.subject} ${r.predicate} ${r.object}`
-        ).join('\n');
-        sections.push(`### Assertion history (suppressed trail)\n${text}`);
+        const text = hRows.map((r) => {
+          const ts = r.created_at
+            ? (typeof r.created_at === 'string' ? r.created_at : r.created_at.toISOString())
+            : 'unknown';
+          const kindTag = r.suppression_kind ? `|${r.suppression_kind}` : '|suppressed';
+          return `- [${r.source}|conf=${r.confidence}${kindTag}|${ts}] ${r.subject} ${r.predicate} ${r.object}`;
+        }).join('\n');
+        sections.push(`### Assertion history (suppressed/probation trail)\n${text}`);
         tokensUsed      += Math.ceil(text.length / 4);
         assertionsCount += hRows.length;
         // No bump — history rows are read-only for decay purposes.
@@ -1436,34 +1458,27 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
     ? ass.source : 'model_extracted';
 
   // Wrap suppress+INSERT in an explicit transaction (atomicity requirement I-A mechanism-a).
+  //
+  // PR-B: supersession is now enriched via db.buildSupersessionUpdate() which sets:
+  //   suppressed = true, invalid_at = now(), suppression_kind = 'superseded'
+  // on the prior live row(s).  Rows with pinned = true are EXEMPT from auto-suppression
+  // here — they are skipped by buildSupersessionUpdate's WHERE clause.
+  // Note: explicit user re-statement of a 1:1 predicate WILL supersede a pinned row
+  // (pinned blocks C2 AUTO actions, not explicit writes — documented distinction).
+  //
+  // The new INSERT also sets valid_at = now() to record when the assertion became live.
   await db.query('BEGIN');
   try {
-    if (cardinality === '1:1') {
-      // Suppress any existing live row for this (project_id, subject, predicate) pair.
-      await db.query(
-        `UPDATE assertions SET suppressed = true
-         WHERE project_id = $1
-           AND subject    = $2
-           AND predicate  = $3
-           AND suppressed = false`,
-        [projectId, ass.subject, ass.predicate]
-      );
-    } else {
-      // 1:N: suppress only an exact (project_id, subject, predicate, object) duplicate.
-      await db.query(
-        `UPDATE assertions SET suppressed = true
-         WHERE project_id = $1
-           AND subject    = $2
-           AND predicate  = $3
-           AND object     = $4
-           AND suppressed = false`,
-        [projectId, ass.subject, ass.predicate, ass.object]
-      );
-    }
+    // buildSupersessionUpdate encapsulates dialect-specific SQL (Postgres vs SQLite booleans).
+    const supersessionStmt = db.buildSupersessionUpdate(
+      cardinality, projectId, ass.subject, ass.predicate, ass.object
+    );
+    await db.query(supersessionStmt.sql, supersessionStmt.params);
 
     await db.query(
-      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, session_id, last_reinforced)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, now())`,
+      `INSERT INTO assertions
+         (project_id, subject, predicate, object, confidence, source, session_id, last_reinforced, valid_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now())`,
       [projectId, ass.subject, ass.predicate, ass.object, conf, source, sessionId]
     );
 
@@ -2010,7 +2025,7 @@ async function cmdClose(args) {
   // Session resolution: same logic as the outcome capture block above — payload.session_id
   // takes precedence, then the DB marker. Both are read before session_in_progress is cleared.
   try {
-    const feedbackEnabled = await getSetting(db, projectId, 'feedback_loop_enabled', 'disabled');
+    const feedbackEnabled = await getSetting(db, projectId, 'feedback_loop_enabled', 'enabled');
     if (feedbackEnabled === 'enabled') {
       // Re-resolve session id (same approach as outcome capture, before marker is cleared).
       const fbSessionId = (typeof payload.session_id === 'string' && payload.session_id.length > 0)
@@ -2051,21 +2066,84 @@ async function cmdClose(args) {
           );
 
           if (aggRes.rows.length > 0) {
-            // Apply bounded delta to each assertion's outcome_bias.
+            // PR-B: C2 feedback now distinguishes suppression_kind and respects pinned exemption.
+            //
+            // Downvote thresholds (hardcoded conservative values):
+            //   Net delta < -1.5 over this session → downvoted_probation (soft, recoverable).
+            //   Net delta < -3.0 over this session → downvoted_terminal  (terminal, not auto-revivable).
+            // Positive net delta → REHABILITATION: if a row is in downvoted_probation,
+            //   clear it back to live (clears suppressed, invalid_at, suppression_kind).
+            //
+            // Pinned rows (pinned = true/1): NEVER auto-suppressed/downvoted by this path.
+            //   The filter is applied via a WHERE pinned = false guard on all downvote UPDATEs.
+            //
+            // outcome_bias update is applied REGARDLESS of whether suppression fires —
+            //   bias reflects retrieval quality signal even on live rows.
+            const DOWNVOTE_PROBATION_THRESHOLD = -1.5;
+            const DOWNVOTE_TERMINAL_THRESHOLD  = -3.0;
+
+            let biasAdjusted = 0;
+            let downvotedProbation = 0;
+            let downvotedTerminal  = 0;
+            let rehabilitated      = 0;
+
             for (const row of aggRes.rows) {
               const delta =
                 row.success_count    * successDelta +
                 row.failure_count    * failureDelta +
                 row.irrelevant_count * irrelevantDelta;
-              // CLAMP via GREATEST/LEAST in SQL for atomicity.
+
+              // 1. Update outcome_bias (CLAMP via GREATEST/LEAST in SQL for atomicity).
               await db.query(
                 `UPDATE assertions
                  SET outcome_bias = GREATEST($2::float, LEAST($3::float, outcome_bias + $4::float))
                  WHERE id = $1`,
                 [row.assertion_id, -biasClamp, biasClamp, delta]
               );
+              biasAdjusted++;
+
+              // 2. Determine downvote / rehabilitation action based on net delta.
+              if (delta > 0) {
+                // Positive signal → attempt rehabilitation for probation rows.
+                const rehabStmt = db.buildProbationRehabUpdate([row.assertion_id]);
+                if (rehabStmt) {
+                  const rehabResult = await db.query(rehabStmt.sql, rehabStmt.params);
+                  if (rehabResult.rowCount > 0) rehabilitated++;
+                }
+              } else if (delta <= DOWNVOTE_TERMINAL_THRESHOLD) {
+                // Strong negative → terminal downvote (not auto-revivable; pinned exempt).
+                // Only fires on currently live rows (suppressed=false, invalid_at IS NULL).
+                await db.query(
+                  `UPDATE assertions
+                   SET suppressed = true, invalid_at = now(), suppression_kind = 'downvoted_terminal'
+                   WHERE id = $1
+                     AND suppressed = false
+                     AND invalid_at IS NULL
+                     AND (pinned = false OR pinned IS NULL)`,
+                  [row.assertion_id]
+                );
+                downvotedTerminal++;
+              } else if (delta <= DOWNVOTE_PROBATION_THRESHOLD) {
+                // Moderate negative → probation downvote (recoverable via rehabilitation).
+                // Only fires on currently live rows (suppressed=false, invalid_at IS NULL).
+                await db.query(
+                  `UPDATE assertions
+                   SET suppressed = true, invalid_at = now(), suppression_kind = 'downvoted_probation'
+                   WHERE id = $1
+                     AND suppressed = false
+                     AND invalid_at IS NULL
+                     AND (pinned = false OR pinned IS NULL)`,
+                  [row.assertion_id]
+                );
+                downvotedProbation++;
+              }
+              // else: delta between 0 and DOWNVOTE_PROBATION_THRESHOLD → bias adjustment only.
             }
-            console.log(`  C2 feedback: adjusted outcome_bias for ${aggRes.rows.length} assertion(s) (session=${fbSessionId})`);
+            const parts = [`adjusted outcome_bias for ${biasAdjusted} assertion(s)`];
+            if (downvotedProbation > 0) parts.push(`${downvotedProbation} → downvoted_probation`);
+            if (downvotedTerminal  > 0) parts.push(`${downvotedTerminal} → downvoted_terminal`);
+            if (rehabilitated      > 0) parts.push(`${rehabilitated} probation row(s) rehabilitated`);
+            console.log(`  C2 feedback: ${parts.join('; ')} (session=${fbSessionId})`);
           } else {
             console.log(`  C2 feedback: no attributed outcomes found for session ${fbSessionId} — nothing to adjust`);
           }

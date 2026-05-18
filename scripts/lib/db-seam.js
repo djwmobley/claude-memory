@@ -35,9 +35,17 @@
 //                                  — col <> ALL($n::text[])  (Postgres)
 //                                  — col NOT IN (?,?,?)      (SQLite, or 1=1 if empty)
 //                                  Returns { clause, params }.
-//   buildBumpAssertions(ids, suppressedFalseValue)
+//   buildBumpAssertions(ids)
 //                                  — Returns { sql, params } for updating
 //                                    last_reinforced + last_retrieved on the given ids.
+//                                    Only touches live rows (suppressed=false, invalid_at IS NULL).
+//   buildSupersessionUpdate(cardinality, projectId, subject, predicate, object)
+//                                  — Returns { sql, params } that sets suppressed, invalid_at,
+//                                    suppression_kind='superseded' on the prior live row(s).
+//                                    Pinned rows (pinned=true/1) are exempt from auto-suppression.
+//   buildProbationRehabUpdate(ids)
+//                                  — Returns { sql, params } that revives downvoted_probation rows
+//                                    (clears suppressed/invalid_at/suppression_kind).
 //   buildMultiPairInsert(table, col1, col2, col1Val, col2Values)
 //                                  — Returns { sql, params } for an INSERT of
 //                                    (col1Val, col2Values[0]), (col1Val, col2Values[1])...
@@ -57,7 +65,8 @@
 //   3. Date arithmetic:     EXTRACT(EPOCH FROM (now()-col))/86400
 //                           -> (julianday('now')-julianday(col)) [numerically identical]
 //   4. ON CONFLICT:         identical syntax — no rewrite needed
-//   5. ADD COLUMN IF NOT EXISTS: identical — no rewrite needed
+//   5. ADD COLUMN IF NOT EXISTS: SQLite 3.51 does not support this syntax.
+//      runSchema() strips "IF NOT EXISTS" and catches "duplicate column name" errors.
 //   6. Graph CTE cycle prevention: Postgres ARRAY path -> SQLite path-string
 //   7. Array params:        id = ANY($n::int[]) -> IN (?,?) via buildArrayContains()
 //   8. RETURNING id:        INSERT then SELECT last_insert_rowid()
@@ -580,7 +589,23 @@ class SQLiteAdapter {
     const stmts = splitStatements(rewriteForSQLite(sql));
     for (const stmt of stmts) {
       const s = stmt.trim();
-      if (s) db.prepare(s).run();
+      if (!s) continue;
+      // Strip leading -- comment lines to expose the actual SQL keyword.
+      // splitStatements() appends comment text to the preceding statement's buffer,
+      // so a statement may start with one or more "--..." comment lines.
+      const stripped = s.replace(/^(--[^\n]*\n\s*)*/g, '').trim();
+      if (!stripped) continue;
+      // SQLite does not support ALTER TABLE ... ADD COLUMN IF NOT EXISTS syntax.
+      // Simulate idempotency: strip "IF NOT EXISTS" and catch "duplicate column name".
+      if (/^ALTER\s+TABLE\s+\S+\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\b/i.test(stripped)) {
+        const rewritten = stripped.replace(/\bIF\s+NOT\s+EXISTS\b/i, '');
+        try { db.prepare(rewritten).run(); } catch (e) {
+          if (!/duplicate column name/i.test(e.message)) throw e;
+          // Column already exists — idempotent, continue.
+        }
+        continue;
+      }
+      db.prepare(s).run();
     }
   }
 
@@ -630,6 +655,7 @@ class SQLiteAdapter {
   /**
    * Build an UPDATE to bump last_reinforced + last_retrieved for the given ids.
    * suppressedFalseValue: the literal false-equivalent for this dialect (0 for SQLite).
+   * Only bumps live rows (suppressed = 0 AND invalid_at IS NULL) — OQ-2 guard.
    * Returns { sql, params }.
    */
   buildBumpAssertions(ids) {
@@ -637,7 +663,61 @@ class SQLiteAdapter {
     const { clause: inClause, params: inParams } = this.buildArrayContains('id', ids);
     return {
       sql: `UPDATE assertions SET last_reinforced = datetime('now'), last_retrieved = datetime('now')
-            WHERE ${inClause} AND suppressed = 0`,
+            WHERE ${inClause} AND suppressed = 0 AND invalid_at IS NULL`,
+      params: inParams,
+    };
+  }
+
+  /**
+   * Build an UPDATE that marks a row as superseded by enriching the suppression columns.
+   * Sets: suppressed = 1 (SQLite), invalid_at = now(), suppression_kind = 'superseded'.
+   *
+   * For 1:1 cardinality: suppresses all live rows for (project_id, subject, predicate)
+   *   that are NOT pinned (pinned = 0 blocks auto-suppression).
+   * For 1:N cardinality: suppresses only exact (project_id, subject, predicate, object) duplicates.
+   *
+   * Returns { sql, params } — designed for use inside a BEGIN/COMMIT transaction.
+   */
+  buildSupersessionUpdate(cardinality, projectId, subject, predicate, object) {
+    if (cardinality === '1:1') {
+      return {
+        sql: `UPDATE assertions
+              SET suppressed = 1, invalid_at = datetime('now'), suppression_kind = 'superseded'
+              WHERE project_id = ?
+                AND subject    = ?
+                AND predicate  = ?
+                AND suppressed = 0
+                AND pinned     = 0`,
+        params: [projectId, subject, predicate],
+      };
+    }
+    // 1:N: only exact duplicate suppressed; pinned exemption applies here too.
+    return {
+      sql: `UPDATE assertions
+            SET suppressed = 1, invalid_at = datetime('now'), suppression_kind = 'superseded'
+            WHERE project_id = ?
+              AND subject    = ?
+              AND predicate  = ?
+              AND object     = ?
+              AND suppressed = 0
+              AND pinned     = 0`,
+      params: [projectId, subject, predicate, object],
+    };
+  }
+
+  /**
+   * Build an UPDATE that rehabilitates downvoted_probation rows back to live.
+   * Clears: suppressed → 0, invalid_at → NULL, suppression_kind → NULL.
+   * Only acts on rows with suppression_kind = 'downvoted_probation'.
+   * Returns { sql, params } — safe to call with an empty ids array (returns null).
+   */
+  buildProbationRehabUpdate(ids) {
+    if (!ids || ids.length === 0) return null;
+    const { clause: inClause, params: inParams } = this.buildArrayContains('id', ids);
+    return {
+      sql: `UPDATE assertions
+            SET suppressed = 0, invalid_at = NULL, suppression_kind = NULL
+            WHERE ${inClause} AND suppression_kind = 'downvoted_probation'`,
       params: inParams,
     };
   }
@@ -795,6 +875,7 @@ class PostgresAdapter {
   /**
    * Build an UPDATE to bump last_reinforced + last_retrieved for the given ids.
    * Postgres passes the ids as a single int[] array.
+   * Only bumps live rows (suppressed = false AND invalid_at IS NULL) — OQ-2 guard.
    * Returns { sql, params }.
    */
   buildBumpAssertions(ids) {
@@ -802,7 +883,62 @@ class PostgresAdapter {
     return {
       sql: `UPDATE assertions SET last_reinforced = now(), last_retrieved = now()
             WHERE id = ANY($1::int[])
-              AND suppressed = false`,
+              AND suppressed = false
+              AND invalid_at IS NULL`,
+      params: [ids],
+    };
+  }
+
+  /**
+   * Build an UPDATE that marks a row as superseded by enriching the suppression columns.
+   * Sets: suppressed = true, invalid_at = now(), suppression_kind = 'superseded'.
+   *
+   * For 1:1 cardinality: suppresses all live, non-pinned rows for (project_id, subject, predicate).
+   * For 1:N cardinality: suppresses only exact (project_id, subject, predicate, object) duplicates.
+   *   Pinned rows are exempt from auto-suppression in both cardinality classes.
+   *
+   * Returns { sql, params } — designed for use inside a BEGIN/COMMIT transaction.
+   */
+  buildSupersessionUpdate(cardinality, projectId, subject, predicate, object) {
+    if (cardinality === '1:1') {
+      return {
+        sql: `UPDATE assertions
+              SET suppressed = true, invalid_at = now(), suppression_kind = 'superseded'
+              WHERE project_id = $1
+                AND subject    = $2
+                AND predicate  = $3
+                AND suppressed = false
+                AND (pinned = false OR pinned IS NULL)`,
+        params: [projectId, subject, predicate],
+      };
+    }
+    // 1:N: only exact duplicate suppressed; pinned exemption applies here too.
+    return {
+      sql: `UPDATE assertions
+            SET suppressed = true, invalid_at = now(), suppression_kind = 'superseded'
+            WHERE project_id = $1
+              AND subject    = $2
+              AND predicate  = $3
+              AND object     = $4
+              AND suppressed = false
+              AND (pinned = false OR pinned IS NULL)`,
+      params: [projectId, subject, predicate, object],
+    };
+  }
+
+  /**
+   * Build an UPDATE that rehabilitates downvoted_probation rows back to live.
+   * Clears: suppressed → false, invalid_at → NULL, suppression_kind → NULL.
+   * Only acts on rows with suppression_kind = 'downvoted_probation'.
+   * Returns { sql, params } — safe to call with empty ids (returns null).
+   */
+  buildProbationRehabUpdate(ids) {
+    if (!ids || ids.length === 0) return null;
+    return {
+      sql: `UPDATE assertions
+            SET suppressed = false, invalid_at = NULL, suppression_kind = NULL
+            WHERE id = ANY($1::int[])
+              AND suppression_kind = 'downvoted_probation'`,
       params: [ids],
     };
   }
