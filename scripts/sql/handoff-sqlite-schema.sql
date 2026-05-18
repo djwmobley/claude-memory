@@ -65,11 +65,27 @@ CREATE TABLE IF NOT EXISTS assertions (
   suppressed       INTEGER NOT NULL DEFAULT 0,
   outcome_bias     REAL    NOT NULL DEFAULT 0,
   promoted         INTEGER NOT NULL DEFAULT 0,
-  promoted_at      TEXT
+  promoted_at      TEXT,
+  -- PR-B bi-temporal supersession + suppression_kind + pinned-exemption (additive, NULL-tolerant).
+  -- Existing rows have NULL for valid_at/invalid_at/suppression_kind; pinned defaults to 0 (false).
+  -- No backfill of existing rows (§7 SKIP; honors no-backfill rule).
+  valid_at         TEXT,
+  invalid_at       TEXT,
+  suppression_kind TEXT    CHECK (suppression_kind IN ('superseded', 'downvoted_terminal', 'downvoted_probation')),
+  pinned           INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS assertions_project_idx    ON assertions (project_id);
 CREATE INDEX IF NOT EXISTS assertions_subject_idx    ON assertions (project_id, subject);
 CREATE INDEX IF NOT EXISTS assertions_confidence_idx ON assertions (project_id, confidence DESC);
+
+-- PR-B: idempotent ADD COLUMN for existing DBs that predate this migration.
+-- SQLite >= 3.37.0 supports ADD COLUMN IF NOT EXISTS.
+-- Existing rows receive NULL for valid_at / invalid_at / suppression_kind; 0 for pinned.
+-- These are safe no-ops on fresh DBs created from the CREATE TABLE above.
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS valid_at TEXT;
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS invalid_at TEXT;
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS suppression_kind TEXT;
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS pinned INTEGER NOT NULL DEFAULT 0;
 
 -- 1:1 partial unique index (same predicate set as Postgres version)
 CREATE UNIQUE INDEX IF NOT EXISTS assertions_1to1_unique

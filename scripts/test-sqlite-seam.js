@@ -738,6 +738,319 @@ async function runSection13() {
   });
 }
 
+// ── SECTION 14: PR-B bi-temporal supersession + suppression_kind + pinned-exemption ──
+async function runSection14() {
+  console.log('\n=== Section 14: PR-B bi-temporal supersession, suppression_kind, pinned, probation rehab ===');
+
+  // Helper: apply SQLite schema to an in-memory DB.
+  async function makeSchemaDb() {
+    const db = new SQLiteAdapter(':memory:');
+    await db.connect();
+    const schemaSql = fs.readFileSync(path.resolve(__dirname, 'sql', 'handoff-sqlite-schema.sql'), 'utf8');
+    await db.runSchema(schemaSql);
+    return db;
+  }
+
+  const PID = 'test-prb';
+
+  // ── Port method: buildSupersessionUpdate ─────────────────────────────────────
+
+  await test('SQLiteAdapter.buildSupersessionUpdate 1:1 produces correct SQL', () => {
+    const db = new SQLiteAdapter(':memory:');
+    const stmt = db.buildSupersessionUpdate('1:1', 'proj', 'subj', 'pred', 'obj');
+    assertTrue(stmt.sql.includes("suppressed = 1"), 'should set suppressed = 1');
+    assertTrue(stmt.sql.includes("suppression_kind = 'superseded'"), 'should set suppression_kind');
+    assertTrue(stmt.sql.includes("invalid_at = datetime('now')"), 'should set invalid_at');
+    assertTrue(stmt.sql.includes("pinned     = 0"), 'should guard on pinned = 0');
+    // 1:1: no object parameter in WHERE
+    assertTrue(!stmt.sql.includes("object"), '1:1 should not filter on object');
+    assertEqual(stmt.params.length, 3, 'params: projectId, subject, predicate');
+  });
+
+  await test('SQLiteAdapter.buildSupersessionUpdate 1:N produces correct SQL', () => {
+    const db = new SQLiteAdapter(':memory:');
+    const stmt = db.buildSupersessionUpdate('1:N', 'proj', 'subj', 'pred', 'obj');
+    assertTrue(stmt.sql.includes("suppressed = 1"), 'should set suppressed = 1');
+    assertTrue(stmt.sql.includes("suppression_kind = 'superseded'"), 'should set suppression_kind');
+    assertTrue(stmt.sql.includes("object     = ?"), '1:N should filter on object');
+    assertEqual(stmt.params.length, 4, 'params: projectId, subject, predicate, object');
+  });
+
+  await test('PostgresAdapter.buildSupersessionUpdate 1:1 produces correct SQL', () => {
+    const db = new PostgresAdapter(null);
+    const stmt = db.buildSupersessionUpdate('1:1', 'proj', 'subj', 'pred', 'obj');
+    assertTrue(stmt.sql.includes("suppressed = true"), 'should set suppressed = true');
+    assertTrue(stmt.sql.includes("suppression_kind = 'superseded'"), 'should set suppression_kind');
+    assertTrue(stmt.sql.includes("invalid_at = now()"), 'should set invalid_at');
+    assertTrue(stmt.sql.includes("pinned = false OR pinned IS NULL"), 'should guard on pinned');
+    assertTrue(!stmt.sql.includes("object"), '1:1 should not filter on object');
+    assertEqual(stmt.params.length, 3, 'params: projectId, subject, predicate');
+  });
+
+  await test('PostgresAdapter.buildSupersessionUpdate 1:N produces correct SQL', () => {
+    const db = new PostgresAdapter(null);
+    const stmt = db.buildSupersessionUpdate('1:N', 'proj', 'subj', 'pred', 'obj');
+    assertTrue(stmt.sql.includes("suppressed = true"), 'should set suppressed = true');
+    assertTrue(stmt.sql.includes("object     = $4"), '1:N should filter on object');
+    assertEqual(stmt.params.length, 4, 'params: projectId, subject, predicate, object');
+  });
+
+  // ── Port method: buildProbationRehabUpdate ───────────────────────────────────
+
+  await test('SQLiteAdapter.buildProbationRehabUpdate produces correct SQL', () => {
+    const db = new SQLiteAdapter(':memory:');
+    const stmt = db.buildProbationRehabUpdate([10, 11]);
+    assertTrue(stmt.sql.includes("suppressed = 0"), 'should clear suppressed');
+    assertTrue(stmt.sql.includes("invalid_at = NULL"), 'should clear invalid_at');
+    assertTrue(stmt.sql.includes("suppression_kind = NULL"), 'should clear suppression_kind');
+    assertTrue(stmt.sql.includes("suppression_kind = 'downvoted_probation'"), 'should guard on downvoted_probation');
+    assertDeepEqual(stmt.params, [10, 11]);
+  });
+
+  await test('PostgresAdapter.buildProbationRehabUpdate produces correct SQL', () => {
+    const db = new PostgresAdapter(null);
+    const stmt = db.buildProbationRehabUpdate([10, 11]);
+    assertTrue(stmt.sql.includes("suppressed = false"), 'should clear suppressed (Postgres)');
+    assertTrue(stmt.sql.includes("suppression_kind = NULL"), 'should clear suppression_kind');
+    assertTrue(stmt.sql.includes("suppression_kind = 'downvoted_probation'"), 'guard on downvoted_probation');
+    // Postgres passes as array
+    assertDeepEqual(stmt.params, [[10, 11]]);
+  });
+
+  await test('buildProbationRehabUpdate returns null for empty ids', () => {
+    const db = new SQLiteAdapter(':memory:');
+    const stmt = db.buildProbationRehabUpdate([]);
+    assertEqual(stmt, null, 'should return null for empty ids');
+  });
+
+  // ── buildBumpAssertions now includes invalid_at IS NULL guard ────────────────
+
+  await test('SQLiteAdapter.buildBumpAssertions includes invalid_at IS NULL guard', () => {
+    const db = new SQLiteAdapter(':memory:');
+    const stmt = db.buildBumpAssertions([1]);
+    assertTrue(stmt.sql.includes('invalid_at IS NULL'), 'bump should exclude invalidated rows');
+  });
+
+  await test('PostgresAdapter.buildBumpAssertions includes invalid_at IS NULL guard', () => {
+    const db = new PostgresAdapter(null);
+    const stmt = db.buildBumpAssertions([1]);
+    assertTrue(stmt.sql.includes('invalid_at IS NULL'), 'bump should exclude invalidated rows');
+  });
+
+  // ── Integration tests against a live SQLite DB ───────────────────────────────
+
+  await test('PR-B schema: valid_at / invalid_at / suppression_kind / pinned columns exist', async () => {
+    const db = await makeSchemaDb();
+    try {
+      // Insert a row — should succeed with new columns present.
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source,
+           valid_at, invalid_at, suppression_kind, pinned)
+         VALUES (?, ?, ?, ?, ?, ?, datetime('now'), NULL, NULL, 0)`,
+        [PID, 'subj', 'pred', 'obj', 5, 'user_stated']
+      );
+      const { rows } = await db.query(
+        `SELECT valid_at, invalid_at, suppression_kind, pinned FROM assertions WHERE project_id = ?`,
+        [PID]
+      );
+      assertEqual(rows.length, 1, 'should have 1 row');
+      assertTrue(rows[0].valid_at !== null, 'valid_at should be set');
+      assertEqual(rows[0].invalid_at, null, 'invalid_at should be NULL');
+      assertEqual(rows[0].suppression_kind, null, 'suppression_kind should be NULL');
+      assertEqual(rows[0].pinned, 0, 'pinned should default to 0');
+    } finally { await db.end(); }
+  });
+
+  await test('PR-B: buildSupersessionUpdate sets suppression_kind=superseded and invalid_at on 1:1 rows', async () => {
+    const db = await makeSchemaDb();
+    try {
+      // Use a predicate NOT in the 1:1 partial unique index so we can insert both rows directly.
+      // The test validates buildSupersessionUpdate SQL behavior, not the full write-path transaction.
+      // 'prb_custom_pred_1to1' is unrecognized by the index, so the UNIQUE constraint won't fire.
+      const pred = 'prb_custom_pred_1to1';
+      // Insert v1 (will be superseded) then v2 (the new value, not yet inserted in reality).
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
+         VALUES (?, 'A', ?, 'v1', 7, 'user_stated')`,
+        [PID, pred]
+      );
+      // Run the supersession update (marks v1 as superseded).
+      const stmt = db.buildSupersessionUpdate('1:1', PID, 'A', pred, 'v2');
+      await db.query(stmt.sql, stmt.params);
+      // Now insert v2 as the new live row.
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
+         VALUES (?, 'A', ?, 'v2', 8, 'user_stated')`,
+        [PID, pred]
+      );
+
+      const { rows } = await db.query(
+        `SELECT object, suppressed, suppression_kind, invalid_at FROM assertions
+         WHERE project_id = ? AND subject = 'A' AND predicate = ?
+         ORDER BY object`,
+        [PID, pred]
+      );
+      assertEqual(rows.length, 2);
+      const v1 = rows.find((r) => r.object === 'v1');
+      const v2 = rows.find((r) => r.object === 'v2');
+      assertEqual(v1.suppressed, 1, 'v1 should be suppressed');
+      assertEqual(v1.suppression_kind, 'superseded', 'v1 suppression_kind should be superseded');
+      assertTrue(v1.invalid_at !== null, 'v1 invalid_at should be set');
+      assertEqual(v2.suppressed, 0, 'v2 (new) should not be suppressed');
+      assertEqual(v2.suppression_kind, null, 'v2 suppression_kind should be NULL');
+      assertEqual(v2.invalid_at, null, 'v2 invalid_at should be NULL');
+    } finally { await db.end(); }
+  });
+
+  await test('PR-B: pinned row is NOT suppressed by buildSupersessionUpdate', async () => {
+    const db = await makeSchemaDb();
+    try {
+      // Use a predicate not in the 1:1 index to avoid unique constraint interference.
+      const pred = 'prb_pinned_test_pred';
+      // Insert a pinned assertion.
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, pinned)
+         VALUES (?, 'B', ?, 'pinned_val', 9, 'user_stated', 1)`,
+        [PID, pred]
+      );
+      // Run supersession — pinned row should be exempt.
+      const stmt = db.buildSupersessionUpdate('1:1', PID, 'B', pred, 'new_val');
+      await db.query(stmt.sql, stmt.params);
+
+      const { rows } = await db.query(
+        `SELECT object, suppressed, suppression_kind FROM assertions
+         WHERE project_id = ? AND subject = 'B' AND predicate = ?`,
+        [PID, pred]
+      );
+      const pinned = rows.find((r) => r.object === 'pinned_val');
+      assertEqual(pinned.suppressed, 0, 'pinned row should NOT be suppressed');
+      assertEqual(pinned.suppression_kind, null, 'pinned row suppression_kind should remain NULL');
+    } finally { await db.end(); }
+  });
+
+  await test('PR-B: standard retrieval excludes rows with invalid_at IS NOT NULL', async () => {
+    const db = await makeSchemaDb();
+    try {
+      // Insert one live and one invalidated row.
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source,
+           suppressed, invalid_at, suppression_kind)
+         VALUES
+           (?, 'C', 'pred', 'live',        7, 'user_stated', 0, NULL,          NULL),
+           (?, 'C', 'pred', 'probation',   6, 'user_stated', 1, datetime('now'), 'downvoted_probation')`,
+        [PID, PID]
+      );
+      // Standard retrieval should only return the live row.
+      const { rows } = await db.query(
+        `SELECT object FROM assertions
+         WHERE project_id = ? AND suppressed = 0 AND invalid_at IS NULL`,
+        [PID]
+      );
+      assertEqual(rows.length, 1);
+      assertEqual(rows[0].object, 'live', 'only live row should appear in standard retrieval');
+    } finally { await db.end(); }
+  });
+
+  await test('PR-B: probation row present in history query (suppressed OR invalid_at NOT NULL)', async () => {
+    const db = await makeSchemaDb();
+    try {
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source,
+           suppressed, invalid_at, suppression_kind)
+         VALUES
+           (?, 'D', 'pred', 'live',     7, 'user_stated', 0, NULL,           NULL),
+           (?, 'D', 'pred', 'probation',6, 'user_stated', 1, datetime('now'),'downvoted_probation'),
+           (?, 'D', 'pred', 'terminal', 5, 'user_stated', 1, datetime('now'),'downvoted_terminal')`,
+        [PID, PID, PID]
+      );
+      // History query: rows with suppressed=1 OR invalid_at IS NOT NULL.
+      const { rows } = await db.query(
+        `SELECT object, suppression_kind FROM assertions
+         WHERE project_id = ? AND (suppressed = 1 OR invalid_at IS NOT NULL)
+         ORDER BY object`,
+        [PID]
+      );
+      assertEqual(rows.length, 2, 'history should have 2 rows (probation + terminal)');
+      const objects = rows.map((r) => r.object).sort();
+      assertDeepEqual(objects, ['probation', 'terminal'], 'both probation and terminal in history');
+    } finally { await db.end(); }
+  });
+
+  await test('PR-B: buildProbationRehabUpdate rehabilitates probation row', async () => {
+    const db = await makeSchemaDb();
+    try {
+      // Insert a probation row.
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source,
+           suppressed, invalid_at, suppression_kind)
+         VALUES (?, 'E', 'pred', 'probation_val', 6, 'user_stated', 1, datetime('now'), 'downvoted_probation')`,
+        [PID]
+      );
+      const { rows: preRows } = await db.query(
+        `SELECT id FROM assertions WHERE project_id = ? AND object = 'probation_val'`, [PID]
+      );
+      const rowId = preRows[0].id;
+
+      // Rehabilitate.
+      const rehabStmt = db.buildProbationRehabUpdate([rowId]);
+      await db.query(rehabStmt.sql, rehabStmt.params);
+
+      const { rows } = await db.query(
+        `SELECT suppressed, invalid_at, suppression_kind FROM assertions WHERE id = ?`, [rowId]
+      );
+      assertEqual(rows[0].suppressed, 0, 'rehabilitated: suppressed should be 0');
+      assertEqual(rows[0].invalid_at, null, 'rehabilitated: invalid_at should be NULL');
+      assertEqual(rows[0].suppression_kind, null, 'rehabilitated: suppression_kind should be NULL');
+    } finally { await db.end(); }
+  });
+
+  await test('PR-B: buildProbationRehabUpdate does NOT rehabilitate terminal rows', async () => {
+    const db = await makeSchemaDb();
+    try {
+      // Insert a terminal row.
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source,
+           suppressed, invalid_at, suppression_kind)
+         VALUES (?, 'F', 'pred', 'terminal_val', 5, 'user_stated', 1, datetime('now'), 'downvoted_terminal')`,
+        [PID]
+      );
+      const { rows: preRows } = await db.query(
+        `SELECT id FROM assertions WHERE project_id = ? AND object = 'terminal_val'`, [PID]
+      );
+      const rowId = preRows[0].id;
+
+      // buildProbationRehabUpdate guards on suppression_kind = 'downvoted_probation' — terminal is not affected.
+      const rehabStmt = db.buildProbationRehabUpdate([rowId]);
+      await db.query(rehabStmt.sql, rehabStmt.params);
+
+      const { rows } = await db.query(
+        `SELECT suppressed, suppression_kind FROM assertions WHERE id = ?`, [rowId]
+      );
+      assertEqual(rows[0].suppressed, 1, 'terminal row should remain suppressed');
+      assertEqual(rows[0].suppression_kind, 'downvoted_terminal', 'terminal suppression_kind unchanged');
+    } finally { await db.end(); }
+  });
+
+  await test('PR-B: C2 default-on — feedback_loop_enabled default in defaults object is enabled', () => {
+    // Read handoff.js source and verify the defaults object contains 'enabled' for feedback_loop_enabled.
+    const engineSrc = fs.readFileSync(path.resolve(__dirname, 'handoff.js'), 'utf8');
+    // Find the defaults object block.
+    const defaultsMatch = engineSrc.match(/feedback_loop_enabled:\s*'([^']+)'/);
+    assertTrue(defaultsMatch !== null, 'feedback_loop_enabled should appear in defaults object');
+    assertEqual(defaultsMatch[1], 'enabled', 'feedback_loop_enabled default should be "enabled"');
+  });
+
+  await test('PR-B: getSetting fallback for feedback_loop_enabled is enabled', () => {
+    const engineSrc = fs.readFileSync(path.resolve(__dirname, 'handoff.js'), 'utf8');
+    // Check that getSetting calls for feedback_loop_enabled use 'enabled' as fallback.
+    const matches = [...engineSrc.matchAll(/getSetting\s*\([^)]*feedback_loop_enabled[^)]*'([^']+)'\s*\)/g)];
+    assertTrue(matches.length >= 2, 'should have at least 2 getSetting calls for feedback_loop_enabled');
+    for (const m of matches) {
+      assertEqual(m[1], 'enabled', `getSetting fallback for feedback_loop_enabled should be 'enabled', got '${m[1]}'`);
+    }
+  });
+}
+
 // ── Run all sections ──────────────────────────────────────────────────────────
 (async () => {
   console.log(`\ntest-sqlite-seam.js (Node ${process.versions.node})\n`);
@@ -755,6 +1068,7 @@ async function runSection13() {
   await runSection11();
   await runSection12();
   await runSection13();
+  await runSection14();
 
   console.log(`\n─── Results ──────────────────────────────────────`);
   console.log(`PASS ${passed}  FAIL ${failed}`);

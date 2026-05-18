@@ -3203,25 +3203,36 @@ async function runC1Section() {
 // ── C2: Bundle C2 — outcome→ranking+decay feedback loop ──────────────────────
 
 /**
- * C2 1/4: Gate OFF ⇒ loader output byte-identical to pre-C2 and outcome_bias never read.
+ * C2 1/4: Gate OFF ⇒ loader output byte-identical in structure to pre-C2, outcome_bias never in output.
  *
- * With feedback_loop_enabled='disabled' (default), loader output must be byte-identical
- * across two consecutive calls, and must not contain any outcome_bias-related text.
+ * PR-B: feedback_loop_enabled now defaults to 'enabled'.  This step explicitly sets the gate
+ * to 'disabled' so the gate-OFF SQL path (no outcome_bias term) can be verified independently.
+ * I-6: when C2 is explicitly disabled, gate-OFF SQL must not contain the outcome_bias term.
  */
 async function c2Step1_gateOffNoOp(c2Db, c2ProjectId, c2ProjectDir) {
   const label = 'Gate OFF: loader output byte-identical, outcome_bias term never in query output';
   try {
     const db = await pgConnect(c2Db);
 
-    // Confirm the gate is disabled (default).
+    // PR-B: feedback_loop_enabled now defaults to 'enabled'.  This test validates the
+    // gate-OFF path, so we explicitly set it to 'disabled' for the duration of this step.
+    // I-6: gate-OFF SQL must remain byte-identical in structure (no outcome_bias term).
+    await db.query(
+      `INSERT INTO project_settings (project_id, key, value)
+       VALUES ($1, 'feedback_loop_enabled', 'disabled')
+       ON CONFLICT (project_id, key) DO UPDATE SET value = 'disabled'`,
+      [c2ProjectId]
+    );
+
+    // Confirm the gate is now explicitly disabled.
     const { rows: settingRows } = await db.query(
       `SELECT value FROM project_settings WHERE project_id = $1 AND key = 'feedback_loop_enabled'`,
       [c2ProjectId]
     );
-    const gateValue = settingRows.length > 0 ? settingRows[0].value : 'disabled';
+    const gateValue = settingRows.length > 0 ? settingRows[0].value : null;
     if (gateValue !== 'disabled') {
       await db.end();
-      c2Fail(1, label, `feedback_loop_enabled is '${gateValue}', expected 'disabled' (default)`);
+      c2Fail(1, label, `feedback_loop_enabled is '${gateValue}', expected 'disabled' after explicit set`);
       return false;
     }
 

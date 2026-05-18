@@ -89,6 +89,33 @@ CREATE TABLE IF NOT EXISTS assertions (
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS suppressed BOOLEAN NOT NULL DEFAULT false;
 -- Add outcome_bias column if not present (Bundle C1 — unused by retrieval yet; observability placeholder).
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS outcome_bias FLOAT NOT NULL DEFAULT 0;
+-- Add promoted / promoted_at columns if not present (mirrors SQLite schema; used by cmdPromote).
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMPTZ;
+
+-- ── PR-B bi-temporal supersession + suppression_kind + pinned-exemption ───────
+--
+-- Additive, NULL-tolerant additions.  Existing rows are left untouched — any
+-- missing value is NULL and is handled gracefully by all read paths.
+-- No UPDATE or DELETE of existing data (§7 SKIP; honors no-backfill rule).
+--
+-- valid_at   — when the assertion became live (set = now() on INSERT going forward).
+--              NULL for rows written before this migration.
+-- invalid_at — when the assertion was superseded or invalidated (NULL = still valid).
+--              Standard retrieval excludes rows where invalid_at IS NOT NULL.
+-- suppression_kind — reason for suppression:
+--              'superseded'          cardinality-driven (1:1 predicate replaced by newer row)
+--              'downvoted_terminal'  C2 auto-downvote; not auto-revivable
+--              'downvoted_probation' C2 auto-downvote soft-exclusion; revivable by positive feedback
+--              NULL when the row is live (not suppressed).
+-- pinned     — if true, the assertion is NEVER auto-suppressed/auto-downvoted by the C2 path.
+--              Explicit cardinality-driven supersession (user re-stating a 1:1 predicate) MAY
+--              still supersede a pinned row — pinned blocks AUTO actions only, not explicit writes.
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS valid_at TIMESTAMPTZ;
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS invalid_at TIMESTAMPTZ;
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS suppression_kind TEXT
+  CHECK (suppression_kind IN ('superseded', 'downvoted_terminal', 'downvoted_probation'));
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT false;
 
 CREATE INDEX IF NOT EXISTS assertions_project_idx
   ON assertions (project_id);
@@ -270,7 +297,7 @@ CREATE TABLE IF NOT EXISTS project_settings (
 --   decay_rate_default         default: '0.05'      (per-day decay for new assertions lacking row-level override)
 --   cluster_aware_retrieval    default: 'enabled'   ('enabled'|any other value — W3 cluster-aware expansion)
 --   cluster_max_siblings       default: '10'        (max same-community sibling entities added per load)
---   feedback_loop_enabled              default: 'disabled'  ('enabled'|any other value — C2 outcome→ranking feedback loop; byte-identical when disabled)
+--   feedback_loop_enabled              default: 'enabled'   ('enabled'|any other value — C2 outcome→ranking+probation feedback loop; byte-identical gate-OFF SQL when explicitly disabled)
 --   feedback_success_delta             default: '0.5'       (outcome_bias nudge per success outcome in a session)
 --   feedback_failure_delta             default: '-0.75'     (outcome_bias nudge per failure outcome in a session)
 --   feedback_irrelevant_delta          default: '-0.25'     (outcome_bias nudge per irrelevant outcome in a session)
