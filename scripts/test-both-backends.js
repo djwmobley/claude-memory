@@ -2589,6 +2589,239 @@ async function runS12() {
       pass(label_d6);
     } catch (err) { fail(label_d6, err.message); }
   }
+
+  // ── S12.e: PR-1.1 Defect-1 regression — ensureSchemaCurrent must persist fingerprint on both backends ──
+  //
+  // Defect: applyAdditiveSchema used db.query() for ALTER TABLE ... ADD COLUMN IF NOT EXISTS,
+  // which throws on SQLite (node:sqlite does not support IF NOT EXISTS syntax).  The throw
+  // caused the fingerprint upsert to never execute, making every subsequent call re-attempt
+  // and re-throw (non-idempotent).
+  // Fix: ALTER TABLE routed through db.runSchema() which strips IF NOT EXISTS + catches
+  // "duplicate column name" on SQLite.
+
+  await bothBackends(
+    'S12.e1: ensureSchemaCurrent persists schema_fingerprint on already-initialized DB (Defect-1 regression)',
+    async (db) => {
+      const PID = 's12-e1-defect1';
+      const fp  = 'fp-defect1-test';
+
+      // Verify fingerprint is absent.
+      const { rows: before } = await db.query(
+        'SELECT value FROM project_settings WHERE project_id=$1 AND key=$2',
+        [PID, 'schema_fingerprint']
+      );
+      assertEqual(before.length, 0, 'S12.e1: no fingerprint row initially');
+
+      // First call: fingerprint absent → must apply and upsert fingerprint.
+      const applied = await _testEnsureSchemaCurrent(db, PID,
+        db.dialect === 'sqlite' ? SCHEMA_SQLITE : SCHEMA_POSTGRES, fp);
+      assertTrue(applied, 'S12.e1: first call returns true (schema was applied)');
+
+      // Verify fingerprint stored.
+      const { rows: after } = await db.query(
+        'SELECT value FROM project_settings WHERE project_id=$1 AND key=$2',
+        [PID, 'schema_fingerprint']
+      );
+      assertEqual(after.length, 1, 'S12.e1: fingerprint row now exists');
+      assertEqual(after[0].value, fp, 'S12.e1: stored fingerprint matches');
+    }
+  );
+
+  await bothBackends(
+    'S12.e2: second ensureSchemaCurrent call is a true no-op — no apply, no stderr on both backends (Defect-1 regression)',
+    async (db) => {
+      const PID = 's12-e2-defect1';
+      const fp  = 'fp-defect1-noop';
+
+      // First call: sets fingerprint.
+      await _testEnsureSchemaCurrent(db, PID,
+        db.dialect === 'sqlite' ? SCHEMA_SQLITE : SCHEMA_POSTGRES, fp);
+
+      // Second call with same fingerprint: must be a no-op (returns false).
+      const applied = await _testEnsureSchemaCurrent(db, PID,
+        db.dialect === 'sqlite' ? SCHEMA_SQLITE : SCHEMA_POSTGRES, fp);
+      assertFalse(applied, 'S12.e2: second call is a no-op (returns false)');
+
+      // Fingerprint row must still exist unchanged.
+      const { rows } = await db.query(
+        'SELECT value FROM project_settings WHERE project_id=$1 AND key=$2',
+        [PID, 'schema_fingerprint']
+      );
+      assertEqual(rows.length, 1, 'S12.e2: exactly one fingerprint row');
+      assertEqual(rows[0].value, fp, 'S12.e2: fingerprint value unchanged');
+    }
+  );
+
+  await bothBackends(
+    'S12.e3: drift triggers exactly one reapply that is idempotent — delete fingerprint → re-apply → fingerprint restored (Defect-1 regression)',
+    async (db) => {
+      const PID = 's12-e3-defect1';
+      const fp  = 'fp-defect1-drift';
+
+      // Establish fingerprint.
+      await _testEnsureSchemaCurrent(db, PID,
+        db.dialect === 'sqlite' ? SCHEMA_SQLITE : SCHEMA_POSTGRES, fp);
+
+      // Simulate drift: delete the fingerprint row.
+      await db.query(
+        'DELETE FROM project_settings WHERE project_id=$1 AND key=$2',
+        [PID, 'schema_fingerprint']
+      );
+
+      // Should re-apply (returns true).
+      const applied = await _testEnsureSchemaCurrent(db, PID,
+        db.dialect === 'sqlite' ? SCHEMA_SQLITE : SCHEMA_POSTGRES, fp);
+      assertTrue(applied, 'S12.e3: re-apply after drift returns true');
+
+      // Fingerprint restored.
+      const { rows } = await db.query(
+        'SELECT value FROM project_settings WHERE project_id=$1 AND key=$2',
+        [PID, 'schema_fingerprint']
+      );
+      assertEqual(rows.length, 1, 'S12.e3: fingerprint row restored');
+      assertEqual(rows[0].value, fp, 'S12.e3: restored fingerprint matches');
+
+      // Third call (after restored) must be a no-op.
+      const applied2 = await _testEnsureSchemaCurrent(db, PID,
+        db.dialect === 'sqlite' ? SCHEMA_SQLITE : SCHEMA_POSTGRES, fp);
+      assertFalse(applied2, 'S12.e3: third call after restore is no-op');
+    }
+  );
+
+  // ── S12.f: PR-1.1 Defect-2 regression — legacy-subject has_unpackaged_state orphan suppressed ──
+  //
+  // Defect: when the canonical subject changed from "<basename> working tree" to "<basename>",
+  // the existing writeAssertionWithSupersession mechanism did NOT suppress the old row because
+  // canonicalize() maps them to different canonical forms.  Result: two live rows for the same
+  // predicate — a contradictory orphan.
+  // Fix: cmdClose now explicitly suppresses live has_unpackaged_state rows with non-canonical
+  // subjects before writing the new canonical assertion.
+
+  await bothBackends(
+    'S12.f1: legacy-subject has_unpackaged_state orphan is suppressed on first canonical write (Defect-2 regression)',
+    async (db) => {
+      const { writeAssertionWithSupersession } = requireHandoffFunctions();
+      const PID      = 's12-f1-defect2';
+      const basename = 'claude-memory';
+      const legacySubject = basename + ' working tree';
+
+      await db.query(
+        `INSERT INTO project_settings (project_id,key,value) VALUES ($1,'predicate_registry_mode','permissive') ON CONFLICT DO NOTHING`,
+        [PID]
+      );
+
+      // Seed legacy row (pre-PR-1 style).
+      await db.query(
+        `INSERT INTO assertions (project_id,subject,predicate,object,confidence,source,suppressed,tier,last_reinforced,valid_at)
+         VALUES ($1,$2,'has_unpackaged_state','clean',8,'model_extracted',${db.dialect==='sqlite'?'0':'false'},'probationary',now(),now())`,
+        [PID, legacySubject]
+      );
+
+      // Replicate the cmdClose Deliverable-B2 cleanup (legacy-subject suppression).
+      const { rows: legacyRows } = await db.query(
+        `SELECT DISTINCT subject FROM assertions WHERE project_id=$1 AND predicate=$2 AND suppressed=${db.dialect==='sqlite'?'0':'false'} AND invalid_at IS NULL`,
+        [PID, 'has_unpackaged_state']
+      );
+      for (const row of legacyRows) {
+        if (row.subject !== basename) {
+          const stmt = db.buildSupersessionUpdate('1:1', PID, row.subject, 'has_unpackaged_state', null);
+          await db.query(stmt.sql, stmt.params);
+        }
+      }
+
+      // Write canonical assertion.
+      await writeAssertionWithSupersession(db, PID,
+        { subject: basename, predicate: 'has_unpackaged_state', object: 'clean', confidence: 9, source: 'user_stated' },
+        'sess-f1', 'permissive'
+      );
+
+      // Assert exactly one live has_unpackaged_state row, with the canonical subject.
+      const { rows: live } = await db.query(
+        `SELECT subject, confidence, source FROM assertions WHERE project_id=$1 AND predicate='has_unpackaged_state' AND suppressed=${db.dialect==='sqlite'?'0':'false'} ORDER BY id`,
+        [PID]
+      );
+      assertEqual(live.length, 1, 'S12.f1: exactly 1 live has_unpackaged_state row');
+      assertEqual(live[0].subject, basename, 'S12.f1: canonical subject');
+      assertEqual(Number(live[0].confidence), 9, 'S12.f1: canonical confidence=9');
+
+      // Assert legacy row is suppressed.
+      const { rows: suppressed } = await db.query(
+        `SELECT subject FROM assertions WHERE project_id=$1 AND predicate='has_unpackaged_state' AND suppressed=${db.dialect==='sqlite'?'1':'true'} ORDER BY id`,
+        [PID]
+      );
+      assertEqual(suppressed.length, 1, 'S12.f1: exactly 1 suppressed row (the legacy orphan)');
+      assertEqual(suppressed[0].subject, legacySubject, 'S12.f1: legacy subject is the suppressed row');
+    }
+  );
+
+  await bothBackends(
+    'S12.f2: second close after Defect-2 fix is idempotent — no churn, exactly 1 live canonical row (Defect-2 regression)',
+    async (db) => {
+      const { writeAssertionWithSupersession } = requireHandoffFunctions();
+      const PID      = 's12-f2-defect2';
+      const basename = 'claude-memory';
+      const legacySubject = basename + ' working tree';
+
+      await db.query(
+        `INSERT INTO project_settings (project_id,key,value) VALUES ($1,'predicate_registry_mode','permissive') ON CONFLICT DO NOTHING`,
+        [PID]
+      );
+
+      // Seed legacy row.
+      await db.query(
+        `INSERT INTO assertions (project_id,subject,predicate,object,confidence,source,suppressed,tier,last_reinforced,valid_at)
+         VALUES ($1,$2,'has_unpackaged_state','clean',8,'model_extracted',${db.dialect==='sqlite'?'0':'false'},'probationary',now(),now())`,
+        [PID, legacySubject]
+      );
+
+      // Helper: run the full close sequence (cleanup + canonical write).
+      async function runCloseSequence(sessionId) {
+        // Cleanup step.
+        const { rows: legacyRows } = await db.query(
+          `SELECT DISTINCT subject FROM assertions WHERE project_id=$1 AND predicate=$2 AND suppressed=${db.dialect==='sqlite'?'0':'false'} AND invalid_at IS NULL`,
+          [PID, 'has_unpackaged_state']
+        );
+        for (const row of legacyRows) {
+          if (row.subject !== basename) {
+            const stmt = db.buildSupersessionUpdate('1:1', PID, row.subject, 'has_unpackaged_state', null);
+            await db.query(stmt.sql, stmt.params);
+          }
+        }
+        // Canonical write.
+        await writeAssertionWithSupersession(db, PID,
+          { subject: basename, predicate: 'has_unpackaged_state', object: 'clean', confidence: 9, source: 'user_stated' },
+          sessionId, 'permissive'
+        );
+      }
+
+      // First close.
+      await runCloseSequence('sess-f2-a');
+
+      const { rows: live1 } = await db.query(
+        `SELECT subject FROM assertions WHERE project_id=$1 AND predicate='has_unpackaged_state' AND suppressed=${db.dialect==='sqlite'?'0':'false'}`,
+        [PID]
+      );
+      assertEqual(live1.length, 1, 'S12.f2: 1 live row after first close');
+      assertEqual(live1[0].subject, basename, 'S12.f2: canonical subject after first close');
+
+      // Second close (idempotency).
+      await runCloseSequence('sess-f2-b');
+
+      const { rows: live2 } = await db.query(
+        `SELECT subject FROM assertions WHERE project_id=$1 AND predicate='has_unpackaged_state' AND suppressed=${db.dialect==='sqlite'?'0':'false'}`,
+        [PID]
+      );
+      assertEqual(live2.length, 1, 'S12.f2: still exactly 1 live row after second close (no churn)');
+      assertEqual(live2[0].subject, basename, 'S12.f2: canonical subject unchanged after second close');
+
+      // Total rows should be: 1 (legacy, suppressed) + 1 (first canonical, superseded) + 1 (second canonical, live) = 3.
+      const { rows: allRows } = await db.query(
+        `SELECT subject, suppressed FROM assertions WHERE project_id=$1 AND predicate='has_unpackaged_state' ORDER BY id`,
+        [PID]
+      );
+      assertEqual(allRows.length, 3, 'S12.f2: exactly 3 total rows (legacy suppressed + first canonical superseded + second canonical live)');
+    }
+  );
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────

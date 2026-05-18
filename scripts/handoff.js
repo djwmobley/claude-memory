@@ -577,8 +577,10 @@ async function applyAdditiveSchema(db, schemaFile, { silent } = {}) {
   try {
     await db.runSchema(coreSchemaSQL);
     // Idempotent migration: add promoted / promoted_at columns (Bundle A).
-    await db.query(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted    BOOLEAN     NOT NULL DEFAULT false`);
-    await db.query(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMPTZ`);
+    // MUST use db.runSchema() (not db.query()) so the SQLiteAdapter's IF NOT EXISTS
+    // strip-and-catch path is applied — node:sqlite does not support ADD COLUMN IF NOT EXISTS.
+    await db.runSchema(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted    BOOLEAN     NOT NULL DEFAULT false`);
+    await db.runSchema(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMPTZ`);
     await db.query('COMMIT');
   } catch (err) {
     try { await db.query('ROLLBACK'); } catch (_) { /* ignore */ }
@@ -776,8 +778,10 @@ async function cmdInit(args) {
     // Idempotent migration: add `promoted` and `promoted_at` columns to assertions
     // (used by /handoff:promote explicit-promotion command, added in Bundle A hardening).
     // For Postgres: BOOLEAN / TIMESTAMPTZ. For SQLite: INTEGER / TEXT (seam rewrites DDL).
-    await db.query(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted    BOOLEAN     NOT NULL DEFAULT false`);
-    await db.query(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMPTZ`);
+    // MUST use db.runSchema() (not db.query()) so the SQLiteAdapter's IF NOT EXISTS
+    // strip-and-catch path is applied — node:sqlite does not support ADD COLUMN IF NOT EXISTS.
+    await db.runSchema(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted    BOOLEAN     NOT NULL DEFAULT false`);
+    await db.runSchema(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMPTZ`);
     await db.query('COMMIT');
     console.log(`  [OK]    Schema applied: ${path.basename(schemaFile)}`);
   } catch (err) {
@@ -2258,6 +2262,40 @@ async function cmdClose(args) {
         '[handoff] packaging state compute failed (non-fatal): ' + packComputeErr.message + '\n'
       );
     }
+  }
+
+  // ── Deliverable B2: suppress legacy-subject has_unpackaged_state orphans ──────
+  //
+  // Prior to PR-1, the packaging assertion was written via writeAssertionWithSupersession
+  // using subject "<basename> working tree" (source=model_extracted, confidence=8).
+  // PR-1 changed the canonical subject to "<basename>" (source=user_stated, confidence=9).
+  // Because the subjects differ, canonicalization differs, so the new canonical write does
+  // NOT suppress the old row — leaving a stale contradictory orphan.
+  //
+  // Fix: after injecting the canonical assertion, suppress any live (suppressed=false)
+  // has_unpackaged_state row in this project whose subject is NOT the canonical subject.
+  // Uses the existing buildSupersessionUpdate port method (dialect-neutral, zero new SQL).
+  // Idempotent: once suppressed, subsequent closes are a no-op on the legacy row.
+  // Non-fatal: mirrors the surrounding ensureSchemaCurrent error semantics.
+  try {
+    const canonBasename = path.basename(root);
+    const { rows: legacyPackRows } = await db.query(
+      `SELECT DISTINCT subject FROM assertions
+       WHERE project_id = $1
+         AND predicate  = $2
+         AND suppressed = false
+         AND invalid_at IS NULL`,
+      [projectId, 'has_unpackaged_state']
+    );
+    for (const row of legacyPackRows) {
+      if (row.subject !== canonBasename) {
+        // This is a legacy/non-canonical subject row — suppress it.
+        const suppressStmt = db.buildSupersessionUpdate('1:1', projectId, row.subject, 'has_unpackaged_state', null);
+        await db.query(suppressStmt.sql, suppressStmt.params);
+      }
+    }
+  } catch (legacyCleanupErr) {
+    process.stderr.write('[handoff] legacy has_unpackaged_state cleanup failed (non-fatal): ' + legacyCleanupErr.message + '\n');
   }
 
   // ── Async extraction gate (opt-in, default OFF = synchronous as before) ──────
