@@ -936,6 +936,22 @@ async function cmdLoaderLoad(opts = {}) {
   // gate-OFF SQL has no outcome_bias term — byte-identical in structure to pre-C2 (I-6).
   const feedbackLoopEnabled = await getSetting(db, projectId, 'feedback_loop_enabled', 'enabled');
 
+  // Two-tier durability retrieval gate (orthogonal to C2 feedback gate).
+  // Default 'enabled' = ON.  Prepends a tier-priority sort key to ORDER BY so that
+  // consolidated/NULL rows rank above probationary rows.  Probationary rows are NEVER
+  // filtered out (only re-ranked) — the LIMIT-30 dormancy floor invariant is preserved.
+  // When any other value: ORDER BY is byte-identical to the pre-feature SQL (no CASE WHEN
+  // tier term at all) — the I-6 byte-identical guarantee is honored on this gate as well.
+  // Gate composition: 4 explicit SQL strings (feedbackOn/Off × tierOn/Off) remain readable.
+  const tierAware = await getSetting(db, projectId, 'tier_aware_retrieval', 'enabled');
+  // Computed prefix: if tier-aware ON, prepend the CASE WHEN tier sort key to ORDER BY.
+  // CASE WHEN tier='probationary' THEN 1 ELSE 0 END is plain SQL, valid on PG and node:sqlite
+  // — no rewrite/port method needed (no now(), no EXTRACT, no dialect-specific syntax).
+  // NULL tier (grandfathered rows) hits ELSE → 0 → ranked with consolidated. Correct.
+  const tierPrefix = tierAware === 'enabled'
+    ? "(CASE WHEN tier = 'probationary' THEN 1 ELSE 0 END) ASC, "
+    : '';
+
   for (const q of queries) {
     if (tokensUsed >= tokenBudget) break;
 
@@ -975,12 +991,14 @@ async function cmdLoaderLoad(opts = {}) {
       if (feedbackLoopEnabled === 'enabled') {
         // Gate ON: rank by decayed score + outcome_bias; no cutoff filter.
         // PR-B: also exclude bi-temporally invalidated rows (invalid_at IS NULL = still live).
+        // Tier gate (orthogonal, I-6 honored): tierPrefix prepended to ORDER BY when
+        // tier_aware_retrieval='enabled'; empty string when disabled (byte-identical then).
         assertionQuerySql = `SELECT id, subject, predicate, object, confidence, source FROM assertions
          WHERE project_id = $1
            AND ($2::text IS NULL OR subject = $2)
            AND suppressed = false
            AND invalid_at IS NULL
-         ORDER BY (confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) + outcome_bias) DESC, last_reinforced DESC LIMIT 30`;
+         ORDER BY ${tierPrefix}(confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) + outcome_bias) DESC, last_reinforced DESC LIMIT 30`;
         assertionQueryParams = [projectId, q.filter?.subject || null];
       } else {
         // Gate OFF: rank by decayed score only (no outcome_bias term); no cutoff filter.
@@ -988,12 +1006,14 @@ async function cmdLoaderLoad(opts = {}) {
         // that is the ONLY C2-driven difference vs gate-ON. The AND invalid_at IS NULL predicate
         // is a bi-temporal extension (PR-B) present identically in both gate-ON and gate-OFF;
         // it is NOT a C2 change.
+        // Tier gate (orthogonal, I-6 honored): tierPrefix prepended to ORDER BY when
+        // tier_aware_retrieval='enabled'; empty string when disabled (byte-identical then).
         assertionQuerySql = `SELECT id, subject, predicate, object, confidence, source FROM assertions
          WHERE project_id = $1
            AND ($2::text IS NULL OR subject = $2)
            AND suppressed = false
            AND invalid_at IS NULL
-         ORDER BY confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) DESC, last_reinforced DESC LIMIT 30`;
+         ORDER BY ${tierPrefix}confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) DESC, last_reinforced DESC LIMIT 30`;
         assertionQueryParams = [projectId, q.filter?.subject || null];
       }
       const { rows } = await db.query(assertionQuerySql, assertionQueryParams);
@@ -1587,6 +1607,13 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
     // UPDATE's WHERE clause.  Omitting the pinned filter here keeps the SELECT dialect-neutral
     // (no boolean literal that differs between backends).
     const storedSubjectsToSuppress = new Set();
+    // Two-tier durability: track corroboration signals from 1:N exact-duplicate matches.
+    // For 1:N only: collect session_id and corroboration_count from canonical-matched prior
+    // live rows to determine cross-session corroboration (hybrid consolidation trigger b).
+    // See the INSERT below for how these are used to compute tier and corroboration_count.
+    let crossSessionCorroborated = false;
+    let maxPriorCorrob = 1;
+
     if (cardinality === '1:1') {
       const { rows: candidates } = await db.query(
         `SELECT DISTINCT subject FROM assertions
@@ -1603,8 +1630,11 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
       }
     } else {
       // 1:N: only exact (project_id, subject[canonical], predicate, object) duplicates.
+      // Also retrieve session_id and corroboration_count for the Hybrid consolidation check.
+      // Cross-session corroboration requires: both session_ids non-null AND DISTINCT from each other.
+      // Same-session re-assertion does NOT graduate. NULL session_id on either side is NOT corroboration.
       const { rows: candidates } = await db.query(
-        `SELECT DISTINCT subject FROM assertions
+        `SELECT subject, session_id, corroboration_count FROM assertions
          WHERE project_id = $1
            AND predicate  = $2
            AND object     = $3
@@ -1615,6 +1645,20 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
       for (const r of candidates) {
         if (canonicalize(r.subject) === canonSubject) {
           storedSubjectsToSuppress.add(r.subject);
+          // Cross-session corroboration check: prior row must have a non-null session_id
+          // that is DISTINCT from the incoming sessionId (also non-null).
+          if (
+            r.session_id !== null && r.session_id !== undefined &&
+            sessionId !== null && sessionId !== undefined &&
+            r.session_id !== sessionId
+          ) {
+            crossSessionCorroborated = true;
+          }
+          // Track max corroboration_count among matched priors (for new row's count).
+          const priorCount = typeof r.corroboration_count === 'number'
+            ? r.corroboration_count
+            : parseInt(r.corroboration_count, 10) || 1;
+          if (priorCount > maxPriorCorrob) maxPriorCorrob = priorCount;
         }
       }
     }
@@ -1634,11 +1678,36 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
     }
 
     // ── Step 3: INSERT the new row with canonical subject ─────────────────────────
+    //
+    // Two-tier durability (Hybrid consolidation trigger):
+    //   (a) High-trust: source='user_stated' AND confidence >= 9 → tier='consolidated' immediately.
+    //   (b) Cross-session corroboration (1:N only): same (subject, predicate, object) asserted
+    //       from a DISTINCT non-null session_id → tier='consolidated'.
+    //   Otherwise → tier='probationary'.
+    //
+    // consolidated_at: set to now() when consolidated, SQL NULL otherwise.
+    // corroboration_count: 1 + maxPriorCorrob when cross-session corroboration fires; 1 otherwise.
+    //
+    // SQL style note: consolidated_at uses now() (PG) / datetime('now') (SQLite) as a raw SQL
+    // fragment embedded in the query string (matching the existing valid_at / last_reinforced
+    // style) — NOT as a JS parameter.  The SQLiteAdapter's rewriteForSQLite regex rewrites
+    // now() → datetime('now') automatically.  Do not parametrize a SQL function.
+    const isHighTrust = (source === 'user_stated' && conf >= 9);
+    const newTier     = (isHighTrust || (cardinality === '1:N' && crossSessionCorroborated))
+      ? 'consolidated'
+      : 'probationary';
+    const consolidatedAtSql = (newTier === 'consolidated') ? 'now()' : 'NULL';
+    const newCorrob = (cardinality === '1:N' && crossSessionCorroborated)
+      ? (maxPriorCorrob + 1)
+      : 1;
+
     await db.query(
       `INSERT INTO assertions
-         (project_id, subject, predicate, object, confidence, source, session_id, last_reinforced, valid_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now())`,
-      [projectId, canonSubject, ass.predicate, ass.object, conf, source, sessionId]
+         (project_id, subject, predicate, object, confidence, source, session_id,
+          last_reinforced, valid_at, tier, consolidated_at, corroboration_count)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now(), $8, ${consolidatedAtSql}, $9)`,
+      [projectId, canonSubject, ass.predicate, ass.object, conf, source, sessionId,
+       newTier, newCorrob]
     );
 
     await db.query('COMMIT');
@@ -2830,9 +2899,16 @@ async function cmdPromote(args) {
   }
   fs.writeFileSync(claudeMdPath, updated, 'utf8');
 
-  // Mark assertion as promoted.
+  // Mark assertion as promoted and graduate to consolidated tier.
+  // Two-tier durability: explicit promote is the sanctioned graduation arm (not a §7 violation —
+  // §7 forbids auto-mutating the existing corpus; explicit /handoff:promote of one targeted row
+  // is an intentional user-driven action, not a backfill).  Sets tier='consolidated',
+  // consolidated_at=now() in addition to the existing promoted/promoted_at columns.
   await db.query(
-    `UPDATE assertions SET promoted = true, promoted_at = now() WHERE id = $1`,
+    `UPDATE assertions
+     SET promoted = true, promoted_at = now(),
+         tier = 'consolidated', consolidated_at = now()
+     WHERE id = $1`,
     [assertionId]
   );
 

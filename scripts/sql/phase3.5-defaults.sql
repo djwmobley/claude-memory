@@ -41,3 +41,7 @@ ON CONFLICT (project_id, key) DO NOTHING;
 INSERT INTO project_settings (project_id, key, value)
 VALUES (:'project_id', 'cluster_max_siblings',           '10')
 ON CONFLICT (project_id, key) DO NOTHING;
+
+INSERT INTO project_settings (project_id, key, value)
+VALUES (:'project_id', 'tier_aware_retrieval',           'enabled')
+ON CONFLICT (project_id, key) DO NOTHING;

@@ -72,7 +72,18 @@ CREATE TABLE IF NOT EXISTS assertions (
   valid_at         TEXT,
   invalid_at       TEXT,
   suppression_kind TEXT    CHECK (suppression_kind IN ('superseded', 'downvoted_terminal', 'downvoted_probation')),
-  pinned           INTEGER NOT NULL DEFAULT 0
+  pinned           INTEGER NOT NULL DEFAULT 0,
+  -- Two-tier durability: probationary → consolidated (additive, NULL-tolerant).
+  -- GRANDFATHER RULE: tier IS NULL = grandfathered; treated as 'consolidated' by all read paths.
+  -- No backfill of existing rows (§7 SKIP; honors no-backfill rule).
+  -- tier: 'probationary' | 'consolidated' | NULL (NULL = grandfathered = consolidated).
+  -- consolidated_at: ISO 8601 TEXT timestamp when tier became 'consolidated'; NULL until graduation.
+  -- corroboration_count: starts 1; +1 on cross-session exact-duplicate corroboration.
+  -- Note: SQLite CHECK on tier omitted (node:sqlite enforces CHECK at parse time but behavior
+  --       varies by build; Postgres version carries the authoritative CHECK constraint).
+  tier                 TEXT,
+  consolidated_at      TEXT,
+  corroboration_count  INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS assertions_project_idx    ON assertions (project_id);
 CREATE INDEX IF NOT EXISTS assertions_subject_idx    ON assertions (project_id, subject);
@@ -86,6 +97,15 @@ ALTER TABLE assertions ADD COLUMN IF NOT EXISTS valid_at TEXT;
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS invalid_at TEXT;
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS suppression_kind TEXT;
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS pinned INTEGER NOT NULL DEFAULT 0;
+
+-- Two-tier durability: idempotent ADD COLUMN for existing DBs that predate this migration.
+-- GRANDFATHER RULE (CRITICAL — §7 compliance): tier IS NULL means grandfathered and MUST be
+-- treated as 'consolidated' by every read/ranking path. NEVER UPDATE tier on pre-existing rows.
+-- Existing rows receive NULL for tier / consolidated_at; 1 for corroboration_count.
+-- These are safe no-ops on fresh DBs created from the CREATE TABLE above.
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS tier TEXT;
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS consolidated_at TEXT;
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS corroboration_count INTEGER NOT NULL DEFAULT 1;
 
 -- 1:1 partial unique index (same predicate set as Postgres version)
 CREATE UNIQUE INDEX IF NOT EXISTS assertions_1to1_unique
