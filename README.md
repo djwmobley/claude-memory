@@ -1,107 +1,110 @@
 # claude-memory
 
-Standard memory schema for AI agents on Postgres + pgvector. Hybrid full-text
-and vector search over a directory of atomic markdown files. Runs entirely on
-infrastructure you already have — no SaaS dependency, no framework lock-in.
+A self-hosted, zero-per-write-token-cost, Claude Code-native cross-session memory
+layer for AI agents. Runs on stock PostgreSQL or on an embedded zero-server SQLite
+backend (Node 22 `node:sqlite`). No pgvector, no extensions, no sidecar daemon.
 
 ---
 
-## What this is / what this is not
+## What this is
 
-**What it is:** A Postgres schema and a set of Node scripts that turn a directory
-of atomic markdown files into a hybrid-searchable memory store for AI agents. You
-drop files in, run the loader, and agents can search by keyword or semantic
-similarity. The scripts are plain Node — no build step, no framework.
+A knowledge-graph persistence layer purpose-built for Claude Code workflows.
+At its core it is a Node script (`scripts/handoff.js`) backed by a schema-validated
+storage abstraction, wired into the Claude Code session lifecycle via
+`SessionStart`/`Stop` hooks and a set of eight slash-command recipes in
+`commands/handoff/`.
 
-**What it is not:** A framework, a hosted service, or a vector database product.
-There is no LangChain dependency. No Pinecone account required. No vendor lock-in
-beyond Postgres + pgvector + a local embedding server. If you already run Postgres,
-the marginal cost to add this is a single `psql -f` command.
+Key properties:
+
+- **Zero per-write token cost.** Extraction is the Claude Code conversation itself
+  via slash-command recipes. The script does schema-validated writes only — no LLM
+  API call is made per write. Contrast with mem0, Graphiti/Zep, and Cognee which all
+  require one or more LLM calls per knowledge write.
+- **Dual backend — Postgres or embedded SQLite.** Set `STORAGE_BACKEND=sqlite` to
+  use Node 22's built-in `node:sqlite` at `<project_root>/.claude/handoff.sqlite`
+  (zero-server, no installation). Leave it unset for stock Postgres. The engine is
+  backend-agnostic; the single composition root in `scripts/lib/db-seam.js` is the
+  only place dialect is selected.
+- **No pgvector, no extensions.** The handoff/knowledge-graph layer uses only stock
+  SQL features (recursive CTEs, partial unique indexes, JSONB on Postgres; plain
+  SQLite equivalents on the embedded path). The optional full-text and vector search
+  layer (`scripts/pipeline-embed.js`) does use pgvector if available, but it is
+  separate from the session-memory subsystem.
+- **Dormancy-resilient decay.** Scoring uses ranking-only decay — a project that has
+  been dormant for weeks does not return an empty retrieval set. A guaranteed top-N
+  floor ensures continuity regardless of how long a project has been idle.
+- **Deterministic cardinality-aware supersession.** A per-predicate registry
+  (`scripts/lib/predicate-registry.json`) declares whether a predicate is 1:1 or
+  1:N. On a 1:1 predicate the prior live assertion is atomically suppressed when a
+  new value arrives. No LLM needed for conflict resolution.
+- **Bi-temporal model with recoverable probation.** Every assertion carries
+  `valid_at`/`invalid_at` and a `suppression_kind` field with three states:
+  `superseded` (deterministic replacement), `downvoted_terminal` (not auto-revived),
+  and `downvoted_probation` (soft-excluded from standard retrieval but rehabilitatable
+  by positive feedback).
+- **Pinned exemption.** Assertions marked `pinned = true` are never auto-suppressed
+  by the C2 feedback loop. Explicit cardinality supersession (via the predicate
+  registry) may still replace a pinned row.
+- **C2 feedback loop.** Outcome signals written at close influence bias-ranking for
+  the next retrieval. Default on.
+- **Operator manual prune.** The `prune` subcommand lets an operator hard-delete
+  selected assertion rows. Dry-run by default; pass `--apply` to execute. Pinned
+  rows are excluded unless `--include-pinned` is specified. Project-scoped; at least
+  one criterion required.
+- **Claude Code session-lifecycle binding.** A `loader-hook` subcommand is the
+  `SessionStart` hook entry point; it injects prior-session context automatically
+  when the project is fresh enough (configurable `staleness_days` threshold). A
+  `loader-stop` subcommand is the `Stop` hook entry point; it writes an implicit
+  close record if the session ended without an explicit `/handoff:close`.
 
 ---
 
-## Origin story
+## How this compares
 
-Forked from [pipeline](https://github.com/djwmobley/pipeline), a Claude Code plugin
-where this memory infrastructure was first built and dogfooded as part of a 13-step
-AI agent workflow engine. The `pipeline-*` filename prefixes in this repo are
-intentional -- a spiritual callback to where the code was born. Pipeline still uses
-this schema in-tree; a formal extraction to a shared package is on the backlog but
-not yet done.
+A code-grounded comparison against agentmemory, mem0, Letta/MemGPT, Graphiti/Zep,
+and Cognee is in [`docs/studies/2026-05-memory-systems-comparison.md`](docs/studies/2026-05-memory-systems-comparison.md).
 
----
+Short version:
 
-## What shipped in Bundle A
+| System | Zero per-write token cost | Decay / dormancy-resilient | Claude Code lifecycle binding | Storage |
+|--------|--------------------------|---------------------------|-------------------------------|---------|
+| **claude-memory** | Yes | Yes — ranking-only + top-N floor | Yes — hooks + staleness gate | Stock PG or embedded SQLite |
+| agentmemory | Yes (heuristic) | No | Yes (purpose-built) | Proprietary non-swappable sidecar |
+| mem0 | No (LLM per add) | No | No (requires separate server) | Pluggable (pgvector / FAISS / Qdrant) |
+| Graphiti/Zep | No (3–5 LLM calls/episode) | No | No | Kuzu embedded |
+| Cognee | No (LLM per cognify) | No | No | Kuzu + LanceDB + SQLite |
+| Letta/MemGPT | No (agent self-insert) | No | No (requires always-running server) | Bundled |
 
-Bundle A is the substrate upgrade that brought the stack from a single-table
-mxbai-only proof of concept to a production-grade retrieval system. Phases
-shipped sequentially; all shipped via PRs to `main`.
-
-| Phase | What it does |
-|-------|-------------|
-| **Phase 0** | Backfill: migrates the existing decisions corpus from `pipeline_pipeline.decisions` into `memory_entries` + `memory_entry_chunks` with `embedding = NULL`. |
-| **Phase 1** | Embedder upgrade: replaces mxbai-embed-large (1024-dim) with Qwen/Qwen3-Embedding-8B via vLLM; stores embeddings as `halfvec(4000)` (Matryoshka truncation, HNSW-indexable at pgvector 0.8.1). Eval corpus expanded to 42 fixtures + 38 queries. |
-| **Phase 2** | Schema expansion: adds `entities`, `assertions`, `edges`, `retrieval_contract`, `project_settings`, and `retrieval_events` tables for the knowledge graph and session-state layers. |
-| **Phase 3a** | Cross-encoder reranker: opt-in `--rerank` flag for `eval-retrieval.js` backed by Qwen/Qwen3-Reranker-4B on vLLM. |
-| **Phase 3b** | DB-persisted contextual blurbs: `memory_entry_chunks.blurb` column (qwen2.5:14b via Ollama); vLLM-native late chunking via `LATE_CHUNKING=1 EMBED_BACKEND=vllm`. |
-| **Phase 3.5** | `/handoff` skill: seven Claude Code slash commands (`init`, `status`, `resume`, `close`, `checkpoint`, `drop`, `purge`) backed by `scripts/handoff.js` for cross-session memory continuity. |
-
-For full design rationale, acceptance gates, and revision history see
-[BUNDLE-A-SPEC.md](BUNDLE-A-SPEC.md).
-
----
-
-## Roadmap
-
-### Bundle A — Memory & Retrieval Foundation
-
-| Phase | Title | Status |
-|---|---|---|
-| 0 | Decisions backfill | Shipped |
-| 1 | Embedder upgrade + halfvec(4000) | Shipped |
-| 2 | Knowledge graph schema | Shipped |
-| 3a | Cross-encoder reranker | Shipped |
-| 3b | Contextual blurbs + late chunking | Shipped |
-| 3.5 | `/handoff` skill | Shipped |
-| 3.6 | SessionStart loader hook | Shipped |
-| 3.7 | Stop-hook safety net | Shipped |
-| 3.8 | Schema portability + init hardening | In this PR |
-
-### Beyond Bundle A (planned, undated)
-
-- **Bundle B** — Outcome capture (writing `retrieval_events.outcome`), community detection (Leiden/Louvain over the entity graph), automated entity extraction over backfilled decisions, formal "writing down the bundle" methodology for `retrieval_contract` evolution.
-- **Bundle E2** — Validator skill: 2% audit floor and validator subagent.
-- **Bundle F** — Multi-workflow support: the current write path keeps one handoff summary and one active retrieval contract per project directory, so interleaving or shelving a second workflow silently displaces the first workflow's context (the stored facts remain but retrieval stops targeting them). Planned direction: per-workflow named handoff summaries and retrieval contracts, making the write path symmetric with the read path (which already resolves a contract by name). Dependency: same-subject supersession must carry workflow scope, or an unrelated task can supersede a shelved workflow's still-valid facts.
+The two features with no equivalent in any surveyed system: ranking-only decay with a
+guaranteed top-N floor, and deterministic predicate-registry cardinality supersession.
 
 ---
 
 ## Prerequisites
 
-- **Postgres 14+** with pgvector **0.8.1 or later**
-  (`CREATE EXTENSION vector;` in your target database).
-  pgvector 0.8.1 is the minimum for `halfvec(4000)` HNSW indexes — earlier
-  versions cannot index the 4000-dim column used in production.
-- **Node 20+**
-- **vLLM** (primary embedder path) — see [Native WSL install](#native-wsl-vllm-install--recommended-on-windows) in Gotchas for the
-  step-by-step install on Windows 11 + WSL2. At minimum, launch the embedder:
+**For the embedded SQLite path (zero-server, low friction):**
 
-  ```bash
-  ~/.venv/vllm/bin/vllm serve Qwen/Qwen3-Embedding-8B \
-    --runner pooling --port 8800 --gpu-memory-utilization 0.40
-  ```
+- Node 22+ (`node:sqlite` is a built-in available from Node 22)
+- No database installation required
 
-- **Ollama** (fallback embedder, required for blurb generation) with
-  `qwen2.5:14b` pulled for blurbs (`ollama pull qwen2.5:14b`).
-  mxbai-embed-large is the legacy fallback embedder; pull it only if you
-  cannot run vLLM (`ollama pull mxbai-embed-large`).
-- A database already created: `createdb your_db_name`
+**For the Postgres path (durable, recommended for teams):**
 
-FTS still works if pgvector is absent. Vector columns and indexes are silently
-skipped via DO blocks in `setup.sql`.
+- PostgreSQL 13+ (no extensions required for the handoff layer)
+- Node 20+
+
+**For the optional full-text + vector search layer** (`scripts/pipeline-embed.js`,
+`scripts/pipeline-memory-loader.js`):
+
+- PostgreSQL 14+ with pgvector 0.8.1+ (`CREATE EXTENSION vector;`)
+  — required only for the vector search path; FTS works without pgvector
+- An embedding server (vLLM or Ollama) — see the [Embedder setup](#embedder-setup)
+  section
 
 ---
 
 ## Quickstart
+
+### Embedded SQLite (zero-server)
 
 ```sh
 # 1. Clone
@@ -111,55 +114,45 @@ cd claude-memory
 # 2. Install dependencies
 cd scripts && pnpm install && cd ..
 
-# 3. Apply base schema
-psql -d your_db_name -f scripts/setup.sql
+# 3. Provision a project
+STORAGE_BACKEND=sqlite node scripts/handoff.js init
 
-# 4. Apply handoff-core schema (portable — no extensions required)
-node scripts/handoff.js init
-# Apply app-specific schema (requires pgvector)
-psql -d your_db_name -f scripts/sql/app-retrieval-events-schema.sql
-psql -d your_db_name -f scripts/sql/phase3b-schema.sql
+# 4. Install the slash commands
+cp commands/handoff/*.md ~/.claude/commands/handoff/
 
-# 5. Configure (see Configuration section)
-#    Create .claude/pipeline.yml in your project root.
-
-# 6. Start vLLM embedder (WSL, separate terminal)
-~/.venv/vllm/bin/vllm serve Qwen/Qwen3-Embedding-8B \
-  --runner pooling --port 8800 --gpu-memory-utilization 0.40
-
-# 7. Drop atomic markdown files into your memory directory
-#    Each file needs YAML frontmatter (see Atomic file convention below).
-
-# 8. Load, generate blurbs, and embed
-node scripts/pipeline-memory-loader.js memory
-node scripts/pipeline-embed.js blurbs
-EMBED_BACKEND=vllm node scripts/pipeline-embed.js index
-
-# 9. Search
-node scripts/pipeline-embed.js hybrid "what is the routing rule for Opus?"
+# 5. Wire the session-lifecycle hooks in your project's .claude/settings.json:
+#    See "Session-lifecycle hooks" below.
 ```
 
-Example frontmatter for a memory file:
+The SQLite database is created at `<project_root>/.claude/handoff.sqlite`.
+Override the path with `HANDOFF_SQLITE_PATH=/path/to/file.sqlite`.
 
-```yaml
----
-name: routing-opus-rule
-description: When Opus may and may not write directly to files
-type: feedback
----
+### Postgres
 
-Opus orchestrates. Opus does not draft. If the task involves writing more
-than one or two sentences of substantive content into a file or deliverable,
-delegate to a Sonnet subagent. This rule has no exceptions for convenience
-or time pressure.
+```sh
+# 1. Clone and install
+git clone https://github.com/djwmobley/claude-memory.git
+cd claude-memory
+cd scripts && pnpm install && cd ..
+
+# 2. Create target database
+createdb your_db_name
+
+# 3. Apply base schema (optional — handoff init does this too)
+psql -d your_db_name -f scripts/setup.sql
+
+# 4. Provision a project
+HANDOFF_DB=your_db_name node scripts/handoff.js init
+
+# 5. Install slash commands and wire hooks (same as above)
+cp commands/handoff/*.md ~/.claude/commands/handoff/
 ```
 
 ---
 
 ## Configuration
 
-Scripts read `.claude/pipeline.yml` from the project root. Production shape
-after Bundle A Phase 1:
+Scripts read `.claude/pipeline.yml` from the project root:
 
 ```yaml
 project:
@@ -171,454 +164,250 @@ knowledge:
   port: 5432
   database: your_db_name
   user: your_pg_user
-  embed_backend: vllm                          # vllm | ollama (default: ollama)
-  vllm_embed_url: http://localhost:8800        # vLLM embedder endpoint
-  embedding_model: Qwen/Qwen3-Embedding-8B    # model served by vLLM
 ```
 
-To fall back to Ollama (mxbai-embed-large), omit `embed_backend` and
-`vllm_embed_url`, and set `embedding_model: mxbai-embed-large`.
+For SQLite, set `STORAGE_BACKEND=sqlite` (environment variable or
+`storage_backend: sqlite` under `knowledge:` in `pipeline.yml`). No host/port
+configuration is needed.
 
-If you have no `pipeline.yml`, the standard `PG*` environment variables
-(`PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`) are checked as a
-fallback. See `scripts/lib/shared.js` for the exact fallback order.
+If no `pipeline.yml` exists, standard `PG*` environment variables (`PGHOST`,
+`PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`) are used as a fallback.
 
-**`HANDOFF_DB` env var:** `scripts/handoff.js` targets `claude_memory_eval_test` by default.
-Set `HANDOFF_DB=your_db_name` to use a different database — useful when adopting the
-`/handoff` skill in projects that already have a Postgres DB under a different name.
-The env var is read at startup; it overrides the default and any `pipeline.yml` database
-setting for handoff operations only.
+**`HANDOFF_DB` env var:** `scripts/handoff.js` defaults to the database named
+`claude_memory_eval_test`. Set `HANDOFF_DB=your_db_name` to use a different
+Postgres database. This overrides the default and any `pipeline.yml` setting
+for handoff operations only.
 
-**CRLF warning:** The YAML parser uses bare `\n`. On Windows, editors that
-default to CRLF cause `loadConfig()` to silently fall back to defaults. Save
-`pipeline.yml` with LF endings. See [Gotchas](#gotchas).
+**CRLF warning (Windows):** The YAML parser uses bare `\n`. On Windows, editors
+that default to CRLF cause `loadConfig()` to silently fall back to defaults. Save
+`pipeline.yml` with LF line endings.
 
-**handoff.md location and `.gitignore` recommendation.** The per-project
-handoff state file lives outside the repository, under the user's Claude home
-directory (`~/.claude/projects/<encoded-cwd>/handoff.md`), so it is not
-committed by default. If you ever relocate handoff state into your repo tree,
-add it to `.gitignore` — it can contain session summaries you may not want
-in a public repository.
+**handoff.md location.** Per-project handoff state lives at
+`~/.claude/projects/<encoded-cwd>/handoff.md`, outside the repository tree.
+This file contains session summaries; add it to `.gitignore` if you ever
+relocate it into a repo you plan to publish.
 
 ---
 
-## Atomic file convention
+## Session-lifecycle hooks
 
-Memory lives in a flat directory of `.md` files, each with YAML frontmatter:
+Wire the `loader-hook` (SessionStart) and `loader-stop` (Stop) subcommands into
+your project's `.claude/settings.json` to enable automatic context injection and
+implicit close:
 
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "command": "node /path/to/claude-memory/scripts/handoff.js loader-hook"
+      }
+    ],
+    "Stop": [
+      {
+        "command": "node /path/to/claude-memory/scripts/handoff.js loader-stop"
+      }
+    ]
+  }
+}
 ```
-memory/
-  feedback_routing_rule.md
-  project_auth_decision_2026-04-28.md
-  user_hardware.md
-  archive/
-    old_feedback_v1.md    <-- soft-deleted; loader ignores this subdir
-```
 
-**Frontmatter fields:**
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `name` | yes | Stable identifier used as the display label in search results |
-| `description` | no | One-line summary; included in FTS |
-| `type` | no | Category tag: `user`, `feedback`, `project`, `reference`, etc. |
-
-**Naming convention:** `<type>_<slug>.md` or `<type>_<slug>_<date>.md` for
-time-anchored memos. The loader does a flat `readdir` -- it does not recurse
-into subdirectories. `archive/` is a natural soft-delete: move a file there to
-hide it from the loader without deleting it.
+Both hooks are defensive: they always exit 0 and log errors to stderr without
+breaking session start or teardown. The `loader-hook` skips context injection if
+the last close was more than `staleness_days` (default 7, configurable per-project
+in `project_settings`) days ago; it emits a stale warning instead.
 
 ---
 
-## CLI reference
+## `/handoff` slash commands
 
-All commands run from the repo root with `node scripts/<script> <subcommand>`.
+Eight commands back the session-memory lifecycle:
 
 | Command | Description |
 |---------|-------------|
-| `node scripts/pipeline-memory-loader.js memory` | Load all files from the memory directory, compute content hashes, upsert rows, chunk text (1400-char ceiling) |
-| `node scripts/pipeline-embed.js blurbs` | Generate contextual blurbs (qwen2.5:14b via Ollama) for chunks where `blurb IS NULL`. Idempotent. |
-| `node scripts/pipeline-embed.js blurbs --all` | Regenerate blurbs for every chunk (overwrites existing). |
-| `EMBED_BACKEND=vllm node scripts/pipeline-embed.js index` | Embed all unembedded chunks via vLLM. Reads blurb from DB and prepends before embedding. |
-| `LATE_CHUNKING=1 EMBED_BACKEND=vllm node scripts/pipeline-embed.js index` | Same, but uses vLLM per-token pooling + client-side mean-pool for cross-chunk context (Phase 3b late chunking). |
-| `node scripts/pipeline-embed.js index --all` | Force re-embed everything. |
-| `node scripts/pipeline-embed.js hybrid "query"` | Hybrid search: FTS rank * 0.3 + cosine similarity * 0.7 |
-| `node scripts/pipeline-embed.js search "query"` | Vector-only search (cosine similarity) |
-| `node scripts/pipeline-embed.js stats` | Embedding coverage: how many chunks have embeddings vs. total |
-| `PGUSER=postgres node test/eval/eval-retrieval.js` | Retrieval-quality regression (42 fixtures, 38 queries) |
-| `PGUSER=postgres node test/eval/eval-retrieval.js --rerank` | Same with vLLM cross-encoder reranker (Phase 3a) |
+| `/handoff:init` | First-run provisioning: schema, `handoff.md`, `CLAUDE.md`, default contract. Idempotent. |
+| `/handoff:status` | Read-only: entity/assertion counts, last close, contract names, session marker. |
+| `/handoff:resume` | Force-load prior session context regardless of staleness threshold. |
+| `/handoff:close` | End-of-session extraction: entities, assertions, edges, contract update, clears `session_in_progress`. |
+| `/handoff:checkpoint` | Mid-session save without ending the session. |
+| `/handoff:drop` | Archive prior assertions (recoverable), start fresh `handoff.md`. |
+| `/handoff:purge` | Hard-delete all project memory. Requires confirmation. |
+| `/handoff:promote <id>` | Explicitly promote an assertion to the `## Durable facts` section of `CLAUDE.md`. |
 
-**Standard operational sequence for a full corpus refresh:**
-
-```sh
-node scripts/pipeline-memory-loader.js memory   # load; blurbs and embeddings are NULL
-node scripts/pipeline-embed.js blurbs           # fill NULL blurbs via qwen2.5:14b
-EMBED_BACKEND=vllm node scripts/pipeline-embed.js index  # embed, reading blurbs from DB
-```
-
-See [/handoff skill install](#handoff-skill-install) for the handoff subcommands.
+The command files in `commands/handoff/` are thin recipes. `scripts/handoff.js`
+does the heavy lifting: schema-validated DB writes, contract evaluation, JSON
+payload parsing, and file I/O.
 
 ---
 
-## Architecture
+## Knowledge-graph schema
 
-Eight tables and one view.
+The handoff layer uses six tables:
 
 ```
-memory_entries          (one row per .md file)
-  id, name, description, mem_type, body, source_file,
-  content_hash, fts_vec tsvector
-
-memory_entry_chunks     (one row per semantic chunk)
-  id, entry_id -> memory_entries.id, chunk_idx, content,
-  content_hash, embedding halfvec(4000), fts_vec tsvector,
-  blurb TEXT (Phase 3b: qwen2.5:14b topic blurb; NULL until generated)
-
-entities                (typed named entities; written at /handoff:close)
-  id, project_id, name, entity_type, description, session_id
-
-assertions              (S/P/O triples with 1-10 confidence + decay)
-  id, project_id, subject, predicate, object, confidence,
-  decay_rate, last_reinforced, source, session_id
-
-edges                   (typed relationships between entities)
-  id, project_id, from_entity, edge_type, to_entity, weight, session_id
-
-retrieval_contract      (named retrieval plans for the SessionStart loader)
-  id, project_id, name, queries JSONB
-
-project_settings        (per-project key/value tunable config)
-  project_id, key, value
-
-retrieval_events        (log of every retrieval call; outcome written by Bundle B)
-  id, project_id, query_text, query_embedding halfvec(4000),
-  retrieved_at, outcome, session_id
-
-v_memory_hits           (view: chunks joined with parent name)
-  exposes: label (=name), snippet, content, embedding, fts_vec
+entities          — typed named entities (person, system, concept, decision, file)
+assertions        — S/P/O triples: subject, predicate, object, confidence 1–10,
+                    decay_rate, last_reinforced, suppressed, invalid_at,
+                    suppression_kind, pinned, source
+edges             — typed relationships between entities (depends_on, implements,
+                    blocks, owns, calls, produces)
+retrieval_contract — named retrieval plans (JSONB queries array)
+project_settings  — per-project key/value config (staleness_days, implicit_close, …)
+retrieval_events  — log of retrieval calls; outcome written at close
 ```
 
-Why a separate chunks table rather than chunking inline in `memory_entries`?
-Long files must be split before embedding. The parent row stays intact for
-display and sync; the chunk table holds the searchable units. CASCADE delete
-keeps them in sync.
+**Bi-temporal model.** Each assertion row has `valid_at` (write time) and
+`invalid_at` (suppression time). `suppression_kind` ∈ `{superseded,
+downvoted_terminal, downvoted_probation}`. Probation rows are excluded from
+standard retrieval but preserved in history and rehabilitatable by positive
+feedback. Terminal and superseded rows are not auto-revived.
 
-**Embedding column type:** `halfvec(4000)`. Qwen3-Embedding-8B outputs 4096
-dims; the leading 4000 are stored (Matryoshka truncation). pgvector 0.8.1 caps
-HNSW indexes at 4000 dims for `halfvec` and 2000 dims for `vector` — storing
-4000 dims is what makes ANN indexing viable as the corpus grows. See
-[Gotchas](#gotchas) for the `halfvec(4000)` migration pattern.
+**Cardinality-aware supersession.** The predicate registry
+(`scripts/lib/predicate-registry.json`) declares 1:1 or 1:N cardinality per
+predicate. On a 1:1 predicate, all live non-pinned rows for
+`(project_id, subject, predicate)` are atomically marked `suppressed = true`,
+`invalid_at = now()`, `suppression_kind = 'superseded'` when a new object value
+arrives. On a 1:N predicate, only exact `(subject, predicate, object)` duplicates
+are suppressed. No LLM is involved in conflict resolution.
 
-**Contextual blurbs (Phase 3b):** `memory_entry_chunks.blurb` is a ≤200-token
-topic description generated by qwen2.5:14b. At embed time the blurb is
-prepended to the chunk text before calling the embedder, giving the model
-topic-anchored context that reduces cross-chunk co-reference loss. The blurb
-is stored in the DB; the canonical chunk content is unchanged.
+**Retrieval contract.** A named JSONB queries array stored per project. Supported
+query types: `entity`, `assertion`, `recency`, `vector`, `graph`. The contract
+drives what context is injected at `SessionStart`; it is updated at
+`/handoff:close`.
 
-**Late chunking (Phase 3b):** When `LATE_CHUNKING=1 EMBED_BACKEND=vllm`, the
-embedder requests per-token pooling over the full document text from vLLM,
-then client-side mean-pools each chunk's token span. This preserves inter-chunk
-context that is lost under standard pooled embedding.
+---
 
-**Hybrid scoring** (applied by `pipeline-embed.js`, not by Postgres):
+## Optional: full-text and vector search layer
+
+If you also want hybrid full-text + vector retrieval over a corpus of Markdown
+memory files, the repo includes `scripts/pipeline-memory-loader.js` and
+`scripts/pipeline-embed.js`. This layer requires PostgreSQL with pgvector 0.8.1+.
+
+```
+memory_entries        — one row per .md file
+memory_entry_chunks   — one row per semantic chunk, with embedding halfvec(4000)
+v_memory_hits         — view: chunks joined with parent name
+```
+
+Hybrid scoring (applied in Node, not in Postgres):
 
 ```
 score = ts_rank(fts_vec, query) * 0.3
       + (1 - embedding <=> query_vector) * 0.7
 ```
 
-FTS catches exact keyword matches that vectors miss (proper nouns, version
-strings, error codes). Vector search catches paraphrase and intent. The 70/30
-split was tuned empirically on the project's memory store.
+**Embedding column type:** `halfvec(4000)`. Qwen3-Embedding-8B outputs 4096 dims;
+the leading 4000 are stored (Matryoshka truncation). pgvector 0.8.1 caps HNSW
+indexes at 4000 dims for `halfvec` — this is what makes ANN indexing viable as
+corpus size grows.
 
-**Index choices:**
+The handoff/knowledge-graph layer works independently of this layer. You can use
+the slash-command memory system alone without ever running the embedder pipeline.
 
-- HNSW (`halfvec_cosine_ops`) on `memory_entry_chunks.embedding`: O(log n)
-  approximate nearest-neighbor. pgvector 0.8.1+ required for `halfvec` HNSW.
-- GIN on `fts_vec` columns: standard for containment queries (`@@`).
+### Embedder setup
 
----
+The embedder pipeline supports two backends:
 
-## Limitations
+- **vLLM** (primary): `Qwen/Qwen3-Embedding-8B` via vLLM, produces `halfvec(4000)`.
+  Recommended for retrieval quality.
+- **Ollama** (fallback): `mxbai-embed-large` (1024 dims). Works but produces
+  1024-dim embeddings in a `halfvec(4000)` column — the remaining 2976 dims are
+  zero-padded on insert, which degrades retrieval quality relative to vLLM.
 
-- **Postgres only.** No SQLite backend, no Pinecone, no other vector DB.
-- **vLLM is the production embedder.** Ollama + mxbai-embed-large is the
-  fallback; it still works but produces 1024-dim embeddings in a `halfvec(4000)`
-  schema column (the remaining 2976 dims will be zero-padded on insert, which
-  degrades retrieval quality). Use vLLM for any new index build.
-- **No tokenizer-aware chunking.** The chunker uses a 1400-character ceiling.
-  It will not overrun the embedding model's context window, but chunks may be
-  semantically awkward at boundaries. The `blurbs` step mitigates this for
-  embedding quality; late chunking mitigates it further at the cost of a
-  vLLM-native token-pooling call per entry.
-- **No orphan pruning.** If you rename or delete a source file, the
-  corresponding `memory_entries` row is not removed automatically.
-- **No subdir recursion.** The loader does a flat `readdir`. Files nested inside
-  subdirectories (other than the conventional `archive/`) are invisible to it.
-- **No multi-database support.** One Postgres connection, one database.
-- **Reranker precision gate is corpus-size-gated.** The `+5pp precision@5`
-  acceptance gate for the Phase 3a reranker only fires when the corpus exceeds
-  `project_settings.precision_at_5_gate_min_chunks` (default: 1000 chunks). On
-  smaller corpora both vector-only and reranker modes saturate at 1.00 and the
-  gate is recorded as SKIPPED.
-
----
-
-## Gotchas
-
-Environment issues discovered during Phase 1 bring-up on Windows 11
-(WSL2 Ubuntu, RTX 3090).
-
-**Docker Desktop pull pipeline on multi-GB images.** Docker Desktop 29.4.3 on
-Windows 11 could not pull `vllm/vllm-openai` — three consecutive attempts
-(latest tag and a pinned v0.20.2 tag) failed with
-`httpReadSeeker: failed open ... EOF` on different blobs from
-`production.cloudfront.docker.com`. Small images pulled fine. Workarounds: try
-`regctl image copy` or `skopeo copy` (different HTTP client), pull from a
-different network, or pivot to the native WSL install path (next item).
-
-### Native WSL vLLM install — recommended on Windows
-
-Instead of the Docker path, install vLLM directly inside WSL Ubuntu via uv:
-
-```bash
-# one-time inside WSL Ubuntu
-curl -LsSf https://astral.sh/uv/install.sh | sh
-~/.local/bin/uv venv --python 3.12 ~/.venv/vllm
-source ~/.venv/vllm/bin/activate
-uv pip install vllm
-sudo apt-get install -y build-essential   # required for torch.compile JIT
-```
-
-Launch the embedder:
+vLLM launch command:
 
 ```bash
 ~/.venv/vllm/bin/vllm serve Qwen/Qwen3-Embedding-8B \
   --runner pooling --port 8800 --gpu-memory-utilization 0.40
 ```
 
-Launch the reranker (separate terminal, Phase 3a):
+Configure in `.claude/pipeline.yml`:
 
-```bash
-~/.venv/vllm/bin/vllm serve Qwen/Qwen3-Reranker-4B \
-  --runner pooling \
-  --hf_overrides '{"architectures":["Qwen3ForSequenceClassification"],"classifier_from_token":["no","yes"],"is_original_qwen3_reranker":true}' \
-  --chat-template scripts/qwen3_reranker.jinja \
-  --port 8801 --gpu-memory-utilization 0.25
+```yaml
+knowledge:
+  embed_backend: vllm
+  vllm_embed_url: http://localhost:8800
+  embedding_model: Qwen/Qwen3-Embedding-8B
 ```
 
-Notes:
+### Full corpus pipeline
 
-- vLLM 0.20.x uses `--runner pooling`, not the older `--task embed`.
-- `--convert embed` may be useful when converting a non-pooling base model.
-- If `build-essential` is not installed, append `--enforce-eager` to bypass
-  torch.compile (functional but slower).
-- Ubuntu WSL ships Python 3.14 by default, which is too new for current vLLM
-  wheels. uv handles this transparently by downloading CPython 3.12.
-- **Reranker requires the `--hf_overrides` and `--chat-template` flags.** Without
-  them vLLM loads it as a generic causal LM and rerank scores are near-uniform.
-
-**Windows port preemption.** A pre-existing Windows-side Python process can
-preempt a WSL port via WSL2's localhost forwarding, returning confusing 404s
-even though vLLM is healthy inside WSL. Use non-default ports (`8800`, `18000`)
-or check before starting:
-
-```powershell
-Get-NetTCPConnection -LocalPort 8800 -State Listen
+```sh
+node scripts/pipeline-memory-loader.js memory      # load .md files, chunk, hash
+node scripts/pipeline-embed.js blurbs              # generate contextual blurbs (Ollama qwen2.5:14b)
+EMBED_BACKEND=vllm node scripts/pipeline-embed.js index  # embed via vLLM
 ```
 
-**CRLF line endings break `loadConfig()`.** The YAML parser uses bare `\n`.
-On Windows, `.claude/pipeline.yml` saved with CRLF causes `loadConfig` to
-silently fall back to defaults (`database` resolves to `pipeline_<basename>`).
-Fast fix: convert `pipeline.yml` to LF.
+Search:
 
-**NVIDIA Container Toolkit not enabled by default in Docker Desktop.** If you
-use the Docker path, enable Docker Desktop → Settings → AI → "GPU-backed
-inference". Without it, `docker run --gpus all` fails with
-`nvidia-container-cli: libnvidia-ml.so.1: cannot open shared object file`.
-
-**WSL GPU access can get stuck.** Symptom: `nvidia-smi` inside WSL returns
-`Failed to initialize NVML: GPU access blocked by the operating system` while
-the Windows host's `nvidia-smi` works. Fix: `wsl --shutdown` from PowerShell,
-then re-enter WSL.
-
-**pgvector HNSW dimension cap (4000 for halfvec, 2000 for vector).** pgvector
-0.8.1 hard-caps HNSW indexes: `vector` accepts at most 2000 dims, `halfvec`
-accepts at most 4000 dims. A `vector(4096)` column cannot have any HNSW index.
-At small corpus sizes a sequential scan is acceptable, but ANN indexing is
-required at scale.
-
-The production fix is Matryoshka truncation: Qwen3-Embedding-8B is
-Matryoshka-trained, so the first 4000 leading dims preserve semantic load. Store
-as `halfvec(4000)`. Migration pattern for an existing `vector(4096)` column:
-
-```sql
-BEGIN;
-DROP VIEW v_memory_hits;
-ALTER TABLE memory_entry_chunks
-  ALTER COLUMN embedding TYPE halfvec(4000)
-  USING subvector(embedding, 1, 4000)::halfvec(4000);
-CREATE INDEX mem_chunks_vec_idx
-  ON memory_entry_chunks USING hnsw (embedding halfvec_cosine_ops);
-\ir scripts/sql/v_memory_hits.sql
-COMMIT;
-```
-
-At write time, slice before storing: `vec.slice(0, 4000)`, or set
-`EMBED_DIMS=4000` and use the `vllmEmbed()` helper in `scripts/lib/shared.js`.
-
-**Reranker precision@5 acceptance gate is corpus-size-gated.** See the
-Limitations section. Configure the threshold:
-
-```sql
-INSERT INTO project_settings (project_id, key, value)
-VALUES ('<encoded_cwd>', 'precision_at_5_gate_min_chunks', '1000')
-ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value;
+```sh
+node scripts/pipeline-embed.js hybrid "your query"  # FTS * 0.3 + cosine * 0.7
+node scripts/pipeline-embed.js search "your query"  # vector-only
 ```
 
 ---
 
-## `/handoff` skill install
+## Trust model and CLAUDE.md promotion
 
-The `/handoff` skill is a set of seven Claude Code slash commands that provide
-cross-session memory continuity. The skill files live in `commands/handoff/` in
-this repo. To install:
+> Full security policy and payload-validation details: [SECURITY.md](SECURITY.md)
 
-```bash
-cp commands/handoff/*.md ~/.claude/commands/handoff/
-```
+**Auto-promotion is off by default.** Assertions with `confidence >= 9`,
+`source = user_stated`, and reinforcement across multiple sessions are surfaced
+as candidates at `/handoff:close`. They are written to the `## Durable facts`
+section of `CLAUDE.md` only when the close payload explicitly sets
+`confirm_claude_md_promotion: true`. The `/handoff:promote <id>` command is the
+explicit single-assertion path.
 
-After install, the following slash commands become available in any project that
-has `scripts/handoff.js` on the walk-up path:
+Every promotion writes an HTML comment annotation immediately before the fact line,
+recording session, confidence, date, and source assertion ID.
 
-| Command | Description |
-|---------|-------------|
-| `/handoff:init` | First-run provisioning: schema, handoff.md, CLAUDE.md, default contract |
-| `/handoff:status` | Read-only: counts, last close, contract names, session marker |
-| `/handoff:resume` | Load prior session context regardless of staleness threshold |
-| `/handoff:close` | End-of-session extraction: entities, assertions, edges, contract update |
-| `/handoff:checkpoint` | Mid-session save without ending the session |
-| `/handoff:drop` | Archive prior assertions (recoverable), start fresh handoff.md |
-| `/handoff:purge` | Hard delete all project memory (confirmation required) |
-| `/handoff:promote <id>` | Explicitly promote an assertion to CLAUDE.md durable facts |
-
-The helper (`scripts/handoff.js`) does the heavy lifting. The Markdown command
-files are thin recipes that announce `Running: handoff:<sub>` at start and
-`Done: handoff:<sub> — <one-line>` at finish.
-
----
-
-<a id="trust-model"></a>
-
-### Trust model
-
-> Full security policy, configuration-defaults exposure review, and payload
-> validation details live in [SECURITY.md](SECURITY.md).
-
-**Multi-author detection.** When `scripts/handoff.js init` or `scripts/handoff.js close`
-is run, the helper runs `git log --format=%ae --since='1 year ago'` to count distinct commit
-author emails over the last year of commits. If more than one author is detected, it writes a one-line notice to stderr:
-
-```
-[handoff] multi-author repo detected — see README#trust-model before relying on CLAUDE.md auto-promotion
-```
-
-This notice is advisory. No behavior changes today when it fires: context injection,
-assertion storage, and CLAUDE.md promotion all work exactly as they do on single-author
-repos. The flag (`multi_author_detected = true` in `project_settings`) is available for
-future policy gates. The intent is to surface the condition once per invocation so you can
-decide whether the auto-promotion path is appropriate for your threat model.
-
-**Auto-promotion is off by default.** Promotion of high-confidence assertions (`confidence >= 9`,
-`source = user_stated`, reinforced across multiple sessions) to the `## Durable facts`
-section of `CLAUDE.md` happens **only** when the `/handoff:close` payload explicitly
-sets `confirm_claude_md_promotion: true`. When that flag is absent or `false`, the tool
-prints the candidate list to the console and writes nothing to disk. The `/handoff:close`
-skill also instructs the assistant to ask the user for confirmation before any CLAUDE.md
-write, and its example payload defaults the flag to `false`. The `/handoff:promote <assertion_id>`
-command is the explicit single-assertion path for promoting individual assertions after manual
-inspection. Every promotion — payload-flag or explicit — writes an HTML comment audit annotation
-(`<!-- promoted: session=..., conf=..., date=..., source_assertion=... -->`) immediately before
-the fact line, so the provenance of each entry in `## Durable facts` is traceable.
-For the full exposure review, including the residual risk on a public multi-author repo,
-see [SECURITY.md](SECURITY.md).
+**Multi-author detection.** When `handoff init` or `handoff close` runs,
+`git log` is checked for distinct author emails over the last year. If more than
+one author is detected, a notice is written to stderr. No behavior changes; the
+`multi_author_detected` flag in `project_settings` is available for future policy
+gates. The intent is to surface the condition so you can decide whether
+auto-promotion is appropriate for your threat model.
 
 ---
 
 ## Testing
 
-Three harnesses cover different layers.
+CI runs on every pull request (Node 22, Postgres 16 via `pgvector/pgvector:pg16`
+image). Test steps:
 
-**`scripts/test-chunker.js`** — structural correctness. Six scenarios: chunk
-boundary rules, idempotence via content_hash, partial-failure resilience, and
-an end-to-end round-trip (loader → DB → embed → hybrid retrieval). Set
-`OLLAMA_SKIP=1` to skip embed-dependent assertions.
+| Step | What it covers |
+|------|----------------|
+| `test-chunker.js` | Structural correctness: chunk boundaries, content-hash idempotence, loader–DB–embed round-trip |
+| `eval-retrieval.js --ollama-skip` | SQL/loader/schema path smoke test (vector-quality detection requires local embedder) |
+| `test-graph-traversal.js` | Exhaustive tests for `kind:'graph'` recursive-CTE retrieval on Postgres |
+| `smoketest-handoff.js` | Full smoketest suite — all 13 sections, including supersession invariant and predicate-registry drift |
+| `test-sqlite-seam.js` | SQLite adapter unit and integration tests: dialect rewrite, schema application, JSONB round-trip, graph CTE, abstraction invariant, bi-temporal columns, canonicalization, manual prune |
+| `test-both-backends.js` | Adversarial-invariant sweep on both Postgres and SQLite (10 invariants: bi-temporal, probation lifecycle, terminal-is-terminal, pinned exemption, canonicalization × supersession, prune × bi-temporal, C2 gate, abstraction invariant, constants, no-backfill guarantee) |
 
-```bash
-PROJECT_ROOT=$(pwd) node scripts/test-chunker.js
-```
+Run locally:
 
-**`test/handoff/test-handoff.js`** — golden-path tests for the `/handoff` skill
-helper. Runs each subcommand against `claude_memory_eval_test` with a temporary
-`project_id` and asserts row counts and file contents. Requires Phase 2 schema
-applied first.
+```sh
+# Chunker tests (OLLAMA_SKIP=1 skips embed assertions)
+OLLAMA_SKIP=1 node scripts/test-chunker.js
 
-```bash
-node test/handoff/test-handoff.js
-```
+# Full smoketest
+node scripts/smoketest-handoff.js
 
-**`test/eval/eval-retrieval.js`** — retrieval-quality regression. 42 synthetic
-fixture markdown files in `test/eval/fixtures/`, 38 hand-labeled queries in
-`test/eval/queries.json` with expected top-1 / top-3 hits and negative
-constraints. Computes recall@1, recall@3 (relaxed), MRR, negative precision.
-Asserts each metric stays within 5% of the committed baseline at
-`test/eval/baseline.json`. Negative precision is strict (== 1.0).
+# SQLite seam tests (Node 22+)
+node scripts/test-sqlite-seam.js
 
-One-time setup:
+# Both-backend adversarial sweep
+node scripts/test-both-backends.js
 
-```bash
-psql -U postgres -c "CREATE DATABASE claude_memory_eval_test"
-psql -U postgres -d claude_memory_eval_test -f scripts/setup.sql
-node scripts/handoff.js init                # applies handoff-core-schema.sql
-psql -U postgres -d claude_memory_eval_test -f scripts/sql/app-retrieval-events-schema.sql
-psql -U postgres -d claude_memory_eval_test -f scripts/sql/phase3b-schema.sql
-```
-
-Run:
-
-```bash
+# Retrieval quality regression (requires Ollama or vLLM locally)
 PGUSER=postgres node test/eval/eval-retrieval.js
 ```
 
-With Phase 3a reranker:
-
-```bash
-PGUSER=postgres node test/eval/eval-retrieval.js --rerank
-```
-
-To accept a real improvement as the new baseline:
-
-```bash
-PGUSER=postgres node test/eval/eval-retrieval.js --update-baseline
-```
-
-The harness writes `test/eval/last-run.json` (gitignored) with per-query
-results for debugging. Adding a new query: append to `queries.json`, label
-expected hits by reading the relevant fixture, then `--update-baseline`. Adding
-a new fixture: drop a markdown file in `test/eval/fixtures/` with frontmatter
-(`name`, `description`, `type`); the harness loads everything in that
-directory.
-
-CI runs the eval harness in `--ollama-skip` mode (smoke test for the SQL and
-loader path; vector-quality regression detection requires running locally with
-vLLM or Ollama).
-
-> **CI footgun warning.** `.github/workflows/test.yml` runs on every PR with
-> `OLLAMA_SKIP=1`. It exercises the SQL, loader, and schema paths, but **skips
-> all vector-quality and embedding regression detection**. A green CI run does
-> **not** mean retrieval quality is unregressed. Maintainers must run the full
-> harness locally (with Ollama or vLLM available) to catch retrieval-quality
-> regressions before relying on a change.
+**CI caveat.** CI runs `eval-retrieval.js` in `--ollama-skip` mode. This exercises
+the SQL and loader paths but skips vector-quality regression detection. A green CI
+run does not mean retrieval quality is unregressed. Run the full harness locally
+with Ollama or vLLM to catch retrieval-quality regressions before relying on a
+change.
 
 ---
 
@@ -626,14 +415,11 @@ vLLM or Ollama).
 
 This repo is shared in good faith but is not a maintained open-source product.
 There are no SLAs on issue response, no roadmap commitment, and no guarantee of
-backward-compatible schema migrations between versions. The author uses this code
-daily in pipeline, so basic correctness is likely to stay current. Feature
-requests are unlikely to be prioritized unless they align with pipeline's own
-needs.
+backward-compatible schema migrations between versions. The schema is small enough
+to understand in an afternoon.
 
-If you fork this and it works for you, great. If something breaks, you will need
-to fix it yourself or wait. The schema is small enough to understand in an
-afternoon.
+If you fork this and it works for you, great. If something breaks, you will need to
+fix it yourself or wait.
 
 ---
 
