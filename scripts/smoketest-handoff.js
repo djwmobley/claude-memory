@@ -4846,9 +4846,10 @@ async function qStep2_drainWritesAssertionMarksDone(qDb, qProjectId, qProjectDir
     }
 
     // Verify: at least one assertion now in DB (Q_SUBJ / is_status).
+    // Note: subject canonicalization lowercases subjects at write time, so stored subject = 'q_subj'.
     const db = await pgConnect(qDb);
     const { rows: assRows } = await db.query(
-      `SELECT predicate, object FROM assertions WHERE project_id = $1 AND subject = 'Q_SUBJ'`,
+      `SELECT predicate, object FROM assertions WHERE project_id = $1 AND subject = 'q_subj'`,
       [qProjectId]
     );
     // Verify: queue row is marked 'done'.
@@ -4948,13 +4949,14 @@ async function qStep3_strictModeSkipsBadPredicate(qDb, qProjectId, qProjectDir) 
     }
 
     // Verify: good assertion written, bad assertion not written.
+    // Note: subject canonicalization lowercases at write time: 'Q_STRICT_GOOD' → 'q_strict_good'.
     const db2 = await pgConnect(qDb);
     const { rows: goodRows } = await db2.query(
-      `SELECT 1 FROM assertions WHERE project_id = $1 AND subject = 'Q_STRICT_GOOD'`,
+      `SELECT 1 FROM assertions WHERE project_id = $1 AND subject = 'q_strict_good'`,
       [qProjectId]
     );
     const { rows: badRows } = await db2.query(
-      `SELECT 1 FROM assertions WHERE project_id = $1 AND subject = 'Q_STRICT_BAD'`,
+      `SELECT 1 FROM assertions WHERE project_id = $1 AND subject = 'q_strict_bad'`,
       [qProjectId]
     );
     await db2.end();
@@ -5038,9 +5040,10 @@ async function qStep4_permissiveAndSyncNonRegression(qDb, qProjectId, qProjectDi
     );
 
     // Verify unknown predicate was written (permissive).
+    // Note: subject canonicalization lowercases at write time: 'Q_PERM_SUBJ' → 'q_perm_subj'.
     const db2 = await pgConnect(qDb);
     const { rows: permRows } = await db2.query(
-      `SELECT 1 FROM assertions WHERE project_id = $1 AND subject = 'Q_PERM_SUBJ' AND predicate = 'unknown_perm_pred'`,
+      `SELECT 1 FROM assertions WHERE project_id = $1 AND subject = 'q_perm_subj' AND predicate = 'unknown_perm_pred'`,
       [qProjectId]
     );
     if (permRows.length === 0) {
@@ -5112,8 +5115,9 @@ async function qStep4_permissiveAndSyncNonRegression(qDb, qProjectId, qProjectDi
     const qPendingAfter = parseInt(qAfter[0].n, 10);
 
     // Verify assertion was written directly.
+    // Note: subject canonicalization lowercases at write time: 'Q_SYNC_NOREG' → 'q_sync_noreg'.
     const { rows: assAfter } = await db3.query(
-      `SELECT 1 FROM assertions WHERE project_id = $1 AND subject = 'Q_SYNC_NOREG'`,
+      `SELECT 1 FROM assertions WHERE project_id = $1 AND subject = 'q_sync_noreg'`,
       [qProjectId]
     );
     await db3.end();
