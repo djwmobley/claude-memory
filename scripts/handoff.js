@@ -577,9 +577,11 @@ async function cmdInit(args) {
   //     - Supersession correctness is still enforced transactionally in
   //       writeAssertionWithSupersession (BEGIN/suppress+INSERT/COMMIT).
   //     - The missing index is a defense-in-depth layer, not the primary guarantee.
-  //     - Remediation: operator can run `node scripts/handoff.js prune --suppressed
-  //       --apply` to remove suppressed rows, then re-run `handoff init` to create
-  //       the indexes once the constraint can be satisfied.  Or revisit §7 SKIP.
+  //     - The blocking rows are LIVE duplicates (suppressed=false). The `prune
+  //       --suppressed` command targets only suppressed=true rows and will NOT
+  //       resolve this condition. Resolving live-duplicate rows is corpus-dedupe
+  //       work — precisely the §7 SKIP (WILL-NOT-RUN) decision — and requires
+  //       explicit operator authorization, not a routine command.
   let sql = fs.readFileSync(schemaFile, 'utf8');
   // Remove psql meta-commands (\ir, \d, etc.) — not supported by pg client
   sql = sql.replace(/^\\[a-z].*$/gm, '');
@@ -632,12 +634,16 @@ async function cmdInit(args) {
       console.log(`          This means the DB contains pre-existing duplicate live rows`);
       console.log(`          (same project_id/subject/predicate with suppressed=false) that`);
       console.log(`          violate the uniqueness constraint — a legacy-duplicate corpus.`);
-      console.log(`          Supersession correctness is still enforced transactionally in`);
-      console.log(`          writeAssertionWithSupersession (BEGIN/suppress+INSERT/COMMIT).`);
-      console.log(`          Remediation options:`);
-      console.log(`            1. Run: node scripts/handoff.js prune --suppressed --apply`);
-      console.log(`               to remove suppressed rows, then re-run handoff init.`);
-      console.log(`            2. Revisit §7 SKIP if a full corpus migration is warranted.`);
+      console.log(`          The blocking rows are LIVE duplicates (suppressed=false).`);
+      console.log(`          prune --suppressed targets only suppressed=true rows and will`);
+      console.log(`          NOT resolve this — do not run it for this condition.`);
+      console.log(`          Resolving live-duplicate rows is corpus-dedupe work (§7 SKIP,`);
+      console.log(`          WILL-NOT-RUN) and requires explicit operator authorization.`);
+      console.log(`          Until that decision is taken, handoff init succeeds WITHOUT`);
+      console.log(`          this index. Supersession correctness is still enforced`);
+      console.log(`          transactionally in writeAssertionWithSupersession`);
+      console.log(`          (BEGIN/suppress+INSERT/COMMIT). The missing index is`);
+      console.log(`          defense-in-depth only.`);
     }
   }
 
