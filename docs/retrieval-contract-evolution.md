@@ -31,7 +31,7 @@ Each query object has this shape:
 | Kind        | What it retrieves                                                      |
 |-------------|------------------------------------------------------------------------|
 | `entity`    | Named entities from the `entities` table (optionally filtered by name).|
-| `assertion` | Subject/predicate/object triples from `assertions`, decay-filtered.    |
+| `assertion` | Subject/predicate/object triples from `assertions`, decay-ranked (top-N via LIMIT). |
 | `vector`    | Semantic nearest-neighbor search (requires Ollama/vLLM embedding).     |
 | `recency`   | Most-recently-reinforced assertions (recency window, no filter).       |
 

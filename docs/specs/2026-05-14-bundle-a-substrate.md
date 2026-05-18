@@ -893,9 +893,9 @@ CREATE INDEX IF NOT EXISTS entities_name_idx
 --   effective_confidence = confidence * exp(-decay_rate * EXTRACT(EPOCH FROM
 --     (now() - last_reinforced)) / 86400)
 --
--- Suppression threshold: effective_confidence < 1.0 → excluded from retrieval.
--- Example: confidence=10, decay_rate=0.05 → survives ~46 days before suppression.
---          confidence=5, decay_rate=0.05  → survives ~32 days before suppression.
+-- Ranking-only decay (Commit B): effective_confidence is used only in ORDER BY, not as a
+-- WHERE cutoff. LIMIT N is the guaranteed top-N floor; dormant rows are never dropped from
+-- the loader by decay alone. suppressed = false still excludes manually suppressed rows.
 --
 -- Reinforcement: every retrieval bumps last_reinforced = now() (live "used" event,
 -- option a — coarser but simpler than retrieve-and-reference signal).
@@ -1240,7 +1240,7 @@ scope creep at acceptance gate.
 | Blurb runtime length guard failure — qwen2.5:14b returns blurbs exceeding 200 tokens; guard must be implemented to prevent silent embedding quality degradation | Low | Medium | Runtime guard is a required deliverable in Phase 3 (not optional). If a blurb exceeds 200 tokens, it is truncated or the embedding proceeds without the blurb for that chunk, and the event is logged. |
 | FP16 quantization overflow — if vLLM services are started with FP16 instead of Q8, combined VRAM exceeds available VRAM and overflows to CPU RAM, causing performance failure | Low (Q8 is pinned) | High | Q8 is explicitly pinned in both service launch commands. Verify quantization flags are correct before the first service start. |
 | Skill not registered in Claude Code's command surface — if the user-scoped install path is not followed or the registration step is missed, the skill subcommands are unavailable | Low | Medium | Explicit registration step in Phase 3.5 order of operations. Test with a simple `/handoff:status` call after install before proceeding to `:close` wiring. |
-| Decay rate miscalibration — if 0.05/day is too aggressive, assertions disappear too fast; if too slow, stale content persists | Medium initially | Medium | `decay_rate` is per-row tunable and the global default is configurable via `project_settings`. First two weeks of usage will calibrate. Revisit the default after real usage data is available. |
+| Decay rate miscalibration — if 0.05/day is too aggressive, stale content is overly deprioritized in ranking; if too slow, stale content ranks too high | Low (Commit B: decay is ranking-only; no rows are dropped by decay alone) | Low | `decay_rate` is per-row tunable and the global default is configurable via `project_settings`. |
 | Golden fixture session capture not yet done | High at start of implementation | Medium | Capturing the golden fixture is in-scope for Bundle A (2–3 hours). Schedule it early in Phase 3.5 implementation so skill eval can run at acceptance gate. |
 | First-close seed fidelity — if the first `/handoff:close` extracts poorly, the entire substrate starts with bad assertions | Medium | Medium | The very first close should be reviewed by the maintainer before the next session loads from it. Strongly recommend using `/handoff:checkpoint` as the first invocation (not `:close`) to allow manual review of extraction output before committing. |
 | Loader infinite loop on stale prompt — if the staleness prompt runs at SessionStart, there may be no clean UI to receive input | Low | Low | The SessionStart hook surfaces staleness state but does not block session start. The user runs `:resume` or `:drop` from the new session. Hook never waits for inline input. |
@@ -1284,14 +1284,16 @@ ships PG18 Windows support before Bundle B's graph retrieval is implemented, the
 can evaluate AGE compatibility at that time. No impact on Bundle A.
 
 **Q6. Does the decay rate of 0.05/day produce useful retention curves on real usage?**
-An assertion at confidence 10 survives approximately 46 days before suppression; at confidence 5,
-approximately 32 days. These curves are theoretical; calibration requires real usage data. Tunable
-via `project_settings` key `decay_rate_default`. Revisit after two weeks of actual usage.
+Decay is a ranking-only signal (Commit B): it affects ORDER BY priority, not row inclusion.
+Dormant assertions are no longer excluded by decay alone — LIMIT N is the guaranteed floor.
+The `decay_rate_default` setting still tunes how aggressively stale rows are deprioritized in
+ranking relative to fresh ones. Tunable via `project_settings` key `decay_rate_default`.
 
-**Q7. What is the right `effective_confidence` suppression threshold?**
-Default 1.0 (see decay formula in Section 4 DDL). At confidence 10 and decay_rate 0.05,
-suppression occurs at approximately day 46; at confidence 5, approximately day 32. Validated
-empirically; tunable per the same pattern as Q6.
+**Q7. What is the right `effective_confidence` ranking weight?**
+Decay is applied as `confidence * exp(-decay_rate * age_days)` in ORDER BY only (Commit B).
+There is no `>= 1.0` suppression threshold in the loader; rows are excluded only by
+`suppressed = false`. This eliminates the dormancy bug where data intact in the DB was silently
+dropped after ~6 weeks of no reinforcement.
 
 **Q8. Should the SessionStart loader's token budget default be 4000 tokens, or higher/lower?**
 Empirical question; revisit after first usage. 4000 tokens is a conservative starting point that
