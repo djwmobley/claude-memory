@@ -117,6 +117,42 @@ ALTER TABLE assertions ADD COLUMN IF NOT EXISTS suppression_kind TEXT
   CHECK (suppression_kind IN ('superseded', 'downvoted_terminal', 'downvoted_probation'));
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT false;
 
+-- ── Two-tier durability: probationary → consolidated ──────────────────────────
+--
+-- Additive, NULL-tolerant additions.  Existing rows are left untouched — any
+-- missing value is NULL and is handled gracefully by all read/ranking paths.
+-- No UPDATE or DELETE of existing data (§7 SKIP; honors no-backfill rule).
+--
+-- GRANDFATHER RULE (CRITICAL — §7 compliance):
+--   tier IS NULL means the row predates this migration and MUST be treated as
+--   'consolidated' by every read/ranking path. A NULL tier row is never penalized
+--   in retrieval ordering. NEVER issue an UPDATE that sets tier on pre-existing rows.
+--   New columns are added with ADD COLUMN IF NOT EXISTS exactly mirroring the
+--   existing pinned precedent above.
+--
+-- tier          — 'probationary' | 'consolidated' | NULL (grandfathered = consolidated).
+--                 New assertions enter 'probationary' by default unless the Hybrid
+--                 consolidation trigger fires:
+--                   (a) source='user_stated' AND confidence >= 9 → 'consolidated' immediately.
+--                   (b) 1:N cross-session corroboration: same (subject, predicate, object)
+--                       asserted from a DISTINCT non-null session_id → 'consolidated'.
+--                 Explicit /handoff:promote also sets tier='consolidated'.
+-- consolidated_at — timestamp when tier was set to 'consolidated'; NULL until graduation.
+-- corroboration_count — starts at 1; incremented when cross-session corroboration fires
+--                       (new count = max corroboration_count among matched priors + 1).
+--                       Observability signal for multi-session fact convergence.
+--
+-- Retrieval behavior:
+--   When tier_aware_retrieval='enabled' (default): consolidated/NULL rows rank above
+--   probationary rows via CASE WHEN tier='probationary' THEN 1 ELSE 0 END ASC prefix
+--   in ORDER BY. Probationary rows are NEVER filtered out — only re-ranked.
+--   When tier_aware_retrieval is any other value: ORDER BY is byte-identical to pre-feature
+--   SQL (no CASE WHEN tier term at all). Guaranteed by the gate design.
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS tier TEXT
+  CHECK (tier IN ('probationary', 'consolidated'));
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS consolidated_at TIMESTAMPTZ;
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS corroboration_count INTEGER NOT NULL DEFAULT 1;
+
 CREATE INDEX IF NOT EXISTS assertions_project_idx
   ON assertions (project_id);
 CREATE INDEX IF NOT EXISTS assertions_subject_idx
@@ -310,6 +346,7 @@ CREATE TABLE IF NOT EXISTS project_settings (
 --   contract_evolution_budget_step     default: '200'       (max budget change per evolution pass; gradual and bounded)
 --   extraction_async_enabled           default: 'false'     ('true'|'false' — async extraction queue; byte-identical to synchronous when 'false')
 --   predicate_registry_mode            default: 'permissive' ('permissive'|'strict' — unrecognized-predicate enforcement)
+--   tier_aware_retrieval               default: 'enabled'   ('enabled'|any other value — tier-aware retrieval ranking; probationary rows re-ranked below consolidated/NULL; byte-identical ORDER BY when disabled)
 
 
 -- ============================================================================
