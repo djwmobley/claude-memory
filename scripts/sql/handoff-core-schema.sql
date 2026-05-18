@@ -200,10 +200,16 @@ CREATE INDEX IF NOT EXISTS edges_to_idx
 --
 -- Query object shape:
 --   {
---     "kind": "entity" | "assertion" | "vector" | "recency",
+--     "kind": "entity" | "assertion" | "vector" | "recency" | "history" | "graph",
 --     "filter": { ... kind-specific filter fields ... },
 --     "token_budget": <int>
 --   }
+--
+-- Graph filter shape: { "seed": <string|string[]>, "direction": "out"|"in"|"both",
+--                       "max_depth": <int 1-5> }
+--   seed: entity names to start traversal from (falls back to retrieved entities if absent)
+--   direction: edge traversal direction (default "out": from_entity → to_entity)
+--   max_depth: max hop depth (hard-clamped to 5; default from graph_max_depth setting = 2)
 --
 -- /handoff:init inserts a default contract row for the project.
 -- /handoff:close updates (or inserts) the default contract based on session state.

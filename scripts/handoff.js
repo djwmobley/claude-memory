@@ -696,6 +696,12 @@ async function cmdInit(args) {
     retrieval_outcome_timeout_days:   '14',
     cluster_aware_retrieval:          'enabled',
     cluster_max_siblings:             '10',
+    // Graph edge traversal retrieval (opt-in via contract kind:'graph', default OFF-by-contract).
+    // When graph_retrieval_enabled='disabled', the branch is a no-op even with a graph query
+    // in the contract. Default contract has no graph query — byte-identical to pre-feature.
+    graph_retrieval_enabled:          'enabled',
+    graph_max_depth:                  '2',
+    graph_max_nodes:                  '25',
     // C2: outcome→ranking+decay feedback loop (default OFF — byte-identical to pre-C2 when disabled).
     feedback_loop_enabled:            'disabled',
     feedback_success_delta:           '0.5',   // bias nudge per success outcome
@@ -1104,6 +1110,261 @@ async function cmdLoaderLoad(opts = {}) {
         tokensUsed      += Math.ceil(text.length / 4);
         assertionsCount += hRows.length;
         // No bump — history rows are read-only for decay purposes.
+      }
+
+    } else if (q.type === 'graph' || q.kind === 'graph') {
+      // Graph kind: recursive-CTE edge traversal from seed entities.
+      //
+      // Design decisions:
+      //   1. Seeds: q.filter.seed (string or array). If absent, fall back to
+      //      retrievedEntityNames (so a graph query placed after an entity query
+      //      inherits the entity results as seeds). If still no seeds → no-op.
+      //   2. Direction: q.filter.direction ∈ 'out'|'in'|'both', default 'out'.
+      //   3. Depth: effective = q.filter.max_depth if positive int, else setting
+      //      graph_max_depth (default '2'). HARD-clamped to Math.min(effective, 5).
+      //   4. Node cap: setting graph_max_nodes (default '25'). Deterministic ordering:
+      //      min_depth ASC, weight DESC, entity_name ASC.
+      //   5. Recursive CTE with cycle prevention via path array.
+      //   6. Gating: graph_retrieval_enabled default 'enabled'. When 'disabled', no-op.
+      //   7. Output: strictly additive "### Related (graph)" section.
+      //   8. No modification of default contract — default session: byte-identical output.
+      //      (Same I-2 guard as the history kind.)
+      //
+      // REGRESSION GUARD: the default retrieval_contract is NOT modified by this PR.
+      // A default session has no graph query, so this branch is unreachable in default
+      // sessions — loader output is byte-identical to pre-feature. (I-2 guarantee.)
+      try {
+        const graphEnabled = await getSetting(db, projectId, 'graph_retrieval_enabled', 'enabled');
+        if (graphEnabled !== 'enabled') {
+          // Gate off: no-op. Do not add any section or modify tokensUsed.
+        } else {
+          // Resolve seeds.
+          let seeds = [];
+          if (q.filter && q.filter.seed != null) {
+            seeds = Array.isArray(q.filter.seed) ? q.filter.seed : [q.filter.seed];
+            seeds = seeds.filter((s) => typeof s === 'string' && s.length > 0);
+          }
+          if (seeds.length === 0) {
+            seeds = retrievedEntityNames.slice(); // fallback: entities retrieved earlier
+          }
+
+          if (seeds.length > 0 && tokensUsed < tokenBudget) {
+            // Resolve direction.
+            const direction = (q.filter && q.filter.direction) || 'out';
+
+            // Resolve max depth.
+            const settingDepth = parseInt(
+              await getSetting(db, projectId, 'graph_max_depth', '2'), 10
+            );
+            const filterDepth = (q.filter && Number.isInteger(q.filter.max_depth) && q.filter.max_depth > 0)
+              ? q.filter.max_depth : settingDepth;
+            const maxDepth = Math.min(filterDepth, 5); // abuse guard
+
+            // Resolve node cap.
+            const maxNodes = parseInt(
+              await getSetting(db, projectId, 'graph_max_nodes', '25'), 10
+            );
+
+            // Build direction-aware edge join clause.
+            // 'out': from_entity → to_entity (follow outgoing edges)
+            // 'in':  to_entity → from_entity (follow incoming edges)
+            // 'both': union of both directions
+            //
+            // Recursive CTE structure:
+            //   base:      seed entities at depth 0
+            //   recursive: join edges in chosen direction, depth + 1, cycle prevention
+            // Aggregate reached nodes excluding seeds themselves.
+            // All parameterized — no string interpolation of user values.
+
+            let cteReachSql;
+            if (direction === 'in') {
+              cteReachSql = `
+                WITH RECURSIVE graph_traverse(entity_name, depth, weight, from_e, edge_type, to_e, path) AS (
+                  -- Base: seeds at depth 0
+                  SELECT
+                    unnest($2::text[]) AS entity_name,
+                    0                  AS depth,
+                    1.0::float         AS weight,
+                    ''::text           AS from_e,
+                    ''::text           AS edge_type,
+                    ''::text           AS to_e,
+                    ARRAY[unnest($2::text[])] AS path
+                  UNION ALL
+                  -- Recursive: follow edges INBOUND (to_entity → from_entity)
+                  SELECT
+                    e.from_entity      AS entity_name,
+                    t.depth + 1        AS depth,
+                    e.weight           AS weight,
+                    e.from_entity      AS from_e,
+                    e.edge_type        AS edge_type,
+                    e.to_entity        AS to_e,
+                    t.path || e.from_entity AS path
+                  FROM edges e
+                  JOIN graph_traverse t ON e.to_entity = t.entity_name
+                  WHERE e.project_id = $1
+                    AND t.depth + 1 <= $3
+                    AND NOT (e.from_entity = ANY(t.path))
+                )
+                SELECT
+                  entity_name,
+                  MIN(depth) AS min_depth,
+                  MAX(weight) AS max_weight,
+                  (array_agg(from_e ORDER BY depth ASC, weight DESC))[1] AS rep_from,
+                  (array_agg(edge_type ORDER BY depth ASC, weight DESC))[1] AS rep_edge_type,
+                  (array_agg(to_e ORDER BY depth ASC, weight DESC))[1] AS rep_to
+                FROM graph_traverse
+                WHERE depth > 0
+                  AND NOT (entity_name = ANY($2::text[]))
+                GROUP BY entity_name
+                ORDER BY min_depth ASC, max_weight DESC, entity_name ASC
+                LIMIT $4
+              `;
+            } else if (direction === 'both') {
+              // PostgreSQL recursive CTEs do not allow two recursive references to the
+              // working table in a single WITH RECURSIVE. Use two separate CTEs (out + in)
+              // and UNION their results before aggregating.
+              cteReachSql = `
+                WITH RECURSIVE
+                gt_out(entity_name, depth, weight, from_e, edge_type, to_e, path) AS (
+                  -- Base: seeds at depth 0 (outbound traversal)
+                  SELECT
+                    unnest($2::text[]) AS entity_name,
+                    0                  AS depth,
+                    1.0::float         AS weight,
+                    ''::text           AS from_e,
+                    ''::text           AS edge_type,
+                    ''::text           AS to_e,
+                    ARRAY[unnest($2::text[])] AS path
+                  UNION ALL
+                  -- Recursive: follow edges OUTBOUND (from_entity → to_entity)
+                  SELECT
+                    e.to_entity        AS entity_name,
+                    t.depth + 1        AS depth,
+                    e.weight           AS weight,
+                    e.from_entity      AS from_e,
+                    e.edge_type        AS edge_type,
+                    e.to_entity        AS to_e,
+                    t.path || e.to_entity AS path
+                  FROM edges e
+                  JOIN gt_out t ON e.from_entity = t.entity_name
+                  WHERE e.project_id = $1
+                    AND t.depth + 1 <= $3
+                    AND NOT (e.to_entity = ANY(t.path))
+                ),
+                gt_in(entity_name, depth, weight, from_e, edge_type, to_e, path) AS (
+                  -- Base: seeds at depth 0 (inbound traversal)
+                  SELECT
+                    unnest($2::text[]) AS entity_name,
+                    0                  AS depth,
+                    1.0::float         AS weight,
+                    ''::text           AS from_e,
+                    ''::text           AS edge_type,
+                    ''::text           AS to_e,
+                    ARRAY[unnest($2::text[])] AS path
+                  UNION ALL
+                  -- Recursive: follow edges INBOUND (to_entity → from_entity)
+                  SELECT
+                    e.from_entity      AS entity_name,
+                    t.depth + 1        AS depth,
+                    e.weight           AS weight,
+                    e.from_entity      AS from_e,
+                    e.edge_type        AS edge_type,
+                    e.to_entity        AS to_e,
+                    t.path || e.from_entity AS path
+                  FROM edges e
+                  JOIN gt_in t ON e.to_entity = t.entity_name
+                  WHERE e.project_id = $1
+                    AND t.depth + 1 <= $3
+                    AND NOT (e.from_entity = ANY(t.path))
+                ),
+                combined AS (
+                  SELECT entity_name, depth, weight, from_e, edge_type, to_e
+                  FROM gt_out WHERE depth > 0 AND NOT (entity_name = ANY($2::text[]))
+                  UNION ALL
+                  SELECT entity_name, depth, weight, from_e, edge_type, to_e
+                  FROM gt_in  WHERE depth > 0 AND NOT (entity_name = ANY($2::text[]))
+                )
+                SELECT
+                  entity_name,
+                  MIN(depth) AS min_depth,
+                  MAX(weight) AS max_weight,
+                  (array_agg(from_e ORDER BY depth ASC, weight DESC))[1] AS rep_from,
+                  (array_agg(edge_type ORDER BY depth ASC, weight DESC))[1] AS rep_edge_type,
+                  (array_agg(to_e ORDER BY depth ASC, weight DESC))[1] AS rep_to
+                FROM combined
+                GROUP BY entity_name
+                ORDER BY min_depth ASC, max_weight DESC, entity_name ASC
+                LIMIT $4
+              `;
+            } else {
+              // Default: 'out' — follow outgoing edges from_entity → to_entity
+              cteReachSql = `
+                WITH RECURSIVE graph_traverse(entity_name, depth, weight, from_e, edge_type, to_e, path) AS (
+                  -- Base: seeds at depth 0
+                  SELECT
+                    unnest($2::text[]) AS entity_name,
+                    0                  AS depth,
+                    1.0::float         AS weight,
+                    ''::text           AS from_e,
+                    ''::text           AS edge_type,
+                    ''::text           AS to_e,
+                    ARRAY[unnest($2::text[])] AS path
+                  UNION ALL
+                  -- Recursive: follow edges OUTBOUND (from_entity → to_entity)
+                  SELECT
+                    e.to_entity        AS entity_name,
+                    t.depth + 1        AS depth,
+                    e.weight           AS weight,
+                    e.from_entity      AS from_e,
+                    e.edge_type        AS edge_type,
+                    e.to_entity        AS to_e,
+                    t.path || e.to_entity AS path
+                  FROM edges e
+                  JOIN graph_traverse t ON e.from_entity = t.entity_name
+                  WHERE e.project_id = $1
+                    AND t.depth + 1 <= $3
+                    AND NOT (e.to_entity = ANY(t.path))
+                )
+                SELECT
+                  entity_name,
+                  MIN(depth) AS min_depth,
+                  MAX(weight) AS max_weight,
+                  (array_agg(from_e ORDER BY depth ASC, weight DESC))[1] AS rep_from,
+                  (array_agg(edge_type ORDER BY depth ASC, weight DESC))[1] AS rep_edge_type,
+                  (array_agg(to_e ORDER BY depth ASC, weight DESC))[1] AS rep_to
+                FROM graph_traverse
+                WHERE depth > 0
+                  AND NOT (entity_name = ANY($2::text[]))
+                GROUP BY entity_name
+                ORDER BY min_depth ASC, max_weight DESC, entity_name ASC
+                LIMIT $4
+              `;
+            }
+
+            const { rows: graphRows } = await db.query(cteReachSql, [
+              projectId,
+              seeds,
+              maxDepth,
+              maxNodes,
+            ]);
+
+            if (graphRows.length > 0 && tokensUsed < tokenBudget) {
+              const graphText = graphRows.map((r) =>
+                `- ${r.entity_name} (depth ${r.min_depth}, via ${r.rep_from} -[${r.rep_edge_type}]-> ${r.rep_to})`
+              ).join('\n');
+              const graphSection = `### Related (graph)\n${graphText}`;
+              // Only add if budget allows.
+              const cost = Math.ceil(graphSection.length / 4);
+              if (tokensUsed + cost <= tokenBudget) {
+                sections.push(graphSection);
+                tokensUsed += cost;
+              }
+            }
+          }
+        }
+      } catch (graphErr) {
+        // Non-fatal: any error degrades gracefully (no graph section, no crash).
+        if (!silent) console.error(`[handoff] graph traversal error (non-fatal): ${graphErr.message}`);
       }
 
     } else if (q.type === 'vector' || q.kind === 'vector') {
