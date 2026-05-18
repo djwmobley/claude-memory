@@ -5,6 +5,13 @@
 **Panel:** Advocate, Skeptic, Domain Practitioner (all Opus, per session derivation)
 **Change size:** LARGE
 
+> **Status note (Commit B shipped 2026-05-17):** The decay-dormancy risk raised in Contested
+> Point 4 and Risk Register row 3 ("4C activates dormant decay → rarely-retrieved facts vanish")
+> is resolved by Commit B. The `>= 1.0` decay cutoff is removed from the loader WHERE clause;
+> decay is now a ranking-only signal and `LIMIT N` is the guaranteed top-N floor. Dormant rows
+> are never excluded by decay alone. The remaining contested points (predicate-key stability,
+> collapse mechanism, `suppressed` overloading) are not addressed by Commit B and remain open.
+
 ## Disposition
 **proceed-with-constraints** — The core direction (4A write-time supersession + 4C bump fix) is unanimously endorsed and the §2 root-cause diagnosis (FACT 4 project-wide bump defeats staleness — staleness is "decoration" until fixed) is praised by all three panelists as forensic and correct. However, one P0 defect (the `(subject, predicate)` natural-key instability under model-driven extraction) was independently raised by all three panelists and must be resolved in the plan before any implementation proceeds, and several mechanism choices remain contested and require an explicit documented decision from the plan author.
 

@@ -108,7 +108,12 @@ FACT 2). Ingesting 9 HANDOFF files that each include an assertion `Bundle A stat
 
 ### Step 2 — Retrieval has no collapse mechanism
 
-The assertion query at `scripts/handoff.js:947-952` (gate OFF, FACT 3):
+> **Note (Commit B shipped):** The `>= 1.0` decay cutoff shown in the SQL below was the
+> pre-Commit-B behavior. Commit B removes this cutoff; decay is now a ranking-only signal and
+> `LIMIT 30` is the guaranteed top-N floor. The collapse-mechanism defect analyzed in this
+> section (no `GROUP BY` / `DISTINCT ON`) is a separate problem, not addressed by Commit B.
+
+The assertion query (gate OFF, FACT 3, pre-Commit-B):
 
 ```sql
 SELECT id, subject, predicate, object, confidence, source
@@ -365,7 +370,8 @@ cardinality lookup adds a runtime dependency on the declared predicate registry.
 `scripts/handoff.js:938-943` (gate ON) to collapse same-subject rows to the best-ranked one
 per `(subject, predicate)`:
 
-Gate-OFF variant:
+Gate-OFF variant (illustrative; the `>= 1.0` cutoff is not present in the shipped loader
+after Commit B — decay is ranking-only):
 ```sql
 SELECT DISTINCT ON (subject, predicate)
   id, subject, predicate, object, confidence, source
@@ -373,8 +379,9 @@ FROM assertions
 WHERE project_id = $1
   AND ($2::text IS NULL OR subject = $2)
   AND suppressed = false
-  AND confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) >= 1.0
-ORDER BY subject, predicate, confidence DESC, last_reinforced DESC
+ORDER BY subject, predicate,
+         confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) DESC,
+         last_reinforced DESC
 LIMIT 30
 ```
 

@@ -994,36 +994,38 @@ async function cmdLoaderLoad(opts = {}) {
       }
 
     } else if (q.type === 'assertion' || q.kind === 'assertion') {
-      // C2: When feedback_loop_enabled='enabled', factor outcome_bias into both the suppression
-      // threshold and the ORDER BY so that positive bias promotes assertions and negative bias
-      // demotes them. effective_confidence = confidence * exp(-decay_rate * age_days) + outcome_bias.
+      // Commit B: decay is a ranking-only signal — it no longer gates rows out of the loader.
+      // Previously the WHERE clause enforced a >= 1.0 effective-confidence cutoff, which caused
+      // dormancy: any assertion not retrieved for ~6+ weeks decayed below 1.0 and was silently
+      // excluded, even though the data was intact in the DB. Fix: remove the decay cutoff from
+      // WHERE entirely; LIMIT 30 is now the guaranteed top-N floor. Suppressed rows are still
+      // excluded via suppressed = false.
+      //
+      // Gate ON (feedback_loop_enabled='enabled'): ORDER BY uses
+      //   confidence * exp(-decay_rate * age_days) + outcome_bias  (decayed score + feedback bias).
+      // Gate OFF: ORDER BY uses confidence * exp(-decay_rate * age_days) (decayed score only).
+      // The gate-ON/gate-OFF difference is now only the outcome_bias term in the ranking expression.
+      // outcome_bias semantics (gap 5b) are unchanged.
       //
       // Clamp design: outcome_bias is bounded by feedback_bias_clamp on write (see cmdClose).
-      // An assertion with confidence=1.0 at the floor and outcome_bias=-clamp could in theory
-      // go just below the 1.0 suppression threshold, which is the intended behavior for a
-      // repeatedly-unhelpful assertion. We use the same formula for both the WHERE filter and
-      // ORDER BY, so they are consistent.
-      //
-      // When gate is OFF: SQL is byte-identical to the pre-C2 query (no outcome_bias term).
       let assertionQuerySql;
       let assertionQueryParams;
       if (feedbackLoopEnabled === 'enabled') {
-        // Gate ON: incorporate outcome_bias into effective_confidence.
+        // Gate ON: rank by decayed score + outcome_bias; no cutoff filter.
         assertionQuerySql = `SELECT id, subject, predicate, object, confidence, source FROM assertions
          WHERE project_id = $1
            AND ($2::text IS NULL OR subject = $2)
            AND suppressed = false
-           AND (confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) + outcome_bias) >= 1.0
          ORDER BY (confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) + outcome_bias) DESC, last_reinforced DESC LIMIT 30`;
         assertionQueryParams = [projectId, q.filter?.subject || null];
       } else {
-        // Gate OFF: byte-identical to pre-C2 query.
+        // Gate OFF: rank by decayed score only (no outcome_bias term); no cutoff filter.
+        // ORDER BY is now the decayed expression, not the pre-C2 plain confidence order.
         assertionQuerySql = `SELECT id, subject, predicate, object, confidence, source FROM assertions
          WHERE project_id = $1
            AND ($2::text IS NULL OR subject = $2)
            AND suppressed = false
-           AND confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) >= 1.0
-         ORDER BY confidence DESC, last_reinforced DESC LIMIT 30`;
+         ORDER BY confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) DESC, last_reinforced DESC LIMIT 30`;
         assertionQueryParams = [projectId, q.filter?.subject || null];
       }
       const { rows } = await db.query(assertionQuerySql, assertionQueryParams);
@@ -1050,20 +1052,22 @@ async function cmdLoaderLoad(opts = {}) {
       }
 
     } else if (q.type === 'recency' || q.kind === 'recency') {
-      // C2: Same gate pattern as assertion kind — incorporate outcome_bias when enabled.
-      // Gate OFF: byte-identical to pre-C2 query. Gate ON: outcome_bias shifts threshold + rank.
+      // Commit B: decay cutoff removed from recency kind too — dormancy fix applies here.
+      // Recency queries are ordered by last_reinforced DESC regardless of gate state;
+      // decay is not factored into the ORDER BY for recency (recency stays recency-ordered).
+      // LIMIT 20 is the guaranteed top-N floor; suppressed = false still excludes suppressed rows.
       let recencyQuerySql;
       if (feedbackLoopEnabled === 'enabled') {
+        // Gate ON: no cutoff filter; recency order unchanged.
         recencyQuerySql = `SELECT id, subject, predicate, object, confidence FROM assertions
          WHERE project_id = $1
            AND suppressed = false
-           AND (confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) + outcome_bias) >= 1.0
          ORDER BY last_reinforced DESC LIMIT 20`;
       } else {
+        // Gate OFF: no cutoff filter; recency order unchanged.
         recencyQuerySql = `SELECT id, subject, predicate, object, confidence FROM assertions
          WHERE project_id = $1
            AND suppressed = false
-           AND confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400) >= 1.0
          ORDER BY last_reinforced DESC LIMIT 20`;
       }
       const { rows } = await db.query(recencyQuerySql, [projectId]);
