@@ -1051,6 +1051,408 @@ async function runSection14() {
   });
 }
 
+// ── SECTION 15: Prospective subject canonicalization (spine step 5, Option 2) ─
+async function runSection15() {
+  console.log('\n=== Section 15: Prospective subject canonicalization ===');
+
+  const { canonicalize, normalize, loadAliasMap, resetAliasMapCache } =
+    require('./lib/subject-canon');
+
+  // ── canonicalize() unit tests ─────────────────────────────────────────────────
+
+  await test('canonicalize: trims leading and trailing whitespace', () => {
+    assertEqual(canonicalize('  foo bar  '), 'foo bar');
+    assertEqual(canonicalize('\t foo \n'), 'foo');
+  });
+
+  await test('canonicalize: case-folds to lowercase', () => {
+    assertEqual(canonicalize('Claude-Memory Main'), 'claude-memory main');
+    assertEqual(canonicalize('UPPER CASE'), 'upper case');
+    assertEqual(canonicalize('MixEd CaSe'), 'mixed case');
+  });
+
+  await test('canonicalize: collapses internal whitespace to single space', () => {
+    assertEqual(canonicalize('foo   bar'), 'foo bar');
+    assertEqual(canonicalize('a\t\tb'), 'a b');
+    assertEqual(canonicalize('x  \n  y'), 'x y');
+  });
+
+  await test('canonicalize: trims + folds + collapses in combination', () => {
+    assertEqual(canonicalize('  Claude-Memory   Main  '), 'claude-memory main');
+    assertEqual(canonicalize('claude_memory main'), 'claude_memory main');
+    // Underscore is not whitespace — preserved.
+    assertEqual(canonicalize('  BUNDLE  A  STATUS  '), 'bundle a status');
+  });
+
+  await test('canonicalize: idempotent — canonicalize(canonicalize(x)) === canonicalize(x)', () => {
+    const inputs = [
+      '  My Project Main  ',
+      'claude-memory main',
+      'UPPER  CASE   String ',
+      '  already canonical  ',
+      'single',
+      '',
+    ];
+    for (const input of inputs) {
+      const once  = canonicalize(input);
+      const twice = canonicalize(once);
+      assertEqual(twice, once, `idempotency failed for input: ${JSON.stringify(input)}`);
+    }
+  });
+
+  await test('canonicalize: alias-map lookup returns mapped canonical form', () => {
+    // Inject a test alias map via cache reset + override.
+    resetAliasMapCache();
+    // Temporarily override require cache with a test map.
+    const subjectCanonPath = require.resolve('./lib/subject-canon');
+    const orig = require.cache[subjectCanonPath];
+    delete require.cache[subjectCanonPath];
+    // Write a temp alias map file, then restore.
+    const tempMapPath = require.resolve('./lib/subject-alias-map.json');
+    const origMap = fs.readFileSync(tempMapPath, 'utf8');
+    fs.writeFileSync(tempMapPath, JSON.stringify({
+      '_comment': 'test override',
+      'claude memory main': 'claude-memory main',
+      'my proj': 'my-project',
+    }));
+    try {
+      const freshMod = require('./lib/subject-canon');
+      assertEqual(freshMod.canonicalize('Claude Memory Main'), 'claude-memory main',
+        'alias: claude memory main → claude-memory main');
+      assertEqual(freshMod.canonicalize('MY  PROJ'), 'my-project',
+        'alias: my proj → my-project (after normalize)');
+      // No alias: normalizes but is not remapped
+      assertEqual(freshMod.canonicalize('unaliased subject'), 'unaliased subject',
+        'no alias: returns normalized form');
+    } finally {
+      fs.writeFileSync(tempMapPath, origMap);
+      delete require.cache[require.resolve('./lib/subject-canon')];
+      require.cache[subjectCanonPath] = orig;
+      resetAliasMapCache();
+    }
+  });
+
+  await test('canonicalize: alias-map values are idempotent through canonicalize', () => {
+    // If a canonical value is itself passed through canonicalize, it should return itself.
+    // This verifies the alias-map values are stored in normalized form.
+    resetAliasMapCache();
+    const subjectCanonPath = require.resolve('./lib/subject-canon');
+    const orig = require.cache[subjectCanonPath];
+    delete require.cache[subjectCanonPath];
+    const tempMapPath = require.resolve('./lib/subject-alias-map.json');
+    const origMap = fs.readFileSync(tempMapPath, 'utf8');
+    fs.writeFileSync(tempMapPath, JSON.stringify({
+      'alias form': 'canonical-form',  // canonical-form has no alias
+    }));
+    try {
+      const freshMod = require('./lib/subject-canon');
+      const val = freshMod.canonicalize('alias form');
+      assertEqual(val, 'canonical-form');
+      // Re-canonicalize the result: no alias entry for 'canonical-form', so it normalizes to itself.
+      const val2 = freshMod.canonicalize(val);
+      assertEqual(val2, val, 'alias map values should be stable under re-canonicalization');
+    } finally {
+      fs.writeFileSync(tempMapPath, origMap);
+      delete require.cache[require.resolve('./lib/subject-canon')];
+      require.cache[subjectCanonPath] = orig;
+      resetAliasMapCache();
+    }
+  });
+
+  // ── Integration: canonical write supersedes variant-spelled prior row ─────────
+
+  // Helper: apply SQLite schema to an in-memory DB.
+  async function makeSchemaDb() {
+    const db = new SQLiteAdapter(':memory:');
+    await db.connect();
+    const schemaSql = fs.readFileSync(
+      path.resolve(__dirname, 'sql', 'handoff-sqlite-schema.sql'), 'utf8'
+    );
+    await db.runSchema(schemaSql);
+    return db;
+  }
+
+  const PID = 'test-canon-s15';
+
+  await test('canonicalize: variant-spelled prior row is superseded; stored subject byte-unchanged (§7 proof)', async () => {
+    // This test proves:
+    //  (a) A new canonical write supersedes a pre-existing variant-spelled live row
+    //      (different casing/whitespace → same canonical form → treated as same subject).
+    //  (b) The prior row becomes suppressed=1, suppression_kind='superseded', invalid_at set.
+    //  (c) The prior row's stored subject column is byte-unchanged after the operation (§7).
+    //  (d) No UPDATE SET subject appears in the code path.
+    const db = await makeSchemaDb();
+    try {
+      // Insert a prior row with variant spelling (extra spaces, mixed case).
+      const variantSubject = 'claude-Memory  Main';  // variant: mixed case + double space
+      const canonicalSubject = canonicalize(variantSubject);  // expected: 'claude-memory main'
+
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
+         VALUES (?, ?, 'is_status', 'old_value', 7, 'user_stated')`,
+        [PID, variantSubject]
+      );
+
+      // Record the stored subject before suppression.
+      const { rows: preBefore } = await db.query(
+        `SELECT id, subject, suppressed, suppression_kind, invalid_at FROM assertions
+         WHERE project_id = ? ORDER BY id`, [PID]
+      );
+      assertEqual(preBefore.length, 1, 'should have 1 prior row');
+      assertEqual(preBefore[0].subject, variantSubject, 'prior row stored subject should be the variant spelling');
+      assertEqual(preBefore[0].suppressed, 0, 'prior row should be live initially');
+
+      // Simulate what writeAssertionWithSupersession does:
+      //   1. Canonicalize incoming subject.
+      //   2. Fetch candidate prior rows (by project_id, predicate, live).
+      //   3. In JS: filter by canonical match.
+      //   4. Suppress matched stored subjects via buildSupersessionUpdate.
+      //   5. INSERT new row with canonical subject.
+      const newSubject = '  CLAUDE-MEMORY   MAIN  ';  // same canonical form, different raw spelling
+      const canonNew = canonicalize(newSubject);
+      assertEqual(canonNew, canonicalSubject, 'pre-check: canonical forms match');
+
+      await db.query('BEGIN');
+      try {
+        // Step 1-3: fetch and match candidates.
+        const { rows: candidates } = await db.query(
+          `SELECT DISTINCT subject FROM assertions
+           WHERE project_id = ? AND predicate = 'is_status'
+             AND suppressed = false AND invalid_at IS NULL`,
+          [PID]
+        );
+        const toSuppress = candidates.filter((r) => canonicalize(r.subject) === canonNew);
+        assertEqual(toSuppress.length, 1, 'should match 1 candidate for suppression');
+        assertEqual(toSuppress[0].subject, variantSubject, 'matched candidate is the variant-spelled row');
+
+        // Step 4: suppress matched rows via buildSupersessionUpdate (passing stored subject).
+        for (const r of toSuppress) {
+          const stmt = db.buildSupersessionUpdate('1:1', PID, r.subject, 'is_status', null);
+          await db.query(stmt.sql, stmt.params);
+        }
+
+        // Step 5: INSERT new row with canonical subject.
+        await db.query(
+          `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
+           VALUES (?, ?, 'is_status', 'new_value', 8, 'user_stated')`,
+          [PID, canonNew]
+        );
+        await db.query('COMMIT');
+      } catch (err) {
+        await db.query('ROLLBACK');
+        throw err;
+      }
+
+      // Verify post-state.
+      const { rows: post } = await db.query(
+        `SELECT subject, object, suppressed, suppression_kind, invalid_at FROM assertions
+         WHERE project_id = ? ORDER BY id`, [PID]
+      );
+      assertEqual(post.length, 2, 'should have 2 rows (prior + new)');
+
+      const priorRow = post.find((r) => r.object === 'old_value');
+      const newRow   = post.find((r) => r.object === 'new_value');
+
+      // §7 proof: prior row's subject column is BYTE-UNCHANGED.
+      assertEqual(priorRow.subject, variantSubject,
+        '§7 proof: prior row stored subject must be the original variant spelling, not rewritten');
+
+      // Prior row is suppressed via PR-B path.
+      assertEqual(priorRow.suppressed, 1, 'prior row should be suppressed');
+      assertEqual(priorRow.suppression_kind, 'superseded', 'prior row suppression_kind should be superseded');
+      assertTrue(priorRow.invalid_at !== null, 'prior row invalid_at should be set');
+
+      // New row is live with canonical subject.
+      assertEqual(newRow.subject, canonNew, 'new row should have canonical subject');
+      assertEqual(newRow.suppressed, 0, 'new row should be live');
+      assertEqual(newRow.suppression_kind, null, 'new row suppression_kind should be NULL');
+      assertEqual(newRow.invalid_at, null, 'new row invalid_at should be NULL');
+    } finally { await db.end(); }
+  });
+
+  await test('canonicalize: 1:N exact duplicate semantics — variant subject + same predicate+object → duplicate', async () => {
+    // A 1:N assertion with a variant-spelled subject + same predicate + same object
+    // should be treated as an exact duplicate (suppresses the prior row).
+    const db = await makeSchemaDb();
+    try {
+      const variantSubject = 'Bundle  A';  // variant: double space
+      const canonSubject   = canonicalize(variantSubject);  // 'bundle a'
+      const pred = 'depends_on';
+      const obj  = 'some-dep';
+
+      // Insert prior row with variant spelling.
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
+         VALUES (?, ?, ?, ?, 5, 'user_stated')`,
+        [PID + '_1n', variantSubject, pred, obj]
+      );
+
+      // Now simulate a canonical write of the same (canonical-subject, predicate, object).
+      await db.query('BEGIN');
+      try {
+        const { rows: candidates } = await db.query(
+          `SELECT DISTINCT subject FROM assertions
+           WHERE project_id = ? AND predicate = ? AND object = ?
+             AND suppressed = false AND invalid_at IS NULL`,
+          [PID + '_1n', pred, obj]
+        );
+        const toSuppress = candidates.filter((r) => canonicalize(r.subject) === canonSubject);
+        for (const r of toSuppress) {
+          const stmt = db.buildSupersessionUpdate('1:N', PID + '_1n', r.subject, pred, obj);
+          await db.query(stmt.sql, stmt.params);
+        }
+        await db.query(
+          `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
+           VALUES (?, ?, ?, ?, 6, 'user_stated')`,
+          [PID + '_1n', canonSubject, pred, obj]
+        );
+        await db.query('COMMIT');
+      } catch (err) { await db.query('ROLLBACK'); throw err; }
+
+      const { rows: post } = await db.query(
+        `SELECT subject, object, suppressed FROM assertions
+         WHERE project_id = ? ORDER BY id`,
+        [PID + '_1n']
+      );
+      assertEqual(post.length, 2, 'should have 2 rows (prior + new)');
+      assertEqual(post.find((r) => r.object === obj && r.subject === variantSubject).suppressed, 1,
+        'prior variant-spelled row should be suppressed (treated as duplicate)');
+      assertEqual(post.find((r) => r.object === obj && r.subject === canonSubject).suppressed, 0,
+        'new canonical row should be live');
+    } finally { await db.end(); }
+  });
+
+  await test('canonicalize: 1:N different-object rows coexist under canonicalization', async () => {
+    // A 1:N write with different object → coexists; the prior row is NOT suppressed.
+    const db = await makeSchemaDb();
+    try {
+      const variantSubject = '  Bundle  B  ';
+      const canonSubject   = canonicalize(variantSubject);  // 'bundle b'
+      const pred = 'depends_on';
+
+      // Insert prior row with dep-A.
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
+         VALUES (?, ?, ?, 'dep-A', 5, 'user_stated')`,
+        [PID + '_coex', variantSubject, pred]
+      );
+
+      // Write with canonical subject but DIFFERENT object (dep-B) → no suppression of prior.
+      await db.query('BEGIN');
+      try {
+        const { rows: candidates } = await db.query(
+          `SELECT DISTINCT subject FROM assertions
+           WHERE project_id = ? AND predicate = ? AND object = 'dep-B'
+             AND suppressed = false AND invalid_at IS NULL`,
+          [PID + '_coex', pred]
+        );
+        const toSuppress = candidates.filter((r) => canonicalize(r.subject) === canonSubject);
+        // toSuppress should be empty — no prior row for dep-B.
+        for (const r of toSuppress) {
+          const stmt = db.buildSupersessionUpdate('1:N', PID + '_coex', r.subject, pred, 'dep-B');
+          await db.query(stmt.sql, stmt.params);
+        }
+        await db.query(
+          `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
+           VALUES (?, ?, ?, 'dep-B', 6, 'user_stated')`,
+          [PID + '_coex', canonSubject, pred]
+        );
+        await db.query('COMMIT');
+      } catch (err) { await db.query('ROLLBACK'); throw err; }
+
+      const { rows: post } = await db.query(
+        `SELECT subject, object, suppressed FROM assertions
+         WHERE project_id = ? ORDER BY object`,
+        [PID + '_coex']
+      );
+      assertEqual(post.length, 2, 'both rows should coexist');
+      assertEqual(post.find((r) => r.object === 'dep-A').suppressed, 0,
+        'dep-A row should remain live (different object)');
+      assertEqual(post.find((r) => r.object === 'dep-B').suppressed, 0,
+        'dep-B row should be live (new)');
+    } finally { await db.end(); }
+  });
+
+  await test('canonicalize: §7 proof — no code path issues UPDATE SET subject on existing rows', () => {
+    // Static analysis: grep handoff.js for UPDATE ... SET subject patterns.
+    // Any UPDATE that sets subject on existing rows would be a §7 violation.
+    const engineSrc = fs.readFileSync(path.resolve(__dirname, 'handoff.js'), 'utf8');
+    // Pattern: UPDATE <table> SET ... subject = ...  (any form)
+    // We look for an UPDATE statement that includes both 'SET' and 'subject =' in sequence.
+    // This is a conservative over-approximation; false positives require manual review.
+    const lines = engineSrc.split('\n');
+    let inUpdateBlock = false;
+    let updateBlockContent = '';
+    for (const line of lines) {
+      const upper = line.trim().toUpperCase();
+      if (/^\s*`?UPDATE\b/i.test(line)) {
+        inUpdateBlock = true;
+        updateBlockContent = line;
+      } else if (inUpdateBlock) {
+        updateBlockContent += ' ' + line;
+        // An UPDATE block ends at the next backtick (template literal end) or semicolon
+        if (line.includes('`') || line.trim().endsWith(';')) {
+          inUpdateBlock = false;
+          // Check if this UPDATE block sets the subject column.
+          // Allow: SET subject = ... in INSERT context (but we're in UPDATE block).
+          if (/SET\b[^`]*\bsubject\s*=/i.test(updateBlockContent)) {
+            throw new Error(
+              `§7 VIOLATION: found UPDATE that sets subject column in handoff.js:\n` +
+              updateBlockContent.slice(0, 300)
+            );
+          }
+          updateBlockContent = '';
+        }
+      }
+    }
+  });
+
+  await test('canonicalize: handoff.js imports subject-canon module', () => {
+    const engineSrc = fs.readFileSync(path.resolve(__dirname, 'handoff.js'), 'utf8');
+    assertTrue(
+      engineSrc.includes("require('./lib/subject-canon')"),
+      "handoff.js should require('./lib/subject-canon')"
+    );
+    assertTrue(
+      engineSrc.includes('canonicalize'),
+      'handoff.js should use canonicalize from subject-canon'
+    );
+  });
+
+  await test('canonicalize: writeAssertionWithSupersession uses canonical subject for INSERT', () => {
+    const engineSrc = fs.readFileSync(path.resolve(__dirname, 'handoff.js'), 'utf8');
+    // The INSERT in writeAssertionWithSupersession must use canonSubject, not ass.subject.
+    // Find the function body.
+    const fnStart = engineSrc.indexOf('async function writeAssertionWithSupersession(');
+    assertTrue(fnStart !== -1, 'writeAssertionWithSupersession must exist');
+    // Find the end of the function (next top-level async function).
+    const fnEnd = engineSrc.indexOf('\nasync function ', fnStart + 1);
+    const fnBody = fnEnd !== -1
+      ? engineSrc.slice(fnStart, fnEnd)
+      : engineSrc.slice(fnStart);
+    assertTrue(
+      fnBody.includes('canonSubject'),
+      'writeAssertionWithSupersession should compute canonSubject'
+    );
+    // The INSERT VALUES should pass canonSubject (not ass.subject) for the subject param.
+    // Check that canonSubject appears as an INSERT parameter.
+    assertTrue(
+      fnBody.includes('canonSubject,') || fnBody.includes('canonSubject]'),
+      'writeAssertionWithSupersession INSERT should use canonSubject as the subject value'
+    );
+    // Confirm ass.subject is NOT directly used as the subject INSERT parameter.
+    // (It is still used for classification/lookup, but not in the final INSERT subject param.)
+    const insertMatch = fnBody.match(/INSERT INTO assertions[\s\S]*?VALUES[\s\S]*?\[([^\]]+)\]/);
+    if (insertMatch) {
+      const params = insertMatch[1];
+      assertTrue(
+        !params.split(',').some((p) => p.trim() === 'ass.subject'),
+        'INSERT params should not pass ass.subject directly as the subject value'
+      );
+    }
+  });
+}
+
 // ── Run all sections ──────────────────────────────────────────────────────────
 (async () => {
   console.log(`\ntest-sqlite-seam.js (Node ${process.versions.node})\n`);
@@ -1069,6 +1471,7 @@ async function runSection14() {
   await runSection12();
   await runSection13();
   await runSection14();
+  await runSection15();
 
   console.log(`\n─── Results ──────────────────────────────────────`);
   console.log(`PASS ${passed}  FAIL ${failed}`);

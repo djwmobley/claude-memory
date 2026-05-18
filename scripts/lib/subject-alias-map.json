@@ -1,0 +1,6 @@
+{
+  "_comment": "Subject alias map for prospective canonicalization (spine step 5, Option 2).",
+  "_usage": "Keys are normalized alias forms (already trimmed, lowercased, whitespace-collapsed). Values are the canonical subject strings (also normalized). Canonicalization order: normalize(trim+lowercase+collapse) first, then alias-map lookup on the normalized form. Add entries here to redirect variant subject spellings to their canonical form.",
+  "_example": "\"my project main\" → \"my-project main\" (if dashes are preferred in the canonical name)",
+  "_corpus_mutation": "ZERO. This map affects only NEW inserts going forward. Existing rows are never rewritten."
+}

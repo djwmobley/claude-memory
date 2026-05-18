@@ -45,6 +45,7 @@ const {
   resolveDialect, createAdapter, createInitProbe,
   resolveSQLiteDbPath,
 } = require('./lib/db-seam');
+const { canonicalize }                             = require('./lib/subject-canon');
 
 process.on('exit', () => {
   const ms = Number(process.hrtime.bigint() - __startNs) / 1e6;
@@ -1457,9 +1458,35 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
   const source = ['user_stated', 'model_extracted', 'doc_quoted', 'retrieved_from_prior'].includes(ass.source)
     ? ass.source : 'model_extracted';
 
+  // ── Spine step 5: prospective subject canonicalization (Option 2, §7-honoring) ──
+  //
+  // Canonicalize the incoming subject: trim + lowercase + collapse whitespace + alias-map.
+  // The NEW row is inserted with the canonical subject.
+  //
+  // Canonical-aware supersession match (application-code approach — dialect-neutral):
+  //   We fetch candidate prior live rows scoped to (project_id, predicate [+ object for 1:N]),
+  //   canonicalize each stored subject in JS, and identify those whose canonical form equals
+  //   the new canonical subject.  We then suppress those rows by calling buildSupersessionUpdate
+  //   with their stored subject (so the existing PR-B mechanism handles dialect-specific
+  //   boolean/timestamp SQL — zero new dialect conditionals in the engine).
+  //
+  //   Rationale: dialect-specific SQL expressions like lower(regexp_replace(...)) are NOT
+  //   portable — SQLite (node:sqlite, zero extensions) has no regexp_replace.  The
+  //   application-code approach uses only plain SELECT + the existing suppression port method,
+  //   both already dialect-neutral.
+  //
+  // §7 zero-corpus-mutation guarantee:
+  //   The ONLY writes are: (a) the new INSERT with canonical subject, and (b) the existing
+  //   PR-B suppression mechanism setting suppressed/invalid_at/suppression_kind on matched rows.
+  //   We NEVER issue UPDATE assertions SET subject = ... on any existing row.
+  //   A matched prior row's stored subject column is NOT modified — it retains its original
+  //   byte-for-byte value.  The suppression path (buildSupersessionUpdate) writes only
+  //   suppressed, invalid_at, and suppression_kind — never the subject column.
+  const canonSubject = canonicalize(ass.subject);
+
   // Wrap suppress+INSERT in an explicit transaction (atomicity requirement I-A mechanism-a).
   //
-  // PR-B: supersession is now enriched via db.buildSupersessionUpdate() which sets:
+  // PR-B: supersession is enriched via db.buildSupersessionUpdate() which sets:
   //   suppressed = true, invalid_at = now(), suppression_kind = 'superseded'
   // on the prior live row(s).  Rows with pinned = true are EXEMPT from auto-suppression
   // here — they are skipped by buildSupersessionUpdate's WHERE clause.
@@ -1469,17 +1496,75 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
   // The new INSERT also sets valid_at = now() to record when the assertion became live.
   await db.query('BEGIN');
   try {
-    // buildSupersessionUpdate encapsulates dialect-specific SQL (Postgres vs SQLite booleans).
-    const supersessionStmt = db.buildSupersessionUpdate(
-      cardinality, projectId, ass.subject, ass.predicate, ass.object
-    );
-    await db.query(supersessionStmt.sql, supersessionStmt.params);
+    // ── Step 1: Canonical-aware match — find prior live rows to suppress ──────────
+    //
+    // Fetch candidate rows using only the non-subject scope keys (project_id, predicate
+    // [+ object for 1:N]), suppressed=false AND invalid_at IS NULL, non-pinned.
+    // Canonicalize each stored subject in JS.  Collect the stored subjects of rows whose
+    // canonical form equals canonSubject — these are the rows to suppress.
+    //
+    // We group by stored subject so that each unique stored subject triggers exactly one
+    // buildSupersessionUpdate call.  This handles both the exact-match case (stored subject
+    // already canonical) and the variant-spelling case (stored subject differs in case/whitespace
+    // but maps to the same canonical form).
+    // Note on pinned guard: we omit the pinned filter from the candidate SELECT intentionally.
+    // buildSupersessionUpdate already guards on pinned (= 0 for SQLite, = false OR IS NULL for
+    // Postgres) — so even if a pinned candidate is collected here, it will be skipped by the
+    // UPDATE's WHERE clause.  Omitting the pinned filter here keeps the SELECT dialect-neutral
+    // (no boolean literal that differs between backends).
+    const storedSubjectsToSuppress = new Set();
+    if (cardinality === '1:1') {
+      const { rows: candidates } = await db.query(
+        `SELECT DISTINCT subject FROM assertions
+         WHERE project_id = $1
+           AND predicate  = $2
+           AND suppressed = false
+           AND invalid_at IS NULL`,
+        [projectId, ass.predicate]
+      );
+      for (const r of candidates) {
+        if (canonicalize(r.subject) === canonSubject) {
+          storedSubjectsToSuppress.add(r.subject);
+        }
+      }
+    } else {
+      // 1:N: only exact (project_id, subject[canonical], predicate, object) duplicates.
+      const { rows: candidates } = await db.query(
+        `SELECT DISTINCT subject FROM assertions
+         WHERE project_id = $1
+           AND predicate  = $2
+           AND object     = $3
+           AND suppressed = false
+           AND invalid_at IS NULL`,
+        [projectId, ass.predicate, ass.object]
+      );
+      for (const r of candidates) {
+        if (canonicalize(r.subject) === canonSubject) {
+          storedSubjectsToSuppress.add(r.subject);
+        }
+      }
+    }
 
+    // ── Step 2: Suppress matched prior rows via the existing PR-B port method ────
+    //
+    // buildSupersessionUpdate(cardinality, projectId, storedSubject, predicate, object)
+    // matches on the exact stored subject in its WHERE clause.  Passing the stored subject
+    // (not the canonical one) ensures it hits the exact rows we identified above.
+    // This reuses the existing mechanism without modification — the subject column of
+    // the matched rows is NEVER updated (only suppressed/invalid_at/suppression_kind).
+    for (const storedSubject of storedSubjectsToSuppress) {
+      const supersessionStmt = db.buildSupersessionUpdate(
+        cardinality, projectId, storedSubject, ass.predicate, ass.object
+      );
+      await db.query(supersessionStmt.sql, supersessionStmt.params);
+    }
+
+    // ── Step 3: INSERT the new row with canonical subject ─────────────────────────
     await db.query(
       `INSERT INTO assertions
          (project_id, subject, predicate, object, confidence, source, session_id, last_reinforced, valid_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now())`,
-      [projectId, ass.subject, ass.predicate, ass.object, conf, source, sessionId]
+      [projectId, canonSubject, ass.predicate, ass.object, conf, source, sessionId]
     );
 
     await db.query('COMMIT');
