@@ -224,3 +224,59 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run payload-schema unit tests
+        # Tests scripts/lib/payload-schema.js directly (no DB required):
+        #   T1  buildPayloadSchema() returns expected top-level structure
+        #   T2  valid payload with empty arrays accepted
+        #   T3  recognized predicate — ok=true, no warnings, no errors
+        #   T4  missing assertions array treated as valid
+        #   T5  assertions not an array — error
+        #   T6  assertion item not a plain object — error
+        #   T7  null predicate skipped (not a vocabulary error)
+        #   T8  numeric predicate — error
+        #   T9  unrecognized predicate in permissive mode — warning, ok=true
+        #   T10 unrecognized predicate in strict mode — error, ok=false
+        #   T11 recognized predicate in strict mode — ok, no error, no warning
+        #   T12 empty payload object — ok=true
+        #   T13 null payload — error
+        #   T14 array payload — error
+        #   T15 CRLF in string fields validates same as LF (line-ending invariant)
+        #   T16 mixed CRLF/LF validates same as LF
+        #   T17 schema predicate enum matches recognizedPredicates()
+        # Pure unit test — no Postgres or Ollama required.
+        run: node scripts/test-payload-schema.js
+      - name: Run async-queue state-machine tests
+        # Tests the async extraction queue paths in handoff.js via subprocess:
+        #   T1  Enqueue creates a pending row (extraction_async_enabled=true)
+        #   T2  Queue-drain processes pending→done
+        #   T3  session_id absent + session_in_progress cleared — no crash,
+        #       entities written with null sessionId (documented L4-degraded behavior)
+        #   T4  Idempotent re-drain: done row not re-processed
+        #   T5  Empty queue drain — clean no-op, exit 0
+        # Requires Postgres (uses throwaway DB); skips gracefully if unavailable.
+        run: node scripts/test-async-queue.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: Run config-loading unit tests
+        # Tests loadConfig and findProjectRoot in scripts/lib/shared.js:
+        #   T1  Pure LF pipeline.yml parses correctly (baseline)
+        #   T2  Pure CRLF parses to byte-identical values as LF — no \r in any value
+        #   T3  Mixed CRLF/LF — same no-\r guarantee
+        #   T4  Absent pipeline.yml falls back to documented defaults
+        #   T5  findProjectRoot honors PROJECT_ROOT env var
+        #   T6  findProjectRoot walks up from cwd to .git
+        #   T7  project name derived from root directory basename (no config)
+        #   T8  knowledge object has all required fields in no-config fallback
+        # Pure file-system unit test — no Postgres or Ollama required.
+        run: node scripts/test-config-loading.js
+      - name: Run OS-portability invariant assertions
+        # Static invariant sweep over the source tree — mirrors S8/S9/S10 style:
+        #   P1  pg connection is OS-uniform (no platform branch in connectHandoff)
+        #   P2  no shell:true anywhere in scripts/, hooks/, test/
+        #   P3  only sanctioned platform branch is shared.js runWinBin
+        #   P4  marker/handoff writes are LF-only (static + behavioral)
+        #   P5  no POSIX-only assumptions in test suite (no hardcoded /tmp, etc.)
+        # Pure static analysis — no Postgres or Ollama required.
+        run: node scripts/test-os-portability.js
