@@ -416,7 +416,7 @@ change.
 Design notes and methodology write-ups for the project:
 
 - [**Decay vs. Don't-Forget: Devalue, Invalidate, and On-Demand Resurrection**](docs/studies/decay-vs-dont-forget-and-resurrection.md)
-  — How aggressive time-decay and strict trust-tiering can compound to sink valuable older context below the retrieval horizon; the devalue-vs-invalidate distinction that makes on-demand resurrection safe; the adversarial guard that must ship alongside any decay-override mechanism; and the iterative replication discipline that corrected two overstatements before conclusions were accepted.
+  — Designed and shipped case study tracing the full journey from problem to production: how decay and trust-tiering compound to sink valuable older context; the devalue-vs-invalidate spine that makes recovery safe; and three proven mechanisms shipped as one mutually-dependent ring — (1) devalue-over-delete with a bitemporal guard that hard-excludes terminal/superseded rows, (2) operator-pin for foundational facts that must survive decay permanently via a non-model-invocable standalone tool, and (3) fuzzy resurrection combining semantic seed, pg_trgm trigram fallback, and depth-2 graph fan-out. Includes the adversarial finding (why all three had to ship together), and the two-question replication discipline that caught and corrected two author overstatements before conclusions were accepted.
 
 - [**claude-memory vs. Alternatives: Was the Build Justified?**](docs/studies/2026-05-memory-systems-comparison.md)
   — Code-grounded comparison against agentmemory, mem0, Letta/MemGPT, Graphiti/Zep, and Cognee.
