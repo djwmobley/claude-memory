@@ -265,15 +265,25 @@ async function testT2GenuineCorroborationN() {
 
     db = await pgConnect(dbName);
     await setSetting(db, projectId, 'consolidation_corroboration_gate', 'enforce');
+    // L2 quality-corroborator requirement: with consolidation_gate_mode='enforce' (now
+    // the default), genuine cross-session corroboration ALSO requires the corroborating
+    // prior row to be independently trustworthy (reality_check='verified' OR pinned=true).
+    // This test sets reality_check='verified' on the prior row so the L2 arm(b)
+    // quality-corroborator predicate passes. This is the correct post-L2 behavior:
+    // genuine corroboration by a trusted source → consolidated; by an unverified
+    // source → probationary (the L2 patient-adversary gate).
+    // consolidation_gate_mode defaults to 'enforce' from cmdInit; no explicit set needed.
 
     // Inject a prior persisted row directly — simulates a prior close from a different session.
     // The predicate 'has_tag' is 1:N; we insert with a distinct session_id.
+    // reality_check='verified' satisfies the L2 quality-corroborator gate (arm a/b).
     const priorSessionId = `l0-t2-prior-session-${TS}`;
     await db.query(
       `INSERT INTO assertions
          (project_id, subject, predicate, object, confidence, source, session_id,
-          last_reinforced, valid_at, tier, consolidated_at, corroboration_count)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now(), $8, NULL, 1)`,
+          last_reinforced, valid_at, tier, consolidated_at, corroboration_count,
+          reality_check)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now(), $8, NULL, 1, 'verified')`,
       [projectId, 'project', 'has_tag', 'l0-test-genuine-n',
        9, 'user_stated', priorSessionId, 'probationary']
     );
@@ -348,15 +358,21 @@ async function testT3GenuineCorroboration1() {
 
     db = await pgConnect(dbName);
     await setSetting(db, projectId, 'consolidation_corroboration_gate', 'enforce');
+    // L2 quality-corroborator requirement: same as T2. The prior row must have
+    // reality_check='verified' OR pinned=true to satisfy L2 arm(a/b) under the
+    // new 'enforce' default. This mirrors the expected production path where a
+    // verified prior row provides the trust anchor for consolidation.
 
     // Inject a prior persisted row for a 1:1 predicate ('is_at_commit' is 1:1).
     // Use a well-known 1:1 predicate from the registry.
+    // reality_check='verified' satisfies the L2 quality-corroborator gate.
     const priorSessionId = `l0-t3-prior-session-${TS}`;
     await db.query(
       `INSERT INTO assertions
          (project_id, subject, predicate, object, confidence, source, session_id,
-          last_reinforced, valid_at, tier, consolidated_at, corroboration_count)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now(), $8, NULL, 1)`,
+          last_reinforced, valid_at, tier, consolidated_at, corroboration_count,
+          reality_check)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now(), $8, NULL, 1, 'verified')`,
       [projectId, 'project', 'is_at_commit', 'abc123corroboration',
        9, 'user_stated', priorSessionId, 'probationary']
     );
@@ -601,8 +617,12 @@ async function testT6DisabledByteIdentical() {
     projectId = await setupProject(dbName, projectDir);
 
     db = await pgConnect(dbName);
-    // Explicitly disable the L0 gate.
+    // Explicitly disable both the L0 gate and the L2 gate mode to get the full
+    // pre-L0/pre-L2 behavior: a self-stamped conf=9 close produces consolidated.
+    // As of the L2-enforce ring, consolidation_gate_mode defaults to 'enforce',
+    // so T6 must also disable it to reproduce the pre-gate baseline.
     await setSetting(db, projectId, 'consolidation_corroboration_gate', 'disabled');
+    await setSetting(db, projectId, 'consolidation_gate_mode', 'disabled');
     await db.end(); db = null;
 
     // Single close: source='user_stated', confidence=9, no prior corroboration.

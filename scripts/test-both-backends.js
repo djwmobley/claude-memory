@@ -1522,11 +1522,17 @@ async function runS11() {
   // ── S11.2: Write/Hybrid trigger tests ───────────────────────────────────────
 
   await bothBackends(
-    'S11.2a: user_stated + conf=9 → tier=consolidated, consolidated_at set (high-trust path)',
+    'S11.2a: user_stated + conf=9 → tier=consolidated, consolidated_at set (high-trust path, L0 disabled mode)',
     async (db) => {
       const { writeAssertionWithSupersession } = requireHandoffFunctions();
       const PID = 's11-2a';
       await db.query(`INSERT INTO project_settings (project_id,key,value) VALUES ($1,'predicate_registry_mode','permissive') ON CONFLICT DO NOTHING`, [PID]);
+      // Set consolidation_gate_mode='disabled' so the L0 high-trust path (user_stated conf>=9
+      // → consolidated) is exercised without the L2 quality-corroborator requirement.
+      // Under enforce (default since L2), isHighTrust alone cannot consolidate — a quality
+      // corroborator is needed. This test specifically validates the L0 isHighTrust property,
+      // so it explicitly opts the project into L0 baseline behavior (gate disabled).
+      await db.query(`INSERT INTO project_settings (project_id,key,value) VALUES ($1,'consolidation_gate_mode','disabled') ON CONFLICT (project_id,key) DO UPDATE SET value=EXCLUDED.value`, [PID]);
       await writeAssertionWithSupersession(db, PID,
         { subject: 'proj', predicate: 'depends_on', object: 'obj-a', confidence: 9, source: 'user_stated' },
         'sess-A', 'permissive'
@@ -1596,6 +1602,18 @@ async function runS11() {
       );
       assertEqual(firstRows.length, 1, 'S11.2d: first write → 1 live row');
       assertEqual(firstRows[0].tier, 'probationary', 'S11.2d: first row probationary');
+
+      // Stamp reality_check='verified' on the first row — mirrors T2/T3 in test-l0-consolidation-gate.js.
+      // Under consolidation_gate_mode='enforce' (default since L2), cross-session repetition alone
+      // is insufficient; the L2 quality-corroborator gate (arm b) requires >=1 prior row with
+      // reality_check='verified' OR pinned=true. Stamping the prior row verified provides the
+      // quality anchor so the second write from sess-B fires arm b → consolidated.
+      await db.query(
+        `UPDATE assertions SET reality_check = 'verified'
+         WHERE project_id = $1 AND subject = 'proj' AND predicate = 'depends_on'
+           AND object = 'corrobobj' AND suppressed = false`,
+        [PID]
+      );
 
       // Second write from DIFFERENT session B (same triple) → corroboration → consolidated
       await writeAssertionWithSupersession(db, PID,
@@ -4931,6 +4949,17 @@ async function runS18() {
       const pid = `s18-3-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const ass = { subject: 's18-subj-cross', predicate: 'depends_on', object: 's18-obj-cross', confidence: 7, source: 'model_extracted' };
       await writeAssertionWithSupersession(db, pid, ass, SESSION_A);
+      // Stamp reality_check='verified' on the first row (from SESSION_A) before the second write.
+      // Under consolidation_gate_mode='enforce' (default since L2), arm(b) requires >=1 prior
+      // cross-session row with reality_check='verified' OR pinned=true. Without this stamp,
+      // hasQualityCorroborator=false and the second write produces probationary, not consolidated.
+      // This mirrors the T2/T3 fixture-upgrade in test-l0-consolidation-gate.js.
+      await db.query(
+        `UPDATE assertions SET reality_check = 'verified'
+         WHERE project_id = $1 AND subject = 's18-subj-cross' AND predicate = 'depends_on'
+           AND object = 's18-obj-cross' AND suppressed = false`,
+        [pid]
+      );
       await writeAssertionWithSupersession(db, pid, ass, SESSION_B); // different session
       const { rows } = await db.query(
         `SELECT tier, corroboration_count, suppressed FROM assertions
