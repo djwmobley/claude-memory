@@ -1600,7 +1600,7 @@ async function cmdLoaderLoad(opts = {}) {
       //      Terminal-is-terminal is an enforced invariant (test-both-backends S3).
       //   2. M2 seed-gate: only assertions whose subject/entity is corroborated by a trusted
       //      anchor may be resurrected. Trusted = reality_check='verified' OR pinned=true
-      //      (the same quality-corroborator predicate used by L2 at :2098-2099).
+      //      (the same quality-corroborator predicate L2 consolidation uses — see hasQualityCorroborator).
       //      This prevents a forged probationary row from self-resurrecting.
       //   3. Semantic seed: uses v_memory_hits cosine path when Ollama is available.
       //      Degrades to pg_trgm fuzzy match (db.buildFuzzyMatch) under OLLAMA_SKIP=1.
@@ -1713,7 +1713,7 @@ async function cmdLoaderLoad(opts = {}) {
 
           // ── Step 3: Filter by M2 seed-gate (trusted anchor required) ─────────
           // Only resurrect assertions whose subject has at least one trusted anchor:
-          //   reality_check='verified' OR pinned=true  (L2 :2098-2099 predicate).
+          //   reality_check='verified' OR pinned=true  (the L2 hasQualityCorroborator predicate).
           let trustedSubjects = [];
           if (candidateSubjects.length > 0) {
             const { clause: tsClauses, params: tsContainsParams } =
