@@ -121,10 +121,13 @@ function loadConfig() {
 
 async function connect(config) {
   const cfg = config || loadConfig();
+  // PGDATABASE env override allows callers (e.g. eval-retrieval's loader subprocess)
+  // to direct the connection at a different DB without modifying pipeline.yml.
+  const database = process.env.PGDATABASE || cfg.database;
   const client = new Client({
     host: cfg.host,
     port: cfg.port,
-    database: cfg.database,
+    database,
     user: cfg.user,
   });
   await client.connect();
