@@ -439,6 +439,109 @@ async function sectionR3(dbName, projectDir, projectId) {
   }
 }
 
+// ── SECTION R-3c: Budget-blocked revive guard ────────────────────────────────
+//
+// When resurrect_token_budget is tiny (e.g. 50 tokens), the section cannot be
+// emitted. With revive:true, this must:
+//   (a) produce NO ### Resurrected section in output
+//   (b) leave probation rows still suppressed (NOT revived in the DB)
+//   (c) emit a skip warning on stderr
+
+async function sectionR3c(dbName, projectDir, projectId) {
+  console.log('\n--- R-3c: Budget-blocked revive guard ---');
+
+  const db = await pgConnect(dbName);
+  let probationIds = [];
+  try {
+    // Trusted anchor for entity-Rc.
+    await insertAssertionDirect(db, projectId, {
+      subject: 'entity-Rc', predicate: 'status', object: 'budget-block-anchor',
+      source: 'user_stated', confidence: 9.0, pinned: true, suppressed: false,
+    });
+
+    // Insert several probation rows so there is definitely content to revive.
+    for (let i = 0; i < 5; i++) {
+      const id = await insertAssertionDirect(db, projectId, {
+        subject: 'entity-Rc', predicate: 'uses', object: `budget-blocked-item-${i}`,
+        suppressed: true, suppressionKind: 'downvoted_probation',
+      });
+      probationIds.push(id);
+    }
+
+    // Extremely tiny sub-budget (50 tokens ~ 200 chars) — section header alone is ~46 chars;
+    // combined section with any rows exceeds this, so the section must be suppressed.
+    await setSetting(db, projectId, 'resurrect_token_budget', '50');
+    await setSetting(db, projectId, 'loader_token_budget',   '4000');
+
+    // Contract with revive:true — the DB mutation must NOT fire if section is suppressed.
+    await setContract(db, projectId, [
+      { kind: 'resurrect', seed: 'entity-Rc', revive: true },
+    ]);
+  } finally {
+    await db.end();
+  }
+
+  const r = runLoaderLoad(dbName, projectDir);
+  const out    = r.stdout || '';
+  const errOut = r.stderr || '';
+
+  // R-3c-a: loader must not crash.
+  if (r.status === 0) {
+    pass('R-3c-a', 'budget-blocked revive does not crash loader');
+  } else {
+    fail('R-3c-a', 'budget-blocked revive does not crash loader',
+      `loader exited ${r.status}: ${errOut.slice(0, 200)}`);
+  }
+
+  // R-3c-b: no ### Resurrected section in output (section must be suppressed).
+  if (!out.includes('### Resurrected')) {
+    pass('R-3c-b', 'no ### Resurrected section emitted when budget is exhausted');
+  } else {
+    fail('R-3c-b', 'no ### Resurrected section emitted when budget is exhausted',
+      '### Resurrected appeared — section emitted despite tiny budget');
+  }
+
+  // R-3c-c: probation rows must still be suppressed (NOT revived) in the DB.
+  if (probationIds.length > 0) {
+    const db2 = await pgConnect(dbName);
+    try {
+      const { rows } = await db2.query(
+        `SELECT id, suppressed, suppression_kind FROM assertions WHERE id = ANY($1::int[])`,
+        [probationIds]
+      );
+      const allStillSuppressed = rows.every(
+        (row) => row.suppressed === true && row.suppression_kind === 'downvoted_probation'
+      );
+      if (allStillSuppressed) {
+        pass('R-3c-c', 'probation rows remain suppressed after budget-blocked revive (DB mutation not fired)');
+      } else {
+        const revived = rows.filter((row) => !row.suppressed);
+        fail('R-3c-c', 'probation rows remain suppressed after budget-blocked revive',
+          `${revived.length} of ${rows.length} rows were revived despite section being suppressed`);
+      }
+    } finally {
+      await db2.end();
+    }
+  }
+
+  // R-3c-d: skip warning must be emitted on stderr (revival-skipped non-silent warning).
+  const warnLower = errOut.toLowerCase();
+  if (warnLower.includes('revival') && warnLower.includes('skip')) {
+    pass('R-3c-d', 'skip warning emitted on stderr when revival is blocked by budget');
+  } else {
+    fail('R-3c-d', 'skip warning emitted on stderr when revival is blocked by budget',
+      `expected "revival" + "skip" in stderr, got: ${errOut.slice(0, 300)}`);
+  }
+
+  // Reset sub-budget to default for subsequent sections.
+  const db3 = await pgConnect(dbName);
+  try {
+    await setSetting(db3, projectId, 'resurrect_token_budget', '1500');
+  } finally {
+    await db3.end();
+  }
+}
+
 // ── SECTION R-4: Default-contract byte-identical ──────────────────────────────
 
 async function sectionR4(dbName, projectDir, projectId) {
@@ -715,6 +818,7 @@ async function main() {
     await sectionR1(DB_NAME, projectDir, projectId);
     await sectionR2(DB_NAME, projectDir, projectId);
     await sectionR3(DB_NAME, projectDir, projectId);
+    await sectionR3c(DB_NAME, projectDir, projectId);
     await sectionR4(DB_NAME, projectDir, projectId);
     await sectionR5(DB_NAME, projectDir, projectId);
     await sectionR6(DB_NAME, projectDir, projectId);

@@ -1594,6 +1594,14 @@ async function cmdLoaderLoad(opts = {}) {
     } else if (q.type === 'resurrect' || q.kind === 'resurrect') {
       // Resurrect kind: on-demand revival of decay-suppressed (downvoted_probation) rows.
       //
+      // DIALECT CONTRACT: the resurrect branch runs exclusively on the Postgres loader
+      // path. The SQLite adapter arm is not exercised by the loader. All inline queries
+      // in this branch use Postgres boolean literals (suppressed = true / false) and
+      // parameterized $N placeholders. The db-seam adapter methods (buildFuzzyMatch,
+      // buildGraphCTE, buildArrayContains, buildProbationRehabUpdate) handle dialect
+      // translation internally; the no-candidate fallback query below uses the same
+      // Postgres literal style consistent with Steps 3/4 throughout this branch.
+      //
       // Design decisions:
       //   1. Eligibility: EXACTLY suppressed=true AND suppression_kind='downvoted_probation'.
       //      Hard-excludes 'downvoted_terminal', 'superseded', 'retired', and live rows.
@@ -1637,26 +1645,19 @@ async function cmdLoaderLoad(opts = {}) {
           const seedText = q.seed || q.query || '';
           const reviveOpt = q.revive === true;
           const fuzzyLimit = 20;
+          // Tracks whether the ### Resurrected section was actually emitted.
+          // Step 6 (revival DB mutation) MUST NOT run unless this is true.
+          let resurrectEmitted = false;
 
           // ── Step 1: Resolve candidate subjects via semantic or fuzzy seed ─────────
           let candidateSubjects = [];
           const ollamaSkip = (process.env.OLLAMA_SKIP === '1');
 
           if (!ollamaSkip && seedText) {
-            // Semantic seed: cosine distance on v_memory_hits (halfvec 4000).
-            // Degrade gracefully if view is absent or embedding unavailable.
-            try {
-              const { rows: viewCheck } = await db.query(
-                `SELECT 1 FROM pg_views WHERE viewname = 'v_memory_hits' LIMIT 1`
-              );
-              if (viewCheck.length > 0) {
-                // Placeholder: embedding call would go here in Phase 3.6 when Ollama
-                // is wired. For now, fall through to fuzzy fallback on any error.
-                throw new Error('embedding not wired in loader — using fuzzy fallback');
-              }
-            } catch (_embedErr) {
-              // Fall through to pg_trgm fuzzy below.
-            }
+            // Phase 3.6 hook site — DO NOT REMOVE: semantic embedding seed not yet wired;
+            // intentionally falls through to pg_trgm/LIKE fuzzy fallback below.
+            // When Ollama is wired in Phase 3.6, populate candidateSubjects here via
+            // cosine distance on v_memory_hits (halfvec 4000) and skip the fuzzy path.
           }
 
           // Fuzzy fallback (always runs when ollamaSkip or semantic unavailable).
@@ -1773,11 +1774,27 @@ async function cmdLoaderLoad(opts = {}) {
               sections.push(resurrectSection);
               tokensUsed      += cost;
               assertionsCount += resurrectRows.length;
+              resurrectEmitted = true;
+            } else {
+              // Budget gate suppressed the section — warn if revival was requested.
+              if (reviveOpt) {
+                if (!silent) console.error(
+                  `[handoff] resurrect: revival SKIPPED — token budget exhausted before section could be emitted (subBudget=${subBudget}, cost=${cost}, tokensUsed=${tokensUsed}, tokenBudget=${tokenBudget}). Probation rows NOT revived.`
+                );
+              }
             }
           }
 
           // ── Step 6: Revival mechanic (only on explicit opt-in q.revive=true) ─
-          if (reviveOpt && resurrectRows.length > 0) {
+          // INVARIANT: resurrectEmitted must be true before any DB mutation runs.
+          // If the section was budget-blocked or seed was empty, skip revival and warn.
+          if (reviveOpt && !seedText) {
+            // Blank-seed guard: a revive with no seed would mass-revive all probation
+            // subjects. Read-only surfacing is still allowed; revival is not.
+            if (!silent) console.error(
+              '[handoff] resurrect: revival SKIPPED — revive=true requires a non-empty seed (blank seed would mass-revive all probation subjects). Probation rows NOT revived.'
+            );
+          } else if (reviveOpt && resurrectEmitted && resurrectRows.length > 0) {
             const reviveIds = resurrectRows.map((r) => r.id);
             const rehabStmt = db.buildProbationRehabUpdate(reviveIds);
             if (rehabStmt) {
@@ -2489,9 +2506,37 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
  * }
  */
 async function writeExtraction(db, projectId, payload) {
-  const sessionId = (typeof payload.session_id === 'string' && payload.session_id.length > 0)
+  // Resolve session id: payload.session_id takes precedence.
+  // Fallback: session_in_progress marker from project_settings.
+  // STALENESS GUARD: session_in_progress stores an ISO timestamp set at session start
+  // (see cmdLoaderHook). If the stored marker is older than staleness_days, treat it
+  // as absent to avoid binding this extraction to a stale prior session. A marker from
+  // an abnormally-ended prior session (e.g., process kill before cmdClose ran) would
+  // otherwise silently associate new writes with the wrong session.
+  let sessionId = (typeof payload.session_id === 'string' && payload.session_id.length > 0)
     ? payload.session_id
-    : await getSetting(db, projectId, 'session_in_progress', null);
+    : null;
+  if (!sessionId) {
+    const sipRaw = await getSetting(db, projectId, 'session_in_progress', null);
+    if (sipRaw) {
+      const sipMs = Date.parse(sipRaw);
+      if (!Number.isNaN(sipMs)) {
+        const stalenessDays = parseInt(
+          await getSetting(db, projectId, 'staleness_days', '7'),
+          10
+        );
+        const staleMs = (Number.isFinite(stalenessDays) && stalenessDays > 0 ? stalenessDays : 7)
+          * 24 * 60 * 60 * 1000;
+        if (Date.now() - sipMs <= staleMs) {
+          sessionId = sipRaw; // marker is fresh — use it
+        }
+        // else: marker is stale (abnormally-ended prior session) — leave sessionId=null
+      } else {
+        // Stored value is not a parseable timestamp — use it as-is for backward compat.
+        sessionId = sipRaw;
+      }
+    }
+  }
   let entitiesWritten   = 0;
   let assertionsWritten = 0;
   let edgesWritten      = 0;
