@@ -1,0 +1,18 @@
+{
+  "name": "handoff",
+  "metadata": {
+    "description": "Intersession memory and retrieval for Claude Code projects via Postgres."
+  },
+  "owner": {
+    "name": "djwmobley"
+  },
+  "plugins": [
+    {
+      "name": "handoff",
+      "description": "Intersession memory and retrieval for Claude Code projects via Postgres.",
+      "version": "1.0.0",
+      "source": "./",
+      "category": "development"
+    }
+  ]
+}
