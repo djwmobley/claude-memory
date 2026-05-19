@@ -2011,9 +2011,14 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
     let preLo1NCorroborated      = false; // disabled-mode path: 1:N only (pre-L0 formula)
     let maxPriorCorrob = 1;
 
+    // L2: track whether at least one cross-session corroborating row is independently
+    // trustworthy (reality_check='verified' OR pinned=true/1).
+    // This is the positive-evidence quality plug — the load-bearing L2 element.
+    let hasQualityCorroborator = false; // ≥1 independently-trustworthy corroborating prior row
+
     if (cardinality === '1:1') {
       const { rows: candidates } = await db.query(
-        `SELECT id, subject, object, session_id, confidence, source FROM assertions
+        `SELECT id, subject, object, session_id, confidence, source, reality_check, pinned FROM assertions
          WHERE project_id = $1
            AND predicate  = $2
            AND suppressed = false
@@ -2045,6 +2050,11 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
               r.session_id !== sessionId
             ) {
               crossSessionCorroborated = true;
+              // L2 quality plug: this corroborating row is independently trustworthy if
+              // reality_check='verified' OR pinned=true/1.
+              if (r.reality_check === 'verified' || r.pinned === true || r.pinned === 1) {
+                hasQualityCorroborator = true;
+              }
             }
           }
         }
@@ -2055,7 +2065,7 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
       // Cross-session corroboration requires: both session_ids non-null AND DISTINCT from each other.
       // Same-session re-assertion does NOT graduate. NULL session_id on either side is NOT corroboration.
       const { rows: candidates } = await db.query(
-        `SELECT id, subject, session_id, corroboration_count, confidence, source FROM assertions
+        `SELECT id, subject, session_id, corroboration_count, confidence, source, reality_check, pinned FROM assertions
          WHERE project_id = $1
            AND predicate  = $2
            AND object     = $3
@@ -2085,6 +2095,11 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
           ) {
             crossSessionCorroborated = true; // L0 enforce path
             preLo1NCorroborated      = true; // disabled-mode path (pre-L0 formula, 1:N only)
+            // L2 quality plug: this corroborating row is independently trustworthy if
+            // reality_check='verified' OR pinned=true/1.
+            if (r.reality_check === 'verified' || r.pinned === true || r.pinned === 1) {
+              hasQualityCorroborator = true;
+            }
           }
           // Track max corroboration_count among matched priors (for new row's count).
           const priorCount = typeof r.corroboration_count === 'number'
@@ -2147,6 +2162,39 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
     //   Pinned rows: pinned is a suppression-exemption flag; not a tier-grant flag at write
     //   time. L0 does not alter pinned handling (suppression path, unaffected by newTier).
     //
+    // L2 — consolidation_gate_mode (patient-adversary quality plug):
+    //   Builds on L0 with a 3-arm gate.  A row is born consolidated ONLY IF:
+    //     Arm (a) — reality-verified: this assertion's corroborating row OR the incoming
+    //               close's own reality_check will be 'verified' (L3 reality-bound). However,
+    //               the incoming row's reality_check is written AFTER the INSERT by the L3
+    //               verify pass. For the L2 arm (a), we check whether the insertion context
+    //               will be verified: not feasible at INSERT time without circular dependency.
+    //               Instead, arm (a) is implemented via the pinned/reality_check check on
+    //               the incoming assertion's own prior corroborators (or operator-confirmed).
+    //               See note below: arm (a) for the NEW row itself is handled post-INSERT by
+    //               cmdClose's L3 pass re-evaluating reality_check='verified' rows (these rows
+    //               are already born consolidated by arm (a) if they arrive with a verified prior).
+    //     Arm (b) — corroborated AND quality-plugged: crossSessionCorroborated=true AND
+    //               hasQualityCorroborator=true (≥1 corroborating prior-session row is
+    //               independently trustworthy: reality_check='verified' OR pinned).
+    //     Arm (c) — operator-confirmed: the incoming assertion's pinned flag is true.
+    //               This is the only genuine second actor in a single-operator system.
+    //   Count-based thresholds (THR) are RETIRED: N corroborations is never the criterion.
+    //   Only ONE independently-trustworthy corroborator is needed — adding more self-stamped
+    //   corroborations never changes the outcome (a patient attacker cannot forge quality).
+    //
+    //   NOTE on the "genuinely user-evidenced" corroborator path: the design also names
+    //   "genuinely user-evidenced" as a trustworthy basis, but that depends on L1
+    //   (model-independent transcript capture) which is NOT implemented. In v1, the
+    //   independently-trustworthy predicate is: (reality_check='verified') OR (pinned).
+    //   The user-evidenced arm activates when L1 lands.
+    //
+    // consolidation_gate_mode: new setting controlling L2 behavior.
+    //   disabled: L2 inert — tier outcomes byte-identical to post-L0 main (L0 gate applies).
+    //   report:   compute L2 decision, LOG would-withhold, but do NOT change tier outcomes.
+    //             (DEFAULT — mandatory report window before enforce)
+    //   enforce:  full L2 3-arm gate actually decides tier.
+    //
     // consolidated_at: set to now() when consolidated, SQL NULL otherwise.
     // corroboration_count: 1 + maxPriorCorrob when cross-session corroboration fires; 1 otherwise.
     //
@@ -2157,13 +2205,43 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
     //
     // L0 gate: read once, inside the transaction (plain SELECT — safe, no write).
     const corrobGate  = await getSetting(db, projectId, 'consolidation_corroboration_gate', 'enforce');
+    const gateMode    = await getSetting(db, projectId, 'consolidation_gate_mode', 'report');
     const isHighTrust = (source === 'user_stated' && conf >= 9);
-    // newTier — full consolidated-birth decision:
-    //   enforce (default): corroboration required for ALL consolidation paths.
-    //   disabled:          pre-L0 formula exactly — isHighTrust OR (1:N && preLo1NCorroborated).
-    const newTier = (corrobGate === 'disabled')
+    const isPinned    = (ass.pinned === true || ass.pinned === 1);
+
+    // L2 arm evaluation (evaluated regardless of gateMode for report/enforce use):
+    //   arm (a): any corroborating prior row has reality_check='verified' (or is itself pinned)
+    //            — hasQualityCorroborator already captures this from the candidate loop above.
+    //   arm (b): crossSessionCorroborated AND hasQualityCorroborator.
+    //   arm (c): the incoming assertion is operator-pinned.
+    const l2ArmA = hasQualityCorroborator; // independently-trustworthy corroborator exists
+    const l2ArmB = crossSessionCorroborated && hasQualityCorroborator;
+    const l2ArmC = isPinned; // operator-confirmed
+    const l2Consolidates = l2ArmA || l2ArmB || l2ArmC;
+
+    // L0 tier outcome (used as base for disabled/report modes):
+    const l0Tier = (corrobGate === 'disabled')
       ? ((isHighTrust || (cardinality === '1:N' && preLo1NCorroborated)) ? 'consolidated' : 'probationary')
       : (crossSessionCorroborated ? 'consolidated' : 'probationary');
+
+    // newTier — full consolidated-birth decision considering both L0 and L2:
+    let newTier;
+    if (gateMode === 'enforce') {
+      // L2 enforce: full 3-arm gate.
+      newTier = l2Consolidates ? 'consolidated' : 'probationary';
+    } else {
+      // disabled or report: tier outcome is byte-identical to L0 (post-L0 main behavior).
+      newTier = l0Tier;
+      if (gateMode === 'report' && l0Tier === 'consolidated' && !l2Consolidates) {
+        // Report mode: log what WOULD be withheld under enforce (but do NOT change the tier).
+        process.stderr.write(
+          `[handoff] L2 report: would-withhold consolidated→probationary for ` +
+          `${canonSubject} ${ass.predicate} "${ass.object}" ` +
+          `(crossSessionCorroborated=${crossSessionCorroborated}, hasQualityCorroborator=${hasQualityCorroborator}, pinned=${isPinned})\n`
+        );
+      }
+    }
+
     const consolidatedAtSql = (newTier === 'consolidated') ? 'now()' : 'NULL';
     const newCorrob = (cardinality === '1:N' && crossSessionCorroborated)
       ? (maxPriorCorrob + 1)
@@ -2740,22 +2818,36 @@ async function cmdClose(args) {
   // Surface CLAUDE.md promotion candidates (conf >= 9, user_stated, multi-session).
   // Hole A fix: col-minus-col epoch difference now goes through a port method so both
   // Postgres (EXTRACT) and SQLite (julianday) produce identical results.
+  //
+  // Candidate-query bug fix (L2): SELECT was missing id and tier columns. Later code
+  // reads r.id (for the source_assertion annotation) and r.tier (for L2 transitive
+  // binding). Without these columns, r.id is undefined and the annotation is corrupted.
+  //
+  // L2 transitive binding: only gate-consolidated rows are eligible for CLAUDE.md
+  // promotion. A self-stamped row that is merely source='user_stated' but tier='probationary'
+  // (because it did not satisfy the L2 gate) is NOT eligible — this closes the transitive
+  // forge where a self-stamped row both self-consolidates and self-promotes into CLAUDE.md.
+  // When consolidation_gate_mode='disabled' or 'report', tier='consolidated' rows are those
+  // produced by the L0 gate (post-L0 main behavior); under 'enforce', only L2-consolidated
+  // rows have tier='consolidated'. In all modes, the tier='consolidated' filter is the
+  // gate — CLAUDE.md eligibility is always transitively bound to the active gate decision.
   const multiSessionPred = db.buildEpochSecondsDiffPredicate(
     'last_reinforced', 'created_at', '>', 86400
   );
   const { rows: candidates } = await db.query(
-    `SELECT subject, predicate, object, confidence
+    `SELECT id, subject, predicate, object, confidence, tier
      FROM assertions
      WHERE project_id = $1
        AND suppressed = false
        AND confidence >= 9
        AND source = 'user_stated'
+       AND tier = 'consolidated'
        AND ${multiSessionPred}
      ORDER BY confidence DESC`,
     [projectId]
   );
   if (candidates.length > 0) {
-    console.log('\n  CLAUDE.md promotion candidates (confidence >= 9, user_stated, multi-session):');
+    console.log('\n  CLAUDE.md promotion candidates (confidence >= 9, user_stated, consolidated, multi-session):');
     for (const row of candidates) {
       console.log(`    [conf=${row.confidence}] ${row.subject} ${row.predicate} ${row.object}`);
     }
