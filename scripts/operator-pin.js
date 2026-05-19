@@ -106,15 +106,14 @@ async function main() {
   // Connect — use pg Client directly (not connectHandoff) so this script is
   // non-model-invocable and uses separate creds from the main engine.
   const cfg = loadConfig();
+  // SSL is governed by standard libpq / pg environment variables (e.g. PGSSLMODE),
+  // not by pipeline.yml — loadConfig() does not return an ssl key.
   const client = new Client({
     host:     process.env.PGHOST     || cfg.host     || 'localhost',
     port:     parseInt(process.env.PGPORT || String(cfg.port || 5432), 10),
     database: process.env.PGDATABASE || cfg.database || 'postgres',
     user:     process.env.PGUSER     || cfg.user     || 'postgres',
     password: process.env.PGPASSWORD || cfg.password || undefined,
-    // Propagate ssl config if present in pipeline.yml (e.g. ssl: { rejectUnauthorized: false }).
-    // cfg.ssl is undefined when pipeline.yml omits ssl, so this spread is a no-op by default.
-    ...(cfg.ssl ? { ssl: cfg.ssl } : {}),
   });
   await client.connect();
 

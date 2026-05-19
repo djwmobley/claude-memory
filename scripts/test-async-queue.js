@@ -396,28 +396,41 @@ async function main() {
       // (current behavior: writeExtraction writes entity with sessionId=null when getSetting returns null)
     });
 
-    // T3b — Stale session_in_progress marker: drain must NOT bind new writes to stale session
-    await runTest('T3b: stale session_in_progress marker (prior session) — writeExtraction does not bind entity to stale session', async () => {
-      // This test locks in the staleness-guard behavior added to writeExtraction:
-      // If session_in_progress is set but its timestamp is older than staleness_days,
-      // writeExtraction must treat it as absent (entity written with session_id=NULL).
+    // T3b — Stale session_in_progress marker: drain's staleness-guard MUST reject it
+    await runTest('T3b: stale session_in_progress marker PRESENT during drain — staleness guard rejects it, entity written with session_id=NULL', async () => {
+      // This test locks in the staleness-guard branch in writeExtraction (PR #70).
       //
-      // Setup: re-enable async, set a session_in_progress marker dated FAR in the past.
+      // The guard (handoff.js writeExtraction): when payload.session_id is absent,
+      // the fallback reads session_in_progress from project_settings. If the stored
+      // ISO timestamp is older than staleness_days (default 7), the marker is REJECTED
+      // and sessionId stays null — the entity must be written with session_id=NULL.
+      //
+      // PREVIOUS BUG (fixed here): T3b was deleting session_in_progress before
+      // runQueueDrain, so getSetting returned null and the absent-marker path ran —
+      // not the staleness-rejection path. That duplicated T3 and gave a false safety
+      // signal. The guard's age-check branch was never exercised.
+      //
+      // CORRECT SETUP:
+      //   1. Enqueue via checkpoint (checkpoint internally deletes session_in_progress).
+      //   2. INSERT a stale marker (30 days old, well past the 7-day threshold)
+      //      AFTER the checkpoint, so it is present when queue-drain calls writeExtraction.
+      //   3. Do NOT delete the marker before drain.
+      //   4. Run drain — writeExtraction reads the stale marker, parses its timestamp,
+      //      detects age > staleness_days, and leaves sessionId=null.
+      //   5. Assert entity.session_id IS NULL (staleness guard rejected the marker).
+      //   6. Assert the marker is STILL PRESENT in project_settings after drain
+      //      (the guard does not consume or delete it — only cmdClose/cmdCheckpoint do).
+      //
+      // FALSIFIABILITY: a hypothetical no-guard implementation (writeExtraction simply
+      // reads session_in_progress and uses it regardless of age) would produce
+      // entity.session_id = staleTs (the ISO string), causing assertion step 5 to FAIL.
+
+      // Step 1: re-enable async and enqueue a row. No payload.session_id.
       await db.query(
         `UPDATE project_settings SET value = 'true' WHERE key = 'extraction_async_enabled'`
       );
-      // Write a stale marker (8 days ago — beyond the default 7-day staleness window).
-      const staleTs = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
-      await db.query(
-        `INSERT INTO project_settings (project_id, key, value)
-         SELECT project_id, 'session_in_progress', $1
-         FROM project_settings WHERE key = 'extraction_async_enabled' LIMIT 1
-         ON CONFLICT (project_id, key) DO UPDATE SET value = $1`,
-        [staleTs]
-      );
-
       const testPayload = {
-        // Deliberately omit session_id — fallback must hit the stale marker and reject it.
+        // Deliberately omit session_id — fallback in writeExtraction hits the staleness guard.
         tldr:        'T3b stale marker corner',
         entities:    [{ name: 'TestEntityT3bStaleSession', entity_type: 'fact' }],
         assertions:  [],
@@ -429,19 +442,38 @@ async function main() {
         throw new Error(`checkpoint for T3b failed: ${out.slice(0, 400)}`);
       }
 
-      // Find the pending row.
+      // Find the pending row created by the checkpoint.
       const { rows: pending } = await db.query(
         `SELECT id FROM extraction_queue WHERE status = 'pending' ORDER BY id DESC LIMIT 1`
       );
       if (pending.length === 0) {
         throw new Error('no pending row found for T3b');
       }
+      const rowId = pending[0].id;
 
-      // Clear session_in_progress after enqueue to simulate normal drain context.
-      // (marker already stale — drain should not use it regardless)
-      await db.query(`DELETE FROM project_settings WHERE key = 'session_in_progress'`);
+      // Step 2: INSERT a stale marker (30 days ago — well beyond the 7-day threshold).
+      // The checkpoint just cleared session_in_progress, so we must insert it now.
+      // Format matches what cmdLoaderHook writes: new Date().toISOString() — a raw ISO string.
+      const staleTs = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+      await db.query(
+        `INSERT INTO project_settings (project_id, key, value)
+         SELECT project_id, 'session_in_progress', $1
+         FROM project_settings WHERE key = 'extraction_async_enabled' LIMIT 1
+         ON CONFLICT (project_id, key) DO UPDATE SET value = $1`,
+        [staleTs]
+      );
 
-      // Run drain — must not crash.
+      // Verify the stale marker is in place before drain.
+      const { rows: markerBefore } = await db.query(
+        `SELECT value FROM project_settings WHERE key = 'session_in_progress'`
+      );
+      if (markerBefore.length === 0) {
+        throw new Error('stale marker not inserted — cannot exercise staleness-guard branch');
+      }
+
+      // Step 3: Run drain WITH the stale marker present (no delete before drain).
+      // writeExtraction will read the marker, parse staleTs, compute age > 7 days,
+      // and reject it — leaving sessionId=null.
       const dr = runQueueDrain([]);
       if (dr.signal) {
         throw new Error(`queue-drain killed by signal ${dr.signal} — unexpected crash`);
@@ -450,29 +482,50 @@ async function main() {
         throw new Error(`queue-drain spawn error: ${dr.error.message}`);
       }
 
-      // Find the entity and verify session_id is NULL (stale marker was rejected).
-      const { rows: ents } = await db.query(
-        `SELECT name, session_id FROM entities WHERE name = 'TestEntityT3bStaleSession' LIMIT 1`
+      // Step 4: Check queue row status.
+      const { rows: qrows } = await db.query(
+        `SELECT status FROM extraction_queue WHERE id = $1`, [rowId]
       );
-      if (ents.length === 0) {
-        // Entity may not be written if drain hit an error — check queue status.
-        const { rows: qrows } = await db.query(
-          `SELECT status FROM extraction_queue WHERE id = $1`, [pending[0].id]
+      const qstatus = qrows[0] ? qrows[0].status : 'not found';
+
+      // Step 5: Assert entity.session_id IS NULL (staleness guard rejected the marker).
+      if (qstatus === 'done') {
+        const { rows: ents } = await db.query(
+          `SELECT name, session_id FROM entities WHERE name = 'TestEntityT3bStaleSession' LIMIT 1`
         );
-        const qstatus = qrows[0] ? qrows[0].status : 'not found';
-        // If status is 'error', that is acceptable — stale marker did not cause a corrupt bind.
-        // The important invariant: entity is NOT present with a stale session_id.
-        if (qstatus === 'error' || qstatus === 'done') {
-          // No entity row — nothing corrupt written; stale marker behavior is defined.
-          return; // Test passes
+        if (ents.length === 0) {
+          throw new Error('entity TestEntityT3bStaleSession not found after drain (status=done)');
         }
-        throw new Error(`entity TestEntityT3bStaleSession not found after drain (queue status=${qstatus})`);
+        if (ents[0].session_id !== null) {
+          // A no-guard implementation would set session_id = staleTs here — failing this check.
+          throw new Error(
+            `STALENESS GUARD FAILED: entity session_id='${ents[0].session_id}' ` +
+            `but expected null — stale session_in_progress marker was used instead of rejected`
+          );
+        }
+      } else if (qstatus === 'error') {
+        // Drain errored — stale marker did not cause a corrupt bind. Acceptable.
+        // The important invariant (no entity written with stale session_id) holds trivially.
+      } else {
+        throw new Error(`unexpected queue row status '${qstatus}' after drain`);
       }
-      // Entity found — must have session_id=NULL (stale marker must have been rejected).
-      if (ents[0].session_id !== null) {
+
+      // Step 6: Assert the stale marker is STILL PRESENT after drain.
+      // writeExtraction's staleness guard does not delete the marker — only cmdClose
+      // and cmdCheckpoint do. If the marker was consumed/deleted by drain, that would
+      // indicate unintended side-effects in the guard implementation.
+      const { rows: markerAfter } = await db.query(
+        `SELECT value FROM project_settings WHERE key = 'session_in_progress'`
+      );
+      if (markerAfter.length === 0) {
         throw new Error(
-          `entity session_id expected null (stale marker must be rejected by staleness guard), ` +
-          `got '${ents[0].session_id}' — stale session_in_progress marker was used`
+          'session_in_progress marker was deleted by queue-drain — ' +
+          'the staleness guard must not consume the marker (only cmdClose/cmdCheckpoint clear it)'
+        );
+      }
+      if (markerAfter[0].value !== staleTs) {
+        throw new Error(
+          `session_in_progress value changed during drain: expected '${staleTs}', got '${markerAfter[0].value}'`
         );
       }
     });
