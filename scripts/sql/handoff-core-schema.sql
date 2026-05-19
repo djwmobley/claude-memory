@@ -347,6 +347,7 @@ CREATE TABLE IF NOT EXISTS project_settings (
 --   extraction_async_enabled           default: 'false'     ('true'|'false' — async extraction queue; byte-identical to synchronous when 'false')
 --   predicate_registry_mode            default: 'permissive' ('permissive'|'strict' — unrecognized-predicate enforcement)
 --   tier_aware_retrieval               default: 'enabled'   ('enabled'|any other value — tier-aware retrieval ranking; probationary rows re-ranked below consolidated/NULL; byte-identical ORDER BY when disabled)
+--   close_degraded_exit_mode           default: 'warn'      ('warn'|'strict' — L4: 'warn' exits 0 on degraded close (default, backward-compatible); 'strict' exits 3; degraded_close:* rows always written regardless)
 
 
 -- ============================================================================

@@ -377,6 +377,48 @@ async function setSetting(db, projectId, key, value) {
 }
 
 /**
+ * L4: Record a degraded close — a subsystem (C2 or C3) that silently skipped
+ * because the session id was unresolvable.
+ *
+ * Writes a project_settings row keyed `degraded_close:<closeStamp>` with a
+ * JSON value carrying the subsystem name, reason, and timestamp. The key
+ * includes an ISO timestamp so successive degraded closes accumulate as
+ * distinct rows (append-style — never overwrites a prior degraded record).
+ *
+ * Non-fatal: any write error is logged to stderr and ignored so cmdClose
+ * continues. Returns the stamp used in the key so callers can reference it.
+ *
+ * @param {object}      db         - storage adapter (port interface)
+ * @param {string}      projectId
+ * @param {string|null} sessionId  - session id if known, null if unresolvable
+ * @param {string}      subsystem  - 'C2' | 'C3'
+ * @param {string}      reason     - human-readable skip reason
+ * @returns {Promise<string>}       - the ISO stamp used in the key
+ */
+// Monotonic counter for recordDegradedClose key uniqueness within a process.
+// Ensures that two records written within the same millisecond get distinct keys.
+let _degradedCloseSeq = 0;
+
+async function recordDegradedClose(db, projectId, sessionId, subsystem, reason) {
+  const stamp = new Date().toISOString();
+  const seq   = String(_degradedCloseSeq++).padStart(4, '0');
+  // Key: degraded_close:<ISO-stamp>:<seq> — ISO stamp for ordering/filtering;
+  // seq suffix guarantees uniqueness when multiple subsystems degrade in the same ms.
+  const key   = `degraded_close:${stamp}:${seq}`;
+  const val   = JSON.stringify({ subsystem, reason, stamp, sessionId: sessionId || null });
+  try {
+    await db.query(
+      `INSERT INTO project_settings (project_id, key, value) VALUES ($1, $2, $3)
+       ON CONFLICT (project_id, key) DO NOTHING`,
+      [projectId, key, val]
+    );
+  } catch (writeErr) {
+    process.stderr.write(`[handoff] recordDegradedClose write failed (non-fatal): ${writeErr.message}\n`);
+  }
+  return stamp;
+}
+
+/**
  * Deep-equal comparison for two retrieval contract objects.
  * Compares via JSON.stringify (contract shape is {queries:[...]}, deterministic).
  * Exported for unit tests.
@@ -1015,6 +1057,7 @@ async function cmdInit(args) {
       TLDR:                '(init — no sessions closed yet)',
       OPEN_THREADS:        '- (none)',
       QUICK_REFERENCES:    '(none)',
+      DEGRADED_SECTION:    '',
     });
     console.log(`  [OK]    handoff.md created: ${handoffPath}`);
   }
@@ -1190,6 +1233,57 @@ async function cmdLoaderLoad(opts = {}) {
     await ensureSchemaCurrent(db, projectId, { silent });
   } catch (schemaErr) {
     process.stderr.write('[handoff] schema auto-apply failed (non-fatal): ' + schemaErr.message + '\n');
+  }
+
+  // L4: Resume banner — warn if the last close ran degraded (C2/C3 skipped).
+  // Query project_settings for any degraded_close:* key newer than the last
+  // clean close (i.e., last_close frontmatter timestamp). Non-fatal: any error
+  // here must not abort the load.
+  try {
+    const { rows: degradedRows } = await db.query(
+      `SELECT key, value FROM project_settings
+       WHERE project_id = $1 AND key LIKE 'degraded_close:%'
+       ORDER BY key DESC`,
+      [projectId]
+    );
+    if (degradedRows.length > 0) {
+      // Filter to rows newer than the last clean close (if we have one).
+      // Key format: degraded_close:<ISO-stamp>:<seq> — extract the ISO portion
+      // (first 24 chars of the ISO 8601 timestamp) for comparison.
+      const lastCleanStamp = lastClose || null;
+      const newerRows = lastCleanStamp
+        ? degradedRows.filter((r) => {
+            // Key format: degraded_close:<ISO-stamp>:<seq>
+            // Extract ISO stamp: the segment between the first ':' separator
+            // (after 'degraded_close') and the trailing ':<seq>'.
+            const afterPrefix  = r.key.slice('degraded_close:'.length);
+            // ISO stamp is everything up to the last ':' (the seq suffix).
+            const lastColon    = afterPrefix.lastIndexOf(':');
+            const stampPart    = lastColon >= 0 ? afterPrefix.slice(0, lastColon) : afterPrefix;
+            return stampPart > lastCleanStamp;
+          })
+        : degradedRows;
+      if (newerRows.length > 0) {
+        // Collect unique subsystem names and session ids for the banner.
+        const degradedEntries = newerRows.map((r) => {
+          try { return JSON.parse(r.value); } catch (_) { return null; }
+        }).filter(Boolean);
+        const subsystems = [...new Set(degradedEntries.map((e) => e.subsystem))].join(', ');
+        const sessionRef = degradedEntries[0] && degradedEntries[0].sessionId
+          ? degradedEntries[0].sessionId
+          : 'unknown';
+        const bannerLine =
+          `RESUME WARNING: last close ran degraded (${subsystems} skipped) — ` +
+          `feedback/evolution state is stale for session ${sessionRef}`;
+        if (!silent) {
+          console.log(`\n  ${bannerLine}`);
+        } else {
+          process.stderr.write(`[handoff] ${bannerLine}\n`);
+        }
+      }
+    }
+  } catch (degradedCheckErr) {
+    process.stderr.write('[handoff] degraded-close resume check failed (non-fatal): ' + degradedCheckErr.message + '\n');
   }
 
   // Load retrieval_contract
@@ -1780,6 +1874,7 @@ async function cmdDrop() {
     TLDR:                '(dropped — prior session memory archived)',
     OPEN_THREADS:        '- (none)',
     QUICK_REFERENCES:    '(none)',
+    DEGRADED_SECTION:    '',
   });
 
   await db.end();
@@ -2283,6 +2378,7 @@ async function cmdCheckpoint(args) {
       TLDR:                payload.tldr || '(checkpoint — async queued)',
       OPEN_THREADS:        (payload.open_threads || []).map((t) => `- ${t}`).join('\n') || '- (none)',
       QUICK_REFERENCES:    payload.quick_references || '(none)',
+      DEGRADED_SECTION:    '',
     });
 
     // Clear session_in_progress so the Stop hook treats this checkpoint as an explicit save.
@@ -2316,6 +2412,7 @@ async function cmdCheckpoint(args) {
     TLDR:                payload.tldr || '(checkpoint)',
     OPEN_THREADS:        (payload.open_threads || []).map((t) => `- ${t}`).join('\n') || '- (none)',
     QUICK_REFERENCES:    payload.quick_references || '(none)',
+    DEGRADED_SECTION:    '',
   });
 
   // Clear session_in_progress so the Phase 3.7 Stop hook treats this checkpoint
@@ -2537,6 +2634,7 @@ async function cmdClose(args) {
       TLDR:                payload.tldr || '(closed — async queued)',
       OPEN_THREADS:        (payload.open_threads || []).map((t) => `- ${t}`).join('\n') || '- (none)',
       QUICK_REFERENCES:    payload.quick_references || '(none)',
+      DEGRADED_SECTION:    '',
     });
 
     // Clear session_in_progress marker
@@ -2616,20 +2714,11 @@ async function cmdClose(args) {
     );
   }
 
-  // Update handoff.md
+  // L4: Accumulate degraded-close records for C2/C3 unresolvable-session skips.
+  // Written to project_settings and surfaced in the close summary / handoff.md
+  // by the writeHandoffMd call below (after C2 and C3 complete).
   const stamp = new Date().toISOString();
-  writeHandoffMd(handoffPath, {
-    PROJECT_ID:          projectId,
-    LAST_CLOSE:          stamp,
-    CONTRACT:            'default',
-    ENTITIES_WRITTEN:    String(entitiesWritten),
-    ASSERTIONS_WRITTEN:  String(assertionsWritten),
-    EDGES_WRITTEN:       String(edgesWritten),
-    PROJECT_NAME:        path.basename(root),
-    TLDR:                payload.tldr || '(closed)',
-    OPEN_THREADS:        (payload.open_threads || []).map((t) => `- ${t}`).join('\n') || '- (none)',
-    QUICK_REFERENCES:    payload.quick_references || '(none)',
-  });
+  const _degradedSubsystems = [];
 
   // ── Retrieval outcome capture (non-fatal) ─────────────────────────────────────
   // Must run BEFORE session_in_progress is cleared (we need the session id).
@@ -2699,7 +2788,11 @@ async function cmdClose(args) {
 
       if (!fbSessionId) {
         // No session id — skip silently (nothing to attribute).
+        // L4: Record degraded close — C2 skipped because session id is unresolvable.
+        // Persists to project_settings so the resume path can surface a warning banner.
         process.stderr.write('[handoff] C2 feedback: no session id resolvable — skipping bias update\n');
+        await recordDegradedClose(db, projectId, null, 'C2', 'no session id resolvable — skipping bias update');
+        _degradedSubsystems.push({ subsystem: 'C2', reason: 'no session id resolvable — skipping bias update' });
       } else {
         // Idempotency check: if we have already applied feedback for this session, skip.
         const markerKey = `feedback_applied:${fbSessionId}`;
@@ -2870,7 +2963,11 @@ async function cmdClose(args) {
         : await getSetting(db, projectId, 'session_in_progress', null);
 
       if (!evolSessionId) {
+        // L4: Record degraded close — C3 skipped because session id is unresolvable.
+        // Persists to project_settings so the resume path can surface a warning banner.
         process.stderr.write('[handoff] C3 evolution: no session id resolvable — skipping\n');
+        await recordDegradedClose(db, projectId, null, 'C3', 'no session id resolvable — skipping');
+        _degradedSubsystems.push({ subsystem: 'C3', reason: 'no session id resolvable — skipping' });
       } else {
         // Idempotency check: skip if we already processed this session.
         const evolMarkerKey   = `contract_evolved:${evolSessionId}`;
@@ -3020,6 +3117,39 @@ async function cmdClose(args) {
     process.stderr.write(`[handoff] C3 contract evolution failed (non-fatal): ${evolutionErr.message}\n`);
   }
 
+  // ── L4: Write handoff.md (after C2/C3) with DEGRADED_SECTION ─────────────────
+  //
+  // This is the single authoritative handoff.md write for the synchronous close path.
+  // When _degradedSubsystems is empty (clean close), DEGRADED_SECTION is '' and the
+  // rendered output is byte-identical to the pre-L4 template output.
+  // When any subsystem is degraded, a ## Degraded section is appended.
+  {
+    const degradedSection = _degradedSubsystems.length > 0
+      ? '\n\n## Degraded\n' + _degradedSubsystems.map(
+          (d) => `- ${d.subsystem} ${d.reason}`
+        ).join('\n')
+      : '';
+
+    writeHandoffMd(handoffPath, {
+      PROJECT_ID:          projectId,
+      LAST_CLOSE:          stamp,
+      CONTRACT:            'default',
+      ENTITIES_WRITTEN:    String(entitiesWritten),
+      ASSERTIONS_WRITTEN:  String(assertionsWritten),
+      EDGES_WRITTEN:       String(edgesWritten),
+      PROJECT_NAME:        path.basename(root),
+      TLDR:                payload.tldr || '(closed)',
+      OPEN_THREADS:        (payload.open_threads || []).map((t) => `- ${t}`).join('\n') || '- (none)',
+      QUICK_REFERENCES:    payload.quick_references || '(none)',
+      DEGRADED_SECTION:    degradedSection,
+    });
+
+    // Surface degraded subsystems in the close summary (operator-visible).
+    for (const d of _degradedSubsystems) {
+      console.log(`  ${d.subsystem} skipped: ${d.reason}`);
+    }
+  }
+
   // ── Packaging-honesty display (non-fatal, synchronous close path only) ────────
   //
   // Detects whether the session's work is already committed and pushed, and
@@ -3048,6 +3178,10 @@ async function cmdClose(args) {
   // Run reranker gate (informational)
   await runRerankerGate(db, projectId, root);
 
+  // L4: Read close_degraded_exit_mode BEFORE closing the DB connection.
+  // Values: 'warn' (default, exit 0) | 'strict' (exit 3 on any degraded subsystem).
+  const closeDegradedExitMode = await getSetting(db, projectId, 'close_degraded_exit_mode', 'warn');
+
   await db.end();
 
   console.log(`\n  entities written:    ${entitiesWritten}`);
@@ -3055,6 +3189,14 @@ async function cmdClose(args) {
   console.log(`  edges written:       ${edgesWritten}`);
   console.log(`  contract:            updated`);
   console.log(`\nDone: handoff:close — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written, session marker cleared`);
+
+  // L4: Exit-code gate — 'strict' mode exits 3 when any subsystem ran degraded.
+  if (_degradedSubsystems.length > 0 && closeDegradedExitMode === 'strict') {
+    process.stderr.write(
+      `[handoff] close_degraded_exit_mode=strict — exiting 3 (${_degradedSubsystems.length} degraded subsystem(s))\n`
+    );
+    process.exit(3);
+  }
 }
 
 // ── purge ─────────────────────────────────────────────────────────────────────
@@ -3219,6 +3361,7 @@ async function cmdLoaderStop() {
       TLDR:                '(implicit close — session ended without explicit /handoff:close)',
       OPEN_THREADS:        openThreads,
       QUICK_REFERENCES:    quickRefs,
+      DEGRADED_SECTION:    '',
     });
 
     // Clear the session_in_progress marker.
