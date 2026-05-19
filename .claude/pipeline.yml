@@ -10,3 +10,60 @@ knowledge:
   embedding_model: "Qwen/Qwen3-Embedding-8B"
   embed_backend: vllm
   vllm_embed_url: http://localhost:8800
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pipeline plugin configuration (added to make the `pipeline` Claude Code
+# plugin a first-class skillset in this repo). All keys below are read ONLY by
+# the pipeline plugin; claude-memory's own loadConfig ignores them.
+#
+# Coexistence note: knowledge.tier above is required by claude-memory's runtime
+# (postgres). The pipeline plugin would otherwise key its findings-persistence
+# off the same knowledge.tier value. We force `integrations.postgres.enabled:
+# false` below so pipeline:review persists findings to docs/findings/ only and
+# NEVER touches claude-memory's own Postgres DB.
+# ──────────────────────────────────────────────────────────────────────────────
+
+commands:
+  typecheck: null     # plain JS, no typecheck step
+  lint: null          # no eslint config in this repo
+  test: null          # tests are the bespoke harness; CI runs the suite directly
+
+routing:
+  source_dirs:
+    - scripts
+    - scripts/lib
+    - hooks
+
+review:
+  non_negotiable:
+    - "Ranking-only decay with guaranteed top-N floor — intentional; never flag as 'old data leaking through'"
+    - "No UPDATE SET on the assertion corpus — cardinality supersession is via suppress+insert only (§7 invariant; test-both-backends S10 locks it)"
+    - "Bespoke hand-rolled test harness with manual pass/fail counters — no Jest/Vitest/Mocha/c8/nyc framework; this is the project's testing philosophy"
+    - "consolidation_gate_mode defaults to 'enforce' — intentional patient-adversary hardening; not a breaking change to flag"
+    - "operator-pin.js is intentionally outside the model-invocable dispatch map — separate creds, INSERT-only canon rows"
+    - "resurrect query type is opt-in, runs only on the Postgres loader path; SQLite seam is not exercised by the resurrect loader"
+    - "pg_views / vector hook sites are intentional Phase 3.6 placeholders — do not remove the annotated fall-through comments"
+    - "Marker and handoff file writes terminate with literal '\\n' on every platform — LF-only is intentional for clean git diffs"
+    - "Two-agent PR-independence model — GitHub 'Can not approve your own PR' rejection under shared-account is expected; the independent agent review decision is the operative gate"
+    - "Zero per-write LLM cost — extraction is the Claude Code conversation itself via slash commands; no API call per write is by design"
+  criteria:
+    - security
+    - dead-code
+    - simplicity
+    - solid
+    - performance
+
+static_analysis:
+  semgrep:
+    enabled: auto
+  grep_fallback: true
+
+integrations:
+  github:
+    enabled: true
+    issue_tracking: false   # do NOT auto-create issues from pipeline:review
+  postgres:
+    enabled: false          # CRITICAL: prevents pipeline-db.js writes against claude-memory's own DB
+
+dashboard:
+  enabled: false
