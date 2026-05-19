@@ -379,7 +379,7 @@ async function main() {
         [LOADER_SCRIPT, 'memory'],
         {
           cwd:      tempCwd,
-          env:      { ...process.env, PROJECT_ROOT: path.resolve(__dirname, '..', '..') },
+          env:      { ...process.env, PROJECT_ROOT: path.resolve(__dirname, '..', '..'), PGDATABASE: EVAL_DB_NAME },
           stdio:    'pipe',
           encoding: 'utf8',
           timeout:  120000,
