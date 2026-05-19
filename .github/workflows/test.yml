@@ -159,3 +159,22 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run L2 consolidation gate tests
+        # Tests Lever L2: corroboration-quality plug (positive-evidence form) that closes
+        # the patient-adversary gap in L0. A model that restates the same forged triple
+        # across >=2 genuine distinct sessions satisfies L0 crossSessionCorroborated but
+        # still forges 'consolidated' under L0 alone. L2 arm(b) requires >=1 corroborating
+        # prior-session row to be independently trustworthy (reality_check='verified' OR
+        # pinned) -- positive-evidence form only. THR/count thresholds retired.
+        # Covers: patient-adversary closed (2 and 20 self-stamped corroborations ->
+        # probationary), arm(a)/(b) via verified/pinned corroborator -> consolidated,
+        # arm(c) operator-pinned incoming -> consolidated, single self-stamped still
+        # probationary (L0 property preserved), disabled/report byte-identical to L0,
+        # report emits would-withhold log, enforce changes outcomes, CLAUDE.md transitive
+        # binding (only gate-consolidated eligible), candidate-query bug fixed (id+tier),
+        # no UPDATE SET tier on pre-existing rows.
+        run: node scripts/test-l2-consolidation-gate.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
