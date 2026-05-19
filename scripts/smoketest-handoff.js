@@ -159,7 +159,7 @@ const C2_TOTAL = 5;
 const C3_TOTAL = 5;
 const RG_TOTAL  = 7;
 const Q_TOTAL   = 4;
-const COL_TOTAL = 5;
+const COL_TOTAL = 7;
 const GR_TOTAL  = 4;
 const DC_TOTAL  = 4;
 const PN_TOTAL  = 7;
@@ -5465,10 +5465,120 @@ async function colStep5_registryIndexDrift() {
   } catch (err) { colFail(5, label, err.message); return false; }
 }
 
+/**
+ * COLLISION 6/7 — same-session exact repeat does NOT reset the decay clock.
+ * Two cmdClose calls with the SAME session_id and identical triple → only 1 live row,
+ * no suppression, and valid_at is unchanged (last_reinforced may equal or exceed va1).
+ */
+async function colStep6_sameSessionNoDecayReset(colDb, colProjectId, colProjectDir) {
+  const label = 'same-session exact repeat: 1 live row, 0 suppressed, valid_at unchanged (no decay-clock reset)';
+  try {
+    const pred      = 'depends_on';
+    const SID       = `col-sess-same-${Date.now()}`;
+    const closeArgs = [HANDOFF_SCRIPT, 'close', '--json', '-'];
+    const closeEnv  = { ...process.env, HANDOFF_DB: colDb, PROJECT_ROOT: colProjectDir };
+    const opts      = { cwd: PROJECT_ROOT, env: closeEnv, encoding: 'utf8', timeout: 30000 };
+    const payload   = { session_id: SID, assertions: [{ subject: 'col-f', predicate: pred, object: 'dep-f', confidence: 7, source: 'model_extracted' }] };
+
+    // First close — creates the row.
+    const r1 = spawnSync(process.execPath, closeArgs, { ...opts, input: JSON.stringify(payload) });
+    if (r1.status !== 0) { colFail(6, label, `close-1 exited ${r1.status}: ${(r1.stderr || '').slice(0, 200)}`); return false; }
+
+    // Capture DB-generated valid_at and id after first write.
+    const db = await pgConnect(colDb);
+    const { rows: firstRows } = await db.query(
+      `SELECT id, valid_at, last_reinforced FROM assertions
+       WHERE project_id=$1 AND subject='col-f' AND predicate=$2 AND object='dep-f' AND suppressed=false`,
+      [colProjectId, pred]
+    );
+    if (firstRows.length !== 1) { await db.end(); colFail(6, label, `expected 1 live row after first close, got ${firstRows.length}`); return false; }
+    const id1  = firstRows[0].id;
+    const va1  = firstRows[0].valid_at;
+    const lr1  = firstRows[0].last_reinforced;
+
+    // Second close — same session, same triple → touch-only (sequential, so 2nd txn now() >= 1st).
+    const r2 = spawnSync(process.execPath, closeArgs, { ...opts, input: JSON.stringify(payload) });
+    if (r2.status !== 0) { await db.end(); colFail(6, label, `close-2 exited ${r2.status}: ${(r2.stderr || '').slice(0, 200)}`); return false; }
+
+    const { rows: afterRows } = await db.query(
+      `SELECT id, valid_at, last_reinforced, suppressed FROM assertions
+       WHERE project_id=$1 AND subject='col-f' AND predicate=$2 AND object='dep-f'`,
+      [colProjectId, pred]
+    );
+    await db.end();
+
+    const liveRows = afterRows.filter(r => r.suppressed === false || r.suppressed === 0);
+    const suppRows = afterRows.filter(r => r.suppressed === true  || r.suppressed === 1);
+
+    if (liveRows.length !== 1) { colFail(6, label, `expected 1 live row, got ${liveRows.length}`); return false; }
+    if (suppRows.length !== 0) { colFail(6, label, `expected 0 suppressed rows, got ${suppRows.length}`); return false; }
+    if (String(liveRows[0].id) !== String(id1)) { colFail(6, label, `row id changed: was ${id1}, now ${liveRows[0].id}`); return false; }
+
+    // valid_at must be byte-identical (compare as ISO strings — both DB-generated).
+    const va2    = liveRows[0].valid_at;
+    const va1Str = (va1 instanceof Date) ? va1.toISOString() : String(va1);
+    const va2Str = (va2 instanceof Date) ? va2.toISOString() : String(va2);
+    if (va2Str !== va1Str) { colFail(6, label, `valid_at changed: was ${va1Str}, now ${va2Str} (decay clock was reset)`); return false; }
+
+    // last_reinforced must be >= lr1 (DB clock only — sequential spawnSync, so no time travel).
+    const lr2 = liveRows[0].last_reinforced;
+    const lr1Ms = (lr1 instanceof Date) ? lr1.getTime() : new Date(lr1).getTime();
+    const lr2Ms = (lr2 instanceof Date) ? lr2.getTime() : new Date(lr2).getTime();
+    if (lr2Ms < lr1Ms) { colFail(6, label, `last_reinforced decreased: was ${lr1Ms}, now ${lr2Ms}`); return false; }
+
+    colPass(6, label);
+    return true;
+  } catch (err) { colFail(6, label, err.message); return false; }
+}
+
+/**
+ * COLLISION 7/7 — same triple from DISTINCT session_ids consolidates (parity proof).
+ * Two cmdClose calls with DISTINCT session_ids and identical triple → 1 live row,
+ * tier='consolidated', corroboration_count=2 (cross-session path still works after fix).
+ */
+async function colStep7_sameSessionCrossSessionParity(colDb, colProjectId, colProjectDir) {
+  const label = 'cross-session same triple → 1 live, tier=consolidated, corrob=2 (parity with touch-only)';
+  try {
+    const pred    = 'depends_on';
+    const SID_X   = `col-sess-x-${Date.now()}`;
+    const SID_Y   = `col-sess-y-${Date.now()}`;
+    const closeArgs = [HANDOFF_SCRIPT, 'close', '--json', '-'];
+    const closeEnv  = { ...process.env, HANDOFF_DB: colDb, PROJECT_ROOT: colProjectDir };
+    const opts      = { cwd: PROJECT_ROOT, env: closeEnv, encoding: 'utf8', timeout: 30000 };
+
+    const r1 = spawnSync(process.execPath, closeArgs,
+      { ...opts, input: JSON.stringify({ session_id: SID_X, assertions: [{ subject: 'col-g', predicate: pred, object: 'dep-g', confidence: 7, source: 'model_extracted' }] }) });
+    if (r1.status !== 0) { colFail(7, label, `close-1 exited ${r1.status}: ${(r1.stderr || '').slice(0, 200)}`); return false; }
+
+    const r2 = spawnSync(process.execPath, closeArgs,
+      { ...opts, input: JSON.stringify({ session_id: SID_Y, assertions: [{ subject: 'col-g', predicate: pred, object: 'dep-g', confidence: 7, source: 'model_extracted' }] }) });
+    if (r2.status !== 0) { colFail(7, label, `close-2 exited ${r2.status}: ${(r2.stderr || '').slice(0, 200)}`); return false; }
+
+    const db = await pgConnect(colDb);
+    const { rows } = await db.query(
+      `SELECT tier, corroboration_count, suppressed FROM assertions
+       WHERE project_id=$1 AND subject='col-g' AND predicate=$2 AND object='dep-g'`,
+      [colProjectId, pred]
+    );
+    await db.end();
+
+    const liveRows = rows.filter(r => r.suppressed === false || r.suppressed === 0);
+    if (liveRows.length !== 1) { colFail(7, label, `expected 1 live row, got ${liveRows.length}`); return false; }
+    if (liveRows[0].tier !== 'consolidated') { colFail(7, label, `expected tier=consolidated, got ${liveRows[0].tier}`); return false; }
+    const corrob = typeof liveRows[0].corroboration_count === 'number'
+      ? liveRows[0].corroboration_count
+      : parseInt(liveRows[0].corroboration_count, 10);
+    if (corrob !== 2) { colFail(7, label, `expected corroboration_count=2, got ${corrob}`); return false; }
+
+    colPass(7, label);
+    return true;
+  } catch (err) { colFail(7, label, err.message); return false; }
+}
+
 async function runCollisionSection() {
   console.log(`\n=== COLLISION SECTION (${COL_TOTAL} steps) ===`);
   console.log('smoketest-handoff collision: OQ-5 shared invariant fixture + registry/index drift guard');
-  console.log('Step 5 (drift): pure — no Postgres. Steps 1-4: require Postgres.');
+  console.log('Step 5 (drift): pure — no Postgres. Steps 1-4, 6-7: require Postgres.');
   console.log('');
 
   // Step 5 is pure — always run it.
@@ -5487,9 +5597,9 @@ async function runCollisionSection() {
     const initR = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'init', '-y'],
       { cwd: PROJECT_ROOT, env: { ...process.env, HANDOFF_DB: COL_DB, PROJECT_ROOT: PROJ_DIR }, encoding: 'utf8', timeout: 30000 });
     if (initR.status !== 0) {
-      console.log('[COLLISION] DB init failed — skipping DB-backed steps 1-4');
+      console.log('[COLLISION] DB init failed — skipping DB-backed steps 1-4, 6-7');
       console.log((initR.stderr || initR.stdout || '').slice(0, 400));
-      colFailed += 4;
+      colFailed += 6;
     } else {
       PROJ_ID = markerUUID(PROJ_DIR) || PROJ_ID;
       console.log(`[COLLISION] DB init OK (${COL_DB})`);
@@ -5497,8 +5607,8 @@ async function runCollisionSection() {
       try { await createRetrievalEventsTable(COL_DB); } catch (_) { /* non-fatal */ }
     }
   } catch (err) {
-    console.log(`[COLLISION] DB setup error: ${err.message} — skipping steps 1-4`);
-    colFailed += 4;
+    console.log(`[COLLISION] DB setup error: ${err.message} — skipping steps 1-4, 6-7`);
+    colFailed += 6;
   }
 
   if (dbOk) {
@@ -5510,6 +5620,8 @@ async function runCollisionSection() {
     } else {
       colFail(4, 'history kind', 'skipped — step 1 failed (no suppressed row available)');
     }
+    await colStep6_sameSessionNoDecayReset(COL_DB, PROJ_ID, PROJ_DIR);
+    await colStep7_sameSessionCrossSessionParity(COL_DB, PROJ_ID, PROJ_DIR);
   }
 
   try {

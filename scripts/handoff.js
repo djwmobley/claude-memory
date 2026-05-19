@@ -1892,6 +1892,9 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
     // UPDATE's WHERE clause.  Omitting the pinned filter here keeps the SELECT dialect-neutral
     // (no boolean literal that differs between backends).
     const storedSubjectsToSuppress = new Set();
+    // Touch-only ids: same-session exact repeats that should only have last_reinforced bumped,
+    // NOT suppressed+reinserted. Accumulate across both cardinalities before deciding path.
+    const touchOnlyIds = [];
     // Two-tier durability: track corroboration signals from 1:N exact-duplicate matches.
     // For 1:N only: collect session_id and corroboration_count from canonical-matched prior
     // live rows to determine cross-session corroboration (hybrid consolidation trigger b).
@@ -1901,7 +1904,7 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
 
     if (cardinality === '1:1') {
       const { rows: candidates } = await db.query(
-        `SELECT DISTINCT subject FROM assertions
+        `SELECT id, subject, object, session_id, confidence, source FROM assertions
          WHERE project_id = $1
            AND predicate  = $2
            AND suppressed = false
@@ -1910,7 +1913,18 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
       );
       for (const r of candidates) {
         if (canonicalize(r.subject) === canonSubject) {
-          storedSubjectsToSuppress.add(r.subject);
+          // Same-session exact repeat (1:1): object, conf, source, session all match →
+          // touch-only (bump last_reinforced only; no new row, no suppression).
+          if (
+            r.object === ass.object &&
+            r.session_id != null && sessionId != null &&
+            r.session_id === sessionId &&
+            Number(r.confidence) === conf && r.source === source
+          ) {
+            touchOnlyIds.push(r.id);
+          } else {
+            storedSubjectsToSuppress.add(r.subject);
+          }
         }
       }
     } else {
@@ -1919,7 +1933,7 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
       // Cross-session corroboration requires: both session_ids non-null AND DISTINCT from each other.
       // Same-session re-assertion does NOT graduate. NULL session_id on either side is NOT corroboration.
       const { rows: candidates } = await db.query(
-        `SELECT subject, session_id, corroboration_count FROM assertions
+        `SELECT id, subject, session_id, corroboration_count, confidence, source FROM assertions
          WHERE project_id = $1
            AND predicate  = $2
            AND object     = $3
@@ -1929,6 +1943,16 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
       );
       for (const r of candidates) {
         if (canonicalize(r.subject) === canonSubject) {
+          // Same-session exact repeat (1:N): conf, source, session all match →
+          // touch-only (bump last_reinforced only; skip suppression + corroboration tracking).
+          if (
+            r.session_id != null && sessionId != null &&
+            r.session_id === sessionId &&
+            Number(r.confidence) === conf && r.source === source
+          ) {
+            touchOnlyIds.push(r.id);
+            continue; // skip suppression + corroboration tracking for this row
+          }
           storedSubjectsToSuppress.add(r.subject);
           // Cross-session corroboration check: prior row must have a non-null session_id
           // that is DISTINCT from the incoming sessionId (also non-null).
@@ -1946,6 +1970,18 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
           if (priorCount > maxPriorCorrob) maxPriorCorrob = priorCount;
         }
       }
+    }
+
+    // ── Touch-only short-circuit ───────────────────────────────────────────────
+    // ALL matched live candidates are same-session exact repeats: bump last_reinforced/
+    // last_retrieved only via buildBumpAssertions, then commit and return false.
+    // No new row, no suppression, no advance of valid_at/tier/consolidated_at/corroboration_count.
+    // Mixed case (some touch-only + some suppress): fall through to normal suppress+INSERT path.
+    if (touchOnlyIds.length > 0 && storedSubjectsToSuppress.size === 0) {
+      const bumpStmt = db.buildBumpAssertions(touchOnlyIds);
+      if (bumpStmt) await db.query(bumpStmt.sql, bumpStmt.params);
+      await db.query('COMMIT');
+      return false; // no new row; caller must NOT increment assertionsWritten
     }
 
     // ── Step 2: Suppress matched prior rows via the existing PR-B port method ────
