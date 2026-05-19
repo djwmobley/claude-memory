@@ -36,6 +36,7 @@
  *   S10 — No-backfill guarantee (static): no UPDATE SET subject path exists in engine
  *   S16 — Hole A fix: buildEpochSecondsDiffPredicate identical row selection on both backends
  *   S17 — Hole B fix: buildWithinDaysPredicate (>=) identical row selection on both backends
+ *   S18 — Collision/decay fix: same-session exact-repeat touch-only path (no decay clock reset)
  *
  * Usage:
  *   node scripts/test-both-backends.js
@@ -2086,12 +2087,13 @@ function requireHandoffFunctions() {
     await db.query('BEGIN');
     try {
       const storedSubjectsToSuppress = new Set();
+      const touchOnlyIds = [];
       let crossSessionCorroborated = false;
       let maxPriorCorrob = 1;
 
       if (cardinality === '1:1') {
         const { rows: candidates } = await db.query(
-          `SELECT DISTINCT subject FROM assertions
+          `SELECT id, subject, object, session_id, confidence, source FROM assertions
            WHERE project_id = $1
              AND predicate  = $2
              AND suppressed = false
@@ -2100,12 +2102,21 @@ function requireHandoffFunctions() {
         );
         for (const r of candidates) {
           if (canonicalize(r.subject) === canonSubject) {
-            storedSubjectsToSuppress.add(r.subject);
+            if (
+              r.object === ass.object &&
+              r.session_id != null && sessionId != null &&
+              r.session_id === sessionId &&
+              Number(r.confidence) === conf && r.source === source
+            ) {
+              touchOnlyIds.push(r.id);
+            } else {
+              storedSubjectsToSuppress.add(r.subject);
+            }
           }
         }
       } else {
         const { rows: candidates } = await db.query(
-          `SELECT subject, session_id, corroboration_count FROM assertions
+          `SELECT id, subject, session_id, corroboration_count, confidence, source FROM assertions
            WHERE project_id = $1
              AND predicate  = $2
              AND object     = $3
@@ -2115,6 +2126,14 @@ function requireHandoffFunctions() {
         );
         for (const r of candidates) {
           if (canonicalize(r.subject) === canonSubject) {
+            if (
+              r.session_id != null && sessionId != null &&
+              r.session_id === sessionId &&
+              Number(r.confidence) === conf && r.source === source
+            ) {
+              touchOnlyIds.push(r.id);
+              continue;
+            }
             storedSubjectsToSuppress.add(r.subject);
             if (
               r.session_id !== null && r.session_id !== undefined &&
@@ -2129,6 +2148,13 @@ function requireHandoffFunctions() {
             if (priorCount > maxPriorCorrob) maxPriorCorrob = priorCount;
           }
         }
+      }
+
+      if (touchOnlyIds.length > 0 && storedSubjectsToSuppress.size === 0) {
+        const bumpStmt = db.buildBumpAssertions(touchOnlyIds);
+        if (bumpStmt) await db.query(bumpStmt.sql, bumpStmt.params);
+        await db.query('COMMIT');
+        return false;
       }
 
       for (const storedSubject of storedSubjectsToSuppress) {
@@ -4822,6 +4848,214 @@ async function runS17() {
   }
 }
 
+// ── S18: Collision/decay fix — same-session exact-repeat touch-only path ─────
+
+async function runS18() {
+  console.log('\n=== S18: Collision/decay fix — same-session exact-repeat touch-only path ===');
+
+  const SESSION_A = 'sess-s18-a';
+  const SESSION_B = 'sess-s18-b';
+
+  // ── S18.1: 1:N same-session exact repeat → last_reinforced bumped, valid_at unchanged ──
+  await bothBackends(
+    'S18.1: 1:N same-session exact repeat → last_reinforced bumped; valid_at unchanged; 0 suppressed; tier=probationary; corrob=1',
+    async (db) => {
+      const { writeAssertionWithSupersession } = requireHandoffFunctions();
+      const pid = `s18-1-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const ass = { subject: 's18-subj-1n', predicate: 'depends_on', object: 's18-obj-1n', confidence: 7, source: 'model_extracted' };
+      // First write — establishes the row; capture DB-generated valid_at.
+      await writeAssertionWithSupersession(db, pid, ass, SESSION_A);
+      const { rows: firstRows } = await db.query(
+        `SELECT id, valid_at, last_reinforced, tier, corroboration_count FROM assertions
+         WHERE project_id=$1 AND subject='s18-subj-1n' AND predicate='depends_on' AND suppressed=false`,
+        [pid]
+      );
+      if (firstRows.length !== 1) throw new Error(`expected 1 live row after first write, got ${firstRows.length}`);
+      const va1 = firstRows[0].valid_at;   // DB-generated timestamp (string or Date object)
+      const lr1 = firstRows[0].last_reinforced;
+      const id1 = firstRows[0].id;
+
+      // Second write — same session, same triple: should be touch-only.
+      await writeAssertionWithSupersession(db, pid, ass, SESSION_A);
+
+      const { rows: afterRows } = await db.query(
+        `SELECT id, valid_at, last_reinforced, tier, corroboration_count, suppressed FROM assertions
+         WHERE project_id=$1 AND subject='s18-subj-1n' AND predicate='depends_on'`,
+        [pid]
+      );
+      const liveRows = afterRows.filter(r => r.suppressed === false || r.suppressed === 0);
+      const suppRows = afterRows.filter(r => r.suppressed === true  || r.suppressed === 1);
+
+      assertEqual(liveRows.length, 1,  'S18.1: must still be exactly 1 live row');
+      assertEqual(suppRows.length, 0,  'S18.1: must be 0 suppressed rows');
+      assertEqual(liveRows[0].id, id1, 'S18.1: existing row id must be unchanged');
+      // valid_at must be byte-identical — compare as strings (both DB-generated).
+      const va2 = liveRows[0].valid_at;
+      const va1Str = (va1 instanceof Date) ? va1.toISOString() : String(va1);
+      const va2Str = (va2 instanceof Date) ? va2.toISOString() : String(va2);
+      assertEqual(va2Str, va1Str, 'S18.1: valid_at must be unchanged (decay clock not reset)');
+      // last_reinforced must be >= va1 (DB clock only — no JS Date.now()).
+      const lr2 = liveRows[0].last_reinforced;
+      const lr1Ms = (lr1 instanceof Date) ? lr1.getTime() : new Date(lr1).getTime();
+      const va1Ms = (va1 instanceof Date) ? va1.getTime() : new Date(va1).getTime();
+      const lr2Ms = (lr2 instanceof Date) ? lr2.getTime() : new Date(lr2).getTime();
+      assertTrue(lr2Ms >= va1Ms, `S18.1: last_reinforced (${lr2Ms}) must be >= va1 (${va1Ms})`);
+      assertTrue(lr2Ms >= lr1Ms, 'S18.1: last_reinforced must not decrease');
+      assertEqual(liveRows[0].tier, 'probationary', 'S18.1: tier must remain probationary');
+      const corrob = typeof liveRows[0].corroboration_count === 'number'
+        ? liveRows[0].corroboration_count
+        : parseInt(liveRows[0].corroboration_count, 10);
+      assertEqual(corrob, 1, 'S18.1: corroboration_count must remain 1');
+    }
+  );
+
+  // ── S18.2: return value === false on same-session exact repeat ────────────
+  await bothBackends(
+    'S18.2: writeAssertionWithSupersession returns false on same-session exact repeat (caller counter discipline)',
+    async (db) => {
+      const { writeAssertionWithSupersession } = requireHandoffFunctions();
+      const pid = `s18-2-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const ass = { subject: 's18-subj-ret', predicate: 'depends_on', object: 's18-obj-ret', confidence: 6, source: 'user_stated' };
+      const ret1 = await writeAssertionWithSupersession(db, pid, ass, SESSION_A);
+      assertEqual(ret1, true,  'S18.2: first write must return true');
+      const ret2 = await writeAssertionWithSupersession(db, pid, ass, SESSION_A);
+      assertEqual(ret2, false, 'S18.2: same-session repeat must return false');
+    }
+  );
+
+  // ── S18.3: cross-session exact repeat still consolidates (regression guard for S11.2d) ──
+  await bothBackends(
+    'S18.3: cross-session exact repeat still → 1 live, tier=consolidated, corrob=2 (regression guard for S11.2d)',
+    async (db) => {
+      const { writeAssertionWithSupersession } = requireHandoffFunctions();
+      const pid = `s18-3-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const ass = { subject: 's18-subj-cross', predicate: 'depends_on', object: 's18-obj-cross', confidence: 7, source: 'model_extracted' };
+      await writeAssertionWithSupersession(db, pid, ass, SESSION_A);
+      await writeAssertionWithSupersession(db, pid, ass, SESSION_B); // different session
+      const { rows } = await db.query(
+        `SELECT tier, corroboration_count, suppressed FROM assertions
+         WHERE project_id=$1 AND subject='s18-subj-cross' AND predicate='depends_on' AND object='s18-obj-cross'`,
+        [pid]
+      );
+      const liveRows = rows.filter(r => r.suppressed === false || r.suppressed === 0);
+      assertEqual(liveRows.length, 1, 'S18.3: must be exactly 1 live row');
+      assertEqual(liveRows[0].tier, 'consolidated', 'S18.3: tier must be consolidated after cross-session corroboration');
+      const corrob = typeof liveRows[0].corroboration_count === 'number'
+        ? liveRows[0].corroboration_count
+        : parseInt(liveRows[0].corroboration_count, 10);
+      assertEqual(corrob, 2, 'S18.3: corroboration_count must be 2');
+    }
+  );
+
+  // ── S18.4: 1:1 same-session exact (same object) → touch-only ─────────────
+  await bothBackends(
+    'S18.4: 1:1 same-session exact (same object) → touch-only: 1 live, 0 suppressed, valid_at unchanged, last_reinforced>=va1, returns false',
+    async (db) => {
+      const { writeAssertionWithSupersession } = requireHandoffFunctions();
+      const pid = `s18-4-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const ass = { subject: 's18-subj-11', predicate: 'is_status', object: 'active', confidence: 8, source: 'user_stated' };
+      await writeAssertionWithSupersession(db, pid, ass, SESSION_A);
+      const { rows: firstRows } = await db.query(
+        `SELECT id, valid_at, last_reinforced FROM assertions
+         WHERE project_id=$1 AND subject='s18-subj-11' AND predicate='is_status' AND suppressed=false`,
+        [pid]
+      );
+      if (firstRows.length !== 1) throw new Error(`expected 1 live row after first write, got ${firstRows.length}`);
+      const va1 = firstRows[0].valid_at;
+      const id1 = firstRows[0].id;
+
+      const ret = await writeAssertionWithSupersession(db, pid, ass, SESSION_A);
+
+      const { rows: afterRows } = await db.query(
+        `SELECT id, valid_at, last_reinforced, suppressed FROM assertions
+         WHERE project_id=$1 AND subject='s18-subj-11' AND predicate='is_status'`,
+        [pid]
+      );
+      const liveRows = afterRows.filter(r => r.suppressed === false || r.suppressed === 0);
+      const suppRows = afterRows.filter(r => r.suppressed === true  || r.suppressed === 1);
+      assertEqual(liveRows.length, 1,  'S18.4: must be exactly 1 live row');
+      assertEqual(suppRows.length, 0,  'S18.4: must be 0 suppressed rows');
+      assertEqual(liveRows[0].id, id1, 'S18.4: row id must be unchanged');
+      assertEqual(ret, false,          'S18.4: return value must be false');
+      const va2 = liveRows[0].valid_at;
+      const va1Str = (va1 instanceof Date) ? va1.toISOString() : String(va1);
+      const va2Str = (va2 instanceof Date) ? va2.toISOString() : String(va2);
+      assertEqual(va2Str, va1Str, 'S18.4: valid_at must be unchanged');
+      const lr2 = liveRows[0].last_reinforced;
+      const va1Ms = (va1 instanceof Date) ? va1.getTime() : new Date(va1).getTime();
+      const lr2Ms = (lr2 instanceof Date) ? lr2.getTime() : new Date(lr2).getTime();
+      assertTrue(lr2Ms >= va1Ms, 'S18.4: last_reinforced must be >= va1');
+    }
+  );
+
+  // ── S18.5: 1:1 same-session DIFFERENT object → still supersedes ──────────
+  await bothBackends(
+    'S18.5: 1:1 same-session DIFFERENT object → still supersedes: 1 live (new object), 1 suppressed (prior object)',
+    async (db) => {
+      const { writeAssertionWithSupersession } = requireHandoffFunctions();
+      const pid = `s18-5-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const ass5a = { subject: 's18-subj-11b', predicate: 'is_status', object: 'active',   confidence: 7, source: 'model_extracted' };
+      const ass5b = { subject: 's18-subj-11b', predicate: 'is_status', object: 'inactive', confidence: 7, source: 'model_extracted' };
+      await writeAssertionWithSupersession(db, pid, ass5a, SESSION_A);
+      const ret = await writeAssertionWithSupersession(db, pid, ass5b, SESSION_A);
+
+      const { rows } = await db.query(
+        `SELECT object, suppressed FROM assertions
+         WHERE project_id=$1 AND subject='s18-subj-11b' AND predicate='is_status'`,
+        [pid]
+      );
+      const liveRows = rows.filter(r => r.suppressed === false || r.suppressed === 0);
+      const suppRows = rows.filter(r => r.suppressed === true  || r.suppressed === 1);
+      assertEqual(liveRows.length, 1, 'S18.5: must be 1 live row');
+      assertEqual(suppRows.length, 1, 'S18.5: must be 1 suppressed row');
+      assertEqual(liveRows[0].object, 'inactive', 'S18.5: live row must have new object (inactive)');
+      assertEqual(suppRows[0].object, 'active',   'S18.5: suppressed row must be the prior object (active)');
+      assertEqual(ret, true, 'S18.5: return value must be true (new row inserted)');
+    }
+  );
+
+  // ── S18.6 (adversarial): NULL sessionId → bypasses touch-only → suppress+reinsert ──
+  await bothBackends(
+    'S18.6 (adversarial): NULL sessionId → touch-only bypassed → suppress+reinsert: 1 live + 1 suppressed; new id or new valid_at',
+    async (db) => {
+      const { writeAssertionWithSupersession } = requireHandoffFunctions();
+      const pid = `s18-6-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const ass = { subject: 's18-subj-null', predicate: 'depends_on', object: 's18-obj-null', confidence: 6, source: 'model_extracted' };
+      // First write with a real session.
+      await writeAssertionWithSupersession(db, pid, ass, SESSION_A);
+      const { rows: firstRows } = await db.query(
+        `SELECT id, valid_at FROM assertions
+         WHERE project_id=$1 AND subject='s18-subj-null' AND predicate='depends_on' AND suppressed=false`,
+        [pid]
+      );
+      if (firstRows.length !== 1) throw new Error(`expected 1 live row after first write, got ${firstRows.length}`);
+      const id1    = firstRows[0].id;
+      const va1    = firstRows[0].valid_at;
+      const va1Str = (va1 instanceof Date) ? va1.toISOString() : String(va1);
+
+      // Second write with NULL session — touch-only condition cannot fire.
+      await writeAssertionWithSupersession(db, pid, ass, null);
+
+      const { rows: afterRows } = await db.query(
+        `SELECT id, valid_at, suppressed FROM assertions
+         WHERE project_id=$1 AND subject='s18-subj-null' AND predicate='depends_on' AND object='s18-obj-null'`,
+        [pid]
+      );
+      const liveRows = afterRows.filter(r => r.suppressed === false || r.suppressed === 0);
+      const suppRows = afterRows.filter(r => r.suppressed === true  || r.suppressed === 1);
+      assertEqual(liveRows.length, 1, 'S18.6: must be 1 live row');
+      assertEqual(suppRows.length, 1, 'S18.6: must be 1 suppressed row');
+      // New row must differ from the first by id OR valid_at (suppress+reinsert occurred).
+      const va2    = liveRows[0].valid_at;
+      const va2Str = (va2 instanceof Date) ? va2.toISOString() : String(va2);
+      assertTrue(
+        liveRows[0].id !== id1 || va2Str !== va1Str,
+        'S18.6: NULL session must NOT use touch-only — expected new id or new valid_at after suppress+reinsert'
+      );
+    }
+  );
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 (async () => {
@@ -4856,6 +5090,7 @@ async function runS17() {
   await runS15();
   await runS16();
   await runS17();
+  await runS18();
 
   console.log('\n─── Results ──────────────────────────────────────');
   console.log(`PASS ${passed}  FAIL ${failed}  SKIP ${skipped}`);
