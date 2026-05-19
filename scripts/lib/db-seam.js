@@ -948,16 +948,27 @@ class SQLiteAdapter {
   }
 
   /**
-   * Build a fuzzy-text match query over suppression-eligible rows.
-   * SQLite fallback: uses instr() + LIKE since pg_trgm is not available.
+   * Build a fuzzy-text match query over assertions using per-token OR LIKE / instr().
+   * SQLite fallback: uses instr() since pg_trgm is not available.
    * Matches against the concatenated subject || ' ' || predicate || ' ' || object.
    * Returns id, subject, predicate, object rows; limit is applied.
    * Returns { sql, params }.
+   *
+   * INTENTIONAL CROSS-BACKEND SEMANTIC DIFFERENCE:
+   *   Postgres (PostgresAdapter.buildFuzzyMatch): uses pg_trgm phrase similarity
+   *     (% operator / similarity()) — a single whole-phrase match against the seed.
+   *   SQLite (this adapter): joins per-token LIKE clauses with OR — a row matches if
+   *     ANY token from the seed appears in the concatenated text.
+   * Multi-word seeds may therefore yield different candidate sets across backends.
+   * This is accepted: the resurrect branch runs on the Postgres loader path;
+   * the SQLite arm is best-effort (seam validation only, not production traffic).
+   * Eligibility filtering (suppressed=true, suppression_kind='downvoted_probation')
+   * is the caller's responsibility (Steps 3/4 in the resurrect branch).
    */
   buildFuzzyMatch(projectId, seedText, limit) {
     // Normalise seed to lower-case for case-insensitive matching.
     const tokens = String(seedText || '').toLowerCase().split(/\s+/).filter(Boolean);
-    // Build one LIKE clause per token joined with AND — zero tokens -> match nothing.
+    // Build one LIKE clause per token joined with OR — zero tokens -> match nothing.
     if (tokens.length === 0) {
       return {
         sql: `SELECT id, subject, predicate, object FROM assertions WHERE 1=0`,
@@ -1417,8 +1428,17 @@ class PostgresAdapter {
    * Requires pg_trgm extension (added to setup.sql).
    * Matches against subject || ' ' || predicate || ' ' || object via similarity().
    * The % operator is equivalent to similarity(a,b) > pg_trgm.similarity_threshold.
-   * Returns id, subject, predicate, object rows ordered by descending similarity.
+   * Returns candidate subjects from any matching rows ordered by descending similarity.
+   * Eligibility filtering (suppressed, suppression_kind, etc.) is the caller's
+   * responsibility — this method does not filter by suppression state.
    * Returns { sql, params }.
+   *
+   * INTENTIONAL CROSS-BACKEND SEMANTIC DIFFERENCE:
+   *   Postgres (this adapter): uses pg_trgm phrase similarity — whole-phrase match.
+   *   SQLite (SQLiteAdapter.buildFuzzyMatch): uses per-token OR LIKE — matches if
+   *     ANY token appears. Multi-word seeds may yield different candidate sets.
+   * This is accepted: the resurrect branch runs on the Postgres loader path;
+   * the SQLite arm is best-effort (seam validation only, not production traffic).
    */
   buildFuzzyMatch(projectId, seedText, limit) {
     const seed = String(seedText || '').trim();

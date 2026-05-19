@@ -112,6 +112,9 @@ async function main() {
     database: process.env.PGDATABASE || cfg.database || 'postgres',
     user:     process.env.PGUSER     || cfg.user     || 'postgres',
     password: process.env.PGPASSWORD || cfg.password || undefined,
+    // Propagate ssl config if present in pipeline.yml (e.g. ssl: { rejectUnauthorized: false }).
+    // cfg.ssl is undefined when pipeline.yml omits ssl, so this spread is a no-op by default.
+    ...(cfg.ssl ? { ssl: cfg.ssl } : {}),
   });
   await client.connect();
 
