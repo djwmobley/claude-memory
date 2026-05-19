@@ -411,6 +411,18 @@ change.
 
 ---
 
+## Studies
+
+Design notes and methodology write-ups for the project:
+
+- [**Decay vs. Don't-Forget: Devalue, Invalidate, and On-Demand Resurrection**](docs/studies/decay-vs-dont-forget-and-resurrection.md)
+  — How aggressive time-decay and strict trust-tiering can compound to sink valuable older context below the retrieval horizon; the devalue-vs-invalidate distinction that makes on-demand resurrection safe; the adversarial guard that must ship alongside any decay-override mechanism; and the iterative replication discipline that corrected two overstatements before conclusions were accepted.
+
+- [**claude-memory vs. Alternatives: Was the Build Justified?**](docs/studies/2026-05-memory-systems-comparison.md)
+  — Code-grounded comparison against agentmemory, mem0, Letta/MemGPT, Graphiti/Zep, and Cognee.
+
+---
+
 ## Maintenance posture
 
 This repo is shared in good faith but is not a maintained open-source product.
