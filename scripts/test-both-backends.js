@@ -4689,10 +4689,14 @@ async function runS17() {
       //
       // Row X: retrieved_at = now - 3 days  → inside window   → QUALIFIES
       // Row Y: retrieved_at = now - 10 days → outside window  → DOES NOT qualify
-      // Row Z: retrieved_at = now - 7 days  → on boundary (>=) → QUALIFIES
+      // Row Z: retrieved_at = exactly DB-clock cutoff (now - 7 days) → QUALIFIES under >=
       //
-      // We generate the datetime values as literals so both backends get identical timestamps,
-      // avoiding divergence from "now" being called at slightly different times per row.
+      // Rows X and Y use JS-computed literals (safe margins; no race possible).
+      // Row Z (boundary) uses the DATABASE's own clock expression at INSERT time, so it
+      // is guaranteed to align with the query cutoff and be included by >= deterministically.
+      // Using JS Date.now() for the boundary row would introduce a JS-vs-DB clock race:
+      // the JS timestamp is computed milliseconds before the DB evaluates now() in the query,
+      // causing the boundary row to land fractionally before the cutoff and be excluded.
 
       const nowMs  = Date.now();
       const DAY_MS = 24 * 60 * 60 * 1000;
@@ -4702,9 +4706,9 @@ async function runS17() {
         return new Date(ms).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
       }
 
-      const tsInside   = toIso(nowMs - 3  * DAY_MS);  // 3 days ago
-      const tsOutside  = toIso(nowMs - 10 * DAY_MS);  // 10 days ago
-      const tsBoundary = toIso(nowMs - 7  * DAY_MS);  // exactly 7 days ago
+      const tsInside  = toIso(nowMs - 3  * DAY_MS);  // 3 days ago
+      const tsOutside = toIso(nowMs - 10 * DAY_MS);  // 10 days ago
+      // tsBoundary is intentionally NOT computed in JS — see boundary-row comment above.
 
       await db.query(
         `INSERT INTO retrieval_events (project_id, query_text, outcome, retrieved_at)
@@ -4716,32 +4720,62 @@ async function runS17() {
          VALUES ($1,$2,$3,$4)`,
         [PID, 'kind=s17-y', 'success', tsOutside]
       );
-      await db.query(
-        `INSERT INTO retrieval_events (project_id, query_text, outcome, retrieved_at)
-         VALUES ($1,$2,$3,$4)`,
-        [PID, 'kind=s17-z', 'success', tsBoundary]
-      );
 
-      // Execute the C3 window query via the port method — same logic as cmdClose C3 block.
-      // projectId = $1, windowDays = $2 (paramOffset=2 for Postgres).
-      const withinPred = db.buildWithinDaysPredicate('retrieved_at', '>=', 2);
+      // Row Z (boundary): seed retrieved_at using the DB's own clock expression so it aligns
+      // exactly with the query cutoff — and run the INSERT + SELECT in the same transaction
+      // so that now() is frozen to the same snapshot for both operations.
+      //
+      // In Postgres, now() == CURRENT_TIMESTAMP == transaction start time; it does NOT tick
+      // between statements in the same transaction.  In SQLite, datetime('now') is also stable
+      // within a transaction.  Wrapping INSERT+SELECT in BEGIN/COMMIT therefore eliminates the
+      // JS-clock-vs-DB-clock race that caused the original S17.1 failure: the boundary row
+      // (seeded at now()-7days) and the query cutoff (now()-7days) see the identical now().
+      //
+      // Dialect-specific: Postgres uses now() - INTERVAL '...'; SQLite uses datetime('now', '...').
+      await db.query('BEGIN');
+      try {
+        if (isPostgres) {
+          await db.query(
+            `INSERT INTO retrieval_events (project_id, query_text, outcome, retrieved_at)
+             VALUES ($1,$2,$3, now() - INTERVAL '${WINDOW_DAYS} days')`,
+            [PID, 'kind=s17-z', 'success']
+          );
+        } else {
+          await db.query(
+            `INSERT INTO retrieval_events (project_id, query_text, outcome, retrieved_at)
+             VALUES ($1,$2,$3, datetime('now', '-${WINDOW_DAYS} days'))`,
+            [PID, 'kind=s17-z', 'success']
+          );
+        }
 
-      const { rows } = await db.query(
-        `SELECT query_text FROM retrieval_events
-         WHERE project_id = $1
-           AND outcome IN ('success', 'failure', 'irrelevant')
-           AND ${withinPred}
-         ORDER BY query_text`,
-        [PID, String(WINDOW_DAYS)]
-      );
+        // Execute the C3 window query via the port method — same logic as cmdClose C3 block.
+        // projectId = $1, windowDays = $2 (paramOffset=2 for Postgres).
+        // now() here sees the same transaction snapshot as the INSERT above.
+        const withinPred = db.buildWithinDaysPredicate('retrieved_at', '>=', 2);
 
-      // Rows X (3 days ago) and Z (exactly 7 days ago, boundary-inclusive) must qualify.
-      // Row Y (10 days ago) must NOT qualify.
-      assertEqual(rows.length, 2,
-        `S17.1: expected 2 qualifying rows (inside + boundary), got ${rows.length}`);
-      const subjects = rows.map((r) => r.query_text).sort();
-      assertEqual(subjects[0], 'kind=s17-x', 'S17.1: inside-window row qualifies');
-      assertEqual(subjects[1], 'kind=s17-z', 'S17.1: boundary row qualifies (>= is inclusive)');
+        const { rows } = await db.query(
+          `SELECT query_text FROM retrieval_events
+           WHERE project_id = $1
+             AND outcome IN ('success', 'failure', 'irrelevant')
+             AND ${withinPred}
+           ORDER BY query_text`,
+          [PID, String(WINDOW_DAYS)]
+        );
+
+        await db.query('COMMIT');
+
+        // Rows X (3 days ago) and Z (exactly 7 days ago, boundary-inclusive) must qualify.
+        // Row Y (10 days ago) must NOT qualify.
+        assertEqual(rows.length, 2,
+          `S17.1: expected 2 qualifying rows (inside + boundary), got ${rows.length}`);
+        const subjects = rows.map((r) => r.query_text).sort();
+        assertEqual(subjects[0], 'kind=s17-x', 'S17.1: inside-window row qualifies');
+        assertEqual(subjects[1], 'kind=s17-z', 'S17.1: boundary row qualifies (>= is inclusive)');
+      } catch (err) {
+        await db.query('ROLLBACK');
+        throw err;
+      }
+
     }
   );
 
