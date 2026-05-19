@@ -2498,7 +2498,12 @@ async function cmdClose(args) {
   const { entitiesWritten, assertionsWritten, edgesWritten } =
     await writeExtraction(db, projectId, payload);
 
-  // Surface CLAUDE.md promotion candidates (conf >= 9, user_stated, multi-session)
+  // Surface CLAUDE.md promotion candidates (conf >= 9, user_stated, multi-session).
+  // Hole A fix: col-minus-col epoch difference now goes through a port method so both
+  // Postgres (EXTRACT) and SQLite (julianday) produce identical results.
+  const multiSessionPred = db.buildEpochSecondsDiffPredicate(
+    'last_reinforced', 'created_at', '>', 86400
+  );
   const { rows: candidates } = await db.query(
     `SELECT subject, predicate, object, confidence
      FROM assertions
@@ -2506,7 +2511,7 @@ async function cmdClose(args) {
        AND suppressed = false
        AND confidence >= 9
        AND source = 'user_stated'
-       AND EXTRACT(EPOCH FROM (last_reinforced - created_at)) > 86400
+       AND ${multiSessionPred}
      ORDER BY confidence DESC`,
     [projectId]
   );
@@ -2843,12 +2848,15 @@ async function cmdClose(args) {
               // Aggregate outcome counts per kind from retrieval_events in the rolling window.
               // query_text encodes kinds as 'loader:contract=<name>;kinds=<k1,k2,...>;sections=<n>'.
               // We extract individual kind tokens by splitting on commas and semicolons.
+              // Hole B fix: >= interval predicate now goes through a port method so
+              // both Postgres and SQLite produce identical row selection results.
+              const withinWindowPred = db.buildWithinDaysPredicate('retrieved_at', '>=', 2);
               const { rows: evtRows } = await db.query(
                 `SELECT query_text, outcome
                  FROM retrieval_events
                  WHERE project_id = $1
                    AND outcome IN ('success', 'failure', 'irrelevant')
-                   AND retrieved_at >= now() - ($2 || ' days')::interval`,
+                   AND ${withinWindowPred}`,
                 [projectId, String(windowDays)]
               );
 
