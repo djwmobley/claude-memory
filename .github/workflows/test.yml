@@ -116,3 +116,15 @@ jobs:
         # no-silent-SQLite-fallback guard in plugin mode.
         # Pure Node — no Postgres or Ollama required.
         run: node scripts/test-plugin-packaging.js
+      - name: Run L4 degraded-close tests
+        # Tests Lever L4: fail-loud, persist-to-DB, resume-visible skip record when
+        # C2 (feedback bias) or C3 (contract evolution) skip due to unresolvable
+        # session id at close time. Covers: clean-close byte-equivalence, C2/C3
+        # degraded_close row persistence, ## Degraded section in handoff.md,
+        # summary-line surfacing, resume RESUME WARNING banner, and exit-code gate
+        # (warn=exit 0, strict=exit 3).
+        run: node scripts/test-l4-degraded-close.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
