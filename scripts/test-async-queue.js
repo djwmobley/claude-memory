@@ -122,7 +122,7 @@ function runHandoff(subcmd, extraArgs = [], stdinData = null, extraEnv = {}) {
   };
   if (stdinData !== null) {
     opts.input = stdinData;
-    args.splice(1, 0, '--json', '-'); // insert after subcmd but before extra args
+    args.splice(2, 0, '--json', '-'); // insert after subcmd but before extra args
   }
   return spawnSync(process.execPath, args, opts);
 }

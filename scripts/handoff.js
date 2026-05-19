@@ -1642,7 +1642,7 @@ async function cmdLoaderLoad(opts = {}) {
         if (subBudget <= 0) {
           // No budget remaining — skip silently (no section, no crash).
         } else {
-          const seedText = q.seed || q.query || '';
+          const seedText = (q.seed || q.query || '').trim();
           const reviveOpt = q.revive === true;
           const fuzzyLimit = 20;
           // Tracks whether the ### Resurrected section was actually emitted.
@@ -1678,8 +1678,11 @@ async function cmdLoaderLoad(opts = {}) {
             }
           }
 
-          // If still no candidates, use all subjects with resurrect-eligible rows (bounded).
-          if (candidateSubjects.length === 0) {
+          // If still no candidates (and a seed was provided), use all subjects with
+          // resurrect-eligible rows (bounded). Gated on seedText so that a whitespace-only
+          // or absent seed does not trigger an unconstrained fallback fetch of all probation
+          // subjects — that would bypass the empty-seed guard at Step 6.
+          if (candidateSubjects.length === 0 && seedText) {
             const { rows: allSubj } = await db.query(
               `SELECT DISTINCT subject FROM assertions
                WHERE project_id = $1
