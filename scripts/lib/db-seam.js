@@ -889,6 +889,43 @@ class SQLiteAdapter {
   }
 
   /**
+   * Build an UPDATE that retires one or more live directive rows (L5).
+   * Sets: suppressed = 1, invalid_at = datetime('now'), suppression_kind = 'retired'.
+   * Only acts on live rows (suppressed = 0 AND invalid_at IS NULL).
+   *
+   * withObject=true  (--object supplied): retire only exact (project_id, subject, predicate, object).
+   * withObject=false (--object omitted):  retire ALL live rows for (project_id, subject, predicate).
+   *   Caller is responsible for checking isDirective(predicate) before invoking this form.
+   *
+   * Returns { sql, params }.
+   */
+  buildRetirementUpdate(projectId, subject, predicate, object, withObject) {
+    if (withObject) {
+      return {
+        sql: `UPDATE assertions
+              SET suppressed = 1, invalid_at = datetime('now'), suppression_kind = 'retired'
+              WHERE project_id = ?
+                AND subject    = ?
+                AND predicate  = ?
+                AND object     = ?
+                AND suppressed = 0
+                AND invalid_at IS NULL`,
+        params: [projectId, subject, predicate, object],
+      };
+    }
+    return {
+      sql: `UPDATE assertions
+            SET suppressed = 1, invalid_at = datetime('now'), suppression_kind = 'retired'
+            WHERE project_id = ?
+              AND subject    = ?
+              AND predicate  = ?
+              AND suppressed = 0
+              AND invalid_at IS NULL`,
+      params: [projectId, subject, predicate],
+    };
+  }
+
+  /**
    * Build an UPDATE that rehabilitates downvoted_probation rows back to live.
    * Clears: suppressed → 0, invalid_at → NULL, suppression_kind → NULL.
    * Only acts on rows with suppression_kind = 'downvoted_probation'.
@@ -1280,6 +1317,43 @@ class PostgresAdapter {
               AND suppressed = false
               AND (pinned = false OR pinned IS NULL)`,
       params: [projectId, subject, predicate, object],
+    };
+  }
+
+  /**
+   * Build an UPDATE that retires one or more live directive rows (L5).
+   * Sets: suppressed = true, invalid_at = now(), suppression_kind = 'retired'.
+   * Only acts on live rows (suppressed = false AND invalid_at IS NULL).
+   *
+   * withObject=true  (--object supplied): retire only exact (project_id, subject, predicate, object).
+   * withObject=false (--object omitted):  retire ALL live rows for (project_id, subject, predicate).
+   *   Caller is responsible for checking isDirective(predicate) before invoking this form.
+   *
+   * Returns { sql, params }.
+   */
+  buildRetirementUpdate(projectId, subject, predicate, object, withObject) {
+    if (withObject) {
+      return {
+        sql: `UPDATE assertions
+              SET suppressed = true, invalid_at = now(), suppression_kind = 'retired'
+              WHERE project_id = $1
+                AND subject    = $2
+                AND predicate  = $3
+                AND object     = $4
+                AND suppressed = false
+                AND invalid_at IS NULL`,
+        params: [projectId, subject, predicate, object],
+      };
+    }
+    return {
+      sql: `UPDATE assertions
+            SET suppressed = true, invalid_at = now(), suppression_kind = 'retired'
+            WHERE project_id = $1
+              AND subject    = $2
+              AND predicate  = $3
+              AND suppressed = false
+              AND invalid_at IS NULL`,
+      params: [projectId, subject, predicate],
     };
   }
 

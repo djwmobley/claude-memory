@@ -82,7 +82,8 @@ jobs:
         # Unit and integration tests for the SQLite storage adapter (db-seam.js).
         # Guards: resolveDialect, rewriteForSQLite, schema application, JSONB round-trip,
         # graph CTE, abstraction invariant (Section 13), PR-B bi-temporal columns,
-        # canonicalization (Section 15), and manual prune (Section 16).
+        # canonicalization (Section 15), manual prune (Section 16), cmdInit resilience
+        # (Section 17), and L5 buildRetirementUpdate SQLite-arm (Section 18).
         # Requires Node >= 22 for node:sqlite built-in; CI now runs Node 22 so both halves gate.
         run: node scripts/test-sqlite-seam.js
       - name: Run both-backend behavioral parity + adversarial-invariant sweep
@@ -97,6 +98,7 @@ jobs:
         #   S8  Abstraction invariant: zero dialect conditionals outside composition root (static + port checks)
         #   S9  Do-not-touch constants: 86400 JS constants intact (static)
         #   S10 No-backfill guarantee: no UPDATE SET subject in engine (static)
+        #   S19 L5 buildRetirementUpdate: dual-backend retirement invariants (both adapters)
         # Postgres half always runs (service is available). SQLite half runs on Node >= 22.
         # CI now runs Node 22 — both halves gate; zero Node-version skips.
         run: node scripts/test-both-backends.js
@@ -174,6 +176,22 @@ jobs:
         # binding (only gate-consolidated eligible), candidate-query bug fixed (id+tier),
         # no UPDATE SET tier on pre-existing rows.
         run: node scripts/test-l2-consolidation-gate.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: Run L5 directive retirement tests
+        # Tests Lever L5: non-destructive, operator-only retirement of 1:N directive
+        # assertions whose rule text has changed. Covers: registry directive flag (7
+        # predicates marked), isDirective() helper, loadRegistry rejects non-boolean
+        # directive values, buildRetirementUpdate port methods (both SQLite and Postgres
+        # adapters), cmdRetire dry-run safety, --apply --object pinpoint retirement,
+        # --apply without --object mass-retirement for directive predicates,
+        # non-directive without --object refused (exit 2), retired row excluded from
+        # live retrieval but still in table (recoverable), --replace-with flag rejected
+        # (exit 2), prune --suppression-kind retired accepted, no UPDATE SET tier in
+        # cmdRetire, and cmdRetire not wired into any automated path.
+        run: node scripts/test-l5-directive-retirement.js
         env:
           PGHOST: localhost
           PGUSER: postgres

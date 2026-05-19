@@ -89,6 +89,10 @@ function assertTrue(v, msg) {
   if (!v) throw new Error(msg || `expected truthy got ${JSON.stringify(v)}`);
 }
 
+function assertFalse(v, msg) {
+  if (v) throw new Error(msg || `expected falsy got ${JSON.stringify(v)}`);
+}
+
 // ── Helper: create an in-memory SQLiteClient ──────────────────────────────────
 async function makeMemDb() {
   const c = new SQLiteClient(':memory:');
@@ -1963,6 +1967,184 @@ async function runSection17() {
   });
 }
 
+// ── SECTION 18: L5 — buildRetirementUpdate SQLite-arm ───────────────────────
+async function runSection18() {
+  console.log('\n=== Section 18: L5 buildRetirementUpdate — SQLite seam ===');
+
+  // Helper: in-memory DB with handoff schema applied.
+  async function makeSchemaDb() {
+    const db = new SQLiteAdapter(':memory:');
+    await db.connect();
+    const schemaSql = fs.readFileSync(SCHEMA_FILE, 'utf8');
+    await db.runSchema(schemaSql);
+    return db;
+  }
+
+  const PID = 'test-l5-sqlite';
+
+  // ── Static shape tests (adapter method unit tests) ────────────────────────────
+
+  await test('L5 SQLite: buildRetirementUpdate with-object sets correct columns', () => {
+    const db = new SQLiteAdapter(':memory:');
+    const stmt = db.buildRetirementUpdate(PID, 'agent', 'must_do', 'old-rule', true);
+    assertTrue(stmt.sql.includes("suppressed = 1"),
+      'SQLite with-object: suppressed = 1');
+    assertTrue(stmt.sql.includes("datetime('now')"),
+      'SQLite with-object: invalid_at = datetime(now)');
+    assertTrue(stmt.sql.includes("suppression_kind = 'retired'"),
+      'SQLite with-object: suppression_kind = retired');
+    assertTrue(stmt.sql.includes("object     = ?"),
+      'SQLite with-object: filters on object');
+    assertTrue(stmt.sql.includes("suppressed = 0"),
+      'SQLite with-object: guards on suppressed = 0 (live only)');
+    assertTrue(stmt.sql.includes("invalid_at IS NULL"),
+      'SQLite with-object: guards on invalid_at IS NULL (live only)');
+    assertEqual(stmt.params.length, 4,
+      'SQLite with-object: 4 params (projectId, subject, predicate, object)');
+  });
+
+  await test('L5 SQLite: buildRetirementUpdate without-object does not filter on object', () => {
+    const db = new SQLiteAdapter(':memory:');
+    const stmt = db.buildRetirementUpdate(PID, 'agent', 'never_uses', undefined, false);
+    assertTrue(stmt.sql.includes("suppressed = 1"), 'SQLite without-object: suppressed = 1');
+    assertTrue(stmt.sql.includes("suppression_kind = 'retired'"), 'SQLite without-object: kind=retired');
+    assertFalse(/\bobject\b/.test(stmt.sql), 'SQLite without-object: must NOT filter on object');
+    assertEqual(stmt.params.length, 3,
+      'SQLite without-object: 3 params (projectId, subject, predicate)');
+  });
+
+  // ── Integration: live SQLite round-trip ──────────────────────────────────────
+
+  await test('L5 SQLite round-trip: with-object retires exactly one row', async () => {
+    const db = await makeSchemaDb();
+    try {
+      // Insert 2 rows with same predicate, different objects.
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
+         VALUES (?,?,?,?,7,'user_stated'),(?,?,?,?,7,'user_stated')`,
+        [PID, 'svc', 'must_do', 'rule-A', PID, 'svc', 'must_do', 'rule-B']
+      );
+
+      const stmt = db.buildRetirementUpdate(PID, 'svc', 'must_do', 'rule-A', true);
+      await db.query(stmt.sql, stmt.params);
+
+      const { rows } = await db.query(
+        `SELECT object, suppressed, suppression_kind, invalid_at FROM assertions
+         WHERE project_id=? ORDER BY object`,
+        [PID]
+      );
+      const ruleA = rows.find((r) => r.object === 'rule-A');
+      const ruleB = rows.find((r) => r.object === 'rule-B');
+      assertEqual(ruleA.suppressed, 1, 'rule-A must be suppressed');
+      assertEqual(ruleA.suppression_kind, 'retired', 'rule-A suppression_kind=retired');
+      assertTrue(ruleA.invalid_at !== null, 'rule-A invalid_at set');
+      assertEqual(ruleB.suppressed, 0, 'rule-B must remain live');
+      assertEqual(ruleB.suppression_kind, null, 'rule-B suppression_kind unchanged (null)');
+    } finally { await db.end(); }
+  });
+
+  await test('L5 SQLite round-trip: without-object retires ALL live rows for (subject, predicate)', async () => {
+    const db = await makeSchemaDb();
+    try {
+      // Insert 3 rows: 2 for (agent, never_uses), 1 for (agent, must_do) — must_do must NOT be retired.
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
+         VALUES (?,?,?,?,7,'user_stated'),(?,?,?,?,7,'user_stated'),(?,?,?,?,7,'user_stated')`,
+        [PID, 'agent', 'never_uses', 'tool-A',
+         PID, 'agent', 'never_uses', 'tool-B',
+         PID, 'agent', 'must_do',    'check-X']
+      );
+
+      const stmt = db.buildRetirementUpdate(PID, 'agent', 'never_uses', undefined, false);
+      await db.query(stmt.sql, stmt.params);
+
+      const { rows } = await db.query(
+        `SELECT predicate, object, suppressed, suppression_kind FROM assertions
+         WHERE project_id=? ORDER BY predicate, object`,
+        [PID]
+      );
+      const toolA  = rows.find((r) => r.predicate === 'never_uses' && r.object === 'tool-A');
+      const toolB  = rows.find((r) => r.predicate === 'never_uses' && r.object === 'tool-B');
+      const checkX = rows.find((r) => r.predicate === 'must_do');
+      assertEqual(toolA.suppressed, 1, 'tool-A: suppressed');
+      assertEqual(toolA.suppression_kind, 'retired', 'tool-A: kind=retired');
+      assertEqual(toolB.suppressed, 1, 'tool-B: suppressed');
+      assertEqual(toolB.suppression_kind, 'retired', 'tool-B: kind=retired');
+      assertEqual(checkX.suppressed, 0, 'check-X (must_do): untouched — wrong predicate');
+    } finally { await db.end(); }
+  });
+
+  await test('L5 SQLite: retired row excluded from live retrieval but still in table', async () => {
+    const db = await makeSchemaDb();
+    try {
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
+         VALUES (?,?,?,?,7,'user_stated')`,
+        [PID, 'foo', 'policy', 'bar']
+      );
+      const { rows: pre } = await db.query(
+        `SELECT id FROM assertions WHERE project_id=?`, [PID]
+      );
+      const rowId = pre[0].id;
+
+      const stmt = db.buildRetirementUpdate(PID, 'foo', 'policy', 'bar', true);
+      await db.query(stmt.sql, stmt.params);
+
+      // Row still in table.
+      const { rows: all } = await db.query(
+        `SELECT id, suppressed, suppression_kind FROM assertions WHERE project_id=? AND id=?`,
+        [PID, rowId]
+      );
+      assertEqual(all.length, 1, 'retired row must still be in table (recoverable)');
+      assertEqual(all[0].suppression_kind, 'retired', 'suppression_kind=retired');
+
+      // Excluded from live retrieval.
+      const { rows: live } = await db.query(
+        `SELECT id FROM assertions WHERE project_id=? AND id=? AND suppressed=0 AND invalid_at IS NULL`,
+        [PID, rowId]
+      );
+      assertEqual(live.length, 0, 'retired row must not appear in live retrieval');
+    } finally { await db.end(); }
+  });
+
+  await test('L5 SQLite: suppression_kind=retired accepted by schema (no constraint violation)', async () => {
+    const db = await makeSchemaDb();
+    try {
+      // Direct INSERT of a row with suppression_kind='retired' — must not throw.
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source,
+           suppressed, invalid_at, suppression_kind)
+         VALUES (?,?,?,?,7,'user_stated',1,datetime('now'),'retired')`,
+        [PID, 'schema-test-subj', 'policy', 'schema-test-rule']
+      );
+      const { rows } = await db.query(
+        `SELECT suppression_kind FROM assertions WHERE project_id=?`, [PID]
+      );
+      assertEqual(rows[0].suppression_kind, 'retired', "suppression_kind='retired' stored correctly");
+    } finally { await db.end(); }
+  });
+
+  await test('L5 SQLite: PostgresAdapter.buildRetirementUpdate with-object shape (static)', () => {
+    // Verify the Postgres adapter's method also exists and has correct shape.
+    const db = new PostgresAdapter(null);
+    const stmt = db.buildRetirementUpdate('proj', 'sub', 'policy', 'rule-C', true);
+    assertTrue(stmt.sql.includes("suppressed = true"), 'Postgres: suppressed = true');
+    assertTrue(stmt.sql.includes("invalid_at = now()"), 'Postgres: invalid_at = now()');
+    assertTrue(stmt.sql.includes("suppression_kind = 'retired'"), 'Postgres: kind=retired');
+    assertTrue(stmt.sql.includes("object     = $4"), 'Postgres: object filter at $4');
+    assertEqual(stmt.params.length, 4, 'Postgres with-object: 4 params');
+  });
+
+  await test('L5 SQLite: PostgresAdapter.buildRetirementUpdate without-object shape (static)', () => {
+    const db = new PostgresAdapter(null);
+    const stmt = db.buildRetirementUpdate('proj', 'sub', 'policy', undefined, false);
+    assertTrue(stmt.sql.includes("suppressed = true"), 'Postgres: suppressed = true');
+    assertTrue(stmt.sql.includes("suppression_kind = 'retired'"), 'Postgres: kind=retired');
+    assertFalse(/\bobject\b/.test(stmt.sql), 'Postgres without-object: no object filter');
+    assertEqual(stmt.params.length, 3, 'Postgres without-object: 3 params');
+  });
+}
+
 // ── Run all sections ──────────────────────────────────────────────────────────
 (async () => {
   console.log(`\ntest-sqlite-seam.js (Node ${process.versions.node})\n`);
@@ -1984,6 +2166,7 @@ async function runSection17() {
   await runSection15();
   await runSection16();
   await runSection17();
+  await runSection18();
 
   console.log(`\n─── Results ──────────────────────────────────────`);
   console.log(`PASS ${passed}  FAIL ${failed}`);

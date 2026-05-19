@@ -8,6 +8,7 @@
  *   1. Which predicates are in the declared vocabulary (loadRegistry / recognizedPredicates).
  *   2. The cardinality of each recognized predicate (cardinalityOf).
  *   3. How an unrecognized predicate is handled at write time (classifyPredicate).
+ *   4. Whether a predicate is directive-shaped (isDirective) — governs cmdRetire semantics.
  *
  * COHERENCE CONTRACT — READ BEFORE EXTENDING:
  *   Any consumer that needs to know a predicate's cardinality or needs to decide
@@ -23,6 +24,8 @@
  *   R-2: Cardinality is determined by the registry, not by per-call heuristics.
  *   R-5: Adding a predicate is a versioned, recorded operation (edit the JSON).
  *   R-6: The supersession logic consumes cardinality exclusively from this module.
+ *   R-7: The directive flag governs whole-predicate retirement without --object.
+ *        Only predicates explicitly marked "directive": true permit mass-retirement.
  */
 
 const fs   = require('fs');
@@ -103,6 +106,13 @@ function loadRegistry() {
     if (typeof entry.added_version !== 'string') {
       throw new Error(
         `predicate-registry: entry "${entry.predicate}" missing "added_version" field`
+      );
+    }
+
+    // "directive" is optional; if present it must be a boolean.
+    if ('directive' in entry && typeof entry.directive !== 'boolean') {
+      throw new Error(
+        `predicate-registry: entry "${entry.predicate}" has invalid "directive" value "${entry.directive}" — must be a boolean`
       );
     }
 
@@ -188,4 +198,24 @@ function recognizedPredicates() {
   return sorted.slice(); // return a copy so callers cannot mutate the cache
 }
 
-module.exports = { loadRegistry, cardinalityOf, classifyPredicate, recognizedPredicates };
+/**
+ * Return true if the predicate is explicitly marked as directive-shaped
+ * in the registry (i.e. the entry has "directive": true).
+ *
+ * Directive predicates are permitted by cmdRetire to retire ALL live rows
+ * for a (subject, predicate) tuple when --object is omitted — the "rescind
+ * the whole rule" form.  Non-directive 1:N predicates record parallel values
+ * (e.g. uses, covers) that must not be mass-retired without an explicit object.
+ *
+ * Unrecognized predicates return false (non-directive by default).
+ *
+ * @param {string} predicate
+ * @returns {boolean}
+ */
+function isDirective(predicate) {
+  const { byPredicate } = loadRegistry();
+  const entry = byPredicate.get(predicate);
+  return !!(entry && entry.directive === true);
+}
+
+module.exports = { loadRegistry, cardinalityOf, classifyPredicate, recognizedPredicates, isDirective };

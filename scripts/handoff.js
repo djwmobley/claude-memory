@@ -44,7 +44,7 @@ const readline = require('readline');
 
 const { loadConfig, connect, c, findProjectRoot } = require('./lib/shared');
 const { encodeCwd, getClaudeProjectDir }           = require('./lib/encoded-cwd');
-const { classifyPredicate }                        = require('./lib/predicate-registry');
+const { classifyPredicate, isDirective }            = require('./lib/predicate-registry');
 const { validatePayload }                          = require('./lib/payload-schema');
 const {
   resolveDialect, createAdapter, createInitProbe,
@@ -3952,7 +3952,7 @@ async function cmdPrune(args) {
     console.error('prune: --suppression-kind requires a value (superseded | downvoted_terminal | downvoted_probation)');
     process.exit(2);
   }
-  const validKinds = ['superseded', 'downvoted_terminal', 'downvoted_probation'];
+  const validKinds = ['superseded', 'downvoted_terminal', 'downvoted_probation', 'retired'];
   if (suppressionKind && !validKinds.includes(suppressionKind)) {
     console.error(`prune: invalid --suppression-kind "${suppressionKind}". Valid: ${validKinds.join(', ')}`);
     process.exit(2);
@@ -4102,6 +4102,180 @@ async function cmdPrune(args) {
   console.log(`\nDone: handoff:prune — ${deletedCount} row(s) hard-deleted`);
 }
 
+// ─── cmdRetire ────────────────────────────────────────────────────────────────
+//
+// Operator-only non-destructive retirement of live directive rows (L5).
+// Usage: node scripts/handoff.js retire --subject <s> --predicate <p> [--object <o>] [--apply]
+//
+// Dry-run by default (no mutation without --apply), matching prune's contract.
+// Sets suppressed=true/1, invalid_at=now(), suppression_kind='retired' on matched rows.
+//
+// Without --object: retires ALL live rows for (subject, predicate).
+//   Only permitted when isDirective(predicate) === true ("rescind the whole rule").
+//   For non-directive predicates, --object is required.
+// With --object: retires only the exact (subject, predicate, object) live row(s).
+//
+// NOT wired into cmdClose or any automated path.  Operator invocation only.
+
+async function cmdRetire(args) {
+  console.log('Running: handoff:retire');
+
+  // ── Parse flags ─────────────────────────────────────────────────────────────
+
+  const applyMode = args.includes('--apply');
+
+  // Guard: --replace-with is explicitly not supported (L5 spec: dropped).
+  if (args.includes('--replace-with')) {
+    console.error(
+      'retire: --replace-with is not supported. ' +
+      'retire only retires; write a replacement row separately if needed.'
+    );
+    process.exit(2);
+  }
+
+  // --subject <raw>
+  const subjectIdx = args.indexOf('--subject');
+  let rawSubject = subjectIdx !== -1 ? args[subjectIdx + 1] : undefined;
+  if (subjectIdx !== -1 && (!rawSubject || rawSubject.startsWith('--'))) {
+    console.error('retire: --subject requires a value');
+    process.exit(2);
+  }
+  if (!rawSubject) {
+    console.error('retire: --subject is required');
+    process.exit(2);
+  }
+  const canonSubject = canonicalize(rawSubject);
+
+  // --predicate <pred>
+  const predicateIdx = args.indexOf('--predicate');
+  const rawPredicate = predicateIdx !== -1 ? args[predicateIdx + 1] : undefined;
+  if (predicateIdx !== -1 && (!rawPredicate || rawPredicate.startsWith('--'))) {
+    console.error('retire: --predicate requires a value');
+    process.exit(2);
+  }
+  if (!rawPredicate) {
+    console.error('retire: --predicate is required');
+    process.exit(2);
+  }
+  const predicate = rawPredicate.trim();
+
+  // --object <obj>  (optional)
+  const objectIdx = args.indexOf('--object');
+  let rawObject = objectIdx !== -1 ? args[objectIdx + 1] : undefined;
+  if (objectIdx !== -1 && (!rawObject || rawObject.startsWith('--'))) {
+    console.error('retire: --object requires a value');
+    process.exit(2);
+  }
+  const withObject = rawObject != null;
+  const objectVal  = withObject ? rawObject.trim() : undefined;
+
+  // Without --object: only directive predicates may do mass-retirement.
+  if (!withObject && !isDirective(predicate)) {
+    console.error(
+      `retire: --object is required for predicate "${predicate}" — ` +
+      'only directive predicates (depends_on, must_do, never_uses, should, ' +
+      'policy, enforces, is_constraint) may be retired without specifying --object. ' +
+      'To retire a specific value, add --object <value>.'
+    );
+    process.exit(2);
+  }
+
+  const projectId = resolveProjectId();
+
+  console.log('');
+  console.log(`  mode       : ${applyMode ? '--apply (MUTATIONS ENABLED)' : 'dry-run (read-only, default)'}`);
+  console.log(`  project_id : ${projectId}`);
+  console.log(`  subject    : ${canonSubject} (canonicalized from '${rawSubject}')`);
+  console.log(`  predicate  : ${predicate}`);
+  if (withObject) {
+    console.log(`  object     : ${objectVal}`);
+  } else {
+    console.log(`  object     : (all live rows for this predicate)`);
+  }
+  console.log('');
+
+  let db;
+  try {
+    db = await connectHandoff();
+  } catch (err) {
+    console.error(`DB connection failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  // ── SELECT: preview what would be retired ────────────────────────────────────
+
+  let selectSql, selectParams;
+  if (withObject) {
+    selectSql = `SELECT id, subject, predicate, object, pinned, suppression_kind
+                 FROM assertions
+                 WHERE project_id = $1
+                   AND subject    = $2
+                   AND predicate  = $3
+                   AND object     = $4
+                   AND suppressed = false
+                   AND invalid_at IS NULL`;
+    selectParams = [projectId, canonSubject, predicate, objectVal];
+  } else {
+    selectSql = `SELECT id, subject, predicate, object, pinned, suppression_kind
+                 FROM assertions
+                 WHERE project_id = $1
+                   AND subject    = $2
+                   AND predicate  = $3
+                   AND suppressed = false
+                   AND invalid_at IS NULL`;
+    selectParams = [projectId, canonSubject, predicate];
+  }
+
+  const { rows: matchedRows } = await db.query(selectSql, selectParams);
+
+  console.log(`  Matched live rows  : ${matchedRows.length}`);
+  if (matchedRows.length > 0) {
+    const sampleSize = Math.min(10, matchedRows.length);
+    console.log(`  Sample of rows that ${applyMode ? 'will be' : 'would be'} retired (up to 10):`);
+    for (const row of matchedRows.slice(0, sampleSize)) {
+      const pinnedNote = (row.pinned === true || row.pinned === 1) ? ' [PINNED]' : '';
+      console.log(`    id=${row.id}  subject="${row.subject}"  predicate="${row.predicate}"  object="${String(row.object).slice(0, 60)}"${pinnedNote}`);
+    }
+    if (matchedRows.length > sampleSize) {
+      console.log(`    ... and ${matchedRows.length - sampleSize} more`);
+    }
+  }
+  console.log('');
+
+  if (!applyMode) {
+    await db.end();
+    if (matchedRows.length === 0) {
+      console.log('  No live rows match the given criteria.');
+    } else {
+      console.log(`  Dry-run complete — no changes made.`);
+      console.log(`  Run with --apply to perform the retirement.`);
+    }
+    console.log('\nDone: handoff:retire — dry-run (no changes)');
+    return;
+  }
+
+  // ── APPLY: non-destructive retirement ────────────────────────────────────────
+
+  if (matchedRows.length === 0) {
+    await db.end();
+    console.log('  No live rows match the given criteria — nothing to retire.');
+    console.log('\nDone: handoff:retire — 0 rows retired (no-op)');
+    return;
+  }
+
+  const { sql: updateSql, params: updateParams } =
+    db.buildRetirementUpdate(projectId, canonSubject, predicate, objectVal, withObject);
+
+  const { rowCount: retiredCount } = await db.query(updateSql, updateParams);
+
+  await db.end();
+
+  console.log(`  Retired ${retiredCount} assertion row(s).`);
+  console.log(`  Rows are suppressed (suppression_kind='retired') and excluded from retrieval.`);
+  console.log(`  They are NOT deleted and remain recoverable.`);
+  console.log(`\nDone: handoff:retire — ${retiredCount} row(s) retired`);
+}
+
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -4121,6 +4295,7 @@ async function main() {
     promote:         () => cmdPromote(rest),
     'queue-drain':   () => cmdQueueDrain(rest),
     prune:           () => cmdPrune(rest),
+    retire:          () => cmdRetire(rest),
   };
 
   if (!sub || !subcommands[sub]) {
