@@ -219,6 +219,25 @@ END $$;
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS reality_check TEXT
   CHECK (reality_check IN ('verified', 'mismatch', 'unverifiable'));
 
+-- ── pg_trgm GIN index for resurrect fuzzy-text matching ──────────────────────
+--
+-- Additive migration: creates a GIN trigram index on the concatenated
+-- subject || ' ' || predicate || ' ' || object for the resurrect query type's
+-- pg_trgm fallback (buildFuzzyMatch Postgres arm). Requires pg_trgm extension
+-- (installed via setup.sql). CREATE INDEX IF NOT EXISTS is a no-op on fresh DBs
+-- that already have it and on DBs where pg_trgm is not installed (error swallowed
+-- below). The assertion text column is computed from existing columns; no schema
+-- change to existing rows.
+--
+-- Wrapped in a DO block so that missing pg_trgm (no extension) degrades gracefully
+-- rather than failing the entire schema migration.
+DO $$ BEGIN
+  CREATE INDEX IF NOT EXISTS assertions_trgm_text_idx
+    ON assertions USING GIN ((subject || ' ' || predicate || ' ' || object) gin_trgm_ops);
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'pg_trgm GIN index skipped -- pg_trgm not installed; resurrect will use fallback';
+END $$;
+
 CREATE INDEX IF NOT EXISTS assertions_project_idx
   ON assertions (project_id);
 CREATE INDEX IF NOT EXISTS assertions_subject_idx

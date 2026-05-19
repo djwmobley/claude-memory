@@ -21,6 +21,14 @@ EXCEPTION WHEN OTHERS THEN
   RAISE NOTICE 'pgvector not installed -- semantic search disabled. Install: https://github.com/pgvector/pgvector';
 END $$;
 
+-- pg_trgm enables trigram-based fuzzy text matching used by the resurrect query
+-- type (buildFuzzyMatch seam method). Gracefully no-ops if already installed.
+DO $$ BEGIN
+  CREATE EXTENSION IF NOT EXISTS pg_trgm;
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'pg_trgm not installed -- resurrect fuzzy fallback will degrade to SQL LIKE';
+END $$;
+
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- MEMORY ENTRIES
 -- One row per atomic memory file (frontmatter: name, description, type).

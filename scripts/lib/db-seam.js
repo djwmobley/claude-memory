@@ -46,6 +46,11 @@
 //   buildProbationRehabUpdate(ids)
 //                                  — Returns { sql, params } that revives downvoted_probation rows
 //                                    (clears suppressed/invalid_at/suppression_kind).
+//   buildFuzzyMatch(projectId, seedText, limit)
+//                                  — Returns { sql, params } for a fuzzy-text subject/entity search.
+//                                    Postgres: uses pg_trgm similarity() on subject+predicate+object.
+//                                    SQLite:   uses LIKE / instr fallback.
+//                                    Returns id, subject, predicate, object rows ranked by relevance.
 //   buildPruneSelect(criteria, projectId)
 //                                  — Returns { sql, params } for SELECT id, subject, predicate,
 //                                    object, pinned FROM assertions WHERE <criteria>.
@@ -943,6 +948,39 @@ class SQLiteAdapter {
   }
 
   /**
+   * Build a fuzzy-text match query over suppression-eligible rows.
+   * SQLite fallback: uses instr() + LIKE since pg_trgm is not available.
+   * Matches against the concatenated subject || ' ' || predicate || ' ' || object.
+   * Returns id, subject, predicate, object rows; limit is applied.
+   * Returns { sql, params }.
+   */
+  buildFuzzyMatch(projectId, seedText, limit) {
+    // Normalise seed to lower-case for case-insensitive matching.
+    const tokens = String(seedText || '').toLowerCase().split(/\s+/).filter(Boolean);
+    // Build one LIKE clause per token joined with AND — zero tokens -> match nothing.
+    if (tokens.length === 0) {
+      return {
+        sql: `SELECT id, subject, predicate, object FROM assertions WHERE 1=0`,
+        params: [],
+      };
+    }
+    // SQLite: positional ? placeholders; projectId is param 1.
+    const whereClauses = tokens.map(
+      () => `(instr(lower(subject || ' ' || predicate || ' ' || object), ?) > 0)`
+    );
+    const params = [projectId, ...tokens, limit];
+    return {
+      sql: `SELECT id, subject, predicate, object
+            FROM assertions
+            WHERE project_id = ?
+              AND (${whereClauses.join(' OR ')})
+            ORDER BY subject ASC
+            LIMIT ?`,
+      params,
+    };
+  }
+
+  /**
    * Build a SQL predicate for comparing the epoch-seconds difference between two
    * timestamp columns against a fixed threshold.
    *
@@ -1371,6 +1409,34 @@ class PostgresAdapter {
             WHERE id = ANY($1::int[])
               AND suppression_kind = 'downvoted_probation'`,
       params: [ids],
+    };
+  }
+
+  /**
+   * Build a fuzzy-text match query over assertions using pg_trgm similarity.
+   * Requires pg_trgm extension (added to setup.sql).
+   * Matches against subject || ' ' || predicate || ' ' || object via similarity().
+   * The % operator is equivalent to similarity(a,b) > pg_trgm.similarity_threshold.
+   * Returns id, subject, predicate, object rows ordered by descending similarity.
+   * Returns { sql, params }.
+   */
+  buildFuzzyMatch(projectId, seedText, limit) {
+    const seed = String(seedText || '').trim();
+    if (!seed) {
+      return {
+        sql: `SELECT id, subject, predicate, object FROM assertions WHERE 1=0`,
+        params: [],
+      };
+    }
+    return {
+      sql: `SELECT id, subject, predicate, object,
+                   similarity($2, subject || ' ' || predicate || ' ' || object) AS sim_score
+            FROM assertions
+            WHERE project_id = $1
+              AND (subject || ' ' || predicate || ' ' || object) % $2
+            ORDER BY sim_score DESC
+            LIMIT $3`,
+      params: [projectId, seed, limit],
     };
   }
 

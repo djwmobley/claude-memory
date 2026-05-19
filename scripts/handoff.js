@@ -963,6 +963,14 @@ async function cmdInit(args) {
   const defaults = {
     staleness_days:                   '7',
     loader_token_budget:              '4000',
+    // L2: corroboration-quality gate mode. 'enforce' (default) withholds consolidation
+    // when no independently-trustworthy corroborator exists. 'report' logs but does not
+    // block. ON CONFLICT DO NOTHING ensures existing rows are never overridden on re-init.
+    consolidation_gate_mode:          'enforce',
+    // Resurrect query type: token sub-budget for the ### Resurrected section.
+    // Enforced as min(globalRemaining, resurrect_token_budget) so the loader-wide
+    // envelope is never exceeded.
+    resurrect_token_budget:           '1500',
     implicit_close:                   'enabled',
     decay_rate_default:               '0.05',
     retrieval_outcome_timeout_days:   '14',
@@ -1581,6 +1589,205 @@ async function cmdLoaderLoad(opts = {}) {
       } catch (graphErr) {
         // Non-fatal: any error degrades gracefully (no graph section, no crash).
         if (!silent) console.error(`[handoff] graph traversal error (non-fatal): ${graphErr.message}`);
+      }
+
+    } else if (q.type === 'resurrect' || q.kind === 'resurrect') {
+      // Resurrect kind: on-demand revival of decay-suppressed (downvoted_probation) rows.
+      //
+      // Design decisions:
+      //   1. Eligibility: EXACTLY suppressed=true AND suppression_kind='downvoted_probation'.
+      //      Hard-excludes 'downvoted_terminal', 'superseded', 'retired', and live rows.
+      //      Terminal-is-terminal is an enforced invariant (test-both-backends S3).
+      //   2. M2 seed-gate: only assertions whose subject/entity is corroborated by a trusted
+      //      anchor may be resurrected. Trusted = reality_check='verified' OR pinned=true
+      //      (the same quality-corroborator predicate used by L2 at :2098-2099).
+      //      This prevents a forged probationary row from self-resurrecting.
+      //   3. Semantic seed: uses v_memory_hits cosine path when Ollama is available.
+      //      Degrades to pg_trgm fuzzy match (db.buildFuzzyMatch) under OLLAMA_SKIP=1.
+      //      Both paths route through the seam — zero dialect conditionals in the engine.
+      //   4. Graph fan-out: from seeded subjects, calls db.buildGraphCTE(out, seeds, 2)
+      //      to pull depth-2 connected entities and include their resurrect-eligible rows.
+      //   5. Revival mechanic: gated on q.revive===true. When false (default), the branch
+      //      surfaces rows read-only into the loader output without mutating suppressed.
+      //      When true, calls db.buildProbationRehabUpdate(ids) — the only sanctioned
+      //      mutation; only revivable (downvoted_probation) rows.
+      //   6. Sub-budget: resurrect_token_budget setting, default '1500'. Enforced as
+      //      min(globalRemaining, subBudget).
+      //   7. I-2 guard: the default contract ({queries:[]}) contains no resurrect query,
+      //      so this branch is unreachable in a default session — byte-identical to pre-feature.
+      //      (Same I-2 guarantee as history/graph kinds.)
+      //
+      // REGRESSION GUARD: the default retrieval_contract is NOT modified by this PR.
+      // A default session has no resurrect query, so this branch is unreachable in default
+      // sessions — loader output is byte-identical to pre-feature. (I-2 guarantee.)
+      //
+      // Pre-existing limitation: the async queue-drain path (cmdQueueDrain) is a known
+      // pre-existing L4-handled corner when payload.session_id is absent AND the
+      // session_in_progress marker has already been cleared. This is not introduced here.
+      try {
+        // Resolve sub-budget.
+        const subBudgetRaw = await getSetting(db, projectId, 'resurrect_token_budget', '1500');
+        const subBudget    = Math.min(
+          tokenBudget - tokensUsed,
+          Math.max(0, parseInt(subBudgetRaw, 10) || 1500)
+        );
+        if (subBudget <= 0) {
+          // No budget remaining — skip silently (no section, no crash).
+        } else {
+          const seedText = q.seed || q.query || '';
+          const reviveOpt = q.revive === true;
+          const fuzzyLimit = 20;
+
+          // ── Step 1: Resolve candidate subjects via semantic or fuzzy seed ─────────
+          let candidateSubjects = [];
+          const ollamaSkip = (process.env.OLLAMA_SKIP === '1');
+
+          if (!ollamaSkip && seedText) {
+            // Semantic seed: cosine distance on v_memory_hits (halfvec 4000).
+            // Degrade gracefully if view is absent or embedding unavailable.
+            try {
+              const { rows: viewCheck } = await db.query(
+                `SELECT 1 FROM pg_views WHERE viewname = 'v_memory_hits' LIMIT 1`
+              );
+              if (viewCheck.length > 0) {
+                // Placeholder: embedding call would go here in Phase 3.6 when Ollama
+                // is wired. For now, fall through to fuzzy fallback on any error.
+                throw new Error('embedding not wired in loader — using fuzzy fallback');
+              }
+            } catch (_embedErr) {
+              // Fall through to pg_trgm fuzzy below.
+            }
+          }
+
+          // Fuzzy fallback (always runs when ollamaSkip or semantic unavailable).
+          if (candidateSubjects.length === 0 && seedText) {
+            const { sql: fuzzySql, params: fuzzyParams } = db.buildFuzzyMatch(
+              projectId, seedText, fuzzyLimit
+            );
+            try {
+              const { rows: fuzzyRows } = await db.query(fuzzySql, fuzzyParams);
+              for (const r of fuzzyRows) {
+                if (r.subject && !candidateSubjects.includes(r.subject)) {
+                  candidateSubjects.push(r.subject);
+                }
+              }
+            } catch (fuzzyErr) {
+              // pg_trgm may be absent — degrade to empty candidate set (no resurrect section).
+              if (!silent) console.error(`[handoff] resurrect fuzzy-match error (non-fatal): ${fuzzyErr.message}`);
+            }
+          }
+
+          // If still no candidates, use all subjects with resurrect-eligible rows (bounded).
+          if (candidateSubjects.length === 0) {
+            const { rows: allSubj } = await db.query(
+              `SELECT DISTINCT subject FROM assertions
+               WHERE project_id = $1
+                 AND suppressed = true
+                 AND suppression_kind = 'downvoted_probation'
+               LIMIT $2`,
+              [projectId, fuzzyLimit]
+            );
+            candidateSubjects = allSubj.map((r) => r.subject);
+          }
+
+          // ── Step 2: Depth-2 graph fan-out from candidate subjects ──────────────
+          if (candidateSubjects.length > 0) {
+            try {
+              const graphMaxDepth = 2;
+              const graphMaxNodes = parseInt(
+                await getSetting(db, projectId, 'graph_max_nodes', '25'), 10
+              );
+              const { sql: cteSql, params: cteParams } = db.buildGraphCTE(
+                'out', candidateSubjects, graphMaxDepth, graphMaxNodes, projectId
+              );
+              const { rows: fanOutRows } = await db.query(cteSql, cteParams);
+              for (const r of fanOutRows) {
+                if (r.entity_name && !candidateSubjects.includes(r.entity_name)) {
+                  candidateSubjects.push(r.entity_name);
+                }
+              }
+            } catch (_fanErr) {
+              // Non-fatal — proceed with the seed subjects only.
+            }
+          }
+
+          // ── Step 3: Filter by M2 seed-gate (trusted anchor required) ─────────
+          // Only resurrect assertions whose subject has at least one trusted anchor:
+          //   reality_check='verified' OR pinned=true  (L2 :2098-2099 predicate).
+          let trustedSubjects = [];
+          if (candidateSubjects.length > 0) {
+            const { clause: tsClauses, params: tsContainsParams } =
+              db.buildArrayContains('subject', candidateSubjects, 2);
+            const { rows: trustedRows } = await db.query(
+              `SELECT DISTINCT subject FROM assertions
+               WHERE project_id = $1
+                 AND ${tsClauses}
+                 AND suppressed = false
+                 AND (reality_check = 'verified' OR pinned = true)`,
+              [projectId, ...tsContainsParams]
+            );
+            trustedSubjects = trustedRows.map((r) => r.subject);
+          }
+
+          // ── Step 4: Fetch resurrect-eligible rows scoped to trusted subjects ──
+          // Limit to 5 rows per subject (using a subquery rank to avoid any single
+          // subject flooding the result set and excluding other trusted subjects).
+          let resurrectRows = [];
+          if (trustedSubjects.length > 0) {
+            const { clause: subjClause, params: subjContainsParams } =
+              db.buildArrayContains('subject', trustedSubjects, 2);
+            const { rows: eligibleRows } = await db.query(
+              `SELECT id, subject, predicate, object, confidence, source,
+                      suppression_kind, created_at
+               FROM (
+                 SELECT id, subject, predicate, object, confidence, source,
+                        suppression_kind, created_at,
+                        ROW_NUMBER() OVER (PARTITION BY subject ORDER BY created_at DESC) AS rn
+                 FROM assertions
+                 WHERE project_id = $1
+                   AND ${subjClause}
+                   AND suppressed = true
+                   AND suppression_kind = 'downvoted_probation'
+               ) ranked
+               WHERE rn <= 5
+               ORDER BY subject ASC, created_at DESC
+               LIMIT 50`,
+              [projectId, ...subjContainsParams]
+            );
+            resurrectRows = eligibleRows;
+          }
+
+          // ── Step 5: Build output section (read-only by default) ──────────────
+          if (resurrectRows.length > 0) {
+            const lines = resurrectRows.map((r) => {
+              const ts = r.created_at
+                ? (typeof r.created_at === 'string' ? r.created_at : r.created_at.toISOString())
+                : 'unknown';
+              return `- [${r.source}|conf=${r.confidence}|${r.suppression_kind}|${ts}] ${r.subject} ${r.predicate} ${r.object}`;
+            });
+            const sectionText = lines.join('\n');
+            const resurrectSection = `### Resurrected (decayed/probationary, on-demand)\n${sectionText}`;
+            const cost = Math.ceil(resurrectSection.length / 4);
+            // Enforce sub-budget and global remaining budget.
+            if (cost <= subBudget && tokensUsed + cost <= tokenBudget) {
+              sections.push(resurrectSection);
+              tokensUsed      += cost;
+              assertionsCount += resurrectRows.length;
+            }
+          }
+
+          // ── Step 6: Revival mechanic (only on explicit opt-in q.revive=true) ─
+          if (reviveOpt && resurrectRows.length > 0) {
+            const reviveIds = resurrectRows.map((r) => r.id);
+            const rehabStmt = db.buildProbationRehabUpdate(reviveIds);
+            if (rehabStmt) {
+              await db.query(rehabStmt.sql, rehabStmt.params);
+            }
+          }
+        }
+      } catch (resurrectErr) {
+        // Non-fatal: any error degrades gracefully (no resurrect section, no crash).
+        if (!silent) console.error(`[handoff] resurrect error (non-fatal): ${resurrectErr.message}`);
       }
 
     } else if (q.type === 'vector' || q.kind === 'vector') {
@@ -2205,7 +2412,7 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
     //
     // L0 gate: read once, inside the transaction (plain SELECT — safe, no write).
     const corrobGate  = await getSetting(db, projectId, 'consolidation_corroboration_gate', 'enforce');
-    const gateMode    = await getSetting(db, projectId, 'consolidation_gate_mode', 'report');
+    const gateMode    = await getSetting(db, projectId, 'consolidation_gate_mode', 'enforce');
     const isHighTrust = (source === 'user_stated' && conf >= 9);
     const isPinned    = (ass.pinned === true || ass.pinned === 1);
 
@@ -2282,7 +2489,9 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
  * }
  */
 async function writeExtraction(db, projectId, payload) {
-  const sessionId = payload.session_id || null;
+  const sessionId = (typeof payload.session_id === 'string' && payload.session_id.length > 0)
+    ? payload.session_id
+    : await getSetting(db, projectId, 'session_in_progress', null);
   let entitiesWritten   = 0;
   let assertionsWritten = 0;
   let edgesWritten      = 0;

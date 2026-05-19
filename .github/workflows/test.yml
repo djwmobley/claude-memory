@@ -196,3 +196,31 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run resurrect query-type tests
+        # Tests the resurrect query type (Part 4 of the L2-enforce ring):
+        #   R-1  Eligibility predicate: probation resurfaces; terminal/superseded do NOT
+        #   R-2  M2 forge-gate: uncorroborated probation blocked; pinned/verified passes
+        #   R-3  Sub-budget enforcement: min(global, resurrect_token_budget) honored
+        #   R-4  Default-contract byte-identical (I-2 guard — no resurrect section)
+        #   R-5  pg_trgm fallback under OLLAMA_SKIP=1
+        #   R-6  Depth-2 graph fan-out from seeded subjects
+        #   R-7  Read-only-by-default vs explicit revive opt-in (q.revive=true)
+        run: node scripts/test-resurrect.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          OLLAMA_SKIP: '1'
+      - name: Run operator-pin tests
+        # Tests the operator-pin.js standalone script (Part 3 of the L2-enforce ring):
+        #   P-1  Dry-run writes nothing (exit 0, no DB rows)
+        #   P-2  --apply inserts rows: pinned=true, source=user_stated,
+        #        confidence=10, tier=consolidated, suppressed=false, invalid_at=NULL
+        #   P-3  Idempotent re-run: second --apply is a no-op (no duplicates)
+        #   P-4  operator-pin NOT in handoff.js dispatch map (static check)
+        #   P-5  Invalid facts skipped without crash; valid fact still inserted
+        run: node scripts/test-operator-pin.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
