@@ -69,9 +69,11 @@ CREATE TABLE IF NOT EXISTS assertions (
   -- PR-B bi-temporal supersession + suppression_kind + pinned-exemption (additive, NULL-tolerant).
   -- Existing rows have NULL for valid_at/invalid_at/suppression_kind; pinned defaults to 0 (false).
   -- No backfill of existing rows (§7 SKIP; honors no-backfill rule).
+  -- suppression_kind values: 'superseded' | 'downvoted_terminal' | 'downvoted_probation' | 'retired'
+  --   'retired' added by L5 (cmdRetire operator verb); row excluded from retrieval but recoverable.
   valid_at         TEXT,
   invalid_at       TEXT,
-  suppression_kind TEXT    CHECK (suppression_kind IN ('superseded', 'downvoted_terminal', 'downvoted_probation')),
+  suppression_kind TEXT    CHECK (suppression_kind IN ('superseded', 'downvoted_terminal', 'downvoted_probation', 'retired')),
   pinned           INTEGER NOT NULL DEFAULT 0,
   -- Two-tier durability: probationary → consolidated (additive, NULL-tolerant).
   -- GRANDFATHER RULE: tier IS NULL = grandfathered; treated as 'consolidated' by all read paths.
@@ -93,6 +95,14 @@ CREATE INDEX IF NOT EXISTS assertions_confidence_idx ON assertions (project_id, 
 -- SQLite >= 3.37.0 supports ADD COLUMN IF NOT EXISTS.
 -- Existing rows receive NULL for valid_at / invalid_at / suppression_kind; 0 for pinned.
 -- These are safe no-ops on fresh DBs created from the CREATE TABLE above.
+--
+-- L5 note: the suppression_kind column's CREATE TABLE definition above already includes
+-- 'retired' in the CHECK constraint.  For existing DBs, SQLite does not support
+-- ALTER TABLE ... MODIFY COLUMN or DROP CONSTRAINT, so the column-level CHECK on an
+-- existing column cannot be widened in place.  In practice this is acceptable:
+--   1. The CHECK in the ADD COLUMN path below omits the CHECK (SQLite varies by build).
+--   2. The authoritative CHECK lives in the Postgres schema; SQLite is seam-test-only.
+--   3. db-seam.js port methods produce correct suppression_kind='retired' values regardless.
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS valid_at TEXT;
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS invalid_at TEXT;
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS suppression_kind TEXT;

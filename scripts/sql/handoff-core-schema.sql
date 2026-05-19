@@ -107,6 +107,8 @@ ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMPTZ;
 --              'superseded'          cardinality-driven (1:1 predicate replaced by newer row)
 --              'downvoted_terminal'  C2 auto-downvote; not auto-revivable
 --              'downvoted_probation' C2 auto-downvote soft-exclusion; revivable by positive feedback
+--              'retired'             operator-retired via cmdRetire (L5); non-destructive; row
+--                                    is excluded from retrieval but retained and recoverable
 --              NULL when the row is live (not suppressed).
 -- pinned     — if true, the assertion is NEVER auto-suppressed/auto-downvoted by the C2 path.
 --              Explicit cardinality-driven supersession (user re-stating a 1:1 predicate) MAY
@@ -114,7 +116,7 @@ ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMPTZ;
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS valid_at TIMESTAMPTZ;
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS invalid_at TIMESTAMPTZ;
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS suppression_kind TEXT
-  CHECK (suppression_kind IN ('superseded', 'downvoted_terminal', 'downvoted_probation'));
+  CHECK (suppression_kind IN ('superseded', 'downvoted_terminal', 'downvoted_probation', 'retired'));
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT false;
 
 -- ── Two-tier durability: probationary → consolidated ──────────────────────────
@@ -152,6 +154,51 @@ ALTER TABLE assertions ADD COLUMN IF NOT EXISTS tier TEXT
   CHECK (tier IN ('probationary', 'consolidated'));
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS consolidated_at TIMESTAMPTZ;
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS corroboration_count INTEGER NOT NULL DEFAULT 1;
+
+-- ── L5 suppression_kind CHECK widening: add 'retired' ────────────────────────
+--
+-- The ADD COLUMN IF NOT EXISTS above installs the widened CHECK on fresh DBs.
+-- On existing DBs that already have the suppression_kind column with the prior
+-- three-value CHECK, the ADD COLUMN is a no-op and the old constraint remains.
+-- This DO block drops the old constraint (by any auto-generated or legacy name)
+-- and re-adds the widened CHECK including 'retired'.  It is fully idempotent:
+--   - If the column does not yet have a CHECK (e.g. added by a very old script
+--     before the CHECK was introduced), the drop-constraint step is a no-op.
+--   - If the column already has the widened 4-value CHECK, the constraint name
+--     clash on re-add is caught and silently ignored.
+--
+-- Constraint name: assertions_suppression_kind_check  (Postgres auto-name for a
+-- column-level CHECK on the assertions table).  If your instance uses a
+-- different name (e.g. from a manual migration), the DO block drops all inline
+-- CHECK constraints on suppression_kind via the catalog and re-adds with the
+-- canonical name.
+DO $$
+DECLARE
+  r RECORD;
+BEGIN
+  -- Drop any existing CHECK constraint that references suppression_kind.
+  FOR r IN
+    SELECT con.conname
+    FROM   pg_constraint con
+    JOIN   pg_class      rel ON rel.oid = con.conrelid
+    JOIN   pg_namespace  ns  ON ns.oid  = rel.relnamespace
+    WHERE  con.contype   = 'c'
+      AND  rel.relname   = 'assertions'
+      AND  ns.nspname    = current_schema()
+      AND  pg_get_constraintdef(con.oid) LIKE '%suppression_kind%'
+  LOOP
+    EXECUTE 'ALTER TABLE assertions DROP CONSTRAINT IF EXISTS ' || quote_ident(r.conname);
+  END LOOP;
+
+  -- Add the widened CHECK (idempotent: catch duplicate-constraint error).
+  BEGIN
+    ALTER TABLE assertions
+      ADD CONSTRAINT assertions_suppression_kind_check
+        CHECK (suppression_kind IN ('superseded','downvoted_terminal','downvoted_probation','retired'));
+  EXCEPTION
+    WHEN duplicate_object THEN NULL;  -- already widened
+  END;
+END $$;
 
 -- ── L3 reality-check tag (additive, NULL-tolerant) ────────────────────────────
 --

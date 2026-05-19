@@ -140,7 +140,8 @@
       "predicate": "depends_on",
       "cardinality": "1:N",
       "description": "Subject depends on the named object; multiple objects are valid simultaneously",
-      "added_version": "1.0"
+      "added_version": "1.0",
+      "directive": true
     },
     {
       "predicate": "elevates_to",
@@ -152,7 +153,8 @@
       "predicate": "enforces",
       "cardinality": "1:N",
       "description": "Policies or constraints that a component enforces; may enforce multiple simultaneously",
-      "added_version": "1.1"
+      "added_version": "1.1",
+      "directive": true
     },
     {
       "predicate": "evaluates_at",
@@ -260,7 +262,8 @@
       "predicate": "is_constraint",
       "cardinality": "1:N",
       "description": "A constraint that applies to a subject or system behavior; multiple constraints may apply simultaneously",
-      "added_version": "1.1"
+      "added_version": "1.1",
+      "directive": true
     },
     {
       "predicate": "is_designed_for",
@@ -350,7 +353,8 @@
       "predicate": "must_do",
       "cardinality": "1:N",
       "description": "Normative requirement; a subject may have multiple simultaneous obligations",
-      "added_version": "1.1"
+      "added_version": "1.1",
+      "directive": true
     },
     {
       "predicate": "must_mean",
@@ -362,7 +366,8 @@
       "predicate": "never_uses",
       "cardinality": "1:N",
       "description": "Prohibition; items a subject must never use; multiple prohibitions may apply",
-      "added_version": "1.1"
+      "added_version": "1.1",
+      "directive": true
     },
     {
       "predicate": "no_longer_includes",
@@ -404,7 +409,8 @@
       "predicate": "policy",
       "cardinality": "1:N",
       "description": "Policy statement applicable to a subject; multiple policies may apply simultaneously",
-      "added_version": "1.1"
+      "added_version": "1.1",
+      "directive": true
     },
     {
       "predicate": "prefers",
@@ -458,7 +464,8 @@
       "predicate": "should",
       "cardinality": "1:N",
       "description": "Normative guidance (weaker than must_do); multiple guidance items may apply simultaneously",
-      "added_version": "1.1"
+      "added_version": "1.1",
+      "directive": true
     },
     {
       "predicate": "skip_for",
