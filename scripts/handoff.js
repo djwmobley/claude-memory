@@ -689,6 +689,10 @@ async function applyAdditiveSchema(db, schemaFile, { silent } = {}) {
     // strip-and-catch path is applied — node:sqlite does not support ADD COLUMN IF NOT EXISTS.
     await db.runSchema(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted    BOOLEAN     NOT NULL DEFAULT false`);
     await db.runSchema(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMPTZ`);
+    // L3 reality-check tag (additive, NULL-tolerant).
+    // 'verified' | 'mismatch' | 'unverifiable' | NULL (pre-L3 rows).
+    // On mismatch, conf/source/tier are NEVER modified — only this column.
+    await db.runSchema(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS reality_check TEXT`);
     await db.query('COMMIT');
   } catch (err) {
     try { await db.query('ROLLBACK'); } catch (_) { /* ignore */ }
@@ -919,6 +923,10 @@ async function cmdInit(args) {
     // strip-and-catch path is applied — node:sqlite does not support ADD COLUMN IF NOT EXISTS.
     await db.runSchema(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted    BOOLEAN     NOT NULL DEFAULT false`);
     await db.runSchema(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMPTZ`);
+    // L3 reality-check tag (additive, NULL-tolerant).
+    // 'verified' | 'mismatch' | 'unverifiable' | NULL (pre-L3 rows).
+    // On mismatch, conf/source/tier are NEVER modified — only this column.
+    await db.runSchema(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS reality_check TEXT`);
     await db.query('COMMIT');
     console.log(`  [OK]    Schema applied: ${path.basename(schemaFile)}`);
   } catch (err) {
@@ -2492,44 +2500,72 @@ async function cmdClose(args) {
     process.stderr.write('[handoff] schema auto-apply failed (non-fatal): ' + schemaErr.message + '\n');
   }
 
-  // Deliverable B: deterministic has_unpackaged_state assertion.
-  // Strip any model-supplied has_unpackaged_state assertions from the payload and
-  // replace with a single authoritative code-computed one.  This applies to BOTH
-  // the async (enqueue) path and the synchronous (writeExtraction) path.
+  // ── L3: Reality-check registry — authoritative pass ──────────────────────────
+  //
+  // Replaces the former "Deliverable B" hard-coded has_unpackaged_state block.
+  // Behavior is fully generalized through the REALITY_CHECKS registry (see
+  // scripts/lib/reality-checks.js) while preserving byte-identical output for
+  // the existing has_unpackaged_state authoritative injection (golden test).
+  //
+  // Authoritative mode: for each registered 'authoritative' entry whose
+  //   subjectMatch fires on at least one assertion (or unconditionally), strip
+  //   ALL model-supplied assertions for that predicate and inject a single
+  //   code-computed canonical one.  Applies to BOTH the async (enqueue) path
+  //   and the synchronous (writeExtraction) path.
+  //
+  // The subject, confidence, and source of each injected assertion are determined
+  // by the registry entry's probe and the canonical injection shape below.
   {
-    const originalCount = (payload.assertions || []).length;
-    const filtered = (payload.assertions || []).filter((a) => {
-      if (typeof a.predicate === 'string' &&
-          a.predicate.trim().toLowerCase() === 'has_unpackaged_state') {
-        process.stderr.write(
-          '[handoff] discarded model-supplied has_unpackaged_state assertion — packaging state is computed authoritatively\n'
-        );
-        return false;
-      }
-      return true;
-    });
-    if (filtered.length < originalCount) {
-      payload = Object.assign({}, payload, { assertions: filtered });
-    }
+    const { REALITY_CHECKS } = require('./lib/reality-checks');
 
-    // Compute authoritative packaging state and inject canonical assertion.
-    try {
-      const packState = detectUnpackagedState(root);
-      const canonicalPackAssertion = {
-        subject:    path.basename(root),
-        predicate:  'has_unpackaged_state',
-        object:     packState.unpackaged ? ('dirty — ' + packState.label) : 'clean',
-        confidence: 9,
-        source:     'user_stated',
-      };
-      payload = Object.assign({}, payload, {
-        assertions: (payload.assertions || []).concat([canonicalPackAssertion]),
+    for (const check of REALITY_CHECKS) {
+      if (check.mode !== 'authoritative') continue;
+
+      // Strip model-supplied rows for this predicate.
+      const originalCount = (payload.assertions || []).length;
+      const filtered = (payload.assertions || []).filter((a) => {
+        if (typeof a.predicate === 'string' &&
+            a.predicate.trim().toLowerCase() === check.predicate.toLowerCase()) {
+          process.stderr.write(
+            `[handoff] discarded model-supplied ${check.predicate} assertion — ${check.predicate} state is computed authoritatively\n`
+          );
+          return false;
+        }
+        return true;
       });
-    } catch (packComputeErr) {
-      // Non-fatal: if detectUnpackagedState fails, skip the canonical assertion.
-      process.stderr.write(
-        '[handoff] packaging state compute failed (non-fatal): ' + packComputeErr.message + '\n'
-      );
+      if (filtered.length < originalCount) {
+        payload = Object.assign({}, payload, { assertions: filtered });
+      }
+
+      // Run the probe and inject the canonical assertion.
+      // Probe is fail-soft: null return → skip injection (non-fatal).
+      try {
+        const probeResult = check.probe(root);
+        if (probeResult !== null) {
+          // Canonical injection shape — byte-identical to the pre-L3 hard-coded block
+          // for has_unpackaged_state (golden-test invariant):
+          //   subject:    path.basename(root)
+          //   predicate:  check.predicate
+          //   object:     probe result string
+          //   confidence: 9
+          //   source:     'user_stated'
+          const canonicalAssertion = {
+            subject:    path.basename(root),
+            predicate:  check.predicate,
+            object:     probeResult,
+            confidence: 9,
+            source:     'user_stated',
+          };
+          payload = Object.assign({}, payload, {
+            assertions: (payload.assertions || []).concat([canonicalAssertion]),
+          });
+        }
+      } catch (probeErr) {
+        // Non-fatal: probe threw unexpectedly — skip injection and continue.
+        process.stderr.write(
+          `[handoff] ${check.predicate} authoritative probe failed (non-fatal): ${probeErr.message}\n`
+        );
+      }
     }
   }
 
@@ -2719,6 +2755,100 @@ async function cmdClose(args) {
   // by the writeHandoffMd call below (after C2 and C3 complete).
   const stamp = new Date().toISOString();
   const _degradedSubsystems = [];
+
+  // ── L3: Reality-check registry — verify pass (strictly non-mutating) ──────────
+  //
+  // For each registered 'verify'-mode entry, find live assertions written this
+  // close whose predicate and subject match the entry.  Run the probe and tag the
+  // row with reality_check='verified' | 'mismatch' | 'unverifiable'.
+  //
+  // DESIGN-OF-RECORD INVARIANTS:
+  //   - confidence, source, and tier are NEVER modified on any row.
+  //   - Only the reality_check column is written.
+  //   - Probe failure (null) → 'unverifiable'; close exits normally.
+  //   - Mismatch → routes through recordDegradedClose (L4 surface) so it persists,
+  //     shows in the close summary, and re-surfaces on resume via the L4 banner.
+  //   - is_at_commit is NOT included; it records historical ship points and must
+  //     not be reality-verified against now-state.
+  try {
+    const { REALITY_CHECKS } = require('./lib/reality-checks');
+    const verifySessionId = payload.session_id || null;
+
+    for (const check of REALITY_CHECKS) {
+      if (check.mode !== 'verify') continue;
+
+      // Find live assertions for this predicate (written this close or pre-existing).
+      // The verify pass is best-effort — it queries all live rows for the predicate
+      // so it catches just-written assertions regardless of session id.
+      let verifyRows;
+      try {
+        const { rows } = await db.query(
+          `SELECT id, subject, object FROM assertions
+           WHERE project_id = $1
+             AND predicate  = $2
+             AND suppressed = false
+             AND invalid_at IS NULL`,
+          [projectId, check.predicate]
+        );
+        verifyRows = rows;
+      } catch (queryErr) {
+        process.stderr.write(
+          `[handoff] L3 verify query for "${check.predicate}" failed (non-fatal): ${queryErr.message}\n`
+        );
+        continue;
+      }
+
+      for (const row of verifyRows) {
+        if (!check.subjectMatch(row.subject, root)) continue;
+
+        // Run the probe; it accepts (root, object) to allow object-dependent probes.
+        let probeResult;
+        try {
+          probeResult = check.probe(root, row.object);
+        } catch (probeErr) {
+          // Probe threw unexpectedly — treat as unverifiable (fail-soft).
+          probeResult = null;
+        }
+
+        let tag;
+        if (probeResult === null) {
+          tag = 'unverifiable';
+        } else if (probeResult === row.object) {
+          tag = 'verified';
+        } else {
+          tag = 'mismatch';
+        }
+
+        // Write only the reality_check column — NEVER touch conf/source/tier.
+        try {
+          await db.query(
+            `UPDATE assertions SET reality_check = $1 WHERE id = $2`,
+            [tag, row.id]
+          );
+        } catch (updateErr) {
+          process.stderr.write(
+            `[handoff] L3 reality_check tag write failed for assertion ${row.id} (non-fatal): ${updateErr.message}\n`
+          );
+          continue;
+        }
+
+        // On mismatch, route through L4's degraded-close surface.
+        if (tag === 'mismatch') {
+          const reason =
+            `${check.predicate} subject="${row.subject}": ` +
+            `asserted "${row.object}" but probe returned "${probeResult}"`;
+          await recordDegradedClose(db, projectId, verifySessionId, 'reality_verify', reason);
+          _degradedSubsystems.push({ subsystem: 'reality_verify', reason });
+          process.stderr.write(
+            `[handoff] L3 reality mismatch (non-fatal): ${reason}\n`
+          );
+        }
+      }
+    }
+  } catch (verifyPassErr) {
+    // Fully non-fatal: any error in the verify dispatch must not abort close.
+    process.stderr.write(`[handoff] L3 verify pass failed (non-fatal): ${verifyPassErr.message}\n`);
+  }
 
   // ── Retrieval outcome capture (non-fatal) ─────────────────────────────────────
   // Must run BEFORE session_in_progress is cleared (we need the session id).

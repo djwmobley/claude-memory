@@ -128,3 +128,19 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run L3 reality-check registry tests
+        # Tests Lever L3: generalizes the single hard-coded reality-bound assertion
+        # (packaging state) into a reality-check registry with a strictly non-mutating
+        # verify pass. Covers: golden byte-equivalence of authoritative packaging
+        # injection, registry dispatch (authoritative strips+injects, verify does not
+        # strip), verify match → reality_check='verified' (conf/source/tier unchanged),
+        # verify mismatch → reality_check='mismatch' (conf/source/tier unchanged) +
+        # recordDegradedClose + L4 resume banner, probe failure → fail-soft
+        # 'unverifiable' + close exits normally, reality_check column present after
+        # init, no UPDATE SET tier on pre-existing rows (static scan), and
+        # is_at_commit is not listed as authoritative (design-of-record guard).
+        run: node scripts/test-l3-reality-checks.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
