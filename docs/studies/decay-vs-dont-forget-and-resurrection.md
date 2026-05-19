@@ -1,6 +1,6 @@
 # Decay vs. Don't-Forget: Devalue, Invalidate, and On-Demand Resurrection
 
-*A methodology and design study for the claude-memory OSS project. All claims are qualitative design conclusions validated through iterative testing on a realistic synthetic corpus in an isolated scratch database. No production telemetry, live-instance data, or instance-specific identifiers appear here.*
+*A methodology and case study for the claude-memory OSS project. The design described here has shipped — all mechanism claims are anchored to production code on `main`. Conclusions are presented qualitatively; no synthetic corpus counts appear here as telemetry.*
 
 ---
 
@@ -29,58 +29,106 @@ These are different axes:
 | Decay / tier | Default ranked surface | Yes — rehabilitation by feedback | Yes, on demand |
 | Bi-temporal invalidation | Truth | No (terminal) / conditional (probation) | Never (terminal), only after rehabilitation (probation) |
 
-Conflating them is the core danger. If a recovery mechanism treats devalued and invalidated memories the same way — either suppressing both equally, or resurfacing both equally — it is wrong in both directions. Suppressing both equally causes the forgetting problem described above. Resurfacing both equally turns a recovery tool into an attack surface: an adversary can engineer a query that retrieves invalidated (false) assertions under the guise of recovery.
+Conflating them is the core danger. If a recovery mechanism treats devalued and invalidated memories the same way — either suppressing both equally, or resurfacing both equally — it is wrong in both directions. Suppressing both equally causes the forgetting problem described above. Resurfacing both equally turns a recovery tool into an attack surface: an adversary who can influence query construction can retrieve invalidated (false) assertions under the guise of recovery.
 
 The distinction is what makes on-demand resurrection safe. A recovery mechanism may override devaluation freely. It must never override invalidation.
 
----
-
-## 3. The Resolution: An Opt-In `resurrect` Retrieval Mode
-
-The correct architecture is a two-tier retrieval model:
-
-**Default bootstrap** — lean and token-minimal. Standard decay scoring, tier gates active, top-N floor as the only dormancy safeguard. This is what every session receives without asking. Keeps context injection fast and predictable.
-
-**`resurrect` mode** — explicit and opt-in. Triggered per-query when the operator or agent determines that the lean default has likely missed relevant older context. The mechanism:
-
-1. **Semantic seed.** The query is embedded and run against the full assertion store without decay or tier filtering applied to the ranking pass.
-2. **Knowledge-graph fan-out.** The seed results drive a bounded traversal of the entity graph — related subjects, predicates, and objects within a configurable hop limit — to surface contextually linked points that the seed alone might miss.
-3. **Bitemporal guard.** Before any row is returned, it passes through a hard filter: `suppressed = false` AND `invalid_at IS NULL` AND `suppression_kind NOT IN ('superseded', 'downvoted_terminal')`. Probation rows (soft-excluded from default retrieval but not permanently invalidated) may be included with an explicit flag; terminal rows are never included under any flag.
-4. **Bounded additive token budget.** The resurrection results are injected as a separate budget from the default bootstrap. The lean default is not inflated; the resurrection block is clearly marked and bounded so the caller can reason about cost.
-
-This design means: decay stays rank-only, never a hard filter, never a truth signal. Tier gates are overridden by explicit intent. Invalidation is absolute and non-negotiable regardless of how the query was constructed.
+The shipped code makes this invariant non-negotiable. The `resurrect` branch in `cmdLoaderLoad` (`scripts/handoff.js`) targets eligibility as `suppressed = true AND suppression_kind = 'downvoted_probation'` — only soft-suppressed, recoverable rows — and hard-excludes `downvoted_terminal`, `superseded`, and `retired` in every fetch path. Terminal is terminal; no query flag overrides it.
 
 ---
 
-## 4. The Adversarial Finding: The Decay-Override Ring
+## 3. The Path We Took
 
-A naive implementation of `resurrect` mode is an adversary amplifier. If override of decay and tier applies unconditionally to every seed — including seeds constructed by an untrusted source — then the recovery path becomes a mechanism for injecting previously suppressed content. An adversary who can influence query construction can attempt to retrieve assertions that the trust model excluded for safety reasons, not merely for relevance.
+The resolution was not obvious at the outset. The tension between "decay forgets valuable things" and "recovery must not resurface false things" was worked through in an isolated scratch environment run as a self-paced reflective loop. Every iteration ended with exactly two gating questions:
 
-The minimal sufficient mitigation is a **seed-step trust gate**: before the fan-out step, the seed query itself is evaluated against the trust substrate. Only seeds that pass a provenance check (verified or pinned source, or operator-issued query) are permitted to invoke the full decay-override. Seeds from unverified or low-tier sources are allowed to retrieve only within their own trust band — the override does not apply.
+1. Have I asked all the questions of the work — is every implicit invariant tested, every failure mode explored?
+2. Is this my best judgment, or could I do better with another pass?
 
-This gate only works if a trust substrate exists. You cannot evaluate seed provenance if you have not tracked provenance. The strict tier model and the resurrection mode are therefore **mutually dependent**: the tier model is what makes the gate evaluable, and the gate is what makes the resurrection mode safe to expose.
+Multiple independent rounds were run with configurations frozen between them — no mid-round artifact-fixing, no tuning toward a desired result. A deliberate repeatability challenge was added: the same scenarios replayed across independent configurations, with the safety invariant required to hold at zero failures in every single trial, not on average. Zero-tolerance safety invariants are binary properties. Reporting an average while individual trials fail is not an acceptable characterization of a safety property.
 
-The implication for implementors: you cannot add a recovery mechanism to a system that lacks rigorous provenance tracking and expect it to be safe. The two features must ship together. The tier model is not bureaucratic overhead relative to recovery; it is the precondition for recovery.
+This discipline caught and corrected two overstatements before any conclusions were accepted:
 
----
+- **Denominator conflation.** An early metric conflated "rows below the decay horizon" with "rows that would be meaningfully retrieved by resurrection." These are different populations. The corrected analysis separated them and produced a more conservative — and accurate — characterization of what resurrection actually recovers. The original framing overstated the forgetting problem.
 
-## 5. Methodology and Epistemic Discipline
+- **Invalid proxy measurement.** An early trial used tier-exclusion rate as a proxy for "forgetting." This is wrong: a row can be tier-excluded and still appear in the default bootstrap via the top-N floor. The corrected measurement directly counted assertions that failed the top-N floor AND failed tier AND would pass the bitemporal guard — the actual target population for resurrection. The original proxy understated the relevance of tier rehabilitation.
 
-The conclusions above were reached iteratively. The process is worth describing as practice, not just as provenance.
-
-**Initial development.** A realistic synthetic corpus was loaded into an isolated scratch database. A candidate resurrection algorithm was run across multiple independent random seeds with the configuration frozen (no mid-run artifact fixing). Each round ended with a two-question gate: (1) does the bitemporal guard hold on every trial, or only on average? (2) what is the worst-case false-resurrection rate without the guard?
-
-This gate corrected two overstatements before the conclusions were accepted:
-
-- **Denominator conflation.** An early metric conflated "rows below the decay horizon" with "rows that would be meaningfully retrieved by resurrection." These are different populations. The corrected analysis separated them and produced a more conservative — and accurate — characterization of what resurrection actually recovers.
-- **Invalid proxy measurement.** An early trial used tier-exclusion rate as a proxy for "forgetting." This is wrong: a row can be tier-excluded and still appear in the default bootstrap via the top-N floor. The corrected measurement directly counted assertions that failed the top-N floor AND failed tier AND would pass the bitemporal guard — the actual target population for resurrection.
-
-**Repeatability discipline.** A deliberate repeatability challenge was run: many independent random seeds, frozen configuration, no artifact-fixing between runs. The bitemporal guard was required to hold at zero false-resurrections on every single trial — not on average. Zero-tolerance safety invariants are binary properties, not statistical ones. Reporting an average while individual trials fail is not an acceptable characterization of a safety property.
-
-**Qualitative presentation.** This study presents conclusions qualitatively: "false-resurrection held at zero across every replicated trial with the guard in place, and was substantial without it." Specific counts from a synthetic corpus would invite misreading as production telemetry. They are not; they are illustrative signals from controlled conditions. The design conclusion — not the number — is what transfers.
+With those overstatements corrected, three design forks were surfaced, each with a recommended lean. The critical structural finding was that the three mechanisms were not independently shippable: fuzzy resurrection without a trust gate is an adversary amplifier; the trust gate is only evaluable if L2-enforce is active; and operator-pin is what makes the seed-gate substrate trustworthy for the long-running project use case. The decision was made to ship all three as one mutually-dependent unit. That unit is now on `main` (squash commit `9085fe4`, PR #66).
 
 ---
 
-## 6. Summary
+## 4. The Shipped Resolution — Three Mechanisms, Proven Out
 
-Decay and don't-forget are not opposites. They operate on different axes. Decay governs ranked relevance; bi-temporal invalidation governs truth. An on-demand resurrection mode that overrides the former while absolutely respecting the latter is safe, replicable, and consistent with the existing system design. The adversarial guard that makes it safe is not optional — it is the feature that makes resurrection trustworthy, and it requires the trust substrate (tier model, provenance tracking) to be in place first. Both must ship together or neither is safe to expose.
+### (a) Devalue Over Delete
+
+Decay and tier are rank-only mechanisms, not truth mechanisms. The shipped design enforces this at the retrieval layer: `resurrect` mode overrides decay and tier suppression freely for probationary rows, and is absolutely barred from doing so for terminal or superseded rows.
+
+The bitemporal guard predicate in `cmdLoaderLoad` (`scripts/handoff.js`) targets eligibility as:
+
+```
+suppressed = true AND suppression_kind = 'downvoted_probation'
+```
+
+Every fetch in the resurrect branch carries this predicate. The hard-exclude of `downvoted_terminal`, `superseded`, and `retired` is not a flag or a setting — it is the absence of those kinds from the eligibility clause. There is no path through the resurrect branch that returns a terminal row.
+
+Rehabilitation — transitioning a probationary row back to live status — is handled by the symmetrically paired mutation path: `db.buildProbationRehabUpdate` in `scripts/lib/db-seam.js` (line 939 / 1404). This is the only sanctioned mutation in the resurrect branch, and it is gated on an explicit `q.revive === true` opt-in. The default resurrect query is read-only.
+
+**Why it is safe:** decay and tier never act as truth signals; they never cause a row to be removed or invalidated. A row surfaced by `resurrect` was always true by the system's current belief. The guard ensures that nothing the system has explicitly disbelieved is reintroduced.
+
+### (b) Override for Past Projects — Operator-Pin
+
+For long-running projects, there is a class of facts that should survive decay and tier permanently: foundational architectural decisions, confirmed constraints, user-stated invariants. These are facts the operator knows are true and wants the system to treat as trusted anchors unconditionally.
+
+The shipped `scripts/operator-pin.js` is a standalone out-of-engine tool that inserts canon rows with `pinned = true`, `source = 'user_stated'`, `confidence = 10`, `tier = 'consolidated'`. It uses separate credentials from the main engine and is deliberately not wired into the `handoff.js` subcommand dispatch map — a model-invoked query cannot trigger it. Dry-run is the default; writes require explicit `--apply`. This is not an escape hatch from the trust model; it is a controlled extension of it.
+
+Pinned rows serve two purposes. First, they survive all automatic suppression paths: the downvote logic in `handoff.js` explicitly exempts `pinned = true` rows from auto-suppression (line 3310). Second, they are trusted anchors for the M2 seed gate: the gate predicate `reality_check = 'verified' OR pinned = true` (line 1726) means a pinned subject is unconditionally eligible to seed a resurrection pass. Without operator-pin, the seed gate depends entirely on L2 corroboration accruing organically — which can be slow for assertions written before the trust substrate was in place. Operator-pin bridges that gap.
+
+**Why it is safe:** the tool is non-model-invocable (absent from the dispatch map, separate creds), insert-only, idempotent on duplicate live pinned rows, and dry-run by default. The operator retains full audit visibility. The `test-operator-pin.js` harness validates these constraints as CI cases.
+
+### (c) Fuzzy Resurrection
+
+A user who wants to resurrect older context months later does not remember the exact predicate or subject terms from the original assertions. The shipped resurrect mode handles this via a two-level fallback:
+
+1. **Semantic seed** — when Ollama is available, the query is embedded and run against the vector substrate (`v_memory_hits` cosine path). This is the primary path.
+2. **pg_trgm fuzzy fallback** — when running under `OLLAMA_SKIP=1` (or when Ollama is unavailable), the resurrect branch calls `db.buildFuzzyMatch` (`scripts/lib/db-seam.js` line 957 / 1416) which issues a trigram similarity query (`similarity($2, subject || ' ' || predicate || ' ' || object)`) on Postgres, or an `instr()`/`LIKE` token-scan on SQLite. The pg_trgm extension is provisioned in `scripts/setup.sql` with a graceful degrade notice if absent.
+
+Both paths route through the db-seam abstraction — there are no dialect conditionals in the engine itself. The seam handles the Postgres/SQLite split transparently.
+
+From the seed candidates, the resurrect branch performs a depth-2 knowledge-graph fan-out via `db.buildGraphCTE('out', seeds, 2)` (`scripts/lib/db-seam.js` line 814 / 1276). This surfaces contextually linked entities that the text seed alone would miss — for example, a canonical decision about module X resurfaces alongside related assertions about modules Y and Z that reference X as a dependency.
+
+**Why it is safe:** fuzzy search widens the candidate set before the M2 gate, not after. Every candidate that passes fuzzy matching still passes through the seed-gate trust filter (`reality_check = 'verified' OR pinned = true`) before any rows are fetched. A broad fuzzy match cannot bypass the trust requirement.
+
+---
+
+## 5. The Adversarial Finding: The Decay-Override Ring
+
+A naive implementation of `resurrect` mode is an adversary amplifier. If override of decay and tier applies unconditionally to every seed — including seeds constructed or influenced by an untrusted source — then the recovery path becomes a mechanism for injecting previously suppressed content. The minimal sufficient mitigation is the M2 seed-gate.
+
+The gate (`handoff.js` line 1726) requires that a subject have at least one live, trusted anchor — `reality_check = 'verified' OR pinned = true` — before any of its probationary rows are eligible for resurrection. This is the same quality-corroborator predicate used by L2 at the consolidation gate (line 2098–2099). An adversary-injected probationary row whose subject has no trusted anchor cannot self-resurrect; it is filtered at the gate before any rows are fetched.
+
+But the gate is only evaluable if the trust substrate is populated. L2 corroboration (`consolidation_gate_mode = 'enforce'`, default as of `scripts/handoff.js` line 969) is what drives `reality_check = 'verified'` onto rows that have been positively corroborated across sessions. Operator-pin is what drives `pinned = true` onto foundational facts that have not yet had the opportunity to accrue cross-session corroboration. The gate requires both.
+
+This is why the three mechanisms shipped as one mutually-dependent unit:
+
+- **resurrect** without the M2 gate is an adversary amplifier.
+- The **M2 gate** is only evaluable if L2-enforce is active and the trust substrate is populated.
+- **Operator-pin** is what makes the substrate trustworthy for the pre-corroboration bootstrap case.
+
+None of the three is independently safe to expose. All three on `main` together are.
+
+The CI proof is in `scripts/test-resurrect.js` section R-2 ("M2 forge-gate"): a probationary row whose subject has no trusted anchor is confirmed blocked. The adversarial case is an explicit named test, not an incidental side-effect of a passing suite.
+
+---
+
+## 6. Methodology and Epistemic Discipline
+
+The two overstatements corrected during development (denominator conflation and invalid proxy metric) are worth dwelling on. Both were caught not by a reviewer but by the two-question gate applied to the author's own work. The gate's value is precisely that it creates structured pressure to re-examine the work before conclusions are accepted.
+
+The repeatability discipline — independent frozen-config rounds, safety invariant required at zero across every single trial — is the companion to the gate. Without the gate, the work could be declared done before the proxy measurement error was noticed. Without the repeatability requirement, the bitemporal guard could be characterized as "holds on average" — which, for a safety invariant, is meaningless. The two practices together are what make the qualitative framing ("false-resurrection held at zero across every replicated trial with the guard in place, and was substantial without it") trustworthy as a design conclusion.
+
+Specific counts from a synthetic corpus would invite misreading as production telemetry. The design conclusion — not the count — is what transfers to any operator's deployment.
+
+---
+
+## 7. Summary
+
+Decay and don't-forget are not opposites. They operate on different axes. Decay governs ranked relevance; bi-temporal invalidation governs truth. The shipped `resurrect` query mode overrides the former — fully, freely, for any probationary row — while absolutely respecting the latter. The M2 seed-gate that makes it safe, the L2-enforce mode that makes the gate evaluable, and the operator-pin tool that seeds the trust substrate for foundational facts are mutually dependent: all three shipped together (PR #66) because none is independently safe without the others. The CI harness (`test-resurrect.js`, `test-operator-pin.js`) proves the adversarial invariants explicitly, not incidentally.
