@@ -5550,6 +5550,22 @@ async function colStep7_sameSessionCrossSessionParity(colDb, colProjectId, colPr
       { ...opts, input: JSON.stringify({ session_id: SID_X, assertions: [{ subject: 'col-g', predicate: pred, object: 'dep-g', confidence: 7, source: 'model_extracted' }] }) });
     if (r1.status !== 0) { colFail(7, label, `close-1 exited ${r1.status}: ${(r1.stderr || '').slice(0, 200)}`); return false; }
 
+    // Under consolidation_gate_mode='enforce' (default since L2), cross-session repetition
+    // alone is insufficient — the L2 quality-corroborator gate (arm b) requires >=1 prior
+    // row with reality_check='verified' OR pinned=true. Mirror the T2/T3 fix in
+    // test-l0-consolidation-gate.js: stamp reality_check='verified' on the first close's
+    // row so the second close sees a quality corroborator and arm b fires → consolidated.
+    // This is the legitimate cross-session parity path; the test still exercises the
+    // consolidated-birth invariant — not weakened, fixture upgraded.
+    const dbStamp = await pgConnect(colDb);
+    await dbStamp.query(
+      `UPDATE assertions SET reality_check = 'verified'
+       WHERE project_id = $1 AND subject = 'col-g' AND predicate = $2 AND object = 'dep-g'
+         AND session_id = $3 AND suppressed = false`,
+      [colProjectId, pred, SID_X]
+    );
+    await dbStamp.end();
+
     const r2 = spawnSync(process.execPath, closeArgs,
       { ...opts, input: JSON.stringify({ session_id: SID_Y, assertions: [{ subject: 'col-g', predicate: pred, object: 'dep-g', confidence: 7, source: 'model_extracted' }] }) });
     if (r2.status !== 0) { colFail(7, label, `close-2 exited ${r2.status}: ${(r2.stderr || '').slice(0, 200)}`); return false; }
