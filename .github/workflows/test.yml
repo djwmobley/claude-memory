@@ -109,3 +109,10 @@ jobs:
         # and the detection logic vendored from ~/.claude/hooks/pr-independence.js.
         # Pure Node — no Postgres or Ollama required; reuses the Node 22 setup above.
         run: node hooks/pr-independence.test.js
+      - name: Run plugin packaging tests
+        # Validates the Claude Code plugin manifest (.claude-plugin/plugin.json,
+        # marketplace.json, hooks/hooks.json), CLAUDE_PLUGIN_ROOT asset resolution,
+        # loader-hook inertness when no .claude-memory marker is present, and the
+        # no-silent-SQLite-fallback guard in plugin mode.
+        # Pure Node — no Postgres or Ollama required.
+        run: node scripts/test-plugin-packaging.js

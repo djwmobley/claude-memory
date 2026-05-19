@@ -1,0 +1,11 @@
+{
+  "name": "handoff",
+  "description": "Intersession memory and retrieval for Claude Code projects. Persists entities, assertions, and edges across sessions via Postgres; auto-loads context at SessionStart when the project opts in via a .claude-memory marker.",
+  "version": "1.0.0",
+  "author": {
+    "name": "djwmobley"
+  },
+  "license": "MIT",
+  "commands": "./commands/",
+  "hooks": "./hooks/hooks.json"
+}

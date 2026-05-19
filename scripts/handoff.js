@@ -81,8 +81,19 @@ if (!_DB_NAME_RE.test(_rawTargetDb)) {
   process.exit(1);
 }
 const TARGET_DB = _rawTargetDb;
-const HANDOFF_TEMPLATE = path.resolve(__dirname, '..', 'templates', 'handoff.md.tpl');
-const PROJECT_CLAUDE_MD_TEMPLATE = path.resolve(__dirname, '..', 'templates', 'project-claude-md.tpl');
+
+// ─── PLUGIN ROOT RESOLUTION ───────────────────────────────────────────────────
+// When running as a Claude Code plugin, CLAUDE_PLUGIN_ROOT is set to the plugin
+// install directory.  Asset paths (templates, SQL schemas) are resolved from
+// the plugin root in that case, and from __dirname's parent otherwise.
+// This lets standalone repo usage (CLAUDE_PLUGIN_ROOT unset) behave byte-identically
+// to pre-plugin behavior — CI passes with no env-var changes required.
+const _ENGINE_ROOT = process.env.CLAUDE_PLUGIN_ROOT
+  ? process.env.CLAUDE_PLUGIN_ROOT
+  : path.resolve(__dirname, '..');
+
+const HANDOFF_TEMPLATE = path.join(_ENGINE_ROOT, 'templates', 'handoff.md.tpl');
+const PROJECT_CLAUDE_MD_TEMPLATE = path.join(_ENGINE_ROOT, 'templates', 'project-claude-md.tpl');
 
 // ─── OPERATING CANON (hardcoded trusted preamble) ─────────────────────────────
 // Emitted unconditionally before the untrusted retrieved-context block so every
@@ -111,6 +122,20 @@ async function connectHandoff() {
   const dialect = resolveDialect(cfg);
 
   if (dialect === 'sqlite') {
+    // Plugin mode: Postgres is a declared prerequisite. Silently falling back to
+    // SQLite in plugin mode would violate the design premise and risk data loss /
+    // incorrect behavior in multi-project setups. Fail loudly so the user can
+    // configure Postgres rather than silently operating on a wrong backend.
+    if (process.env.CLAUDE_PLUGIN_ROOT) {
+      const msg = [
+        '[handoff plugin] STORAGE_BACKEND=sqlite is not supported in plugin mode.',
+        'Postgres is required. Set PGHOST/PGUSER/PGPASSWORD (and optionally HANDOFF_DB)',
+        'to point at your Postgres instance, then remove STORAGE_BACKEND=sqlite.',
+        'SQLite is available only for the db-seam test suite (standalone repo mode).',
+      ].join('\n');
+      process.stderr.write(msg + '\n');
+      process.exit(1);
+    }
     const root   = findProjectRoot();
     const dbPath = resolveSQLiteDbPath(root);
     return createAdapter('sqlite', { dbPath });
@@ -561,8 +586,8 @@ function _hashSchemaFile(filePath) {
  * to either file triggers a re-apply on the active backend.
  */
 function _computeSchemaFingerprint() {
-  const pgFile     = path.resolve(__dirname, 'sql', 'handoff-core-schema.sql');
-  const sqliteFile = path.resolve(__dirname, 'sql', 'handoff-sqlite-schema.sql');
+  const pgFile     = path.join(_ENGINE_ROOT, 'scripts', 'sql', 'handoff-core-schema.sql');
+  const sqliteFile = path.join(_ENGINE_ROOT, 'scripts', 'sql', 'handoff-sqlite-schema.sql');
   const crypto = require('crypto');
   return crypto.createHash('sha256')
     .update(_hashSchemaFile(pgFile))
@@ -671,7 +696,7 @@ async function ensureSchemaCurrent(db, projectId, { silent } = {}) {
 
   // Resolve the schema file for the active dialect.
   const schemaFileName = db.schemaFileName;
-  const schemaFile = path.resolve(__dirname, 'sql', schemaFileName);
+  const schemaFile = path.join(_ENGINE_ROOT, 'scripts', 'sql', schemaFileName);
   await applyAdditiveSchema(db, schemaFile, { silent });
 
   // Upsert the new fingerprint into project_settings.
@@ -773,7 +798,7 @@ async function cmdInit(args) {
 
   // Step 6: schema file present on disk — adapter knows the correct filename.
   const schemaFileName = probeAdapter.schemaFileName;
-  const schemaFile = path.resolve(__dirname, 'sql', schemaFileName);
+  const schemaFile = path.join(_ENGINE_ROOT, 'scripts', 'sql', schemaFileName);
   const schemaExists = fs.existsSync(schemaFile);
   if (schemaExists) {
     console.log(`  [OK]    Schema file present: ${path.basename(schemaFile)}`);

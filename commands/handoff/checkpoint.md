@@ -35,21 +35,35 @@ Before calling the helper, extract the following from this conversation:
 Build a JSON payload and pipe it to the helper:
 
 ```bash
-# Detect project root — prefer .claude-memory marker, fall back to .git
-PROJECT_ROOT=$(pwd)
-while [ ! -f "$PROJECT_ROOT/.claude-memory" ] && [ ! -d "$PROJECT_ROOT/.git" ] && [ "$PROJECT_ROOT" != "/" ]; do
-  PROJECT_ROOT=$(dirname "$PROJECT_ROOT")
-done
-if [ "$PROJECT_ROOT" = "/" ] && [ ! -f "$PROJECT_ROOT/.claude-memory" ] && [ ! -d "$PROJECT_ROOT/.git" ]; then
+# Resolve engine script and project root.
+# Plugin mode: CLAUDE_PLUGIN_ROOT is set by the Claude Code runtime when loaded as a plugin.
+# Standalone mode: walk up from cwd to find the project root containing scripts/handoff.js.
+if [ -n "$CLAUDE_PLUGIN_ROOT" ]; then
+  HANDOFF_ENGINE="$CLAUDE_PLUGIN_ROOT/scripts/handoff.js"
   PROJECT_ROOT=$(pwd)
+  while [ ! -f "$PROJECT_ROOT/.claude-memory" ] && [ "$PROJECT_ROOT" != "/" ]; do
+    PROJECT_ROOT=$(dirname "$PROJECT_ROOT")
+  done
+  if [ ! -f "$PROJECT_ROOT/.claude-memory" ]; then
+    echo "Error: no .claude-memory marker found — run /handoff:init first."
+    exit 1
+  fi
+else
+  PROJECT_ROOT=$(pwd)
+  while [ ! -f "$PROJECT_ROOT/.claude-memory" ] && [ ! -d "$PROJECT_ROOT/.git" ] && [ "$PROJECT_ROOT" != "/" ]; do
+    PROJECT_ROOT=$(dirname "$PROJECT_ROOT")
+  done
+  if [ "$PROJECT_ROOT" = "/" ] && [ ! -f "$PROJECT_ROOT/.claude-memory" ] && [ ! -d "$PROJECT_ROOT/.git" ]; then
+    PROJECT_ROOT=$(pwd)
+  fi
+  if [ ! -f "$PROJECT_ROOT/scripts/handoff.js" ]; then
+    echo "Error: scripts/handoff.js not found — is this a claude-memory project?"
+    exit 1
+  fi
+  HANDOFF_ENGINE="$PROJECT_ROOT/scripts/handoff.js"
 fi
 
-if [ ! -f "$PROJECT_ROOT/scripts/handoff.js" ]; then
-  echo "Error: scripts/handoff.js not found — is this a claude-memory project?"
-  exit 1
-fi
-
-echo '<JSON_PAYLOAD>' | node "$PROJECT_ROOT/scripts/handoff.js" checkpoint --json -
+echo '<JSON_PAYLOAD>' | PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" checkpoint --json -
 ```
 
 ### JSON payload shape
