@@ -144,3 +144,18 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run L0 consolidation gate tests
+        # Tests Lever L0: severs the single-close consolidation forge (Attack 1).
+        # A single close with source='user_stated', conf>=9 and no genuine prior-session
+        # corroboration must produce tier='probationary' (not 'consolidated') when the
+        # consolidation_corroboration_gate setting is 'enforce' (the default).
+        # Covers: Attack-1 closed (core security assertion), genuine 1:N and 1:1
+        # corroboration consolidates, payload-supplied session_id cannot forge the gate,
+        # pinned suppression exemption unaffected, disabled=byte-identical to pre-L0
+        # (golden equivalence), no UPDATE SET tier on pre-existing rows (static + behavioral),
+        # and same-session fake corroboration rejected (defense-in-depth).
+        run: node scripts/test-l0-consolidation-gate.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres

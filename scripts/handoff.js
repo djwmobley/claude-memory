@@ -1999,10 +1999,16 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
     // NOT suppressed+reinserted. Accumulate across both cardinalities before deciding path.
     const touchOnlyIds = [];
     // Two-tier durability: track corroboration signals from 1:N exact-duplicate matches.
-    // For 1:N only: collect session_id and corroboration_count from canonical-matched prior
-    // live rows to determine cross-session corroboration (hybrid consolidation trigger b).
+    // For 1:N only (pre-L0): collect session_id and corroboration_count from canonical-matched
+    // prior live rows to determine cross-session corroboration (hybrid consolidation trigger b).
     // See the INSERT below for how these are used to compute tier and corroboration_count.
-    let crossSessionCorroborated = false;
+    //
+    // L0: crossSessionCorroborated is also set for 1:1 cardinality when the same
+    // (subject, predicate, object) was seen from a distinct prior non-null session_id.
+    // The disabled-mode path uses preLo1NCorroborated (1:N only, pre-L0 formula) to
+    // preserve byte-identical behavior when the gate is disabled.
+    let crossSessionCorroborated = false; // L0 enforce gate: both 1:1 and 1:N
+    let preLo1NCorroborated      = false; // disabled-mode path: 1:N only (pre-L0 formula)
     let maxPriorCorrob = 1;
 
     if (cardinality === '1:1') {
@@ -2027,6 +2033,19 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
             touchOnlyIds.push(r.id);
           } else {
             storedSubjectsToSuppress.add(r.subject);
+            // L0: Cross-session corroboration for 1:1 — same (subject, predicate, object)
+            // asserted from a DISTINCT non-null session_id counts as genuine corroboration.
+            // Same-session re-assertion (or null session_id on either side) does NOT count.
+            // Note: the 1:1 corroboration signal is ONLY used by the L0 enforce gate;
+            // the disabled-mode path preserves the pre-L0 formula exactly (see Step 3).
+            if (
+              r.object === ass.object &&
+              r.session_id !== null && r.session_id !== undefined &&
+              sessionId !== null && sessionId !== undefined &&
+              r.session_id !== sessionId
+            ) {
+              crossSessionCorroborated = true;
+            }
           }
         }
       }
@@ -2064,7 +2083,8 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
             sessionId !== null && sessionId !== undefined &&
             r.session_id !== sessionId
           ) {
-            crossSessionCorroborated = true;
+            crossSessionCorroborated = true; // L0 enforce path
+            preLo1NCorroborated      = true; // disabled-mode path (pre-L0 formula, 1:N only)
           }
           // Track max corroboration_count among matched priors (for new row's count).
           const priorCount = typeof r.corroboration_count === 'number'
@@ -2104,10 +2124,28 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
     // ── Step 3: INSERT the new row with canonical subject ─────────────────────────
     //
     // Two-tier durability (Hybrid consolidation trigger):
-    //   (a) High-trust: source='user_stated' AND confidence >= 9 → tier='consolidated' immediately.
-    //   (b) Cross-session corroboration (1:N only): same (subject, predicate, object) asserted
-    //       from a DISTINCT non-null session_id → tier='consolidated'.
+    //   (a) High-trust: source='user_stated' AND confidence >= 9 — subject to L0 gate (see below).
+    //   (b) Cross-session corroboration: same (subject, predicate, object) asserted
+    //       from a DISTINCT non-null prior-session row → tier='consolidated'.
+    //       (1:N tracked via the candidate loop above; 1:1 also tracked since L0.)
     //   Otherwise → tier='probationary'.
+    //
+    // L0 — consolidation_corroboration_gate (Attack-1 single-close forge prevention):
+    //   When setting = 'enforce' (DEFAULT): the FULL newTier consolidated-birth decision
+    //   is gated on genuine cross-session corroboration (crossSessionCorroborated = true).
+    //   Defense-in-depth: the gate covers the ENTIRE decision (not just the isHighTrust
+    //   boolean term) — both trigger (a) and trigger (b) require corroboration.
+    //   A single close cannot self-stamp consolidated regardless of the source/confidence
+    //   values it supplies — those are model-controlled fields. Only persisted, distinct
+    //   prior close rows from a different session_id (which the closing model cannot
+    //   fabricate in one close) satisfy the gate.
+    //   If corroboration does NOT hold: row is born probationary (data fully preserved;
+    //   probationary still participates in retrieval, ranked below consolidated).
+    //   When setting = 'disabled': reverts to pre-L0 behavior byte-for-byte.
+    //   The pre-L0 formula was: (isHighTrust || (cardinality === '1:N' && 1:N-corroboration))
+    //   which is reproduced exactly via preLo1NCorroborated (1:N only, the original variable).
+    //   Pinned rows: pinned is a suppression-exemption flag; not a tier-grant flag at write
+    //   time. L0 does not alter pinned handling (suppression path, unaffected by newTier).
     //
     // consolidated_at: set to now() when consolidated, SQL NULL otherwise.
     // corroboration_count: 1 + maxPriorCorrob when cross-session corroboration fires; 1 otherwise.
@@ -2116,10 +2154,16 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
     // fragment embedded in the query string (matching the existing valid_at / last_reinforced
     // style) — NOT as a JS parameter.  The SQLiteAdapter's rewriteForSQLite regex rewrites
     // now() → datetime('now') automatically.  Do not parametrize a SQL function.
+    //
+    // L0 gate: read once, inside the transaction (plain SELECT — safe, no write).
+    const corrobGate  = await getSetting(db, projectId, 'consolidation_corroboration_gate', 'enforce');
     const isHighTrust = (source === 'user_stated' && conf >= 9);
-    const newTier     = (isHighTrust || (cardinality === '1:N' && crossSessionCorroborated))
-      ? 'consolidated'
-      : 'probationary';
+    // newTier — full consolidated-birth decision:
+    //   enforce (default): corroboration required for ALL consolidation paths.
+    //   disabled:          pre-L0 formula exactly — isHighTrust OR (1:N && preLo1NCorroborated).
+    const newTier = (corrobGate === 'disabled')
+      ? ((isHighTrust || (cardinality === '1:N' && preLo1NCorroborated)) ? 'consolidated' : 'probationary')
+      : (crossSessionCorroborated ? 'consolidated' : 'probationary');
     const consolidatedAtSql = (newTier === 'consolidated') ? 'now()' : 'NULL';
     const newCorrob = (cardinality === '1:N' && crossSessionCorroborated)
       ? (maxPriorCorrob + 1)
