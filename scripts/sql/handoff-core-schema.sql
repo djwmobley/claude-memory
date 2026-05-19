@@ -153,6 +153,25 @@ ALTER TABLE assertions ADD COLUMN IF NOT EXISTS tier TEXT
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS consolidated_at TIMESTAMPTZ;
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS corroboration_count INTEGER NOT NULL DEFAULT 1;
 
+-- ── L3 reality-check tag (additive, NULL-tolerant) ────────────────────────────
+--
+-- Additive, NULL-tolerant addition.  Existing rows are left untouched — any
+-- missing value is NULL and is handled gracefully by all read paths.
+-- No UPDATE or DELETE of existing data (§7 SKIP; honors no-backfill rule).
+--
+-- reality_check — result of the non-mutating verify pass run at /handoff:close:
+--   'verified'      probe ran and returned a value matching the asserted object
+--   'mismatch'      probe ran and returned a value NOT matching the asserted object;
+--                   conf/source/tier are NEVER modified on mismatch — only this tag
+--   'unverifiable'  probe returned null (git unavailable, file path unclear, etc.)
+--   NULL            row predates L3 or predicate has no registered verify probe
+--
+-- Authoritative-mode predicates (has_unpackaged_state) are always re-injected at
+-- close time as fresh rows; old rows for that predicate are suppressed by the
+-- normal supersession path, so they never need a reality_check tag.
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS reality_check TEXT
+  CHECK (reality_check IN ('verified', 'mismatch', 'unverifiable'));
+
 CREATE INDEX IF NOT EXISTS assertions_project_idx
   ON assertions (project_id);
 CREATE INDEX IF NOT EXISTS assertions_subject_idx

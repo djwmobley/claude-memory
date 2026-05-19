@@ -107,6 +107,13 @@ ALTER TABLE assertions ADD COLUMN IF NOT EXISTS tier TEXT;
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS consolidated_at TEXT;
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS corroboration_count INTEGER NOT NULL DEFAULT 1;
 
+-- L3 reality-check tag (additive, NULL-tolerant).
+-- 'verified' | 'mismatch' | 'unverifiable' | NULL (pre-L3 rows).
+-- On mismatch, conf/source/tier are NEVER modified — only this column.
+-- Note: SQLite CHECK on reality_check omitted (behavior varies by build);
+--       Postgres version carries the authoritative CHECK constraint.
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS reality_check TEXT;
+
 -- 1:1 partial unique index (same predicate set as Postgres version)
 CREATE UNIQUE INDEX IF NOT EXISTS assertions_1to1_unique
   ON assertions (project_id, subject, predicate)
