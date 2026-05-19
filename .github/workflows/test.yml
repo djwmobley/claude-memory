@@ -47,7 +47,7 @@ jobs:
           DATABASE_URL: postgres://postgres:postgres@localhost/postgres
           OLLAMA_SKIP: '1'
       - name: Create eval test database
-        run: psql -h localhost -U postgres -c "CREATE DATABASE claude_memory_eval_test"
+        run: psql -h localhost -U postgres -c "CREATE DATABASE claude_memory_eval_ci"
         env:
           PGPASSWORD: postgres
       - name: Run retrieval eval (FTS-only smoke test)
@@ -56,7 +56,7 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
-          EVAL_DB_NAME: claude_memory_eval_test
+          EVAL_DB_NAME: claude_memory_eval_ci
           # Propagates into the loader subprocess that eval STEP 5 spawns;
           # without this, the loader tries Ollama-on-localhost and fails 3x per fixture.
           OLLAMA_SKIP: '1'

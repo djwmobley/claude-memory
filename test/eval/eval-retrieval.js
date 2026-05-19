@@ -8,15 +8,22 @@
  * the metrics meet committed baselines.
  *
  * Usage:
- *   node test/eval/eval-retrieval.js                 # Run full eval
+ *   node test/eval/eval-retrieval.js                 # Run full eval (auto throwaway DB)
  *   node test/eval/eval-retrieval.js --update-baseline  # Accept current metrics as new baseline
  *   node test/eval/eval-retrieval.js --quiet          # Summary only (no per-query output)
  *   node test/eval/eval-retrieval.js --ollama-skip    # FTS-only; skip vector parts
  *
- * Prerequisites:
- *   - Create the eval DB before first run:
- *       psql -U postgres -c "CREATE DATABASE claude_memory_eval_test;"
- *       psql -U postgres -d claude_memory_eval_test -c "CREATE EXTENSION IF NOT EXISTS vector;"
+ * DB lifecycle:
+ *   When EVAL_DB_NAME is NOT set (default): the harness generates a unique throwaway
+ *   DB name (claude_memory_eval_run_<timestamp>_<rand>), creates it at startup, and
+ *   drops it at end — even on failure (try/finally). No manual setup required.
+ *
+ *   When EVAL_DB_NAME IS set: the harness uses that name as-is and does NOT create or
+ *   drop it — the caller owns the lifecycle. This is the CI path (EVAL_DB_NAME is set
+ *   to an ephemeral database created by the workflow before this script runs).
+ *
+ * Prerequisites (only needed when running with an explicit EVAL_DB_NAME):
+ *   - The named database must already exist and have the pgvector extension.
  *   - Ollama running with mxbai-embed-large pulled (unless --ollama-skip).
  *
  * Exit codes: 0 all-pass, 1 metric regression, 2 infrastructure failure.
@@ -28,6 +35,9 @@ const fs            = require('fs');
 const os            = require('os');
 const { execFileSync } = require('child_process');
 
+// pg is in scripts/node_modules — load via explicit path since test/ has no
+// node_modules of its own. Using path.resolve so this works from any cwd.
+const { Client }                               = require(path.resolve(__dirname, '..', '..', 'scripts', 'node_modules', 'pg'));
 const { loadConfig, connect, ollamaEmbed, vllmEmbed, vllmRerank, c } = require('../../scripts/lib/shared');
 const { encodeCwd }                            = require('../../scripts/lib/encoded-cwd');
 
@@ -76,9 +86,64 @@ const SCRIPTS_DIR   = path.join(__dirname, '..', '..', 'scripts');
 const SETUP_SQL     = path.join(SCRIPTS_DIR, 'setup.sql');
 const LOADER_SCRIPT = path.join(SCRIPTS_DIR, 'pipeline-memory-loader.js');
 
-// ─── DB OVERRIDE ──────────────────────────────────────────────────────────────
+// ─── DB NAME — throwaway vs caller-supplied ───────────────────────────────────
+//
+// When EVAL_DB_NAME env is set: use it as-is; the caller owns the DB lifecycle
+// (create/drop). This is the CI path.
+//
+// When EVAL_DB_NAME env is NOT set: generate a unique per-run throwaway name.
+// The harness creates the DB at startup and drops it at end (try/finally), so
+// no manual DB setup is required for local runs.
 
-const EVAL_DB_NAME = process.env.EVAL_DB_NAME || 'claude_memory_eval_test';
+const _CALLER_SUPPLIED_DB = process.env.EVAL_DB_NAME || '';
+const EVAL_DB_OWNED        = !_CALLER_SUPPLIED_DB; // true = harness owns lifecycle
+const EVAL_DB_NAME         = _CALLER_SUPPLIED_DB ||
+  `claude_memory_eval_run_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+
+// ─── THROWAWAY DB HELPERS ─────────────────────────────────────────────────────
+
+/** Open a connection to the postgres maintenance DB using the same host/auth as
+ *  the eval config. Used only when EVAL_DB_OWNED=true to CREATE/DROP the throwaway. */
+async function pgSysConnect(config) {
+  const client = new Client({
+    host:     process.env.PGHOST     || config.host     || 'localhost',
+    port:     parseInt(process.env.PGPORT || String(config.port || 5432), 10),
+    user:     process.env.PGUSER     || config.user     || 'postgres',
+    password: process.env.PGPASSWORD || config.password || undefined,
+    database: 'postgres',
+  });
+  await client.connect();
+  return client;
+}
+
+async function createEvalDb(config, dbName) {
+  const sys = await pgSysConnect(config);
+  try {
+    await sys.query(`CREATE DATABASE "${dbName}"`);
+  } finally {
+    await sys.end().catch(() => {});
+  }
+}
+
+async function dropEvalDb(config, dbName) {
+  let sys;
+  try {
+    sys = await pgSysConnect(config);
+    // Terminate any open connections to the throwaway DB before dropping.
+    await sys.query(
+      `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+       WHERE datname = $1 AND pid <> pg_backend_pid()`,
+      [dbName]
+    );
+    await sys.query(`DROP DATABASE IF EXISTS "${dbName}"`);
+    console.log(`[TEARDOWN] Dropped throwaway eval DB: ${dbName}`);
+  } catch (err) {
+    console.error(`[TEARDOWN] WARNING: could not drop throwaway DB ${dbName}: ${err.message}`);
+    console.error(`           Manual cleanup: psql -c 'DROP DATABASE IF EXISTS "${dbName}"'`);
+  } finally {
+    if (sys) { try { await sys.end(); } catch (_) {} }
+  }
+}
 
 // ─── STEP / SUMMARY HELPERS (mirrors test-chunker.js) ────────────────────────
 
@@ -101,7 +166,10 @@ function log(...args) {
 function infraFail(msg) {
   console.error(`\n${c.red('[INFRA]')} ${msg}`);
   infraOk = false;
-  process.exit(2);
+  // Throw rather than process.exit() so that the try/finally teardown (DB drop)
+  // runs before the process exits. The catch block at the bottom of main() sets
+  // exitCode=2 when infraOk is false and returns, allowing finally to execute.
+  throw new Error(`[INFRA] ${msg}`);
 }
 
 // ─── HYBRID SQL ───────────────────────────────────────────────────────────────
@@ -198,7 +266,7 @@ async function main() {
   const runStartedAt = new Date().toISOString();
   console.log('');
   console.log(c.bold('eval-retrieval — Hybrid retrieval quality eval'));
-  console.log(`  DB:      ${EVAL_DB_NAME}`);
+  console.log(`  DB:      ${EVAL_DB_NAME}${EVAL_DB_OWNED ? c.dim(' (throwaway — will be created and dropped)') : c.dim(' (caller-supplied — lifecycle not managed here)')}`);
   console.log(`  Backend: ${FLAG_OLLAMA_SKIP ? 'SKIP (--ollama-skip)' : (USE_VLLM_EVAL ? 'vLLM (Qwen3-Embedding-8B)' : 'Ollama (mxbai-embed-large)')}`);
   console.log(`  View:    ${HITS_VIEW}`);
   console.log(`  Started: ${runStartedAt}`);
@@ -230,17 +298,43 @@ async function main() {
 
   console.log('\nSTEP 2 — Connect to eval DB');
 
-  let config, db;
+  // Load config early — needed for pgSysConnect host/auth when creating/dropping
+  // the throwaway DB, and for the eval DB connection config below.
+  // Declared here (outside the try/finally) so the finally block can reference it.
+  let config;
   try {
-    config          = loadConfig();
-    const evalConfig = { ...config, database: EVAL_DB_NAME };
-    db              = await connect(evalConfig);
-    step(`Connected to ${EVAL_DB_NAME}`, true);
+    config = loadConfig();
   } catch (err) {
-    infraFail(`DB connection failed (${EVAL_DB_NAME}): ${err.message}\n  Ensure the database exists: psql -c "CREATE DATABASE ${EVAL_DB_NAME}"`);
+    console.error(`\n${c.red('[INFRA]')} Failed to load config: ${err.message}`);
+    exitCode = 2;
+    return;
   }
 
+  // Everything from DB creation onwards is wrapped in try/finally so the
+  // throwaway DB is always dropped, even if an infraFail() throw propagates.
+  let db;
   try {
+    // ── Throwaway DB creation (EVAL_DB_OWNED only) ─────────────────────────
+
+    if (EVAL_DB_OWNED) {
+      try {
+        await createEvalDb(config, EVAL_DB_NAME);
+        log(c.dim(`  Created throwaway DB: ${EVAL_DB_NAME}`));
+      } catch (err) {
+        infraFail(`Failed to create throwaway eval DB "${EVAL_DB_NAME}": ${err.message}`);
+      }
+    }
+
+    // ── Connect ────────────────────────────────────────────────────────────
+
+    try {
+      const evalConfig = { ...config, database: EVAL_DB_NAME };
+      db              = await connect(evalConfig);
+      step(`Connected to ${EVAL_DB_NAME}`, true);
+    } catch (err) {
+      infraFail(`DB connection failed (${EVAL_DB_NAME}): ${err.message}`);
+    }
+
     // ── Step 3: Apply schema ─────────────────────────────────────────────────
 
     console.log('\nSTEP 3 — Apply schema');
@@ -659,18 +753,35 @@ async function main() {
     }
 
     await db.end().catch(() => {});
-    process.exit(anyRegression && !FLAG_OLLAMA_SKIP && !FLAG_RERANK ? 1 : 0);
+    exitCode = anyRegression && !FLAG_OLLAMA_SKIP && !FLAG_RERANK ? 1 : 0;
 
   } catch (err) {
     try { await db.end(); } catch (_) {}
-    if (!infraOk) process.exit(2);
+    if (!infraOk) { exitCode = 2; return; }
     console.error(`\n${c.red('Unhandled error:')} ${err.message}`);
     console.error(err.stack);
-    process.exit(2);
+    exitCode = 2;
+  } finally {
+    // Drop the throwaway DB regardless of success or failure.
+    // This block runs even when the catch sets exitCode — process.exit() is
+    // deferred to after cleanup so the DROP always executes.
+    // Guard: if config is undefined (failure before config loading), dropEvalDb
+    // falls back to env-var defaults for host/auth — still safe.
+    if (EVAL_DB_OWNED) {
+      await dropEvalDb(config || {}, EVAL_DB_NAME);
+    }
   }
 }
 
-main().catch(err => {
+// ─── ENTRY POINT ──────────────────────────────────────────────────────────────
+// exitCode is set inside main() then read here so that the try/finally teardown
+// (DB drop) runs before process.exit() is called.
+
+let exitCode = 0;
+
+main().then(() => {
+  process.exit(exitCode);
+}).catch(err => {
   console.error(`\nFatal: ${err.message}`);
   process.exit(2);
 });

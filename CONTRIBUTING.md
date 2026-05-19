@@ -52,21 +52,16 @@ DATABASE_URL=postgres://postgres:postgres@localhost/postgres OLLAMA_SKIP=1 node 
 
 `OLLAMA_SKIP=1` skips embedding assertions (no Ollama required in CI or local runs).
 
-### Step 4 — Create eval test database
-
-```sh
-PGPASSWORD=postgres psql -h localhost -U postgres -c "CREATE DATABASE claude_memory_eval_test"
-```
-
-(Idempotent — ignore the "already exists" error if you have run this before.)
-
-### Step 5 — Retrieval eval (FTS-only smoke test)
+### Step 4 — Retrieval eval (FTS-only smoke test)
 
 ```sh
 PGHOST=localhost PGUSER=postgres PGPASSWORD=postgres \
-  EVAL_DB_NAME=claude_memory_eval_test OLLAMA_SKIP=1 \
+  OLLAMA_SKIP=1 \
   node test/eval/eval-retrieval.js --ollama-skip
 ```
+
+No manual database setup required. The harness generates a unique throwaway
+database, creates it at startup, and drops it when finished (even on failure).
 
 This exercises the SQL/loader/schema path. Vector-quality regression detection
 requires a local Ollama or vLLM instance and is skipped in CI.
