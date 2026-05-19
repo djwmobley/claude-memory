@@ -542,6 +542,108 @@ async function sectionR3c(dbName, projectDir, projectId) {
   }
 }
 
+// ── SECTION R-3d: Whitespace-seed bypass guard ───────────────────────────────
+//
+// A seed consisting solely of whitespace (e.g. "   ") must be treated as empty
+// after trimming. With revive:true and a generous budget the only gate that
+// prevents mass-revive is the trim+!seedText guard at Step 6.
+//
+// This test FAILS against the pre-trim implementation (seedText = "   ", which
+// is truthy, so the guard is skipped and Step 6 mass-revives all probation rows)
+// and PASSES after the fix (seedText = "", so the guard fires and warns).
+//
+//   (a) NO ### Resurrected section in output
+//   (b) probation rows remain suppressed (NOT revived in the DB)
+//   (c) skip warning emitted on stderr (mirrors R-3c-d)
+
+async function sectionR3d(dbName, projectDir, projectId) {
+  console.log('\n--- R-3d: Whitespace-seed bypass guard ---');
+
+  const db = await pgConnect(dbName);
+  let probationIds = [];
+  try {
+    // Trusted anchor for entity-Rd (M2 gate: pinned + user_stated allows resurrection).
+    await insertAssertionDirect(db, projectId, {
+      subject: 'entity-Rd', predicate: 'status', object: 'whitespace-seed-anchor',
+      source: 'user_stated', confidence: 9.0, pinned: true, suppressed: false,
+    });
+
+    // Insert several probation rows so a bypass would visibly revive them.
+    for (let i = 0; i < 5; i++) {
+      const id = await insertAssertionDirect(db, projectId, {
+        subject: 'entity-Rd', predicate: 'uses', object: `whitespace-bypass-item-${i}`,
+        suppressed: true, suppressionKind: 'downvoted_probation',
+      });
+      probationIds.push(id);
+    }
+
+    // Generous budgets — the only thing preventing mass-revive must be the trim guard.
+    await setSetting(db, projectId, 'resurrect_token_budget', '1500');
+    await setSetting(db, projectId, 'loader_token_budget',   '4000');
+
+    // Contract: whitespace-only seed with revive:true.
+    // Pre-trim: seedText = "   " (truthy) → guard skipped → mass-revive fires.
+    // Post-trim: seedText = ""   (falsy) → guard fires → warns + skips revive.
+    await setContract(db, projectId, [
+      { kind: 'resurrect', seed: '   ', revive: true },
+    ]);
+  } finally {
+    await db.end();
+  }
+
+  const r      = runLoaderLoad(dbName, projectDir);
+  const out    = r.stdout || '';
+  const errOut = r.stderr || '';
+
+  // R-3d-a: loader must not crash.
+  if (r.status === 0) {
+    pass('R-3d-a', 'whitespace-seed revive does not crash loader');
+  } else {
+    fail('R-3d-a', 'whitespace-seed revive does not crash loader',
+      `loader exited ${r.status}: ${errOut.slice(0, 200)}`);
+  }
+
+  // R-3d-b: no ### Resurrected section in output (trim must have collapsed seed to "").
+  if (!out.includes('### Resurrected')) {
+    pass('R-3d-b', 'no ### Resurrected section emitted when seed is whitespace-only');
+  } else {
+    fail('R-3d-b', 'no ### Resurrected section emitted when seed is whitespace-only',
+      '### Resurrected appeared — whitespace seed was not trimmed before the empty-seed guard');
+  }
+
+  // R-3d-c: probation rows must still be suppressed (mass-revive must NOT have fired).
+  if (probationIds.length > 0) {
+    const db2 = await pgConnect(dbName);
+    try {
+      const { rows } = await db2.query(
+        `SELECT id, suppressed, suppression_kind FROM assertions WHERE id = ANY($1::int[])`,
+        [probationIds]
+      );
+      const allStillSuppressed = rows.every(
+        (row) => row.suppressed === true && row.suppression_kind === 'downvoted_probation'
+      );
+      if (allStillSuppressed) {
+        pass('R-3d-c', 'probation rows remain suppressed after whitespace-seed revive (mass-revive not fired)');
+      } else {
+        const revived = rows.filter((row) => !row.suppressed);
+        fail('R-3d-c', 'probation rows remain suppressed after whitespace-seed revive',
+          `${revived.length} of ${rows.length} rows were mass-revived via whitespace-seed bypass`);
+      }
+    } finally {
+      await db2.end();
+    }
+  }
+
+  // R-3d-d: skip warning must be emitted on stderr (blank-seed guard warning).
+  const warnLower = errOut.toLowerCase();
+  if (warnLower.includes('revival') && warnLower.includes('skip')) {
+    pass('R-3d-d', 'skip warning emitted on stderr when seed is whitespace-only');
+  } else {
+    fail('R-3d-d', 'skip warning emitted on stderr when seed is whitespace-only',
+      `expected "revival" + "skip" in stderr, got: ${errOut.slice(0, 300)}`);
+  }
+}
+
 // ── SECTION R-4: Default-contract byte-identical ──────────────────────────────
 
 async function sectionR4(dbName, projectDir, projectId) {
@@ -819,6 +921,7 @@ async function main() {
     await sectionR2(DB_NAME, projectDir, projectId);
     await sectionR3(DB_NAME, projectDir, projectId);
     await sectionR3c(DB_NAME, projectDir, projectId);
+    await sectionR3d(DB_NAME, projectDir, projectId);
     await sectionR4(DB_NAME, projectDir, projectId);
     await sectionR5(DB_NAME, projectDir, projectId);
     await sectionR6(DB_NAME, projectDir, projectId);
