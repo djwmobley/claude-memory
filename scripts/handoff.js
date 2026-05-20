@@ -64,6 +64,7 @@ const {
   ensureProjectIdentity,
   reconcileLegacySettings,
 } = require('./lib/project-identity');
+const { embedQuery }                               = require('./lib/embed');
 
 process.on('exit', () => {
   const ms = Number(process.hrtime.bigint() - __startNs) / 1e6;
@@ -1143,6 +1144,10 @@ async function cmdInit(args) {
     // Enforced as min(globalRemaining, resurrect_token_budget) so the loader-wide
     // envelope is never exceeded.
     resurrect_token_budget:           '1500',
+    // Resurrect semantic seed: cosine similarity threshold for the vLLM embedding path.
+    // Range [0, 1]; 0.75 requires a strong semantic match before a subject is considered
+    // a candidate. Lowering increases recall; raising increases precision.
+    resurrect_cosine_threshold:       '0.75',
     implicit_close:                   'enabled',
     decay_rate_default:               '0.05',
     retrieval_outcome_timeout_days:   '14',
@@ -1400,13 +1405,46 @@ async function runResurrectQuery(db, projectId, q, opts = {}) {
   const ollamaSkip = (process.env.OLLAMA_SKIP === '1');
 
   if (!ollamaSkip && seedText) {
-    // Phase 3.6 hook site — DO NOT REMOVE: semantic embedding seed not yet wired;
-    // intentionally falls through to pg_trgm/LIKE fuzzy fallback below.
-    // When Ollama is wired in Phase 3.6, populate candidateSubjects here via
-    // cosine distance on v_memory_hits (halfvec 4000) and skip the fuzzy path.
+    // Semantic seed — embed the query via vLLM and run a cosine ANN search
+    // directly on assertions.embedding (halfvec 4000, Qwen/Qwen3-Embedding-8B).
+    // This is the primary path; pg_trgm fuzzy is the fallback below.
+    // On any embed error, we log a non-fatal warning and fall through to fuzzy.
+    const cosineThreshold = parseFloat(
+      await getSetting(db, projectId, 'resurrect_cosine_threshold', '0.75')
+    );
+    try {
+      const vec = await embedQuery(seedText);
+      // Bind embedding as a halfvec literal string that pgvector accepts.
+      const vecLiteral = '[' + vec.join(',') + ']';
+      const { rows: semRows } = await db.query(
+        `SELECT DISTINCT subject
+         FROM (
+           SELECT subject, (embedding <=> $2::halfvec) AS dist
+           FROM assertions
+           WHERE project_id = $1
+             AND embedding IS NOT NULL
+             AND 1 - (embedding <=> $2::halfvec) >= $3
+           ORDER BY dist ASC
+           LIMIT $4
+         ) sub`,
+        [projectId, vecLiteral, cosineThreshold, fuzzyLimit]
+      );
+      for (const r of semRows) {
+        if (r.subject && !candidateSubjects.includes(r.subject)) {
+          candidateSubjects.push(r.subject);
+        }
+      }
+    } catch (embedErr) {
+      if (!silent) {
+        process.stderr.write(
+          `[handoff] resurrect semantic seed degraded: ${embedErr.message}\n`
+        );
+      }
+      // candidateSubjects remains empty → falls through to pg_trgm fuzzy below.
+    }
   }
 
-  // Fuzzy fallback (always runs when ollamaSkip or semantic unavailable).
+  // Fuzzy fallback (runs when ollamaSkip=1, semantic unavailable, or semantic returned empty).
   if (candidateSubjects.length === 0 && seedText) {
     const { sql: fuzzySql, params: fuzzyParams } = db.buildFuzzyMatch(
       projectId, seedText, fuzzyLimit
@@ -1987,8 +2025,10 @@ async function cmdLoaderLoad(opts = {}) {
       //      anchor may be resurrected. Trusted = reality_check='verified' OR pinned=true
       //      (the same quality-corroborator predicate L2 consolidation uses — see hasQualityCorroborator).
       //      This prevents a forged probationary row from self-resurrecting.
-      //   3. Semantic seed: uses v_memory_hits cosine path when Ollama is available.
-      //      Degrades to pg_trgm fuzzy match (db.buildFuzzyMatch) under OLLAMA_SKIP=1.
+      //   3. Semantic seed: embeds query via vLLM (Qwen/Qwen3-Embedding-8B) and runs
+      //      cosine ANN directly on assertions.embedding (halfvec 4000, project-scoped).
+      //      Degrades to pg_trgm fuzzy match (db.buildFuzzyMatch) under OLLAMA_SKIP=1
+      //      or when the embed backend is unreachable/throws. Both paths are non-fatal.
       //      Both paths route through the seam — zero dialect conditionals in the engine.
       //   4. Graph fan-out: from seeded subjects, calls db.buildGraphCTE(out, seeds, 2)
       //      to pull depth-2 connected entities and include their resurrect-eligible rows.

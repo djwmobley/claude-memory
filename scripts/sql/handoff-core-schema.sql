@@ -219,6 +219,35 @@ END $$;
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS reality_check TEXT
   CHECK (reality_check IN ('verified', 'mismatch', 'unverifiable'));
 
+-- ── Semantic embedding for resurrect cosine seed (halfvec 4000) ──────────────
+--
+-- Additive, NULL-tolerant addition.  Existing rows have embedding = NULL until
+-- an explicit embedding backfill is run (production backfill is a separate
+-- follow-up; not done in this migration per the OQ-5 decision).
+--
+-- Wrapped in a DO block so that missing pgvector extension (no halfvec type)
+-- degrades gracefully — the resurrect engine falls through to the pg_trgm fuzzy
+-- path when this column is absent or all-NULL.
+--
+-- Dimension: 4000 (Qwen/Qwen3-Embedding-8B via vLLM, configured in pipeline.yml).
+-- Query: `1 - (embedding <=> $2::halfvec) >= threshold` (cosine similarity).
+DO $$ BEGIN
+  ALTER TABLE assertions ADD COLUMN IF NOT EXISTS embedding halfvec(4000);
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'assertions.embedding halfvec(4000) skipped -- pgvector not installed; resurrect will use fuzzy fallback';
+END $$;
+
+-- HNSW index for fast cosine ANN search on assertions.embedding.
+-- Wrapped in a DO block so that missing pgvector (or NULL-only column) fails gracefully.
+DO $$ BEGIN
+  CREATE INDEX IF NOT EXISTS assertions_embedding_hnsw_idx
+    ON assertions USING hnsw (embedding halfvec_cosine_ops)
+    WITH (m = 16, ef_construction = 64)
+    WHERE embedding IS NOT NULL;
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'assertions_embedding_hnsw_idx skipped -- pgvector not installed or halfvec_cosine_ops unavailable';
+END $$;
+
 -- ── pg_trgm GIN index for resurrect fuzzy-text matching ──────────────────────
 --
 -- Additive migration: creates a GIN trigram index on the concatenated
