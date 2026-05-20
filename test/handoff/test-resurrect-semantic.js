@@ -127,6 +127,13 @@ async function applySchema(dbName) {
   const sql = fs.readFileSync(SCHEMA_FILE, 'utf8');
   const db  = await pgConnect(dbName);
   try {
+    // Install pgvector and pg_trgm on the per-run DB before applying the schema.
+    // CREATE DATABASE inherits from template0/template1, which on CI runners do
+    // not have the vector extension pre-installed. The schema SQL wraps halfvec
+    // DDL in DO/EXCEPTION blocks (graceful skip), but insertAssertionWithEmbedding
+    // casts directly to halfvec — that cast fails at runtime if the type is absent.
+    await db.query('CREATE EXTENSION IF NOT EXISTS vector');
+    await db.query('CREATE EXTENSION IF NOT EXISTS pg_trgm');
     await db.query(sql);
   } finally {
     await db.end();
