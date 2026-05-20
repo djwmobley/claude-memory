@@ -184,6 +184,15 @@ time. The model MUST NOT include a `has_unpackaged_state` entry in the `assertio
 of the JSON payload. If one is included, it is silently discarded and replaced by the
 authoritative code-computed value.
 
+**Pointer-staleness gate:** at close time, `handoff.js` also scans TL;DR, open threads,
+and quick references for `file:line` code pointers and validates each against the live
+file tree. Stale line numbers are auto-corrected in the written `handoff.md`; pointers
+whose anchor (enclosing function/class name or content snippet) can no longer be located
+in the file are flagged in the `## Reconciliation notice` section alongside any
+contradiction findings. This gate is a peer to the contradiction gate — both feed the
+same unified Reconciliation block — and is fully non-fatal (any gate error leaves the
+close output unchanged).
+
 ## Expected output
 
 ```
