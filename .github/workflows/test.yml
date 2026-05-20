@@ -289,10 +289,11 @@ jobs:
         #   T5  snippet anchor found at different line → pointer rewritten
         #   T6  legacy pointer (no stored anchor) → derive at first encounter, emit unchanged
         #   T7  false-positive guard: host:port in prose → untouched
-        #   T8  resume rewrites served output only; close persists to assertion
-        #   T9  multiple assertions citing same stale pointer → gate updates both
+        #   T8  resume rewrites served output only; close persists anchor only (not object)
+        #   T9  multiple assertions citing same stale pointer → gate processes all in output
         #   T10 stale-pointer finding lands in same unified Reconciliation block as
         #       contradiction findings (single ## Reconciliation notice, not two)
+        # Self-contained: creates + drops throwaway DB (claude_memory_ptr_gate_<ts>).
         run: node test/handoff/test-pointer-gate.js
         env:
           PGHOST: localhost
