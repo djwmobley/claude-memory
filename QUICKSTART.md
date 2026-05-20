@@ -71,13 +71,11 @@ If the file already exists, the script will ask before overwriting. Pass `--forc
 
 ### 4. Run the setup command
 
-This creates the tables Claude will use to store notes. Tables are just organized slots in the database — one for session summaries, one for things Claude wants to remember long-term, etc. You don't need to understand the table structure to use it.
+This creates the tables Claude will use to store notes.
 
 ```sh
 node scripts/handoff.js init
 ```
-
-The script reads your database name from `.claude/pipeline.yml` (the file you just created), so you don't need to pass it on the command line.
 
 **You should see:**
 
@@ -93,7 +91,7 @@ OK    retrieval_contract 'default' row ensured
 Done: handoff:init — project <your-path> provisioned
 ```
 
-**What just happened:** The script created the tables in your database, wrote a `CLAUDE.md` file at the root of your project (Claude reads this at startup), and created a `handoff.md` file in a private folder outside your repo where session notes will live. That `CLAUDE.md` file is worth committing to git.
+**What just happened:** The script created the database tables. It wrote a `CLAUDE.md` to your repo root (Claude reads this at startup) — commit that file to git. It also created a `handoff.md` in a private folder outside the repo where session notes will live.
 
 ---
 
