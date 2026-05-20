@@ -7,6 +7,7 @@
     "setup": "node pipeline-db.js setup",
     "status": "node pipeline-db.js status",
     "init-config": "node init-config.js",
+    "install-hooks": "node install.js",
     "test": "echo \"No tests\" && exit 0"
   },
   "dependencies": {

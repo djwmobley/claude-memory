@@ -97,21 +97,35 @@ Done: handoff:init — project <your-path> provisioned
 
 ---
 
-### 5. Install the slash commands
+### 5. Install the slash commands and wire the session hooks
 
-These are small recipe files that give Claude the `/handoff:close`, `/handoff:resume`, and other commands it needs to manage its notes. Copying them to `~/.claude/commands/` makes them available in every Claude Code session.
+Two things need to happen for Claude to actually use the memory layer: the slash commands (`/handoff:close`, `/handoff:resume`, and the rest) need to live where Claude Code can find them, and the session-start and session-end hooks need to be registered in your project's settings. The installer does both:
+
+```sh
+node <path-to-this-repo>/scripts/install.js
+```
+
+Replace `<path-to-this-repo>` with the absolute path where you cloned `claude-memory`. The script will:
+
+- Copy the eight `/handoff:*` slash command files to `~/.claude/commands/handoff/`
+- Add SessionStart and Stop hooks to `.claude/settings.local.json` in your current project (creating the file if it doesn't exist, or merging with what's already there)
+
+**You should see** a short summary listing what was copied and wired, then "Done. Restart Claude Code or open a fresh session to pick up the changes."
+
+If you'd rather do this by hand — or want to see exactly what's being written before it happens — expand the section below.
+
+<details>
+<summary>Manual setup (alternative to the installer)</summary>
+
+**Copy the slash commands:**
 
 ```sh
 cp commands/handoff/*.md ~/.claude/commands/handoff/
 ```
 
-**You should see:** No output. That's fine.
+No output means it worked.
 
----
-
-### 6. Wire the session hooks
-
-A hook is a script that runs automatically at a specific moment — in this case, when a Claude session starts and when it ends. Without this step, Claude won't automatically load prior notes or save new ones.
+**Wire the session hooks:**
 
 Add this to `.claude/settings.local.json` in your project (create the file if it doesn't exist), replacing `/full/path/to/claude-memory` with the actual path where you cloned this repo:
 
@@ -132,7 +146,9 @@ Add this to `.claude/settings.local.json` in your project (create the file if it
 }
 ```
 
-**You should see:** Nothing yet — the hooks fire the next time you open a Claude session.
+The hooks fire the next time you open a Claude session.
+
+</details>
 
 ---
 
@@ -150,10 +166,28 @@ That means Claude can read from and write to the database. You're set up.
 
 ---
 
+## Day-to-day usage
+
+Once the setup steps are done, you'll mainly touch two commands in a normal session:
+
+**`/handoff:close`** — run this at the end of a session. Claude reads back over what happened, pulls out decisions, facts, and context worth keeping, and writes them to the database. If you skip it, the Stop hook will do a quick automatic save when Claude closes, but the explicit close gives Claude more room to write a richer summary.
+
+**`/handoff:checkpoint`** — same as `/handoff:close`, but the session stays open so you can keep working. Use it whenever you hit a natural decision point in a long session and want to make sure that progress is captured before continuing.
+
+Two more you'll use occasionally:
+
+**`/handoff:status`** — shows your project name, the database it's connected to, and a quick count of what's in memory. Good for confirming everything is wired up correctly, and for a gut-check before starting a long session.
+
+**`/handoff:resume`** — loads the most recent session summary back into context. The SessionStart hook does this automatically when you open a new session, so you usually won't need to run it by hand — but it's there if you want to pull in prior context mid-session without closing and reopening.
+
+For the full set of commands and what each one does, see [commands/handoff/README.md](commands/handoff/README.md).
+
+---
+
 ## What's next
 
 - [docs/how-memory-works.md](docs/how-memory-works.md) — how Claude decides what to save and how it finds things later
-- [commands/handoff/](commands/handoff/) — the full list of `/handoff:` commands and what each one does
+- [commands/handoff/README.md](commands/handoff/README.md) — the full list of `/handoff:` commands and what each one does
 - [docs/troubleshooting.md](docs/troubleshooting.md) — common problems and how to fix them
 
 ---
