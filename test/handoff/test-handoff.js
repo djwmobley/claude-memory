@@ -24,8 +24,9 @@ const fs     = require('fs');
 const os     = require('os');
 const { execFileSync, spawnSync } = require('child_process');
 
-const { loadConfig } = require('../../scripts/lib/shared');
-const { encodeCwd }  = require('../../scripts/lib/encoded-cwd');
+const { loadConfig }   = require('../../scripts/lib/shared');
+const { encodeCwd }    = require('../../scripts/lib/encoded-cwd');
+const { writeMarker }  = require('../../scripts/lib/project-marker');
 // pg lives in scripts/node_modules — use createRequire anchored to scripts/package.json
 // so the import is portable across any pnpm/npm/yarn layout (hoisted or symlink-store).
 const { createRequire } = require('module');
@@ -138,8 +139,18 @@ knowledge:
   // Symlink is cross-platform-awkward; copy just enough for the check
   // The command files check for `scripts/handoff.js` existence in their walk-up logic
 
+  // Pre-mint the .claude-memory marker so init/close/checkpoint/drop/purge all
+  // resolve project_id to a known UUID. Without this, ensureProjectIdentity()
+  // auto-mints a UUID at first helper invocation and DB rows go to that UUID
+  // while the test still looks up by encodeCwd(fakeRoot) — the cause of the
+  // pre-fix 12-failure cascade. With the marker in place at setup time, every
+  // helper invocation reads the existing UUID and all writes/lookups align.
+  const marker = writeMarker(fakeRoot);
+  global.__projectId = marker.uuid;
+
   console.log(`\n  test project_id: ${PROJECT_ID}`);
   console.log(`  fake root:       ${fakeRoot}`);
+  console.log(`  marker uuid:     ${marker.uuid}`);
 
   // Ensure DB tables exist (run phase2 schema)
   let db;
@@ -151,10 +162,13 @@ knowledge:
     process.exit(2);
   }
 
-  // Apply phase2 schema (idempotent)
-  const schemaFile = path.resolve(__dirname, '..', '..', 'scripts', 'sql', 'phase2-schema.sql');
+  // Apply handoff-core schema (idempotent). Was previously pointing at a
+  // non-existent phase2-schema.sql which silently skipped — this is the real
+  // canonical schema file applied by /handoff:init.
+  const schemaFile = path.resolve(__dirname, '..', '..', 'scripts', 'sql', 'handoff-core-schema.sql');
   if (fs.existsSync(schemaFile)) {
     let sql = fs.readFileSync(schemaFile, 'utf8');
+    // Strip psql meta-commands (e.g. \c, \echo) so we can run via the JS client.
     sql = sql.replace(/^\\[a-z].*$/gm, '');
     try {
       await db.query(sql);
@@ -173,16 +187,20 @@ knowledge:
 // ─── TEARDOWN ─────────────────────────────────────────────────────────────────
 
 async function teardown() {
-  const fakeRoot = global.__fakeRoot;
+  const fakeRoot        = global.__fakeRoot;
   const encodedFakeRoot = fakeRoot ? encodeCwd(fakeRoot) : null;
+  const projectUuid     = global.__projectId;  // marker UUID minted in setup()
 
   let db;
   try {
     db = await connectDb();
     const tables = ['edges', 'assertions', 'entities', 'retrieval_contract', 'project_settings'];
+    // Clean rows under both the UUID (where writes go) and the legacy encoded-cwd
+    // (in case any legacy code path leaked rows under the old project_id).
+    const ids = [projectUuid, encodedFakeRoot].filter(Boolean);
     for (const tbl of tables) {
-      if (encodedFakeRoot) {
-        await db.query(`DELETE FROM ${tbl} WHERE project_id = $1`, [encodedFakeRoot]);
+      for (const id of ids) {
+        await db.query(`DELETE FROM ${tbl} WHERE project_id = $1`, [id]);
       }
     }
     await db.end();
@@ -195,12 +213,11 @@ async function teardown() {
     fs.rmSync(fakeRoot, { recursive: true, force: true });
   } catch (_) {}
 
-  // Remove any handoff.md created under ~/.claude/projects/<encoded_fakeRoot>/
+  // Remove ~/.claude/projects/<UUID>/ where handoff.md actually lives.
   try {
-    const { getClaudeProjectDir } = require('../../scripts/lib/encoded-cwd');
-    const dir = getClaudeProjectDir(fakeRoot);
-    if (fs.existsSync(dir)) {
-      fs.rmSync(dir, { recursive: true, force: true });
+    if (projectUuid) {
+      const dir = path.join(os.homedir(), '.claude', 'projects', projectUuid);
+      if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
     }
   } catch (_) {}
 }
@@ -212,7 +229,16 @@ async function runTests() {
   let db = await connectDb();
 
   // ── Test 1: init creates DB rows and handoff.md ──────────────────────────
-  const encodedRoot = encodeCwd(fakeRoot);
+  // project_id throughout the test = the marker UUID (pre-minted in setup).
+  // Variable name kept as `encodedRoot` to minimize churn across the file —
+  // its value is the UUID, not the encoded-cwd; behavior is identical because
+  // handoff.js's resolveProjectId() reads the marker when present.
+  const encodedRoot = global.__projectId;
+  // Helper: claude per-project dir resolved via the UUID, not the legacy
+  // encodeCwd path. Mirrors handoff.js's getHandoffPath() at line ~210.
+  function claudeProjectDir() {
+    return path.join(os.homedir(), '.claude', 'projects', encodedRoot);
+  }
 
   await test('init: creates project_settings defaults', async () => {
     runHelper('init', [], { fakeRoot });
@@ -233,8 +259,7 @@ async function runTests() {
   });
 
   await test('init: creates handoff.md', () => {
-    const { getClaudeProjectDir } = require('../../scripts/lib/encoded-cwd');
-    const dir = getClaudeProjectDir(fakeRoot);
+    const dir = claudeProjectDir();
     const handoffPath = path.join(dir, 'handoff.md');
     assert.ok(fs.existsSync(handoffPath), `Expected handoff.md at ${handoffPath}`);
     const content = fs.readFileSync(handoffPath, 'utf8');
@@ -313,8 +338,7 @@ async function runTests() {
   });
 
   await test('close: rewrites handoff.md with correct content', () => {
-    const { getClaudeProjectDir } = require('../../scripts/lib/encoded-cwd');
-    const dir = getClaudeProjectDir(fakeRoot);
+    const dir = claudeProjectDir();
     const handoffPath = path.join(dir, 'handoff.md');
     const content = fs.readFileSync(handoffPath, 'utf8');
     assert.ok(content.includes('Test session closed successfully.'), 'handoff.md should contain TL;DR');
@@ -419,8 +443,7 @@ async function runTests() {
   });
 
   await test('drop: creates fresh handoff.md', () => {
-    const { getClaudeProjectDir } = require('../../scripts/lib/encoded-cwd');
-    const dir = getClaudeProjectDir(fakeRoot);
+    const dir = claudeProjectDir();
     const handoffPath = path.join(dir, 'handoff.md');
     assert.ok(fs.existsSync(handoffPath), 'handoff.md should exist after drop');
     const content = fs.readFileSync(handoffPath, 'utf8');
@@ -428,8 +451,7 @@ async function runTests() {
   });
 
   await test('drop: archives old handoff.md', () => {
-    const { getClaudeProjectDir } = require('../../scripts/lib/encoded-cwd');
-    const dir = getClaudeProjectDir(fakeRoot);
+    const dir = claudeProjectDir();
     const files = fs.readdirSync(dir);
     const archived = files.some((f) => f.includes('.archived.md'));
     assert.ok(archived, 'Expected an archived handoff.*.archived.md file');
@@ -453,8 +475,7 @@ async function runTests() {
   });
 
   await test('purge --yes: removes handoff.md', () => {
-    const { getClaudeProjectDir } = require('../../scripts/lib/encoded-cwd');
-    const dir = getClaudeProjectDir(fakeRoot);
+    const dir = claudeProjectDir();
     const handoffPath = path.join(dir, 'handoff.md');
     assert.ok(!fs.existsSync(handoffPath), 'handoff.md should be removed after purge');
   });
