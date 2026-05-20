@@ -142,7 +142,7 @@ echo '<JSON_PAYLOAD>' | PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" clos
   "tldr": "3–5 sentences summarizing session state.",
   "open_threads": ["pending decision 1", "blocked task 2"],
   "quick_references": "optional named handles",
-  "session_id": "optional-session-id",
+  "session_id": "optional — engine resolves in order: (1) this value, (2) CLAUDE_CODE_SESSION_ID env var, (3) session_in_progress DB marker; omit unless you know the actual session id",
   "confirm_claude_md_promotion": false
 }
 ```
