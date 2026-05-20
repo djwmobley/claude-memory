@@ -2,10 +2,7 @@
 
 > Running: handoff:promote
 
-This slash command explicitly promotes a single assertion (by its integer ID) to the
-`## Durable facts` section of `CLAUDE.md`. It is the manual alternative to the
-auto-promotion path in `/handoff:close`, for users who prefer explicit control over
-what enters the privileged CLAUDE.md channel.
+Bump a fact to `CLAUDE.md`. Promoted facts are always loaded at session start — not just "when relevant," but every single time. Use this for things Claude should never work without knowing: "we use Python 3.12," "the repo lives at github.com/x/y," "never use SQLite in production." This is the manual alternative to the auto-promotion that happens during `/handoff:close`.
 
 The command is idempotent: re-running on an already-promoted assertion prints a notice
 and exits 0 without rewriting CLAUDE.md.

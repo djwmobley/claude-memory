@@ -1341,7 +1341,7 @@ async function hardenStep1_dbNameValidation() {
       return false;
     }
     const stderr = r.stderr || '';
-    if (!stderr.includes('Invalid HANDOFF_DB')) {
+    if (!stderr.includes('Invalid database name')) {
       hdFail(1, label, `exit ${r.status} but error message not found in stderr: ${stderr.slice(0, 200)}`);
       return false;
     }

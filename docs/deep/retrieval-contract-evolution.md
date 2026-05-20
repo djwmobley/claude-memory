@@ -1,3 +1,5 @@
+> Archive — preserved for reference. For the current operator-facing docs, see [QUICKSTART.md](../QUICKSTART.md) or [README.md](../README.md).
+
 # Retrieval Contract Evolution
 
 Methodology for safely changing the retrieval contract in the `/handoff` skill.

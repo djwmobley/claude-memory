@@ -2,10 +2,9 @@
 
 > Running: handoff:close
 
-This slash command ends the session: extracts entities, assertions, edges, and an
-updated retrieval contract from the conversation, writes them to Postgres, rewrites
-`handoff.md`, surfaces CLAUDE.md promotion candidates, runs the reranker precision@5
-gate, and clears the `session_in_progress` marker.
+Wrap up the session. Reads back over what happened — decisions you made, things you tried, things that broke — and writes them to the database so next session can find them. Also rewrites the `handoff.md` summary file, surfaces any facts that look ready to promote to `CLAUDE.md`, and clears the in-progress session marker.
+
+Run this before you close the window. If you skip it, today's work won't be saved to memory.
 
 When `extraction_async_enabled` is set to `'true'` in project settings, the write is
 deferred: the payload is enqueued and written by the deterministic background worker
@@ -32,17 +31,19 @@ For each assertion:
 - `subject` — entity name or topic string
 - `predicate` — **MUST be one of the declared registry predicates** (see
   `scripts/lib/predicate-registry.json` for the authoritative vocabulary).
-  Current recognized predicates: `chose`, `depends_on`, `is_status`, `prefers`.
+  Predicates are the verbs in facts. Use `is_status` for state ("status is active"),
+  `prefers` for user preferences, `chose` for explicit decisions, `depends_on` for
+  dependencies. Full list: [docs/glossary.md#predicate](../../docs/glossary.md#predicate).
   Unknown predicates are flagged (permissive mode: stderr warning, assertion kept)
   or rejected (strict mode: assertion skipped) by the deterministic write path.
   Do not invent new predicates; extend `predicate-registry.json` first.
 - `object` — asserted value or referenced entity
-- `confidence` — 1–10 integer:
-  - 9–10: user-stated durable facts ("the DB is on localhost")
-  - 7–8: strongly inferred from multiple user statements
-  - 5–6: model-extracted with moderate support
-  - 3–4: tentative; contradicting signals
-  - 1–2: speculative
+- `confidence` — 1–10 integer. How sure are you this is true?
+  - 9–10: the user said so directly ("the DB is on localhost")
+  - 7–8: strongly implied by multiple things the user said
+  - 5–6: reasonable inference from what was said, but not stated outright
+  - 3–4: tentative — contradicting signals, or based on a single ambiguous remark
+  - 1–2: speculation; no real evidence either way
 - `source` — `user_stated` | `model_extracted` | `doc_quoted` | `retrieved_from_prior`
 
 ### 3. Edges

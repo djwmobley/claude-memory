@@ -2,20 +2,19 @@
 
 > Running: handoff:resume
 
-This slash command force-runs the SessionStart loader regardless of staleness.
-Use it when you want to load prior session context at the start of a new session,
-or when the automatic load was skipped due to a staleness threshold.
+Force-load context from the last session. Normally the session hook loads prior notes automatically — but if your last session was more than seven days ago, the auto-load is skipped to avoid flooding you with stale context. Run this command to override that and load anyway.
 
-## Phase 3.5 note
+<details>
+<summary>How this works internally</summary>
 
-In Phase 3.5, this command performs the loader's read-and-inject inline:
+This command performs the loader's read-and-inject inline:
 1. Parses `handoff.md` for the active contract name.
 2. Executes the contract's query array against the DB.
 3. Bumps `last_reinforced` on returned assertions.
 4. Prints a compact context summary.
 
-In Phase 3.6, a Stop-hook will handle automatic loading. This command will
-remain as the manual override for staleness acknowledgment.
+The session hook (Phase 3.6) will eventually handle automatic loading. This command stays as the manual override for staleness acknowledgment.
+</details>
 
 ## How to invoke
 

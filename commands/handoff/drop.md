@@ -2,12 +2,9 @@
 
 > Running: handoff:drop
 
-This slash command suppresses all current assertions for this project by setting
-their effective confidence to near-zero (via decay_rate=999), then archives
-`handoff.md` and creates a fresh one. Rows are kept — this is recoverable via SQL.
+Archive this project's notes and start fresh. All existing assertions are suppressed — they get a confidence score so low they'll never surface in retrieval — and the `handoff.md` summary is archived with a datestamp. The rows are still in the database, so a developer can recover them via SQL if needed. Nothing is permanently deleted.
 
-Use this when you want a clean slate but do not want to lose the rows entirely
-(use `/handoff:purge` for a hard delete).
+Use this when a project phase is truly over and you want a clean slate. For a hard delete with no recovery path, use `/handoff:purge` instead.
 
 ## What this does
 

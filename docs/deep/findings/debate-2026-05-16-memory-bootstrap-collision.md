@@ -1,3 +1,5 @@
+> Archive — preserved for reference. For the current operator-facing docs, see [QUICKSTART.md](../../QUICKSTART.md) or [README.md](../../README.md).
+
 # Debate Verdict — Memory Bootstrap Same-Subject Collision
 
 **Spec:** docs/specs/2026-05-16-memory-bootstrap-collision.md

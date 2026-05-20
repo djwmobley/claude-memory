@@ -2,11 +2,9 @@
 
 > Running: handoff:purge
 
-This slash command permanently deletes all memory rows for the current project:
-entities, assertions, edges, retrieval contracts, and project settings. It also
-deletes `handoff.md`. **This is not reversible.**
+Permanently delete all notes for this project. There is no undo. Everything goes: entities, assertions, edges, retrieval contracts, project settings, and `handoff.md`. The command will ask you to confirm before running.
 
-Use `/handoff:drop` instead if you want a recoverable archive.
+If you want to archive instead of delete — keeping rows in the database where a developer can recover them — use `/handoff:drop` instead.
 
 ## Confirmation requirement
 

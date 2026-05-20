@@ -2,8 +2,7 @@
 
 > Running: handoff:init
 
-This slash command provisions the handoff infrastructure for the current project.
-It is idempotent: safe to run on a project that is already initialized.
+First-run setup. Creates the database tables, writes a project-level `CLAUDE.md`, and registers the default retrieval contract. Run once per project. Safe to re-run — it won't overwrite anything that already exists.
 
 ## What this does
 
