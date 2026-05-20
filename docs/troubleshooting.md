@@ -63,6 +63,28 @@ $env:PGUSER = 'postgres' # PowerShell
 
 ---
 
+### `password authentication failed for user "X"`
+
+**What it means:** Postgres rejected your password. Either none was provided, the wrong one was provided, or your auth config requires one when you weren't expecting it.
+
+**Fix:**
+
+1. Set `PGPASSWORD` in your shell:
+   ```sh
+   export PGPASSWORD=yourpassword   # Linux/macOS
+   $env:PGPASSWORD = "yourpassword" # Windows PowerShell
+   ```
+2. Or set up a `.pgpass` file — see [PREREQS.md](../PREREQS.md#postgres-password) for the exact format and file location.
+3. Re-run the command that failed.
+
+If you don't have a password set on your Postgres role, the issue is in `pg_hba.conf` — you can either set a password for your role:
+```sql
+ALTER ROLE youruser WITH PASSWORD 'newpassword';
+```
+Or change the auth method to `trust` or `peer` for local connections (edit `pg_hba.conf` and run `pg_reload_conf()` or restart Postgres).
+
+---
+
 ### `database "claude_memory" does not exist`
 
 **What it means:** The database hasn't been created yet — or you skipped QUICKSTART step 2.
