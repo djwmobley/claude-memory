@@ -54,6 +54,8 @@ You'll be asked for:
 
 Hit Enter at any prompt to accept the default shown in brackets. The script creates `.claude/` if it doesn't exist yet.
 
+**Note on passwords:** The script doesn't ask for your Postgres password — intentionally. Storing it in `pipeline.yml` as plain text would be unsafe, and prompting on every run would be a hassle. Instead, this project relies on Postgres's standard auth mechanisms: set a `PGPASSWORD` environment variable in your shell, or put your credentials in `~/.pgpass` (Linux/macOS) or `%APPDATA%\postgresql\pgpass.conf` (Windows). See [PREREQS.md](PREREQS.md#postgres-password) for setup details. If you're using peer authentication or the trust auth method (common in local dev setups), you don't need to configure anything — the script will just connect.
+
 **You should see** a summary like this:
 
 ```
@@ -91,7 +93,7 @@ OK    retrieval_contract 'default' row ensured
 Done: handoff:init — project <your-path> provisioned
 ```
 
-**What just happened:** The script created the database tables. It wrote a `CLAUDE.md` to your repo root (Claude reads this at startup) — commit that file to git. It also created a `handoff.md` in a private folder outside the repo where session notes will live.
+**What just happened:** The script created the database tables and a `handoff.md` in a private folder outside the repo where session notes will live. If your project didn't already have a `CLAUDE.md` at the repo root, it created one too (Claude reads this at startup — commit it to git). If you already had a `CLAUDE.md`, the script left it alone. The output line will say `OK    created CLAUDE.md: <path>` or `OK    CLAUDE.md already exists — skipped: <path>` accordingly.
 
 ---
 

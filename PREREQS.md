@@ -57,6 +57,62 @@ see "Connection refused", Postgres is installed but not started yet. See
 
 ---
 
+### Postgres password {#postgres-password}
+
+This project never stores your Postgres password in `pipeline.yml` or any other config file checked into the repo. Plain-text passwords in YAML files are a common source of credential leaks; keeping them out is intentional.
+
+There are three ways to provide credentials, in order of how much setup they require:
+
+**Option 1 — Peer or trust auth (no setup needed for many local installs)**
+
+If your Postgres is configured to allow your OS user to connect without a password — which is the default for many macOS Homebrew installs and Linux packages when connecting over a Unix socket — you don't need to do anything. The scripts will connect automatically.
+
+**Option 2 — `PGPASSWORD` environment variable**
+
+Set the variable in your shell before running scripts:
+
+```sh
+# Linux / macOS (bash/zsh)
+export PGPASSWORD=yourpassword
+node scripts/handoff.js init
+
+# Windows PowerShell
+$env:PGPASSWORD = "yourpassword"
+node scripts/handoff.js init
+```
+
+To avoid typing it every time, add the `export` line to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.). Note that the variable is visible in process listings (`ps aux`) while it's set — acceptable for local dev, but not for shared machines.
+
+**Option 3 — `.pgpass` file (recommended for regular use)**
+
+Postgres reads credentials from a local file and never exposes them in the environment:
+
+- **Linux / macOS:** `~/.pgpass`
+- **Windows:** `%APPDATA%\postgresql\pgpass.conf`
+
+Format — one line per connection, colon-separated:
+
+```
+hostname:port:database:username:password
+```
+
+Examples:
+
+```
+localhost:5432:claude_memory:postgres:yourpassword
+localhost:5432:*:myuser:mypassword
+```
+
+Use `*` as a wildcard for any field. On Linux/macOS the file must be readable only by your user — Postgres ignores it otherwise:
+
+```sh
+chmod 600 ~/.pgpass
+```
+
+Windows doesn't have `chmod`; file permissions are set via Properties → Security in Explorer.
+
+---
+
 ## pgvector extension (version 0.8.1 or higher)
 
 pgvector is a Postgres add-on that lets it search by meaning — finding notes that are
