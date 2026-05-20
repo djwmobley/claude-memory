@@ -193,6 +193,19 @@ contradiction findings. This gate is a peer to the contradiction gate — both f
 same unified Reconciliation block — and is fully non-fatal (any gate error leaves the
 close output unchanged).
 
+Extended behaviors (PR #86):
+- **P-4 prose-vs-content check:** Legacy pointers (no stored anchor) are validated by
+  comparing identifier tokens in the prose window around the pointer against tokens in
+  a ±3-line window at the cited location. Zero overlap emits a P-4 finding and skips
+  anchor derivation — preventing stale pointers from silently locking in wrong anchors.
+- **Bulk supersession pass:** At close time, assertion rows with `anchor IS NULL` and
+  pointer-shaped objects are scanned via the same prose-vs-content check. Rows that fail
+  overlap are set to `suppressed = true` (§7 no-backfill: subject/predicate/object/source
+  are never changed). Rows that pass have an anchor derived and persisted.
+- **Bare-filename path fallback:** Pointers like `handoff.js:1106` (no path prefix) now
+  try `scripts/`, `src/`, `lib/`, `test/` subdirectories before emitting a P-1 stale
+  finding. The served pointer string is never altered.
+
 ## Expected output
 
 ```
