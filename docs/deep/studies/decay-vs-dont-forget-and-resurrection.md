@@ -90,8 +90,8 @@ Pinned rows serve two purposes. First, they survive all automatic suppression pa
 
 A user who wants to resurrect older context months later does not remember the exact predicate or subject terms from the original assertions. The shipped resurrect mode handles this via a two-level fallback:
 
-1. **Semantic seed** — when Ollama is available, the query is embedded and run against the vector substrate (`v_memory_hits` cosine path). This is the primary path.
-2. **pg_trgm fuzzy fallback** — when running under `OLLAMA_SKIP=1` (or when Ollama is unavailable), the resurrect branch calls `db.buildFuzzyMatch` (`scripts/lib/db-seam.js` line 957 / 1416) which issues a trigram similarity query (`similarity($2, subject || ' ' || predicate || ' ' || object)`) on Postgres, or an `instr()`/`LIKE` token-scan on SQLite. The pg_trgm extension is provisioned in `scripts/setup.sql` with a graceful degrade notice if absent.
+1. **Semantic seed** — the query is embedded via vLLM (Qwen/Qwen3-Embedding-8B) and run as a cosine ANN search directly against `assertions.embedding` (halfvec 4000), scoped by `project_id`. This is the primary path; it is bypassed when `OLLAMA_SKIP=1` is set or the embedding backend is unreachable.
+2. **pg_trgm fuzzy fallback** — when the semantic path is unavailable or returns no candidates, the resurrect branch calls `db.buildFuzzyMatch` (`scripts/lib/db-seam.js` line 957 / 1416) which issues a trigram similarity query (`similarity($2, subject || ' ' || predicate || ' ' || object)`) on Postgres, or an `instr()`/`LIKE` token-scan on SQLite. The pg_trgm extension is provisioned in `scripts/setup.sql` with a graceful degrade notice if absent.
 
 Both paths route through the db-seam abstraction — there are no dialect conditionals in the engine itself. The seam handles the Postgres/SQLite split transparently.
 

@@ -16,8 +16,9 @@ suppression and return the rows to live status.
 <details>
 <summary>How this works internally</summary>
 
-1. Resolves candidate subjects by fuzzy-matching the seed text against live
-   assertions (pg_trgm / LIKE path; semantic embedding wired in Phase 3.6).
+1. Resolves candidate subjects via semantic embedding (vLLM/Qwen3-Embedding-8B
+   cosine search on `assertions.embedding`) when the backend is reachable, then
+   falls back to pg_trgm / LIKE fuzzy matching when embedding is unavailable.
 2. Expands via depth-2 graph fan-out from the seed subjects.
 3. Applies the M2 trusted-anchor gate: only subjects that have at least one
    `reality_check='verified'` or `pinned=true` live assertion are eligible

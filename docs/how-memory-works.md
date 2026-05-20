@@ -173,7 +173,7 @@ The journal has three parts, and they serve different purposes.
 
 The QUICKSTART mentions "hooks" — session hooks that run at start and stop. A hook is just a script that fires automatically at a specific moment. You don't need to understand the internals, but here's the plain-English version of what each one does.
 
-**SessionStart hook.** Runs before Claude reads your first message. It connects to the database, runs the retrieval queries (recency, confidence, vector search, resurrect check), and writes the selected entries into the session context. The librarian arriving for work, in other words.
+**SessionStart hook.** Runs before Claude reads your first message. It connects to the database, runs the retrieval queries (recency, confidence, vector search, resurrect check — the resurrect path uses semantic embedding via vLLM with a pg_trgm fuzzy fallback), and writes the selected entries into the session context. The librarian arriving for work, in other words.
 
 **Stop hook.** Runs when the session ends or Claude stops. It writes a brief status record. This is not the same as `/handoff:close` — the stop hook is lightweight housekeeping. The full session summary (the 5-15 new journal entries) only gets written when you explicitly run `/handoff:close`.
 
