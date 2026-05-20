@@ -269,7 +269,11 @@ function embedOne(text) {
             reject(new Error(`missing data[0].embedding: ${raw.slice(0, 200)}`));
             return;
           }
-          resolve(vec);
+          // Matryoshka truncation to DIM. Qwen3-Embedding-8B returns native 4096;
+          // pgvector 0.8.1 caps halfvec HNSW at 4000 dims, so leading DIM dims are
+          // the stable storage form (mirrors scripts/lib/{shared,embed}.js).
+          const truncated = DIM < vec.length ? vec.slice(0, DIM) : vec;
+          resolve(truncated);
         } catch (err) {
           reject(new Error(`JSON parse: ${err.message}`));
         }
@@ -294,9 +298,9 @@ async function generateReal() {
   // Health check.
   try {
     const hv = await embedOne('health');
-    console.log(`vLLM OK — vector dim: ${hv.length}`);
+    console.log(`vLLM OK — vector dim after Matryoshka truncation: ${hv.length} (target ${DIM})`);
     if (hv.length !== DIM) {
-      console.warn(`WARNING: expected dim=${DIM} but got ${hv.length}. Column is halfvec(4000).`);
+      throw new Error(`post-truncation dim ${hv.length} != target ${DIM} — refusing to write fixtures that won't load into halfvec(${DIM})`);
     }
   } catch (err) {
     console.error(`\nFATAL: vLLM not reachable at ${VLLM_URL}: ${err.message}`);

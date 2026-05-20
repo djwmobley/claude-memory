@@ -9,6 +9,12 @@
  *   2. vLLM mode  — POSTs to the vLLM /v1/embeddings endpoint using the URL
  *                   and model from pipeline.yml (via loadConfig()).
  *
+ * Matryoshka truncation: vLLM returns the model's native dimension (4096 for
+ * Qwen3-Embedding-8B); leading EMBED_DIMS (default 4000) are kept because
+ * pgvector 0.8.1 caps halfvec HNSW indexes at 4000 dims. Qwen3-Embedding-8B is
+ * Matryoshka-trained: the leading prefix is a valid embedding. Mirrors the
+ * truncation in scripts/lib/shared.js:vllmEmbed.
+ *
  * This module does NOT degrade silently. It throws on every error. The caller
  * (handoff.js runResurrectQuery) decides whether to fall through to the
  * pg_trgm fuzzy path.
@@ -23,6 +29,8 @@ const fs   = require('fs');
 const path = require('path');
 const http = require('http');
 const { loadConfig } = require('./shared');
+
+const EMBED_DIMS = parseInt(process.env.EMBED_DIMS || '4000', 10);
 
 /**
  * Read a key from pipeline.yml knowledge section without a full loadConfig parse.
@@ -101,7 +109,8 @@ function _vllmEmbed(text, vllmUrl, model) {
           reject(new Error(`[embed] vLLM response missing data[0].embedding — got: ${raw.slice(0, 200)}`));
           return;
         }
-        resolve(embedding);
+        const truncated = EMBED_DIMS < embedding.length ? embedding.slice(0, EMBED_DIMS) : embedding;
+        resolve(truncated);
       });
     });
 
