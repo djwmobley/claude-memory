@@ -148,9 +148,9 @@ These are the commands you type to interact with the journal. Each one is a shor
 
 - `/handoff:init` — Set up the journal for a new project. Creates the database tables and the starter files. Run this once per project.
 - `/handoff:status` — Quick check on how the journal is doing. Shows your project name, database connection, and how many entries exist.
-- `/handoff:close` — Wrap up the session and write today's entries. Run this at the end of your work session. The librarian writes and saves all new notes.
+- `/handoff:close` — Wrap up the session and write today's entries. Run this at the end of your work session. The librarian writes and saves all new notes. Code pointers (`file:line`) in the served output are validated against the live file tree at close time: stale line numbers are auto-corrected, and pointers whose anchor can no longer be located are flagged in the Reconciliation section.
 - `/handoff:checkpoint` — Write entries mid-session without ending the session. Useful for long sessions where you want to save progress partway through.
-- `/handoff:resume` — Force the librarian to load context, even if it's been a long time. Normally the loader skips auto-injection if your last session was more than a week ago — this overrides that.
+- `/handoff:resume` — Force the librarian to load context, even if it's been a long time. Normally the loader skips auto-injection if your last session was more than a week ago — this overrides that. Code pointers are validated against the live file tree on resume as well; stale line numbers are corrected in the served output, but corrections are not persisted (close is the mutation point).
 - `/handoff:drop` — Archive the current journal and start fresh. The old entries are kept but set aside. Use this when a project phase is truly over and you want a clean slate.
 - `/handoff:purge` — Delete everything. No undo. Use with care.
 - `/handoff:promote` — Bump a journal entry up to `CLAUDE.md`. Promoted entries are always loaded, not just "when relevant." Use this for facts that are so fundamental Claude should never be without them.

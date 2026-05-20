@@ -14,6 +14,12 @@ This command performs the loader's read-and-inject inline:
 4. Prints a compact context summary.
 
 The session hook (Phase 3.6) will eventually handle automatic loading. This command stays as the manual override for staleness acknowledgment.
+
+**Pointer-staleness gate:** at resume time, `handoff.js` scans the served `handoff.md`
+body for `file:line` code pointers and rewrites stale line numbers in the output you
+see — but does NOT persist corrections back to the database. Persistence happens only at
+close time (close is the canonical mutation point). This means a resumed session always
+sees the freshest pointer positions without risk of corrupting the DB mid-session.
 </details>
 
 ## How to invoke

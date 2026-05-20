@@ -398,6 +398,351 @@ function detectCloseContradictions(payload, degradedList, root) {
   return contradictions;
 }
 
+// ─── POINTER-STALENESS GATE ───────────────────────────────────────────────────
+//
+// validatePointers — detect and rewrite stale file:line references.
+//
+// Design rationale: code-pointer drift has recurred three times in succession
+// (sessions N-2, N-1, N).  Per feedback_recurring_drift_build_enforcement_not_a_note,
+// the fix is an automated gate wired into the harness — not another corrected line
+// number stored in memory that will rot again.
+
+/** Known code/text extensions that can contain valid code pointers. */
+const POINTER_EXTENSIONS = new Set([
+  'js', 'ts', 'json', 'md', 'sql', 'yml', 'yaml', 'sh', 'py', 'mjs', 'cjs', 'jsx', 'tsx',
+]);
+
+/**
+ * Regex that matches code pointers: path/to/file.ext:N  or  path/to/file.ext:N-M
+ * Capture groups: [1] full pointer, [2] path, [3] ext, [4] start line, [5] end line (optional)
+ */
+const POINTER_RE = /(?<![a-zA-Z0-9])(\b([\w./][\w./\-]*?\.([a-z]+)):([1-9][0-9]*)(?:-([1-9][0-9]*))?)\b/g;
+
+function _isValidPointerMatch(ext, pth) {
+  if (!POINTER_EXTENSIONS.has(ext.toLowerCase())) return false;
+  const hasSlash = pth.includes('/') || pth.includes('\\');
+  const hasDirOrKnownFile = hasSlash || /[a-zA-Z_-]/.test(pth.replace(/\.[^.]+$/, ''));
+  return hasDirOrKnownFile;
+}
+
+function _extractPointers(text) {
+  const seen    = new Set();
+  const results = [];
+  const re      = new RegExp(POINTER_RE.source, 'g');
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const [, pointer, pth, ext, startStr, endStr] = m;
+    if (!_isValidPointerMatch(ext, pth)) continue;
+    if (seen.has(pointer)) continue;
+    seen.add(pointer);
+    results.push({
+      pointer,
+      path:      pth,
+      ext:       ext.toLowerCase(),
+      startLine: parseInt(startStr, 10),
+      endLine:   endStr ? parseInt(endStr, 10) : null,
+    });
+  }
+  return results;
+}
+
+function _findEnclosingSymbol(lines, lineIdx, ext) {
+  const jsExts = new Set(['js', 'ts', 'mjs', 'cjs', 'jsx', 'tsx']);
+  if (!jsExts.has(ext)) return null;
+  const DECL_RE = /^\s*(?:async\s+)?(?:function\s+(\w+)|(?:const|let|var|class)\s+(\w+)\s*[=\s({])/;
+  const scanStart = Math.max(0, lineIdx - 200);
+  for (let i = lineIdx; i >= scanStart; i--) {
+    const m = DECL_RE.exec(lines[i]);
+    if (m) return m[1] || m[2] || null;
+  }
+  return null;
+}
+
+function _deriveAnchor(root, pointerInfo) {
+  const absPath = path.join(root, pointerInfo.path);
+  if (!fs.existsSync(absPath)) return null;
+  let content;
+  try { content = fs.readFileSync(absPath, 'utf8'); } catch (_) { return null; }
+  const lines   = content.split('\n');
+  const lineIdx = pointerInfo.startLine - 1;
+  if (lineIdx < 0 || lineIdx >= lines.length) return null;
+  const symbol  = _findEnclosingSymbol(lines, lineIdx, pointerInfo.ext);
+  const snippet = symbol ? null : (lines[lineIdx].trim().slice(0, 80) || null);
+  return {
+    pointer:        pointerInfo.pointer,
+    symbol:         symbol  || null,
+    snippet:        snippet || null,
+    last_validated: new Date().toISOString(),
+  };
+}
+
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function _findSymbolRange(lines, symbolName, ext) {
+  const jsExts = new Set(['js', 'ts', 'mjs', 'cjs', 'jsx', 'tsx']);
+  if (!jsExts.has(ext)) return null;
+  const DECL_RE = new RegExp(
+    `^(\\s*)(?:async\\s+)?(?:function\\s+${escapeRegExp(symbolName)}|(?:const|let|var|class)\\s+${escapeRegExp(symbolName)}\\s*[=\\s({])`
+  );
+  for (let i = 0; i < lines.length; i++) {
+    if (!DECL_RE.test(lines[i])) continue;
+    let depth = 0;
+    let endIdx = i;
+    for (let j = i; j < lines.length; j++) {
+      for (const ch of lines[j]) {
+        if (ch === '{') depth++;
+        else if (ch === '}') depth--;
+      }
+      if (depth > 0 || (depth === 0 && j > i)) {
+        endIdx = j;
+        if (depth === 0) break;
+      }
+      if (j === lines.length - 1) { endIdx = j; break; }
+    }
+    return { startLine: i + 1, endLine: endIdx + 1 };
+  }
+  return null;
+}
+
+function _findSnippetLine(lines, snippet) {
+  const trimmed = snippet.trim();
+  if (!trimmed) return null;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].includes(trimmed)) return i + 1;
+  }
+  return null;
+}
+
+/**
+ * Run the pointer-staleness gate over a text block.
+ *
+ * @param {string}  text           — text block to scan
+ * @param {string}  projectRoot    — absolute project root path
+ * @param {Map}     storedAnchors  — Map<pointer_string, anchorObj> from the DB
+ * @param {Map}     derivedAnchors — accumulates newly derived/updated anchors (OUT param)
+ * @param {Map}     correctedPtrs  — accumulates old→new pointer rewrites (OUT param)
+ * @param {string}  mode           — 'close' | 'resume'
+ * @param {boolean} warnLegacy     — if true, emit legacy-pointer warnings to stderr
+ * @returns {{ rewrittenText:string, findings:Array<{rule:string, message:string}> }}
+ */
+function validatePointers(text, projectRoot, storedAnchors, derivedAnchors, correctedPtrs, mode, warnLegacy) {
+  if (!text || typeof text !== 'string') return { rewrittenText: text, findings: [] };
+  const pointers = _extractPointers(text);
+  if (pointers.length === 0) return { rewrittenText: text, findings: [] };
+
+  const findings  = [];
+  let   rewritten = text;
+
+  for (const pi of pointers) {
+    const absPath = path.join(projectRoot, pi.path);
+
+    if (!fs.existsSync(absPath)) {
+      findings.push({ rule: 'P-1', message: `stale pointer: ${pi.pointer} — file ${pi.path} no longer present` });
+      continue;
+    }
+    let fileLines;
+    try { fileLines = fs.readFileSync(absPath, 'utf8').split('\n'); } catch (_) {
+      findings.push({ rule: 'P-1', message: `stale pointer: ${pi.pointer} — file ${pi.path} unreadable` });
+      continue;
+    }
+
+    const stored = storedAnchors.get(pi.pointer);
+
+    // No stored anchor — legacy path.
+    if (!stored) {
+      const lineIdx   = pi.startLine - 1;
+      const plausible = lineIdx >= 0 && lineIdx < fileLines.length && fileLines[lineIdx].trim().length > 0;
+      if (plausible) {
+        if (!derivedAnchors.has(pi.pointer)) {
+          const derived = _deriveAnchor(projectRoot, pi);
+          if (derived) derivedAnchors.set(pi.pointer, derived);
+        }
+        if (warnLegacy && mode === 'close') {
+          process.stderr.write(`[handoff] pointer-gate: legacy pointer ${pi.pointer} — no stored anchor; derived for next close\n`);
+        }
+      } else {
+        findings.push({ rule: 'P-2', message: `stale pointer: ${pi.pointer} — no anchor stored and line ${pi.startLine} is out of range or blank in ${pi.path}` });
+      }
+      continue;
+    }
+
+    // Symbol anchor path.
+    if (stored.symbol) {
+      const currentRange = _findSymbolRange(fileLines, stored.symbol, pi.ext);
+      if (!currentRange) {
+        findings.push({ rule: 'P-3', message: `stale pointer: ${pi.pointer} — anchor symbol "${stored.symbol}" no longer found in ${pi.path}` });
+        continue;
+      }
+      const expectedEnd = pi.endLine !== null ? pi.endLine : pi.startLine;
+      if (currentRange.startLine === pi.startLine && currentRange.endLine === expectedEnd) {
+        derivedAnchors.set(pi.pointer, Object.assign({}, stored, { last_validated: new Date().toISOString() }));
+      } else {
+        const newPointer = pi.endLine !== null
+          ? `${pi.path}:${currentRange.startLine}-${currentRange.endLine}`
+          : `${pi.path}:${currentRange.startLine}`;
+        rewritten = rewritten.split(pi.pointer).join(newPointer);
+        correctedPtrs.set(pi.pointer, newPointer);
+        derivedAnchors.set(newPointer, Object.assign({}, stored, { pointer: newPointer, last_validated: new Date().toISOString() }));
+        if (warnLegacy) process.stderr.write(`[handoff] pointer-gate: corrected ${pi.pointer} → ${newPointer} (symbol "${stored.symbol}" moved)\n`);
+      }
+      continue;
+    }
+
+    // Snippet anchor path.
+    if (stored.snippet) {
+      const currentLine = _findSnippetLine(fileLines, stored.snippet);
+      if (currentLine === null) {
+        findings.push({ rule: 'P-3', message: `stale pointer: ${pi.pointer} — anchor snippet "${stored.snippet.slice(0, 40)}…" no longer found in ${pi.path}` });
+        continue;
+      }
+      if (currentLine === pi.startLine) {
+        derivedAnchors.set(pi.pointer, Object.assign({}, stored, { last_validated: new Date().toISOString() }));
+      } else {
+        const newPointer = `${pi.path}:${currentLine}`;
+        rewritten = rewritten.split(pi.pointer).join(newPointer);
+        correctedPtrs.set(pi.pointer, newPointer);
+        derivedAnchors.set(newPointer, Object.assign({}, stored, { pointer: newPointer, last_validated: new Date().toISOString() }));
+        if (warnLegacy) process.stderr.write(`[handoff] pointer-gate: corrected ${pi.pointer} → ${newPointer} (snippet moved)\n`);
+      }
+      continue;
+    }
+
+    // Anchor has neither symbol nor snippet — treat as legacy.
+    if (warnLegacy && mode === 'close') {
+      process.stderr.write(`[handoff] pointer-gate: anchor for ${pi.pointer} has neither symbol nor snippet — treating as legacy\n`);
+    }
+  }
+
+  return { rewrittenText: rewritten, findings };
+}
+
+async function _loadStoredAnchors(db, projectId, ptrs) {
+  const anchorMap = new Map();
+  if (!ptrs.length) return anchorMap;
+  try {
+    const { rows } = await db.query(
+      `SELECT anchor FROM assertions WHERE project_id = $1 AND anchor IS NOT NULL AND suppressed = false`,
+      [projectId]
+    );
+    for (const row of rows) {
+      let anchor;
+      try { anchor = typeof row.anchor === 'string' ? JSON.parse(row.anchor) : row.anchor; } catch (_) { continue; }
+      if (anchor && anchor.pointer && ptrs.includes(anchor.pointer)) {
+        anchorMap.set(anchor.pointer, anchor);
+      }
+    }
+  } catch (err) {
+    process.stderr.write(`[handoff] pointer-gate: anchor load failed (non-fatal): ${err.message}\n`);
+  }
+  return anchorMap;
+}
+
+async function _persistPointerCorrections(db, projectId, correctedPtrs, derivedAnchors) {
+  // §7 no-backfill invariant: we NEVER UPDATE the object field of source assertions.
+  // Source assertions stay canonical; pointer rewrites happen only in the served
+  // handoff.md output (via validatePointers / runPointerGate return values).
+  //
+  // What we DO persist: anchor metadata updates (anchor is not a canonical corpus
+  // field — it is derived validation metadata).  S10 forbids updates to
+  // subject / predicate / object / source; it permits anchor.
+  if (!derivedAnchors.size) return;
+  try {
+    // For corrected pointers: persist the new anchor keyed by the new pointer string.
+    for (const [oldPtr, newPtr] of correctedPtrs) {
+      const anchor = derivedAnchors.get(newPtr) || derivedAnchors.get(oldPtr);
+      if (!anchor) continue;
+      await db.query(
+        `UPDATE assertions SET anchor = $3
+         WHERE project_id = $1 AND (anchor->>'pointer') = $2 AND suppressed = false`,
+        [projectId, oldPtr, JSON.stringify(Object.assign({}, anchor, { pointer: newPtr }))]
+      );
+    }
+    // For derived anchors that were not part of a correction (fresh derivations):
+    for (const [ptr, anchor] of derivedAnchors) {
+      if (correctedPtrs.has(ptr)) continue;
+      await db.query(
+        `UPDATE assertions SET anchor = $3
+         WHERE project_id = $1 AND object LIKE $4
+           AND (anchor IS NULL OR (anchor->>'pointer') = $2) AND suppressed = false`,
+        [projectId, ptr, JSON.stringify(anchor), `%${ptr}%`]
+      );
+    }
+  } catch (err) {
+    process.stderr.write(`[handoff] pointer-gate: anchor persistence failed (non-fatal): ${err.message}\n`);
+  }
+}
+
+async function _backfillMissingAnchors(db, projectId, projectRoot) {
+  try {
+    const { rows } = await db.query(
+      `SELECT id, object FROM assertions WHERE project_id = $1 AND anchor IS NULL AND suppressed = false AND object ~ $2`,
+      [projectId, '\\.[a-z]+:[0-9]']
+    );
+    if (!rows.length) return;
+    let filled = 0;
+    for (const row of rows) {
+      const ptrs = _extractPointers(row.object);
+      if (!ptrs.length) continue;
+      const anchor = _deriveAnchor(projectRoot, ptrs[0]);
+      if (!anchor) continue;
+      await db.query(`UPDATE assertions SET anchor = $1 WHERE id = $2`, [JSON.stringify(anchor), row.id]);
+      filled++;
+    }
+    if (filled > 0) process.stderr.write(`[handoff] pointer-gate: backfilled anchors for ${filled} assertion(s)\n`);
+  } catch (err) {
+    process.stderr.write(`[handoff] pointer-gate: anchor backfill failed (non-fatal): ${err.message}\n`);
+  }
+}
+
+/**
+ * Run the full pointer-staleness gate over all text fields (TL;DR, open threads, quick references).
+ * Integration entry point called from cmdClose (persistent) and cmdLoaderLoad (read-only).
+ *
+ * @param {object} fields        — { tldr, openThreads, quickReferences }
+ * @param {string} projectRoot
+ * @param {object} db            — pg Client
+ * @param {string} projectId
+ * @param {string} mode          — 'close' | 'resume'
+ * @returns {Promise<{ rewrittenFields:object, findings:Array<{rule:string, message:string}> }>}
+ */
+async function runPointerGate(fields, projectRoot, db, projectId, mode) {
+  const { tldr = '', openThreads = '', quickReferences = '' } = fields;
+  const allPointers = [
+    ..._extractPointers(tldr),
+    ..._extractPointers(openThreads),
+    ..._extractPointers(quickReferences),
+  ];
+  const uniquePtrs     = [...new Set(allPointers.map((p) => p.pointer))];
+  const storedAnchors  = await _loadStoredAnchors(db, projectId, uniquePtrs);
+  const derivedAnchors = new Map();
+  const correctedPtrs  = new Map();
+  const warnLegacy     = mode === 'close';
+  const allFindings    = [];
+  const fieldResult    = {};
+
+  for (const [fieldName, fieldText] of [
+    ['tldr',            tldr],
+    ['openThreads',     openThreads],
+    ['quickReferences', quickReferences],
+  ]) {
+    const { rewrittenText, findings } = validatePointers(
+      fieldText, projectRoot, storedAnchors, derivedAnchors, correctedPtrs, mode, warnLegacy
+    );
+    fieldResult[fieldName] = rewrittenText;
+    allFindings.push(...findings);
+  }
+
+  if (mode === 'close') {
+    await _persistPointerCorrections(db, projectId, correctedPtrs, derivedAnchors);
+  }
+
+  return { rewrittenFields: fieldResult, findings: allFindings };
+}
+
+// ─── END POINTER-STALENESS GATE ───────────────────────────────────────────────
+
 /**
  * Read JSON payload from stdin (used for --json - flag).
  * Validates structure: only allowed top-level keys, string-field length caps,
@@ -2164,7 +2509,26 @@ async function cmdLoaderLoad(opts = {}) {
 
   if (fs.existsSync(handoffPath)) {
     const raw  = fs.readFileSync(handoffPath, 'utf8');
-    const body = raw.replace(/^---[\s\S]*?---\r?\n/, '');
+    let   body = raw.replace(/^---[\s\S]*?---\r?\n/, '');
+
+    // Pointer-staleness gate — resume mode: rewrite stale line numbers in the served
+    // output but do NOT persist corrections back to the DB (close is the mutation point).
+    // Runs non-fatally; any error leaves body unchanged.
+    try {
+      const resumeRoot = findProjectRoot();
+      // Pass the full handoff.md body as tldr (single scan covers all pointer references).
+      const gateResult = await runPointerGate(
+        { tldr: body, openThreads: '', quickReferences: '' },
+        resumeRoot,
+        db,
+        projectId,
+        'resume'
+      );
+      body = gateResult.rewrittenFields.tldr;
+    } catch (ptrResumeErr) {
+      process.stderr.write(`[handoff] pointer-gate (resume) failed (non-fatal): ${ptrResumeErr.message}\n`);
+    }
+
     retrievedParts.push('=== Handoff context ===');
     retrievedParts.push(body.trim());
   }
@@ -3974,11 +4338,49 @@ async function cmdClose(args) {
       // Fully non-fatal: any error here must not break cmdClose.
       process.stderr.write(`[handoff] reconciliation gate failed (non-fatal): ${reconcileErr.message}\n`);
     }
-    const reconciliationSection = contradictions.length > 0
+
+    // Pointer-staleness gate — peer to the contradiction gate; never blocks close.
+    // Rewrites stale line numbers in TL;DR/open_threads/quick_references, persists
+    // anchor corrections back to assertion rows, and returns findings that feed into
+    // the same ## Reconciliation notice section as the contradiction gate.
+    let pointerFindings = [];
+    let rewrittenTldr         = payload.tldr || '(closed)';
+    let rewrittenOpenThreads  = (payload.open_threads || []).map((t) => `- ${t}`).join('\n') || '- (none)';
+    let rewrittenQuickRefs    = payload.quick_references || '(none)';
+    try {
+      // Run anchor backfill for any legacy assertion rows before validating.
+      await _backfillMissingAnchors(db, projectId, root);
+
+      const gateResult = await runPointerGate(
+        {
+          tldr:            rewrittenTldr,
+          openThreads:     rewrittenOpenThreads,
+          quickReferences: rewrittenQuickRefs,
+        },
+        root,
+        db,
+        projectId,
+        'close'
+      );
+      rewrittenTldr        = gateResult.rewrittenFields.tldr;
+      rewrittenOpenThreads = gateResult.rewrittenFields.openThreads;
+      rewrittenQuickRefs   = gateResult.rewrittenFields.quickReferences;
+      pointerFindings      = gateResult.findings;
+    } catch (ptrErr) {
+      // Fully non-fatal: any error here must not break cmdClose.
+      process.stderr.write(`[handoff] pointer-gate failed (non-fatal): ${ptrErr.message}\n`);
+    }
+
+    // Combine contradiction and pointer-staleness findings into a single Reconciliation section.
+    const allReconciliationFindings = [
+      ...contradictions.map((c) => ({ rule: c.rule, message: c.message })),
+      ...pointerFindings,
+    ];
+    const reconciliationSection = allReconciliationFindings.length > 0
       ? '\n\n## Reconciliation notice\n' +
-        'The following contradictions were detected between the LLM-authored TL;DR/references\n' +
+        'The following issues were detected between the LLM-authored TL;DR/references\n' +
         'and engine-verified state. The engine-verified state is authoritative.\n\n' +
-        contradictions.map((c) => `- **[${c.rule}]** ${c.message}`).join('\n')
+        allReconciliationFindings.map((c) => `- **[${c.rule}]** ${c.message}`).join('\n')
       : '';
 
     writeHandoffMd(handoffPath, {
@@ -3989,9 +4391,9 @@ async function cmdClose(args) {
       ASSERTIONS_WRITTEN:  String(assertionsWritten),
       EDGES_WRITTEN:       String(edgesWritten),
       PROJECT_NAME:        path.basename(root),
-      TLDR:                payload.tldr || '(closed)',
-      OPEN_THREADS:        (payload.open_threads || []).map((t) => `- ${t}`).join('\n') || '- (none)',
-      QUICK_REFERENCES:    payload.quick_references || '(none)',
+      TLDR:                rewrittenTldr,
+      OPEN_THREADS:        rewrittenOpenThreads,
+      QUICK_REFERENCES:    rewrittenQuickRefs,
       DEGRADED_SECTION:    degradedSection,
       RECONCILIATION_SECTION: reconciliationSection,
     });
@@ -4001,13 +4403,14 @@ async function cmdClose(args) {
       console.log(`  ${d.subsystem} skipped: ${d.reason}`);
     }
 
-    // Surface reconciliation contradictions (operator-visible).
-    if (contradictions.length > 0) {
+    // Surface reconciliation findings (contradictions + pointer staleness) as operator-visible output.
+    if (allReconciliationFindings.length > 0) {
       process.stderr.write(
-        `[handoff] close-reconciliation gate: ${contradictions.length} contradiction(s) detected ` +
+        `[handoff] close-reconciliation gate: ${allReconciliationFindings.length} finding(s) detected ` +
+        `(${contradictions.length} contradiction(s), ${pointerFindings.length} stale pointer(s)) ` +
         `(see handoff.md ## Reconciliation notice)\n`
       );
-      for (const c of contradictions) {
+      for (const c of allReconciliationFindings) {
         console.log(`  RECONCILIATION [${c.rule}]: ${c.message}`);
       }
     }
@@ -5044,5 +5447,15 @@ async function main() {
 if (require.main === module) {
   main();
 } else {
-  module.exports = { queriesEqual, recordContractChange };
+  module.exports = {
+    queriesEqual,
+    recordContractChange,
+    // Pointer-staleness gate internals (exposed for test-pointer-gate.js)
+    _extractPointers,
+    _deriveAnchor,
+    _findSymbolRange,
+    _findSnippetLine,
+    validatePointers,
+    runPointerGate,
+  };
 }

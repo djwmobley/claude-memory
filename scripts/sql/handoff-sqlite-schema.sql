@@ -124,6 +124,12 @@ ALTER TABLE assertions ADD COLUMN IF NOT EXISTS corroboration_count INTEGER NOT 
 --       Postgres version carries the authoritative CHECK constraint.
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS reality_check TEXT;
 
+-- Pointer-staleness gate: anchor metadata for file:line references (additive, NULL-tolerant).
+-- Stored as TEXT (serialized JSON) in SQLite; Postgres uses JSONB.
+-- Schema: { "pointer": "path:N-M", "symbol": "...", "snippet": "...", "last_validated": "ISO" }
+-- NULL for rows that predate this feature or have no pointer in their object field.
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS anchor TEXT;
+
 -- 1:1 partial unique index (same predicate set as Postgres version)
 CREATE UNIQUE INDEX IF NOT EXISTS assertions_1to1_unique
   ON assertions (project_id, subject, predicate)

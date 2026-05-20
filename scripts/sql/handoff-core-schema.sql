@@ -248,6 +248,15 @@ EXCEPTION WHEN OTHERS THEN
   RAISE NOTICE 'assertions_embedding_hnsw_idx skipped -- pgvector not installed or halfvec_cosine_ops unavailable';
 END $$;
 
+-- anchor — pointer-staleness gate: stores derived anchor metadata for file:line
+--          references found in the assertion's object field. NULL for rows that
+--          predate this feature or have no code pointer in their object.
+-- Schema: { "pointer": "path:N-M", "symbol": "funcName", "snippet": "...", "last_validated": "ISO" }
+-- symbol and snippet are mutually exclusive: symbol is preferred for JS/TS files
+-- (enclosing function/class/const name); snippet is the ≤80-char fallback for
+-- other file types or when no enclosing symbol can be detected.
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS anchor JSONB;
+
 -- ── pg_trgm GIN index for resurrect fuzzy-text matching ──────────────────────
 --
 -- Additive migration: creates a GIN trigram index on the concatenated
