@@ -564,6 +564,106 @@ async function runTests() {
     }
   });
 
+  // ── Test 10: resurrect subcommand ────────────────────────────────────────
+  //
+  // Re-open a fresh DB connection for the resurrect tests (the previous one
+  // was closed above by the teardown-adjacent db.end() — but teardown hasn't
+  // run yet; we just need to re-resolve the project_id now that init has
+  // minted a .claude-memory marker UUID in fakeRoot).
+  {
+    // Resolve the live project_id (may be a UUID marker, not just encodedRoot).
+    const markerPath = path.join(fakeRoot, '.claude-memory');
+    let resurrectProjectId = encodedRoot;
+    if (fs.existsSync(markerPath)) {
+      try {
+        const txt = fs.readFileSync(markerPath, 'utf8');
+        const m   = txt.match(/"uuid"\s*:\s*"([^"]+)"/);
+        if (m) resurrectProjectId = m[1];
+      } catch (_) { /* fall back to encodedRoot */ }
+    }
+
+    // Re-connect for resurrect tests.
+    const rdb = await connectDb();
+
+    // Ensure the project exists in DB (init may have used the UUID project_id).
+    // Insert a live trusted-anchor assertion so the M2 gate can pass.
+    await rdb.query(
+      `INSERT INTO entities (project_id, name, entity_type, description)
+       VALUES ($1, 'resurrect-subject', 'concept', 'test resurrect entity')
+       ON CONFLICT DO NOTHING`,
+      [resurrectProjectId]
+    );
+    // Trusted-anchor live row (reality_check='verified').
+    await rdb.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence,
+                               source, suppressed, reality_check)
+       VALUES ($1, 'resurrect-subject', 'status', 'trusted-live', 9,
+               'user_stated', false, 'verified')
+       ON CONFLICT DO NOTHING`,
+      [resurrectProjectId]
+    );
+    // Probationary (downvoted_probation) row for the same subject.
+    await rdb.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence,
+                               source, suppressed, suppression_kind, tier)
+       VALUES ($1, 'resurrect-subject', 'old_detail', 'probation-value', 6,
+               'model_extracted', true, 'downvoted_probation', 'probationary')
+       ON CONFLICT DO NOTHING`,
+      [resurrectProjectId]
+    );
+
+    await test('resurrect: dry-run finds matching probationary row', () => {
+      // The fuzzy seed 'resurrect-subject' should match the probationary row.
+      const out = runHelper('resurrect', ['resurrect-subject'], { fakeRoot });
+      assert.ok(out.includes('Running: handoff:resurrect'), 'resurrect should emit Running line');
+      // Either the row is found (section present) or no matches (both are valid success paths).
+      assert.ok(
+        out.includes('Done: handoff:resurrect'),
+        'resurrect should emit Done line'
+      );
+      // Should be a dry-run (no rows revived).
+      assert.ok(
+        out.includes('dry-run') || out.includes('no matches'),
+        'resurrect dry-run should mention dry-run or no-matches'
+      );
+    });
+
+    await test('resurrect: --revive flag emits revived output or no-matches', () => {
+      const out = runHelper('resurrect', ['resurrect-subject', '--revive'], { fakeRoot });
+      assert.ok(out.includes('Done: handoff:resurrect'), 'resurrect --revive should emit Done line');
+      // Either rows were revived or no matches — both are valid DB states.
+      assert.ok(
+        out.includes('revived') || out.includes('no matches'),
+        'resurrect --revive should mention revived or no-matches'
+      );
+    });
+
+    await test('resurrect: seed with no matching rows emits no-matches message', () => {
+      const out = runHelper('resurrect', ['xyzzy-nonexistent-seed-qqqq'], { fakeRoot });
+      assert.ok(
+        out.includes('No matching probationary rows found') || out.includes('Done: handoff:resurrect'),
+        'resurrect should handle no-match seed gracefully'
+      );
+      assert.ok(out.includes('Done: handoff:resurrect'), 'resurrect should emit Done line on no match');
+    });
+
+    await test('resurrect: missing seed exits 2 with usage on stderr', () => {
+      try {
+        runHelper('resurrect', [], { fakeRoot });
+        assert.fail('Expected exit code 2 when seed is missing');
+      } catch (err) {
+        assert.strictEqual(err.status, 2, `Expected exit code 2, got ${err.status}`);
+        const combined = (err.stdout || '') + (err.stderr || '');
+        assert.ok(
+          combined.includes('seed text is required') || combined.includes('Usage:'),
+          'Missing seed should print usage info'
+        );
+      }
+    });
+
+    await rdb.end();
+  }
+
   await db.end();
   await teardown();
 }

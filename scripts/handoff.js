@@ -20,6 +20,9 @@ const __startNs = process.hrtime.bigint();
  *   close      --json -     End-of-session extraction (reads JSON from stdin).
  *   purge      [--yes]      Hard-delete all project rows (requires confirmation or --yes).
  *   promote    <id>         Explicitly promote an assertion to CLAUDE.md durable facts.
+ *   resurrect  <topic>      Manually resurrect dormant notes by topic.
+ *                           Flags: --revive (-r), --limit=N (default 20).
+ *                           Dry-run by default; --revive un-suppresses rows.
  *   prune      [flags]      Operator manual prune: hard-delete selected assertion rows.
  *                           Flags: --suppressed, --suppression-kind <kind>, --subject <s>,
  *                           --older-than <days>, --include-pinned, --apply.
@@ -1208,6 +1211,210 @@ async function cmdStatus() {
   console.log(`\nDone: handoff:status — ${entRes.rows[0].n} entities, ${assRes.rows[0].n} assertions, ${edgRes.rows[0].n} edges`);
 }
 
+// ── runResurrectQuery — shared resurrect engine ───────────────────────────────
+
+/**
+ * Execute the resurrect query logic: seed resolution, fuzzy-match fallback,
+ * depth-2 graph fan-out, M2 trusted-anchor gate, eligible-row fetch, optional
+ * revival mutation.
+ *
+ * Called from BOTH the loader's contract-driven 'resurrect' branch AND from
+ * cmdResurrect (slash command). The loader path supplies tokenBudget from its
+ * sub-budget calculation; cmdResurrect passes Infinity (no budget limit for CLI).
+ *
+ * @param {object} db              Connected StoragePort adapter.
+ * @param {string} projectId       Project UUID / encoded-cwd.
+ * @param {object} q               Query object: { type?, seed?, revive?, limit? }
+ * @param {object} opts
+ * @param {boolean} [opts.silent=false]      Suppress non-fatal console.error lines.
+ * @param {number}  [opts.tokenBudget]       Token ceiling for the output section. Default Infinity.
+ * @returns {Promise<{
+ *   sectionText: string|null,    Section markdown string, or null if nothing to emit.
+ *   revivedRows:  number,        Count of eligible rows (for assertionsCount tracking).
+ *   revivedIds:   number[],      IDs of rows un-suppressed (empty unless revive was applied).
+ *   candidateCount: number,      Candidate subject count after seed resolution.
+ * }>}
+ */
+async function runResurrectQuery(db, projectId, q, opts = {}) {
+  const silent      = opts.silent === true;
+  const tokenBudget = (opts.tokenBudget != null && isFinite(opts.tokenBudget))
+    ? opts.tokenBudget
+    : Infinity;
+
+  const seedText   = (q.seed || q.query || '').trim();
+  const reviveOpt  = q.revive === true;
+  const fuzzyLimit = typeof q.limit === 'number' && q.limit > 0 ? q.limit : 20;
+
+  // Tracks whether the ### Resurrected section was actually emitted.
+  // Step 6 (revival DB mutation) MUST NOT run unless this is true.
+  let resurrectEmitted = false;
+
+  // ── Step 1: Resolve candidate subjects via semantic or fuzzy seed ──────────
+  let candidateSubjects = [];
+  const ollamaSkip = (process.env.OLLAMA_SKIP === '1');
+
+  if (!ollamaSkip && seedText) {
+    // Phase 3.6 hook site — DO NOT REMOVE: semantic embedding seed not yet wired;
+    // intentionally falls through to pg_trgm/LIKE fuzzy fallback below.
+    // When Ollama is wired in Phase 3.6, populate candidateSubjects here via
+    // cosine distance on v_memory_hits (halfvec 4000) and skip the fuzzy path.
+  }
+
+  // Fuzzy fallback (always runs when ollamaSkip or semantic unavailable).
+  if (candidateSubjects.length === 0 && seedText) {
+    const { sql: fuzzySql, params: fuzzyParams } = db.buildFuzzyMatch(
+      projectId, seedText, fuzzyLimit
+    );
+    try {
+      const { rows: fuzzyRows } = await db.query(fuzzySql, fuzzyParams);
+      for (const r of fuzzyRows) {
+        if (r.subject && !candidateSubjects.includes(r.subject)) {
+          candidateSubjects.push(r.subject);
+        }
+      }
+    } catch (fuzzyErr) {
+      // pg_trgm may be absent — degrade to empty candidate set (no resurrect section).
+      if (!silent) console.error(`[handoff] resurrect fuzzy-match error (non-fatal): ${fuzzyErr.message}`);
+    }
+  }
+
+  // If still no candidates (and a seed was provided), use all subjects with
+  // resurrect-eligible rows (bounded). Gated on seedText so that a whitespace-only
+  // or absent seed does not trigger an unconstrained fallback fetch of all probation
+  // subjects — that would bypass the empty-seed guard at Step 6.
+  if (candidateSubjects.length === 0 && seedText) {
+    const { rows: allSubj } = await db.query(
+      `SELECT DISTINCT subject FROM assertions
+       WHERE project_id = $1
+         AND suppressed = true
+         AND suppression_kind = 'downvoted_probation'
+       LIMIT $2`,
+      [projectId, fuzzyLimit]
+    );
+    candidateSubjects = allSubj.map((r) => r.subject);
+  }
+
+  const candidateCount = candidateSubjects.length;
+
+  // ── Step 2: Depth-2 graph fan-out from candidate subjects ────────────────
+  if (candidateSubjects.length > 0) {
+    try {
+      const graphMaxDepth = 2;
+      const graphMaxNodes = parseInt(
+        await getSetting(db, projectId, 'graph_max_nodes', '25'), 10
+      );
+      const { sql: cteSql, params: cteParams } = db.buildGraphCTE(
+        'out', candidateSubjects, graphMaxDepth, graphMaxNodes, projectId
+      );
+      const { rows: fanOutRows } = await db.query(cteSql, cteParams);
+      for (const r of fanOutRows) {
+        if (r.entity_name && !candidateSubjects.includes(r.entity_name)) {
+          candidateSubjects.push(r.entity_name);
+        }
+      }
+    } catch (_fanErr) {
+      // Non-fatal — proceed with the seed subjects only.
+    }
+  }
+
+  // ── Step 3: Filter by M2 seed-gate (trusted anchor required) ─────────────
+  // Only resurrect assertions whose subject has at least one trusted anchor:
+  //   reality_check='verified' OR pinned=true  (the L2 hasQualityCorroborator predicate).
+  let trustedSubjects = [];
+  if (candidateSubjects.length > 0) {
+    const { clause: tsClauses, params: tsContainsParams } =
+      db.buildArrayContains('subject', candidateSubjects, 2);
+    const { rows: trustedRows } = await db.query(
+      `SELECT DISTINCT subject FROM assertions
+       WHERE project_id = $1
+         AND ${tsClauses}
+         AND suppressed = false
+         AND (reality_check = 'verified' OR pinned = true)`,
+      [projectId, ...tsContainsParams]
+    );
+    trustedSubjects = trustedRows.map((r) => r.subject);
+  }
+
+  // ── Step 4: Fetch resurrect-eligible rows scoped to trusted subjects ──────
+  // Limit to 5 rows per subject (using a subquery rank to avoid any single
+  // subject flooding the result set and excluding other trusted subjects).
+  let resurrectRows = [];
+  if (trustedSubjects.length > 0) {
+    const { clause: subjClause, params: subjContainsParams } =
+      db.buildArrayContains('subject', trustedSubjects, 2);
+    const { rows: eligibleRows } = await db.query(
+      `SELECT id, subject, predicate, object, confidence, source,
+              suppression_kind, created_at
+       FROM (
+         SELECT id, subject, predicate, object, confidence, source,
+                suppression_kind, created_at,
+                ROW_NUMBER() OVER (PARTITION BY subject ORDER BY created_at DESC) AS rn
+         FROM assertions
+         WHERE project_id = $1
+           AND ${subjClause}
+           AND suppressed = true
+           AND suppression_kind = 'downvoted_probation'
+       ) ranked
+       WHERE rn <= 5
+       ORDER BY subject ASC, created_at DESC
+       LIMIT 50`,
+      [projectId, ...subjContainsParams]
+    );
+    resurrectRows = eligibleRows;
+  }
+
+  // ── Step 5: Build output section (read-only by default) ───────────────────
+  let sectionText = null;
+  if (resurrectRows.length > 0) {
+    const lines = resurrectRows.map((r) => {
+      const ts = r.created_at
+        ? (typeof r.created_at === 'string' ? r.created_at : r.created_at.toISOString())
+        : 'unknown';
+      return `- [${r.source}|conf=${r.confidence}|${r.suppression_kind}|${ts}] ${r.subject} ${r.predicate} ${r.object}`;
+    });
+    const bodyText = lines.join('\n');
+    const candidate = `### Resurrected (decayed/probationary, on-demand)\n${bodyText}`;
+    const cost = Math.ceil(candidate.length / 4);
+    // Enforce budget constraint.
+    if (cost <= tokenBudget) {
+      sectionText      = candidate;
+      resurrectEmitted = true;
+    } else {
+      // Budget gate suppressed the section — warn if revival was requested.
+      if (reviveOpt) {
+        if (!silent) console.error(
+          `[handoff] resurrect: revival SKIPPED — token budget exhausted before section could be emitted (tokenBudget=${tokenBudget}, cost=${cost}). Probation rows NOT revived.`
+        );
+      }
+    }
+  }
+
+  // ── Step 6: Revival mechanic (only on explicit opt-in q.revive=true) ──────
+  // INVARIANT: resurrectEmitted must be true before any DB mutation runs.
+  // If the section was budget-blocked or seed was empty, skip revival and warn.
+  let revivedIds = [];
+  if (reviveOpt && !seedText) {
+    // Blank-seed guard: a revive with no seed would mass-revive all probation
+    // subjects. Read-only surfacing is still allowed; revival is not.
+    if (!silent) console.error(
+      '[handoff] resurrect: revival SKIPPED — revive=true requires a non-empty seed (blank seed would mass-revive all probation subjects). Probation rows NOT revived.'
+    );
+  } else if (reviveOpt && resurrectEmitted && resurrectRows.length > 0) {
+    revivedIds = resurrectRows.map((r) => r.id);
+    const rehabStmt = db.buildProbationRehabUpdate(revivedIds);
+    if (rehabStmt) {
+      await db.query(rehabStmt.sql, rehabStmt.params);
+    }
+  }
+
+  return {
+    sectionText,
+    revivedRows:    resurrectRows.length,
+    revivedIds,
+    candidateCount,
+  };
+}
+
 // ── loader-load (shared with resume and loader-hook) ─────────────────────────
 
 /**
@@ -1663,172 +1870,18 @@ async function cmdLoaderLoad(opts = {}) {
           tokenBudget - tokensUsed,
           Math.max(0, parseInt(subBudgetRaw, 10) || 1500)
         );
-        if (subBudget <= 0) {
-          // No budget remaining — skip silently (no section, no crash).
-        } else {
-          const seedText = (q.seed || q.query || '').trim();
-          const reviveOpt = q.revive === true;
-          const fuzzyLimit = 20;
-          // Tracks whether the ### Resurrected section was actually emitted.
-          // Step 6 (revival DB mutation) MUST NOT run unless this is true.
-          let resurrectEmitted = false;
-
-          // ── Step 1: Resolve candidate subjects via semantic or fuzzy seed ─────────
-          let candidateSubjects = [];
-          const ollamaSkip = (process.env.OLLAMA_SKIP === '1');
-
-          if (!ollamaSkip && seedText) {
-            // Phase 3.6 hook site — DO NOT REMOVE: semantic embedding seed not yet wired;
-            // intentionally falls through to pg_trgm/LIKE fuzzy fallback below.
-            // When Ollama is wired in Phase 3.6, populate candidateSubjects here via
-            // cosine distance on v_memory_hits (halfvec 4000) and skip the fuzzy path.
-          }
-
-          // Fuzzy fallback (always runs when ollamaSkip or semantic unavailable).
-          if (candidateSubjects.length === 0 && seedText) {
-            const { sql: fuzzySql, params: fuzzyParams } = db.buildFuzzyMatch(
-              projectId, seedText, fuzzyLimit
-            );
-            try {
-              const { rows: fuzzyRows } = await db.query(fuzzySql, fuzzyParams);
-              for (const r of fuzzyRows) {
-                if (r.subject && !candidateSubjects.includes(r.subject)) {
-                  candidateSubjects.push(r.subject);
-                }
-              }
-            } catch (fuzzyErr) {
-              // pg_trgm may be absent — degrade to empty candidate set (no resurrect section).
-              if (!silent) console.error(`[handoff] resurrect fuzzy-match error (non-fatal): ${fuzzyErr.message}`);
-            }
-          }
-
-          // If still no candidates (and a seed was provided), use all subjects with
-          // resurrect-eligible rows (bounded). Gated on seedText so that a whitespace-only
-          // or absent seed does not trigger an unconstrained fallback fetch of all probation
-          // subjects — that would bypass the empty-seed guard at Step 6.
-          if (candidateSubjects.length === 0 && seedText) {
-            const { rows: allSubj } = await db.query(
-              `SELECT DISTINCT subject FROM assertions
-               WHERE project_id = $1
-                 AND suppressed = true
-                 AND suppression_kind = 'downvoted_probation'
-               LIMIT $2`,
-              [projectId, fuzzyLimit]
-            );
-            candidateSubjects = allSubj.map((r) => r.subject);
-          }
-
-          // ── Step 2: Depth-2 graph fan-out from candidate subjects ──────────────
-          if (candidateSubjects.length > 0) {
-            try {
-              const graphMaxDepth = 2;
-              const graphMaxNodes = parseInt(
-                await getSetting(db, projectId, 'graph_max_nodes', '25'), 10
-              );
-              const { sql: cteSql, params: cteParams } = db.buildGraphCTE(
-                'out', candidateSubjects, graphMaxDepth, graphMaxNodes, projectId
-              );
-              const { rows: fanOutRows } = await db.query(cteSql, cteParams);
-              for (const r of fanOutRows) {
-                if (r.entity_name && !candidateSubjects.includes(r.entity_name)) {
-                  candidateSubjects.push(r.entity_name);
-                }
-              }
-            } catch (_fanErr) {
-              // Non-fatal — proceed with the seed subjects only.
-            }
-          }
-
-          // ── Step 3: Filter by M2 seed-gate (trusted anchor required) ─────────
-          // Only resurrect assertions whose subject has at least one trusted anchor:
-          //   reality_check='verified' OR pinned=true  (the L2 hasQualityCorroborator predicate).
-          let trustedSubjects = [];
-          if (candidateSubjects.length > 0) {
-            const { clause: tsClauses, params: tsContainsParams } =
-              db.buildArrayContains('subject', candidateSubjects, 2);
-            const { rows: trustedRows } = await db.query(
-              `SELECT DISTINCT subject FROM assertions
-               WHERE project_id = $1
-                 AND ${tsClauses}
-                 AND suppressed = false
-                 AND (reality_check = 'verified' OR pinned = true)`,
-              [projectId, ...tsContainsParams]
-            );
-            trustedSubjects = trustedRows.map((r) => r.subject);
-          }
-
-          // ── Step 4: Fetch resurrect-eligible rows scoped to trusted subjects ──
-          // Limit to 5 rows per subject (using a subquery rank to avoid any single
-          // subject flooding the result set and excluding other trusted subjects).
-          let resurrectRows = [];
-          if (trustedSubjects.length > 0) {
-            const { clause: subjClause, params: subjContainsParams } =
-              db.buildArrayContains('subject', trustedSubjects, 2);
-            const { rows: eligibleRows } = await db.query(
-              `SELECT id, subject, predicate, object, confidence, source,
-                      suppression_kind, created_at
-               FROM (
-                 SELECT id, subject, predicate, object, confidence, source,
-                        suppression_kind, created_at,
-                        ROW_NUMBER() OVER (PARTITION BY subject ORDER BY created_at DESC) AS rn
-                 FROM assertions
-                 WHERE project_id = $1
-                   AND ${subjClause}
-                   AND suppressed = true
-                   AND suppression_kind = 'downvoted_probation'
-               ) ranked
-               WHERE rn <= 5
-               ORDER BY subject ASC, created_at DESC
-               LIMIT 50`,
-              [projectId, ...subjContainsParams]
-            );
-            resurrectRows = eligibleRows;
-          }
-
-          // ── Step 5: Build output section (read-only by default) ──────────────
-          if (resurrectRows.length > 0) {
-            const lines = resurrectRows.map((r) => {
-              const ts = r.created_at
-                ? (typeof r.created_at === 'string' ? r.created_at : r.created_at.toISOString())
-                : 'unknown';
-              return `- [${r.source}|conf=${r.confidence}|${r.suppression_kind}|${ts}] ${r.subject} ${r.predicate} ${r.object}`;
-            });
-            const sectionText = lines.join('\n');
-            const resurrectSection = `### Resurrected (decayed/probationary, on-demand)\n${sectionText}`;
-            const cost = Math.ceil(resurrectSection.length / 4);
-            // Enforce sub-budget and global remaining budget.
-            if (cost <= subBudget && tokensUsed + cost <= tokenBudget) {
-              sections.push(resurrectSection);
-              tokensUsed      += cost;
-              assertionsCount += resurrectRows.length;
-              resurrectEmitted = true;
-            } else {
-              // Budget gate suppressed the section — warn if revival was requested.
-              if (reviveOpt) {
-                if (!silent) console.error(
-                  `[handoff] resurrect: revival SKIPPED — token budget exhausted before section could be emitted (subBudget=${subBudget}, cost=${cost}, tokensUsed=${tokensUsed}, tokenBudget=${tokenBudget}). Probation rows NOT revived.`
-                );
-              }
-            }
-          }
-
-          // ── Step 6: Revival mechanic (only on explicit opt-in q.revive=true) ─
-          // INVARIANT: resurrectEmitted must be true before any DB mutation runs.
-          // If the section was budget-blocked or seed was empty, skip revival and warn.
-          if (reviveOpt && !seedText) {
-            // Blank-seed guard: a revive with no seed would mass-revive all probation
-            // subjects. Read-only surfacing is still allowed; revival is not.
-            if (!silent) console.error(
-              '[handoff] resurrect: revival SKIPPED — revive=true requires a non-empty seed (blank seed would mass-revive all probation subjects). Probation rows NOT revived.'
-            );
-          } else if (reviveOpt && resurrectEmitted && resurrectRows.length > 0) {
-            const reviveIds = resurrectRows.map((r) => r.id);
-            const rehabStmt = db.buildProbationRehabUpdate(reviveIds);
-            if (rehabStmt) {
-              await db.query(rehabStmt.sql, rehabStmt.params);
-            }
+        if (subBudget > 0) {
+          const result = await runResurrectQuery(db, projectId, q, {
+            silent,
+            tokenBudget: subBudget,
+          });
+          if (result.sectionText) {
+            sections.push(result.sectionText);
+            tokensUsed      += Math.ceil(result.sectionText.length / 4);
+            assertionsCount += result.revivedRows;
           }
         }
+        // subBudget <= 0: skip silently (no section, no crash).
       } catch (resurrectErr) {
         // Non-fatal: any error degrades gracefully (no resurrect section, no crash).
         if (!silent) console.error(`[handoff] resurrect error (non-fatal): ${resurrectErr.message}`);
@@ -4058,6 +4111,132 @@ async function cmdPromote(args) {
   console.log(`\nDone: handoff:promote — assertion id=${assertionId} promoted to CLAUDE.md`);
 }
 
+// ── resurrect ────────────────────────────────────────────────────────────────
+
+/**
+ * /handoff:resurrect <topic> [--revive|-r] [--limit=N]
+ *
+ * Manually surface (dry-run) or un-suppress (--revive) dormant notes matching
+ * a topic seed. Backed by runResurrectQuery — the same engine used by the
+ * contract-driven loader branch, with no token-budget ceiling in CLI mode.
+ *
+ * Usage:
+ *   node scripts/handoff.js resurrect "auth bug"
+ *   node scripts/handoff.js resurrect "auth bug" --revive
+ *   node scripts/handoff.js resurrect "auth bug" --revive --limit=30
+ *
+ * Exit codes:
+ *   0  success (matches or no matches both count as success)
+ *   1  DB error (connect / query failure)
+ *   2  bad usage (missing seed text)
+ */
+async function cmdResurrect(args) {
+  console.log('Running: handoff:resurrect');
+
+  // ── Parse flags ─────────────────────────────────────────────────────────────
+
+  const helpFlag   = args.includes('--help') || args.includes('-h');
+  const reviveFlag = args.includes('--revive') || args.includes('-r');
+
+  const limitArg = args.find((a) => a.startsWith('--limit='));
+  let limit = 20;
+  if (limitArg) {
+    const parsed = parseInt(limitArg.slice('--limit='.length), 10);
+    if (!Number.isFinite(parsed) || parsed < 1) {
+      process.stderr.write('resurrect: --limit must be a positive integer\n');
+      process.exit(2);
+    }
+    limit = parsed;
+  }
+
+  // Usage / help
+  const USAGE = [
+    'Usage: node scripts/handoff.js resurrect <topic> [--revive|-r] [--limit=N]',
+    '',
+    '  <topic>      Topic seed text (required). Quoted phrases recommended.',
+    '  --revive,-r  Un-suppress matching probationary rows (default: dry-run only).',
+    '  --limit=N    Cap candidate subject set size (default 20).',
+    '  --help,-h    Show this help and exit.',
+    '',
+    'Dry-run mode (default): prints a preview of what WOULD be resurrected.',
+    'With --revive:          actually clears the suppressed flag on matched rows.',
+    '',
+    'Exit codes: 0 success, 1 DB error, 2 bad usage.',
+  ].join('\n');
+
+  if (helpFlag) {
+    console.log(USAGE);
+    process.exit(0);
+  }
+
+  // Positional arg: first non-flag argument is the seed text.
+  const seedText = args.filter((a) => !a.startsWith('-')).join(' ').trim();
+
+  if (!seedText) {
+    process.stderr.write('resurrect: seed text is required\n\n');
+    process.stderr.write(USAGE + '\n');
+    process.exit(2);
+  }
+
+  // ── Connect to DB ────────────────────────────────────────────────────────────
+
+  let db;
+  try {
+    db = await connectHandoff();
+  } catch (err) {
+    process.stderr.write(`DB connection failed: ${err.message}\n`);
+    process.exit(1);
+  }
+
+  const projectId = resolveProjectId();
+
+  // ── Run the resurrect engine ─────────────────────────────────────────────────
+
+  let result;
+  try {
+    result = await runResurrectQuery(db, projectId, {
+      type:   'resurrect',
+      seed:   seedText,
+      revive: reviveFlag,
+      limit,
+    }, {
+      silent:      false,
+      tokenBudget: Infinity,  // no token ceiling in CLI mode
+    });
+  } catch (err) {
+    await db.end();
+    process.stderr.write(`resurrect query failed: ${err.message}\n`);
+    process.exit(1);
+  }
+
+  await db.end();
+
+  // ── Output ───────────────────────────────────────────────────────────────────
+
+  if (!result.sectionText) {
+    console.log(`\nNo matching probationary rows found for seed: "${seedText}"`);
+    console.log('\nDone: handoff:resurrect — no matches');
+    process.exit(0);
+  }
+
+  // Replace the loader-style heading with a CLI-friendly heading.
+  const heading = reviveFlag
+    ? '### Resurrected (revived)'
+    : '### Resurrected (preview — dry-run)';
+  const bodyLines = result.sectionText.split('\n').slice(1).join('\n');
+  console.log(`\n${heading}\n${bodyLines}`);
+
+  if (reviveFlag) {
+    const count = result.revivedIds.length;
+    console.log(`\n  Revived: ${count} row(s) un-suppressed (suppressed cleared, suppression_kind cleared).`);
+  } else {
+    console.log('\n  (Dry-run — no rows modified. Pass --revive to un-suppress.)');
+  }
+
+  const doneVerb = reviveFlag ? `${result.revivedIds.length} row(s) revived` : 'dry-run (no changes)';
+  console.log(`\nDone: handoff:resurrect — ${doneVerb}`);
+}
+
 // ── queue-drain ───────────────────────────────────────────────────────────────
 
 /**
@@ -4597,6 +4776,7 @@ async function main() {
     close:           () => cmdClose(rest),
     purge:           () => cmdPurge(rest),
     promote:         () => cmdPromote(rest),
+    resurrect:       () => cmdResurrect(rest),
     'queue-drain':   () => cmdQueueDrain(rest),
     prune:           () => cmdPrune(rest),
     retire:          () => cmdRetire(rest),
