@@ -35,6 +35,9 @@ const {
   _deriveAnchor,
   _findSymbolRange,
   _findSnippetLine,
+  _resolvePointerPath,
+  _proseVsContentOverlap,
+  _suppressStaleLegacyPointers,
   validatePointers,
   runPointerGate,
 } = require('../../scripts/handoff.js');
@@ -331,16 +334,18 @@ async function runTests() {
     const derivedAnchors = new Map();
     const correctedPtrs  = new Map();
 
+    // Text includes "legacyFunc" — overlaps with the function name at line 2, so P-4 does not fire.
     const { rewrittenText, findings } = validatePointers(
-      `See ${pointer} for the impl.`, dir, storedAnchors, derivedAnchors, correctedPtrs, 'close', false
+      `See ${pointer} for legacyFunc impl.`, dir, storedAnchors, derivedAnchors, correctedPtrs, 'close', false
     );
-    // Text should be unchanged (line number is plausible)
-    assert.strictEqual(rewrittenText, `See ${pointer} for the impl.`, 'Text must not change for legacy pointer with plausible line');
+    // Text should be unchanged (line number is plausible and overlap passes)
+    assert.strictEqual(rewrittenText, `See ${pointer} for legacyFunc impl.`, 'Text must not change for legacy pointer with plausible line');
     // A derived anchor should have been created for future use
     assert.ok(derivedAnchors.has(pointer), 'derivedAnchors should contain a derived entry for the legacy pointer');
     const derived = derivedAnchors.get(pointer);
     assert.ok(derived && (derived.symbol || derived.snippet), 'Derived anchor must have symbol or snippet');
-    assert.strictEqual(findings.length, 0, 'No findings for a valid legacy pointer');
+    const p4 = findings.filter((f) => f.rule === 'P-4');
+    assert.strictEqual(p4.length, 0, 'No P-4 finding when prose overlaps with file content');
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -523,6 +528,185 @@ async function runTests() {
     } finally {
       fs.rmSync(fakeRoot, { recursive: true, force: true });
     }
+  });
+
+  // ── T11: Legacy pointer, zero token overlap → P-4 finding, no anchor derived ─
+  await test('T11: legacy pointer, zero prose-vs-content overlap → P-4, no derived anchor', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ptr-gate-t11-'));
+    const scriptsDir = path.join(dir, 'scripts');
+    fs.mkdirSync(scriptsDir, { recursive: true });
+    // File line 42: contains only unrelated code, no tokens from the prose
+    const lines = Array.from({ length: 45 }, (_, i) => {
+      if (i === 41) return "const unrelated = require('./elsewhere');";
+      return `// line ${i + 1}`;
+    });
+    fs.writeFileSync(path.join(scriptsDir, 'handoff.js'), lines.join('\n'), 'utf8');
+
+    // Text that mentions the pointer — prose tokens: "semantic-vector-stub", "WIRED"
+    // None of these appear in line 42 content
+    const pointer = 'scripts/handoff.js:42';
+    const text    = `semantic-vector-stub NOT WIRED at ${pointer}`;
+    const storedAnchors  = new Map();
+    const derivedAnchors = new Map();
+    const correctedPtrs  = new Map();
+
+    const { findings } = validatePointers(text, dir, storedAnchors, derivedAnchors, correctedPtrs, 'close', false);
+    const p4 = findings.filter((f) => f.rule === 'P-4');
+    assert.ok(p4.length >= 1, `Expected at least one P-4 finding, got: ${JSON.stringify(findings)}`);
+    assert.ok(p4[0].message.includes(pointer), `P-4 message should name the pointer, got: ${p4[0].message}`);
+    assert.ok(!derivedAnchors.has(pointer), 'derivedAnchors must NOT contain the pointer when overlap is zero');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // ── T12: Legacy pointer, token overlap → no P-4, anchor derived ──────────────
+  await test('T12: legacy pointer, token overlap passes → no P-4, derived anchor present', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ptr-gate-t12-'));
+    const scriptsDir = path.join(dir, 'scripts');
+    fs.mkdirSync(scriptsDir, { recursive: true });
+    // File line 42: contains tokens matching the prose ("semantic" or "stub")
+    const lines = Array.from({ length: 45 }, (_, i) => {
+      if (i === 41) return 'function semanticVectorStub() {';
+      if (i === 42) return '  return null;';
+      if (i === 43) return '}';
+      return `// line ${i + 1}`;
+    });
+    fs.writeFileSync(path.join(scriptsDir, 'handoff.js'), lines.join('\n'), 'utf8');
+
+    const pointer = 'scripts/handoff.js:42';
+    const text    = `semantic-vector-stub NOT WIRED at ${pointer}`;
+    const storedAnchors  = new Map();
+    const derivedAnchors = new Map();
+    const correctedPtrs  = new Map();
+
+    const { findings } = validatePointers(text, dir, storedAnchors, derivedAnchors, correctedPtrs, 'close', false);
+    const p4 = findings.filter((f) => f.rule === 'P-4');
+    assert.strictEqual(p4.length, 0, `Expected no P-4 finding, got: ${JSON.stringify(p4)}`);
+    assert.ok(derivedAnchors.has(pointer), 'derivedAnchors must contain an entry when overlap passes');
+    const derived = derivedAnchors.get(pointer);
+    assert.ok(derived && (derived.symbol || derived.snippet), 'Derived anchor must have symbol or snippet');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // ── T13: Bulk supersession pass ───────────────────────────────────────────────
+  await test('T13: bulk supersession — stale rows suppressed, passing rows anchored, already-suppressed unchanged', async () => {
+    const fakeRoot = mkFakeRoot(TARGET_DB);
+    try {
+      const scriptsDir = path.join(fakeRoot, 'scripts');
+      fs.mkdirSync(scriptsDir, { recursive: true });
+      // Write a file with lines 42 (unrelated), 50 (realHelper), 99 (anything)
+      const lines = Array.from({ length: 102 }, (_, i) => {
+        if (i === 41) return "const unrelated = require('./elsewhere');";
+        if (i === 49) return 'function realHelper() {';
+        if (i === 50) return '  return true;';
+        if (i === 51) return '}';
+        if (i === 98) return '// placeholder line 99';
+        return `// line ${i + 1}`;
+      });
+      fs.writeFileSync(path.join(scriptsDir, 'handoff.js'), lines.join('\n'), 'utf8');
+
+      // Connect to the throwaway DB and provision the schema
+      runHelper('init', [], { fakeRoot });
+
+      // Read the project_id from the .claude-memory marker written by init
+      const markerPath = path.join(fakeRoot, '.claude-memory');
+      assert.ok(fs.existsSync(markerPath), '.claude-memory marker must exist after init');
+      const markerTxt = fs.readFileSync(markerPath, 'utf8');
+      const uuidMatch = markerTxt.match(/"uuid"\s*:\s*"([^"]+)"/);
+      assert.ok(uuidMatch, '.claude-memory must contain a uuid field');
+      const testProjectId = uuidMatch[1];
+
+      // Open a direct DB connection to insert test rows
+      const db = await pgConnect(TARGET_DB);
+      try {
+
+        // Insert Row A: stale — prose says "semantic-vector-stub" but line 42 is unrelated
+        const rowA = await db.query(
+          `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, anchor, suppressed)
+           VALUES ($1, 'semantic-vector-stub', 'is_at', 'scripts/handoff.js:42', 7, 'model_extracted', NULL, false)
+           RETURNING id`,
+          [testProjectId]
+        );
+        const idA = rowA.rows[0].id;
+
+        // Insert Row B: passes — prose "real-helper" overlaps with "realHelper" at line 50
+        const rowB = await db.query(
+          `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, anchor, suppressed)
+           VALUES ($1, 'real-helper', 'is_at', 'scripts/handoff.js:50', 7, 'model_extracted', NULL, false)
+           RETURNING id`,
+          [testProjectId]
+        );
+        const idB = rowB.rows[0].id;
+
+        // Insert Row C: already suppressed — must be unchanged
+        const rowC = await db.query(
+          `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, anchor, suppressed)
+           VALUES ($1, 'already-suppressed', 'is_at', 'scripts/handoff.js:99', 7, 'model_extracted', NULL, true)
+           RETURNING id`,
+          [testProjectId]
+        );
+        const idC = rowC.rows[0].id;
+
+        // Run the bulk supersession pass
+        await _suppressStaleLegacyPointers(db, testProjectId, fakeRoot);
+
+        // Check Row A: should be suppressed, anchor still NULL
+        const afterA = await db.query(`SELECT suppressed, anchor FROM assertions WHERE id = $1`, [idA]);
+        assert.strictEqual(afterA.rows[0].suppressed, true, 'Row A must be suppressed');
+        assert.strictEqual(afterA.rows[0].anchor, null, 'Row A anchor must remain NULL');
+
+        // Check Row B: suppressed=false, anchor IS NOT NULL
+        const afterB = await db.query(`SELECT suppressed, anchor FROM assertions WHERE id = $1`, [idB]);
+        assert.strictEqual(afterB.rows[0].suppressed, false, 'Row B must remain unsuppressed');
+        assert.ok(afterB.rows[0].anchor !== null, 'Row B must have an anchor derived');
+
+        // Check Row C: unchanged — suppressed=true, anchor still NULL
+        const afterC = await db.query(`SELECT suppressed, anchor FROM assertions WHERE id = $1`, [idC]);
+        assert.strictEqual(afterC.rows[0].suppressed, true, 'Row C must still be suppressed (unchanged)');
+        assert.strictEqual(afterC.rows[0].anchor, null, 'Row C anchor must remain NULL');
+
+        // Idempotency: run again — no changes
+        await _suppressStaleLegacyPointers(db, testProjectId, fakeRoot);
+        const idempA = await db.query(`SELECT suppressed, anchor FROM assertions WHERE id = $1`, [idA]);
+        assert.strictEqual(idempA.rows[0].suppressed, true, 'Row A idempotent: still suppressed');
+        const idempB = await db.query(`SELECT suppressed, anchor FROM assertions WHERE id = $1`, [idB]);
+        assert.strictEqual(idempB.rows[0].suppressed, false, 'Row B idempotent: still unsuppressed');
+
+      } finally {
+        await db.end();
+      }
+    } finally {
+      fs.rmSync(fakeRoot, { recursive: true, force: true });
+    }
+  });
+
+  // ── T14: Bare-filename path fallback ─────────────────────────────────────────
+  await test('T14: bare-filename pointer resolved via scripts/ fallback → no P-1, anchor derived', () => {
+    // Create a project root with scripts/handoff.js but no root-level handoff.js
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ptr-gate-t14-'));
+    const scriptsDir = path.join(dir, 'scripts');
+    fs.mkdirSync(scriptsDir, { recursive: true });
+    // Line 10 contains "handoffContext" which overlaps with "handoff" and "context" in prose
+    const lines = Array.from({ length: 15 }, (_, i) => {
+      if (i === 9) return 'function handoffContext() { return true; }';
+      return `// line ${i + 1}`;
+    });
+    fs.writeFileSync(path.join(scriptsDir, 'handoff.js'), lines.join('\n'), 'utf8');
+    // No root-level handoff.js — the bare-filename fallback must kick in
+
+    // Text uses bare filename pointer (no scripts/ prefix)
+    const pointer = 'handoff.js:10';
+    const text    = `see ${pointer} for handoff context`;
+    const storedAnchors  = new Map();
+    const derivedAnchors = new Map();
+    const correctedPtrs  = new Map();
+
+    const { findings } = validatePointers(text, dir, storedAnchors, derivedAnchors, correctedPtrs, 'close', false);
+    const p1 = findings.filter((f) => f.rule === 'P-1');
+    assert.strictEqual(p1.length, 0, `Expected no P-1 finding (fallback should resolve), got: ${JSON.stringify(p1)}`);
+    assert.ok(derivedAnchors.has(pointer), `derivedAnchors must contain an entry for ${pointer}`);
+    const derived = derivedAnchors.get(pointer);
+    assert.ok(derived && (derived.symbol || derived.snippet), 'Derived anchor must have symbol or snippet');
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 
   // Clean up throwaway DB.

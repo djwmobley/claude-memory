@@ -406,6 +406,25 @@ function detectCloseContradictions(payload, degradedList, root) {
 // (sessions N-2, N-1, N).  Per feedback_recurring_drift_build_enforcement_not_a_note,
 // the fix is an automated gate wired into the harness — not another corrected line
 // number stored in memory that will rot again.
+//
+// Extended in PR #86 (stale-entry categorical fix):
+//
+//  P-4 rule (prose-vs-content check): For legacy pointers (no stored anchor),
+//  a prose-window vs. file-window identifier-overlap check is run before
+//  deriving and locking in an anchor.  Zero overlap → P-4 finding; anchor NOT
+//  derived.  This prevents silently locking in a wrong anchor for a pointer
+//  whose line number has already drifted.
+//
+//  Bulk supersession (_suppressStaleLegacyPointers): Called at close time after
+//  _backfillMissingAnchors.  Iterates anchor-IS-NULL assertions that have
+//  pointer-shaped objects and runs the same prose-vs-content check.  Rows that
+//  fail overlap are suppressed (suppressed = true) — §7 no-backfill invariant
+//  respected (subject/predicate/object/source never updated).
+//
+//  Bare-filename path fallback (_resolvePointerPath): Pointers like
+//  "handoff.js:1106" (no path prefix) now try scripts/, src/, lib/, test/ in
+//  order before emitting a P-1 false positive.  The served pointer string is
+//  never rewritten — only the existence check is more lenient.
 
 /** Known code/text extensions that can contain valid code pointers. */
 const POINTER_EXTENSIONS = new Set([
@@ -459,8 +478,9 @@ function _findEnclosingSymbol(lines, lineIdx, ext) {
 }
 
 function _deriveAnchor(root, pointerInfo) {
-  const absPath = path.join(root, pointerInfo.path);
-  if (!fs.existsSync(absPath)) return null;
+  // Use _resolvePointerPath so bare-filename pointers get the subdirectory fallback.
+  const absPath = _resolvePointerPath(root, pointerInfo.path);
+  if (!absPath) return null;
   let content;
   try { content = fs.readFileSync(absPath, 'utf8'); } catch (_) { return null; }
   const lines   = content.split('\n');
@@ -516,7 +536,111 @@ function _findSnippetLine(lines, snippet) {
 }
 
 /**
+ * Resolve a pointer path against the project root, trying common subdirectories
+ * when the raw path does not exist.  Only the fallback search is attempted when
+ * the pointer contains no slashes (bare filename like "handoff.js").
+ *
+ * @param {string} projectRoot   — absolute project root
+ * @param {string} ptrPath       — path component from the pointer
+ * @returns {string|null}        — resolved absolute path, or null if not found anywhere
+ */
+function _resolvePointerPath(projectRoot, ptrPath) {
+  const direct = path.join(projectRoot, ptrPath);
+  if (fs.existsSync(direct)) return direct;
+  const hasSep = ptrPath.includes('/') || ptrPath.includes('\\');
+  if (hasSep) return null;
+  for (const sub of ['scripts', 'src', 'lib', 'test']) {
+    const candidate = path.join(projectRoot, sub, ptrPath);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Extract identifier-shaped tokens from a text string.
+ * Matches camelCase, snake_case, kebab-case, and dotted identifiers of length >= 4.
+ *
+ * @param {string} text
+ * @returns {Set<string>} — lowercase token set
+ */
+function _extractIdentifierTokens(text) {
+  const TOKEN_RE = /[A-Za-z_][A-Za-z0-9_\-.]{3,}/g;
+  const tokens   = new Set();
+  let m;
+  while ((m = TOKEN_RE.exec(text)) !== null) {
+    const raw = m[0];
+    tokens.add(raw.toLowerCase());
+    // Also split compound identifiers into parts so that kebab-case, snake_case,
+    // camelCase, and dotted names all yield their component sub-tokens.
+    // This ensures e.g. "semantic-vector-stub" (prose) matches "semanticVectorStub" (code).
+    // Steps: (1) insert space at lower→Upper camelCase boundaries, (2) split on
+    // delimiters and whitespace.
+    const parts = raw
+      .replace(/([a-z])([A-Z])/g, '$1 $2')   // camelCase split
+      .split(/[-_.\s]+/g);                    // kebab, snake, dotted, whitespace
+    for (const p of parts) {
+      if (p.length >= 4) tokens.add(p.toLowerCase());
+    }
+  }
+  return tokens;
+}
+
+/**
+ * Extract identifier tokens from a +/-windowChars window around the pointer
+ * literal in the prose text (the pointer literal itself is excluded).
+ *
+ * @param {string} text        — full prose text
+ * @param {string} pointerStr  — the pointer literal
+ * @param {number} windowChars — characters to include on each side (default 200)
+ * @returns {Set<string>}
+ */
+function _extractProseTokens(text, pointerStr, windowChars = 200) {
+  const idx = text.indexOf(pointerStr);
+  if (idx === -1) return new Set();
+  const before = text.slice(Math.max(0, idx - windowChars), idx);
+  const after  = text.slice(idx + pointerStr.length, idx + pointerStr.length + windowChars);
+  return _extractIdentifierTokens(before + ' ' + after);
+}
+
+/**
+ * Run the prose-vs-content overlap check for a legacy pointer (no stored anchor).
+ * Extracts identifier tokens from a prose window around the pointer and from a
+ * +/-3-line window in the file.  Returns true if overlap >= 1 token.
+ *
+ * @param {string}   prose       — text block containing the pointer
+ * @param {string}   pointerStr  — the pointer literal
+ * @param {string[]} fileLines   — lines of the resolved file
+ * @param {number}   startLine   — 1-based cited line
+ * @returns {boolean}
+ */
+function _proseVsContentOverlap(prose, pointerStr, fileLines, startLine) {
+  const lineIdx   = startLine - 1;
+  const winStart  = Math.max(0, lineIdx - 3);
+  const winEnd    = Math.min(fileLines.length, lineIdx + 4);
+  const fileWindow = fileLines.slice(winStart, winEnd).join('\n');
+  const fileTokens  = _extractIdentifierTokens(fileWindow);
+  const proseTokens = _extractProseTokens(prose, pointerStr);
+  for (const t of proseTokens) {
+    if (fileTokens.has(t)) return true;
+  }
+  return false;
+}
+
+/**
  * Run the pointer-staleness gate over a text block.
+ *
+ * For each code pointer found in text:
+ *  - P-1: file no longer present (or unreadable). Also emits P-1 if a bare-filename
+ *    pointer is not found anywhere in scripts/, src/, lib/, or test/ subdirs.
+ *  - P-2: no stored anchor and cited line is out of range / blank.
+ *  - P-3: stored symbol/snippet no longer found in file.
+ *  - P-4 (NEW): no stored anchor and prose-vs-content identifier overlap is zero —
+ *    the pointer's cited line contains nothing that matches identifiers from the
+ *    surrounding assertion prose.  Anchor is NOT derived; the pointer is flagged stale.
+ *
+ * Bare-filename path resolution (NEW): when pi.path contains no slashes and the file
+ * is not at root, _resolvePointerPath tries scripts/, src/, lib/, test/ in order.
+ * The served pointer string is never altered; only the existence check is more lenient.
  *
  * @param {string}  text           — text block to scan
  * @param {string}  projectRoot    — absolute project root path
@@ -536,9 +660,12 @@ function validatePointers(text, projectRoot, storedAnchors, derivedAnchors, corr
   let   rewritten = text;
 
   for (const pi of pointers) {
-    const absPath = path.join(projectRoot, pi.path);
+    // Sub-deliverable #3: bare-filename path fallback.
+    // _resolvePointerPath tries scripts/, src/, lib/, test/ when the raw path fails.
+    // The served pointer string is never changed; only the existence check is lenient.
+    const absPath = _resolvePointerPath(projectRoot, pi.path);
 
-    if (!fs.existsSync(absPath)) {
+    if (!absPath) {
       findings.push({ rule: 'P-1', message: `stale pointer: ${pi.pointer} — file ${pi.path} no longer present` });
       continue;
     }
@@ -548,6 +675,13 @@ function validatePointers(text, projectRoot, storedAnchors, derivedAnchors, corr
       continue;
     }
 
+    // Build a pointerInfo that points at the resolved absolute path for _deriveAnchor.
+    // For bare-filename fallbacks the resolved sub-path replaces pi.path internally.
+    const resolvedRelPath = path.relative(projectRoot, absPath).replace(/\\/g, '/');
+    const piResolved = resolvedRelPath !== pi.path
+      ? Object.assign({}, pi, { path: resolvedRelPath })
+      : pi;
+
     const stored = storedAnchors.get(pi.pointer);
 
     // No stored anchor — legacy path.
@@ -555,9 +689,18 @@ function validatePointers(text, projectRoot, storedAnchors, derivedAnchors, corr
       const lineIdx   = pi.startLine - 1;
       const plausible = lineIdx >= 0 && lineIdx < fileLines.length && fileLines[lineIdx].trim().length > 0;
       if (plausible) {
+        // Sub-deliverable #1: prose-vs-content overlap check (P-4 rule).
+        // Before locking in an anchor, require >= 1 identifier token shared between
+        // the prose window around the pointer and the +-3-line window in the file.
+        const hasOverlap = _proseVsContentOverlap(text, pi.pointer, fileLines, pi.startLine);
+        if (!hasOverlap) {
+          findings.push({ rule: 'P-4', message: `stale pointer: ${pi.pointer} — assertion prose does not match cited content` });
+          // Do NOT derive an anchor. Do NOT add to derivedAnchors. Continue.
+          continue;
+        }
         if (!derivedAnchors.has(pi.pointer)) {
-          const derived = _deriveAnchor(projectRoot, pi);
-          if (derived) derivedAnchors.set(pi.pointer, derived);
+          const derived = _deriveAnchor(projectRoot, piResolved);
+          if (derived) derivedAnchors.set(pi.pointer, Object.assign({}, derived, { pointer: pi.pointer }));
         }
         if (warnLegacy && mode === 'close') {
           process.stderr.write(`[handoff] pointer-gate: legacy pointer ${pi.pointer} — no stored anchor; derived for next close\n`);
@@ -693,6 +836,85 @@ async function _backfillMissingAnchors(db, projectId, projectRoot) {
     if (filled > 0) process.stderr.write(`[handoff] pointer-gate: backfilled anchors for ${filled} assertion(s)\n`);
   } catch (err) {
     process.stderr.write(`[handoff] pointer-gate: anchor backfill failed (non-fatal): ${err.message}\n`);
+  }
+}
+
+/**
+ * Bulk supersession pass for pre-gate stale-pointer legacy rows.
+ *
+ * Called at close time (after _backfillMissingAnchors).  Iterates all
+ * anchor-IS-NULL assertion rows with pointer-shaped objects and runs the
+ * prose-vs-content overlap check.  Rows that fail overlap are suppressed
+ * (suppressed = true).  Rows that pass get an anchor derived and persisted.
+ *
+ * Resume mode NEVER runs this pass (§7 no-backfill invariant + gate close/resume split).
+ *
+ * S10 compliance: we NEVER UPDATE subject / predicate / object / source.
+ * Only `suppressed` and `anchor` are written.
+ *
+ * @param {object} db          — pg Client
+ * @param {string} projectId
+ * @param {string} projectRoot — absolute project root
+ */
+async function _suppressStaleLegacyPointers(db, projectId, projectRoot) {
+  try {
+    const { rows } = await db.query(
+      `SELECT id, subject, predicate, object
+         FROM assertions
+        WHERE project_id = $1 AND anchor IS NULL AND suppressed = false
+          AND object ~ $2`,
+      [projectId, '\\.[a-z]+:[0-9]']
+    );
+    if (!rows.length) return;
+    let suppressed = 0;
+    let anchored   = 0;
+    for (const row of rows) {
+      const ptrs = _extractPointers(row.object);
+      if (!ptrs.length) continue;
+      const ptr = ptrs[0];
+      // Resolve the file — use the same fallback logic as validatePointers.
+      const absPath = _resolvePointerPath(projectRoot, ptr.path);
+      if (!absPath) {
+        // File not found — suppress as stale.
+        await db.query(`UPDATE assertions SET suppressed = true WHERE id = $1`, [row.id]);
+        suppressed++;
+        process.stderr.write(`[handoff] pointer-gate: suppressed legacy stale-pointer assertion id=${row.id} pointer=${ptr.pointer} — file not found\n`);
+        continue;
+      }
+      let fileLines;
+      try { fileLines = fs.readFileSync(absPath, 'utf8').split('\n'); } catch (_) { continue; }
+      // Compose prose from subject + predicate (object contains only the pointer in these rows).
+      const prose = `${row.subject} ${row.predicate} ${row.object}`;
+      const lineIdx = ptr.startLine - 1;
+      const plausible = lineIdx >= 0 && lineIdx < fileLines.length && fileLines[lineIdx].trim().length > 0;
+      if (!plausible) {
+        await db.query(`UPDATE assertions SET suppressed = true WHERE id = $1`, [row.id]);
+        suppressed++;
+        process.stderr.write(`[handoff] pointer-gate: suppressed legacy stale-pointer assertion id=${row.id} pointer=${ptr.pointer} — line out of range or blank\n`);
+        continue;
+      }
+      const hasOverlap = _proseVsContentOverlap(prose, ptr.pointer, fileLines, ptr.startLine);
+      if (!hasOverlap) {
+        await db.query(`UPDATE assertions SET suppressed = true WHERE id = $1`, [row.id]);
+        suppressed++;
+        process.stderr.write(`[handoff] pointer-gate: suppressed legacy stale-pointer assertion id=${row.id} pointer=${ptr.pointer} — prose-vs-content mismatch\n`);
+      } else {
+        // Overlap passes — derive and persist an anchor.
+        const resolvedRelPath = path.relative(projectRoot, absPath).replace(/\\/g, '/');
+        const piResolved = resolvedRelPath !== ptr.path
+          ? Object.assign({}, ptr, { path: resolvedRelPath })
+          : ptr;
+        const anchor = _deriveAnchor(projectRoot, piResolved);
+        if (anchor) {
+          await db.query(`UPDATE assertions SET anchor = $1 WHERE id = $2`, [JSON.stringify(Object.assign({}, anchor, { pointer: ptr.pointer })), row.id]);
+          anchored++;
+        }
+      }
+    }
+    if (suppressed > 0) process.stderr.write(`[handoff] pointer-gate: bulk-suppressed ${suppressed} stale legacy assertion(s)\n`);
+    if (anchored   > 0) process.stderr.write(`[handoff] pointer-gate: derived anchors for ${anchored} passing legacy assertion(s)\n`);
+  } catch (err) {
+    process.stderr.write(`[handoff] pointer-gate: bulk supersession failed (non-fatal): ${err.message}\n`);
   }
 }
 
@@ -4350,6 +4572,9 @@ async function cmdClose(args) {
     try {
       // Run anchor backfill for any legacy assertion rows before validating.
       await _backfillMissingAnchors(db, projectId, root);
+      // Sub-deliverable #2: suppress legacy stale-pointer rows via prose-vs-content check.
+      // Runs only at close time (never at resume — §7 no-backfill invariant).
+      await _suppressStaleLegacyPointers(db, projectId, root);
 
       const gateResult = await runPointerGate(
         {
@@ -5455,6 +5680,11 @@ if (require.main === module) {
     _deriveAnchor,
     _findSymbolRange,
     _findSnippetLine,
+    _resolvePointerPath,
+    _extractIdentifierTokens,
+    _extractProseTokens,
+    _proseVsContentOverlap,
+    _suppressStaleLegacyPointers,
     validatePointers,
     runPointerGate,
   };
