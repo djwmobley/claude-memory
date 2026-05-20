@@ -377,6 +377,36 @@ async function runTests() {
     assert.ok(out.includes('Done: handoff:resume'), 'resume should emit Done line');
   });
 
+  await test('resume: seeds session_in_progress marker', async () => {
+    // Resume may have triggered identity resolution (ensureProjectIdentity), which mints a
+    // .claude-memory UUID marker in fakeRoot and writes all DB rows under that UUID — not
+    // under the legacy encodedRoot.  Resolve the actual project_id by reading the marker
+    // if present; fall back to encodedRoot for repos that have not yet been migrated.
+    const markerPath = path.join(fakeRoot, '.claude-memory');
+    let resumeProjectId = encodedRoot;
+    if (fs.existsSync(markerPath)) {
+      try {
+        const markerText = fs.readFileSync(markerPath, 'utf8');
+        const uuidMatch  = markerText.match(/"uuid"\s*:\s*"([^"]+)"/);
+        if (uuidMatch) resumeProjectId = uuidMatch[1];
+      } catch (_) { /* ignore — fall back to encodedRoot */ }
+    }
+
+    // Clear any existing marker under whichever project_id resume will use.
+    await db.query(
+      "DELETE FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'",
+      [resumeProjectId]
+    );
+    runHelper('resume', [], { fakeRoot });
+    const { rows } = await db.query(
+      "SELECT value FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'",
+      [resumeProjectId]
+    );
+    assert.strictEqual(rows.length, 1, 'session_in_progress should be set after resume');
+    // Value should be an ISO timestamp (non-empty string).
+    assert.ok(rows[0].value && rows[0].value.length > 0, 'session_in_progress value should be a non-empty ISO timestamp');
+  });
+
   // ── Test 6: drop zeroes assertions and archives handoff.md ───────────────
   await test('drop: emits Running and Done lines', () => {
     const out = runHelper('drop', [], { fakeRoot });

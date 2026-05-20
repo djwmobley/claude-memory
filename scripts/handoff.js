@@ -2062,6 +2062,32 @@ async function cmdLoaderHook() {
 async function cmdResume() {
   console.log('Running: handoff:resume');
   const result = await cmdLoaderLoad();
+
+  // Seed session_in_progress so the Stop hook and cmdClose can resolve session_id
+  // for C2 bias attribution.  The SessionStart auto-loader hook seeds this same
+  // marker on hook-triggered sessions; manual /handoff:resume must do the same.
+  // cmdLoaderLoad opens and closes its own db connection (ownDb path), so we
+  // open a fresh connection here for the marker write — identical defensive pattern
+  // to the loader-hook block at :2014-2031.
+  try {
+    const projectId = resolveProjectId();
+    let markerDb = null;
+    let markerDbOwned = false;
+    try {
+      markerDb = await connectHandoff();
+      markerDbOwned = true;
+    } catch (_) {
+      markerDb = null;
+    }
+    if (markerDb) {
+      await setSetting(markerDb, projectId, 'session_in_progress', new Date().toISOString());
+      if (markerDbOwned) await markerDb.end();
+    }
+  } catch (markerErr) {
+    // Non-fatal: marker write failure must never abort resume.
+    process.stderr.write(`[handoff] resume: session_in_progress marker write failed (non-fatal): ${markerErr.message}\n`);
+  }
+
   console.log(`\nDone: handoff:resume — injected ${result.assertionsCount} assertions, ${result.entitiesCount} entities, ${result.vectorCount} vector matches`);
 }
 
@@ -2768,15 +2794,14 @@ async function cmdCheckpoint(args) {
       DEGRADED_SECTION:    '',
     });
 
-    // Clear session_in_progress so the Stop hook treats this checkpoint as an explicit save.
-    await db.query(
-      `DELETE FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'`,
-      [projectId]
-    );
+    // Do NOT clear session_in_progress here.  The Stop hook's implicit close
+    // (loader-stop path) is responsible for clearing the marker at true session end.
+    // Clearing it at checkpoint time kills C2 attribution for any work done after
+    // the checkpoint, defeating the entire purpose of mid-session saves.
 
     await db.end();
 
-    console.log(`\nDone: handoff:checkpoint — payload queued for async extraction (session marker cleared)`);
+    console.log(`\nDone: handoff:checkpoint — payload queued for async extraction (session marker preserved for continued attribution)`);
     return;
   }
 
@@ -2802,12 +2827,10 @@ async function cmdCheckpoint(args) {
     DEGRADED_SECTION:    '',
   });
 
-  // Clear session_in_progress so the Phase 3.7 Stop hook treats this checkpoint
-  // as an explicit save and skips the implicit close.
-  await db.query(
-    `DELETE FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'`,
-    [projectId]
-  );
+  // Do NOT clear session_in_progress here.  The Stop hook's implicit close
+  // (loader-stop path) is responsible for clearing the marker at true session end.
+  // Clearing it at checkpoint time kills C2 attribution for any work done after
+  // the checkpoint, defeating the entire purpose of mid-session saves.
 
   // Run reranker gate (informational)
   await runRerankerGate(db, projectId, root);
@@ -2817,7 +2840,7 @@ async function cmdCheckpoint(args) {
   console.log(`\n  entities written:    ${entitiesWritten}`);
   console.log(`  assertions written:  ${assertionsWritten}`);
   console.log(`  edges written:       ${edgesWritten}`);
-  console.log(`\nDone: handoff:checkpoint — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written (session marker cleared)`);
+  console.log(`\nDone: handoff:checkpoint — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written (session marker preserved for continued attribution)`);
 }
 
 // ── close ─────────────────────────────────────────────────────────────────────
