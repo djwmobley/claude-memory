@@ -1418,12 +1418,15 @@ async function runResurrectQuery(db, projectId, q, opts = {}) {
       const vecLiteral = '[' + vec.join(',') + ']';
       const { rows: semRows } = await db.query(
         `SELECT DISTINCT subject
-         FROM assertions
-         WHERE project_id = $1
-           AND embedding IS NOT NULL
-           AND 1 - (embedding <=> $2::halfvec) >= $3
-         ORDER BY (embedding <=> $2::halfvec) ASC
-         LIMIT $4`,
+         FROM (
+           SELECT subject, (embedding <=> $2::halfvec) AS dist
+           FROM assertions
+           WHERE project_id = $1
+             AND embedding IS NOT NULL
+             AND 1 - (embedding <=> $2::halfvec) >= $3
+           ORDER BY dist ASC
+           LIMIT $4
+         ) sub`,
         [projectId, vecLiteral, cosineThreshold, fuzzyLimit]
       );
       for (const r of semRows) {
