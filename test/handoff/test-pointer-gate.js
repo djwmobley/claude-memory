@@ -4,7 +4,9 @@
  * test-pointer-gate.js — Tests T1–T10 for the pointer-staleness gate.
  *
  * Mirrors test/handoff/test-handoff.js structure. Each test uses a unique
- * project_id derived from a timestamp. Database: claude_memory_eval_test.
+ * project_id derived from a timestamp. Creates a throwaway Postgres DB
+ * (claude_memory_ptr_gate_<ts>) so it is self-contained — no pre-existing
+ * database or schema setup is required.
  *
  * Tests T1–T7 test internal functions via require() — no subprocess overhead.
  * Tests T8–T10 use subprocess close/resume to test integration behavior.
@@ -13,8 +15,7 @@
  *   node test/handoff/test-pointer-gate.js
  *
  * Prerequisites:
- *   - Postgres running with claude_memory_eval_test database
- *   - Pointer-staleness gate schema (anchor column) applied
+ *   - Postgres available at PGHOST/PGUSER/PGPASSWORD (CI) or localhost/postgres
  *
  * Exit codes: 0 all-pass, 1 any failure, 2 infrastructure error.
  */
@@ -25,8 +26,7 @@ const fs     = require('fs');
 const os     = require('os');
 const { execFileSync } = require('child_process');
 
-const { loadConfig } = require('../../scripts/lib/shared');
-const { encodeCwd, getClaudeProjectDir } = require('../../scripts/lib/encoded-cwd');
+const { getClaudeProjectDir } = require('../../scripts/lib/encoded-cwd');
 const { Client } = require('../../scripts/node_modules/pg');
 
 // Import pointer-gate internals from handoff.js (no CLI execution)
@@ -41,9 +41,12 @@ const {
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-const TARGET_DB = 'claude_memory_eval_test';
+// Use a timestamped throwaway DB — self-contained, no pre-existing DB required.
+// Follows the same pattern as test-l4-degraded-close.js.
+const TS        = Date.now();
+const TARGET_DB = `claude_memory_ptr_gate_${TS}`;
 const HELPER    = path.resolve(__dirname, '..', '..', 'scripts', 'handoff.js');
-const RUN_ID    = Date.now();
+const RUN_ID    = TS;
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -75,16 +78,47 @@ function test(label, fn) {
   return Promise.resolve();
 }
 
-async function connectDb() {
-  const cfg = loadConfig();
+/** Connect to a specific Postgres database using env-var credentials. */
+async function pgConnect(database) {
   const client = new Client({
-    host:     cfg.host,
-    port:     cfg.port,
-    database: TARGET_DB,
-    user:     cfg.user,
+    host:     process.env.PGHOST     || 'localhost',
+    port:     parseInt(process.env.PGPORT || '5432', 10),
+    user:     process.env.PGUSER     || 'postgres',
+    password: process.env.PGPASSWORD || 'postgres',
+    database,
   });
   await client.connect();
   return client;
+}
+
+/** Create the throwaway test database. */
+async function createTestDb(dbName) {
+  const sysDb = await pgConnect('postgres');
+  try {
+    const exists = await sysDb.query('SELECT 1 FROM pg_database WHERE datname = $1', [dbName]);
+    if (exists.rows.length === 0) {
+      await sysDb.query(`CREATE DATABASE "${dbName}"`);
+    }
+  } finally {
+    await sysDb.end();
+  }
+}
+
+/** Drop the throwaway test database. */
+async function dropTestDb(dbName) {
+  let sysDb;
+  try {
+    sysDb = await pgConnect('postgres');
+    await sysDb.query(
+      `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1 AND pid<>pg_backend_pid()`,
+      [dbName]
+    );
+    await sysDb.query(`DROP DATABASE IF EXISTS "${dbName}"`);
+  } catch (_) {
+    // Non-fatal cleanup failure
+  } finally {
+    if (sysDb) { try { await sysDb.end(); } catch (_) {} }
+  }
 }
 
 /** Create a temporary file with given content; return { filePath, lines }. */
@@ -97,19 +131,21 @@ function mkTmpFile(content, ext = 'js') {
 }
 
 /** Create a minimal fake project root for subprocess tests. */
-function mkFakeRoot() {
+function mkFakeRoot(dbName) {
   const fakeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ptr-gate-proj-'));
   fs.mkdirSync(path.join(fakeRoot, '.git'));
   fs.mkdirSync(path.join(fakeRoot, '.claude'));
+  const pgHost = process.env.PGHOST || 'localhost';
+  const pgUser = process.env.PGUSER || 'postgres';
   fs.writeFileSync(path.join(fakeRoot, '.claude', 'pipeline.yml'), [
     'project:',
     '  name: ptr-gate-test',
     'knowledge:',
     '  tier: "postgres"',
-    '  host: "localhost"',
+    `  host: "${pgHost}"`,
     '  port: 5432',
-    `  database: "${TARGET_DB}"`,
-    '  user: "postgres"',
+    `  database: "${dbName}"`,
+    `  user: "${pgUser}"`,
   ].join('\n'), 'utf8');
   return fakeRoot;
 }
@@ -161,13 +197,12 @@ function minimalClosePayload(tldr = 'Pointer gate test session.', overrides = {}
 
 async function runTests() {
 
-  // ── Infrastructure check ───────────────────────────────────────────────────
-  let db;
+  // ── Infrastructure: create throwaway DB ──────────────────────────────────
   try {
-    db = await connectDb();
+    await createTestDb(TARGET_DB);
   } catch (err) {
-    console.error(`\nInfrastructure error: cannot connect to ${TARGET_DB}: ${err.message}`);
-    console.error('Run: psql -U postgres -c "CREATE DATABASE claude_memory_eval_test;"');
+    console.error(`\nInfrastructure error: cannot create throwaway DB ${TARGET_DB}: ${err.message}`);
+    console.error('Ensure Postgres is available at PGHOST/PGUSER/PGPASSWORD (or localhost/postgres).');
     process.exit(2);
   }
 
@@ -328,7 +363,7 @@ async function runTests() {
   // ── T8: resume vs close persistence ──────────────────────────────────────
   // Close persists anchor corrections to DB; resume rewrites in-memory only.
   await test('T8: resume rewrites served output only; close persists to assertion', async () => {
-    const fakeRoot = mkFakeRoot();
+    const fakeRoot = mkFakeRoot(TARGET_DB);
     try {
       // Create a source JS file with a function at line 2
       const srcDir  = path.join(fakeRoot, 'scripts');
@@ -383,7 +418,7 @@ async function runTests() {
 
   // ── T9: multiple assertions citing same stale pointer — gate updates both ──
   await test('T9: multiple assertions citing same stale pointer → gate processes all', async () => {
-    const fakeRoot = mkFakeRoot();
+    const fakeRoot = mkFakeRoot(TARGET_DB);
     try {
       const srcDir  = path.join(fakeRoot, 'scripts');
       fs.mkdirSync(srcDir, { recursive: true });
@@ -432,7 +467,7 @@ async function runTests() {
   // The pointer gate and the contradiction gate both write to the SAME
   // ## Reconciliation notice block — not two competing blocks.
   await test('T10: stale-pointer finding → single unified Reconciliation notice block', async () => {
-    const fakeRoot = mkFakeRoot();
+    const fakeRoot = mkFakeRoot(TARGET_DB);
     try {
       const srcDir = path.join(fakeRoot, 'scripts');
       fs.mkdirSync(srcDir, { recursive: true });
@@ -490,7 +525,8 @@ async function runTests() {
     }
   });
 
-  await db.end();
+  // Clean up throwaway DB.
+  await dropTestDb(TARGET_DB);
 }
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
