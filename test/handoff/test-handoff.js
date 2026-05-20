@@ -803,6 +803,265 @@ async function runTests() {
 
   await c2db.end();
 
+  // ── Tests 11–16: close-reconciliation gate ───────────────────────────────
+  //
+  // These tests verify the contradiction-detection gate added in
+  // feat/close-reconciliation-gate. Each test runs a close via subprocess and
+  // inspects the written handoff.md. The gate is soft-inject only (never blocks
+  // close), so all tests expect exit 0 and a valid Done line.
+  //
+  // Setup: re-run init to ensure the project row exists (purge may have wiped it).
+  runHelper('init', [], { fakeRoot });
+
+  // Helper: resolve the actual handoff.md path for a given project root.
+  // After init, ensureProjectIdentity may mint a UUID-based marker in .claude-memory,
+  // so the handoff.md lives under ~/.claude/projects/<uuid>/handoff.md, not under
+  // the encodeCwd(root) path. Read the marker when present.
+  function resolveHandoffPath(root) {
+    const os2 = require('os');
+    const markerPath = path.join(root, '.claude-memory');
+    if (fs.existsSync(markerPath)) {
+      try {
+        const txt = fs.readFileSync(markerPath, 'utf8');
+        const m = txt.match(/"uuid"\s*:\s*"([^"]+)"/);
+        if (m) {
+          return path.join(os2.homedir(), '.claude', 'projects', m[1], 'handoff.md');
+        }
+      } catch (_) { /* fall back to encodeCwd */ }
+    }
+    const { getClaudeProjectDir } = require('../../scripts/lib/encoded-cwd');
+    return path.join(getClaudeProjectDir(root), 'handoff.md');
+  }
+
+  // ── Test 11 (C-1): degraded label in tldr → Reconciliation notice fires ──
+  await test('reconciliation C-1: degraded label in tldr → notice in handoff.md', () => {
+    const payload = {
+      tldr: 'This session addressed C2 session attribution and related bookkeeping.',
+      open_threads: ['verify C2 attribution is working'],
+      quick_references: '(none)',
+      // No entities/assertions/edges so the close runs quickly.
+      entities: [],
+      assertions: [],
+      edges: [],
+      // Intentionally omit session_id so C2 degrades (fbSessionId = null →
+      // _degradedSubsystems gets a C2 entry). The tldr mentions "C2" → C-1 fires.
+      // IMPORTANT: must strip CLAUDE_CODE_SESSION_ID from subprocess env so that
+      // resolveSessionId() (PR #79) cannot fall back to the env var and prevent
+      // C2 degradation — otherwise the test loses its signal.
+    };
+    runHelperBoth('close', ['--json', '-'], { fakeRoot, stdin: JSON.stringify(payload), deleteEnv: ['CLAUDE_CODE_SESSION_ID'] });
+    const handoffPath = resolveHandoffPath(fakeRoot);
+    const content = fs.readFileSync(handoffPath, 'utf8');
+    // C2 will be degraded (no session_id resolvable), and the tldr mentions "C2",
+    // so C-1 should fire and the Reconciliation notice should appear.
+    assert.ok(
+      content.includes('## Reconciliation notice'),
+      'handoff.md should contain ## Reconciliation notice when C-1 fires'
+    );
+    assert.ok(
+      content.includes('[C-1]'),
+      'handoff.md Reconciliation notice should include [C-1] rule label'
+    );
+  });
+
+  // ── Test 12 (byte-identity): clean close → no Reconciliation notice ──────
+  await test('reconciliation byte-identity: clean payload → no notice, no literal placeholder', () => {
+    // Re-init (purge may have run, so ensure the project row is fresh).
+    runHelper('init', [], { fakeRoot });
+    const payload = {
+      tldr: 'Everything looks great — quiet session with minor housekeeping.',
+      open_threads: ['follow up on documentation'],
+      quick_references: '(none)',
+      entities: [],
+      assertions: [],
+      edges: [],
+      session_id: 'test-session-recon-002',
+    };
+    runHelper('close', ['--json', '-'], { fakeRoot, stdin: JSON.stringify(payload) });
+    const handoffPath = resolveHandoffPath(fakeRoot);
+    const content = fs.readFileSync(handoffPath, 'utf8');
+    // Clean close: no degraded subsystems, no fix-claim keywords adjacent to labels,
+    // no green-build claim, no dangling SHAs → Reconciliation section must be absent.
+    assert.ok(
+      !content.includes('## Reconciliation notice'),
+      'handoff.md should NOT contain ## Reconciliation notice on a clean close'
+    );
+    // Placeholder must not appear literally in the rendered output.
+    assert.ok(
+      !content.includes('{{RECONCILIATION_SECTION}}'),
+      'rendered handoff.md must not contain the literal {{RECONCILIATION_SECTION}} placeholder'
+    );
+  });
+
+  // ── Test 13 (C-2): fix-keyword adjacent to degraded label → fires ─────────
+  await test('reconciliation C-2: fix-keyword adjacent to degraded label in tldr → notice in handoff.md', () => {
+    runHelper('init', [], { fakeRoot });
+    const payload = {
+      // "fixed" is within 60 chars of "C2" and session_id is omitted so C2 degrades.
+      // Both C-1 (label "C2" present in tldr) and C-2 ("fixed" adjacent to "C2") fire.
+      tldr: 'fixed the C2 session attribution — everything working now.',
+      open_threads: [],
+      quick_references: '(none)',
+      entities: [],
+      assertions: [],
+      edges: [],
+      // Intentionally omit session_id → C2 degrades → "C2" label is in degradedList.
+      // Must strip CLAUDE_CODE_SESSION_ID so resolveSessionId() (PR #79) cannot
+      // use the env-var fallback and prevent C2 degradation.
+    };
+    runHelperBoth('close', ['--json', '-'], { fakeRoot, stdin: JSON.stringify(payload), deleteEnv: ['CLAUDE_CODE_SESSION_ID'] });
+    const handoffPath = resolveHandoffPath(fakeRoot);
+    const content = fs.readFileSync(handoffPath, 'utf8');
+    // C2 will degrade (no session_id resolvable), and "fixed" is adjacent to "C2".
+    // Both C-1 (label present) and C-2 (fix keyword present) may fire.
+    assert.ok(
+      content.includes('## Reconciliation notice'),
+      'handoff.md should contain ## Reconciliation notice when C-2 fires'
+    );
+    assert.ok(
+      content.includes('[C-2]') || content.includes('[C-1]'),
+      'handoff.md should contain at least one reconciliation rule label'
+    );
+  });
+
+  // ── Test 14 (C-3): retrieval_outcome=success + C2 degraded → fires ────────
+  await test('reconciliation C-3: retrieval_outcome success + C2 degraded → notice in handoff.md', () => {
+    runHelper('init', [], { fakeRoot });
+    const payload = {
+      tldr: 'Retrieval worked well this session.',
+      open_threads: [],
+      quick_references: '(none)',
+      entities: [],
+      assertions: [],
+      edges: [],
+      // C2 will degrade (session_id not in DB → no resolvable session).
+      // Claiming retrieval_outcome=success contradicts the degraded C2.
+      // Must strip CLAUDE_CODE_SESSION_ID so resolveSessionId() (PR #79) cannot
+      // use the env-var fallback and prevent C2 degradation.
+      retrieval_outcome: 'success',
+    };
+    runHelperBoth('close', ['--json', '-'], { fakeRoot, stdin: JSON.stringify(payload), deleteEnv: ['CLAUDE_CODE_SESSION_ID'] });
+    const handoffPath = resolveHandoffPath(fakeRoot);
+    const content = fs.readFileSync(handoffPath, 'utf8');
+    assert.ok(
+      content.includes('## Reconciliation notice'),
+      'handoff.md should contain ## Reconciliation notice when C-3 fires'
+    );
+    assert.ok(
+      content.includes('[C-3]'),
+      'handoff.md Reconciliation notice should include [C-3] rule label'
+    );
+  });
+
+  // ── Test 15 (C-6): dangling SHA in quick_references → fires ──────────────
+  //
+  // Note: this test sets up a lightweight temp git repo so that gitObjectExists
+  // can actually verify that the fake SHA does not exist. If the test fakeRoot
+  // is itself a git repo (unlikely in CI), the result may differ. We use a
+  // dedicated bare git repo to avoid cross-contamination.
+  await test('reconciliation C-6: dangling SHA in quick_references → notice in handoff.md', () => {
+    // Initialize a bare git repo in a temp dir so gitObjectExists has a real repo to probe.
+    const gitTestRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'handoff-git-recon-'));
+    try {
+      execFileSync('git', ['init', gitTestRoot], { encoding: 'utf8', timeout: 10000 });
+      // Create a minimal config so handoff.js can find the project root.
+      fs.mkdirSync(path.join(gitTestRoot, '.claude'));
+      fs.writeFileSync(path.join(gitTestRoot, '.claude', 'pipeline.yml'), `
+project:
+  name: handoff-git-recon-test
+
+knowledge:
+  tier: "postgres"
+  host: "localhost"
+  port: 5432
+  database: "${TARGET_DB}"
+  user: "postgres"
+`.trim(), 'utf8');
+
+      // Run init on the temp git root.
+      execFileSync(
+        process.execPath,
+        [HELPER, 'init'],
+        {
+          cwd: gitTestRoot,
+          env: { ...process.env, PROJECT_ROOT: gitTestRoot },
+          encoding: 'utf8',
+          timeout: 30000,
+        }
+      );
+
+      const fakeDeadSha = 'deadbeef123456789012345678901234deadbeef';
+      const payload = {
+        tldr: 'Quiet session.',
+        open_threads: [],
+        quick_references: `see commit ${fakeDeadSha} for details`,
+        entities: [],
+        assertions: [],
+        edges: [],
+      };
+      execFileSync(
+        process.execPath,
+        [HELPER, 'close', '--json', '-'],
+        {
+          cwd: gitTestRoot,
+          env: { ...process.env, PROJECT_ROOT: gitTestRoot },
+          encoding: 'utf8',
+          timeout: 30000,
+          input: JSON.stringify(payload),
+        }
+      );
+      // Use resolveHandoffPath to handle UUID-based project IDs from ensureProjectIdentity.
+      const handoffPath = resolveHandoffPath(gitTestRoot);
+      const content = fs.readFileSync(handoffPath, 'utf8');
+      assert.ok(
+        content.includes('## Reconciliation notice'),
+        'handoff.md should contain ## Reconciliation notice when C-6 fires (dangling SHA)'
+      );
+      assert.ok(
+        content.includes('[C-6]'),
+        'handoff.md Reconciliation notice should include [C-6] rule label'
+      );
+    } finally {
+      try { fs.rmSync(gitTestRoot, { recursive: true, force: true }); } catch (_) {}
+      // Clean up the handoff.md dir for the temp git root (both encodedCwd and UUID paths).
+      try {
+        const { getClaudeProjectDir } = require('../../scripts/lib/encoded-cwd');
+        const dir = getClaudeProjectDir(gitTestRoot);
+        if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+      } catch (_) {}
+    }
+  });
+
+  // ── Test 16 (C-4 excluded / acceptable divergence — must NOT fire) ─────────
+  await test('reconciliation acceptable divergence: open_threads mentions C2 without fix-claim in tldr → no notice', () => {
+    runHelper('init', [], { fakeRoot });
+    const payload = {
+      // tldr does NOT mention C2 or any fix-claim keywords next to a degraded label.
+      // open_threads mentions C2 (acceptable — C-4 is intentionally excluded).
+      tldr: 'Session ended; known degradation in session attribution continues.',
+      open_threads: ['C2 session id attribution still unresolved — follow up next session'],
+      quick_references: '(none)',
+      entities: [],
+      assertions: [],
+      edges: [],
+      session_id: 'test-session-recon-006',
+    };
+    runHelper('close', ['--json', '-'], { fakeRoot, stdin: JSON.stringify(payload) });
+    const handoffPath = resolveHandoffPath(fakeRoot);
+    const content = fs.readFileSync(handoffPath, 'utf8');
+    // The tldr does not mention "C2" and has no fix-claim keywords adjacent to
+    // a degraded label. open_threads divergence (C-4) is excluded by design.
+    // C-3 requires retrieval_outcome=success (not set here).
+    // C-5 requires a green-build claim (not set here).
+    // C-6 requires a dangling SHA (quick_references is '(none)').
+    // Therefore no contradiction rules should fire.
+    assert.ok(
+      !content.includes('## Reconciliation notice'),
+      'handoff.md should NOT contain ## Reconciliation notice when only open_threads mentions C2 (C-4 excluded)'
+    );
+  });
+
+
   await db.end();
   await teardown();
 }

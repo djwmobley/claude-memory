@@ -253,6 +253,151 @@ function writeHandoffMd(handoffPath, vars) {
 }
 
 /**
+ * Check whether a git object (commit, blob, tree, tag) exists in the repo.
+ * Fail-open: returns true on any error (git unavailable, not a repo, timeout)
+ * so that C-6 is never fired falsely when git is broken.
+ *
+ * @param {string} root  - Absolute path to the git repo root.
+ * @param {string} sha   - SHA-like token to verify.
+ * @returns {boolean}    - true if the object exists OR if the check fails.
+ */
+function gitObjectExists(root, sha) {
+  try {
+    const { execFileSync } = require('child_process');
+    execFileSync('git', ['cat-file', '-e', sha], {
+      cwd: root,
+      timeout: 3000,
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    return true;   // exit 0 → object exists
+  } catch (err) {
+    // exit 1 → object does not exist; any other error → fail-open (return true)
+    if (err && typeof err.status === 'number' && err.status === 1) return false;
+    return true;   // git unavailable, timeout, not a repo → fail-open
+  }
+}
+
+/**
+ * Detect contradictions between the LLM-authored payload fields and the
+ * engine-verified degraded-subsystem state.
+ *
+ * Rules:
+ *   C-1  Degraded label appears verbatim (case-insensitive) in payload.tldr.
+ *   C-2  Fix-claim keyword appears within 60 chars of a degraded label in tldr.
+ *   C-3  payload.retrieval_outcome === 'success' while C2 is degraded.
+ *   C-4  INTENTIONALLY EXCLUDED — open_threads referencing degraded subsystems
+ *        is acceptable inline divergence, not a contradiction.
+ *   C-5  payload.tldr contains a green-build claim while the working tree is
+ *        unpackaged (detectUnpackagedState reports dirty/ahead).
+ *   C-6  payload.quick_references contains a SHA-like token that does not exist
+ *        in the git object store. Fail-open when git is unavailable.
+ *
+ * @param {object}   payload          - Parsed stdin payload (tldr, quick_references, …).
+ * @param {Array<{subsystem: string, reason: string}>} degradedList - Populated _degradedSubsystems.
+ * @param {string}   root             - Absolute path to the project root.
+ * @returns {Array<{rule: string, message: string}>}
+ */
+function detectCloseContradictions(payload, degradedList, root) {
+  const contradictions = [];
+  const tldr = (payload.tldr || '').toLowerCase();
+
+  // ── C-1: Degraded label appears in tldr ─────────────────────────────────────
+  for (const entry of degradedList) {
+    const label = entry.subsystem.toLowerCase();
+    if (tldr.includes(label)) {
+      contradictions.push({
+        rule: 'C-1',
+        message:
+          `TL;DR mentions degraded subsystem "${entry.subsystem}" — ` +
+          `engine state: ${entry.reason}`,
+      });
+    }
+  }
+
+  // ── C-2: Fix-claim keyword adjacent (60-char window) to a degraded label ───
+  const FIX_KEYWORDS = [
+    'fix', 'fixes', 'fixed', 'resolved', 'resolves', 'working',
+    'now works', 'now seeds', 'seeds', 'cleared', 'corrected',
+    'repair', 'repaired',
+  ];
+  for (const entry of degradedList) {
+    const label = entry.subsystem.toLowerCase();
+    const idx = tldr.indexOf(label);
+    if (idx === -1) continue;
+    const windowStart = Math.max(0, idx - 60);
+    const windowEnd   = Math.min(tldr.length, idx + label.length + 60);
+    const window = tldr.slice(windowStart, windowEnd);
+    for (const kw of FIX_KEYWORDS) {
+      if (window.includes(kw)) {
+        contradictions.push({
+          rule: 'C-2',
+          message:
+            `TL;DR contains fix-claim keyword "${kw}" adjacent to degraded subsystem ` +
+            `"${entry.subsystem}" — engine state: ${entry.reason}`,
+        });
+        break;  // one C-2 per label is sufficient
+      }
+    }
+  }
+
+  // ── C-3: retrieval_outcome=success while C2 is degraded ────────────────────
+  if (payload.retrieval_outcome === 'success') {
+    const c2Degraded = degradedList.some((d) => d.subsystem === 'C2');
+    if (c2Degraded) {
+      contradictions.push({
+        rule: 'C-3',
+        message:
+          'payload.retrieval_outcome is "success" but C2 is degraded ' +
+          '(no session id resolvable — success attribution is impossible)',
+      });
+    }
+  }
+
+  // ── C-4: INTENTIONALLY EXCLUDED ────────────────────────────────────────────
+  // open_threads referencing degraded subsystems is acceptable inline divergence.
+
+  // ── C-5: Green-build claim in tldr while working tree is unpackaged ─────────
+  const GREEN_PATTERNS = [
+    'all tests pass', 'tests pass', 'ci green', 'ci is green',
+    'builds clean', 'build is clean',
+  ];
+  const hasGreenClaim = GREEN_PATTERNS.some((p) => tldr.includes(p));
+  if (hasGreenClaim) {
+    try {
+      const packState = detectUnpackagedState(root);
+      if (packState.unpackaged) {
+        contradictions.push({
+          rule: 'C-5',
+          message:
+            `TL;DR contains a green-build/test-pass claim but the working tree ` +
+            `is unpackaged (${packState.label})`,
+        });
+      }
+    } catch (_) {
+      // detectUnpackagedState is fail-safe; if it throws, skip C-5.
+    }
+  }
+
+  // ── C-6: SHA-like token in quick_references that does not exist in git ──────
+  const quickRefs = payload.quick_references || '';
+  const SHA_RE = /\b([0-9a-f]{7,40})\b/gi;
+  let shaMatch;
+  while ((shaMatch = SHA_RE.exec(quickRefs)) !== null) {
+    const sha = shaMatch[1];
+    if (!gitObjectExists(root, sha)) {
+      contradictions.push({
+        rule: 'C-6',
+        message:
+          `quick_references contains SHA-like token "${sha}" that does not ` +
+          `exist in the git object store`,
+      });
+    }
+  }
+
+  return contradictions;
+}
+
+/**
  * Read JSON payload from stdin (used for --json - flag).
  * Validates structure: only allowed top-level keys, string-field length caps,
  * array length caps. Throws with a field-naming error message on violation.
@@ -1101,6 +1246,7 @@ async function cmdInit(args) {
       OPEN_THREADS:        '- (none)',
       QUICK_REFERENCES:    '(none)',
       DEGRADED_SECTION:    '',
+      RECONCILIATION_SECTION: '',
     });
     console.log(`  [OK]    handoff.md created: ${handoffPath}`);
   }
@@ -2213,6 +2359,7 @@ async function cmdDrop() {
     OPEN_THREADS:        '- (none)',
     QUICK_REFERENCES:    '(none)',
     DEGRADED_SECTION:    '',
+    RECONCILIATION_SECTION: '',
   });
 
   await db.end();
@@ -2869,6 +3016,7 @@ async function cmdCheckpoint(args) {
       OPEN_THREADS:        (payload.open_threads || []).map((t) => `- ${t}`).join('\n') || '- (none)',
       QUICK_REFERENCES:    payload.quick_references || '(none)',
       DEGRADED_SECTION:    '',
+      RECONCILIATION_SECTION: '',
     });
 
     // Do NOT clear session_in_progress here.  The Stop hook's implicit close
@@ -2902,6 +3050,7 @@ async function cmdCheckpoint(args) {
     OPEN_THREADS:        (payload.open_threads || []).map((t) => `- ${t}`).join('\n') || '- (none)',
     QUICK_REFERENCES:    payload.quick_references || '(none)',
     DEGRADED_SECTION:    '',
+    RECONCILIATION_SECTION: '',
   });
 
   // Do NOT clear session_in_progress here.  The Stop hook's implicit close
@@ -3173,6 +3322,7 @@ async function cmdClose(args) {
       OPEN_THREADS:        (payload.open_threads || []).map((t) => `- ${t}`).join('\n') || '- (none)',
       QUICK_REFERENCES:    payload.quick_references || '(none)',
       DEGRADED_SECTION:    '',
+      RECONCILIATION_SECTION: '',
     });
 
     // Clear session_in_progress marker
@@ -3763,11 +3913,32 @@ async function cmdClose(args) {
   // When _degradedSubsystems is empty (clean close), DEGRADED_SECTION is '' and the
   // rendered output is byte-identical to the pre-L4 template output.
   // When any subsystem is degraded, a ## Degraded section is appended.
+  //
+  // The reconciliation gate (detectCloseContradictions) runs after the degraded list
+  // is final. It never blocks close — it soft-injects a ## Reconciliation notice
+  // section into handoff.md and emits warnings to stderr/stdout.
+  // When no contradictions are detected, RECONCILIATION_SECTION is '' and the
+  // rendered output is byte-identical to what it would be without the gate.
   {
     const degradedSection = _degradedSubsystems.length > 0
       ? '\n\n## Degraded\n' + _degradedSubsystems.map(
           (d) => `- ${d.subsystem} ${d.reason}`
         ).join('\n')
+      : '';
+
+    // Contradiction gate — soft-inject only; never blocks close.
+    let contradictions = [];
+    try {
+      contradictions = detectCloseContradictions(payload, _degradedSubsystems, root);
+    } catch (reconcileErr) {
+      // Fully non-fatal: any error here must not break cmdClose.
+      process.stderr.write(`[handoff] reconciliation gate failed (non-fatal): ${reconcileErr.message}\n`);
+    }
+    const reconciliationSection = contradictions.length > 0
+      ? '\n\n## Reconciliation notice\n' +
+        'The following contradictions were detected between the LLM-authored TL;DR/references\n' +
+        'and engine-verified state. The engine-verified state is authoritative.\n\n' +
+        contradictions.map((c) => `- **[${c.rule}]** ${c.message}`).join('\n')
       : '';
 
     writeHandoffMd(handoffPath, {
@@ -3782,11 +3953,23 @@ async function cmdClose(args) {
       OPEN_THREADS:        (payload.open_threads || []).map((t) => `- ${t}`).join('\n') || '- (none)',
       QUICK_REFERENCES:    payload.quick_references || '(none)',
       DEGRADED_SECTION:    degradedSection,
+      RECONCILIATION_SECTION: reconciliationSection,
     });
 
     // Surface degraded subsystems in the close summary (operator-visible).
     for (const d of _degradedSubsystems) {
       console.log(`  ${d.subsystem} skipped: ${d.reason}`);
+    }
+
+    // Surface reconciliation contradictions (operator-visible).
+    if (contradictions.length > 0) {
+      process.stderr.write(
+        `[handoff] close-reconciliation gate: ${contradictions.length} contradiction(s) detected ` +
+        `(see handoff.md ## Reconciliation notice)\n`
+      );
+      for (const c of contradictions) {
+        console.log(`  RECONCILIATION [${c.rule}]: ${c.message}`);
+      }
     }
   }
 
@@ -4002,6 +4185,7 @@ async function cmdLoaderStop() {
       OPEN_THREADS:        openThreads,
       QUICK_REFERENCES:    quickRefs,
       DEGRADED_SECTION:    '',
+      RECONCILIATION_SECTION: '',
     });
 
     // Clear the session_in_progress marker.
