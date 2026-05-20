@@ -26,8 +26,11 @@ const { execFileSync, spawnSync } = require('child_process');
 
 const { loadConfig } = require('../../scripts/lib/shared');
 const { encodeCwd }  = require('../../scripts/lib/encoded-cwd');
-// pg lives in scripts/node_modules (the package.json root for this repo's deps)
-const { Client }     = require('../../scripts/node_modules/pg');
+// pg lives in scripts/node_modules — use createRequire anchored to scripts/package.json
+// so the import is portable across any pnpm/npm/yarn layout (hoisted or symlink-store).
+const { createRequire } = require('module');
+const scriptsRequire = createRequire(require.resolve('../../scripts/package.json'));
+const { Client }     = scriptsRequire('pg');
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 

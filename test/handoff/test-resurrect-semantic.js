@@ -35,7 +35,9 @@ const { spawnSync } = require('child_process');
 const fs            = require('fs');
 const os            = require('os');
 const path          = require('path');
-const { Client }    = require('../../scripts/node_modules/pg');
+const { createRequire } = require('module');
+const scriptsRequire = createRequire(require.resolve('../../scripts/package.json'));
+const { Client }    = scriptsRequire('pg');
 const { readMarker } = require('../../scripts/lib/project-marker');
 
 // ─── Constants ────────────────────────────────────────────────────────────────

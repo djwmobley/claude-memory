@@ -77,6 +77,14 @@ use `/handoff:drop` instead.
 
 ---
 
+## Maintenance notes
+
+After pulling a change to `scripts/.npmrc` (e.g., the switch to `node-linker=hoisted`),
+run `rm -rf scripts/node_modules && (cd scripts && pnpm install)` (or the PowerShell
+equivalent: `Remove-Item -Recurse -Force scripts\node_modules; Set-Location scripts; pnpm install`)
+so pnpm rebuilds `scripts/node_modules` in the new flat layout. Existing machines on the
+old symlink layout keep working but won't benefit from the fragility fix until they re-install.
+
 ## See also
 
 - [docs/how-memory-works.md](../../docs/how-memory-works.md) — how the system uses what

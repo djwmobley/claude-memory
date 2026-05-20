@@ -27,7 +27,9 @@ const os     = require('os');
 const { execFileSync } = require('child_process');
 
 const { getClaudeProjectDir } = require('../../scripts/lib/encoded-cwd');
-const { Client } = require('../../scripts/node_modules/pg');
+const { createRequire } = require('module');
+const scriptsRequire = createRequire(require.resolve('../../scripts/package.json'));
+const { Client } = scriptsRequire('pg');
 
 // Import pointer-gate internals from handoff.js (no CLI execution)
 const {
