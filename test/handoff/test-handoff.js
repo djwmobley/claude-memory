@@ -162,11 +162,20 @@ knowledge:
     process.exit(2);
   }
 
-  // Apply handoff-core schema (idempotent). Was previously pointing at a
-  // non-existent phase2-schema.sql which silently skipped — this is the real
-  // canonical schema file applied by /handoff:init.
-  const schemaFile = path.resolve(__dirname, '..', '..', 'scripts', 'sql', 'handoff-core-schema.sql');
-  if (fs.existsSync(schemaFile)) {
+  // Apply the canonical schemas in order:
+  //   1. handoff-core-schema.sql   — portable handoff-core tables (auto-applied
+  //                                  by /handoff:init in production).
+  //   2. app-retrieval-events-schema.sql — claude-memory-specific observability
+  //                                  tables (retrieval_events + retrieval_event_assertions).
+  //                                  NOT applied by /handoff:init; test must apply
+  //                                  it explicitly so the C2/C3 paths handoff.js
+  //                                  invokes during close/checkpoint don't emit
+  //                                  "relation retrieval_events does not exist"
+  //                                  warnings on every test run.
+  const sqlDir = path.resolve(__dirname, '..', '..', 'scripts', 'sql');
+  for (const schemaName of ['handoff-core-schema.sql', 'app-retrieval-events-schema.sql']) {
+    const schemaFile = path.join(sqlDir, schemaName);
+    if (!fs.existsSync(schemaFile)) continue;
     let sql = fs.readFileSync(schemaFile, 'utf8');
     // Strip psql meta-commands (e.g. \c, \echo) so we can run via the JS client.
     sql = sql.replace(/^\\[a-z].*$/gm, '');
@@ -175,7 +184,7 @@ knowledge:
     } catch (err) {
       // May already exist — non-fatal
       if (!err.message.includes('already exists')) {
-        console.warn(`  Schema apply warning: ${err.message}`);
+        console.warn(`  Schema apply warning (${schemaName}): ${err.message}`);
       }
     }
   }
