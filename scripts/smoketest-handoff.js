@@ -637,7 +637,7 @@ async function step6_cmdResume() {
 }
 
 async function step7_cmdCheckpoint() {
-  const label = 'cmdCheckpoint — session_in_progress cleared';
+  const label = 'cmdCheckpoint — session_in_progress preserved';
   try {
     const db = await pgConnect(SMOKE_DB);
     await db.query(
@@ -666,8 +666,8 @@ async function step7_cmdCheckpoint() {
     );
     await db2.end();
 
-    if (rows.length > 0) {
-      lcFail(7, label, `session_in_progress still set to '${rows[0].value}' after checkpoint`);
+    if (rows.length === 0) {
+      lcFail(7, label, `session_in_progress was cleared after checkpoint — expected it to be preserved`);
       return false;
     }
 
