@@ -639,17 +639,26 @@ async function _loadStoredAnchors(db, projectId, ptrs) {
 }
 
 async function _persistPointerCorrections(db, projectId, correctedPtrs, derivedAnchors) {
-  if (!correctedPtrs.size && !derivedAnchors.size) return;
+  // §7 no-backfill invariant: we NEVER UPDATE the object field of source assertions.
+  // Source assertions stay canonical; pointer rewrites happen only in the served
+  // handoff.md output (via validatePointers / runPointerGate return values).
+  //
+  // What we DO persist: anchor metadata updates (anchor is not a canonical corpus
+  // field — it is derived validation metadata).  S10 forbids updates to
+  // subject / predicate / object / source; it permits anchor.
+  if (!derivedAnchors.size) return;
   try {
+    // For corrected pointers: persist the new anchor keyed by the new pointer string.
     for (const [oldPtr, newPtr] of correctedPtrs) {
+      const anchor = derivedAnchors.get(newPtr) || derivedAnchors.get(oldPtr);
+      if (!anchor) continue;
       await db.query(
-        `UPDATE assertions SET object = replace(object, $2, $3), anchor = $4
-         WHERE project_id = $1 AND object LIKE $5 AND suppressed = false`,
-        [projectId, oldPtr, newPtr,
-         JSON.stringify(derivedAnchors.get(newPtr) || derivedAnchors.get(oldPtr) || null),
-         `%${oldPtr}%`]
+        `UPDATE assertions SET anchor = $3
+         WHERE project_id = $1 AND (anchor->>'pointer') = $2 AND suppressed = false`,
+        [projectId, oldPtr, JSON.stringify(Object.assign({}, anchor, { pointer: newPtr }))]
       );
     }
+    // For derived anchors that were not part of a correction (fresh derivations):
     for (const [ptr, anchor] of derivedAnchors) {
       if (correctedPtrs.has(ptr)) continue;
       await db.query(
