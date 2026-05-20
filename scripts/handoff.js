@@ -2920,6 +2920,29 @@ async function cmdCheckpoint(args) {
   console.log(`\nDone: handoff:checkpoint — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written (session marker preserved for continued attribution)`);
 }
 
+// ── resolveSessionId ──────────────────────────────────────────────────────────
+//
+// Resolve the session id for cmdClose attribution in priority order:
+//   1. payload.session_id  — explicit value supplied by the skill
+//   2. process.env.CLAUDE_CODE_SESSION_ID  — set by the Claude Code harness at runtime
+//   3. DB marker 'session_in_progress'  — seeded by cmdResume / SessionStart hook
+//
+// The env var fallback exists because the heredoc pattern used in close.md is
+// single-quoted (<<'EOF') which suppresses shell expansion, so a
+// "$CLAUDE_CODE_SESSION_ID" literal in the payload JSON would arrive as the
+// literal string rather than the resolved value.  Reading process.env on the
+// engine side is clean and requires no skill change.
+async function resolveSessionId(db, projectId, payload) {
+  if (typeof payload.session_id === 'string' && payload.session_id.length > 0) {
+    return payload.session_id;
+  }
+  const envSessionId = process.env.CLAUDE_CODE_SESSION_ID;
+  if (typeof envSessionId === 'string' && envSessionId.length > 0) {
+    return envSessionId;
+  }
+  return await getSetting(db, projectId, 'session_in_progress', null);
+}
+
 // ── close ─────────────────────────────────────────────────────────────────────
 
 async function cmdClose(args) {
@@ -3348,10 +3371,8 @@ async function cmdClose(args) {
   // Order: self-report first, then timeout-decay sweep (so just-reported rows are
   // not also swept).
   try {
-    // 1. Resolve session id: payload.session_id takes precedence, then the DB marker.
-    const closeSessionId = (typeof payload.session_id === 'string' && payload.session_id.length > 0)
-      ? payload.session_id
-      : await getSetting(db, projectId, 'session_in_progress', null);
+    // 1. Resolve session id (priority: payload → env var → DB marker).
+    const closeSessionId = await resolveSessionId(db, projectId, payload);
 
     // 2. Agent self-report: update pending events for this session.
     if (payload.retrieval_outcome) {
@@ -3404,10 +3425,8 @@ async function cmdClose(args) {
   try {
     const feedbackEnabled = await getSetting(db, projectId, 'feedback_loop_enabled', 'enabled');
     if (feedbackEnabled === 'enabled') {
-      // Re-resolve session id (same approach as outcome capture, before marker is cleared).
-      const fbSessionId = (typeof payload.session_id === 'string' && payload.session_id.length > 0)
-        ? payload.session_id
-        : await getSetting(db, projectId, 'session_in_progress', null);
+      // Re-resolve session id (priority: payload → env var → DB marker).
+      const fbSessionId = await resolveSessionId(db, projectId, payload);
 
       if (!fbSessionId) {
         // No session id — skip silently (nothing to attribute).
@@ -3580,10 +3599,8 @@ async function cmdClose(args) {
   try {
     const evolutionEnabled = await getSetting(db, projectId, 'contract_evolution_enabled', 'disabled');
     if (evolutionEnabled === 'enabled') {
-      // Resolve session id (same approach as C2 — payload takes precedence, then DB marker).
-      const evolSessionId = (typeof payload.session_id === 'string' && payload.session_id.length > 0)
-        ? payload.session_id
-        : await getSetting(db, projectId, 'session_in_progress', null);
+      // Resolve session id (priority: payload → env var → DB marker).
+      const evolSessionId = await resolveSessionId(db, projectId, payload);
 
       if (!evolSessionId) {
         // L4: Record degraded close — C3 skipped because session id is unresolvable.

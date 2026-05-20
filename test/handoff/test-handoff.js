@@ -22,7 +22,7 @@ const assert = require('assert');
 const path   = require('path');
 const fs     = require('fs');
 const os     = require('os');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawnSync } = require('child_process');
 
 const { loadConfig } = require('../../scripts/lib/shared');
 const { encodeCwd }  = require('../../scripts/lib/encoded-cwd');
@@ -663,6 +663,145 @@ async function runTests() {
 
     await rdb.end();
   }
+
+  // ── Test 11: C2 session id resolution fallback chain ────────────────────────
+  //
+  // The helper below runs handoff.js and captures BOTH stdout and stderr so we
+  // can assert on the C2 degraded-close messages that go to stderr.
+  //
+  // Note: execFileSync with stdio:'pipe' throws on non-zero exit but also sets
+  // err.stdout / err.stderr on the thrown error object — we only care about the
+  // close output, so we suppress the throw and inspect the captured output.
+  // runHelperBoth — like runHelper but captures both stdout and stderr.
+  // Uses spawnSync so both streams are available regardless of exit code.
+  function runHelperBoth(sub, extraArgs = [], opts = {}) {
+    const fakeRoot = opts.fakeRoot || global.__fakeRoot;
+    const env = {
+      ...process.env,
+      PROJECT_ROOT: fakeRoot,
+      HANDOFF_TEST_PROJECT_ID: PROJECT_ID,
+      ...opts.extraEnv,
+    };
+    // Remove env keys the caller wants cleared.
+    for (const k of (opts.deleteEnv || [])) {
+      delete env[k];
+    }
+    const result = spawnSync(
+      process.execPath,
+      [HELPER, sub, ...extraArgs],
+      {
+        cwd:      fakeRoot,
+        env,
+        encoding: 'utf8',
+        timeout:  30000,
+        input:    opts.stdin || undefined,
+      }
+    );
+    return {
+      stdout:   result.stdout  || '',
+      stderr:   result.stderr  || '',
+      exitCode: result.status  != null ? result.status : 1,
+    };
+  }
+
+  // Minimal close payload with no session_id — shared across C2 tests.
+  const c2BasePayload = {
+    entities:    [],
+    assertions:  [],
+    edges:       [],
+    contract:    { queries: [{ type: 'recency', token_budget: 500 }] },
+    tldr:        'C2 session id resolution test.',
+    open_threads: [],
+  };
+
+  // Re-open DB connection for the C2 tests (previous db was closed above).
+  const c2db = await connectDb();
+
+  // Resolve the live project_id (may be a UUID marker after init minted it).
+  const markerPath2 = require('path').join(fakeRoot, '.claude-memory');
+  let c2ProjectId = encodedRoot;
+  if (require('fs').existsSync(markerPath2)) {
+    try {
+      const txt = require('fs').readFileSync(markerPath2, 'utf8');
+      const m   = txt.match(/"uuid"\s*:\s*"([^"]+)"/);
+      if (m) c2ProjectId = m[1];
+    } catch (_) { /* fall back to encodedRoot */ }
+  }
+
+  // Test A: C2 does not degrade when payload omits session_id but DB marker is set.
+  await test('close: C2 does not degrade when payload omits session_id but DB marker is set', async () => {
+    // Seed session_in_progress for the test project.
+    await c2db.query(
+      `INSERT INTO project_settings (project_id, key, value) VALUES ($1, 'session_in_progress', 'test-db-marker-session')
+       ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
+      [c2ProjectId]
+    );
+    // Run close with CLAUDE_CODE_SESSION_ID unset so the env fallback is bypassed and
+    // the test exercises the DB-marker path exclusively.
+    const result = runHelperBoth('close', ['--json', '-'], {
+      fakeRoot,
+      stdin: JSON.stringify(c2BasePayload),
+      deleteEnv: ['CLAUDE_CODE_SESSION_ID'],
+    });
+    assert.ok(
+      !result.stderr.includes('C2 feedback: no session id resolvable'),
+      `Expected C2 NOT to degrade when DB marker is set. stderr: ${result.stderr}`
+    );
+    // Verify no degraded_close C2 row was written.
+    const { rows } = await c2db.query(
+      `SELECT value FROM project_settings WHERE project_id = $1 AND key LIKE 'degraded_close:%'`,
+      [c2ProjectId]
+    );
+    const c2Degraded = rows.filter((r) => {
+      try { return JSON.parse(r.value).subsystem === 'C2'; } catch (_) { return false; }
+    });
+    assert.strictEqual(c2Degraded.length, 0, `Expected 0 C2 degraded_close rows, got ${c2Degraded.length}`);
+  });
+
+  // Test B: C2 does not degrade when payload omits session_id, DB marker absent, but env var is set.
+  await test('close: C2 does not degrade when env var CLAUDE_CODE_SESSION_ID is set (DB marker absent)', async () => {
+    // Ensure no session_in_progress row exists.
+    await c2db.query(
+      `DELETE FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'`,
+      [c2ProjectId]
+    );
+    // Also clear any degraded_close rows from prior test runs.
+    await c2db.query(
+      `DELETE FROM project_settings WHERE project_id = $1 AND key LIKE 'degraded_close:%'`,
+      [c2ProjectId]
+    );
+    // Run close with CLAUDE_CODE_SESSION_ID explicitly set in the subprocess env.
+    const result = runHelperBoth('close', ['--json', '-'], {
+      fakeRoot,
+      stdin: JSON.stringify(c2BasePayload),
+      extraEnv: { CLAUDE_CODE_SESSION_ID: 'test-env-session-001' },
+    });
+    assert.ok(
+      !result.stderr.includes('C2 feedback: no session id resolvable'),
+      `Expected C2 NOT to degrade when env var is set. stderr: ${result.stderr}`
+    );
+  });
+
+  // Test C (negative): C2 degrades when payload omits session_id and both DB marker and env var absent.
+  await test('close: C2 degrades when payload omits session_id and both DB marker and env var absent', async () => {
+    // Ensure no session_in_progress row.
+    await c2db.query(
+      `DELETE FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'`,
+      [c2ProjectId]
+    );
+    // Run close with CLAUDE_CODE_SESSION_ID explicitly removed from subprocess env.
+    const result = runHelperBoth('close', ['--json', '-'], {
+      fakeRoot,
+      stdin: JSON.stringify(c2BasePayload),
+      deleteEnv: ['CLAUDE_CODE_SESSION_ID'],
+    });
+    assert.ok(
+      result.stderr.includes('C2 feedback: no session id resolvable'),
+      `Expected C2 to degrade when no session id is resolvable. stderr: ${result.stderr}`
+    );
+  });
+
+  await c2db.end();
 
   await db.end();
   await teardown();
