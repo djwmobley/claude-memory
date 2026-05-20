@@ -1,3 +1,5 @@
+> Archive — preserved for reference. For the current operator-facing docs, see [QUICKSTART.md](../../QUICKSTART.md) or [README.md](../../README.md).
+
 ---
 title: Predicate Normalization Migration — Legacy→Canonical Rewrite Spec
 change_size: MEDIUM

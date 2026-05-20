@@ -2,10 +2,7 @@
 
 > Running: handoff:checkpoint
 
-This slash command extracts entities, assertions, edges, and an updated retrieval
-contract from the current conversation state — the same extraction as `/handoff:close`
-— but does NOT clear the `session_in_progress` marker. Use it for long sessions
-where you want to persist progress without formally ending the session.
+Mid-session save. Does the same extraction as `/handoff:close` — entities, assertions, edges, updated retrieval contract — but doesn't end the session. Useful when you've hit a natural decision point in a long session and want to make sure that progress is captured before continuing. The session stays open; run `/handoff:close` when you're actually done.
 
 ## Extraction instructions for Claude
 
@@ -17,7 +14,8 @@ Before calling the helper, extract the following from this conversation:
 2. **Assertions** — facts stated or inferred.
    Each needs: `subject`, `predicate`, `object`, `confidence` (1–10), `source`
    (user_stated | model_extracted | doc_quoted | retrieved_from_prior).
-   Score user-stated durable facts 8–10; tentative model inferences 3–5.
+   How sure are you? Score 9–10 for things the user said directly, 7–8 for
+   strongly implied facts, 5–6 for reasonable inferences, 3–5 for tentative ones.
 
 3. **Edges** — typed relationships between entities.
    Each needs: `from_entity`, `edge_type` (depends_on/implements/blocks/owns/etc.), `to_entity`.

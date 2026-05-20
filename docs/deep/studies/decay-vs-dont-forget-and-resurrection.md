@@ -1,3 +1,5 @@
+> Plain-English version: [docs/case-study.md](../../case-study.md). This is the dense original — preserved for the methodology and the numbers.
+
 # Decay vs. Don't-Forget: Devalue, Invalidate, and On-Demand Resurrection
 
 *A methodology and case study for the claude-memory OSS project. The design described here has shipped — all mechanism claims are anchored to production code on `main`. Conclusions are presented qualitatively; no synthetic corpus counts appear here as telemetry.*

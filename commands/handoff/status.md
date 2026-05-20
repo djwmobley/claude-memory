@@ -2,8 +2,7 @@
 
 > Running: handoff:status
 
-This slash command shows the current state of the handoff memory for the project
-in your working directory. It makes no writes.
+Quick health check. Shows when the last session closed, how many entities, assertions, and edges are in the database, and warns you if the data is stale. It makes no writes — safe to run any time.
 
 ## What this shows
 

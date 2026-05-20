@@ -1,3 +1,5 @@
+> Archive — preserved for reference. For the current operator-facing docs, see [QUICKSTART.md](../../QUICKSTART.md) or [README.md](../../README.md).
+
 Code-grounded comparison study (spine step 1). Informs the public-viability positioning and resolved Forks 1 & 2.
 
 # claude-memory vs. Alternatives: Was the Build Justified?

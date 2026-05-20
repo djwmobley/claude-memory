@@ -69,14 +69,38 @@ process.on('exit', () => {
 
 // ─── CONSTANTS ───────────────────────────────────────────────────────────────
 
-// HANDOFF_DB — documented env-var override for projects that don't use the default DB name.
+// TARGET_DB resolution order (first wins):
+//   1. process.env.HANDOFF_DB  — explicit env override (preserved for CI / scripts)
+//   2. loadConfig().database   — from .claude/pipeline.yml
+//   3. 'claude_memory_eval_test' — final hardcoded fallback
 // Validated against a strict identifier regex because DDL cannot use parameterized $1 and
 // the double-quote wrap in CREATE DATABASE can be broken by names containing '"'.
-const _rawTargetDb = process.env.HANDOFF_DB || 'claude_memory_eval_test';
-const _DB_NAME_RE  = /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/;
+const _DB_NAME_RE = /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/;
+
+let _rawTargetDb;
+let _rawTargetDbSource;
+if (process.env.HANDOFF_DB) {
+  _rawTargetDb       = process.env.HANDOFF_DB;
+  _rawTargetDbSource = 'HANDOFF_DB env var';
+} else {
+  try {
+    const _cfg = loadConfig();
+    if (_cfg && _cfg.database) {
+      _rawTargetDb       = _cfg.database;
+      _rawTargetDbSource = '.claude/pipeline.yml';
+    }
+  } catch (_) {
+    // loadConfig() throws when no config file exists — fall through to default
+  }
+  if (!_rawTargetDb) {
+    _rawTargetDb       = 'claude_memory_eval_test';
+    _rawTargetDbSource = 'built-in default';
+  }
+}
+
 if (!_DB_NAME_RE.test(_rawTargetDb)) {
   process.stderr.write(
-    `Invalid HANDOFF_DB value "${_rawTargetDb}" — must match /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/.\n`
+    `Invalid database name "${_rawTargetDb}" (from ${_rawTargetDbSource}) — must match /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/.\n`
   );
   process.exit(1);
 }
