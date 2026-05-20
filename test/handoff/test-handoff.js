@@ -162,10 +162,13 @@ knowledge:
     process.exit(2);
   }
 
-  // Apply phase2 schema (idempotent)
-  const schemaFile = path.resolve(__dirname, '..', '..', 'scripts', 'sql', 'phase2-schema.sql');
+  // Apply handoff-core schema (idempotent). Was previously pointing at a
+  // non-existent phase2-schema.sql which silently skipped — this is the real
+  // canonical schema file applied by /handoff:init.
+  const schemaFile = path.resolve(__dirname, '..', '..', 'scripts', 'sql', 'handoff-core-schema.sql');
   if (fs.existsSync(schemaFile)) {
     let sql = fs.readFileSync(schemaFile, 'utf8');
+    // Strip psql meta-commands (e.g. \c, \echo) so we can run via the JS client.
     sql = sql.replace(/^\\[a-z].*$/gm, '');
     try {
       await db.query(sql);

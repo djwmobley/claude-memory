@@ -327,6 +327,12 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Create handoff test database
+        # test-handoff.js connects to claude_memory_eval_test (hardcoded TARGET_DB).
+        # Create it here; the test's setup() applies handoff-core-schema.sql into it.
+        run: psql -h localhost -U postgres -c "CREATE DATABASE claude_memory_eval_test"
+        env:
+          PGPASSWORD: postgres
       - name: Run end-to-end handoff subcommand tests
         # Golden-path coverage of every /handoff subcommand against a real Postgres:
         #   init/status/resume/close/checkpoint/drop/purge/resurrect — DB row counts,
