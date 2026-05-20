@@ -327,3 +327,18 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run end-to-end handoff subcommand tests
+        # Golden-path coverage of every /handoff subcommand against a real Postgres:
+        #   init/status/resume/close/checkpoint/drop/purge/resurrect — DB row counts,
+        #   handoff.md write/archive/rewrite, contract update, session_in_progress
+        #   marker lifecycle, TARGET_DB resolution order, C2 session-id fallback chain,
+        #   and the reconciliation-gate C-1/C-2/C-3/C-6 acceptance rules.
+        # Broader than smoketest-handoff.js (which covers invariants and registry
+        # drift but does not run each subcommand end-to-end). Was previously missing
+        # from CI; re-added after the marker-pre-mint fix to test setup that resolves
+        # the 12-failure cascade caused by ensureProjectIdentity auto-minting UUIDs.
+        run: node test/handoff/test-handoff.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
