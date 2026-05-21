@@ -349,6 +349,22 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run serve-time staleness tests
+        # Tests the serve-time reality re-probe (categorical staleness fix):
+        #   (a) Frozen 'verified' row annotated [STALE:] in served output on mismatch
+        #   (b) Floor: no-probe predicate served line unchanged
+        #   (c) Gate off: byte-identical output when serve_time_reality_check=disabled
+        #   (d) Token-budget: trueServedTokens reflects true bootstrap cost (canon+body+sections)
+        #   (e) §7 no-backfill: conf/source/tier/object never modified by serve-time pass
+        #   (f) Resurrect path: does not crash with feature enabled
+        #   (g) End-to-end loop: close-time verified row annotated [STALE:] at next resume
+        #   (h) L2 pre-write refresh: stale verified prior row does not grant unearned L2 trust
+        # Reuses claude_memory_eval_test (created by Create handoff test database step above).
+        run: node test/handoff/test-serve-time-staleness.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       # ── North-star suite (TDD spec — RED BY DESIGN, hard gate) ───────────────
       # These four files encode the system's north star: load-bearing session
       # intent (open-threads / next-actions / tldr) MUST live in Postgres as

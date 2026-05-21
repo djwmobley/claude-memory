@@ -188,6 +188,43 @@ time. The model MUST NOT include a `has_unpackaged_state` entry in the `assertio
 of the JSON payload. If one is included, it is silently discarded and replaced by the
 authoritative code-computed value.
 
+**Authoring volatile now-state facts as probe-able predicates (serve-time staleness fix):**
+Some assertions record volatile now-state that will be re-verified at the next session's
+resume. To get automatic [STALE:] annotation and `reality_check` refresh, author these
+facts using a predicate that has a `mode:'verify'` entry in the L3 reality-check registry
+(`scripts/lib/reality-checks.js`). Supported volatile predicates are:
+
+| Predicate | Object format | What is probed |
+|---|---|---|
+| `in_file` | relative or absolute file path (e.g. `"scripts/handoff.js"`) | file exists on disk |
+| `branch_exists` | subject = branch name; object = `"exists"` | git branch exists locally or on origin |
+| `commit_merged` | `"<sha>"` or `"<sha> on <branch>"` (e.g. `"0ac852a on main"`) | commit is an ancestor of the ref |
+| `pr_state` | `"open"` \| `"closed"` \| `"merged"` (subject must contain the PR number) | `gh pr view` live state |
+
+**Authoring rule:** use these predicates for any assertion whose truth may change between
+sessions. Do NOT use them for historical then-state (use `is_at_commit`, `shipped_at`, or
+`is_status` for those). At the next resume, the serve-time reality re-probe will re-check
+the live value and annotate any mismatched rows with `[STALE: now "<liveValue>"]` in the
+served output.
+
+**Examples:**
+```json
+{ "subject": "feat/serve-time-staleness-fix", "predicate": "branch_exists",
+  "object": "exists", "confidence": 9, "source": "model_extracted" }
+
+{ "subject": "PR #92", "predicate": "pr_state",
+  "object": "open", "confidence": 9, "source": "model_extracted" }
+
+{ "subject": "main-entry-point", "predicate": "in_file",
+  "object": "scripts/handoff.js", "confidence": 9, "source": "model_extracted" }
+
+{ "subject": "PR-92-squash", "predicate": "commit_merged",
+  "object": "0ac852a on main", "confidence": 9, "source": "model_extracted" }
+```
+
+`pr_state` requires `gh` CLI authenticated and online at probe time; offline/CI
+environments get `unverifiable` (fail-soft, never blocks serve).
+
 **Pointer-staleness gate:** at close time, `handoff.js` also scans TL;DR, open threads,
 and quick references for `file:line` code pointers and validates each against the live
 file tree. Stale line numbers are auto-corrected in the written `handoff.md`; pointers

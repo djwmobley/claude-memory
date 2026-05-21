@@ -183,6 +183,36 @@ This distinction matters. If you close the window without running `/handoff:clos
 
 ---
 
+## Serve-time reality re-probe
+
+At close time, `handoff.js` runs an L3 verify pass that probes every live assertion whose predicate has a `mode:'verify'` entry in the L3 reality-check registry. Each row gets a `reality_check` tag: `verified`, `mismatch`, or `unverifiable`.
+
+The problem is that these tags freeze at close time. If an assertion is tagged `verified` at the end of one session, and the real-world state changes before the next session starts — a branch gets deleted, a PR gets merged, a file gets moved — the tag stays `verified` even though the ground truth has shifted.
+
+The serve-time reality re-probe addresses this. Every time assertions are served to a session (via `/handoff:resume`, the SessionStart hook, or the resurrect path), the loader re-runs the same probes against current ground truth. For any row whose live probe result now differs from its asserted object, the served line is annotated:
+
+```
+- [model_extracted|conf=9] feat/my-feature branch_exists exists [STALE: now "<absent>"]
+```
+
+A `[verified✓]` suffix appears on rows that still match. Rows whose probe cannot run (git unavailable, `gh` offline) get `[unverifiable]` and are left unannotated to keep output clean.
+
+The `reality_check` column is also refreshed in the database (fail-soft UPDATE — only `reality_check` is written; confidence, source, tier, and object are never touched). This means the L2 consolidation gate's quality-plug check (`hasQualityCorroborator`) sees fresh values at the next close — a stale frozen `verified` on a row whose probe now mismatches cannot grant unearned trust to an incoming cross-session corroborator.
+
+**Feature gate.** The serve-time re-probe is enabled by default (`serve_time_reality_check = 'enabled'`). It can be disabled per-project:
+
+```sql
+INSERT INTO project_settings (project_id, key, value)
+VALUES ('<your-project-id>', 'serve_time_reality_check', 'disabled')
+ON CONFLICT (project_id, key) DO UPDATE SET value = 'disabled';
+```
+
+With the gate disabled, served output is byte-identical to pre-feature output.
+
+**Volatile predicates.** Only predicates with a `mode:'verify'` entry in the registry are probed. The current set: `in_file`, `branch_exists`, `commit_merged`, `pr_state`. Historical then-state predicates (`is_at_commit`, `shipped_at`) are deliberately excluded — they record fixed historical points and must not be re-verified against now-state.
+
+---
+
 ## What this system is — and what it isn't
 
 **The relay-baton model.** claude-memory is a session seam — a relay baton handed off between sessions. Its job is to carry continuity across session boundaries: capture the durable state at the end of one session, serve it leanly at the start of the next. The baton carries forward only what the next runner needs, not the full transcript of the race.

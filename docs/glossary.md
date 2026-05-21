@@ -4,6 +4,16 @@ This is a quick-reference for the terms you'll see across the docs in this proje
 
 ---
 
+### [STALE: now "…"] annotation
+
+A suffix appended to a served assertion line when the serve-time reality re-probe detects that the asserted value no longer matches live ground truth. Example:
+
+```
+- [model_extracted|conf=9] feat/my-feature branch_exists exists [STALE: now "<absent>"]
+```
+
+The annotation appears only for predicates registered with `mode:'verify'` in the L3 reality-check registry (`scripts/lib/reality-checks.js`). Rows that still match get `[verified✓]`; rows whose probe cannot run are left unannotated (`unverifiable`). The `reality_check` column is refreshed in the database at the same time (fail-soft; only `reality_check` is written — confidence, source, tier, and object are never modified). See also: **serve-time reality re-probe**, **reality_check**.
+
 ### Assertion
 
 A single fact that Claude wrote down. Think of it like one line in a notebook: "the project name is my-app", "the status is in-progress", "the user prefers plain English". Every assertion has a subject (what it's about), a predicate (the type of fact), and an object (the value). See also: **entity**, **predicate**.
@@ -111,6 +121,30 @@ The `### Session intent` block that the loader surfaces at resume time. It is bu
 ### Session seam
 
 The moment of transition between two Claude Code sessions — the point where `/handoff:close` or `/handoff:checkpoint` runs. The session seam is the only point at which session state is captured. Continuity is preserved *across the seam*, not continuously throughout a session. See also: **relay baton vs. court stenographer**, **Limitations** in `docs/how-memory-works.md`.
+
+### branch_exists
+
+A predicate (cardinality 1:1, `mode:'verify'`) that records whether a named git branch currently exists. Subject = the branch name; object = `"exists"` (verified form) or `"<absent>"` (when branch has been deleted). Probed by `probeBranchExists` in the L3 registry (local then remote). At the next resume after a branch is deleted, the served line will show `[STALE: now "<absent>"]`. See also: **[STALE: now "…"] annotation**, **serve-time reality re-probe**.
+
+### commit_merged
+
+A predicate (cardinality 1:1, `mode:'verify'`) that records whether a given commit SHA is an ancestor of a specified ref. Object format: `"merged"` (verified), `"<sha>"`, or `"<sha> on <branch>"`. Probed via `git merge-base --is-ancestor`. Returns `'merged'` or `'<not-merged>'`; fails soft to `null` (unverifiable) when the commit does not exist or git is unavailable. See also: **[STALE: now "…"] annotation**, **serve-time reality re-probe**.
+
+### in_file
+
+A predicate (`mode:'verify'`) that records that something (a function, a constant, a section) lives in a particular file. Object = a relative or absolute file path. Probed by checking file existence on disk — returns the path when the file exists (verified), `'<absent>'` when it does not (mismatch), `null` when the object is not path-like (unverifiable). Used as the deterministic test probe because no network or git required. See also: **[STALE: now "…"] annotation**, **serve-time reality re-probe**.
+
+### pr_state
+
+A predicate (cardinality 1:1, `mode:'verify'`) that records the current GitHub PR state. Subject must contain the PR number (e.g. `"PR #92"`); object is `"open"`, `"closed"`, or `"merged"`. Probed via `gh pr view <number> --json state` with a 5-second timeout. Fails soft to `null` (unverifiable) when `gh` is offline, unauthenticated, or the PR is not found — never hangs the serve path. See also: **[STALE: now "…"] annotation**, **serve-time reality re-probe**.
+
+### reality_check
+
+A column on the `assertions` table that records the most recent probe result for a verify-mode assertion. Values: `'verified'` (probe matched), `'mismatch'` (probe returned a different value), `'unverifiable'` (probe returned null — cannot determine), or NULL (not yet probed). Written by the close-time L3 verify pass and refreshed (fail-soft) by the serve-time reality re-probe. The L2 consolidation gate's `hasQualityCorroborator` check reads this column — a stale `'verified'` on a row whose probe now mismatches cannot grant unearned trust because the pre-write refresh pass (added in the serve-time staleness fix) refreshes it before `writeExtraction` runs. INVARIANT: only `reality_check` is ever written by the verify/re-probe passes — confidence, source, tier, and object are never modified. See also: **[STALE: now "…"] annotation**, **serve-time reality re-probe**.
+
+### serve-time reality re-probe
+
+The mechanism that re-runs `mode:'verify'` probes against live ground truth every time assertions are served (resume, resurrect, SessionStart hook). Addresses the frozen-tag problem: close-time verify tags freeze at the point the close runs; between sessions, real-world state can shift (a branch deleted, a PR merged, a file moved). The re-probe refreshes `reality_check` in the database and annotates mismatched rows with `[STALE: now "…"]` in the served output. Feature-gated via `serve_time_reality_check` project setting (default `'enabled'`). See also: **[STALE: now "…"] annotation**, **reality_check**, **in_file**, **branch_exists**, **commit_merged**, **pr_state**.
 
 ---
 
