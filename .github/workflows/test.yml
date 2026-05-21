@@ -140,6 +140,15 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run degraded_close retention unit tests
+        # Focused unit tests for pruneDegradedClose() in isolation (no retrieval_events
+        # required). Covers: 110 seeded → 100 remain (oldest 10 deleted), 2 seeded →
+        # both retained (no-op), custom keep=5 on 8 records, on both Postgres and SQLite.
+        run: node test/handoff/test-degraded-close-retention.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run L3 reality-check registry tests
         # Tests Lever L3: generalizes the single hard-coded reality-bound assertion
         # (packaging state) into a reality-check registry with a strictly non-mutating

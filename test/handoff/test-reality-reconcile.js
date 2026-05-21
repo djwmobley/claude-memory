@@ -371,88 +371,102 @@ async function runTests() {
     }
   });
 
-  // ── R4: degraded_close retention prune ────────────────────────────────────────
+  // ── R4: degraded_close retention prune (keep-most-recent-100) ───────────────
 
-  await test('(R4) degraded_close retention: records older than prior last_close are pruned; newer retained', async () => {
+  await test('(R4) degraded_close retention: keep-most-recent-100 — oldest excess pruned; small corpus untouched', async () => {
     const ctx = await setup();
     const { fakeRoot, projectId, db } = ctx;
     try {
       runInit(fakeRoot);
 
-      // First close — establishes last_close in handoff.md.
-      runClose(fakeRoot, {
-        session_id: 'r4-close-1',
-        tldr:       'R4 first close',
-        assertions: [],
-      });
-
-      // Read the last_close stamp from handoff.md.
-      const handoffPath = path.join(os.homedir(), '.claude', 'projects', projectId, 'handoff.md');
-      assert.ok(fs.existsSync(handoffPath), 'handoff.md not found after first close');
-      const handoffContent = fs.readFileSync(handoffPath, 'utf8');
-      const lastCloseMatch = handoffContent.match(/last_close:\s*([\S]+)/);
-      assert.ok(lastCloseMatch, 'last_close not found in handoff.md frontmatter');
-      const firstLastClose = lastCloseMatch[1];
-
-      // Seed three OLD degraded_close records with stamps strictly before firstLastClose.
-      // Use ISO stamps earlier than any plausible last_close from this run.
-      const oldStamps = [
-        '2020-01-01T00:00:00.000Z',
-        '2021-06-15T12:00:00.000Z',
-        '2022-12-31T23:59:59.999Z',
-      ];
-      for (let i = 0; i < oldStamps.length; i++) {
+      // Seed 110 degraded_close records with ascending ISO-stamp keys.
+      // Oldest 10 should be deleted; newest 100 retained.
+      const records = [];
+      for (let i = 0; i < 110; i++) {
+        // Stamps from 2020-01-01 (oldest) up through 2020-04-19 (newest), 1 day apart.
+        const d = new Date('2020-01-01T00:00:00.000Z');
+        d.setUTCDate(d.getUTCDate() + i);
+        const stamp = d.toISOString();
+        const key   = `degraded_close:${stamp}:${String(i).padStart(4, '0')}`;
+        records.push({ i, stamp, key });
         await db.query(
           `INSERT INTO project_settings (project_id, key, value)
            VALUES ($1, $2, $3)
            ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
-          [
-            projectId,
-            `degraded_close:${oldStamps[i]}:${i}`,
-            JSON.stringify({ subsystem: 'C2', reason: `old-r4-${i}`, stamp: oldStamps[i] }),
-          ]
+          [projectId, key, JSON.stringify({ subsystem: 'C2', reason: `r4-seed-${i}`, stamp })]
         );
       }
 
-      // Seed one NEW record with a stamp guaranteed to be newer than firstLastClose.
-      // Use a stamp far in the future relative to the test run.
-      const futureStamp = '2099-01-01T00:00:00.000Z';
-      await db.query(
-        `INSERT INTO project_settings (project_id, key, value)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
-        [
-          projectId,
-          `degraded_close:${futureStamp}:0`,
-          JSON.stringify({ subsystem: 'C3', reason: 'new-r4', stamp: futureStamp }),
-        ]
-      );
-
-      // Second close — should prune old records, keep new record.
+      // Run a close — triggers pruneDegradedClose(db, projectId, 100).
       runClose(fakeRoot, {
-        session_id: 'r4-close-2',
-        tldr:       'R4 second close',
+        session_id: 'r4-close-1',
+        tldr:       'R4 retention prune test',
         assertions: [],
       });
 
-      // Old records must be deleted.
-      for (let i = 0; i < oldStamps.length; i++) {
-        const key = `degraded_close:${oldStamps[i]}:${i}`;
+      // Exactly 100 records must remain.
+      const { rows: remaining } = await db.query(
+        `SELECT key FROM project_settings
+         WHERE project_id = $1 AND key LIKE 'degraded_close:%'
+         ORDER BY key`,
+        [projectId]
+      );
+      assert.strictEqual(remaining.length, 100,
+        `Expected exactly 100 degraded_close records after prune, got ${remaining.length}`);
+
+      // The 10 oldest (i=0..9) must be gone.
+      for (let i = 0; i < 10; i++) {
+        const { key } = records[i];
         const { rows } = await db.query(
           `SELECT key FROM project_settings WHERE project_id = $1 AND key = $2`,
           [projectId, key]
         );
-        assert.strictEqual(rows.length, 0, `Expected old record '${key}' to be pruned, but it still exists`);
+        assert.strictEqual(rows.length, 0,
+          `Expected oldest record '${key}' to be pruned, but it still exists`);
       }
 
-      // New (future-stamped) record must be retained.
-      const { rows: retainedRows } = await db.query(
-        `SELECT key FROM project_settings
-         WHERE project_id = $1 AND key = $2`,
-        [projectId, `degraded_close:${futureStamp}:0`]
-      );
-      assert.ok(retainedRows.length > 0,
-        `Expected future-stamped degraded_close record to be retained, but it was pruned`);
+      // The 100 newest (i=10..109) must be present.
+      for (let i = 10; i < 110; i++) {
+        const { key } = records[i];
+        const { rows } = await db.query(
+          `SELECT key FROM project_settings WHERE project_id = $1 AND key = $2`,
+          [projectId, key]
+        );
+        assert.strictEqual(rows.length, 1,
+          `Expected newest record '${key}' to be retained, but it was pruned`);
+      }
+
+      // Separate assertion: with only 2 seeded records (far under 100), prune deletes nothing.
+      // Use a second project to isolate.
+      const ctx2 = await setup();
+      const { fakeRoot: fakeRoot2, projectId: projectId2, db: db2 } = ctx2;
+      try {
+        runInit(fakeRoot2);
+        const twoStamps = ['2020-01-01T00:00:00.000Z', '2020-01-02T00:00:00.000Z'];
+        for (let i = 0; i < twoStamps.length; i++) {
+          const key = `degraded_close:${twoStamps[i]}:${String(i).padStart(4, '0')}`;
+          await db2.query(
+            `INSERT INTO project_settings (project_id, key, value)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
+            [projectId2, key, JSON.stringify({ subsystem: 'C2', reason: `r4-two-${i}`, stamp: twoStamps[i] })]
+          );
+        }
+        runClose(fakeRoot2, {
+          session_id: 'r4-two-close',
+          tldr:       'R4 two-record test',
+          assertions: [],
+        });
+        const { rows: twoRemaining } = await db2.query(
+          `SELECT key FROM project_settings
+           WHERE project_id = $1 AND key LIKE 'degraded_close:%'`,
+          [projectId2]
+        );
+        assert.ok(twoRemaining.length >= 2,
+          `Expected both records retained with only 2 seeded, got ${twoRemaining.length}`);
+      } finally {
+        await teardown(ctx2);
+      }
     } finally {
       await teardown(ctx);
     }

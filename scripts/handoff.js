@@ -1159,6 +1159,43 @@ async function recordDegradedClose(db, projectId, sessionId, subsystem, reason) 
 }
 
 /**
+ * Prune excess degraded_close:* records, keeping the most recent `keep` rows.
+ * Deletes only the oldest excess beyond the keep limit, preserving the
+ * append-only audit trail for all recent records.
+ *
+ * Works on both Postgres and the SQLite seam: the NOT IN subquery is valid
+ * in both dialects; $1 appears twice — pass [projectId, projectId] so the
+ * SQLite rewrite (which maps each $\d+ → ?) gets two bound values.
+ * Fail-soft: any error is logged to stderr and never aborts close.
+ *
+ * @param {object} db        — DB adapter with .query(sql, params) → {rows}
+ * @param {string} projectId
+ * @param {number} [keep=100]
+ */
+async function pruneDegradedClose(db, projectId, keep = 100) {
+  try {
+    // $1 / $2 are both projectId; using distinct positional params ($1 outer,
+    // $2 subquery) satisfies Postgres (which counts unique $N references) while
+    // the SQLite rewrite maps each $\d+ → ? giving two bound values — both work.
+    await db.query(
+      `DELETE FROM project_settings
+       WHERE project_id = $1
+         AND key LIKE 'degraded_close:%'
+         AND key NOT IN (
+           SELECT key FROM project_settings
+           WHERE project_id = $2
+             AND key LIKE 'degraded_close:%'
+           ORDER BY key DESC
+           LIMIT ${keep}
+         )`,
+      [projectId, projectId]
+    );
+  } catch (pruneErr) {
+    process.stderr.write(`[handoff] degraded_close prune failed (non-fatal): ${pruneErr.message}\n`);
+  }
+}
+
+/**
  * Deep-equal comparison for two retrieval contract objects.
  * Compares via JSON.stringify (contract shape is {queries:[...]}, deterministic).
  * Exported for unit tests.
@@ -4388,13 +4425,6 @@ async function cmdClose(args) {
 
   const handoffPath = resolveHandoffMdPath(projectId);
 
-  // Read prior last_close before it is overwritten — needed for the
-  // degraded_close retention prune at the end of close (Part 2).
-  const priorLastClose = (function () {
-    try { return readHandoffFrontmatter(handoffPath).last_close || null; }
-    catch (_) { return null; }
-  })();
-
   // Deliverable A: auto-apply additive schema on drift (non-fatal).
   // Runs immediately after identity resolution, before payload processing.
   // Any error here must NOT abort close — wrap and continue.
@@ -5519,42 +5549,13 @@ async function cmdClose(args) {
 
   // ── Part 2: degraded_close retention prune ────────────────────────────────────
   //
-  // Records older than the PRIOR last_close can never resurface in the resume
-  // warning (the resume filter only shows keys whose stamp > last_close).
-  // Delete them to prevent unbounded accumulation.
+  // Keep the 100 most-recent degraded_close:* records; delete only the oldest
+  // excess beyond that limit.  This bounds unbounded growth while preserving
+  // the append-only audit trail — successive degraded closes always accumulate
+  // as distinct rows until the corpus exceeds 100 entries.
   //
-  // Key format: degraded_close:<ISO-stamp>:<seq>
-  // Strip prefix + trailing :<seq> to get the ISO stamp, same as resume filter.
-  //
-  // Skipped on first close (priorLastClose=null/'never') — nothing to prune.
-  // Fail-soft: any error is logged and does not abort close.
-  if (priorLastClose && priorLastClose !== 'never') {
-    try {
-      const { rows: dcRows } = await db.query(
-        `SELECT key FROM project_settings
-         WHERE project_id = $1 AND key LIKE 'degraded_close:%'`,
-        [projectId]
-      );
-      const toDelete = [];
-      for (const r of dcRows) {
-        const afterPrefix = r.key.slice('degraded_close:'.length);
-        const lastColon   = afterPrefix.lastIndexOf(':');
-        const stampPart   = lastColon >= 0 ? afterPrefix.slice(0, lastColon) : afterPrefix;
-        // Strictly older than the prior last_close (not >= current stamp).
-        if (stampPart < priorLastClose) {
-          toDelete.push(r.key);
-        }
-      }
-      for (const key of toDelete) {
-        await db.query(
-          `DELETE FROM project_settings WHERE project_id = $1 AND key = $2`,
-          [projectId, key]
-        );
-      }
-    } catch (pruneErr) {
-      process.stderr.write(`[handoff] degraded_close prune failed (non-fatal): ${pruneErr.message}\n`);
-    }
-  }
+  // Fail-soft: errors are logged to stderr and never abort close.
+  await pruneDegradedClose(db, projectId);
 
   // ── Packaging-honesty display (non-fatal, synchronous close path only) ────────
   //
@@ -6802,6 +6803,7 @@ if (require.main === module) {
   module.exports = {
     queriesEqual,
     recordContractChange,
+    pruneDegradedClose,
     // Pointer-staleness gate internals (exposed for test-pointer-gate.js)
     _extractPointers,
     _deriveAnchor,
