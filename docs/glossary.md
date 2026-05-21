@@ -124,11 +124,11 @@ The moment of transition between two Claude Code sessions — the point where `/
 
 ### branch_exists
 
-A predicate (cardinality 1:1, `mode:'verify'`) that records whether a named git branch currently exists. Subject = the branch name; object = `"exists"` (verified form) or `"<absent>"` (when branch has been deleted). Probed by `probeBranchExists` in the L3 registry (local then remote). At the next resume after a branch is deleted, the served line will show `[STALE: now "<absent>"]`. See also: **[STALE: now "…"] annotation**, **serve-time reality re-probe**.
+A predicate (cardinality 1:1, `mode:'verify'`) that records whether a named git branch currently exists. Subject = the branch name; object = `"exists"` (verified form) or `"<absent>"` (when branch has been deleted). Probed by `probeBranchExists` in the L3 registry (local then remote). At close time, if the probe detects a mismatch, the stale row is **reconciled** (see: **reality reconciliation**) rather than flagged as degraded. At the next resume after a branch is deleted, the served line will show `[STALE: now "<absent>"]`. See also: **[STALE: now "…"] annotation**, **serve-time reality re-probe**, **reality reconciliation**.
 
 ### commit_merged
 
-A predicate (cardinality 1:1, `mode:'verify'`) that records whether a given commit SHA is an ancestor of a specified ref. Object format: `"merged"` (verified), `"<sha>"`, or `"<sha> on <branch>"`. Probed via `git merge-base --is-ancestor`. Returns `'merged'` or `'<not-merged>'`; fails soft to `null` (unverifiable) when the commit does not exist or git is unavailable. See also: **[STALE: now "…"] annotation**, **serve-time reality re-probe**.
+A predicate (cardinality 1:1, `mode:'verify'`) that records whether a given commit SHA has been merged. Subject = the entity the commit belongs to; object = `"merged"` (verified form) or `"<not-merged>"` (when not yet an ancestor). Object format for authoring: `"<sha>"` or `"<sha> on <branch>"`. Probed via `git merge-base --is-ancestor`. Returns `'merged'` or `'<not-merged>'`; fails soft to `null` (unverifiable) when the commit does not exist or git is unavailable. See also: **[STALE: now "…"] annotation**, **serve-time reality re-probe**, **reality reconciliation**.
 
 ### in_file
 
@@ -140,11 +140,20 @@ A predicate (cardinality 1:1, `mode:'verify'`) that records the current GitHub P
 
 ### reality_check
 
-A column on the `assertions` table that records the most recent probe result for a verify-mode assertion. Values: `'verified'` (probe matched), `'mismatch'` (probe returned a different value), `'unverifiable'` (probe returned null — cannot determine), or NULL (not yet probed). Written by the close-time L3 verify pass and refreshed (fail-soft) by the serve-time reality re-probe. The L2 consolidation gate's `hasQualityCorroborator` check reads this column — a stale `'verified'` on a row whose probe now mismatches cannot grant unearned trust because the pre-write refresh pass (added in the serve-time staleness fix) refreshes it before `writeExtraction` runs. INVARIANT: only `reality_check` is ever written by the verify/re-probe passes — confidence, source, tier, and object are never modified. See also: **[STALE: now "…"] annotation**, **serve-time reality re-probe**.
+A column on the `assertions` table that records the most recent probe result for a verify-mode assertion. Values: `'verified'` (probe matched), `'mismatch'` (probe returned a different value), `'unverifiable'` (probe returned null — cannot determine), or NULL (not yet probed). Written by the close-time L3 verify pass and refreshed (fail-soft) by the serve-time reality re-probe. The L2 consolidation gate's `hasQualityCorroborator` check reads this column — a stale `'verified'` on a row whose probe now mismatches cannot grant unearned trust because the pre-write refresh pass refreshes it before `writeExtraction` runs. INVARIANT: only `reality_check` is ever written by the verify/re-probe passes — confidence, source, tier, and object are never modified (see §7 no-backfill). Close-time mismatches on pre-existing rows trigger **reality reconciliation** rather than a degraded-close record. See also: **[STALE: now "…"] annotation**, **serve-time reality re-probe**, **reality reconciliation**.
 
 ### serve-time reality re-probe
 
-The mechanism that re-runs `mode:'verify'` probes against live ground truth every time assertions are served (resume, resurrect, SessionStart hook). Addresses the frozen-tag problem: close-time verify tags freeze at the point the close runs; between sessions, real-world state can shift (a branch deleted, a PR merged, a file moved). The re-probe refreshes `reality_check` in the database and annotates mismatched rows with `[STALE: now "…"]` in the served output. Feature-gated via `serve_time_reality_check` project setting (default `'enabled'`). See also: **[STALE: now "…"] annotation**, **reality_check**, **in_file**, **branch_exists**, **commit_merged**, **pr_state**.
+The mechanism that re-runs `mode:'verify'` probes against live ground truth every time assertions are served (resume, resurrect, SessionStart hook). Addresses the frozen-tag problem: close-time verify tags freeze at the point the close runs; between sessions, real-world state can shift (a branch deleted, a PR merged, a file moved). The re-probe refreshes `reality_check` in the database and annotates mismatched rows with `[STALE: now "…"]` in the served output. Feature-gated via `serve_time_reality_check` project setting (default `'enabled'`). The serve path is read-annotate only — it never suppresses or supersedes rows. Close-time reconciliation (see: **reality reconciliation**) is a separate, write-path-only operation. See also: **[STALE: now "…"] annotation**, **reality_check**, **in_file**, **branch_exists**, **commit_merged**, **pr_state**, **reality reconciliation**.
+
+### reality reconciliation
+
+The close-path mechanism that repairs stale assertions when the L3 verify pass detects a mismatch with a definitive probe result. Runs in the pre-write pass (before `writeExtraction`) so only pre-existing rows — not rows just authored in the current close — are affected. Behavior by predicate cardinality:
+
+- **1:1 predicates** (`branch_exists`, `commit_merged`, `pr_state`): calls `writeAssertionWithSupersession` to suppress the stale row and insert a reality-correct successor (e.g., if a branch was deleted, inserts a new row with `object='<absent>'`). The successor will probe `'verified'` on the next close.
+- **1:N predicates** (`in_file`): directly suppresses the stale row with `suppression_kind='reality_reconciled'`. No successor is inserted (the file no longer exists).
+
+§7 no-backfill invariant: confidence, source, tier, and object of the stale row are never modified — only `suppressed`, `invalid_at`, and `suppression_kind` are written. No `degraded_close` record is created for reconciled rows; the perpetual-mismatch alarm loop is broken silently. See also: **reality_check**, **branch_exists**, **in_file**, **serve-time reality re-probe**.
 
 ---
 

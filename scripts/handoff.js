@@ -1159,6 +1159,43 @@ async function recordDegradedClose(db, projectId, sessionId, subsystem, reason) 
 }
 
 /**
+ * Prune excess degraded_close:* records, keeping the most recent `keep` rows.
+ * Deletes only the oldest excess beyond the keep limit, preserving the
+ * append-only audit trail for all recent records.
+ *
+ * Works on both Postgres and the SQLite seam: the NOT IN subquery is valid
+ * in both dialects; $1 appears twice — pass [projectId, projectId] so the
+ * SQLite rewrite (which maps each $\d+ → ?) gets two bound values.
+ * Fail-soft: any error is logged to stderr and never aborts close.
+ *
+ * @param {object} db        — DB adapter with .query(sql, params) → {rows}
+ * @param {string} projectId
+ * @param {number} [keep=100]
+ */
+async function pruneDegradedClose(db, projectId, keep = 100) {
+  try {
+    // $1 / $2 are both projectId; using distinct positional params ($1 outer,
+    // $2 subquery) satisfies Postgres (which counts unique $N references) while
+    // the SQLite rewrite maps each $\d+ → ? giving two bound values — both work.
+    await db.query(
+      `DELETE FROM project_settings
+       WHERE project_id = $1
+         AND key LIKE 'degraded_close:%'
+         AND key NOT IN (
+           SELECT key FROM project_settings
+           WHERE project_id = $2
+             AND key LIKE 'degraded_close:%'
+           ORDER BY key DESC
+           LIMIT ${keep}
+         )`,
+      [projectId, projectId]
+    );
+  } catch (pruneErr) {
+    process.stderr.write(`[handoff] degraded_close prune failed (non-fatal): ${pruneErr.message}\n`);
+  }
+}
+
+/**
  * Deep-equal comparison for two retrieval contract objects.
  * Compares via JSON.stringify (contract shape is {queries:[...]}, deterministic).
  * Exported for unit tests.
@@ -4615,16 +4652,19 @@ async function cmdClose(args) {
     try {
       const { REALITY_CHECKS, runVerifyDispatch } = require('./lib/reality-checks');
       const preWriteRoot = root;
+      const preWriteSessionId = payload.session_id || null;
       const verifyPredicates = [...new Set(
         REALITY_CHECKS.filter((c) => c.mode === 'verify').map((c) => c.predicate)
       )];
       if (verifyPredicates.length > 0) {
         // Fetch all live rows for verify predicates in one query.
+        // confidence is included so the reconcile step can preserve it in any
+        // superseding row (§7: only suppressed/invalid_at/suppression_kind may change).
         const placeholders = verifyPredicates.map((_, i) => `$${i + 2}`).join(', ');
         let preWriteRows;
         try {
           const { rows } = await db.query(
-            `SELECT id, subject, predicate, object FROM assertions
+            `SELECT id, subject, predicate, object, confidence FROM assertions
              WHERE project_id = $1
                AND predicate  IN (${placeholders})
                AND suppressed = false
@@ -4637,6 +4677,10 @@ async function cmdClose(args) {
         }
 
         if (preWriteRows.length > 0) {
+          // Build id→confidence map for the reconcile step.
+          const preWriteConfById = new Map();
+          for (const r of preWriteRows) preWriteConfById.set(r.id, r.confidence);
+
           let preWriteResults;
           try {
             preWriteResults = await runVerifyDispatch(db, projectId, preWriteRoot, preWriteRows);
@@ -4644,6 +4688,7 @@ async function cmdClose(args) {
             preWriteResults = [];
           }
           for (const res of preWriteResults) {
+            // Tag the reality_check column.
             try {
               await db.query(
                 `UPDATE assertions SET reality_check = $1 WHERE id = $2`,
@@ -4651,6 +4696,53 @@ async function cmdClose(args) {
               );
             } catch (_tagErr) {
               // Non-fatal — proceed with next row.
+            }
+
+            // Reconcile mismatched pre-existing rows so they stop re-alarming.
+            // This runs BEFORE writeExtraction, ensuring only pre-existing rows are
+            // affected (newly written rows are not yet present and are never reconciled
+            // away immediately after being written).
+            if (res.tag === 'mismatch') {
+              try {
+                const rowConf = preWriteConfById.get(res.id) || 5;
+                const cls     = classifyPredicate(res.predicate, registryMode);
+
+                if (cls.cardinality === '1:1') {
+                  // 1:1: insert a reality-correct successor; suppress the stale row.
+                  await writeAssertionWithSupersession(
+                    db, projectId,
+                    {
+                      subject:    res.subject,
+                      predicate:  res.predicate,
+                      object:     res.probeResult,
+                      confidence: rowConf,
+                      source:     'model_extracted',
+                    },
+                    preWriteSessionId,
+                    registryMode
+                  );
+                } else {
+                  // 1:N (e.g. in_file): directly suppress the stale row.
+                  await db.query(
+                    `UPDATE assertions
+                     SET suppressed       = true,
+                         invalid_at       = now(),
+                         suppression_kind = 'reality_reconciled'
+                     WHERE id = $1`,
+                    [res.id]
+                  );
+                }
+
+                process.stderr.write(
+                  `[handoff] L3 reality reconciled: ${res.predicate} subject="${res.subject}" ` +
+                  `asserted "${res.object}" -> reality "${res.probeResult}"; superseded stale row\n`
+                );
+              } catch (_reconcileErr) {
+                // Fail-soft: log but do not abort the close.
+                process.stderr.write(
+                  `[handoff] L3 reconcile failed for ${res.predicate} id=${res.id} (non-fatal): ${_reconcileErr.message}\n`
+                );
+              }
             }
           }
         }
@@ -4878,36 +4970,27 @@ async function cmdClose(args) {
   const stamp = new Date().toISOString();
   const _degradedSubsystems = [];
 
-  // ── L3: Reality-check registry — verify pass (strictly non-mutating) ──────────
+  // ── L3: Reality-check registry — verify pass (post-write tag) ────────────────
   //
-  // Uses the shared runVerifyDispatch helper from scripts/lib/reality-checks.js to
-  // iterate mode:'verify' registry entries, run each probe against current ground
-  // truth, and tag each matching assertion row with reality_check='verified' |
-  // 'mismatch' | 'unverifiable'.
+  // Tags newly written rows with reality_check='verified'|'mismatch'|'unverifiable'.
+  // Reconciliation of pre-existing stale rows was already done in the pre-write pass
+  // above (before writeExtraction) — those rows are now suppressed and will not
+  // appear here.  This pass only sees rows written this close.
+  //
+  // Mismatch on a freshly written row (unusual — author wrote a bad assertion) falls
+  // back to the legacy degraded-close surface so it is visible on resume.
   //
   // DESIGN-OF-RECORD INVARIANTS:
   //   - confidence, source, and tier are NEVER modified on any row.
   //   - Only the reality_check column is written.
-  //   - Probe failure (null) → 'unverifiable'; close exits normally.
-  //   - Mismatch → routes through recordDegradedClose (L4 surface) so it persists,
-  //     shows in the close summary, and re-surfaces on resume via the L4 banner.
-  //   - is_at_commit is NOT included; it records historical ship points and must
-  //     not be reality-verified against now-state.
-  //
-  // The same runVerifyDispatch helper is called at serve time (cmdLoaderLoad /
-  // serve-time reality re-probe block) — DRY: one function, two callers.
+  //   - is_at_commit is NOT included.
   try {
     const { REALITY_CHECKS, runVerifyDispatch } = require('./lib/reality-checks');
     const verifySessionId = payload.session_id || null;
 
-    // For each verify-mode predicate in the registry, fetch all live assertions
-    // for that predicate (written this close or pre-existing) and run the shared
-    // dispatch.  The close path owns the full fetch-and-tag loop because it needs
-    // the per-predicate query structure; the serve path re-probes only served rows.
     for (const check of REALITY_CHECKS) {
       if (check.mode !== 'verify') continue;
 
-      // Find live assertions for this predicate.
       let verifyRows;
       try {
         const { rows } = await db.query(
@@ -4926,18 +5009,14 @@ async function cmdClose(args) {
         continue;
       }
 
-      // Run the shared verify dispatch for these rows.
       let dispatchResults;
       try {
         dispatchResults = await runVerifyDispatch(db, projectId, root, verifyRows);
       } catch (_dispatchErr) {
-        // Fall back to empty results — close must not abort.
         dispatchResults = [];
       }
 
-      // Process each result: write reality_check + route mismatches through L4.
       for (const res of dispatchResults) {
-        // Write only the reality_check column — NEVER touch conf/source/tier.
         try {
           await db.query(
             `UPDATE assertions SET reality_check = $1 WHERE id = $2`,
@@ -4950,16 +5029,17 @@ async function cmdClose(args) {
           continue;
         }
 
-        // On mismatch, route through L4's degraded-close surface.
         if (res.tag === 'mismatch') {
           const reason =
             `${res.predicate} subject="${res.subject}": ` +
             `asserted "${res.object}" but probe returned "${res.probeResult}"`;
-          await recordDegradedClose(db, projectId, verifySessionId, 'reality_verify', reason);
-          _degradedSubsystems.push({ subsystem: 'reality_verify', reason });
-          process.stderr.write(
-            `[handoff] L3 reality mismatch (non-fatal): ${reason}\n`
-          );
+          try {
+            await recordDegradedClose(db, projectId, verifySessionId, 'reality_verify', reason);
+            _degradedSubsystems.push({ subsystem: 'reality_verify', reason });
+            process.stderr.write(`[handoff] L3 reality mismatch (non-fatal): ${reason}\n`);
+          } catch (_degradeErr) {
+            process.stderr.write(`[handoff] L3 degraded-close record failed (non-fatal): ${_degradeErr.message}\n`);
+          }
         }
       }
     }
@@ -5466,6 +5546,16 @@ async function cmdClose(args) {
       }
     }
   }
+
+  // ── Part 2: degraded_close retention prune ────────────────────────────────────
+  //
+  // Keep the 100 most-recent degraded_close:* records; delete only the oldest
+  // excess beyond that limit.  This bounds unbounded growth while preserving
+  // the append-only audit trail — successive degraded closes always accumulate
+  // as distinct rows until the corpus exceeds 100 entries.
+  //
+  // Fail-soft: errors are logged to stderr and never abort close.
+  await pruneDegradedClose(db, projectId);
 
   // ── Packaging-honesty display (non-fatal, synchronous close path only) ────────
   //
@@ -6713,6 +6803,7 @@ if (require.main === module) {
   module.exports = {
     queriesEqual,
     recordContractChange,
+    pruneDegradedClose,
     // Pointer-staleness gate internals (exposed for test-pointer-gate.js)
     _extractPointers,
     _deriveAnchor,

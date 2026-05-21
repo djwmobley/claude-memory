@@ -140,6 +140,15 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run degraded_close retention unit tests
+        # Focused unit tests for pruneDegradedClose() in isolation (no retrieval_events
+        # required). Covers: 110 seeded → 100 remain (oldest 10 deleted), 2 seeded →
+        # both retained (no-op), custom keep=5 on 8 records, on both Postgres and SQLite.
+        run: node test/handoff/test-degraded-close-retention.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run L3 reality-check registry tests
         # Tests Lever L3: generalizes the single hard-coded reality-bound assertion
         # (packaging state) into a reality-check registry with a strictly non-mutating
@@ -429,6 +438,22 @@ jobs:
         #   B1     Budget economy: annotated corpus stays within 4000-token budget
         # Reuses claude_memory_eval_test; uses fake-gh bash shim (no real GitHub needed).
         run: node test/handoff/test-staleness-permutations.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: Run reality-mismatch reconcile tests
+        # Tests Part 1 (reconcile-on-mismatch) and Part 2 (degraded_close retention prune):
+        #   R1  branch_exists mismatch (1:1): stale row superseded; reality-correct successor
+        #       inserted; no degraded_close row; no ## Degraded section in handoff.md
+        #   R2  Idempotency: second close after reconciliation produces no new mismatch /
+        #       no new degraded_close record
+        #   R3  in_file mismatch (1:N): stale row suppressed=true,
+        #       suppression_kind='reality_reconciled'; §7 no-backfill (conf/source/object unchanged)
+        #   R4  degraded_close retention prune: old records (stamp < prior last_close) deleted;
+        #       newer records retained
+        # Reuses claude_memory_eval_test (created by Create handoff test database step above).
+        run: node test/handoff/test-reality-reconcile.js
         env:
           PGHOST: localhost
           PGUSER: postgres

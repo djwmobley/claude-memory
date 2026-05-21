@@ -345,6 +345,11 @@ async function testT3VerifyModeNotStripped() {
     await db.end(); db = null;
 
     // Include an in_file assertion — verify mode, must NOT be stripped.
+    // Create the file inside projectDir so the probe returns 'verified'
+    // (not a mismatch), confirming that verify-mode does not strip on match.
+    const scriptsDir = path.join(projectDir, 'scripts');
+    if (!fs.existsSync(scriptsDir)) fs.mkdirSync(scriptsDir, { recursive: true });
+    fs.writeFileSync(path.join(scriptsDir, 'handoff.js'), '/* stub */\n', 'utf8');
     const inFilePath = 'scripts/handoff.js';
     const payload = {
       session_id: sessionId,
@@ -485,11 +490,23 @@ async function testT4VerifyMatch() {
   }
 }
 
-// ── T5: Verify mismatch → reality_check='mismatch'; conf/source/tier UNCHANGED;
-//        recordDegradedClose invoked; L4 resume banner fires ──────────────────
+// ── T5: Verify mismatch → stale row reconciled (suppressed + reality_reconciled);
+//        NO degraded_close row; NO L4 resume banner for reality_verify ─────────
+//
+// Reconcile-on-mismatch (Part 1): the pre-write verify pass runs BEFORE
+// writeExtraction and reconciles pre-existing stale rows found in the DB.
+// For 1:N predicates (in_file): the stale row is suppressed with
+// suppression_kind='reality_reconciled'.  For 1:1 predicates (branch_exists etc.):
+// writeAssertionWithSupersession inserts a reality-correct row.
+//
+// The stale row is seeded directly into the DB (simulating a prior session's close)
+// so the pre-write pass encounters it before writeExtraction runs.
+//
+// §7 no-backfill: the stale row's confidence/source/object are never modified;
+// only suppressed/invalid_at/suppression_kind are written.
 
 async function testT5VerifyMismatch() {
-  const label = 'T5: verify mismatch — reality_check=mismatch; conf/source/tier unchanged; degraded banner fires';
+  const label = 'T5: verify mismatch — stale row reconciled; NO degraded_close; NO RESUME WARNING';
   const dbName = `l3_t5_${TS}`;
   const projectDir = path.join(os.tmpdir(), `l3_t5_${TS}`);
   let db = null;
@@ -500,87 +517,92 @@ async function testT5VerifyMismatch() {
     db = await pgConnect(dbName);
     const sessionId = `l3-t5-session-${TS}`;
     await setSetting(db, projectId, 'session_in_progress', sessionId);
-    // Disable C2/C3 so only the reality_verify mismatch creates a degraded record.
     await setSetting(db, projectId, 'feedback_loop_enabled', 'disabled');
     await setSetting(db, projectId, 'contract_evolution_enabled', 'disabled');
+
+    // Seed a stale in_file row from a PRIOR session (not via payload) so the
+    // pre-write verify pass encounters it before writeExtraction runs.
+    const nonExistentPath = 'scripts/this-file-does-not-exist-l3-mismatch-test.js';
+    await db.query(
+      `INSERT INTO assertions
+         (project_id, subject, predicate, object, confidence, source,
+          suppressed, invalid_at, reality_check, tier, session_id)
+       VALUES ($1, $2, $3, $4, $5, $6, false, NULL, 'verified', 'probationary', 'prior-t5-session')`,
+      [projectId, 'phantom-module', 'in_file', nonExistentPath, 6, 'model_extracted']
+    );
     await db.end(); db = null;
 
-    // Assert in_file with a path that definitely does NOT exist (guaranteed to mismatch).
-    // The path must look like a file path (contain '/') so the probe runs.
-    const nonExistentPath = 'scripts/this-file-does-not-exist-l3-mismatch-test.js';
+    // Close with no in_file assertion in payload — the pre-write pass reconciles
+    // the seeded stale row before writeExtraction runs.
     const payload = {
       session_id: sessionId,
       tldr: 'T5 verify mismatch test',
-      assertions: [
-        {
-          subject:    'phantom-module',
-          predicate:  'in_file',
-          object:     nonExistentPath,
-          confidence: 6,
-          source:     'model_extracted',
-        },
-      ],
+      assertions: [],
     };
 
-    // Keep PROJECT_ROOT = projectDir (default); the file does NOT exist there → mismatch.
+    // PROJECT_ROOT = projectDir; file does NOT exist there → mismatch → reconcile.
     const r = runClose(payload, dbName, projectDir);
 
     if (r.status !== 0) {
-      fail(label, `exit code ${r.status} (expected 0 in warn mode). stderr: ${r.stderr}`);
+      fail(label, `exit code ${r.status} (expected 0). stderr: ${r.stderr}`);
       return;
     }
 
     db = await pgConnect(dbName);
-    const { rows } = await db.query(
-      `SELECT id, confidence, source, tier, reality_check
+
+    // The stale in_file row must now be suppressed with suppression_kind='reality_reconciled'.
+    const { rows: suppRows } = await db.query(
+      `SELECT id, confidence, source, suppressed, suppression_kind, reality_check
        FROM assertions
-       WHERE project_id = $1 AND predicate = 'in_file' AND suppressed = false`,
+       WHERE project_id = $1 AND predicate = 'in_file'`,
       [projectId]
     );
+    if (suppRows.length === 0) {
+      fail(label, 'in_file assertion not found at all after close');
+      await db.end(); db = null;
+      return;
+    }
+    const suppRow = suppRows[0];
+    const isSuppressed = suppRow.suppressed === true || suppRow.suppressed === 1;
+    if (!isSuppressed) {
+      fail(label, `Expected stale row suppressed=true, got suppressed=${suppRow.suppressed}`);
+      await db.end(); db = null;
+      return;
+    }
+    if (suppRow.suppression_kind !== 'reality_reconciled') {
+      fail(label, `Expected suppression_kind='reality_reconciled', got '${suppRow.suppression_kind}'`);
+      await db.end(); db = null;
+      return;
+    }
+    // §7: confidence and source of the stale row must be unchanged (suppression only).
+    if (Number(suppRow.confidence) !== 6) {
+      fail(label, `§7 violation: confidence mutated on reconcile: expected 6, got ${suppRow.confidence}`);
+      await db.end(); db = null;
+      return;
+    }
+    if (suppRow.source !== 'model_extracted') {
+      fail(label, `§7 violation: source mutated on reconcile: expected 'model_extracted', got '${suppRow.source}'`);
+      await db.end(); db = null;
+      return;
+    }
 
-    if (rows.length === 0) {
-      fail(label, 'in_file assertion not found after close');
-      await db.end(); db = null;
-      return;
-    }
-    const row = rows[0];
-
-    if (row.reality_check !== 'mismatch') {
-      fail(label, `Expected reality_check='mismatch', got '${row.reality_check}'`);
-      await db.end(); db = null;
-      return;
-    }
-    // conf and source MUST be unchanged.
-    if (Number(row.confidence) !== 6) {
-      fail(label, `confidence mutated on mismatch: expected 6, got ${row.confidence}`);
-      await db.end(); db = null;
-      return;
-    }
-    if (row.source !== 'model_extracted') {
-      fail(label, `source mutated on mismatch: expected 'model_extracted', got '${row.source}'`);
-      await db.end(); db = null;
-      return;
-    }
-
-    // A degraded_close:* row must exist with subsystem='reality_verify'.
+    // NO degraded_close row with subsystem='reality_verify' must exist.
     const degradedRows = await getSettingsLike(db, projectId, 'degraded_close:%');
+    const realityVerifyDegraded = degradedRows.filter((r) => {
+      try { return JSON.parse(r.value).subsystem === 'reality_verify'; } catch (_) { return false; }
+    });
+    if (realityVerifyDegraded.length > 0) {
+      fail(label, `Expected NO reality_verify degraded_close row, found ${realityVerifyDegraded.length}`);
+      await db.end(); db = null;
+      return;
+    }
     await db.end(); db = null;
 
-    if (degradedRows.length === 0) {
-      fail(label, 'Expected degraded_close row for reality_verify mismatch, got 0');
-      return;
-    }
-    const parsed = JSON.parse(degradedRows[0].value);
-    if (parsed.subsystem !== 'reality_verify') {
-      fail(label, `Expected subsystem='reality_verify', got '${parsed.subsystem}'`);
-      return;
-    }
-
-    // Resume — the L4 banner must fire.
+    // Resume — NO RESUME WARNING for reality_verify (it was reconciled, not degraded).
     const resumeResult = runHandoff('resume', [], null, dbName, projectDir);
     const out = resumeResult.stdout || '';
-    if (!out.includes('RESUME WARNING')) {
-      fail(label, `RESUME WARNING banner not found after mismatch. stdout:\n${out}`);
+    if (out.includes('RESUME WARNING')) {
+      fail(label, `Unexpected RESUME WARNING after reconcile (loop was broken). stdout:\n${out}`);
       return;
     }
 

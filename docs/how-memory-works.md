@@ -214,6 +214,13 @@ With the gate disabled, served output is byte-identical to pre-feature output.
 
 **Volatile predicates.** Only predicates with a `mode:'verify'` entry in the registry are probed. The current set: `in_file`, `branch_exists`, `commit_merged`, `pr_state`. Historical then-state predicates (`is_at_commit`, `shipped_at`) are deliberately excluded — they record fixed historical points and must not be re-verified against now-state.
 
+**Close-time reconciliation.** When the close-path L3 verify pass (which runs before `writeExtraction`) detects a mismatch on a pre-existing row, it does not simply flag the row and write a degraded-close record. It **reconciles** the stale row to reality:
+
+- **1:1 predicates** (`branch_exists`, `commit_merged`, `pr_state`): `writeAssertionWithSupersession` suppresses the stale row and inserts a reality-correct successor. The next close will find agreement and tag the successor `verified`.
+- **1:N predicates** (`in_file`): the stale row is suppressed directly with `suppression_kind='reality_reconciled'`. No successor is inserted.
+
+Reconciliation is close-path only — the serve path annotates and re-tags, but never suppresses or supersedes. The §7 no-backfill invariant holds: confidence, source, tier, and object of the stale row are never modified. See the glossary entry for **reality reconciliation** for full details.
+
 ---
 
 ## What this system is — and what it isn't
