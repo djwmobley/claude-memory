@@ -6,6 +6,8 @@ Wrap up the session. Reads back over what happened — decisions you made, thing
 
 **Session intent persistence (north-star inversion).** At close time, the TL;DR, open threads, and quick references from the payload are persisted as queryable Postgres assertion rows using three 1:1 predicates: `session_tldr`, `open_thread`, and `quick_reference`. These rows are written through the same gated write path (`writeAssertionWithSupersession`) used by all other assertions — the L0/L2 consolidation gate applies; a cross-session restatement alone does not forge a `consolidated` tier. Any error during intent persistence is caught per-row and logged; the close operation still succeeds. The `handoff.md` file is rendered as a **thin pointer** (metadata header only; session content lives in Postgres), not a prose narrative of the session.
 
+**Close-time reality reconciliation.** Before writing new assertions, close runs a pre-write verify pass that probes all live `mode:'verify'` assertions. Pre-existing rows with a definitive mismatch are **reconciled** automatically: 1:1 predicates (`branch_exists`, `commit_merged`, `pr_state`) get a reality-correct successor inserted via supersession; 1:N predicates (`in_file`) are suppressed with `suppression_kind='reality_reconciled'`. No `degraded_close` record is created for reconciled rows. The §7 no-backfill invariant holds: confidence, source, tier, and object of the stale row are never modified.
+
 Close also surfaces any facts that look ready to promote to `CLAUDE.md`, and clears the in-progress session marker.
 
 Run this before you close the window. If you skip it, today's work won't be saved to memory.

@@ -433,6 +433,22 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run reality-mismatch reconcile tests
+        # Tests Part 1 (reconcile-on-mismatch) and Part 2 (degraded_close retention prune):
+        #   R1  branch_exists mismatch (1:1): stale row superseded; reality-correct successor
+        #       inserted; no degraded_close row; no ## Degraded section in handoff.md
+        #   R2  Idempotency: second close after reconciliation produces no new mismatch /
+        #       no new degraded_close record
+        #   R3  in_file mismatch (1:N): stale row suppressed=true,
+        #       suppression_kind='reality_reconciled'; §7 no-backfill (conf/source/object unchanged)
+        #   R4  degraded_close retention prune: old records (stamp < prior last_close) deleted;
+        #       newer records retained
+        # Reuses claude_memory_eval_test (created by Create handoff test database step above).
+        run: node test/handoff/test-reality-reconcile.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: "North-star: caveman economy (GREEN gate — caveman tokens < verbose, no fidelity loss)"
         run: node test/north-star/test-caveman-economy.js
         env:

@@ -200,6 +200,38 @@ BEGIN
   END;
 END $$;
 
+-- ── Reality-reconciliation: widen suppression_kind CHECK to add 'reality_reconciled' ──
+--
+-- Close-time mismatch reconciliation (Part 1) suppresses stale verify-mode rows
+-- with suppression_kind='reality_reconciled' so the audit trail is distinct from
+-- ordinary supersession.  Widen the CHECK to include this new value.
+-- Idempotent: the DROP/re-ADD pattern mirrors the L5 widening above.
+DO $$
+DECLARE
+  r RECORD;
+BEGIN
+  FOR r IN
+    SELECT con.conname
+    FROM   pg_constraint con
+    JOIN   pg_class      rel ON rel.oid = con.conrelid
+    JOIN   pg_namespace  ns  ON ns.oid  = rel.relnamespace
+    WHERE  con.contype   = 'c'
+      AND  rel.relname   = 'assertions'
+      AND  ns.nspname    = current_schema()
+      AND  pg_get_constraintdef(con.oid) LIKE '%suppression_kind%'
+  LOOP
+    EXECUTE 'ALTER TABLE assertions DROP CONSTRAINT IF EXISTS ' || quote_ident(r.conname);
+  END LOOP;
+
+  BEGIN
+    ALTER TABLE assertions
+      ADD CONSTRAINT assertions_suppression_kind_check
+        CHECK (suppression_kind IN ('superseded','downvoted_terminal','downvoted_probation','retired','reality_reconciled'));
+  EXCEPTION
+    WHEN duplicate_object THEN NULL;
+  END;
+END $$;
+
 -- ── L3 reality-check tag (additive, NULL-tolerant) ────────────────────────────
 --
 -- Additive, NULL-tolerant addition.  Existing rows are left untouched — any
