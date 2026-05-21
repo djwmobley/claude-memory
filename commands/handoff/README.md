@@ -1,6 +1,6 @@
 # Slash commands
 
-The eight `/handoff:*` slash commands give you and Claude handles on the memory layer.
+The nine `/handoff:*` slash commands give you and Claude handles on the memory layer.
 Most of the time you'll only use two of them — `/handoff:close` at the end of a session,
 and `/handoff:checkpoint` when you reach an important midpoint. The rest exist for setup,
 debugging, and recovery.
@@ -51,6 +51,18 @@ Force-loads context from the last session into the current conversation. The Ses
 hook does this automatically when you open a new Claude session, but it skips loading if
 the last session was more than seven days ago (to avoid flooding you with stale context).
 Run `/handoff:resume` to override that and load anyway.
+
+### /handoff:resurrect
+
+Pulls specific dormant (decay-suppressed) notes back to the surface by topic. Give it a
+topic seed — for example, "auth bug" or "DB migration" — and it finds probationary rows
+whose subjects match, shows you what would come back, and optionally un-suppresses them
+so they flow back into normal retrieval.
+
+By default the command is a dry-run: it shows the matched rows without mutating anything.
+Pass `--revive` to actually clear the suppression and return the rows to live status. This
+is the targeted, on-demand counterpart to the automatic resurrect check that runs at
+session start.
 
 ### /handoff:promote
 

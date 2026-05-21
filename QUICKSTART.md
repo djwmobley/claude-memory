@@ -107,7 +107,7 @@ node <path-to-this-repo>/scripts/install.js
 
 Replace `<path-to-this-repo>` with the absolute path where you cloned `claude-memory`. The script will:
 
-- Copy the eight `/handoff:*` slash command files to `~/.claude/commands/handoff/`
+- Copy the nine `/handoff:*` slash command files to `~/.claude/commands/handoff/`
 - Add SessionStart and Stop hooks to `.claude/settings.local.json` in your current project (creating the file if it doesn't exist, or merging with what's already there)
 
 **You should see** a short summary listing what was copied and wired, then "Done. Restart Claude Code or open a fresh session to pick up the changes."
