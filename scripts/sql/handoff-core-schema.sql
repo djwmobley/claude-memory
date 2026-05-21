@@ -302,7 +302,8 @@ CREATE INDEX IF NOT EXISTS assertions_confidence_idx
 --
 -- 1:1 partial unique index: at most one live row per (project_id, subject, predicate)
 -- for any predicate that the registry declares cardinality 1:1.
-CREATE UNIQUE INDEX IF NOT EXISTS assertions_1to1_unique
+DROP INDEX IF EXISTS assertions_1to1_unique;
+CREATE UNIQUE INDEX assertions_1to1_unique
   ON assertions (project_id, subject, predicate)
   WHERE suppressed = false
     AND predicate IN (
@@ -335,10 +336,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS assertions_1to1_unique
       'moved_to',
       'must_mean',
       'now_uses',
+      'open_thread',
       'orchestrates_only',
       'phase_ordering',
       'prefers',
+      'quick_reference',
       'schema_migration_is',
+      'session_tldr',
       'shipped_at',
       'skipped',
       'usage',

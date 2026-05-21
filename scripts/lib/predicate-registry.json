@@ -388,6 +388,12 @@
       "added_version": "1.1"
     },
     {
+      "predicate": "open_thread",
+      "cardinality": "1:1",
+      "description": "A session-driving open thread / next-action persisted as a queryable row; one live thread per thread-key (subject)",
+      "added_version": "1.1"
+    },
+    {
       "predicate": "orchestrates_only",
       "cardinality": "1:1",
       "description": "Constraint that a subject is limited to an orchestration role only",
@@ -419,6 +425,12 @@
       "added_version": "1.0"
     },
     {
+      "predicate": "quick_reference",
+      "cardinality": "1:1",
+      "description": "Session quick-reference pointer block persisted as a queryable row; latest supersedes prior",
+      "added_version": "1.1"
+    },
+    {
       "predicate": "README_roadmap_scope",
       "cardinality": "1:1",
       "description": "Scope or framing of the roadmap section in a README",
@@ -446,6 +458,12 @@
       "predicate": "schema_migration_is",
       "cardinality": "1:1",
       "description": "Current state of a schema migration",
+      "added_version": "1.1"
+    },
+    {
+      "predicate": "session_tldr",
+      "cardinality": "1:1",
+      "description": "The session TL;DR persisted as a queryable row; latest supersedes prior",
       "added_version": "1.1"
     },
     {

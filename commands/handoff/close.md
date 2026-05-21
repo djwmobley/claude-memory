@@ -2,7 +2,11 @@
 
 > Running: handoff:close
 
-Wrap up the session. Reads back over what happened — decisions you made, things you tried, things that broke — and writes them to the database so next session can find them. Also rewrites the `handoff.md` summary file, surfaces any facts that look ready to promote to `CLAUDE.md`, and clears the in-progress session marker.
+Wrap up the session. Reads back over what happened — decisions you made, things you tried, things that broke — and writes them to the database so next session can find them.
+
+**Session intent persistence (north-star inversion).** At close time, the TL;DR, open threads, and quick references from the payload are persisted as queryable Postgres assertion rows using three 1:1 predicates: `session_tldr`, `open_thread`, and `quick_reference`. These rows are written through the same gated write path (`writeAssertionWithSupersession`) used by all other assertions — the L0/L2 consolidation gate applies; a cross-session restatement alone does not forge a `consolidated` tier. Any error during intent persistence is caught per-row and logged; the close operation still succeeds. The `handoff.md` file is rendered as a **thin pointer** (metadata header only; session content lives in Postgres), not a prose narrative of the session.
+
+Close also surfaces any facts that look ready to promote to `CLAUDE.md`, and clears the in-progress session marker.
 
 Run this before you close the window. If you skip it, today's work won't be saved to memory.
 

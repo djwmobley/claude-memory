@@ -401,8 +401,24 @@ H.run(async () => {
         quick_references: '(none)',
       });
 
+      // L2-consistent consolidation requires a genuine quality corroborator
+      // (reality_check='verified' OR pinned). Cross-session restatement ALONE must NOT
+      // consolidate — that is the patient-adversary invariant (L2, PR #66): a model
+      // restating an identical claim across sessions cannot self-graduate it to durable.
+      // Mark the session-1 intent row verified to stand in for that genuine trust signal
+      // (e.g. operator confirmation), so the session-2 restatement legitimately graduates
+      // a NEW live row to tier='consolidated' through the L2 gate's arm (b) — rather than
+      // an in-place tier UPDATE, which would forge consolidation and trip the no-tier-UPDATE
+      // anti-forge invariant.
+      await db.query(
+        `UPDATE assertions SET reality_check = 'verified'
+          WHERE project_id = $1 AND predicate = $2 AND suppressed = false AND invalid_at IS NULL`,
+        [projectId, INTENT_PREDICATE]
+      );
+
       // Close 2 — the user re-affirms the SAME fact (session 2): cross-session
-      // corroboration of an identical user_stated intent.
+      // corroboration of an identical user_stated intent. With the verified corroborator
+      // present, the L2 gate graduates the replacement row to consolidated.
       H.runClose(fakeRoot, {
         session_id: 'ns-provenance-p4-session-2',
         tldr: 'P4 session 2 — re-affirmed the same canon.',
@@ -417,15 +433,17 @@ H.run(async () => {
         'tier can mean anything'
       );
 
+      // After the session-2 restatement the session-1 row is superseded (1:1 gate); the
+      // LIVE replacement row must carry the durable trust. Query LIVE rows only.
       const rows = await H.queryAssertions(
-        db, projectId, { predicate: INTENT_PREDICATE, includeSuppressed: true }
+        db, projectId, { predicate: INTENT_PREDICATE }
       );
       const factRow = rows.find(
         (r) => String(r.object).includes(DURABLE_INTENT) || DURABLE_INTENT.includes(String(r.object))
       );
       assert.ok(
         factRow,
-        `P4: no persisted intent row carries the durable fact "${DURABLE_INTENT}".`
+        `P4: no LIVE intent row carries the durable fact "${DURABLE_INTENT}" after cross-session corroboration.`
       );
 
       // Trust: the reinforced fact must be expressible as durable trust — either it
