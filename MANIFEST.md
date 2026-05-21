@@ -17,7 +17,7 @@ It persists durable session state as queryable Postgres rows at the session boun
 | `CONTRIBUTING.md` | Contribution guidelines and workflow | current |
 | `CODE_OF_CONDUCT.md` | Community standards | current |
 | `SECURITY.md` | Security policy and disclosure process | current |
-| `docs/how-memory-works.md` | Conceptual explanation of the system, session seam model, identity + limitations | updated (serve-time reality re-probe section added) |
+| `docs/how-memory-works.md` | Conceptual explanation of the system, session seam model, identity + limitations | updated (staleness refresh: added /handoff:resurrect, de-jargoned north-star-inversion phrasing, removed duplicated north-star tenets, pointer to case-study.md) |
 | `docs/glossary.md` | Term definitions for all concepts used across the docs | updated (branch_exists, commit_merged, in_file, pr_state, reality_check, serve-time reality re-probe, [STALE:] annotation entries added) |
 | `docs/case-study.md` | Narrative walkthrough of two design problems: Ch.1 decay/operator-pin/resurrection; Ch.2 north-star TDD harness, RED-by-design test methodology, serve-time staleness, adversarial permutation harness, caveman dogfooding | updated (Chapter 2 added) |
 | `docs/troubleshooting.md` | Diagnosis guide for common setup and runtime problems | current |
