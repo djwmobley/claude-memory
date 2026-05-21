@@ -96,6 +96,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cmdPrune --suppression-kind` full canonical set**: `validKinds` now
+  includes `reality_reconciled` (previously missing, making `reality_reconciled`
+  rows unprunable by kind); the requires-a-value error hint and the
+  `--suppression-kind` doc-comment now list all five canonical values
+  (`superseded`, `downvoted_terminal`, `downvoted_probation`, `retired`,
+  `reality_reconciled`). Glossary Prune entry enumeration brought in sync.
+  (#106 regression)
 - **Resurrect semantic path embedding dimensions**: `lib/embed.js` now
   Matryoshka-truncates embeddings to `halfvec(4000)` to match the configured
   vector column schema, resolving a silent dim-mismatch that prevented semantic

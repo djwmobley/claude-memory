@@ -91,7 +91,7 @@ It is NOT a Claude Code `/handoff:` slash command — there is no `commands/hand
 **At least one criterion flag is required** — running with no criteria is refused (that is what `purge` is for). Criteria are AND-combined:
 
 - `--suppressed` — rows where `suppressed = true`
-- `--suppression-kind <kind>` — rows where `suppression_kind` matches (`superseded`, `downvoted_terminal`, `downvoted_probation`)
+- `--suppression-kind <kind>` — rows where `suppression_kind` matches (`superseded`, `downvoted_terminal`, `downvoted_probation`, `retired`, `reality_reconciled`)
 - `--subject <s>` — rows where subject canonicalizes to the given value
 - `--older-than <days>` — rows where `last_reinforced` is older than N days
 

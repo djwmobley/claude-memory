@@ -6408,7 +6408,8 @@ async function cmdQueueDrain(args) {
  *   --suppressed                          rows where suppressed = true
  *   --suppression-kind <kind>             rows where suppression_kind = <kind>
  *                                         valid: superseded | downvoted_terminal |
- *                                                downvoted_probation
+ *                                                downvoted_probation | retired |
+ *                                                reality_reconciled
  *   --subject <raw-or-canonical>          rows where subject = canonicalize(<arg>)
  *   --older-than <days>                   rows where last_reinforced < now()-N days
  *
@@ -6429,10 +6430,10 @@ async function cmdPrune(args) {
   const skIdx = args.indexOf('--suppression-kind');
   const suppressionKind = skIdx !== -1 ? args[skIdx + 1] : undefined;
   if (skIdx !== -1 && !suppressionKind) {
-    console.error('prune: --suppression-kind requires a value (superseded | downvoted_terminal | downvoted_probation)');
+    console.error('prune: --suppression-kind requires a value (superseded | downvoted_terminal | downvoted_probation | retired | reality_reconciled)');
     process.exit(2);
   }
-  const validKinds = ['superseded', 'downvoted_terminal', 'downvoted_probation', 'retired'];
+  const validKinds = ['superseded', 'downvoted_terminal', 'downvoted_probation', 'retired', 'reality_reconciled'];
   if (suppressionKind && !validKinds.includes(suppressionKind)) {
     console.error(`prune: invalid --suppression-kind "${suppressionKind}". Valid: ${validKinds.join(', ')}`);
     process.exit(2);
