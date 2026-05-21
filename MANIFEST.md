@@ -10,15 +10,15 @@ It persists durable session state as queryable Postgres rows at the session boun
 |---|---|---|
 | `README.md` | Project overview, install, quickstart pointer | current |
 | `CLAUDE.md` | Project-level operating instructions for Claude Code | current |
-| `MANIFEST.md` | This file — tracked index of all documentation | updated (north-star session-intent persistence + self-description) |
+| `MANIFEST.md` | This file — tracked index of all documentation | updated (serve-time staleness fix docs) |
 | `QUICKSTART.md` | Step-by-step setup guide for new users | current |
 | `PREREQS.md` | System prerequisites (Node, Postgres, pgvector, vLLM) | current |
 | `CHANGELOG.md` | Version history and release notes | current |
 | `CONTRIBUTING.md` | Contribution guidelines and workflow | current |
 | `CODE_OF_CONDUCT.md` | Community standards | current |
 | `SECURITY.md` | Security policy and disclosure process | current |
-| `docs/how-memory-works.md` | Conceptual explanation of the system, session seam model, identity + limitations | updated (north-star session-intent persistence + self-description) |
-| `docs/glossary.md` | Term definitions for all concepts used across the docs | updated (north-star session-intent persistence + self-description) |
+| `docs/how-memory-works.md` | Conceptual explanation of the system, session seam model, identity + limitations | updated (serve-time reality re-probe section added) |
+| `docs/glossary.md` | Term definitions for all concepts used across the docs | updated (branch_exists, commit_merged, in_file, pr_state, reality_check, serve-time reality re-probe, [STALE:] annotation entries added) |
 | `docs/case-study.md` | Narrative walkthrough of a real design problem and fix (decay vs. don't-forget) | current |
 | `docs/troubleshooting.md` | Diagnosis guide for common setup and runtime problems | current |
 | `docs/deep/retrieval-contract-evolution.md` | How the retrieval contract schema has evolved over time | current |
@@ -32,8 +32,8 @@ It persists durable session state as queryable Postgres rows at the session boun
 | `commands/handoff/README.md` | Overview of all `/handoff:*` slash commands | current |
 | `commands/handoff/init.md` | `/handoff:init` — first-run provisioning command | current |
 | `commands/handoff/status.md` | `/handoff:status` — read-only project memory status | current |
-| `commands/handoff/close.md` | `/handoff:close` — end-of-session extraction and session-intent persistence | updated (north-star session-intent persistence + self-description) |
-| `commands/handoff/resume.md` | `/handoff:resume` — explicit context load; surfaces `### Session intent` section | updated (north-star session-intent persistence + self-description) |
+| `commands/handoff/close.md` | `/handoff:close` — end-of-session extraction and session-intent persistence | updated (volatile predicate authoring guidance for serve-time re-probe) |
+| `commands/handoff/resume.md` | `/handoff:resume` — explicit context load; surfaces `### Session intent` section | updated (serve-time reality re-probe description added) |
 | `commands/handoff/checkpoint.md` | `/handoff:checkpoint` — mid-session save without ending the session | current |
 | `commands/handoff/promote.md` | `/handoff:promote` — promote an assertion to CLAUDE.md durable facts | current |
 | `commands/handoff/drop.md` | `/handoff:drop` — archive prior session memory and start fresh | current |

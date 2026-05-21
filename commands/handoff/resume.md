@@ -21,6 +21,13 @@ body for `file:line` code pointers and rewrites stale line numbers in the output
 see — but does NOT persist corrections back to the database. Persistence happens only at
 close time (close is the canonical mutation point). This means a resumed session always
 sees the freshest pointer positions without risk of corrupting the DB mid-session.
+
+**Serve-time reality re-probe:** after building the assertion sections, resume re-runs
+the L3 `mode:'verify'` probes against live ground truth for every assertion served.
+Mismatched rows are annotated in the output with `[STALE: now "<liveValue>"]`; matching
+rows get `[verified✓]`. The `reality_check` column is refreshed in the database (fail-soft
+UPDATE — only `reality_check` is written; confidence, source, tier, object are never
+changed). Feature-gated via `serve_time_reality_check` project setting (default `enabled`).
 </details>
 
 ## How to invoke
@@ -77,7 +84,7 @@ Running: handoff:resume
 - [conf=8] DB database is claude_memory_eval_test
 ...
 
-  tokens used: ~320 / 4000
+  tokens used: ~650 / 4000 (sections: ~320)
 
 Done: handoff:resume — context loaded inline (Phase 3.6 will add hook-based auto-load)
 ```

@@ -65,6 +65,12 @@
       "added_version": "1.1"
     },
     {
+      "predicate": "branch_exists",
+      "cardinality": "1:1",
+      "description": "Current existence state of a named git branch; subject is the branch name, object is 'exists' or '<absent>'. Volatile now-state: re-probed live at serve time via the L3 reality-check registry.",
+      "added_version": "1.2"
+    },
+    {
       "predicate": "captures",
       "cardinality": "1:N",
       "description": "Information or event that a component captures or records; multiple captured items may apply",
@@ -81,6 +87,12 @@
       "cardinality": "1:1",
       "description": "Recorded decision or choice made by a subject",
       "added_version": "1.0"
+    },
+    {
+      "predicate": "commit_merged",
+      "cardinality": "1:1",
+      "description": "Whether a specific commit SHA is merged (reachable as an ancestor of a ref or HEAD); object is 'merged', '<not-merged>', or '<sha> on <branch>'. Volatile now-state: re-probed live at serve time. Excludes is_at_commit and shipped_at (historical then-state).",
+      "added_version": "1.2"
     },
     {
       "predicate": "cmdDrop_refactor",
@@ -417,6 +429,12 @@
       "description": "Policy statement applicable to a subject; multiple policies may apply simultaneously",
       "added_version": "1.1",
       "directive": true
+    },
+    {
+      "predicate": "pr_state",
+      "cardinality": "1:1",
+      "description": "Current GitHub pull request state; subject must contain the PR number (e.g. 'PR #92'), object is 'open', 'closed', or 'merged'. Volatile now-state: re-probed live at serve time via gh CLI (fail-soft to unverifiable when gh is absent/offline).",
+      "added_version": "1.2"
     },
     {
       "predicate": "prefers",

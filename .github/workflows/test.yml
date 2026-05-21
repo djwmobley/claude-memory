@@ -60,6 +60,16 @@ jobs:
           # Propagates into the loader subprocess that eval STEP 5 spawns;
           # without this, the loader tries Ollama-on-localhost and fails 3x per fixture.
           OLLAMA_SKIP: '1'
+      - name: Create handoff test database
+        # test-handoff.js and test-serve-time-staleness.js connect to claude_memory_eval_test
+        # (hardcoded TARGET_DB). Create it early — before graph-traversal — so that a
+        # single test-suite failure cannot cascade into a spurious "DB does not exist"
+        # failure in the north-star steps (which run with if: always()). The test's
+        # setup() then applies handoff-core-schema.sql AND app-retrieval-events-schema.sql
+        # into it (both are idempotent). This step is a no-op if the DB already exists.
+        run: psql -h localhost -U postgres -c "CREATE DATABASE claude_memory_eval_test" || true
+        env:
+          PGPASSWORD: postgres
       - name: Run graph edge-traversal tests
         # Exhaustive harness for kind:'graph' recursive-CTE retrieval feature.
         # Creates/drops throwaway DBs; uses the same Postgres service as the other steps.
@@ -327,13 +337,6 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
-      - name: Create handoff test database
-        # test-handoff.js connects to claude_memory_eval_test (hardcoded TARGET_DB).
-        # Create it here; the test's setup() then applies handoff-core-schema.sql
-        # AND app-retrieval-events-schema.sql into it (both are idempotent).
-        run: psql -h localhost -U postgres -c "CREATE DATABASE claude_memory_eval_test"
-        env:
-          PGPASSWORD: postgres
       - name: Run end-to-end handoff subcommand tests
         # Golden-path coverage of every /handoff subcommand against a real Postgres:
         #   init/status/resume/close/checkpoint/drop/purge/resurrect — DB row counts,
@@ -345,6 +348,22 @@ jobs:
         # from CI; re-added after the marker-pre-mint fix to test setup that resolves
         # the 12-failure cascade caused by ensureProjectIdentity auto-minting UUIDs.
         run: node test/handoff/test-handoff.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: Run serve-time staleness tests
+        # Tests the serve-time reality re-probe (categorical staleness fix):
+        #   (a) Frozen 'verified' row annotated [STALE:] in served output on mismatch
+        #   (b) Floor: no-probe predicate served line unchanged
+        #   (c) Gate off: byte-identical output when serve_time_reality_check=disabled
+        #   (d) Token-budget: trueServedTokens reflects true bootstrap cost (canon+body+sections)
+        #   (e) §7 no-backfill: conf/source/tier/object never modified by serve-time pass
+        #   (f) Resurrect path: does not crash with feature enabled
+        #   (g) End-to-end loop: close-time verified row annotated [STALE:] at next resume
+        #   (h) L2 pre-write refresh: stale verified prior row does not grant unearned L2 trust
+        # Reuses claude_memory_eval_test (created by Create handoff test database step above).
+        run: node test/handoff/test-serve-time-staleness.js
         env:
           PGHOST: localhost
           PGUSER: postgres

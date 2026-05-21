@@ -2308,10 +2308,22 @@ async function cmdLoaderLoad(opts = {}) {
   // C1: collect assertion ids retrieved during the contract loop for attribution.
   const retrievedAssertionIds = [];
 
+  // Serve-time reality re-probe: collect full assertion row objects (id + all fields)
+  // so the post-loop pass can run runVerifyDispatch against them.
+  // Only populated when serve_time_reality_check is 'enabled' (default).
+  const servedAssertionRows = [];
+
   // C2: read feedback gate once before the loop.
   // Default is now 'enabled' (PR-B default-on).  When explicitly set to any other value,
   // gate-OFF SQL has no outcome_bias term — byte-identical in structure to pre-C2 (I-6).
   const feedbackLoopEnabled = await getSetting(db, projectId, 'feedback_loop_enabled', 'enabled');
+
+  // Serve-time reality re-probe gate.
+  // Default 'enabled': after section building, re-probe verify-mode registry entries and
+  // annotate served lines with live results.  Any other value: output is byte-identical
+  // to pre-feature (no annotations, no re-probe).
+  // Mirrors how cluster_aware_retrieval / tier_aware_retrieval gates are written.
+  const serveTimeRcEnabled = await getSetting(db, projectId, 'serve_time_reality_check', 'enabled');
 
   // Two-tier durability retrieval gate (orthogonal to C2 feedback gate).
   // Default 'enabled' = ON.  Prepends a tier-priority sort key to ORDER BY so that
@@ -2443,6 +2455,8 @@ async function cmdLoaderLoad(opts = {}) {
           tokensUsed      += rowCost;
           assertionsCount += 1;
           retrievedAssertionIds.push(r.id);
+          // Serve-time re-probe: track full row for the post-loop annotation pass.
+          if (serveTimeRcEnabled === 'enabled') servedAssertionRows.push(r);
         }
         if (lineTexts.length) {
           sections.push(`### Assertions\n${lineTexts.join('\n')}`);
@@ -2493,6 +2507,8 @@ async function cmdLoaderLoad(opts = {}) {
           tokensUsed      += rowCost;
           assertionsCount += 1;
           retrievedAssertionIds.push(r.id);
+          // Serve-time re-probe: track full row for the post-loop annotation pass.
+          if (serveTimeRcEnabled === 'enabled') servedAssertionRows.push(r);
         }
         if (lineTexts.length) {
           sections.push(`### Recent assertions\n${lineTexts.join('\n')}`);
@@ -2801,6 +2817,8 @@ async function cmdLoaderLoad(opts = {}) {
           tokensUsed      += rowCost;
           assertionsCount += 1;
           retrievedAssertionIds.push(r.id);
+          // Serve-time re-probe: track full row for the post-loop annotation pass.
+          if (serveTimeRcEnabled === 'enabled') servedAssertionRows.push(r);
         }
         if (lineTexts.length > 0) {
           sections.push(`### Session intent\n${lineTexts.join('\n')}`);
@@ -2809,6 +2827,104 @@ async function cmdLoaderLoad(opts = {}) {
     } catch (intentSectionErr) {
       // Non-fatal: any error degrades gracefully to pre-intent output.
       if (!silent) process.stderr.write(`[handoff] session intent section error (non-fatal): ${intentSectionErr.message}\n`);
+    }
+  }
+
+  // ── Serve-time reality re-probe (post-loop annotation pass) ─────────────────
+  //
+  // When serve_time_reality_check='enabled' (default), re-probe every served
+  // assertion row whose predicate has a mode:'verify' registry entry.  For each
+  // row that mismatches, annotate the served line with [STALE: now "<probeResult>"].
+  // Verified rows get [verified✓].  Unverifiable rows get [unverifiable].
+  // Also REFRESH the reality_check column via fail-soft UPDATE (bounded by served
+  // row count; only the reality_check column is written — §7 no-backfill).
+  //
+  // Gate off path: serveTimeRcEnabled !== 'enabled' → servedAssertionRows is empty
+  // (we never pushed to it) → this block is a structural no-op (loop body never runs).
+  // Byte-identical output guaranteed when gate is off.
+  //
+  // Fail-soft: any probe or DB error → treat as 'unverifiable'/skip;
+  // NEVER abort or throw out of a serve path.
+  if (serveTimeRcEnabled === 'enabled' && servedAssertionRows.length > 0) {
+    try {
+      const { runVerifyDispatch } = require('./lib/reality-checks');
+      const serveRoot = findProjectRoot();
+
+      // Build a quick lookup: assertion line text → result, keyed by the baseline
+      // line text as it appears in sections[].  We annotate in-place.
+      const dispatchResults = await runVerifyDispatch(db, projectId, serveRoot, servedAssertionRows);
+
+      if (dispatchResults.length > 0) {
+        // Build a map from row id → annotation suffix.
+        const annotationMap = new Map();
+        for (const res of dispatchResults) {
+          let suffix;
+          if (res.tag === 'mismatch') {
+            suffix = ` [STALE: now "${res.probeResult}"]`;
+          } else if (res.tag === 'verified') {
+            suffix = ' [verified✓]';
+          } else {
+            // 'unverifiable' — skip annotation (no suffix) to keep output clean.
+            suffix = null;
+          }
+          if (suffix !== null) annotationMap.set(res.id, { suffix, tag: res.tag });
+        }
+
+        if (annotationMap.size > 0) {
+          // Build a per-row lookup so we can match lines by content.
+          // Row lines have the form: "- [<source>|conf=<n>] <subject> <predicate> <object>"
+          // or "- [conf=<n>] <subject> <predicate> <object>" (recency format without source).
+          // We build a map from id → expected base line text for safe matching.
+          const idToBaseLine = new Map();
+          for (const r of servedAssertionRows) {
+            const ann = annotationMap.get(r.id);
+            if (!ann) continue;
+            // Construct the base line as the section-builder would produce it.
+            let baseLine;
+            if (r.source) {
+              baseLine = `- [${r.source}|conf=${r.confidence}] ${r.subject} ${r.predicate} ${r.object}`;
+            } else {
+              baseLine = `- [conf=${r.confidence}] ${r.subject} ${r.predicate} ${r.object}`;
+            }
+            idToBaseLine.set(r.id, baseLine);
+          }
+
+          // Annotate sections in-place.  Walk every section line; if it matches a
+          // base line for which we have an annotation, append the suffix.
+          for (let si = 0; si < sections.length; si++) {
+            const sectionLines = sections[si].split('\n');
+            let changed = false;
+            for (let li = 0; li < sectionLines.length; li++) {
+              // Check each tracked row against this line.
+              for (const [rowId, baseLine] of idToBaseLine) {
+                if (sectionLines[li] === baseLine) {
+                  const ann = annotationMap.get(rowId);
+                  sectionLines[li] = baseLine + ann.suffix;
+                  changed = true;
+                  break; // one annotation per line
+                }
+              }
+            }
+            if (changed) sections[si] = sectionLines.join('\n');
+          }
+
+          // Refresh reality_check column (fail-soft UPDATE — bounded by served-row count).
+          // Only reality_check is written — §7 no-backfill invariant.
+          for (const res of dispatchResults) {
+            try {
+              await db.query(
+                `UPDATE assertions SET reality_check = $1 WHERE id = $2`,
+                [res.tag, res.id]
+              );
+            } catch (_rcUpdateErr) {
+              // Non-fatal — serve path must never throw.
+            }
+          }
+        }
+      }
+    } catch (serveRcErr) {
+      // Fully non-fatal: any error in the serve-time re-probe must not abort resume.
+      process.stderr.write(`[handoff] serve-time reality re-probe failed (non-fatal): ${serveRcErr.message}\n`);
     }
   }
 
@@ -2841,7 +2957,15 @@ async function cmdLoaderLoad(opts = {}) {
     outputParts.push('=== END RETRIEVED CONTEXT ===');
   }
 
-  outputParts.push(`\n  tokens used: ~${tokensUsed} / ${tokenBudget}`);
+  // Token-budget reporting:
+  // - tokensUsed (sections-only) is preserved unchanged — graph-traversal test B-3 depends on it.
+  // - trueServedTokens is computed from the FULLY assembled output string (Math.ceil(len/4)),
+  //   which includes OPERATING_CANON + servedBody (handoff.md body) + sections.
+  //   This reflects actual bootstrap cost to the model.
+  // We assemble a temporary output to measure before pushing the token line.
+  const outputTextForMeasure = outputParts.join('\n');
+  const trueServedTokens = Math.ceil(outputTextForMeasure.length / 4);
+  outputParts.push(`\n  tokens used: ~${trueServedTokens} / ${tokenBudget} (sections: ~${tokensUsed})`);
 
   const outputText = outputParts.join('\n');
 
@@ -2852,6 +2976,7 @@ async function cmdLoaderLoad(opts = {}) {
   return {
     outputText,
     tokensUsed,
+    trueServedTokens,
     sectionsCount:   sections.length,
     entitiesCount,
     assertionsCount,
@@ -4166,6 +4291,71 @@ async function cmdClose(args) {
     return;
   }
 
+  // ── Step 5: Pre-write verify refresh (L2 stale-trust fix) ───────────────────
+  //
+  // L2's hasQualityCorroborator check (inside writeAssertionWithSupersession)
+  // reads reality_check from PRIOR rows to decide whether a corroborating row is
+  // independently trustworthy.  Those values may be stale from a previous session's
+  // close verify pass that tagged them 'verified'.  Between close→close without an
+  // intervening resume (which would have run the serve-time re-probe), the values
+  // are never refreshed — a stale 'verified' on a row whose probe now returns a
+  // mismatch could grant unearned L2 trust to an incoming assertion.
+  //
+  // Fix: run a quick verify refresh on all live rows whose predicate has a
+  // mode:'verify' registry entry BEFORE writeExtraction runs.  Only reality_check
+  // is written (§7 no-backfill).  Fully non-fatal: any error here must not abort
+  // close — we simply continue with potentially stale values (same as pre-fix).
+  //
+  // This closes the close→close edge case.  Serve-time re-probe covers the
+  // resume→close path (user does resume before next close — already covered).
+  try {
+    const { REALITY_CHECKS, runVerifyDispatch } = require('./lib/reality-checks');
+    const preWriteRoot = root;
+    const verifyPredicates = [...new Set(
+      REALITY_CHECKS.filter((c) => c.mode === 'verify').map((c) => c.predicate)
+    )];
+    if (verifyPredicates.length > 0) {
+      // Fetch all live rows for verify predicates in one query.
+      const placeholders = verifyPredicates.map((_, i) => `$${i + 2}`).join(', ');
+      let preWriteRows;
+      try {
+        const { rows } = await db.query(
+          `SELECT id, subject, predicate, object FROM assertions
+           WHERE project_id = $1
+             AND predicate  IN (${placeholders})
+             AND suppressed = false
+             AND invalid_at IS NULL`,
+          [projectId, ...verifyPredicates]
+        );
+        preWriteRows = rows;
+      } catch (_fetchErr) {
+        preWriteRows = [];
+      }
+
+      if (preWriteRows.length > 0) {
+        let preWriteResults;
+        try {
+          preWriteResults = await runVerifyDispatch(db, projectId, preWriteRoot, preWriteRows);
+        } catch (_dispatchErr) {
+          preWriteResults = [];
+        }
+        for (const res of preWriteResults) {
+          try {
+            await db.query(
+              `UPDATE assertions SET reality_check = $1 WHERE id = $2`,
+              [res.tag, res.id]
+            );
+          } catch (_tagErr) {
+            // Non-fatal — proceed with next row.
+          }
+        }
+      }
+    }
+  } catch (_preWriteErr) {
+    // Fully non-fatal: L2 sees potentially stale reality_check (same as pre-fix behavior).
+    process.stderr.write(`[handoff] pre-write verify refresh failed (non-fatal): ${_preWriteErr.message}\n`);
+  }
+
   // ── Synchronous path (default) — unchanged behavior ──────────────────────────
   const { entitiesWritten, assertionsWritten, edgesWritten } =
     await writeExtraction(db, projectId, payload, { projectBasename: path.basename(root) });
@@ -4249,9 +4439,10 @@ async function cmdClose(args) {
 
   // ── L3: Reality-check registry — verify pass (strictly non-mutating) ──────────
   //
-  // For each registered 'verify'-mode entry, find live assertions written this
-  // close whose predicate and subject match the entry.  Run the probe and tag the
-  // row with reality_check='verified' | 'mismatch' | 'unverifiable'.
+  // Uses the shared runVerifyDispatch helper from scripts/lib/reality-checks.js to
+  // iterate mode:'verify' registry entries, run each probe against current ground
+  // truth, and tag each matching assertion row with reality_check='verified' |
+  // 'mismatch' | 'unverifiable'.
   //
   // DESIGN-OF-RECORD INVARIANTS:
   //   - confidence, source, and tier are NEVER modified on any row.
@@ -4261,20 +4452,25 @@ async function cmdClose(args) {
   //     shows in the close summary, and re-surfaces on resume via the L4 banner.
   //   - is_at_commit is NOT included; it records historical ship points and must
   //     not be reality-verified against now-state.
+  //
+  // The same runVerifyDispatch helper is called at serve time (cmdLoaderLoad /
+  // serve-time reality re-probe block) — DRY: one function, two callers.
   try {
-    const { REALITY_CHECKS } = require('./lib/reality-checks');
+    const { REALITY_CHECKS, runVerifyDispatch } = require('./lib/reality-checks');
     const verifySessionId = payload.session_id || null;
 
+    // For each verify-mode predicate in the registry, fetch all live assertions
+    // for that predicate (written this close or pre-existing) and run the shared
+    // dispatch.  The close path owns the full fetch-and-tag loop because it needs
+    // the per-predicate query structure; the serve path re-probes only served rows.
     for (const check of REALITY_CHECKS) {
       if (check.mode !== 'verify') continue;
 
-      // Find live assertions for this predicate (written this close or pre-existing).
-      // The verify pass is best-effort — it queries all live rows for the predicate
-      // so it catches just-written assertions regardless of session id.
+      // Find live assertions for this predicate.
       let verifyRows;
       try {
         const { rows } = await db.query(
-          `SELECT id, subject, object FROM assertions
+          `SELECT id, subject, predicate, object FROM assertions
            WHERE project_id = $1
              AND predicate  = $2
              AND suppressed = false
@@ -4289,45 +4485,35 @@ async function cmdClose(args) {
         continue;
       }
 
-      for (const row of verifyRows) {
-        if (!check.subjectMatch(row.subject, root)) continue;
+      // Run the shared verify dispatch for these rows.
+      let dispatchResults;
+      try {
+        dispatchResults = await runVerifyDispatch(db, projectId, root, verifyRows);
+      } catch (_dispatchErr) {
+        // Fall back to empty results — close must not abort.
+        dispatchResults = [];
+      }
 
-        // Run the probe; it accepts (root, object) to allow object-dependent probes.
-        let probeResult;
-        try {
-          probeResult = check.probe(root, row.object);
-        } catch (probeErr) {
-          // Probe threw unexpectedly — treat as unverifiable (fail-soft).
-          probeResult = null;
-        }
-
-        let tag;
-        if (probeResult === null) {
-          tag = 'unverifiable';
-        } else if (probeResult === row.object) {
-          tag = 'verified';
-        } else {
-          tag = 'mismatch';
-        }
-
+      // Process each result: write reality_check + route mismatches through L4.
+      for (const res of dispatchResults) {
         // Write only the reality_check column — NEVER touch conf/source/tier.
         try {
           await db.query(
             `UPDATE assertions SET reality_check = $1 WHERE id = $2`,
-            [tag, row.id]
+            [res.tag, res.id]
           );
         } catch (updateErr) {
           process.stderr.write(
-            `[handoff] L3 reality_check tag write failed for assertion ${row.id} (non-fatal): ${updateErr.message}\n`
+            `[handoff] L3 reality_check tag write failed for assertion ${res.id} (non-fatal): ${updateErr.message}\n`
           );
           continue;
         }
 
         // On mismatch, route through L4's degraded-close surface.
-        if (tag === 'mismatch') {
+        if (res.tag === 'mismatch') {
           const reason =
-            `${check.predicate} subject="${row.subject}": ` +
-            `asserted "${row.object}" but probe returned "${probeResult}"`;
+            `${res.predicate} subject="${res.subject}": ` +
+            `asserted "${res.object}" but probe returned "${res.probeResult}"`;
           await recordDegradedClose(db, projectId, verifySessionId, 'reality_verify', reason);
           _degradedSubsystems.push({ subsystem: 'reality_verify', reason });
           process.stderr.write(
