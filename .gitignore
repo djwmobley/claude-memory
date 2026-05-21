@@ -13,6 +13,10 @@ test/eval/last-run.json
 # Project-personal Claude Code settings (machine-specific permission rules)
 .claude/settings.local.json
 
+# Claude Code agent worktrees — transient per-agent isolated checkouts created
+# by the Agent tool's worktree isolation; never part of the repo.
+.claude/worktrees/
+
 # Architect directive staging files (temp content for DB row filing)
 .architect-row/
 
