@@ -42,11 +42,23 @@ else
 fi
 
 PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" init
+
+# Specify a project name:
+PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" init "my-project"
+
+# Auto-create the database without prompting:
+PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" init -y
+
+# Both together:
+PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" init "my-project" -y
 ```
 
-Optional args passed through to the helper:
-- `$1` — project name (optional positional; defaults to the directory basename)
-- `-y` — skip the interactive DB-creation prompt and auto-create the database if absent
+## Arguments
+
+| Argument / flag | Default | Description |
+|---|---|---|
+| `<name>` | directory basename | Optional project name positional. Sets the human-readable project label written to `project_settings`. |
+| `-y` | off | Skip the interactive DB-creation prompt and auto-create the database if absent. |
 
 ## Expected output
 

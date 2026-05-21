@@ -8,7 +8,7 @@ It persists durable session state as queryable Postgres rows at the session boun
 
 | Path | Purpose | Status |
 |---|---|---|
-| `README.md` | Project overview, install, quickstart pointer | updated (added /handoff:resurrect) |
+| `README.md` | Project overview, install, quickstart pointer | updated (added parameter column to command table) |
 | `CLAUDE.md` | Project-level operating instructions for Claude Code | current |
 | `MANIFEST.md` | This file — tracked index of all documentation | updated (serve-time staleness fix docs) |
 | `QUICKSTART.md` | Step-by-step setup guide for new users | updated (added /handoff:resurrect) |
@@ -17,7 +17,7 @@ It persists durable session state as queryable Postgres rows at the session boun
 | `CONTRIBUTING.md` | Contribution guidelines and workflow | current |
 | `CODE_OF_CONDUCT.md` | Community standards | current |
 | `SECURITY.md` | Security policy and disclosure process | current |
-| `docs/how-memory-works.md` | Conceptual explanation of the system, session seam model, identity + limitations | updated (staleness refresh: added /handoff:resurrect, de-jargoned north-star-inversion phrasing, removed duplicated north-star tenets, pointer to case-study.md) + coherence pass (Fix 1: resurrect auto/manual link; Fix 2: session-intent de-jargon; Fix 3: what-it-isn't statement) |
+| `docs/how-memory-works.md` | Conceptual explanation of the system, session seam model, identity + limitations | updated (staleness refresh: added /handoff:resurrect, de-jargoned north-star-inversion phrasing, removed duplicated north-star tenets, pointer to case-study.md) + coherence pass (Fix 1: resurrect auto/manual link; Fix 2: session-intent de-jargon; Fix 3: what-it-isn't statement) + param-docs pass (slash-commands section: inline parameter forms added for all commands that take params) |
 | `docs/glossary.md` | Term definitions for all concepts used across the docs | updated (branch_exists, commit_merged, in_file, pr_state, reality_check, serve-time reality re-probe, [STALE:] annotation entries added; /handoff:resurrect count updated to nine) |
 | `docs/case-study.md` | Narrative walkthrough of two design problems: Ch.1 decay/operator-pin/resurrection; Ch.2 north-star TDD harness, RED-by-design test methodology, serve-time staleness, adversarial permutation harness, caveman dogfooding | updated (Chapter 2 added) |
 | `docs/troubleshooting.md` | Diagnosis guide for common setup and runtime problems | current |
@@ -30,13 +30,13 @@ It persists durable session state as queryable Postgres rows at the session boun
 | `docs/deep/studies/2026-05-memory-systems-comparison.md` | Comparative analysis: claude-memory vs. mem0, Graphiti/Zep, Letta, others | current |
 | `docs/deep/studies/decay-vs-dont-forget-and-resurrection.md` | Study: decay, devalue-vs-invalidate, and the resurrect ring design | current |
 | `commands/handoff/README.md` | Overview of all `/handoff:*` slash commands | updated (added /handoff:resurrect) |
-| `commands/handoff/init.md` | `/handoff:init` — first-run provisioning command | updated (removed phantom $2 description positional) |
+| `commands/handoff/init.md` | `/handoff:init` — first-run provisioning command | updated (removed phantom $2 description positional; added Arguments table + invocation examples for <name> and -y) |
 | `commands/handoff/status.md` | `/handoff:status` — read-only project memory status | updated (added --json, --breakdown, --stale-pointers flags with Arguments table + examples) |
 | `commands/handoff/close.md` | `/handoff:close` — end-of-session extraction and session-intent persistence | updated (--dry-run flag added: Arguments table + expected output + what is/is not rehearsed; --json alone still works) |
-| `commands/handoff/resume.md` | `/handoff:resume` — explicit context load; surfaces `### Session intent` section | updated (serve-time reality re-probe description added) |
+| `commands/handoff/resume.md` | `/handoff:resume` — explicit context load; surfaces `### Session intent` section | updated (serve-time reality re-probe description added; added "Arguments: none" section) |
 | `commands/handoff/checkpoint.md` | `/handoff:checkpoint` — mid-session save without ending the session | updated (--note flag added: Arguments table + expected output; --json alone still works) |
 | `commands/handoff/promote.md` | `/handoff:promote` — promote an assertion to CLAUDE.md durable facts | updated (--subject/--predicate/--object promote-by-content + --demote added; Arguments table + full expected-output examples + exit codes) |
-| `commands/handoff/drop.md` | `/handoff:drop` — archive prior session memory and start fresh | current |
+| `commands/handoff/drop.md` | `/handoff:drop` — archive prior session memory and start fresh | updated (added "Arguments: none" section) |
 | `commands/handoff/purge.md` | `/handoff:purge` — hard delete all project memory (confirmation required) | updated (added --dry-run flag with Arguments table + expected output) |
 | `commands/handoff/resurrect.md` | `/handoff:resurrect` — pull a decayed topic back into active context | updated (added --json flag to Flags table + JSON output example + invocation examples) |
 | `hooks/README.md` | SessionStart and Stop hook setup and behavior | current |

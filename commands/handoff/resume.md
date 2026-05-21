@@ -30,6 +30,10 @@ UPDATE — only `reality_check` is written; confidence, source, tier, object are
 changed). Feature-gated via `serve_time_reality_check` project setting (default `enabled`).
 </details>
 
+## Arguments
+
+None — this command takes no flags or positional arguments.
+
 ## How to invoke
 
 ```bash
