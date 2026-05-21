@@ -1,4 +1,10 @@
-# Case Study: Letting Old Notes Fade Without Losing Them
+# Case Study: Building the Memory System That Forgets Gracefully
+
+Two chapters. Each one is about a different design problem in this project, and each one is honest about what got shipped, what got caught, and what the methodology was.
+
+---
+
+# Chapter 1: Letting Old Notes Fade Without Losing Them
 
 This is a worked example of how one design decision in this project got made.
 It's the story of trying to let old notes fade without losing them — and the
@@ -231,4 +237,263 @@ the trust gate specifics, and citations to the exact line numbers in
 
 - [docs/how-memory-works.md](how-memory-works.md) — the broader picture, of which this is one piece
 - [docs/glossary.md](glossary.md) — definitions for terms used here
+- [README.md](../README.md) — the system as a whole
+
+---
+
+# Chapter 2: Tests That Fail on Purpose
+
+Chapter 1 was about catching my own overstatements with a reflective loop — a
+gate that forced a second look before shipping. This chapter is about applying
+the same instinct to the architecture itself: writing tests that are wrong by
+design, because the architecture hasn't earned them yet.
+
+---
+
+## The north star
+
+Three things this system has to get right, stated plainly:
+
+1. **Lossless fidelity.** Nothing you planned or decided in a prior session
+   should be lost across the session boundary. If you said "the next step is X,"
+   that needs to survive.
+
+2. **A lean default resume.** When you pick up a project, the context you
+   receive should be minimal and ranked by relevance — not a growing prose
+   transcript. Older, less-reinforced facts should fade to the back; the
+   freshest, most load-bearing ones should come first.
+
+3. **Resurrection on demand.** A fact that has faded can be pulled back
+   explicitly when it's relevant again. The system doesn't delete — it quiets.
+
+Those three goals have a load-bearing premise underneath them: the information
+that drives the next session must live in Postgres as queryable, decay-rankable
+rows — not in a markdown file. If the intent only exists in prose, it can't be
+decay-ranked. It can't be queried by topic. It can't be resurrected. And it gets
+silently overwritten the moment the next session closes.
+
+At the time the test suite was written, this premise was violated. The
+`handoff.md` file was carrying all the session-driving content — the TL;DR,
+open threads, quick references — as narrative prose in its body. Postgres got
+the structured assertions (`entities`, `assertions`, `edges`) but not the intent
+that actually steered the next session. The markdown body was the sole store of
+that intent, and it was replaced wholesale on every close.
+
+---
+
+## RED by design
+
+Rather than fix the architecture first and write tests after, a suite was
+written that encoded the target state and failed on purpose against the broken
+state. This is the methodological heart of the chapter.
+
+Four test files:
+
+- `test/north-star/test-fidelity-dataloss.js` — closes a session, blanks the
+  handoff.md body, resumes, and asserts that every open thread still surfaces.
+  The logic: if the intent lived only in the markdown prose, blanking the body
+  erases it. The test fails RED until the intent lands as a queryable Postgres
+  row that resume can serve independently of the markdown body.
+
+- `test/north-star/test-retrieval-economy.js` — asserts that the default resume
+  stays within the token budget and that the markdown body is a thin pointer
+  (under 512 bytes), not a growing narrative. Also exposes a specific lie the
+  engine had been telling: the reported "tokens used" figure excluded the served
+  markdown body entirely, so a large session payload could blow the real budget
+  while the reported number stayed small.
+
+- `test/north-star/test-lifecycle-roundtrip.js` — covers the full close→resume
+  round-trip reconstructed from Postgres alone (MD body blanked), the thin
+  pointer assertion, and a vLLM-gated arm that verifies a devalued intent can be
+  resurrected via an explicit query once it lives as a real Postgres row.
+
+- `test/north-star/test-provenance.js` — asserts that persisted intent carries
+  coherent provenance: confidence, source, tier, bitemporal validity. Prose
+  cannot carry any of these fields. A note in the markdown body has no
+  confidence score, no trust tier, no supersession trail. The tests prove that
+  the fixed architecture gives session-driving intent the same first-class
+  treatment as any other assertion.
+
+Together, these files contain 12 structural tests (the vLLM-dependent arm in
+`test-lifecycle-roundtrip.js` self-skips in CI environments without vLLM). They
+were written before any of the architecture they test was built.
+
+The suite was wired into CI in `.github/workflows/test.yml` under a hard gate:
+each north-star step runs with `if: always()` so all four files report their
+RED status even after the first failure. GitHub's default fail-fast behavior
+would have silently hidden failures after the first; `if: always()` keeps every
+file visible. The job fails if any step is non-zero. The comment in the
+workflow is explicit: *"These FAIL RED today on purpose: close currently
+persists intent only to the markdown body. This is a HARD GATE — CI stays red
+until the architecture is rebuilt."*
+
+That committed the project publicly to a broken CI state until the architecture
+caught up.
+
+(PR #91, commit `f3ec565`)
+
+---
+
+## The rebuild that turned it green
+
+The fix — called the "north-star inversion" in the commit message — rebuilt
+`/handoff:close` to persist the TL;DR, open threads, and quick references as
+queryable Postgres assertion rows under three dedicated predicates:
+`session_tldr`, `open_thread`, and `quick_reference`. These rows are written
+through the same gated write path (`writeAssertionWithSupersession`) used by
+all other assertions, which means the L0/L2 consolidation gate applies: a model
+restating the same intent across sessions cannot self-promote it to
+`consolidated` by repetition alone.
+
+The `handoff.md` file was collapsed to a thin pointer — metadata header only.
+The session-driving content that used to live in the prose body now lives in
+Postgres, where it can be ranked, queried, and resurrected.
+
+The test suite, unmodified, went green.
+
+(PR #92, commit `0ac852a`)
+
+---
+
+## Serve-time reality re-probe
+
+With the architecture now honest about where intent lives, a second problem came
+into focus: facts about volatile now-state.
+
+Some assertions record things that change between sessions — whether a PR is
+open or merged, whether a branch still exists, whether a commit has landed on
+main. Once a session closes with `pr_state: "open"`, that row sits in Postgres
+marked `reality_check: 'verified'`. If the PR merges before the next session,
+that frozen fact silently misleads the next session's context.
+
+The serve-time reality re-probe addresses this: at resume time, assertions with
+volatile predicates (`pr_state`, `branch_exists`, `commit_merged`, `in_file`)
+are re-checked against live reality. If the stored value no longer matches, the
+served output is annotated `[STALE: now "..."]` inline. The DB row's
+`reality_check` field is updated, but — critically — the object, confidence,
+source, and tier are never modified (the §7 no-backfill invariant). History is
+preserved; only the freshness annotation changes.
+
+This work also corrected the token-accounting lie exposed by the north-star
+suite. The loader had been reporting bootstrap cost based only on the
+PG-retrieved sections, excluding the served markdown body. The fix introduced
+`trueServedTokens` — the real bootstrap cost including the canon block, the
+markdown body, and all retrieved sections — so the lean-resume budget guarantee
+is now honest.
+
+(PR #93, commit `bb3e8c2`)
+
+---
+
+## Adversarial permutation harness
+
+The serve-time re-probe introduced new failure modes: what happens when the `gh`
+binary is missing? When a probe times out? When JSON from `gh` is malformed?
+When two serve passes race to update the same `reality_check` field?
+
+A separate adversarial harness was built to close those holes. It permutes
+staleness scenarios across the four probe-able predicates, adversarial failure
+conditions (probe binary missing, non-zero exit, timeout, malformed output), a
+circuit-breaker test to bound total probe time when many rows need checking, a
+concurrency test, and a budget test. Each failure mode must resolve to
+`unverifiable` — never to `verified`, never to a hang, never to a crash.
+
+The harness ran 29 tests (verified by counting `await test(` calls in
+`test/handoff/test-staleness-permutations.js`). It found and fixed four real
+engine holes that the earlier direct tests had not caught.
+
+A sibling fix corrected a specific bug in the `commit_merged` probe: the probe
+function was hardcoded to echo an object string that never matched the stored
+value, so every `commit_merged` assertion came back as a mismatch regardless of
+reality. This was caught by dogfooding the system's own session-close on a
+project that had a `commit_merged` assertion — the system flagged its own
+assertion as stale when it was actually verified.
+
+(PR #94, commit `0e86af0`; PR #95, commit `a134de4`)
+
+---
+
+## The caveman dogfooding harness
+
+The newest arm of the suite defends a property that has no analogue in the
+earlier tests: authoring quality.
+
+Once intent lives in Postgres as prose strings in assertion rows, the question
+becomes: how do you write that prose to minimize bootstrap tokens without losing
+the load-bearing content? The answer is telegraphic ("caveman") authoring —
+strip function words (articles, copulas, most prepositions and conjunctions),
+keep every load-bearing token (identifiers, file paths, line references, PR
+numbers, commit SHAs, decisions). The engine stores what it receives verbatim;
+compression has to happen at authoring time.
+
+A new test file (`test/north-star/test-caveman-economy.js`) proves this with a
+dogfooded round-trip. It runs the real `close` and `resume` subprocesses against
+two paired fixtures — one with telegraphic prose, one with equivalent full
+sentences — and asserts three things:
+
+- **Economy:** the caveman resume costs fewer tokens than the verbose one, at
+  both the true bootstrap level and the intent channel (the `### Assertions`
+  section alone).
+
+- **Fidelity:** every load-bearing token that surfaces in the verbose resume
+  also surfaces in the caveman resume. Economy cannot be bought with loss.
+
+- **Function-word density:** the caveman intent section has a measurably lower
+  function-word ratio than the verbose intent section. This is the direct proof
+  of telegraphic compression.
+
+The tension worth naming: the fidelity check could not be exact-string survival.
+Telegraphic prose is not a verbatim sentence, so character-level equality would
+trivially fail. Fidelity had to be redefined as "every load-bearing token
+survives while function-word density provably drops" — a harder-to-satisfy
+definition, but the right one.
+
+(PR #96, commit `0f07baa`)
+
+---
+
+## The connective thread
+
+Chapter 1 was about building a gate that caught my own overstatements before
+shipping. The gate was a structured question I forced myself to ask: *have I
+explored every failure mode? Can I do better?*
+
+Chapter 2 is the same instinct applied to architecture. Tests that fail on
+purpose encode the target state the code hasn't reached yet. Wiring them into CI
+as a hard gate commits the project to a broken state until the architecture
+catches up. Adversarial and dogfooding harnesses then lock in the properties
+that matter — staleness honesty, token economy, fidelity — so they can't
+silently regress.
+
+In both cases the underlying discipline is the same: expect to be wrong about
+your own work. Build the gates that catch it before someone else does — or
+before you forget what you were trying to guarantee in the first place.
+
+---
+
+## For nerds
+
+The five north-star test files are in `test/north-star/`. The shared scaffold
+(`test/north-star/lib/ns-harness.js`) documents the RED-by-construction
+contract in its header and provides the `blankHandoffMdBody`, `assertSurfaced`,
+`assertMdThinPointer`, and related primitives the sibling files compose.
+
+The adversarial staleness harness is at
+`test/handoff/test-staleness-permutations.js`. The serve-time staleness tests
+it extends are at `test/handoff/test-serve-time-staleness.js`.
+
+The CI wiring, including the `if: always()` gates and the comments explaining
+why each north-star step runs regardless of prior failures, lives in
+`.github/workflows/test.yml`.
+
+---
+
+## Related
+
+- [Chapter 1](#chapter-1-letting-old-notes-fade-without-losing-them) — the
+  decay / operator-pin / resurrection design
+- [docs/how-memory-works.md](how-memory-works.md) — the system's core model,
+  including the serve-time reality re-probe
+- [docs/glossary.md](glossary.md) — definitions for `open_thread`,
+  `session_tldr`, `quick_reference`, `reality_check`, `[STALE:]` annotation
 - [README.md](../README.md) — the system as a whole
