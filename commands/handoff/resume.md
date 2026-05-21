@@ -8,10 +8,11 @@ Force-load context from the last session. Normally the session hook loads prior 
 <summary>How this works internally</summary>
 
 This command performs the loader's read-and-inject inline:
-1. Parses `handoff.md` for the active contract name.
+1. Reads the contract name from `handoff.md` (a thin pointer — metadata header only).
 2. Executes the contract's query array against the DB.
 3. Bumps `last_reinforced` on returned assertions.
-4. Prints a compact context summary.
+4. Surfaces a `### Session intent` section by querying `assertions` rows with `predicate IN ('open_thread', 'session_tldr', 'quick_reference')`, ordered by decay-adjusted confidence. This section appears when the contract does not already include an `assertion` or `recency` query. Suppressed and invalidated rows are excluded.
+5. Prints a compact context summary.
 
 The session hook (Phase 3.6) will eventually handle automatic loading. This command stays as the manual override for staleness acknowledgment.
 
@@ -63,12 +64,14 @@ Running: handoff:resume
 
 === Handoff context ===
 # Handoff — claude-memory
-
-## TL;DR
-<prior session summary>
-...
+(thin pointer — session content is in Postgres)
 
 === Retrieved context (contract: default) ===
+### Session intent
+- [user_stated|conf=8] claude-memory session_tldr <prior TL;DR>
+- [user_stated|conf=8] <thread-key> open_thread <pending action>
+...
+
 ### Recent assertions
 - [conf=9] vLLM embedding_model is Qwen3-Embedding-8B
 - [conf=8] DB database is claude_memory_eval_test

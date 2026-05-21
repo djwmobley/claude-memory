@@ -36,9 +36,9 @@ A list of numbers — hundreds or thousands of them — that represent the *mean
 
 A thing Claude is tracking — a project, a person, a decision, a file, a bug, a concept. Think of it like a Wikipedia page: the entity is the *subject*, and assertions are the facts written about it. If Claude knows "the lead developer is Jordan" and "the lead developer is on vacation", "lead developer" is the entity and both statements are assertions about it. See also: **assertion**, **edge**.
 
-### Handoff.md
+### Handoff.md (thin pointer)
 
-A markdown file that lives outside your repo (in a private `~/.claude/projects/` folder) where the summary of your last session is stored. Claude writes to it at the end of each session and reads from it at the start of the next one. It's what lets Claude say "last time we were working on the auth refactor" instead of starting from scratch. You don't edit this file by hand — the `/handoff:close` and `/handoff:resume` commands manage it.
+A markdown file that lives outside your repo (in a private `~/.claude/projects/` folder). After the north-star inversion, this file is a **thin pointer** — it carries only the project metadata header (project ID, last close time, contract name, session summary counts) and refers to Postgres for TL;DR, open threads, and quick references. It is not the prose store of session state. You do not edit it by hand — `/handoff:close` renders it; the loader reads the contract name from it at session start. See also: **session intent section**, **session seam**.
 
 ### HNSW
 
@@ -87,6 +87,30 @@ An old fact that's been replaced by a newer one. If Claude wrote "the project st
 ### Vector search
 
 Search by meaning, not exact words. If you ask "find me anything about login failures", vector search can surface a note that says "the OAuth token refresh was broken" — because those two things are semantically close, even though they share no exact words. It works by comparing **embeddings**. See also: **embedding**, **pgvector**, **HNSW**.
+
+### open_thread
+
+A predicate (cardinality 1:1) that persists a session-driving next-action as a queryable Postgres assertion row. One live row exists per thread-key (the subject, derived from the thread text). When a thread changes, the new row supersedes the prior one via the 1:1 uniqueness path. Written at `/handoff:close` through the gated assertion write path. Surfaced on resume in the `### Session intent` section. See also: **session_tldr**, **quick_reference**, **session intent section**.
+
+### quick_reference
+
+A predicate (cardinality 1:1) that persists a session quick-reference pointer block as a queryable Postgres assertion row; one live row per project (subject = project basename), latest supersedes prior. Written at `/handoff:close` through the gated write path. See also: **open_thread**, **session_tldr**, **session intent section**.
+
+### Relay baton vs. court stenographer
+
+The central identity distinction for this system. claude-memory is a **relay baton** — its job is to hand continuity across session boundaries, carrying only what the next runner needs. It is not a **court stenographer** — it does not capture a verbatim transcript of every utterance. "Lossless" is scoped to *across the seam*: everything important that crosses a session boundary is preserved. What never reaches a seam (unsaved mid-session work, compacted early context) is not preserved. This is a design contract, not a limitation to apologize for. See also: **session seam**, **Limitations** in `docs/how-memory-works.md`.
+
+### session_tldr
+
+A predicate (cardinality 1:1) that persists the session TL;DR as a queryable Postgres assertion row; one live row per project (subject = project basename), latest supersedes prior. Written at `/handoff:close` through the gated write path. See also: **open_thread**, **quick_reference**, **session intent section**.
+
+### Session intent section
+
+The `### Session intent` block that the loader surfaces at resume time. It is built by querying the `assertions` table for rows with `predicate IN ('open_thread', 'session_tldr', 'quick_reference')`, ordered by decay-adjusted confidence. It appears only when the retrieval contract does not already include an `assertion` or `recency` query (which would serve those rows via their own blocks). Suppressed and invalidated rows are excluded. See also: **open_thread**, **session_tldr**, **quick_reference**, **handoff.md (thin pointer)**.
+
+### Session seam
+
+The moment of transition between two Claude Code sessions — the point where `/handoff:close` or `/handoff:checkpoint` runs. The session seam is the only point at which session state is captured. Continuity is preserved *across the seam*, not continuously throughout a session. See also: **relay baton vs. court stenographer**, **Limitations** in `docs/how-memory-works.md`.
 
 ---
 
