@@ -48,7 +48,7 @@ A thing Claude is tracking — a project, a person, a decision, a file, a bug, a
 
 ### Handoff.md (thin pointer)
 
-A markdown file that lives outside your repo (in a private `~/.claude/projects/` folder). After the north-star inversion, this file is a **thin pointer** — it carries only the project metadata header (project ID, last close time, contract name, session summary counts) and refers to Postgres for TL;DR, open threads, and quick references. It is not the prose store of session state. You do not edit it by hand — `/handoff:close` renders it; the loader reads the contract name from it at session start. See also: **session intent section**, **session seam**.
+A markdown file that lives outside your repo (in a private `~/.claude/projects/` folder). After the north-star inversion, this file is a **thin pointer** — it carries only the project metadata header (project ID, last close time, contract name, session summary counts) and refers to Postgres for TL;DR, open threads, and quick references. It is not the prose store of session state. You do not edit it by hand — `/handoff:close` renders it; the loader reads the contract name from it at session start. See also: **north-star inversion**, **North star**, **session intent section**, **session seam**.
 
 ### HNSW
 
@@ -57,6 +57,14 @@ The type of index Postgres (via pgvector) uses to make vector search fast. Witho
 ### Knowledge graph
 
 The overall structure that stores entities, edges, and assertions together. Rather than a flat list of notes, a knowledge graph lets you navigate relationships — "show me everything connected to the auth subsystem" or "what decisions affect this project?" — instead of just keyword-matching. See also: **entity**, **edge**, **assertion**.
+
+### North star
+
+The three goals this system must satisfy: (1) **lossless fidelity** — nothing planned or decided in a prior session is lost across the session boundary; (2) **a lean default resume** — minimal, decay-ranked context rather than a growing prose transcript; (3) **resurrection on demand** — a faded fact can be pulled back explicitly, because the system quiets rather than deletes. These goals rest on a load-bearing premise: the information that drives the next session must live in Postgres as queryable, decay-rankable rows — not in a markdown file. Prose cannot be decay-ranked, queried by topic, or resurrected; and it is overwritten wholesale on every close. See [docs/case-study.md — "The north star"](case-study.md) for the full narrative. See also: **north-star inversion**, **Handoff.md (thin pointer)**, **relay baton vs. court stenographer**, **decay**, **resurrect**, **session intent section**.
+
+### North-star inversion
+
+The architectural pivot that made the north-star goals achievable. Before the inversion, `/handoff:close` wrote the session TL;DR, open threads, and quick references as narrative prose into the `handoff.md` body — which was replaced wholesale on every close and could not be decay-ranked, queried, or resurrected. The inversion rebuilt `/handoff:close` to persist that intent instead as queryable Postgres assertion rows under three dedicated predicates: `session_tldr`, `open_thread`, and `quick_reference`. These rows go through the same gated write path (`writeAssertionWithSupersession`) as all other assertions, so the L0/L2 consolidation gate applies. As a result, `handoff.md` was demoted to a thin pointer — metadata header only — while the session-driving content moved to Postgres where it can be ranked, queried, and resurrected. The north-star test suite, written RED by design before this rebuild, went green unmodified after the inversion. See [docs/case-study.md — "The rebuild that turned it green"](case-study.md) for the full narrative. See also: **North star**, **Handoff.md (thin pointer)**, **session_tldr**, **open_thread**, **quick_reference**, **session intent section**.
 
 ### pgvector
 
@@ -68,7 +76,7 @@ The "verb" part of an assertion — the type of fact being recorded. In the asse
 
 ### Prune
 
-Manually deleting assertions that aren't worth keeping. Unlike **decay** (which quietly reduces a note's score) or **superseded** (which replaces an old fact with a new one), pruning is a deliberate hard delete. The `/handoff:prune` command does a dry run by default — it shows you what would be removed before actually removing it.
+The concept of deliberately hard-deleting assertions that are no longer worth keeping. Unlike **decay** (which quietly lowers a score but keeps the row) or **superseded** (which replaces an old fact with a new one while preserving history), pruning is a destructive removal. There is no `/handoff:prune` command — selective per-assertion pruning was explicitly not implemented. The deliberate hard-delete operations available are `/handoff:purge` (hard-deletes all project memory for the current project, with confirmation) and `/handoff:drop` (archives prior memory and starts a clean slate). Per-row removal from serving happens via suppression: a **superseded** or otherwise suppressed row is excluded from retrieval without being physically deleted. See also: **decay**, **superseded**, **resurrect**.
 
 ### Resurrect
 
@@ -128,7 +136,7 @@ A predicate (cardinality 1:1, `mode:'verify'`) that records whether a named git 
 
 ### commit_merged
 
-A predicate (cardinality 1:1, `mode:'verify'`) that records whether a given commit SHA has been merged. Subject = the entity the commit belongs to; object = `"merged"` (verified form) or `"<not-merged>"` (when not yet an ancestor). Object format for authoring: `"<sha>"` or `"<sha> on <branch>"`. Probed via `git merge-base --is-ancestor`. Returns `'merged'` or `'<not-merged>'`; fails soft to `null` (unverifiable) when the commit does not exist or git is unavailable. See also: **[STALE: now "…"] annotation**, **serve-time reality re-probe**, **reality reconciliation**.
+A predicate (cardinality 1:1, `mode:'verify'`) that records whether a given commit SHA has been merged into a target branch. Subject = the entity the commit belongs to; object = the asserted value in the form `"<sha>"` or `"<sha> on <branch>"` (e.g. `"0f07baa on main"`). Probed via `git merge-base --is-ancestor`. On success the probe echoes back the asserted object (not a fixed sentinel) — so `runVerifyDispatch` tags the row `'verified'` only when `probeResult === row.object`. On non-ancestor the probe returns `"<not-merged>"` (mismatch). On any error (git unavailable, commit not found, bad format, timeout) the probe returns `null` (fail-soft → `'unverifiable'`). A row whose object is the bare string `"merged"` is permanently unverifiable because the probe cannot parse `"merged"` as a SHA. See also: **[STALE: now "…"] annotation**, **serve-time reality re-probe**, **reality reconciliation**.
 
 ### in_file
 
