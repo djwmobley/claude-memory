@@ -84,7 +84,7 @@ One continuous conversation with Claude Code — from when you open a chat to wh
 
 ### Slash command
 
-A `/foo` command you type into Claude Code. This project adds eight of them — `/handoff:init`, `/handoff:status`, `/handoff:resume`, `/handoff:close`, and a few more. Each one is a short recipe file in `commands/handoff/` that tells Claude what to do. You install them by copying those files to `~/.claude/commands/handoff/`.
+A `/foo` command you type into Claude Code. This project adds nine of them — `/handoff:init`, `/handoff:status`, `/handoff:resume`, `/handoff:close`, and a few more. Each one is a short recipe file in `commands/handoff/` that tells Claude what to do. You install them by copying those files to `~/.claude/commands/handoff/`.
 
 ### Stale
 

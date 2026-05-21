@@ -8,17 +8,17 @@ It persists durable session state as queryable Postgres rows at the session boun
 
 | Path | Purpose | Status |
 |---|---|---|
-| `README.md` | Project overview, install, quickstart pointer | current |
+| `README.md` | Project overview, install, quickstart pointer | updated (added /handoff:resurrect) |
 | `CLAUDE.md` | Project-level operating instructions for Claude Code | current |
 | `MANIFEST.md` | This file — tracked index of all documentation | updated (serve-time staleness fix docs) |
-| `QUICKSTART.md` | Step-by-step setup guide for new users | current |
+| `QUICKSTART.md` | Step-by-step setup guide for new users | updated (added /handoff:resurrect) |
 | `PREREQS.md` | System prerequisites (Node, Postgres, pgvector, vLLM) | current |
 | `CHANGELOG.md` | Version history and release notes | current |
 | `CONTRIBUTING.md` | Contribution guidelines and workflow | current |
 | `CODE_OF_CONDUCT.md` | Community standards | current |
 | `SECURITY.md` | Security policy and disclosure process | current |
-| `docs/how-memory-works.md` | Conceptual explanation of the system, session seam model, identity + limitations | updated (serve-time reality re-probe section added) |
-| `docs/glossary.md` | Term definitions for all concepts used across the docs | updated (branch_exists, commit_merged, in_file, pr_state, reality_check, serve-time reality re-probe, [STALE:] annotation entries added) |
+| `docs/how-memory-works.md` | Conceptual explanation of the system, session seam model, identity + limitations | updated (staleness refresh: added /handoff:resurrect, de-jargoned north-star-inversion phrasing, removed duplicated north-star tenets, pointer to case-study.md) + coherence pass (Fix 1: resurrect auto/manual link; Fix 2: session-intent de-jargon; Fix 3: what-it-isn't statement) |
+| `docs/glossary.md` | Term definitions for all concepts used across the docs | updated (branch_exists, commit_merged, in_file, pr_state, reality_check, serve-time reality re-probe, [STALE:] annotation entries added; /handoff:resurrect count updated to nine) |
 | `docs/case-study.md` | Narrative walkthrough of two design problems: Ch.1 decay/operator-pin/resurrection; Ch.2 north-star TDD harness, RED-by-design test methodology, serve-time staleness, adversarial permutation harness, caveman dogfooding | updated (Chapter 2 added) |
 | `docs/troubleshooting.md` | Diagnosis guide for common setup and runtime problems | current |
 | `docs/deep/retrieval-contract-evolution.md` | How the retrieval contract schema has evolved over time | current |
@@ -29,7 +29,7 @@ It persists durable session state as queryable Postgres rows at the session boun
 | `docs/deep/specs/2026-05-17-predicate-normalization.md` | Design spec: predicate normalization rules | current |
 | `docs/deep/studies/2026-05-memory-systems-comparison.md` | Comparative analysis: claude-memory vs. mem0, Graphiti/Zep, Letta, others | current |
 | `docs/deep/studies/decay-vs-dont-forget-and-resurrection.md` | Study: decay, devalue-vs-invalidate, and the resurrect ring design | current |
-| `commands/handoff/README.md` | Overview of all `/handoff:*` slash commands | current |
+| `commands/handoff/README.md` | Overview of all `/handoff:*` slash commands | updated (added /handoff:resurrect) |
 | `commands/handoff/init.md` | `/handoff:init` — first-run provisioning command | current |
 | `commands/handoff/status.md` | `/handoff:status` — read-only project memory status | current |
 | `commands/handoff/close.md` | `/handoff:close` — end-of-session extraction and session-intent persistence | updated (caveman/telegraphic authoring guidance for tldr, open_threads, quick_references) |

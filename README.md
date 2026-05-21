@@ -75,6 +75,7 @@ Full version: [docs/how-memory-works.md](docs/how-memory-works.md).
 | `/handoff:drop` | Archive the current journal and start fresh. Use when a project phase is truly over. | [commands/handoff/drop.md](commands/handoff/drop.md) |
 | `/handoff:purge` | Delete everything. No undo. Use with care. | [commands/handoff/purge.md](commands/handoff/purge.md) |
 | `/handoff:promote` | Bump a journal entry into `CLAUDE.md` so it's always loaded, not just "when relevant." | [commands/handoff/promote.md](commands/handoff/promote.md) |
+| `/handoff:resurrect` | Pull decay-suppressed notes on a topic back to the surface; dry-run by default, pass `--revive` to un-suppress. | [commands/handoff/resurrect.md](commands/handoff/resurrect.md) |
 
 ---
 
