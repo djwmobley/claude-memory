@@ -47,17 +47,17 @@ PGPASSWORD=postgres psql -h localhost -U postgres -f scripts/setup.sql
 ### Step 3 — Chunker tests
 
 ```sh
-DATABASE_URL=postgres://postgres:postgres@localhost/postgres OLLAMA_SKIP=1 node scripts/test-chunker.js
+DATABASE_URL=postgres://postgres:postgres@localhost/postgres EMBED_SKIP=1 node scripts/test-chunker.js
 ```
 
-`OLLAMA_SKIP=1` skips embedding assertions (no Ollama required in CI or local runs).
+`EMBED_SKIP=1` skips embedding assertions (no live embedding backend required in CI or local runs).
 
 ### Step 4 — Retrieval eval (FTS-only smoke test)
 
 ```sh
 PGHOST=localhost PGUSER=postgres PGPASSWORD=postgres \
-  OLLAMA_SKIP=1 \
-  node test/eval/eval-retrieval.js --ollama-skip
+  EMBED_SKIP=1 \
+  node test/eval/eval-retrieval.js --embed-skip
 ```
 
 No manual database setup required. The harness generates a unique throwaway

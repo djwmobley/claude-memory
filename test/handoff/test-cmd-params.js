@@ -98,7 +98,7 @@ function runHelper(sub, extraArgs = [], opts = {}) {
     PROJECT_ROOT:              fakeRoot,
     HANDOFF_TEST_PROJECT_ID:   PROJECT_ID,
     // Disable vLLM/Ollama embedding so resurrect falls back to fuzzy match.
-    OLLAMA_SKIP: '1',
+    EMBED_SKIP: '1',
     ...(opts.extraEnv || {}),
   };
   for (const k of (opts.deleteEnv || [])) delete env[k];
@@ -122,7 +122,7 @@ function runHelperBoth(sub, extraArgs = [], opts = {}) {
     ...process.env,
     PROJECT_ROOT:            fakeRoot,
     HANDOFF_TEST_PROJECT_ID: PROJECT_ID,
-    OLLAMA_SKIP: '1',
+    EMBED_SKIP: '1',
     ...(opts.extraEnv || {}),
   };
   for (const k of (opts.deleteEnv || [])) delete env[k];

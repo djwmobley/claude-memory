@@ -2157,9 +2157,9 @@ async function runResurrectQuery(db, projectId, q, opts = {}) {
 
   // ── Step 1: Resolve candidate subjects via semantic or fuzzy seed ──────────
   let candidateSubjects = [];
-  const ollamaSkip = (process.env.OLLAMA_SKIP === '1');
+  const embedSkip = (process.env.EMBED_SKIP === '1');
 
-  if (!ollamaSkip && seedText) {
+  if (!embedSkip && seedText) {
     // Semantic seed — embed the query via vLLM and run a cosine ANN search
     // directly on assertions.embedding (halfvec 4000, Qwen/Qwen3-Embedding-8B).
     // This is the primary path; pg_trgm fuzzy is the fallback below.
@@ -2199,7 +2199,7 @@ async function runResurrectQuery(db, projectId, q, opts = {}) {
     }
   }
 
-  // Fuzzy fallback (runs when ollamaSkip=1, semantic unavailable, or semantic returned empty).
+  // Fuzzy fallback (runs when embedSkip=1, semantic unavailable, or semantic returned empty).
   if (candidateSubjects.length === 0 && seedText) {
     const { sql: fuzzySql, params: fuzzyParams } = db.buildFuzzyMatch(
       projectId, seedText, fuzzyLimit
@@ -2895,7 +2895,7 @@ async function cmdLoaderLoad(opts = {}) {
       //      This prevents a forged probationary row from self-resurrecting.
       //   3. Semantic seed: embeds query via vLLM (Qwen/Qwen3-Embedding-8B) and runs
       //      cosine ANN directly on assertions.embedding (halfvec 4000, project-scoped).
-      //      Degrades to pg_trgm fuzzy match (db.buildFuzzyMatch) under OLLAMA_SKIP=1
+      //      Degrades to pg_trgm fuzzy match (db.buildFuzzyMatch) under EMBED_SKIP=1
       //      or when the embed backend is unreachable/throws. Both paths are non-fatal.
       //      Both paths route through the seam — zero dialect conditionals in the engine.
       //   4. Graph fan-out: from seeded subjects, calls db.buildGraphCTE(out, seeds, 2)

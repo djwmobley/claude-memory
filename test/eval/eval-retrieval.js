@@ -11,7 +11,7 @@
  *   node test/eval/eval-retrieval.js                 # Run full eval (auto throwaway DB)
  *   node test/eval/eval-retrieval.js --update-baseline  # Accept current metrics as new baseline
  *   node test/eval/eval-retrieval.js --quiet          # Summary only (no per-query output)
- *   node test/eval/eval-retrieval.js --ollama-skip    # FTS-only; skip vector parts
+ *   node test/eval/eval-retrieval.js --embed-skip    # FTS-only; skip vector parts
  *
  * DB lifecycle:
  *   When EVAL_DB_NAME is NOT set (default): the harness generates a unique throwaway
@@ -24,7 +24,7 @@
  *
  * Prerequisites (only needed when running with an explicit EVAL_DB_NAME):
  *   - The named database must already exist and have the pgvector extension.
- *   - Ollama running with mxbai-embed-large pulled (unless --ollama-skip).
+ *   - Embedding backend running (unless --embed-skip).
  *
  * Exit codes: 0 all-pass, 1 metric regression, 2 infrastructure failure.
  */
@@ -46,7 +46,7 @@ const { encodeCwd }                            = require('../../scripts/lib/enco
 const argv             = process.argv.slice(2);
 const FLAG_UPDATE      = argv.includes('--update-baseline');
 const FLAG_QUIET       = argv.includes('--quiet');
-const FLAG_OLLAMA_SKIP = argv.includes('--ollama-skip');
+const FLAG_EMBED_SKIP = argv.includes('--embed-skip');
 const FLAG_RERANK = argv.includes('--rerank') || process.env.RERANK === '1';
 const RERANK_CANDIDATE_POOL = parseInt(process.env.RERANK_CANDIDATE_POOL || '20', 10);
 
@@ -258,8 +258,8 @@ function stageFixtures() {
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  if (FLAG_RERANK && FLAG_OLLAMA_SKIP) {
-    console.error('ERROR: --rerank and --ollama-skip are incompatible. Reranker requires vector embeddings.');
+  if (FLAG_RERANK && FLAG_EMBED_SKIP) {
+    console.error('ERROR: --rerank and --embed-skip are incompatible. Reranker requires vector embeddings.');
     process.exit(2);
   }
 
@@ -267,7 +267,7 @@ async function main() {
   console.log('');
   console.log(c.bold('eval-retrieval — Hybrid retrieval quality eval'));
   console.log(`  DB:      ${EVAL_DB_NAME}${EVAL_DB_OWNED ? c.dim(' (throwaway — will be created and dropped)') : c.dim(' (caller-supplied — lifecycle not managed here)')}`);
-  console.log(`  Backend: ${FLAG_OLLAMA_SKIP ? 'SKIP (--ollama-skip)' : (USE_VLLM_EVAL ? 'vLLM (Qwen3-Embedding-8B)' : 'Ollama (mxbai-embed-large)')}`);
+  console.log(`  Backend: ${FLAG_EMBED_SKIP ? 'SKIP (--embed-skip)' : (USE_VLLM_EVAL ? 'vLLM (Qwen3-Embedding-8B)' : 'Ollama (mxbai-embed-large)')}`);
   console.log(`  View:    ${HITS_VIEW}`);
   console.log(`  Started: ${runStartedAt}`);
   console.log('');
@@ -405,8 +405,8 @@ async function main() {
     );
     if (!loaderOk) infraFail(`Loader reported ${loaderErrors} error(s). Check fixture files.`);
 
-    // Verify all chunks have embeddings (unless --ollama-skip)
-    if (!FLAG_OLLAMA_SKIP) {
+    // Verify all chunks have embeddings (unless --embed-skip)
+    if (!FLAG_EMBED_SKIP) {
       if (USE_VLLM_EVAL) {
         // vLLM path: the loader may have embedded via Ollama (if running) into the
         // `embedding` column. Run pipeline-embed with vLLM backend to (re-)embed
@@ -464,7 +464,7 @@ async function main() {
         if (!embedOk) infraFail(`${nullCount} chunk(s) have NULL embeddings. Ensure Ollama is running.`);
       }
     } else {
-      step('Embedding verification skipped (--ollama-skip)', true);
+      step('Embedding verification skipped (--embed-skip)', true);
     }
 
     // ── Step 6: Build source_file lookup (label -> fixture filename) ─────────
@@ -494,7 +494,7 @@ async function main() {
 
       let rows;
 
-      if (FLAG_OLLAMA_SKIP) {
+      if (FLAG_EMBED_SKIP) {
         // FTS-only mode
         const res = await db.query(buildFtsOnlySql(HITS_VIEW), [query]);
         rows = res.rows;
@@ -645,7 +645,7 @@ async function main() {
 
     const lastRun = {
       runStartedAt,
-      ollamaSkip: FLAG_OLLAMA_SKIP,
+      embedSkip: FLAG_EMBED_SKIP,
       db: EVAL_DB_NAME,
       queryCount: n,
       metrics,
@@ -690,8 +690,8 @@ async function main() {
       }
     }
 
-    if (FLAG_OLLAMA_SKIP) {
-      console.log(c.yellow('  NOTE: --ollama-skip mode — vector metrics are degraded; baseline comparison skipped.'));
+    if (FLAG_EMBED_SKIP) {
+      console.log(c.yellow('  NOTE: --embed-skip mode — vector metrics are degraded; baseline comparison skipped.'));
       console.log(`  FTS recall@1:           ${recall_at_1.toFixed(2)}`);
       console.log(`  FTS recall@3 (relaxed): ${recall_at_3_relaxed.toFixed(2)}`);
       console.log(`  Negative precision:     ${negative_precision.toFixed(2)}`);
@@ -720,7 +720,7 @@ async function main() {
     console.log('='.repeat(60));
 
     const queryWord = n === 1 ? 'query' : 'queries';
-    if (!anyRegression || FLAG_OLLAMA_SKIP || FLAG_RERANK) {
+    if (!anyRegression || FLAG_EMBED_SKIP || FLAG_RERANK) {
       console.log(c.green(`SUMMARY: ${n}/${n} ${queryWord} evaluated, all metrics within tolerance.`));
     } else {
       console.log(c.red(`SUMMARY: ${n} ${queryWord} evaluated — METRIC REGRESSION DETECTED.`));
@@ -730,8 +730,8 @@ async function main() {
     // ── Step 11: --update-baseline ───────────────────────────────────────────
 
     if (FLAG_UPDATE) {
-      if (FLAG_OLLAMA_SKIP) {
-        console.log(c.yellow('\nBaseline update skipped: --ollama-skip produces degraded metrics.'));
+      if (FLAG_EMBED_SKIP) {
+        console.log(c.yellow('\nBaseline update skipped: --embed-skip produces degraded metrics.'));
       } else {
         const newBaseline = {
           recall_at_1,
@@ -753,7 +753,7 @@ async function main() {
     }
 
     await db.end().catch(() => {});
-    exitCode = anyRegression && !FLAG_OLLAMA_SKIP && !FLAG_RERANK ? 1 : 0;
+    exitCode = anyRegression && !FLAG_EMBED_SKIP && !FLAG_RERANK ? 1 : 0;
 
   } catch (err) {
     try { await db.end(); } catch (_) {}

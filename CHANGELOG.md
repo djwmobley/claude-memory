@@ -79,6 +79,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`OLLAMA_SKIP` / `--ollama-skip` renamed to `EMBED_SKIP` / `--embed-skip`**: the
+  skip-live-embedding switch is not Ollama-specific; the real embedding backend is
+  vLLM Qwen3-Embedding-8B. Renamed repo-wide to the backend-neutral form. No alias
+  retained.
 - **`/handoff:resume` output enriched**: the resume payload now includes a
   `### Session intent` section drawn from persisted intent rows, and
   `[STALE:]` annotations are applied inline to any assertions whose

@@ -28,7 +28,7 @@
  *   --decision <id>  Process a single decision by memory_entries.id.
  *
  * Environment:
- *   OLLAMA_SKIP=1    Skip all LLM calls and DB writes — clean no-op (CI-safe).
+ *   EMBED_SKIP=1     Skip all LLM calls and DB writes — clean no-op (CI-safe).
  *   HANDOFF_DB       Override the target database name (default: claude_memory_eval_test).
  *   PROJECT_ROOT     Override project root detection (used by resolveProjectId()).
  *
@@ -298,9 +298,9 @@ async function writeDecisionExtraction(db, projectId, sid, extraction) {
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  // ─── OLLAMA_SKIP GUARD (first — before any DB or Ollama work) ────────────
-  if (process.env.OLLAMA_SKIP === '1') {
-    console.log('[w2-extract] OLLAMA_SKIP=1 — no-op (LLM extraction skipped)');
+  // ─── EMBED_SKIP GUARD (first — before any DB or LLM work) ───────────────
+  if (process.env.EMBED_SKIP === '1') {
+    console.log('[w2-extract] EMBED_SKIP=1 — no-op (LLM extraction skipped)');
     process.exit(0);
   }
 

@@ -1284,7 +1284,7 @@ async function runTests() {
     // Resume with resurrect query in contract — the resurrect section should
     // include [STALE:] annotation.
     const out = runResume(fakeRoot, {
-      OLLAMA_SKIP: '1',
+      EMBED_SKIP: '1',
     });
     assert.ok(out.includes('[STALE:'),
       `A1: expected [STALE: annotation via resurrect serve path.\nGot:\n${out}`);
@@ -1319,7 +1319,7 @@ async function runTests() {
     fs.unlinkSync(targetFile);
 
     // Run resurrect CLI.
-    const out = runResurrect(fakeRoot, subject, { OLLAMA_SKIP: '1' });
+    const out = runResurrect(fakeRoot, subject, { EMBED_SKIP: '1' });
     assert.ok(out.includes('[STALE:'),
       `A1b: expected [STALE: annotation via cmdResurrect.\nGot:\n${out}`);
 
