@@ -280,6 +280,14 @@ function probeCommitMerged(root, object) {
 
     // Use git merge-base --is-ancestor to check reachability.
     // Returns exit 0 if sha is an ancestor of targetRef, exit 1 if not.
+    //
+    // IMPORTANT: on success we echo back the asserted `object` (not a hardcoded
+    // sentinel like 'merged').  This mirrors probeFileExists, which returns the
+    // path on success.  The dispatch logic in runVerifyDispatch tags a row as
+    // 'verified' when probeResult === row.object, so echoing the object is the
+    // only way commit_merged can ever reach the 'verified' state.  Returning a
+    // fixed string like 'merged' would always produce a mismatch because 'merged'
+    // can never equal an object of the form "<sha> on <branch>" or "<sha>".
     const { execFileSync } = require('child_process');
     try {
       execFileSync(
@@ -287,10 +295,10 @@ function probeCommitMerged(root, object) {
         ['-C', root, 'merge-base', '--is-ancestor', sha, targetRef],
         { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }
       );
-      return 'merged'; // exit 0 → is ancestor
+      return object; // exit 0 → is ancestor → echo back the asserted object → 'verified'
     } catch (ancestorErr) {
       if (ancestorErr && typeof ancestorErr.status === 'number' && ancestorErr.status === 1) {
-        return '<not-merged>'; // exit 1 → not an ancestor
+        return '<not-merged>'; // exit 1 → not an ancestor → mismatch
       }
       return null; // timeout, git unavailable, or commit does not exist → unverifiable
     }
