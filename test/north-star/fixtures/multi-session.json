@@ -1,0 +1,53 @@
+{
+  "_doc": "Multi-session close sequence: an ordered array of 3 close payloads, each with DISTINCT open-threads and distinct marker tokens, for the lossless-fidelity / data-loss tests. A sibling test runs runClose(fakeRoot, sessions[i]) for each in order (optionally blanking the handoff.md body between closes) and then asserts that EARLIER sessions' session-driving intent is still recoverable from PG — currently it is not, because tldr/open_threads/quick_references are written only to the handoff.md body. Each session uses a distinct session_id so cross-session corroboration / tier graduation can be reasoned about. Field shapes match readStdin ALLOWED_KEYS (handoff.js:994-999).",
+  "sessions": [
+    {
+      "session_id": "ns-multi-session-001",
+      "tldr": "NS-S1-TLDR: Session 1 designed the db-seam two-dialect translation layer and chose Postgres as the default backend.",
+      "open_threads": [
+        "NS-S1-THREAD-A: verify the SQLite regex-rewrite holes at handoff.js seam points",
+        "NS-S1-THREAD-B: keep Postgres the only production default; SQLite is seam-test-only"
+      ],
+      "quick_references": "NS-S1-REF: db-seam is a hybrid port plus regex-rewrite for PG/SQLite only, not a db-agnostic abstraction.",
+      "entities": [
+        { "name": "db-seam", "entity_type": "concept", "description": "NS-S1-ENT: two-dialect translation seam for Postgres and SQLite" }
+      ],
+      "assertions": [
+        { "subject": "db-seam", "predicate": "defaults_to", "object": "Postgres (SQLite is seam-test-only)", "confidence": 9, "source": "user_stated" }
+      ],
+      "edges": []
+    },
+    {
+      "session_id": "ns-multi-session-002",
+      "tldr": "NS-S2-TLDR: Session 2 shipped the stale-entry categorical fix with a prose-vs-content gate and bulk supersession.",
+      "open_threads": [
+        "NS-S2-THREAD-A: confirm bulk supersession does not over-suppress pinned rows",
+        "NS-S2-THREAD-B: add the prose-vs-content overlap gate to the resume pointer pass"
+      ],
+      "quick_references": "NS-S2-REF: the prose-vs-content gate (P-4) distinguishes stale line-number prose from live code references.",
+      "entities": [
+        { "name": "prose-vs-content-gate", "entity_type": "concept", "description": "NS-S2-ENT: P-4 gate separating stale prose pointers from live content" }
+      ],
+      "assertions": [
+        { "subject": "prose-vs-content-gate", "predicate": "is_status", "object": "shipped in the stale-entry categorical fix", "confidence": 8, "source": "model_extracted" }
+      ],
+      "edges": []
+    },
+    {
+      "session_id": "ns-multi-session-003",
+      "tldr": "NS-S3-TLDR: Session 3 repaired test-handoff.js with the marker pre-mint pattern and wired it into CI.",
+      "open_threads": [
+        "NS-S3-THREAD-A: pre-mint the .claude-memory marker in setup so DB rows and lookups align on the UUID",
+        "NS-S3-THREAD-B: create the claude_memory_eval_test DB as an explicit CI step"
+      ],
+      "quick_references": "NS-S3-REF: ensureProjectIdentity auto-mints a UUID; pre-minting the marker at setup time prevents the 12-failure cascade.",
+      "entities": [
+        { "name": "marker-premint", "entity_type": "concept", "description": "NS-S3-ENT: pre-mint .claude-memory at setup so project_id is a stable UUID" }
+      ],
+      "assertions": [
+        { "subject": "marker-premint", "predicate": "is_direction", "object": "pre-mint marker before any helper invocation in tests", "confidence": 9, "source": "user_stated" }
+      ],
+      "edges": []
+    }
+  ]
+}
