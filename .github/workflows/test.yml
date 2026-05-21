@@ -368,6 +368,27 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run staleness permutation harness (adversarial)
+        # Adversarial permutation harness for serve-time staleness (PR #94):
+        #   P1-P4  pr_state: open→merged, open→closed, merged→open(reopened), verified match
+        #   P5-P7  branch_exists: exists→deleted, missing→created, stable→verified
+        #   P8-P10 commit_merged: mismatch directions, bad-sha→unverifiable
+        #   P11-P14 in_file: present→deleted, absent→created, present→verified, authoritative floor
+        #   F1-F6  Trust fail-closed: gh missing, non-zero exit, timeout, non-git, bad JSON, missing .state
+        #   L1     GH-offline latency: N pr_state rows + fake gh hangs → circuit-breaker bounds time
+        #   S7     §7 invariance: only reality_check modified, never conf/source/tier/object
+        #   G1     Gate-off: byte-identical when serve_time_reality_check=disabled
+        #   A1/A1b All serve paths: resurrect (loader + CLI) also annotates stale rows
+        #   R1     Multi-session round-trip: verified→STALE→verified
+        #   C1     Concurrency: two racing serve passes, no crash/corruption
+        #   Floor  No-probe predicates never annotated
+        #   B1     Budget economy: annotated corpus stays within 4000-token budget
+        # Reuses claude_memory_eval_test; uses fake-gh bash shim (no real GitHub needed).
+        run: node test/handoff/test-staleness-permutations.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       # ── North-star suite (TDD spec — RED BY DESIGN, hard gate) ───────────────
       # These four files encode the system's north star: load-bearing session
       # intent (open-threads / next-actions / tldr) MUST live in Postgres as

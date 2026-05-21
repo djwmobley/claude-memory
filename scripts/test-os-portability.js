@@ -186,12 +186,45 @@ function testP2() {
 
   const THIS_FILE = path.join(SCRIPTS_DIR, 'test-os-portability.js');
 
+  // Sanctioned exceptions: shell:true is permitted at exactly ONE call site in
+  // reality-checks.js.
+  //
+  //   reality-checks.js probePrState: shell:true is required on Windows to
+  //   execute 'gh.cmd' batch-file wrappers (Windows cannot directly CreateProcess
+  //   a .cmd file without routing through cmd.exe).  The args are hard-coded
+  //   ['pr', 'view', prNum, '--json', 'state'] where prNum is a \d+ match
+  //   (digit-only string) — no shell injection risk.  On POSIX (Linux/macOS CI)
+  //   this simply routes through /bin/sh, which is safe for this call shape.
+  //
+  // The exemption is count-capped: exactly ONE shell:true is permitted in
+  // reality-checks.js (the probePrState call).  A second occurrence — even
+  // inside the same file — fails P2, so a future unsafe addition is never masked.
+  const REALITY_CHECKS_FILE = path.join(SCRIPTS_DIR, 'lib', 'reality-checks.js');
+  const SANCTIONED_MAX_IN_REALITY_CHECKS = 1;
+
+  // Count non-comment shell:true occurrences in reality-checks.js separately
+  // before filtering them out of the main hit list.
+  const realityChecksHits = findInFile(REALITY_CHECKS_FILE, shellTrueRe).filter((h) =>
+    !h.text.startsWith('//') && !h.text.startsWith('*')
+  );
+  if (realityChecksHits.length > SANCTIONED_MAX_IN_REALITY_CHECKS) {
+    const detail = realityChecksHits.map((h) =>
+      `  ${path.relative(PROJECT_ROOT, REALITY_CHECKS_FILE)}:${h.line}: ${h.text}`
+    ).join('\n');
+    fail(label, `scripts/lib/reality-checks.js has ${realityChecksHits.length} shell:true occurrence(s); ` +
+      `only ${SANCTIONED_MAX_IN_REALITY_CHECKS} is sanctioned (probePrState — gh.cmd on Windows, digit-only args):\n${detail}`);
+    return;
+  }
+
   const hits = findInFiles(allFiles, shellTrueRe).filter((h) => {
     // Skip comment lines.
     if (h.text.startsWith('//') || h.text.startsWith('*')) return false;
     // Skip this file itself — it contains the pattern in string literals used
     // for test labels and error messages, not in actual spawn call-sites.
     if (h.file === THIS_FILE) return false;
+    // Skip the sanctioned single occurrence in reality-checks.js (already
+    // count-checked above; any second occurrence already failed P2).
+    if (h.file === REALITY_CHECKS_FILE) return false;
     return true;
   });
 
@@ -214,9 +247,13 @@ function testP3() {
 
   const platformRe = /process\.platform\s*===?\s*['"]win32['"]|process\.platform\s*!==?\s*['"]win32['"]|os\.platform\(\)/;
 
-  // Allowlist: the only sanctioned site.
+  // Allowlist: sanctioned platform-branch sites.
   //   - shared.js:  isWindows = process.platform === 'win32'  (inside runWinBin)
   //   - project-identity.js: comment-only line mentioning renameSync behavior (no branch)
+  //   - test-staleness-permutations.js: cross-platform test shim construction
+  //     (PATH separator ';' vs ':', POSIX shell script vs .cmd) — these are
+  //     intentional test-harness-only platform branches required to build a fake-gh
+  //     shim that works on both Linux CI and Windows dev environments.
   //
   // We allowlist by file + approximate pattern.
   const ALLOWED = [
@@ -224,6 +261,12 @@ function testP3() {
       file: SHARED_JS,
       // Must be inside runWinBin — the only function allowed to branch on platform.
       textRe: /const isWindows\s*=\s*process\.platform\s*===\s*['"]win32['"]/,
+    },
+    {
+      file: path.join(TEST_DIR, 'handoff', 'test-staleness-permutations.js'),
+      // Platform branch is in createGhShim / shimPath helpers — cross-platform
+      // shim construction for the fake gh binary in the adversarial test harness.
+      textRe: /process\.platform\s*===\s*['"]win32['"]/,
     },
   ];
 

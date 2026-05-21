@@ -1958,6 +1958,12 @@ async function runResurrectQuery(db, projectId, q, opts = {}) {
   const tokenBudget = (opts.tokenBudget != null && isFinite(opts.tokenBudget))
     ? opts.tokenBudget
     : Infinity;
+  // Serve-time reality re-probe option: when serveTimeRcEnabled='enabled', the
+  // caller may pass opts.serveRoot (the project root path) so that the resurrect
+  // path also annotates its served rows with [STALE:] / [verified✓].
+  // Matches the annotation logic in cmdLoaderLoad's post-loop pass.
+  const serveRoot           = opts.serveRoot || null;
+  const serveTimeRcEnabled  = opts.serveTimeRcEnabled || 'disabled';
 
   const seedText   = (q.seed || q.query || '').trim();
   const reviveOpt  = q.revive === true;
@@ -2115,13 +2121,60 @@ async function runResurrectQuery(db, projectId, q, opts = {}) {
   }
 
   // ── Step 5: Build output section (read-only by default) ───────────────────
+  //
+  // Serve-time reality re-probe (resurrect path): when serveTimeRcEnabled is
+  // 'enabled' AND serveRoot is provided, run runVerifyDispatch over the
+  // resurrect rows before building the output lines so that stale rows are
+  // annotated with [STALE: now "<live>"] / [verified✓] just as the loader path
+  // does.  Fail-soft: any error here leaves lines unannotated (no crash).
   let sectionText = null;
   if (resurrectRows.length > 0) {
+    // Build annotation map (id → suffix) if serve-time re-probe is active.
+    const annotationMap = new Map();
+    if (serveTimeRcEnabled === 'enabled' && serveRoot) {
+      try {
+        const { runVerifyDispatch } = require('./lib/reality-checks');
+        // Build probe-compatible row objects (need id/subject/predicate/object).
+        const probeRows = resurrectRows.map((r) => ({
+          id:        r.id,
+          subject:   r.subject,
+          predicate: r.predicate,
+          object:    r.object,
+        }));
+        const dispatchResults = await runVerifyDispatch(db, projectId, serveRoot, probeRows);
+        for (const res of dispatchResults) {
+          let suffix;
+          if (res.tag === 'mismatch') {
+            suffix = ` [STALE: now "${res.probeResult}"]`;
+          } else if (res.tag === 'verified') {
+            suffix = ' [verified✓]';
+          } else {
+            suffix = null; // unverifiable — no annotation
+          }
+          if (suffix !== null) annotationMap.set(res.id, suffix);
+          // Refresh reality_check column (fail-soft; §7 no-backfill).
+          try {
+            await db.query(
+              `UPDATE assertions SET reality_check = $1 WHERE id = $2`,
+              [res.tag, res.id]
+            );
+          } catch (_rcUpErr) { /* non-fatal */ }
+        }
+      } catch (_reprErr) {
+        // Fully non-fatal — serve path must never throw.
+        if (!silent) process.stderr.write(
+          `[handoff] resurrect serve-time re-probe failed (non-fatal): ${_reprErr.message}\n`
+        );
+      }
+    }
+
     const lines = resurrectRows.map((r) => {
       const ts = r.created_at
         ? (typeof r.created_at === 'string' ? r.created_at : r.created_at.toISOString())
         : 'unknown';
-      return `- [${r.source}|conf=${r.confidence}|${r.suppression_kind}|${ts}] ${r.subject} ${r.predicate} ${r.object}`;
+      const baseLine = `- [${r.source}|conf=${r.confidence}|${r.suppression_kind}|${ts}] ${r.subject} ${r.predicate} ${r.object}`;
+      const suffix = annotationMap.get(r.id);
+      return suffix ? baseLine + suffix : baseLine;
     });
     const bodyText = lines.join('\n');
     const candidate = `### Resurrected (decayed/probationary, on-demand)\n${bodyText}`;
@@ -2693,6 +2746,10 @@ async function cmdLoaderLoad(opts = {}) {
           const result = await runResurrectQuery(db, projectId, q, {
             silent,
             tokenBudget: subBudget,
+            // Pass serve-time re-probe context so resurrect annotations match
+            // the loader assertion path (both serve paths are consistent).
+            serveTimeRcEnabled,
+            serveRoot: findProjectRoot(),
           });
           if (result.sectionText) {
             sections.push(result.sectionText);
@@ -2856,6 +2913,8 @@ async function cmdLoaderLoad(opts = {}) {
 
       if (dispatchResults.length > 0) {
         // Build a map from row id → annotation suffix.
+        // 'unverifiable' results get no visible annotation (suffix=null) to keep
+        // output clean, but their reality_check column IS still refreshed below.
         const annotationMap = new Map();
         for (const res of dispatchResults) {
           let suffix;
@@ -2907,18 +2966,22 @@ async function cmdLoaderLoad(opts = {}) {
             }
             if (changed) sections[si] = sectionLines.join('\n');
           }
+        }
 
-          // Refresh reality_check column (fail-soft UPDATE — bounded by served-row count).
-          // Only reality_check is written — §7 no-backfill invariant.
-          for (const res of dispatchResults) {
-            try {
-              await db.query(
-                `UPDATE assertions SET reality_check = $1 WHERE id = $2`,
-                [res.tag, res.id]
-              );
-            } catch (_rcUpdateErr) {
-              // Non-fatal — serve path must never throw.
-            }
+        // Refresh reality_check column for ALL dispatch results, including
+        // 'unverifiable' rows.  This is unconditional (not guarded by
+        // annotationMap.size) so that probe failures correctly write
+        // 'unverifiable' even when no visible annotation is emitted.
+        // Fail-soft UPDATE — bounded by served-row count.
+        // Only reality_check is written — §7 no-backfill invariant.
+        for (const res of dispatchResults) {
+          try {
+            await db.query(
+              `UPDATE assertions SET reality_check = $1 WHERE id = $2`,
+              [res.tag, res.id]
+            );
+          } catch (_rcUpdateErr) {
+            // Non-fatal — serve path must never throw.
           }
         }
       }
@@ -5446,6 +5509,9 @@ async function cmdResurrect(args) {
 
   // ── Run the resurrect engine ─────────────────────────────────────────────────
 
+  // Read serve-time reality check gate (default 'enabled') before calling the engine.
+  const cmdResurrectServeRcEnabled = await getSetting(db, projectId, 'serve_time_reality_check', 'enabled');
+
   let result;
   try {
     result = await runResurrectQuery(db, projectId, {
@@ -5454,8 +5520,10 @@ async function cmdResurrect(args) {
       revive: reviveFlag,
       limit,
     }, {
-      silent:      false,
-      tokenBudget: Infinity,  // no token ceiling in CLI mode
+      silent:               false,
+      tokenBudget:          Infinity,  // no token ceiling in CLI mode
+      serveTimeRcEnabled:   cmdResurrectServeRcEnabled,
+      serveRoot:            findProjectRoot(),
     });
   } catch (err) {
     await db.end();
