@@ -60,6 +60,16 @@ jobs:
           # Propagates into the loader subprocess that eval STEP 5 spawns;
           # without this, the loader tries Ollama-on-localhost and fails 3x per fixture.
           OLLAMA_SKIP: '1'
+      - name: Create handoff test database
+        # test-handoff.js and test-serve-time-staleness.js connect to claude_memory_eval_test
+        # (hardcoded TARGET_DB). Create it early — before graph-traversal — so that a
+        # single test-suite failure cannot cascade into a spurious "DB does not exist"
+        # failure in the north-star steps (which run with if: always()). The test's
+        # setup() then applies handoff-core-schema.sql AND app-retrieval-events-schema.sql
+        # into it (both are idempotent). This step is a no-op if the DB already exists.
+        run: psql -h localhost -U postgres -c "CREATE DATABASE claude_memory_eval_test" || true
+        env:
+          PGPASSWORD: postgres
       - name: Run graph edge-traversal tests
         # Exhaustive harness for kind:'graph' recursive-CTE retrieval feature.
         # Creates/drops throwaway DBs; uses the same Postgres service as the other steps.
@@ -326,13 +336,6 @@ jobs:
         env:
           PGHOST: localhost
           PGUSER: postgres
-          PGPASSWORD: postgres
-      - name: Create handoff test database
-        # test-handoff.js connects to claude_memory_eval_test (hardcoded TARGET_DB).
-        # Create it here; the test's setup() then applies handoff-core-schema.sql
-        # AND app-retrieval-events-schema.sql into it (both are idempotent).
-        run: psql -h localhost -U postgres -c "CREATE DATABASE claude_memory_eval_test"
-        env:
           PGPASSWORD: postgres
       - name: Run end-to-end handoff subcommand tests
         # Golden-path coverage of every /handoff subcommand against a real Postgres:

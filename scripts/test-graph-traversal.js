@@ -1066,18 +1066,24 @@ async function sectionB_tokenBudget(bDb, bProjectId, bProjectDir) {
       return;
     }
 
-    // Parse "tokens used: ~N / M" from output.
+    // Parse "tokens used: ~TRUE / BUDGET (sections: ~SECT)" from output.
+    // The TRUE figure includes canon + handoff.md body and legitimately exceeds
+    // tiny test budgets (those components are always served regardless of budget).
+    // The REAL invariant is that the SECTIONS figure respects the section budget:
+    // if the budget is tiny the graph section must be omitted/truncated so that
+    // the sections-only cost stays within budget.
     const out = r.stdout || '';
-    const match = out.match(/tokens used: ~(\d+) \/ (\d+)/);
+    const match = out.match(/tokens used: ~(\d+) \/ (\d+)(?: \(sections: ~(\d+)\))?/);
     if (!match) {
       fail('B', 'B-3', label, 'Could not parse "tokens used" line from output');
       return;
     }
-    const used   = parseInt(match[1], 10);
     const budget = parseInt(match[2], 10);
+    // Use sections figure when available (new format); fall back to headline (old format).
+    const sect = match[3] !== undefined ? parseInt(match[3], 10) : parseInt(match[1], 10);
 
-    if (used > budget) {
-      fail('B', 'B-3', label, `tokens used (${used}) exceeds budget (${budget})`);
+    if (sect > budget) {
+      fail('B', 'B-3', label, `sections tokens (${sect}) exceeds budget (${budget}) — graph section not omitted/truncated`);
       return;
     }
 
@@ -1146,13 +1152,13 @@ async function sectionB_w3AndGraph(bDb, bProjectId, bProjectDir) {
       return;
     }
 
-    // Token budget respected.
-    const match = out.match(/tokens used: ~(\d+) \/ (\d+)/);
+    // Token budget respected (sections figure, not TRUE which includes canon+body).
+    const match = out.match(/tokens used: ~(\d+) \/ (\d+)(?: \(sections: ~(\d+)\))?/);
     if (match) {
-      const used   = parseInt(match[1], 10);
       const budget = parseInt(match[2], 10);
-      if (used > budget) {
-        fail('B', 'B-4', label, `tokens used (${used}) exceeds budget (${budget})`);
+      const sect   = match[3] !== undefined ? parseInt(match[3], 10) : parseInt(match[1], 10);
+      if (sect > budget) {
+        fail('B', 'B-4', label, `sections tokens (${sect}) exceeds budget (${budget})`);
         return;
       }
     }
@@ -1220,7 +1226,8 @@ async function sectionB_gatingDisabled(bDb, bProjectId, bProjectDir) {
     }
 
     // Compare disabled-gate with no-graph-query output (normalize token count).
-    const normalize = (s) => s.replace(/tokens used: ~\d+/g, 'tokens used: ~X');
+    // Mask the full token line: ~TRUE / BUDGET (sections: ~SECT) — all three numbers vary.
+    const normalize = (s) => s.replace(/tokens used: ~\d+(?: \/ \d+)?(?: \(sections: ~\d+\))?/g, 'tokens used: ~X');
     if (normalize(outDisabled) !== normalize(rNoGraph.stdout || '')) {
       fail('B', 'B-5', label, 'gate-disabled output differs from no-graph-query baseline');
       return;
@@ -1262,7 +1269,8 @@ async function sectionB_noGraphQuery_regressionGuard(bDb, bProjectId, bProjectDi
       return;
     }
 
-    const normalize = (s) => s.replace(/tokens used: ~\d+/g, 'tokens used: ~X');
+    // Mask the full token line: ~TRUE / BUDGET (sections: ~SECT) — all three numbers vary.
+    const normalize = (s) => s.replace(/tokens used: ~\d+(?: \/ \d+)?(?: \(sections: ~\d+\))?/g, 'tokens used: ~X');
     const out1 = normalize(r1.stdout || '');
     const out2 = normalize(r2.stdout || '');
 
@@ -1510,13 +1518,13 @@ async function sectionC_organicCloseResume(cDb, cProjectId, cProjectDir) {
       return;
     }
 
-    // Token budget respected.
-    const match = out.match(/tokens used: ~(\d+) \/ (\d+)/);
+    // Token budget respected (sections figure, not TRUE which includes canon+body).
+    const match = out.match(/tokens used: ~(\d+) \/ (\d+)(?: \(sections: ~(\d+)\))?/);
     if (match) {
-      const used   = parseInt(match[1], 10);
       const budget = parseInt(match[2], 10);
-      if (used > budget) {
-        fail('C', 'C-1', label, `tokens used (${used}) exceeds budget (${budget})`);
+      const sect   = match[3] !== undefined ? parseInt(match[3], 10) : parseInt(match[1], 10);
+      if (sect > budget) {
+        fail('C', 'C-1', label, `sections tokens (${sect}) exceeds budget (${budget})`);
         return;
       }
     }

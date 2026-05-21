@@ -3175,7 +3175,7 @@ async function c1Step4_loaderOutputUnchanged(c1Db, c1ProjectId, c1ProjectDir) {
     }
 
     // Strip the "tokens used" line (counts are stable but token count may vary slightly).
-    const normalize = (s) => s.replace(/tokens used: ~\d+/g, 'tokens used: ~X');
+    const normalize = (s) => s.replace(/tokens used: ~\d+(?: \/ \d+)?(?: \(sections: ~\d+\))?/g, 'tokens used: ~X');
     const out1 = normalize(r1.stdout || '');
     const out2 = normalize(r2.stdout || '');
     if (out1 !== out2) {
@@ -3334,7 +3334,7 @@ async function c2Step1_gateOffNoOp(c2Db, c2ProjectId, c2ProjectDir) {
     }
 
     // Normalize token count line (can vary between runs due to reinforcement timestamp drift).
-    const normalize = (s) => s.replace(/tokens used: ~\d+/g, 'tokens used: ~X');
+    const normalize = (s) => s.replace(/tokens used: ~\d+(?: \/ \d+)?(?: \(sections: ~\d+\))?/g, 'tokens used: ~X');
     const out1 = normalize(r1.stdout || '');
     const out2 = normalize(r2.stdout || '');
     if (out1 !== out2) {
@@ -5748,7 +5748,7 @@ async function grStep2_gateOff(grDb, grProjectId, grProjectDir) {
       return;
     }
 
-    const normalize = (s) => s.replace(/tokens used: ~\d+/g, 'tokens used: ~X');
+    const normalize = (s) => s.replace(/tokens used: ~\d+(?: \/ \d+)?(?: \(sections: ~\d+\))?/g, 'tokens used: ~X');
     if (normalize(rDisabled.stdout || '') !== normalize(rNoGraph.stdout || '')) {
       grFail(2, label, 'gate-disabled output differs from no-graph baseline');
       return;
@@ -5833,7 +5833,7 @@ async function grStep4_defaultContractRegression(grDb, grProjectId, grProjectDir
 
     if (r1.status !== 0 || r2.status !== 0) { grFail(4, label, `loader-load failed: ${r1.status}/${r2.status}`); return; }
 
-    const normalize = (s) => s.replace(/tokens used: ~\d+/g, 'tokens used: ~X');
+    const normalize = (s) => s.replace(/tokens used: ~\d+(?: \/ \d+)?(?: \(sections: ~\d+\))?/g, 'tokens used: ~X');
     if (normalize(r1.stdout || '') !== normalize(r2.stdout || '')) {
       grFail(4, label, 'Two runs of no-graph contract produced different output — regression');
       return;
