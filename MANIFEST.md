@@ -19,7 +19,7 @@ It persists durable session state as queryable Postgres rows at the session boun
 | `SECURITY.md` | Security policy and disclosure process | current |
 | `docs/how-memory-works.md` | Conceptual explanation of the system, session seam model, identity + limitations | updated (serve-time reality re-probe section added) |
 | `docs/glossary.md` | Term definitions for all concepts used across the docs | updated (branch_exists, commit_merged, in_file, pr_state, reality_check, serve-time reality re-probe, [STALE:] annotation entries added) |
-| `docs/case-study.md` | Narrative walkthrough of a real design problem and fix (decay vs. don't-forget) | current |
+| `docs/case-study.md` | Narrative walkthrough of two design problems: Ch.1 decay/operator-pin/resurrection; Ch.2 north-star TDD harness, RED-by-design test methodology, serve-time staleness, adversarial permutation harness, caveman dogfooding | updated (Chapter 2 added) |
 | `docs/troubleshooting.md` | Diagnosis guide for common setup and runtime problems | current |
 | `docs/deep/retrieval-contract-evolution.md` | How the retrieval contract schema has evolved over time | current |
 | `docs/deep/findings/debate-2026-05-16-memory-bootstrap-collision.md` | Design finding: memory bootstrap collision analysis | current |
