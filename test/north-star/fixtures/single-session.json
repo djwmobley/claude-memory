@@ -1,0 +1,26 @@
+{
+  "_doc": "Single-session close payload. Top-level keys are the readStdin ALLOWED_KEYS (handoff.js:994-999). Field shapes: tldr=string, open_threads=string[], quick_references=string, entities=[{name,entity_type,description}], assertions=[{subject,predicate,object,confidence,source}], edges=[{from_entity,edge_type,to_entity,weight}]. Carries DISTINCTIVE marker tokens so sibling tests can grep for survival.",
+  "session_id": "ns-single-session-001",
+  "tldr": "NS-TLDR-MARKER: Implemented the resurrection ring and verified the Matryoshka-truncated embed path end to end. Next session must continue the production backfill of live assertions.",
+  "open_threads": [
+    "NS-THREAD-ALPHA: finish the production backfill of all live assertions to halfvec(4000)",
+    "NS-THREAD-BRAVO: wire smoketest-resurrect-real-vllm.js into the pre-release CI gate",
+    "NS-THREAD-CHARLIE: decide whether L1 patient-adversary defense ships this cycle or defers",
+    "NS-THREAD-DELTA: reconcile the legacy encoded-cwd project_settings remnant rows"
+  ],
+  "quick_references": "NS-REF-ONE: lib/embed.js Matryoshka truncation lives at the EMBED_DIMS slice. NS-REF-TWO: resurrect engine fuzzy fallback uses the assertions_trgm_text_idx GIN index. NS-REF-THREE: the close payload schema is enforced in readStdin (handoff.js).",
+  "entities": [
+    { "name": "resurrection-ring",    "entity_type": "concept", "description": "NS-ENT-RING: the on-demand resurrect path that pulls a devalued topic back via an explicit query" },
+    { "name": "embed.js",             "entity_type": "file",    "description": "NS-ENT-EMBED: Matryoshka-truncates Qwen3 embeddings to halfvec(4000) at write time" },
+    { "name": "production-backfill",  "entity_type": "decision", "description": "NS-ENT-BACKFILL: backfill all live assertions with real-vLLM embeddings" }
+  ],
+  "assertions": [
+    { "subject": "embed.js",            "predicate": "defaults_to",  "object": "halfvec(4000) via EMBED_DIMS Matryoshka truncation", "confidence": 9, "source": "user_stated" },
+    { "subject": "resurrection-ring",   "predicate": "is_status",    "object": "shipped and verified end-to-end",                    "confidence": 8, "source": "model_extracted" },
+    { "subject": "production-backfill",  "predicate": "is_direction", "object": "continue next session until all live rows embedded",   "confidence": 8, "source": "user_stated" }
+  ],
+  "edges": [
+    { "from_entity": "resurrection-ring",  "edge_type": "depends_on", "to_entity": "embed.js",            "weight": 1.0 },
+    { "from_entity": "production-backfill", "edge_type": "depends_on", "to_entity": "embed.js",            "weight": 1.0 }
+  ]
+}

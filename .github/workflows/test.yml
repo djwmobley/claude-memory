@@ -349,3 +349,48 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      # ── North-star suite (TDD spec — RED BY DESIGN, hard gate) ───────────────
+      # These four files encode the system's north star: load-bearing session
+      # intent (open-threads / next-actions / tldr) MUST live in Postgres as
+      # queryable, decay-rankable, provenance-bearing rows — NOT in handoff.md
+      # prose. They FAIL RED today on purpose: close currently persists intent
+      # only to the markdown body. This is a HARD GATE — CI stays red until the
+      # architecture is rebuilt so intent is persisted as PG assertions and resume
+      # reconstructs context from PG alone. When that lands, these tests pass GREEN
+      # unmodified (they encode the target state, not assert(false)). Reuses
+      # claude_memory_eval_test (created above); each file's setupNs() re-applies
+      # both schemas idempotently under an isolated project_id. vLLM-dependent arms
+      # self-skip when vLLM is absent (CI has none); the structural prose-vs-rows
+      # arms run and gate regardless.
+      # `if: always()` on each step so ALL FOUR run and report RED even after a
+      # prior north-star step fails (GitHub steps are fail-fast by default). The
+      # job still fails if any step is non-zero — a pre-existing failure above is
+      # never masked, because those steps run before these and fail the job too.
+      - name: "North-star: fidelity / data-loss (RED until intent lives in PG)"
+        if: always()
+        run: node test/north-star/test-fidelity-dataloss.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: "North-star: retrieval economy (RED until intent lives in PG)"
+        if: always()
+        run: node test/north-star/test-retrieval-economy.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: "North-star: lifecycle round-trip (RED until intent lives in PG)"
+        if: always()
+        run: node test/north-star/test-lifecycle-roundtrip.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: "North-star: provenance (RED until intent lives in PG)"
+        if: always()
+        run: node test/north-star/test-provenance.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
