@@ -143,6 +143,10 @@ else
   HANDOFF_ENGINE="$PROJECT_ROOT/scripts/handoff.js"
 fi
 
+# Preferred form — --json alone reads stdin:
+echo '<JSON_PAYLOAD>' | PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" close --json
+
+# Legacy form — --json - also works (backward compatible):
 echo '<JSON_PAYLOAD>' | PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" close --json -
 ```
 
@@ -199,13 +203,13 @@ PAYLOAD_FILE="$(node -e 'const os=require("os"),path=require("path"); \
   require("fs").mkdirSync(d,{recursive:true}); \
   process.stdout.write(path.join(d,"handoff-close-payload.json"))')"
 echo '<JSON_PAYLOAD>' > "$PAYLOAD_FILE"
-cat "$PAYLOAD_FILE" | PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" close --json -
+cat "$PAYLOAD_FILE" | PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" close --json
 ```
 
 Or pipe directly without a file:
 
 ```bash
-echo '<JSON_PAYLOAD>' | PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" close --json -
+echo '<JSON_PAYLOAD>' | PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" close --json
 ```
 
 **Why this matters:** `handoff.js` runs `git status --porcelain` to determine whether the

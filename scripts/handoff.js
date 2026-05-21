@@ -1865,8 +1865,12 @@ async function cmdInit(args) {
 
 // ── status ────────────────────────────────────────────────────────────────────
 
-async function cmdStatus() {
+async function cmdStatus(args = []) {
   console.log('Running: handoff:status');
+
+  const jsonFlag      = args.includes('--json');
+  const breakdownFlag = args.includes('--breakdown');
+  const staleFlag     = args.includes('--stale-pointers');
 
   const projectId   = resolveProjectId();
   const handoffPath = resolveHandoffMdPath(projectId);
@@ -1895,6 +1899,93 @@ async function cmdStatus() {
     [projectId]
   );
 
+  // ── --breakdown: counts by tier and suppression ──────────────────────────
+  let breakdown = null;
+  if (breakdownFlag) {
+    // Tier counts (probationary vs consolidated vs null/grandfathered).
+    // NULL tier rows are grandfathered (written before tier column existed); they
+    // behave as consolidated in retrieval (see tier_aware_retrieval gate).
+    const tierRes = await db.query(
+      `SELECT COALESCE(tier, 'grandfathered') AS tier, COUNT(*) AS n
+         FROM assertions WHERE project_id = $1
+         GROUP BY tier
+         ORDER BY tier`,
+      [projectId]
+    );
+
+    // Suppressed vs live counts.
+    const suppRes = await db.query(
+      `SELECT suppressed, COALESCE(suppression_kind, 'none') AS kind, COUNT(*) AS n
+         FROM assertions WHERE project_id = $1
+         GROUP BY suppressed, suppression_kind
+         ORDER BY suppressed, kind`,
+      [projectId]
+    );
+
+    // Top-10 predicate distribution across LIVE assertions only.
+    const predRes = await db.query(
+      `SELECT predicate, COUNT(*) AS n
+         FROM assertions WHERE project_id = $1 AND suppressed = false
+         GROUP BY predicate
+         ORDER BY n DESC
+         LIMIT 10`,
+      [projectId]
+    );
+
+    breakdown = {
+      by_tier: tierRes.rows.reduce((acc, r) => {
+        acc[r.tier] = parseInt(r.n, 10);
+        return acc;
+      }, {}),
+      by_suppression: suppRes.rows.reduce((acc, r) => {
+        const key = r.suppressed ? `suppressed(${r.kind})` : 'live';
+        acc[key] = (acc[key] || 0) + parseInt(r.n, 10);
+        return acc;
+      }, {}),
+      top_predicates: predRes.rows.map((r) => ({ predicate: r.predicate, count: parseInt(r.n, 10) })),
+    };
+  }
+
+  // ── --stale-pointers: count assertions with unresolvable code pointers ───
+  let stalePointerCount = null;
+  if (staleFlag) {
+    let statusRoot = null;
+    try { statusRoot = findProjectRoot(); } catch (_) {}
+
+    if (statusRoot) {
+      // Fetch object text from all live assertions; scan each for pointer patterns.
+      const ptrRes = await db.query(
+        `SELECT id, object, subject, predicate
+           FROM assertions
+           WHERE project_id = $1 AND suppressed = false
+           AND object IS NOT NULL`,
+        [projectId]
+      );
+
+      let unresolved = 0;
+      for (const row of ptrRes.rows) {
+        const ptrs = _extractPointers(String(row.object));
+        for (const pi of ptrs) {
+          const absPath = _resolvePointerPath(statusRoot, pi.path);
+          if (!absPath) {
+            unresolved++;
+          } else {
+            try {
+              const lines = fs.readFileSync(absPath, 'utf8').split('\n');
+              const lineIdx = pi.startLine - 1;
+              if (lineIdx < 0 || lineIdx >= lines.length || lines[lineIdx].trim().length === 0) {
+                unresolved++;
+              }
+            } catch (_) {
+              unresolved++;
+            }
+          }
+        }
+      }
+      stalePointerCount = unresolved;
+    }
+  }
+
   await db.end();
 
   const lastClose = fm.last_close || 'never';
@@ -1904,10 +1995,12 @@ async function cmdStatus() {
   const sip       = sipRes.rows.length > 0 ? sipRes.rows[0].value : null;
 
   // Packaging-honesty probe (read-only — no DB writes).
-  let packagingLine = '';
+  let packagingState = null;
+  let packagingLine  = '';
   try {
     const statusRoot   = findProjectRoot();
     const packState    = detectUnpackagedState(statusRoot);
+    packagingState = packState.unpackaged ? `UNPACKAGED (${packState.label})` : 'clean';
     packagingLine = packState.unpackaged
       ? `  packaging:        UNPACKAGED (${packState.label})`
       : `  packaging:        clean`;
@@ -1915,6 +2008,34 @@ async function cmdStatus() {
     // Non-fatal — skip display if probe fails for any unexpected reason.
   }
 
+  // ── JSON output path ────────────────────────────────────────────────────
+  if (jsonFlag) {
+    const out = {
+      project_id:     projectId,
+      db:             'connected',
+      handoff_md:     fs.existsSync(handoffPath) ? handoffPath : null,
+      last_close:     lastClose,
+      days_since:     days,
+      entities:       parseInt(entRes.rows[0].n, 10),
+      assertions:     parseInt(assRes.rows[0].n, 10),
+      edges:          parseInt(edgRes.rows[0].n, 10),
+      contracts:      rcRes.rows.map((r) => r.name),
+      session_active: sip ? true : false,
+      session_id:     sip || null,
+      packaging:      packagingState,
+    };
+    if (breakdownFlag && breakdown !== null) {
+      out.breakdown = breakdown;
+    }
+    if (staleFlag && stalePointerCount !== null) {
+      out.stale_pointer_count = stalePointerCount;
+    }
+    console.log(JSON.stringify(out, null, 2));
+    console.log(`\nDone: handoff:status — ${out.entities} entities, ${out.assertions} assertions, ${out.edges} edges`);
+    return;
+  }
+
+  // ── Prose output path (default) ─────────────────────────────────────────
   console.log('\n  === handoff status ===');
   console.log(`  project_id:       ${projectId}`);
   console.log(`  last_close:       ${lastClose} (${daysStr})`);
@@ -1925,6 +2046,30 @@ async function cmdStatus() {
   console.log(`  contracts:        ${contracts}`);
   console.log(`  session_active:   ${sip ? `YES (session_id=${sip})` : 'no'}`);
   if (packagingLine) console.log(packagingLine);
+
+  if (breakdownFlag && breakdown !== null) {
+    console.log('\n  --- breakdown ---');
+    console.log('  by tier:');
+    for (const [tier, n] of Object.entries(breakdown.by_tier)) {
+      console.log(`    ${tier}: ${n}`);
+    }
+    console.log('  by suppression:');
+    for (const [key, n] of Object.entries(breakdown.by_suppression)) {
+      console.log(`    ${key}: ${n}`);
+    }
+    console.log('  top predicates (live assertions):');
+    for (const { predicate, count } of breakdown.top_predicates) {
+      console.log(`    ${predicate}: ${count}`);
+    }
+  }
+
+  if (staleFlag) {
+    if (stalePointerCount !== null) {
+      console.log(`\n  stale pointers:   ${stalePointerCount}`);
+    } else {
+      console.log('\n  stale pointers:   (could not resolve project root)');
+    }
+  }
 
   console.log(`\nDone: handoff:status — ${entRes.rows[0].n} entities, ${assRes.rows[0].n} assertions, ${edgRes.rows[0].n} edges`);
 }
@@ -3939,7 +4084,8 @@ async function runRerankerGate(db, projectId, root) {
 async function cmdCheckpoint(args) {
   console.log('Running: handoff:checkpoint');
 
-  const useJson = args.includes('--json') && args.includes('-');
+  // Accept --json alone OR the legacy --json - form (backward compatible).
+  const useJson = args.includes('--json');
   const projectId   = resolveProjectId();
   const handoffPath = resolveHandoffMdPath(projectId);
   const root        = findProjectRoot();
@@ -4110,7 +4256,8 @@ async function resolveSessionId(db, projectId, payload) {
 async function cmdClose(args) {
   console.log('Running: handoff:close');
 
-  const useJson = args.includes('--json') && args.includes('-');
+  // Accept --json alone OR the legacy --json - form (backward compatible).
+  const useJson = args.includes('--json');
 
   let payload = {};
   if (useJson) {
@@ -5147,6 +5294,32 @@ async function cmdPurge(args) {
   const handoffPath = resolveHandoffMdPath(projectId);
 
   const skipConfirm = args.includes('--yes');
+  const dryRun      = args.includes('--dry-run');
+
+  // ── Dry-run: count rows that WOULD be deleted, then exit without touching anything ──
+  if (dryRun) {
+    let db;
+    try {
+      db = await connectHandoff();
+    } catch (err) {
+      console.error(`DB connection failed: ${err.message}`);
+      process.exit(1);
+    }
+
+    const tables = ['edges', 'assertions', 'entities', 'retrieval_contract', 'project_settings'];
+    console.log(`\n  Dry-run — rows that WOULD be deleted for project_id="${projectId}":`);
+    for (const tbl of tables) {
+      const { rows } = await db.query(`SELECT COUNT(*) AS n FROM ${tbl} WHERE project_id = $1`, [projectId]);
+      console.log(`    ${tbl}: ${rows[0].n}`);
+    }
+    const handoffExists = fs.existsSync(handoffPath);
+    console.log(`    handoff.md: ${handoffExists ? 'exists (would be deleted)' : '(not found)'}`);
+    console.log('\n  (Dry-run — no rows deleted, no files removed.)');
+
+    await db.end();
+    console.log('\nDone: handoff:purge — dry-run complete (no changes made)');
+    return;
+  }
 
   if (!skipConfirm) {
     // Interactive confirmation via stdin
@@ -5454,6 +5627,7 @@ async function cmdResurrect(args) {
 
   const helpFlag   = args.includes('--help') || args.includes('-h');
   const reviveFlag = args.includes('--revive') || args.includes('-r');
+  const jsonFlag   = args.includes('--json');
 
   const limitArg = args.find((a) => a.startsWith('--limit='));
   let limit = 20;
@@ -5468,11 +5642,12 @@ async function cmdResurrect(args) {
 
   // Usage / help
   const USAGE = [
-    'Usage: node scripts/handoff.js resurrect <topic> [--revive|-r] [--limit=N]',
+    'Usage: node scripts/handoff.js resurrect <topic> [--revive|-r] [--limit=N] [--json]',
     '',
     '  <topic>      Topic seed text (required). Quoted phrases recommended.',
     '  --revive,-r  Un-suppress matching probationary rows (default: dry-run only).',
     '  --limit=N    Cap candidate subject set size (default 20).',
+    '  --json       Emit structured JSON instead of prose.',
     '  --help,-h    Show this help and exit.',
     '',
     'Dry-run mode (default): prints a preview of what WOULD be resurrected.',
@@ -5487,6 +5662,7 @@ async function cmdResurrect(args) {
   }
 
   // Positional arg: first non-flag argument is the seed text.
+  // Exclude all flag tokens (starting with '-') from the seed.
   const seedText = args.filter((a) => !a.startsWith('-')).join(' ').trim();
 
   if (!seedText) {
@@ -5534,6 +5710,44 @@ async function cmdResurrect(args) {
   await db.end();
 
   // ── Output ───────────────────────────────────────────────────────────────────
+
+  if (jsonFlag) {
+    // Parse the candidate rows from sectionText into structured objects.
+    // sectionText lines look like:
+    //   - [source|conf=N|suppression_kind|timestamp] subject predicate object
+    const candidates = [];
+    if (result.sectionText) {
+      const lines = result.sectionText.split('\n').filter((l) => l.startsWith('- ['));
+      for (const line of lines) {
+        const m = line.match(/^- \[([^\]]+)\] (.+)$/);
+        if (!m) continue;
+        const meta   = m[1];
+        const rest2  = m[2];
+        const parts  = meta.split('|');
+        candidates.push({
+          meta:       meta,
+          source:     parts[0] || null,
+          confidence: parts[1] ? parseInt(parts[1].replace('conf=', ''), 10) : null,
+          suppression_kind: parts[2] || null,
+          created_at: parts[3] || null,
+          text:       rest2.trim(),
+        });
+      }
+    }
+
+    const jsonOut = {
+      seed:            seedText,
+      mode:            reviveFlag ? 'revived' : 'dry-run',
+      candidate_count: result.candidateCount,
+      candidates,
+      revived_count:   reviveFlag ? result.revivedIds.length : 0,
+      revived_ids:     reviveFlag ? result.revivedIds : [],
+    };
+    console.log(JSON.stringify(jsonOut, null, 2));
+    const doneVerbJson = reviveFlag ? `${result.revivedIds.length} row(s) revived` : 'dry-run (no changes)';
+    console.log(`\nDone: handoff:resurrect — ${doneVerbJson}`);
+    return;
+  }
 
   if (!result.sectionText) {
     console.log(`\nNo matching probationary rows found for seed: "${seedText}"`);
@@ -6090,7 +6304,7 @@ async function main() {
 
   const subcommands = {
     init:            () => cmdInit(rest),
-    status:          () => cmdStatus(),
+    status:          () => cmdStatus(rest),
     resume:          () => cmdResume(),
     'loader-load':   () => cmdLoaderLoad(),
     'loader-hook':   () => cmdLoaderHook(),

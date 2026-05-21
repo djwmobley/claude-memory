@@ -61,6 +61,10 @@ else
   HANDOFF_ENGINE="$PROJECT_ROOT/scripts/handoff.js"
 fi
 
+# Preferred form — --json alone reads stdin:
+echo '<JSON_PAYLOAD>' | PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" checkpoint --json
+
+# Legacy form — --json - also works (backward compatible):
 echo '<JSON_PAYLOAD>' | PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" checkpoint --json -
 ```
 
