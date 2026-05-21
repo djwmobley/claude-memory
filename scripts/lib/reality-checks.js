@@ -204,6 +204,18 @@ function probeBranchExists(root, object) {
     const branchName = object.trim();
     if (!branchName) return null;
 
+    // First, verify this is actually a git repository by running a cheap command.
+    // If this fails (exit 128 = "not a git repository", or any other error), we
+    // return null → 'unverifiable' rather than '<absent>' → 'mismatch'.  This
+    // distinguishes the "git unavailable / not a repo" case from the "branch not
+    // found" case.
+    try {
+      gitExec(root, ['rev-parse', '--git-dir']);
+    } catch (_notRepoErr) {
+      // git unavailable, not a git repository, or timeout → unverifiable.
+      return null;
+    }
+
     // Try local refs first (fast, no network).
     try {
       gitExec(root, ['show-ref', '--verify', '--quiet', `refs/heads/${branchName}`]);
@@ -334,6 +346,10 @@ function probePrState(root, object, subject) {
           encoding: 'utf8',
           timeout: 5000,
           stdio: ['ignore', 'pipe', 'pipe'],
+          // shell:true is required on Windows to execute gh.cmd batch-file wrappers.
+          // On POSIX systems this routes through /bin/sh, which is safe for these
+          // hard-coded arguments (no user-supplied content in the arg list).
+          shell: true,
         }
       );
     } catch (_ghErr) {
@@ -390,6 +406,13 @@ function probePrState(root, object, subject) {
 async function runVerifyDispatch(db, projectId, root, rows) {
   const results = [];
 
+  // Per-pass circuit-breaker for network-bound probes (network: true entries).
+  // Once a network probe returns null (offline / timeout) in this pass, all
+  // subsequent network probes are short-circuited to null → 'unverifiable'
+  // without waiting.  This prevents N×timeout latency when gh is offline.
+  // Local probes (network: false / absent) are never short-circuited.
+  let networkCircuitOpen = false;
+
   for (const row of rows) {
     // Find a matching verify entry in the registry.
     let matched = false;
@@ -400,11 +423,22 @@ async function runVerifyDispatch(db, projectId, root, rows) {
 
       matched = true;
       let probeResult;
-      try {
-        // Probes accept (root, object, subject) — third arg for PR-state probe.
-        probeResult = check.probe(root, row.object, row.subject);
-      } catch (_probeErr) {
-        probeResult = null; // fail-soft
+
+      // Circuit-breaker: if a prior network probe already failed in this pass,
+      // short-circuit this one too (returns null → 'unverifiable', no wait).
+      if (check.network === true && networkCircuitOpen) {
+        probeResult = null;
+      } else {
+        try {
+          // Probes accept (root, object, subject) — third arg for PR-state probe.
+          probeResult = check.probe(root, row.object, row.subject);
+        } catch (_probeErr) {
+          probeResult = null; // fail-soft
+        }
+        // If a network probe just returned null, open the circuit for this pass.
+        if (check.network === true && probeResult === null) {
+          networkCircuitOpen = true;
+        }
       }
 
       let tag;
@@ -452,6 +486,12 @@ async function runVerifyDispatch(db, projectId, root, rows) {
  *                   dispatcher passes (root, object, subject) — probe signature
  *                   may accept a third parameter for subject-dependent probes
  *   mode          — 'authoritative' | 'verify'
+ *   network       — optional boolean; true if the probe requires an external
+ *                   network call (e.g. gh pr view).  The per-serve-pass
+ *                   circuit-breaker in runVerifyDispatch uses this flag: once
+ *                   one network probe returns null (offline / timeout) in a
+ *                   pass, all subsequent network probes in that pass are
+ *                   short-circuited to null ('unverifiable') without waiting.
  *
  * Volatile now-state predicates (mode:'verify'):
  *   - in_file         — file exists at the asserted path
@@ -564,6 +604,10 @@ const REALITY_CHECKS = [
   //
   // Fail-soft: gh absent / offline / unauthenticated → null → 'unverifiable'.
   // Timeout: 5 seconds.  NEVER hangs the serve path.
+  //
+  // network: true — marks this probe as network-bound so the per-pass
+  // circuit-breaker in runVerifyDispatch short-circuits subsequent network
+  // probes once one fails (prevents N×5s latency when gh is offline).
   {
     predicate: 'pr_state',
     subjectMatch: () => true,
@@ -571,6 +615,7 @@ const REALITY_CHECKS = [
       return probePrState(root, object, subject);
     },
     mode: 'verify',
+    network: true,
   },
 ];
 

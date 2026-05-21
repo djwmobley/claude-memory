@@ -186,12 +186,30 @@ function testP2() {
 
   const THIS_FILE = path.join(SCRIPTS_DIR, 'test-os-portability.js');
 
+  // Sanctioned exceptions: shell:true is permitted when the call site is
+  // intentional, the argument list is fully hard-coded (no user-supplied
+  // content), and the use is documented with a comment.
+  //
+  //   reality-checks.js probePrState: shell:true is required on Windows to
+  //   execute 'gh.cmd' batch-file wrappers (Windows cannot directly CreateProcess
+  //   a .cmd file without routing through cmd.exe).  The args are hard-coded
+  //   ['pr', 'view', prNum, '--json', 'state'] where prNum is a \d+ match
+  //   (digit-only string) — no shell injection risk.  On POSIX (Linux/macOS CI)
+  //   this simply routes through /bin/sh, which is safe for this call shape.
+  const SHELL_ALLOWED = [
+    { file: path.join(SCRIPTS_DIR, 'lib', 'reality-checks.js') },
+  ];
+
   const hits = findInFiles(allFiles, shellTrueRe).filter((h) => {
     // Skip comment lines.
     if (h.text.startsWith('//') || h.text.startsWith('*')) return false;
     // Skip this file itself — it contains the pattern in string literals used
     // for test labels and error messages, not in actual spawn call-sites.
     if (h.file === THIS_FILE) return false;
+    // Skip sanctioned exception sites.
+    for (const a of SHELL_ALLOWED) {
+      if (h.file === a.file) return false;
+    }
     return true;
   });
 
@@ -214,9 +232,13 @@ function testP3() {
 
   const platformRe = /process\.platform\s*===?\s*['"]win32['"]|process\.platform\s*!==?\s*['"]win32['"]|os\.platform\(\)/;
 
-  // Allowlist: the only sanctioned site.
+  // Allowlist: sanctioned platform-branch sites.
   //   - shared.js:  isWindows = process.platform === 'win32'  (inside runWinBin)
   //   - project-identity.js: comment-only line mentioning renameSync behavior (no branch)
+  //   - test-staleness-permutations.js: cross-platform test shim construction
+  //     (PATH separator ';' vs ':', POSIX shell script vs .cmd) — these are
+  //     intentional test-harness-only platform branches required to build a fake-gh
+  //     shim that works on both Linux CI and Windows dev environments.
   //
   // We allowlist by file + approximate pattern.
   const ALLOWED = [
@@ -224,6 +246,12 @@ function testP3() {
       file: SHARED_JS,
       // Must be inside runWinBin — the only function allowed to branch on platform.
       textRe: /const isWindows\s*=\s*process\.platform\s*===\s*['"]win32['"]/,
+    },
+    {
+      file: path.join(TEST_DIR, 'handoff', 'test-staleness-permutations.js'),
+      // Platform branch is in createGhShim / shimPath helpers — cross-platform
+      // shim construction for the fake gh binary in the adversarial test harness.
+      textRe: /process\.platform\s*===\s*['"]win32['"]/,
     },
   ];
 
