@@ -76,7 +76,30 @@ The "verb" part of an assertion — the type of fact being recorded. In the asse
 
 ### Prune
 
-The concept of deliberately hard-deleting assertions that are no longer worth keeping. Unlike **decay** (which quietly lowers a score but keeps the row) or **superseded** (which replaces an old fact with a new one while preserving history), pruning is a destructive removal. There is no `/handoff:prune` command — selective per-assertion pruning was explicitly not implemented. The deliberate hard-delete operations available are `/handoff:purge` (hard-deletes all project memory for the current project, with confirmation) and `/handoff:drop` (archives prior memory and starts a clean slate). Per-row removal from serving happens via suppression: a **superseded** or otherwise suppressed row is excluded from retrieval without being physically deleted. See also: **decay**, **superseded**, **resurrect**.
+Deliberate hard-delete of selected assertion rows — distinct from **decay** (lowers a score, keeps the row) and **superseded** (replaces a fact, preserves history as a suppressed row). Pruning is a destructive, irreversible removal from the database.
+
+Pruning IS implemented, as an **operator-only engine subcommand** invoked directly against the script:
+
+```
+node scripts/handoff.js prune [criteria] [--apply]
+```
+
+It is NOT a Claude Code `/handoff:` slash command — there is no `commands/handoff/prune.md`. The subcommand prints `Running: handoff:prune` to stdout when invoked, but you run it via `node scripts/handoff.js prune`, not by typing a slash command in Claude Code. It is never triggered automatically.
+
+**Behavior:** dry-run by default (prints what WOULD be deleted, zero DB changes); `--apply` performs the hard DELETE.
+
+**At least one criterion flag is required** — running with no criteria is refused (that is what `purge` is for). Criteria are AND-combined:
+
+- `--suppressed` — rows where `suppressed = true`
+- `--suppression-kind <kind>` — rows where `suppression_kind` matches (`superseded`, `downvoted_terminal`, `downvoted_probation`)
+- `--subject <s>` — rows where subject canonicalizes to the given value
+- `--older-than <days>` — rows where `last_reinforced` is older than N days
+
+**Scope:** assertions only — entities and edges are out of scope. Always project-scoped (never touches other projects). Pinned rows are never deleted unless `--include-pinned` is given.
+
+Distinct from `/handoff:purge` (hard-deletes ALL project memory for the current project, with confirmation) and `/handoff:drop` (archives prior memory and starts a clean slate).
+
+See also: **decay**, **superseded**, **resurrect**.
 
 ### Resurrect
 

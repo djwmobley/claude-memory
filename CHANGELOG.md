@@ -116,7 +116,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session cannot be resolved, replacing a silent-success path that masked
   identity failures. (#60)
 - **L2 corroboration quality**: fixed a candidate-query bug that prevented
-  positive-evidence corroboration from accruing correctly. (#62 area)
+  positive-evidence corroboration from accruing correctly. (#63)
 - **L0 consolidation forge**: severed a single-close path that could forge a
   consolidation event without the required multi-session corroboration. (#62)
 - **pnpm hoisted layout and portable Postgres test imports**: resolved
