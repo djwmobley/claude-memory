@@ -1,0 +1,37 @@
+{
+  "_doc": "Verbose close payload — full grammatical prose sentences. Carries identical load-bearing tokens to caveman-payload.json. The only difference is function-word density: this version uses complete sentences. Used by test-caveman-economy.js to prove caveman mode reduces bootstrap tokens without losing any load-bearing token.",
+  "session_id": "caveman-verbose-001",
+  "contract": {
+    "queries": [{ "kind": "assertion" }]
+  },
+  "tldr": "In this session we completed the implementation of the serve-time reality re-probe, which is a feature that annotates stale assertions at resume time. The work involved modifications to scripts/lib/reality-checks.js and the runVerifyDispatch function that dispatches to per-predicate probes. We also fixed a critical dimension mismatch: the embedding column was defined as vector(1024) but the configured backend produces halfvec(4000) dimensions, so we had to migrate the schema first. The commit bb3e8c2 on the main branch is now verified as merged. The handoff.js file at line 3030 is where the serve-time pass is wired into the resume path. The trueServedTokens value now reflects the real bootstrap cost including the OPERATING_CANON block, the handoff.md body, and all the PG sections that are retrieved.",
+  "open_threads": [
+    "There is a pending decision about whether the PR #93 staleness annotation approach should be extended to cover additional volatile predicates that are not yet in the registry.",
+    "We need to verify that the halfvec(4000) column migration was applied correctly across all live assertion rows that were previously stored with the wrong vector(1024) dimensions.",
+    "The runVerifyDispatch function in scripts/lib/reality-checks.js needs an additional integration test that covers the timeout and circuit-breaker paths for the gh CLI probe.",
+    "The handoff.js file at line 3030 contains the wiring for the serve-time pass; we should confirm that this line reference is still accurate after the pointer-staleness gate runs at close time.",
+    "There is an open question about whether the north-star inversion — where session intent lives in PG rows rather than in the handoff.md prose body — is fully reflected in the close.md authoring guidance.",
+    "We need to confirm that commit bb3e8c2 on the main branch is an ancestor of HEAD, because the smoketest depends on that commit being present in the history.",
+    "The trueServedTokens calculation should be cross-checked against the actual output length to ensure that the Math.ceil(length/4) convention is consistent with what the engine reports in the tokens-used line.",
+    "There is a caveman-mode gap in the /handoff:close skill: the authoring instructions do not yet specify that tldr, open_threads, and quick_references should be written telegraphically to minimize the bootstrap token cost.",
+    "The test-caveman-economy.js file must be wired into the CI workflow so that the caveman compression invariant is enforced on every pull request.",
+    "The halfvec(4000) schema migration requires that the fix_schema_then_embed principle is applied first before any embedding backfill is attempted."
+  ],
+  "quick_references": "The main implementation file for reality checks is at scripts/lib/reality-checks.js and the dispatch function is named runVerifyDispatch. The serve-time wiring in the resume path is at handoff.js:3030. The embedding dimension is halfvec(4000) which is the Matryoshka-truncated output of the Qwen3-Embedding-8B model. The commit bb3e8c2 corresponds to the serve-time staleness fix that was merged on the main branch. The trueServedTokens value is computed as Math.ceil(fullOutput.length/4) and represents the real bootstrap cost. The PR #93 is the serve-time staleness feature. The vector(1024) to halfvec(4000) migration was a critical schema fix that had to precede the embedding backfill.",
+  "entities": [
+    { "name": "reality-checks.js",    "entity_type": "file",     "description": "CV-ENT-REALCHECKS: scripts/lib/reality-checks.js implements the per-predicate probe registry and runVerifyDispatch" },
+    { "name": "runVerifyDispatch",     "entity_type": "concept",  "description": "CV-ENT-DISPATCH: dispatch function that routes serve-time probes to per-predicate handlers" },
+    { "name": "trueServedTokens",      "entity_type": "concept",  "description": "CV-ENT-TOKENS: Math.ceil(fullOutput.length/4) — real bootstrap cost including canon+body+PG sections" },
+    { "name": "halfvec-migration",     "entity_type": "decision", "description": "CV-ENT-MIGRATION: schema migrated from vector(1024) to halfvec(4000) before embedding backfill" }
+  ],
+  "assertions": [
+    { "subject": "PR #93",              "predicate": "commit_merged",  "object": "bb3e8c2 on main",                          "confidence": 9, "source": "model_extracted" },
+    { "subject": "reality-checks.js",  "predicate": "in_file",        "object": "scripts/lib/reality-checks.js",            "confidence": 9, "source": "user_stated" },
+    { "subject": "serve-time-wiring",  "predicate": "in_file",        "object": "handoff.js",                               "confidence": 8, "source": "model_extracted" },
+    { "subject": "embedding-column",   "predicate": "is_status",      "object": "halfvec(4000) after migration from vector(1024)", "confidence": 9, "source": "user_stated" }
+  ],
+  "edges": [
+    { "from_entity": "runVerifyDispatch", "edge_type": "depends_on", "to_entity": "reality-checks.js", "weight": 1.0 },
+    { "from_entity": "halfvec-migration", "edge_type": "depends_on", "to_entity": "reality-checks.js", "weight": 0.5 }
+  ]
+}

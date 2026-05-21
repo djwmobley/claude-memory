@@ -32,7 +32,7 @@ It persists durable session state as queryable Postgres rows at the session boun
 | `commands/handoff/README.md` | Overview of all `/handoff:*` slash commands | current |
 | `commands/handoff/init.md` | `/handoff:init` — first-run provisioning command | current |
 | `commands/handoff/status.md` | `/handoff:status` — read-only project memory status | current |
-| `commands/handoff/close.md` | `/handoff:close` — end-of-session extraction and session-intent persistence | updated (volatile predicate authoring guidance for serve-time re-probe) |
+| `commands/handoff/close.md` | `/handoff:close` — end-of-session extraction and session-intent persistence | updated (caveman/telegraphic authoring guidance for tldr, open_threads, quick_references) |
 | `commands/handoff/resume.md` | `/handoff:resume` — explicit context load; surfaces `### Session intent` section | updated (serve-time reality re-probe description added) |
 | `commands/handoff/checkpoint.md` | `/handoff:checkpoint` — mid-session save without ending the session | current |
 | `commands/handoff/promote.md` | `/handoff:promote` — promote an assertion to CLAUDE.md durable facts | current |
@@ -40,3 +40,6 @@ It persists durable session state as queryable Postgres rows at the session boun
 | `commands/handoff/purge.md` | `/handoff:purge` — hard delete all project memory (confirmation required) | current |
 | `commands/handoff/resurrect.md` | `/handoff:resurrect` — pull a decayed topic back into active context | current |
 | `hooks/README.md` | SessionStart and Stop hook setup and behavior | current |
+| `test/north-star/test-caveman-economy.js` | North-star GREEN gate: dogfoods caveman/telegraphic authoring — proves leaner close payloads reduce bootstrap tokens with zero load-bearing loss (3 arms: economy, fidelity, function-word density) | added |
+| `test/north-star/fixtures/caveman-payload.json` | Telegraphic close fixture — identical load-bearing tokens to verbose-payload.json, function words stripped | added |
+| `test/north-star/fixtures/verbose-payload.json` | Full-prose close fixture — grammatical sentences, identical load-bearing tokens to caveman-payload.json | added |
