@@ -353,6 +353,34 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run command-parameter flag tests
+        # Focused tests for the read-path command-parameter flags added in feat/cmd-params:
+        #   status --json           emits valid JSON with expected keys
+        #   status --breakdown      emits breakdown section (prose and in JSON)
+        #   status --stale-pointers emits stale pointer count
+        #   purge --dry-run         prints row counts but deletes nothing
+        #   close --json (alone)    accepts stdin without requiring the trailing '-' token
+        #   checkpoint --json (alone) same as above
+        #   resurrect --json        emits structured JSON output
+        # Reuses claude_memory_eval_test (created by Create handoff test database step above).
+        run: node test/handoff/test-cmd-params.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          OLLAMA_SKIP: '1'
+      - name: Run write-path command-parameter tests
+        # Focused tests for the write-path command-parameter flags added in feat/cmd-params:
+        #   checkpoint --note "<text>"   writes a session_note assertion without JSON payload
+        #   promote --subject/--predicate/--object  resolves + promotes unique content match
+        #   promote --demote <id>        clears promoted flag and removes CLAUDE.md line
+        #   close --dry-run              validates + previews; zero DB mutations
+        # Reuses claude_memory_eval_test (created by Create handoff test database step above).
+        run: node test/handoff/test-write-path-params.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run end-to-end handoff subcommand tests
         # Golden-path coverage of every /handoff subcommand against a real Postgres:
         #   init/status/resume/close/checkpoint/drop/purge/resurrect — DB row counts,
