@@ -327,6 +327,15 @@ jobs:
         #   P5  no POSIX-only assumptions in test suite (no hardcoded /tmp, etc.)
         # Pure static analysis — no Postgres or Ollama required.
         run: node scripts/test-os-portability.js
+      - name: Run documentation lint (glossary cross-refs + command refs + suppression_kind enum sync)
+        # Static documentation lint — catches doc drift before merge:
+        #   D1  glossary cross-refs: every See-also bold term resolves to a defined ### heading
+        #   D2  command-ref validity: /handoff:<name> matches commands/handoff/<name>.md;
+        #       `node ... handoff.js <sub>` in code spans matches the subcommands router
+        #   D3  suppression_kind enum sync: validKinds in cmdPrune + glossary bullet
+        #       both equal the canonical set in the SQL schema CHECK constraint
+        # Pure static analysis — no Postgres or Ollama required.
+        run: node scripts/test-doc-lint.js
       - name: Run pointer-staleness gate tests
         # Tests the pointer-staleness gate added in feat/pointer-staleness-gate-v2:
         #   T1  symbol anchor matches at cited lines → emit unchanged
