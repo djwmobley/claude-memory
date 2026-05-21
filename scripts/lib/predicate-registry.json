@@ -229,6 +229,12 @@
       "added_version": "1.1"
     },
     {
+      "predicate": "has_updated",
+      "cardinality": "1:N",
+      "description": "Records that a file or document was updated and what the update covered; a subject may accrue multiple distinct updates over time",
+      "added_version": "1.2"
+    },
+    {
       "predicate": "in_file",
       "cardinality": "1:N",
       "description": "File path where a subject is defined or located; a subject may be defined or present in multiple files simultaneously",
