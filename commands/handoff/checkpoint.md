@@ -4,6 +4,21 @@
 
 Mid-session save. Does the same extraction as `/handoff:close` — entities, assertions, edges, updated retrieval contract — but doesn't end the session. Useful when you've hit a natural decision point in a long session and want to make sure that progress is captured before continuing. The session stays open; run `/handoff:close` when you're actually done.
 
+For a lightweight single-line capture without composing a full JSON payload, use `--note`:
+
+```bash
+PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" checkpoint --note "discovered session_id threading gap in L2 path"
+```
+
+This writes one `session_note` assertion (subject = project basename, confidence = 8, source = `user_stated`) and exits immediately. Multiple notes accumulate (1:N cardinality) — they are not superseded by subsequent notes.
+
+## Arguments
+
+| Flag / argument | Default | Description |
+|---|---|---|
+| `--json` | off | Read full extraction payload from stdin (JSON). Mutually exclusive with `--note`. |
+| `--note "<text>"` | — | Write a single `session_note` assertion without requiring a JSON payload. Text is stored verbatim. |
+
 ## Extraction instructions for Claude
 
 Before calling the helper, extract the following from this conversation:
@@ -29,8 +44,6 @@ Before calling the helper, extract the following from this conversation:
 6. **Open threads** — list of pending decisions or tasks.
 
 ## How to invoke
-
-Build a JSON payload and pipe it to the helper:
 
 ```bash
 # Resolve engine script and project root.
@@ -61,7 +74,10 @@ else
   HANDOFF_ENGINE="$PROJECT_ROOT/scripts/handoff.js"
 fi
 
-# Preferred form — --json alone reads stdin:
+# Lightweight single-line capture (new):
+PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" checkpoint --note "re-grounding: L2 corroboration gate requires non-null session_id"
+
+# Full extraction payload — preferred form (--json alone reads stdin):
 echo '<JSON_PAYLOAD>' | PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" checkpoint --json
 
 # Legacy form — --json - also works (backward compatible):
@@ -91,6 +107,16 @@ echo '<JSON_PAYLOAD>' | PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" chec
 
 ## Expected output
 
+**With `--note`:**
+```
+Running: handoff:checkpoint
+
+  note captured: re-grounding: L2 corroboration gate requires non-null session_id
+
+Done: handoff:checkpoint --note — session_note written (session marker preserved)
+```
+
+**With `--json` (full payload):**
 ```
 Running: handoff:checkpoint
 
@@ -102,5 +128,13 @@ Running: handoff:checkpoint
 
 Done: handoff:checkpoint — 3e/8a/2ed written (session marker retained)
 ```
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | DB connection or write error |
+| 2 | Bad usage (e.g. `--note` with no text) |
 
 > Done: handoff:checkpoint — mid-session save complete

@@ -14,6 +14,13 @@ When `extraction_async_enabled` is set to `'true'` in project settings, the writ
 deferred: the payload is enqueued and written by the deterministic background worker
 (`node scripts/handoff.js queue-drain`). Default behavior is synchronous.
 
+## Arguments
+
+| Flag | Default | Description |
+|---|---|---|
+| `--json` | off | Read extraction payload from stdin (JSON). Accepts `--json` alone or the legacy `--json -` form. |
+| `--dry-run` | off | Parse and validate the payload, run read-only validation/probe passes, print a summary of what WOULD be written, then exit without any DB mutations or handoff.md update. |
+
 ## Extraction instructions for Claude
 
 Read the conversation that just happened. Then extract:
@@ -148,6 +155,9 @@ echo '<JSON_PAYLOAD>' | PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" clos
 
 # Legacy form — --json - also works (backward compatible):
 echo '<JSON_PAYLOAD>' | PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" close --json -
+
+# Dry-run: validate + preview without writing anything:
+echo '<JSON_PAYLOAD>' | PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" close --json --dry-run
 ```
 
 ### JSON payload shape
@@ -284,6 +294,7 @@ Extended behaviors (PR #86):
 
 ## Expected output
 
+**Normal close:**
 ```
 Running: handoff:close
 
@@ -299,5 +310,43 @@ Running: handoff:close
 
 Done: handoff:close — 5e/12a/3ed written, session marker cleared
 ```
+
+**With `--dry-run`:**
+```
+Running: handoff:close
+
+  -- DRY-RUN: nothing will be written --
+
+  payload validation:
+    OK — all predicates recognized
+
+  rows that WOULD be written:
+    entities:   2
+    assertions: 5
+    edges:      1
+    contract:   yes
+
+  session_tldr:       would write (subject=my-project)
+  open_thread rows:   would write 2 row(s)
+
+  CLAUDE.md promotion candidates (would be surfaced — NOT written in dry-run):
+    [conf=9] vLLM embedding_model is Qwen3-Embedding-8B
+
+  skipped in dry-run: writeExtraction, handoff.md render, session_in_progress clear, C2, C3, L4 degraded record
+
+Done: handoff:close --dry-run — no mutations performed
+```
+
+The dry-run runs these passes (read-only): payload validation, L3 authoritative probes (compute only — no DB write), CLAUDE.md promotion candidate query, pointer-staleness gate (findings only — no row updates).
+
+The dry-run skips: `writeExtraction` (all entity/assertion/edge inserts), `handoff.md` render, `session_in_progress` clear, C2 bias feedback, C3 contract evolution, L4 degraded-close record writes.
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success (real close or dry-run) |
+| 1 | DB connection error |
+| 3 | Degraded close in `close_degraded_exit_mode=strict` (real close only) |
 
 > Done: handoff:close — session closed and extracted

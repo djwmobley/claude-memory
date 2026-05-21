@@ -485,6 +485,12 @@
       "added_version": "1.1"
     },
     {
+      "predicate": "session_note",
+      "cardinality": "1:N",
+      "description": "Lightweight mid-session capture note written via checkpoint --note; a project may accumulate many notes over time, one row per note-object",
+      "added_version": "1.3"
+    },
+    {
       "predicate": "session_tldr",
       "cardinality": "1:1",
       "description": "The session TL;DR persisted as a queryable row; latest supersedes prior",
