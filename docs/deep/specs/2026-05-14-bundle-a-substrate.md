@@ -1088,7 +1088,7 @@ continuity. Re-run the eval against the current mxbai-1024 baseline to refresh `
 This expanded baseline is the reference for all Bundle A acceptance gates.
 
 **Extension 1 — vector-only baseline measurement.** Add a `--vector-only` flag (or reuse
-`--ollama-skip` with a vector-only SQL path) that runs retrieval using only the embedding cosine
+`--embed-skip` with a vector-only SQL path) that runs retrieval using only the embedding cosine
 score, no FTS term, and no reranker. This establishes the baseline against which precision@5
 improvement is measured.
 

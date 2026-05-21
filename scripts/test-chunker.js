@@ -511,8 +511,8 @@ async function test5() {
 // ─── TEST 6 — Real E2E (DB + Ollama + retrieval round-trip) ──────────────────
 
 async function test6() {
-  if (process.env.OLLAMA_SKIP === '1') {
-    console.log('  ⊘ Test 6 — E2E round-trip (skipped: OLLAMA_SKIP=1)');
+  if (process.env.EMBED_SKIP === '1') {
+    console.log('  ⊘ Test 6 — E2E round-trip (skipped: EMBED_SKIP=1)');
     return { skipped: true };
   }
 

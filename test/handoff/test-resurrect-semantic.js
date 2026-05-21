@@ -18,7 +18,7 @@
  *   - Unique project dir per test → unique project_id via encodeCwd()
  *   - Schema applied via handoff-core-schema.sql (includes halfvec column)
  *   - Each test that needs row-side embeddings calls insertAssertionWithEmbedding()
- *   - Subprocess env sets EMBED_MOCK_FIXTURES_PATH and clears OLLAMA_SKIP
+ *   - Subprocess env sets EMBED_MOCK_FIXTURES_PATH and clears EMBED_SKIP
  *
  * Usage:
  *   node test/handoff/test-resurrect-semantic.js
@@ -215,7 +215,7 @@ async function setContract(db, projectId, queries) {
  *
  * @param {string} dbName       — Throwaway DB name.
  * @param {string} projectDir   — Temp directory used as PROJECT_ROOT.
- * @param {object} [envOverride] — Additional env vars (e.g. OLLAMA_SKIP=1).
+ * @param {object} [envOverride] — Additional env vars (e.g. EMBED_SKIP=1).
  * @returns {object}  spawnSync result (status, stdout, stderr).
  */
 function runLoader(dbName, projectDir, envOverride = {}) {
@@ -224,8 +224,8 @@ function runLoader(dbName, projectDir, envOverride = {}) {
     HANDOFF_DB:              dbName,
     PROJECT_ROOT:            projectDir,
     EMBED_MOCK_FIXTURES_PATH: FIXTURES_FILE,
-    // Do NOT set OLLAMA_SKIP here — we want the semantic path to run.
-    OLLAMA_SKIP: undefined,
+    // Do NOT set EMBED_SKIP here — we want the semantic path to run.
+    EMBED_SKIP: undefined,
     ...envOverride,
   };
   // Remove keys set to undefined so they are truly absent.
@@ -291,7 +291,7 @@ async function bootstrapProject(db, projectDir) {
       ...process.env,
       HANDOFF_DB:   DB_NAME,
       PROJECT_ROOT: projectDir,
-      OLLAMA_SKIP:  '1',
+      EMBED_SKIP:  '1',
     },
     encoding: 'utf8',
     timeout:  30000,
@@ -878,7 +878,7 @@ async function testH(db, dbName) {
 //        → warning on stderr → falls through to pg_trgm fuzzy fallback
 //        → loader does NOT hard-fail.
 //
-//   I-b: OLLAMA_SKIP=1 → semantic path skipped entirely → straight to fuzzy.
+//   I-b: EMBED_SKIP=1 → semantic path skipped entirely → straight to fuzzy.
 //
 // In both cases the fuzzy fallback must successfully locate the row (which has
 // a fuzzy-matchable subject) and the loader must exit 0.
@@ -907,7 +907,7 @@ async function testI(db, dbName) {
     // I-a: bad fixture path → embed.js throws → warning + fuzzy fallback.
     const rA = runLoader(dbName, projectDir, {
       EMBED_MOCK_FIXTURES_PATH: '/nonexistent/fixtures.json',
-      OLLAMA_SKIP: undefined,
+      EMBED_SKIP: undefined,
     });
 
     if (rA.status === 0) {
@@ -931,16 +931,16 @@ async function testI(db, dbName) {
     // We assert exit 0 (above) and accept that the row may or may not appear.
     pass('I-3: embed-degraded path does not hard-fail (fallback is non-fatal)');
 
-    // I-b: OLLAMA_SKIP=1 → bypass semantic path entirely, go straight to fuzzy.
+    // I-b: EMBED_SKIP=1 → bypass semantic path entirely, go straight to fuzzy.
     const rB = runLoader(dbName, projectDir, {
       EMBED_MOCK_FIXTURES_PATH: undefined,  // unset
-      OLLAMA_SKIP: '1',
+      EMBED_SKIP: '1',
     });
 
     if (rB.status === 0) {
-      pass('I-4: OLLAMA_SKIP=1 exits 0 (semantic path bypassed, fuzzy runs)');
+      pass('I-4: EMBED_SKIP=1 exits 0 (semantic path bypassed, fuzzy runs)');
     } else {
-      fail('I-4: OLLAMA_SKIP=1 exits 0',
+      fail('I-4: EMBED_SKIP=1 exits 0',
         `exit ${rB.status}: ${(rB.stderr || '').slice(0, 200)}`);
     }
 
@@ -948,9 +948,9 @@ async function testI(db, dbName) {
     const stderrB = (rB.stderr || '').toLowerCase();
     const noEmbedErr = !stderrB.includes('[embed]');
     if (noEmbedErr) {
-      pass('I-5: OLLAMA_SKIP=1 does not invoke embed.js (no [embed] messages)');
+      pass('I-5: EMBED_SKIP=1 does not invoke embed.js (no [embed] messages)');
     } else {
-      fail('I-5: OLLAMA_SKIP=1 does not invoke embed.js',
+      fail('I-5: EMBED_SKIP=1 does not invoke embed.js',
         `[embed] found in stderr: ${(rB.stderr || '').slice(0, 300)}`);
     }
 

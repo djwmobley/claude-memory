@@ -134,11 +134,11 @@ async function embedPending(db, config, table, buildCtx, stats) {
   // The caller (eval harness or pipeline-embed index) will re-embed via vLLM
   // after load. Trying Ollama with a Qwen3 model config would time out on
   // per-row retries (2s + 4s + 8s × N rows). See eval-retrieval.js step 5.
-  // Same short-circuit honors OLLAMA_SKIP=1 — used by CI (no Ollama on the
-  // runner) so the eval harness's loader subprocess can stage fixtures into
-  // the FTS path without a 3-retry-per-row Ollama failure cascade.
+  // Same short-circuit honors EMBED_SKIP=1 — used by CI (no embedding backend
+  // on the runner) so the eval harness's loader subprocess can stage fixtures
+  // into the FTS path without a 3-retry-per-row failure cascade.
   if ((process.env.EMBED_BACKEND || '').toLowerCase() === 'vllm') return;
-  if (process.env.OLLAMA_SKIP === '1') return;
+  if (process.env.EMBED_SKIP === '1') return;
 
   // Allowlist guard — prevent arbitrary table names from reaching SQL
   const ALLOWED_TABLES = new Set(['memory_entry_chunks', 'session_chunks', 'policy_sections']);

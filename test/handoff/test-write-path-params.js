@@ -103,7 +103,7 @@ function runHelper(sub, extraArgs = [], opts = {}) {
     ...process.env,
     PROJECT_ROOT:              fakeRoot,
     HANDOFF_TEST_PROJECT_ID:   global.__legacyProjectId || '',
-    OLLAMA_SKIP: '1',
+    EMBED_SKIP: '1',
     ...(opts.extraEnv || {}),
   };
   return execFileSync(
@@ -126,7 +126,7 @@ function runHelperBoth(sub, extraArgs = [], opts = {}) {
     ...process.env,
     PROJECT_ROOT:              fakeRoot,
     HANDOFF_TEST_PROJECT_ID:   global.__legacyProjectId || '',
-    OLLAMA_SKIP: '1',
+    EMBED_SKIP: '1',
     ...(opts.extraEnv || {}),
   };
   const result = spawnSync(

@@ -1802,18 +1802,18 @@ async function w2Step1_parseExtractionUnit() {
 }
 
 /**
- * W2 2/3: OLLAMA_SKIP=1 no-op proof.
+ * W2 2/3: EMBED_SKIP=1 no-op proof.
  *
- * Runs bundleb-w2-extract.js with OLLAMA_SKIP=1 against the W2 throwaway DB.
+ * Runs bundleb-w2-extract.js with EMBED_SKIP=1 against the W2 throwaway DB.
  * Asserts exit 0 and zero source='model_extracted' rows were written.
  */
-async function w2Step2_ollamaSkipNoOp(w2Db, w2ProjectId) {
-  const label = 'OLLAMA_SKIP=1: script exits 0, zero model_extracted assertions written';
+async function w2Step2_embedSkipNoOp(w2Db, w2ProjectId) {
+  const label = 'EMBED_SKIP=1: script exits 0, zero model_extracted assertions written';
   try {
-    // Run the script under OLLAMA_SKIP=1
+    // Run the script under EMBED_SKIP=1
     const env = {
       ...process.env,
-      OLLAMA_SKIP: '1',
+      EMBED_SKIP: '1',
       HANDOFF_DB:  w2Db,
     };
     const r = spawnSync(process.execPath, [W2_SCRIPT], {
@@ -1829,8 +1829,8 @@ async function w2Step2_ollamaSkipNoOp(w2Db, w2ProjectId) {
     }
 
     const stdout = r.stdout || '';
-    if (!stdout.includes('OLLAMA_SKIP=1')) {
-      w2Fail(2, label, `stdout does not contain expected OLLAMA_SKIP=1 message: ${stdout.slice(0, 200)}`);
+    if (!stdout.includes('EMBED_SKIP=1')) {
+      w2Fail(2, label, `stdout does not contain expected EMBED_SKIP=1 message: ${stdout.slice(0, 200)}`);
       return false;
     }
 
@@ -2924,7 +2924,7 @@ async function runW4Section() {
 
 async function runW2Section() {
   console.log(`\n=== W2 SECTION (${W2_TOTAL} steps) ===`);
-  console.log('smoketest-handoff W2: parseExtraction unit + OLLAMA_SKIP no-op + idempotency predicate');
+  console.log('smoketest-handoff W2: parseExtraction unit + EMBED_SKIP no-op + idempotency predicate');
   console.log('');
 
   // W2 needs a throwaway DB provisioned with the handoff schema for DB-backed tests.
@@ -2960,7 +2960,7 @@ async function runW2Section() {
     }
     console.log(`[W2] DB init OK (${W2_DB})`);
 
-    await w2Step2_ollamaSkipNoOp(W2_DB, W2_PROJECT_ID);
+    await w2Step2_embedSkipNoOp(W2_DB, W2_PROJECT_ID);
     await w2Step3_idempotencyPredicate(W2_DB, W2_PROJECT_ID);
 
   } finally {

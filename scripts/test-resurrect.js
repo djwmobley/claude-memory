@@ -18,13 +18,13 @@
  *   R-3  Sub-budget enforcement: never exceeds min(global, sub)
  *   R-4  Default-contract byte-identical: empty queries -> no resurrect output ->
  *        output identical to pre-change
- *   R-5  pg_trgm fallback path under OLLAMA_SKIP=1
+ *   R-5  pg_trgm fallback path under EMBED_SKIP=1
  *   R-6  Depth-2 graph fan-out
  *   R-7  Read-only-by-default vs explicit revive opt-in (q.revive=true)
  *
  * Usage:
  *   node scripts/test-resurrect.js                  # all sections
- *   OLLAMA_SKIP=1 node scripts/test-resurrect.js    # with embedding skip
+ *   EMBED_SKIP=1 node scripts/test-resurrect.js    # with embedding skip
  *
  * Exit 0 = all pass; nonzero = any failure.
  */
@@ -130,7 +130,7 @@ function runHandoff(sub, extraArgs = [], stdin = null, dbName, projectDir) {
     ...process.env,
     HANDOFF_DB:   dbName,
     PROJECT_ROOT: projectDir,
-    OLLAMA_SKIP:  process.env.OLLAMA_SKIP || '1',
+    EMBED_SKIP:  process.env.EMBED_SKIP || '1',
   };
   const opts = {
     cwd:      PROJECT_ROOT,
@@ -680,14 +680,14 @@ async function sectionR4(dbName, projectDir, projectId) {
   }
 }
 
-// ── SECTION R-5: pg_trgm fallback under OLLAMA_SKIP=1 ───────────────────────
+// ── SECTION R-5: pg_trgm fallback under EMBED_SKIP=1 ────────────────────────
 
 async function sectionR5(dbName, projectDir, projectId) {
-  console.log('\n--- R-5: pg_trgm fallback under OLLAMA_SKIP=1 ---');
-  // The harness always runs with OLLAMA_SKIP=1 (set in runHandoff), so the
+  console.log('\n--- R-5: pg_trgm fallback under EMBED_SKIP=1 ---');
+  // The harness always runs with EMBED_SKIP=1 (set in runHandoff), so the
   // semantic path is always bypassed.  This section validates that the fuzzy
   // fallback (pg_trgm similarity / instr) correctly locates rows and that the
-  // loader does not crash when Ollama is skipped.
+  // loader does not crash when embedding is skipped.
 
   const db = await pgConnect(dbName);
   try {
@@ -714,9 +714,9 @@ async function sectionR5(dbName, projectDir, projectId) {
 
   // R-5a: loader must not crash.
   if (r.status === 0) {
-    pass('R-5a', 'loader does not crash under OLLAMA_SKIP=1 (trgm fallback path)');
+    pass('R-5a', 'loader does not crash under EMBED_SKIP=1 (trgm fallback path)');
   } else {
-    fail('R-5a', 'loader does not crash under OLLAMA_SKIP=1',
+    fail('R-5a', 'loader does not crash under EMBED_SKIP=1',
       `exited ${r.status}: ${(r.stderr || '').slice(0, 200)}`);
   }
 
@@ -906,7 +906,7 @@ async function sectionR7(dbName, projectDir, projectId) {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
-  console.log(`test-resurrect: OLLAMA_SKIP=${process.env.OLLAMA_SKIP || '1'}`);
+  console.log(`test-resurrect: EMBED_SKIP=${process.env.EMBED_SKIP || '1'}`);
   console.log(`DB: ${DB_NAME}`);
   console.log('');
 
