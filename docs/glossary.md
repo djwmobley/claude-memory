@@ -111,7 +111,7 @@ The set of queries Claude runs at session start to decide which notes to load in
 
 ### Session
 
-One continuous conversation with Claude Code — from when you open a chat to when you close it or Claude stops responding. Each session gets its own record in the database. Notes written in one session are available in the next one because of the session hooks and the handoff file. See also: **handoff.md**, **slash command**.
+One continuous conversation with Claude Code — from when you open a chat to when you close it or Claude stops responding. Each session gets its own record in the database. Notes written in one session are available in the next one because of the session hooks and the handoff file. See also: **Handoff.md (thin pointer)**, **slash command**.
 
 ### Slash command
 

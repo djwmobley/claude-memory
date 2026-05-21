@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Documentation lint CI gate** (`scripts/test-doc-lint.js`): pure-Node static
+  linter wired into CI that enforces three invariants: (1) every bold term in a
+  glossary "See also:" line resolves to a defined `### heading`; (2) every
+  `/handoff:<name>` slash-command reference in docs matches a real
+  `commands/handoff/<name>.md` file, and every `node … handoff.js <sub>`
+  invocation in code spans matches the engine subcommands router; (3) the
+  `validKinds` array in `cmdPrune` and the `--suppression-kind` enumeration
+  bullet in the glossary both equal the canonical set from the SQL schema CHECK
+  constraint. Would have caught the Prune fictional-command drift (#107/#108)
+  and the validKinds/glossary desync before they reached main.
 - **`/handoff:resurrect` command**: on-demand retrieval of decayed topics back
   into active context using semantic vector search against the full assertion
   corpus. The resurrect ring makes dormant knowledge addressable without
