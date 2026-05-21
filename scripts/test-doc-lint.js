@@ -211,13 +211,18 @@ function testD2() {
     const content = readFile(filePath);
     const codeSpans = [];
 
-    const inlineRe = /`([^`]+)`/g;
-    let inlineMatch;
-    while ((inlineMatch = inlineRe.exec(content)) !== null) codeSpans.push(inlineMatch[1]);
-
+    // Fenced blocks first; strip them so the inline scan cannot mis-pair
+    // backticks against the ``` fences.
     const fencedRe = /```[^\n]*\n([\s\S]*?)```/g;
     let fencedMatch;
     while ((fencedMatch = fencedRe.exec(content)) !== null) codeSpans.push(fencedMatch[1]);
+    const withoutFences = content.replace(fencedRe, '\n');
+
+    // [^`\n]+ stops a stray unbalanced backtick from swallowing across lines
+    // (the over-span false-negative).
+    const inlineRe = /`([^`\n]+)`/g;
+    let inlineMatch;
+    while ((inlineMatch = inlineRe.exec(withoutFences)) !== null) codeSpans.push(inlineMatch[1]);
 
     for (const span of codeSpans) {
       let m;

@@ -1,4 +1,4 @@
-# Changelog
+﻿# Changelog
 
 All notable changes to this project will be documented in this file.
 
@@ -121,6 +121,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Matryoshka-truncates embeddings to `halfvec(4000)` to match the configured
   vector column schema, resolving a silent dim-mismatch that prevented semantic
   resurrect queries from returning results. (#88)
+- **Doc-lint D2 inline-code scan no longer over-spans on unbalanced backticks**: fenced
+  blocks are now stripped from the content before the inline-span scan, and the inline
+  regex uses a single-line class (`[^`\n]+`) to prevent a stray unbalanced backtick
+  in prose from pairing with a later backtick and swallowing the span in between -- a false
+  negative where a fictional `node ... handoff.js <subcommand>` invocation in the swallowed
+  region would go undetected.
 - **`commit_merged` probe return value**: `probeCommitMerged` now echoes the
   result object on success, allowing the reality-check registry to treat the
   predicate as verified rather than always marking it unverifiable. (#95)
