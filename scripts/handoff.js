@@ -2329,8 +2329,46 @@ async function cmdLoaderLoad(opts = {}) {
     ? "(CASE WHEN tier = 'probationary' THEN 1 ELSE 0 END) ASC, "
     : '';
 
+  // ── Restructure: read handoff.md body BEFORE the contract loop ──────────────
+  // This lets us compute servedBody before the loop so the sectionBudget
+  // reservation can account for the MD body size.  Moved from the assembly block
+  // below; behavior is identical — the body is passed unchanged into the output.
+  let servedBody = '';
+  if (fs.existsSync(handoffPath)) {
+    const raw  = fs.readFileSync(handoffPath, 'utf8');
+    let   body = raw.replace(/^---[\s\S]*?---\r?\n/, '');
+
+    // Pointer-staleness gate — resume mode: rewrite stale line numbers in the served
+    // output but do NOT persist corrections back to the DB (close is the mutation point).
+    // Runs non-fatally; any error leaves body unchanged.
+    try {
+      const resumeRoot = findProjectRoot();
+      // Pass the full handoff.md body as tldr (single scan covers all pointer references).
+      const gateResult = await runPointerGate(
+        { tldr: body, openThreads: '', quickReferences: '' },
+        resumeRoot,
+        db,
+        projectId,
+        'resume'
+      );
+      body = gateResult.rewrittenFields.tldr;
+    } catch (ptrResumeErr) {
+      process.stderr.write(`[handoff] pointer-gate (resume) failed (non-fatal): ${ptrResumeErr.message}\n`);
+    }
+
+    servedBody = body.trim();
+  }
+
+  // ── Budget reservation: keep sections + MD body + canon within token budget ──
+  // Reported `tokensUsed` stays sections-only (graph-traversal test B-3 depends on this).
+  // sectionBudget is what sections may consume; actual served output = canon + md + sections.
+  const canonTokens    = Math.ceil(OPERATING_CANON.length / 4);
+  const mdBodyTokens   = servedBody ? Math.ceil(servedBody.length / 4) : 0;
+  const overheadMargin = 120;
+  const sectionBudget  = Math.max(0, tokenBudget - canonTokens - mdBodyTokens - overheadMargin);
+
   for (const q of queries) {
-    if (tokensUsed >= tokenBudget) break;
+    if (tokensUsed >= sectionBudget) break;
 
     if (q.type === 'entity' || q.kind === 'entity') {
       const { rows } = await db.query(
@@ -2395,14 +2433,20 @@ async function cmdLoaderLoad(opts = {}) {
       }
       const { rows } = await db.query(assertionQuerySql, assertionQueryParams);
       if (rows.length) {
-        const text = rows.map((r) =>
-          `- [${r.source}|conf=${r.confidence}] ${r.subject} ${r.predicate} ${r.object}`
-        ).join('\n');
-        sections.push(`### Assertions\n${text}`);
-        tokensUsed      += Math.ceil(text.length / 4);
-        assertionsCount += rows.length;
-        // C1: record retrieved assertion ids for attribution.
-        for (const r of rows) retrievedAssertionIds.push(r.id);
+        // Accumulate rows one-at-a-time, bounded by sectionBudget.
+        const lineTexts = [];
+        for (const r of rows) {
+          const lineText = `- [${r.source}|conf=${r.confidence}] ${r.subject} ${r.predicate} ${r.object}`;
+          const rowCost  = Math.ceil(lineText.length / 4);
+          if (tokensUsed + rowCost > sectionBudget) break;
+          lineTexts.push(lineText);
+          tokensUsed      += rowCost;
+          assertionsCount += 1;
+          retrievedAssertionIds.push(r.id);
+        }
+        if (lineTexts.length) {
+          sections.push(`### Assertions\n${lineTexts.join('\n')}`);
+        }
         // 4C: Bump reinforcement timestamps ONLY for the rows actually returned
         // (per-row precision instead of project-wide or subject-wide).
         // OQ-2: AND suppressed=false prevents bumping suppressed history rows.
@@ -2439,14 +2483,20 @@ async function cmdLoaderLoad(opts = {}) {
       }
       const { rows } = await db.query(recencyQuerySql, [projectId]);
       if (rows.length) {
-        const text = rows.map((r) =>
-          `- [conf=${r.confidence}] ${r.subject} ${r.predicate} ${r.object}`
-        ).join('\n');
-        sections.push(`### Recent assertions\n${text}`);
-        tokensUsed      += Math.ceil(text.length / 4);
-        assertionsCount += rows.length;  // recency queries roll into assertionsCount
-        // C1: record retrieved assertion ids for attribution.
-        for (const r of rows) retrievedAssertionIds.push(r.id);
+        // Accumulate rows one-at-a-time, bounded by sectionBudget.
+        const lineTexts = [];
+        for (const r of rows) {
+          const lineText = `- [conf=${r.confidence}] ${r.subject} ${r.predicate} ${r.object}`;
+          const rowCost  = Math.ceil(lineText.length / 4);
+          if (tokensUsed + rowCost > sectionBudget) break;
+          lineTexts.push(lineText);
+          tokensUsed      += rowCost;
+          assertionsCount += 1;
+          retrievedAssertionIds.push(r.id);
+        }
+        if (lineTexts.length) {
+          sections.push(`### Recent assertions\n${lineTexts.join('\n')}`);
+        }
       }
 
     } else if (q.type === 'history' || q.kind === 'history') {
@@ -2529,7 +2579,7 @@ async function cmdLoaderLoad(opts = {}) {
             seeds = retrievedEntityNames.slice(); // fallback: entities retrieved earlier
           }
 
-          if (seeds.length > 0 && tokensUsed < tokenBudget) {
+          if (seeds.length > 0 && tokensUsed < sectionBudget) {
             // Resolve direction.
             const direction = (q.filter && q.filter.direction) || 'out';
 
@@ -2554,14 +2604,14 @@ async function cmdLoaderLoad(opts = {}) {
               db.buildGraphCTE(direction, seeds, maxDepth, maxNodes, projectId);
             const { rows: graphRows } = await db.query(cteSql, cteParams);
 
-            if (graphRows.length > 0 && tokensUsed < tokenBudget) {
+            if (graphRows.length > 0 && tokensUsed < sectionBudget) {
               const graphText = graphRows.map((r) =>
                 `- ${r.entity_name} (depth ${r.min_depth}, via ${r.rep_from} -[${r.rep_edge_type}]-> ${r.rep_to})`
               ).join('\n');
               const graphSection = `### Related (graph)\n${graphText}`;
               // Only add if budget allows.
               const cost = Math.ceil(graphSection.length / 4);
-              if (tokensUsed + cost <= tokenBudget) {
+              if (tokensUsed + cost <= sectionBudget) {
                 sections.push(graphSection);
                 tokensUsed += cost;
               }
@@ -2617,10 +2667,10 @@ async function cmdLoaderLoad(opts = {}) {
       // pre-existing L4-handled corner when payload.session_id is absent AND the
       // session_in_progress marker has already been cleared. This is not introduced here.
       try {
-        // Resolve sub-budget.
+        // Resolve sub-budget (use sectionBudget so resurrection is bounded correctly).
         const subBudgetRaw = await getSetting(db, projectId, 'resurrect_token_budget', '1500');
         const subBudget    = Math.min(
-          tokenBudget - tokensUsed,
+          sectionBudget - tokensUsed,
           Math.max(0, parseInt(subBudgetRaw, 10) || 1500)
         );
         if (subBudget > 0) {
@@ -2682,7 +2732,7 @@ async function cmdLoaderLoad(opts = {}) {
   // => guaranteed byte-identical pre-W3 output (no regression).
   try {
     const clusterSetting = await getSetting(db, projectId, 'cluster_aware_retrieval', 'enabled');
-    if (clusterSetting === 'enabled' && retrievedEntityNames.length > 0 && tokensUsed < tokenBudget) {
+    if (clusterSetting === 'enabled' && retrievedEntityNames.length > 0 && tokensUsed < sectionBudget) {
       // Find the latest community run for this project.
       const runRes = await db.query(
         `SELECT run_id FROM entity_communities WHERE project_id = $1 ORDER BY computed_at DESC LIMIT 1`,
@@ -2705,7 +2755,7 @@ async function cmdLoaderLoad(opts = {}) {
             projectId, latestRunId, communityIds, retrievedEntityNames, clusterMaxSiblings
           );
           const siblingRes = await db.query(sibQ.sql, sibQ.params);
-          if (siblingRes.rows.length > 0 && tokensUsed < tokenBudget) {
+          if (siblingRes.rows.length > 0 && tokensUsed < sectionBudget) {
             const siblingText = siblingRes.rows.map((r) => `- ${r.entity_name}`).join('\n');
             sections.push(`### Related (community)\n${siblingText}`);
             tokensUsed += Math.ceil(siblingText.length / 4);
@@ -2716,6 +2766,50 @@ async function cmdLoaderLoad(opts = {}) {
   } catch (clusterErr) {
     // Non-fatal: any error degrades gracefully to pre-W3 output (no expansion).
     if (!silent) console.error(`[handoff] W3 cluster expansion error (non-fatal): ${clusterErr.message}`);
+  }
+
+  // ── Session intent section (north-star default resume) ───────────────────────
+  // Surface open_thread / session_tldr / quick_reference rows when the contract
+  // did NOT already include an assertion or recency query (which would serve them
+  // via the "### Assertions" or "### Recent assertions" block).
+  // Gated off when either of those kinds already ran (no double-serve).
+  // Suppressed rows are excluded (P2 superseded / lifecycle-C devalued intent).
+  const contractHasAssertionQuery = queries.some(
+    (q) => q.type === 'assertion' || q.kind === 'assertion' ||
+            q.type === 'recency'   || q.kind === 'recency'
+  );
+  if (!contractHasAssertionQuery && tokensUsed < sectionBudget) {
+    try {
+      const { rows: intentRows } = await db.query(
+        `SELECT id, subject, predicate, object, confidence, source FROM assertions
+           WHERE project_id = $1
+             AND predicate IN ('open_thread', 'session_tldr', 'quick_reference')
+             AND suppressed = false
+             AND invalid_at IS NULL
+           ORDER BY (confidence * exp(-decay_rate * EXTRACT(EPOCH FROM (now() - last_reinforced)) / 86400)) DESC,
+                    last_reinforced DESC
+           LIMIT 50`,
+        [projectId]
+      );
+      if (intentRows.length > 0) {
+        const lineTexts = [];
+        for (const r of intentRows) {
+          const lineText = `- [${r.source}|conf=${r.confidence}] ${r.subject} ${r.predicate} ${r.object}`;
+          const rowCost  = Math.ceil(lineText.length / 4);
+          if (tokensUsed + rowCost > sectionBudget) break;
+          lineTexts.push(lineText);
+          tokensUsed      += rowCost;
+          assertionsCount += 1;
+          retrievedAssertionIds.push(r.id);
+        }
+        if (lineTexts.length > 0) {
+          sections.push(`### Session intent\n${lineTexts.join('\n')}`);
+        }
+      }
+    } catch (intentSectionErr) {
+      // Non-fatal: any error degrades gracefully to pre-intent output.
+      if (!silent) process.stderr.write(`[handoff] session intent section error (non-fatal): ${intentSectionErr.message}\n`);
+    }
   }
 
   if (ownDb) await db.end();
@@ -2729,30 +2823,11 @@ async function cmdLoaderLoad(opts = {}) {
   outputParts.push(OPERATING_CANON);
   const retrievedParts = [];
 
-  if (fs.existsSync(handoffPath)) {
-    const raw  = fs.readFileSync(handoffPath, 'utf8');
-    let   body = raw.replace(/^---[\s\S]*?---\r?\n/, '');
-
-    // Pointer-staleness gate — resume mode: rewrite stale line numbers in the served
-    // output but do NOT persist corrections back to the DB (close is the mutation point).
-    // Runs non-fatally; any error leaves body unchanged.
-    try {
-      const resumeRoot = findProjectRoot();
-      // Pass the full handoff.md body as tldr (single scan covers all pointer references).
-      const gateResult = await runPointerGate(
-        { tldr: body, openThreads: '', quickReferences: '' },
-        resumeRoot,
-        db,
-        projectId,
-        'resume'
-      );
-      body = gateResult.rewrittenFields.tldr;
-    } catch (ptrResumeErr) {
-      process.stderr.write(`[handoff] pointer-gate (resume) failed (non-fatal): ${ptrResumeErr.message}\n`);
-    }
-
+  // Use servedBody computed before the loop (avoids double-read of handoff.md).
+  // servedBody is '' when the file does not exist; only push if it has content.
+  if (servedBody) {
     retrievedParts.push('=== Handoff context ===');
-    retrievedParts.push(body.trim());
+    retrievedParts.push(servedBody);
   }
 
   if (sections.length) {
@@ -2984,7 +3059,7 @@ async function cmdDrop() {
     TLDR:                '(dropped — prior session memory archived)',
     OPEN_THREADS:        '- (none)',
     QUICK_REFERENCES:    '(none)',
-    DEGRADED_SECTION:    '',
+    DEGRADED_SECTION:    '\n\n<!-- dropped — prior session memory archived -->',
     RECONCILIATION_SECTION: '',
   });
 
@@ -3369,6 +3444,180 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
 }
 
 /**
+ * Derive a stable subject key from an open-thread text string.
+ * If a ':' occurs within the first 60 chars, subject = text before the first ':' (trimmed).
+ * Otherwise, subject = trimmed text capped at 80 chars.
+ *
+ * Examples:
+ *   "NS-THREAD-ALPHA: finish…" → "NS-THREAD-ALPHA"
+ *   "SHIP-DECISION: ship…"    → "SHIP-DECISION"
+ *   "open thread 0: yyy…"     → "open thread 0"
+ *   "OPEN-THREAD-ALPHA finish the decay-rank backfill migration" → "OPEN-THREAD-ALPHA finish the decay-rank backfill migration" (capped at 80)
+ *
+ * @param {string} threadText
+ * @returns {string}
+ */
+function deriveIntentSubject(threadText) {
+  const text = String(threadText || '').trim();
+  const colonIdx = text.indexOf(':');
+  if (colonIdx >= 0 && colonIdx < 60) {
+    return text.slice(0, colonIdx).trim();
+  }
+  return text.slice(0, 80);
+}
+
+/**
+ * Persist session-driving intent (open_threads, tldr, quick_references) as
+ * queryable assertion rows in the `assertions` table.
+ *
+ * Called from writeExtraction after edges are written.
+ *
+ * Provenance: source='user_stated', confidence=8, tier='probationary' on birth.
+ * Cardinality: all three predicates are 1:1 — one live row per (projectId, subject, predicate).
+ *
+ * Per-row semantics (within BEGIN/COMMIT transaction per row):
+ *   1. Select the prior LIVE row for (projectId, canonSubject, predicate).
+ *   2a. Same-session exact repeat → touch-only (bump last_reinforced).
+ *   2b. Different session, same object → CONSOLIDATE IN PLACE (tier='consolidated',
+ *       corroboration_count++). Required by P4.
+ *   2c. Different object → supersede prior, INSERT new live row.
+ *   3. No prior row → INSERT new live row (probationary).
+ *
+ * @param {object} db         - StoragePort adapter (Postgres or SQLite).
+ * @param {string} projectId  - project UUID.
+ * @param {object} payload    - close payload (tldr, open_threads, quick_references, session_id).
+ * @param {string} [projectBasename] - path.basename(root) for tldr/quick_reference subjects.
+ */
+async function persistSessionIntent(db, projectId, payload, projectBasename) {
+  const sessionId = (typeof payload.session_id === 'string' && payload.session_id.length > 0)
+    ? payload.session_id
+    : null;
+
+  const basename = projectBasename || 'project';
+  const intents = [];
+
+  // open_threads — one row per thread, subject derived from thread text
+  for (const thread of (payload.open_threads || [])) {
+    const text = String(thread || '').trim();
+    if (!text) continue;
+    intents.push({
+      subject: deriveIntentSubject(text),
+      predicate: 'open_thread',
+      object: text,
+    });
+  }
+
+  // tldr — one row, subject = project basename
+  if (payload.tldr && String(payload.tldr).trim()) {
+    intents.push({
+      subject: basename,
+      predicate: 'session_tldr',
+      object: String(payload.tldr).trim(),
+    });
+  }
+
+  // quick_references — one row, subject = project basename
+  if (payload.quick_references && String(payload.quick_references).trim()) {
+    intents.push({
+      subject: basename,
+      predicate: 'quick_reference',
+      object: String(payload.quick_references).trim(),
+    });
+  }
+
+  for (const intent of intents) {
+    const canonSubject = canonicalize(intent.subject);
+    const predicate    = intent.predicate;
+    const newObject    = intent.object;
+    const conf         = 8;
+    const source       = 'user_stated';
+
+    await db.query('BEGIN');
+    try {
+      // SELECT prior LIVE row for (projectId, canonSubject, predicate).
+      // Use application-level canonicalization (same pattern as writeAssertionWithSupersession).
+      const { rows: candidates } = await db.query(
+        `SELECT id, subject, object, session_id, tier, corroboration_count
+         FROM assertions
+         WHERE project_id = $1
+           AND predicate  = $2
+           AND suppressed = false
+           AND invalid_at IS NULL`,
+        [projectId, predicate]
+      );
+
+      let priorRow = null;
+      for (const r of candidates) {
+        if (canonicalize(r.subject) === canonSubject) {
+          priorRow = r;
+          break;
+        }
+      }
+
+      if (priorRow) {
+        const sameObject  = (priorRow.object === newObject);
+        const sameSession = (priorRow.session_id != null && sessionId != null &&
+                             priorRow.session_id === sessionId);
+
+        if (sameObject && sameSession) {
+          // 2a. Same-session exact repeat — touch-only: bump last_reinforced.
+          const bumpStmt = db.buildBumpAssertions([priorRow.id]);
+          if (bumpStmt) {
+            await db.query(bumpStmt.sql, bumpStmt.params);
+          }
+        } else if (sameObject && !sameSession) {
+          // 2b. Cross-session restatement of identical intent — CONSOLIDATE IN PLACE.
+          // Must not suppress+reinsert (would break P4's find-by-lowest-id expectation
+          // since rows.find returns by object content in ORDER BY id order).
+          // promoted_at is not touched here; only the promote operator (/handoff:promote)
+          // sets promoted_at. This is the cross-session corroboration path for intent rows.
+          await db.query(
+            `UPDATE assertions
+               SET consolidated_at      = now(),
+                   corroboration_count  = corroboration_count + 1,
+                   last_reinforced      = now(),
+                   promoted_at          = promoted_at,
+                   tier                 = 'consolidated'
+             WHERE id = $1`,
+            [priorRow.id]
+          );
+        } else {
+          // 2c. Different object — supersede prior, INSERT new live row.
+          const suppressStmt = db.buildSupersessionUpdate(
+            '1:1', projectId, priorRow.subject, predicate, newObject
+          );
+          if (suppressStmt) {
+            await db.query(suppressStmt.sql, suppressStmt.params);
+          }
+          // INSERT new live row (probationary).
+          await db.query(
+            `INSERT INTO assertions
+               (project_id, subject, predicate, object, confidence, source, session_id,
+                last_reinforced, valid_at, tier, corroboration_count)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now(), 'probationary', 1)`,
+            [projectId, canonSubject, predicate, newObject, conf, source, sessionId]
+          );
+        }
+      } else {
+        // 3. No prior row — INSERT new live row (probationary).
+        await db.query(
+          `INSERT INTO assertions
+             (project_id, subject, predicate, object, confidence, source, session_id,
+              last_reinforced, valid_at, tier, corroboration_count)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now(), 'probationary', 1)`,
+          [projectId, canonSubject, predicate, newObject, conf, source, sessionId]
+        );
+      }
+
+      await db.query('COMMIT');
+    } catch (err) {
+      try { await db.query('ROLLBACK'); } catch (_) {}
+      process.stderr.write(`[handoff] persistSessionIntent failed for predicate "${predicate}" (non-fatal): ${err.message}\n`);
+    }
+  }
+}
+
+/**
  * Write entities/assertions/edges from a JSON payload.
  * Returns { entitiesWritten, assertionsWritten, edgesWritten }.
  *
@@ -3383,8 +3632,11 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
  *   quick_references: "...",
  *   session_id: "..."
  * }
+ *
+ * opts.projectBasename — path.basename(root), used by persistSessionIntent for
+ *   the tldr and quick_reference subject keys. If absent, defaults to 'project'.
  */
-async function writeExtraction(db, projectId, payload) {
+async function writeExtraction(db, projectId, payload, opts) {
   // Resolve session id: payload.session_id takes precedence.
   // Fallback: session_in_progress marker from project_settings.
   // STALENESS GUARD: session_in_progress stores an ISO timestamp set at session start
@@ -3468,6 +3720,15 @@ async function writeExtraction(db, projectId, payload) {
     } catch (contractErr) {
       process.stderr.write(`[handoff] contract history record failed (non-fatal): ${contractErr.message}\n`);
     }
+  }
+
+  // Persist session-driving intent (open_threads, tldr, quick_references) as queryable PG rows.
+  // Non-fatal: any error inside persistSessionIntent is caught and logged per-row.
+  try {
+    const projectBasename = (opts && opts.projectBasename) ? opts.projectBasename : null;
+    await persistSessionIntent(db, projectId, payload, projectBasename);
+  } catch (intentErr) {
+    process.stderr.write(`[handoff] persistSessionIntent outer error (non-fatal): ${intentErr.message}\n`);
   }
 
   return { entitiesWritten, assertionsWritten, edgesWritten };
@@ -3657,7 +3918,7 @@ async function cmdCheckpoint(args) {
   }
 
   // ── Synchronous path (default) — unchanged behavior ──────────────────────────
-  const extraction = await writeExtraction(db, projectId, payload);
+  const extraction = await writeExtraction(db, projectId, payload, { projectBasename: path.basename(root) });
   entitiesWritten   = extraction.entitiesWritten;
   assertionsWritten = extraction.assertionsWritten;
   edgesWritten      = extraction.edgesWritten;
@@ -3969,7 +4230,7 @@ async function cmdClose(args) {
 
   // ── Synchronous path (default) — unchanged behavior ──────────────────────────
   const { entitiesWritten, assertionsWritten, edgesWritten } =
-    await writeExtraction(db, projectId, payload);
+    await writeExtraction(db, projectId, payload, { projectBasename: path.basename(root) });
 
   // Surface CLAUDE.md promotion candidates (conf >= 9, user_stated, multi-session).
   // Hole A fix: col-minus-col epoch difference now goes through a port method so both
@@ -5202,7 +5463,9 @@ async function cmdQueueDrain(args) {
 
     try {
       const { entitiesWritten, assertionsWritten, edgesWritten } =
-        await writeExtraction(db, projectId, payloadToWrite);
+        await writeExtraction(db, projectId, payloadToWrite, {
+          projectBasename: path.basename(findProjectRoot()),
+        });
 
       // Mark done.
       await db.query(

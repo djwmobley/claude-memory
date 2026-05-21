@@ -11,10 +11,10 @@ session_summary:
 # Handoff — {{PROJECT_NAME}}
 
 ## TL;DR
-{{TLDR}}
+See Postgres.
 
 ## Open threads
-{{OPEN_THREADS}}
+See Postgres.
 
 ## Quick references
-{{QUICK_REFERENCES}}{{DEGRADED_SECTION}}{{RECONCILIATION_SECTION}}
+See Postgres.{{DEGRADED_SECTION}}{{RECONCILIATION_SECTION}}

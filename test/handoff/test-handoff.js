@@ -350,9 +350,14 @@ async function runTests() {
     const dir = claudeProjectDir();
     const handoffPath = path.join(dir, 'handoff.md');
     const content = fs.readFileSync(handoffPath, 'utf8');
-    assert.ok(content.includes('Test session closed successfully.'), 'handoff.md should contain TL;DR');
-    assert.ok(content.includes('## Open threads'), 'handoff.md should have Open threads section');
-    assert.ok(content.includes('verify edge weights'), 'handoff.md should list open threads');
+    // Section headers must be present (thin-pointer template).
+    assert.ok(content.includes('## TL;DR'), 'handoff.md should have ## TL;DR section header');
+    assert.ok(content.includes('## Open threads'), 'handoff.md should have ## Open threads section header');
+    assert.ok(content.includes('## Quick references'), 'handoff.md should have ## Quick references section header');
+    // The body must be a thin pointer — raw prose (tldr text, open-thread text) must NOT
+    // be embedded in the MD body (it lives in Postgres as queryable assertion rows instead).
+    assert.ok(!content.includes('Test session closed successfully.'), 'handoff.md body must NOT contain raw TL;DR prose (thin-pointer: prose lives in PG rows)');
+    assert.ok(!content.includes('verify edge weights'), 'handoff.md body must NOT contain raw open-thread prose (thin-pointer: threads live in PG rows)');
   });
 
   await test('close: clears session_in_progress marker', async () => {
