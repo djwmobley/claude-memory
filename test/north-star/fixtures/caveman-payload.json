@@ -1,0 +1,37 @@
+{
+  "_doc": "Caveman close payload — telegraphic prose, function words stripped. Carries identical load-bearing tokens to verbose-payload.json. The only difference is function-word density: this version strips articles/copulas/conjunctions while preserving every load-bearing identifier, path, line ref, PR number, SHA, name, number, and decision. Used by test-caveman-economy.js to prove caveman mode reduces bootstrap tokens without losing any load-bearing token.",
+  "session_id": "caveman-compact-001",
+  "contract": {
+    "queries": [{ "kind": "assertion" }]
+  },
+  "tldr": "Completed: serve-time reality re-probe — annotates stale assertions at resume. Modified: scripts/lib/reality-checks.js + runVerifyDispatch (per-predicate probe dispatch). Fixed: dimension mismatch — embedding column vector(1024) → halfvec(4000); schema migrated first. Confirmed: commit bb3e8c2 on main merged. Serve-time wiring: handoff.js:3030. trueServedTokens = Math.ceil(fullOutput.length/4) — real bootstrap cost: OPERATING_CANON + handoff.md body + PG sections.",
+  "open_threads": [
+    "PR #93 staleness annotation: extend to additional volatile predicates not yet in registry?",
+    "halfvec(4000) migration: verify all live assertion rows converted from vector(1024).",
+    "runVerifyDispatch timeout/circuit-breaker: add integration test for gh CLI probe paths.",
+    "handoff.js:3030 serve-time wiring: confirm line ref accurate post pointer-staleness gate.",
+    "north-star inversion: close.md authoring guidance fully reflects PG-rows-not-prose model?",
+    "commit bb3e8c2 on main: confirm ancestor of HEAD — smoketest depends on commit present.",
+    "trueServedTokens: cross-check output length vs engine tokens-used line; Math.ceil(length/4) consistent?",
+    "Caveman-mode gap: /handoff:close skill authoring instructions missing telegraphic guidance for tldr/open_threads/quick_references.",
+    "test-caveman-economy.js: wire CI workflow; caveman compression invariant enforced per PR.",
+    "halfvec(4000) schema migration: fix_schema_then_embed principle — schema before embedding backfill."
+  ],
+  "quick_references": "scripts/lib/reality-checks.js: per-predicate probe registry; runVerifyDispatch dispatch fn. handoff.js:3030: serve-time pass wired into resume. halfvec(4000): Matryoshka-truncated Qwen3-Embedding-8B output. bb3e8c2: serve-time staleness fix merged on main. trueServedTokens: Math.ceil(fullOutput.length/4) real bootstrap cost. PR #93: serve-time staleness feature. vector(1024)→halfvec(4000): critical schema migration preceding backfill.",
+  "entities": [
+    { "name": "reality-checks.js",    "entity_type": "file",     "description": "CV-ENT-REALCHECKS: scripts/lib/reality-checks.js implements the per-predicate probe registry and runVerifyDispatch" },
+    { "name": "runVerifyDispatch",     "entity_type": "concept",  "description": "CV-ENT-DISPATCH: dispatch function that routes serve-time probes to per-predicate handlers" },
+    { "name": "trueServedTokens",      "entity_type": "concept",  "description": "CV-ENT-TOKENS: Math.ceil(fullOutput.length/4) — real bootstrap cost including canon+body+PG sections" },
+    { "name": "halfvec-migration",     "entity_type": "decision", "description": "CV-ENT-MIGRATION: schema migrated from vector(1024) to halfvec(4000) before embedding backfill" }
+  ],
+  "assertions": [
+    { "subject": "PR #93",              "predicate": "commit_merged",  "object": "bb3e8c2 on main",                          "confidence": 9, "source": "model_extracted" },
+    { "subject": "reality-checks.js",  "predicate": "in_file",        "object": "scripts/lib/reality-checks.js",            "confidence": 9, "source": "user_stated" },
+    { "subject": "serve-time-wiring",  "predicate": "in_file",        "object": "handoff.js",                               "confidence": 8, "source": "model_extracted" },
+    { "subject": "embedding-column",   "predicate": "is_status",      "object": "halfvec(4000) after migration from vector(1024)", "confidence": 9, "source": "user_stated" }
+  ],
+  "edges": [
+    { "from_entity": "runVerifyDispatch", "edge_type": "depends_on", "to_entity": "reality-checks.js", "weight": 1.0 },
+    { "from_entity": "halfvec-migration", "edge_type": "depends_on", "to_entity": "reality-checks.js", "weight": 0.5 }
+  ]
+}

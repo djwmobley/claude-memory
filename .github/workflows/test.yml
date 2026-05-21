@@ -389,6 +389,12 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: "North-star: caveman economy (GREEN gate — caveman tokens < verbose, no fidelity loss)"
+        run: node test/north-star/test-caveman-economy.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       # ── North-star suite (TDD spec — RED BY DESIGN, hard gate) ───────────────
       # These four files encode the system's north star: load-bearing session
       # intent (open-threads / next-actions / tldr) MUST live in Postgres as

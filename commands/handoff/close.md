@@ -75,9 +75,32 @@ immediately when they resume? Supported query types:
 
 3–5 sentences: what happened, where things stand, what's next.
 
+**Caveman/telegraphic authoring (mandatory).** Author `tldr` in telegraphic mode:
+strip function words (articles, copulas, most prepositions/conjunctions — a/an/the,
+is/are/was/were, of/to/in/for/and/or/but, with/that/this/it/as/at/on/by/be) while
+keeping every load-bearing token verbatim: identifiers, file paths, line refs, PR
+numbers, commit SHAs, names, numbers, decisions. Goal: minimum bootstrap tokens,
+zero load-bearing loss. The engine stores prose verbatim (no engine-side compression
+— leaner must come from the author, not the store). `test/north-star/test-caveman-economy.js`
+enforces this invariant: caveman must be leaner than grammatical prose with no
+fidelity regression.
+
+Example — verbose (avoid): "In this session we completed the implementation of the
+serve-time reality re-probe, which is a feature that annotates stale assertions."
+Example — caveman (use): "Completed: serve-time reality re-probe — annotates stale
+assertions at resume. Modified: scripts/lib/reality-checks.js + runVerifyDispatch."
+
 ### 6. Open threads
 
 Bullet list of pending decisions, blocked tasks, or deferred questions.
+
+**Caveman/telegraphic authoring (mandatory).** Author each open-thread string in
+telegraphic mode: strip function words, keep every load-bearing token (identifiers,
+paths, line refs, PR numbers, SHAs, names, numbers, decisions). Each thread is
+stored verbatim as a queryable `open_thread` assertion row in Postgres — the engine
+does not compress it. Shorter threads = fewer bootstrap tokens on the next resume.
+`test/north-star/test-caveman-economy.js` enforces caveman compression with no
+fidelity regression (leaner cannot be bought with lost load-bearing tokens).
 
 ### 7. CLAUDE.md promotion
 
@@ -145,11 +168,19 @@ echo '<JSON_PAYLOAD>' | PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" clos
   },
   "tldr": "3–5 sentences summarizing session state.",
   "open_threads": ["pending decision 1", "blocked task 2"],
-  "quick_references": "optional named handles",
+  "quick_references": "telegraphic: named handles, file paths, line refs — function words stripped",
   "session_id": "optional — engine resolves in order: (1) this value, (2) CLAUDE_CODE_SESSION_ID env var, (3) session_in_progress DB marker; omit unless you know the actual session id",
   "confirm_claude_md_promotion": false
 }
 ```
+
+**Caveman authoring applies to `tldr`, `open_threads`, and `quick_references`.** All
+three are persisted verbatim as queryable `session_tldr`, `open_thread`, and
+`quick_reference` assertion rows in Postgres. Strip function words; keep every
+load-bearing token (identifiers, paths, line refs, PR numbers, SHAs, names, numbers,
+decisions). The engine stores what you write — leaner prose = fewer bootstrap tokens
+on next resume. `test/north-star/test-caveman-economy.js` enforces this: caveman
+tokens < verbose tokens, zero load-bearing loss.
 
 ## Payload staging (mandatory)
 
