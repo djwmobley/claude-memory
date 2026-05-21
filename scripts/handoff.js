@@ -3475,13 +3475,13 @@ function deriveIntentSubject(threadText) {
  * Provenance: source='user_stated', confidence=8, tier='probationary' on birth.
  * Cardinality: all three predicates are 1:1 — one live row per (projectId, subject, predicate).
  *
- * Per-row semantics (within BEGIN/COMMIT transaction per row):
- *   1. Select the prior LIVE row for (projectId, canonSubject, predicate).
- *   2a. Same-session exact repeat → touch-only (bump last_reinforced).
- *   2b. Different session, same object → CONSOLIDATE IN PLACE (tier='consolidated',
- *       corroboration_count++). Required by P4.
- *   2c. Different object → supersede prior, INSERT new live row.
- *   3. No prior row → INSERT new live row (probationary).
+ * Persistence: each intent row is written through writeAssertionWithSupersession
+ * (the SAME gated path payload.assertions uses), so tier is set ONLY at INSERT by the
+ * L0/L2 consolidation gate — never via an UPDATE. This honors the no-tier-UPDATE
+ * anti-forge invariant (test-l0/l2 T13): cross-session restatement of identical intent
+ * is corroboration routed through the gate (it consolidates only when a genuine quality
+ * corroborator exists — reality_check='verified' OR pinned), NOT an auto-forge. A changed
+ * thread on the same subject supersedes the prior via the 1:1 path.
  *
  * @param {object} db         - StoragePort adapter (Postgres or SQLite).
  * @param {string} projectId  - project UUID.
@@ -3525,94 +3525,32 @@ async function persistSessionIntent(db, projectId, payload, projectBasename) {
     });
   }
 
+  // Persist each intent item through the SAME gated write path payload.assertions
+  // uses (writeAssertionWithSupersession). Tier is set ONLY at INSERT by the L0/L2
+  // consolidation gate — never via an UPDATE — so this honors the no-tier-UPDATE
+  // anti-forge invariant (test-l0/l2 T13). 1:1 supersession handles a changed thread;
+  // identical cross-session restatement is corroboration through the gate (consolidates
+  // only with a genuine quality corroborator), never an auto-forge.
+  const registryMode = await getSetting(db, projectId, 'predicate_registry_mode', 'permissive');
   for (const intent of intents) {
-    const canonSubject = canonicalize(intent.subject);
-    const predicate    = intent.predicate;
-    const newObject    = intent.object;
-    const conf         = 8;
-    const source       = 'user_stated';
-
-    await db.query('BEGIN');
     try {
-      // SELECT prior LIVE row for (projectId, canonSubject, predicate).
-      // Use application-level canonicalization (same pattern as writeAssertionWithSupersession).
-      const { rows: candidates } = await db.query(
-        `SELECT id, subject, object, session_id, tier, corroboration_count
-         FROM assertions
-         WHERE project_id = $1
-           AND predicate  = $2
-           AND suppressed = false
-           AND invalid_at IS NULL`,
-        [projectId, predicate]
+      await writeAssertionWithSupersession(
+        db,
+        projectId,
+        {
+          subject:    intent.subject,
+          predicate:  intent.predicate,
+          object:     intent.object,
+          confidence: 8,
+          source:     'user_stated',
+        },
+        sessionId,
+        registryMode
       );
-
-      let priorRow = null;
-      for (const r of candidates) {
-        if (canonicalize(r.subject) === canonSubject) {
-          priorRow = r;
-          break;
-        }
-      }
-
-      if (priorRow) {
-        const sameObject  = (priorRow.object === newObject);
-        const sameSession = (priorRow.session_id != null && sessionId != null &&
-                             priorRow.session_id === sessionId);
-
-        if (sameObject && sameSession) {
-          // 2a. Same-session exact repeat — touch-only: bump last_reinforced.
-          const bumpStmt = db.buildBumpAssertions([priorRow.id]);
-          if (bumpStmt) {
-            await db.query(bumpStmt.sql, bumpStmt.params);
-          }
-        } else if (sameObject && !sameSession) {
-          // 2b. Cross-session restatement of identical intent — CONSOLIDATE IN PLACE.
-          // Must not suppress+reinsert (would break P4's find-by-lowest-id expectation
-          // since rows.find returns by object content in ORDER BY id order).
-          // promoted_at is not touched here; only the promote operator (/handoff:promote)
-          // sets promoted_at. This is the cross-session corroboration path for intent rows.
-          await db.query(
-            `UPDATE assertions
-               SET consolidated_at      = now(),
-                   corroboration_count  = corroboration_count + 1,
-                   last_reinforced      = now(),
-                   promoted_at          = promoted_at,
-                   tier                 = 'consolidated'
-             WHERE id = $1`,
-            [priorRow.id]
-          );
-        } else {
-          // 2c. Different object — supersede prior, INSERT new live row.
-          const suppressStmt = db.buildSupersessionUpdate(
-            '1:1', projectId, priorRow.subject, predicate, newObject
-          );
-          if (suppressStmt) {
-            await db.query(suppressStmt.sql, suppressStmt.params);
-          }
-          // INSERT new live row (probationary).
-          await db.query(
-            `INSERT INTO assertions
-               (project_id, subject, predicate, object, confidence, source, session_id,
-                last_reinforced, valid_at, tier, corroboration_count)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now(), 'probationary', 1)`,
-            [projectId, canonSubject, predicate, newObject, conf, source, sessionId]
-          );
-        }
-      } else {
-        // 3. No prior row — INSERT new live row (probationary).
-        await db.query(
-          `INSERT INTO assertions
-             (project_id, subject, predicate, object, confidence, source, session_id,
-              last_reinforced, valid_at, tier, corroboration_count)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now(), 'probationary', 1)`,
-          [projectId, canonSubject, predicate, newObject, conf, source, sessionId]
-        );
-      }
-
-      await db.query('COMMIT');
     } catch (err) {
-      try { await db.query('ROLLBACK'); } catch (_) {}
-      process.stderr.write(`[handoff] persistSessionIntent failed for predicate "${predicate}" (non-fatal): ${err.message}\n`);
+      process.stderr.write(
+        `[handoff] persistSessionIntent failed for predicate "${intent.predicate}" (non-fatal): ${err.message}\n`
+      );
     }
   }
 }
