@@ -448,7 +448,7 @@ trivially fail. Fidelity had to be redefined as "every load-bearing token
 survives while function-word density provably drops" — a harder-to-satisfy
 definition, but the right one.
 
-(PR #96, commit `0687083`)
+(PR #96, commit `0f07baa`)
 
 ---
 
@@ -473,7 +473,7 @@ before you forget what you were trying to guarantee in the first place.
 
 ## For nerds
 
-The four north-star test files are in `test/north-star/`. The shared scaffold
+The five north-star test files are in `test/north-star/`. The shared scaffold
 (`test/north-star/lib/ns-harness.js`) documents the RED-by-construction
 contract in its header and provides the `blankHandoffMdBody`, `assertSurfaced`,
 `assertMdThinPointer`, and related primitives the sibling files compose.
