@@ -30,7 +30,7 @@ It persists durable session state as queryable Postgres rows at the session boun
 | `docs/deep/studies/2026-05-memory-systems-comparison.md` | Comparative analysis: claude-memory vs. mem0, Graphiti/Zep, Letta, others | current |
 | `docs/deep/studies/decay-vs-dont-forget-and-resurrection.md` | Study: decay, devalue-vs-invalidate, and the resurrect ring design | current |
 | `commands/handoff/README.md` | Overview of all `/handoff:*` slash commands | updated (added /handoff:resurrect) |
-| `commands/handoff/init.md` | `/handoff:init` — first-run provisioning command | current |
+| `commands/handoff/init.md` | `/handoff:init` — first-run provisioning command | updated (removed phantom $2 description positional) |
 | `commands/handoff/status.md` | `/handoff:status` — read-only project memory status | current |
 | `commands/handoff/close.md` | `/handoff:close` — end-of-session extraction and session-intent persistence | updated (caveman/telegraphic authoring guidance for tldr, open_threads, quick_references) |
 | `commands/handoff/resume.md` | `/handoff:resume` — explicit context load; surfaces `### Session intent` section | updated (serve-time reality re-probe description added) |

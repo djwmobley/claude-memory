@@ -44,9 +44,9 @@ fi
 PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" init
 ```
 
-Optional positional args passed through to the helper:
-- `$1` — project name (defaults to directory name)
-- `$2` — project description (defaults to generic placeholder)
+Optional args passed through to the helper:
+- `$1` — project name (optional positional; defaults to the directory basename)
+- `-y` — skip the interactive DB-creation prompt and auto-create the database if absent
 
 ## Expected output
 
