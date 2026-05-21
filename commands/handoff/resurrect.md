@@ -74,6 +74,12 @@ PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" resurrect "auth bug" --reviv
 
 # Cap candidate subject set to 30 (default 20):
 PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" resurrect "auth bug" --revive --limit=30
+
+# Emit JSON instead of prose (dry-run):
+PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" resurrect "auth bug" --json
+
+# Emit JSON and actually revive:
+PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" resurrect "auth bug" --json --revive
 ```
 
 ## Expected output
@@ -113,12 +119,36 @@ No matching probationary rows found for seed: "auth bug"
 Done: handoff:resurrect — no matches
 ```
 
+**With `--json` (dry-run):**
+```json
+{
+  "seed": "auth bug",
+  "mode": "dry-run",
+  "candidate_count": 1,
+  "candidates": [
+    {
+      "meta": "model_extracted|conf=7|downvoted_probation|2026-04-10T14:23:11.000Z",
+      "source": "model_extracted",
+      "confidence": 7,
+      "suppression_kind": "downvoted_probation",
+      "created_at": "2026-04-10T14:23:11.000Z",
+      "text": "auth-service token_expiry is 24h"
+    }
+  ],
+  "revived_count": 0,
+  "revived_ids": []
+}
+```
+
+**With `--json --revive`:** same shape, `"mode": "revived"`, `revived_count` and `revived_ids` are populated.
+
 ## Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--revive`, `-r` | off (dry-run) | Actually un-suppress matched rows |
 | `--limit=N` | 20 | Cap candidate subject set size |
+| `--json` | off | Emit structured JSON instead of prose (see JSON output below) |
 | `--help`, `-h` | — | Show usage and exit 0 |
 
 ## Exit codes
