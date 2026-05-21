@@ -509,6 +509,69 @@ async function runTests() {
       `output should include DRY-RUN header even without --json. stdout: ${result.stdout}`);
   });
 
+  // ─── Feature 3 extra: close --dry-run zero-mutation invariant on reality_check ──
+  //
+  // Seeds a live assertion with a verify-mode predicate (branch_exists) and a known
+  // reality_check value, then runs close --dry-run and asserts the reality_check
+  // column is UNCHANGED.  This locks the invariant that the pre-write verify refresh
+  // (UPDATE assertions SET reality_check) is fully skipped under --dry-run.
+
+  await test('close --dry-run: reality_check column is not mutated for verify-predicate rows', async () => {
+    // Seed a live branch_exists assertion with a known reality_check value.
+    const knownRealityCheck = 'verified';
+    const { rows: seedRcRows } = await db.query(
+      `INSERT INTO assertions
+         (project_id, subject, predicate, object, confidence, source, suppressed, reality_check)
+       VALUES ($1, 'dry-run-branch-subject', 'branch_exists', 'nonexistent-branch-xyzzy', 8, 'user_stated', false, $2)
+       RETURNING id`,
+      [projectId, knownRealityCheck]
+    );
+    const rcAssertionId = seedRcRows[0].id;
+
+    // Also seed an in_file assertion with a known reality_check to cover a second
+    // verify-mode predicate in the same pass.
+    const { rows: seedInFileRows } = await db.query(
+      `INSERT INTO assertions
+         (project_id, subject, predicate, object, confidence, source, suppressed, reality_check)
+       VALUES ($1, 'dry-run-file-subject', 'in_file', 'scripts/handoff.js', 8, 'user_stated', false, $2)
+       RETURNING id`,
+      [projectId, knownRealityCheck]
+    );
+    const inFileAssertionId = seedInFileRows[0].id;
+
+    // Run close --dry-run with a payload that would normally trigger the pre-write refresh.
+    const dryPayload = {
+      entities:   [],
+      assertions: [
+        { subject: 'dry-run-branch-subject', predicate: 'uses', object: 'Node.js', confidence: 7, source: 'model_extracted' },
+      ],
+      edges:    [],
+      contract: { queries: [{ type: 'recency', token_budget: 300 }] },
+      tldr:     'reality-check zero-mutation test',
+      open_threads: [],
+      session_id: 'test-dry-run-rc-001',
+    };
+    const result = runHelperBoth('close', ['--json', '--dry-run'], { fakeRoot, stdin: JSON.stringify(dryPayload) });
+    assert.strictEqual(result.exitCode, 0,
+      `close --dry-run should exit 0; got ${result.exitCode}. stderr: ${result.stderr}`);
+
+    // Assert reality_check is UNCHANGED for both seeded rows.
+    const { rows: rcAfterRows } = await db.query(
+      `SELECT id, reality_check FROM assertions WHERE id = ANY($1::int[])`,
+      [[rcAssertionId, inFileAssertionId]]
+    );
+    assert.strictEqual(rcAfterRows.length, 2, 'both seeded assertions should still exist');
+    for (const row of rcAfterRows) {
+      assert.strictEqual(
+        row.reality_check, knownRealityCheck,
+        `reality_check for assertion ${row.id} should be '${knownRealityCheck}' after --dry-run, got '${row.reality_check}'`
+      );
+    }
+
+    // Clean up the seeded rows so they do not affect other tests.
+    await db.query(`DELETE FROM assertions WHERE id = ANY($1::int[])`, [[rcAssertionId, inFileAssertionId]]);
+  });
+
   // ─── Cleanup ──────────────────────────────────────────────────────────────
   await db.end();
   await teardown();

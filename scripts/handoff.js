@@ -4375,12 +4375,15 @@ async function cmdClose(args) {
   // Remove orphaned project_settings rows keyed to the legacy encodeCwd(root) id
   // for this project ONLY — strictly scoped, idempotent, snapshot-first.
   // Non-fatal: any error is logged and ignored so close can proceed.
-  try {
-    const { encodeCwd: _encodeCwd } = require('./lib/encoded-cwd');
-    const legacyIdForReconcile = _encodeCwd(root);
-    await reconcileLegacySettings(db, legacyIdForReconcile, projectId, { silent: true });
-  } catch (reconcileErr) {
-    process.stderr.write('[handoff] legacy reconcile (non-fatal): ' + reconcileErr.message + '\n');
+  // Skipped under --dry-run (DELETE is a mutation; dry-run must be zero-mutation).
+  if (!dryRun) {
+    try {
+      const { encodeCwd: _encodeCwd } = require('./lib/encoded-cwd');
+      const legacyIdForReconcile = _encodeCwd(root);
+      await reconcileLegacySettings(db, legacyIdForReconcile, projectId, { silent: true });
+    } catch (reconcileErr) {
+      process.stderr.write('[handoff] legacy reconcile (non-fatal): ' + reconcileErr.message + '\n');
+    }
   }
 
   const handoffPath = resolveHandoffMdPath(projectId);
@@ -4476,25 +4479,28 @@ async function cmdClose(args) {
   // Uses the existing buildSupersessionUpdate port method (dialect-neutral, zero new SQL).
   // Idempotent: once suppressed, subsequent closes are a no-op on the legacy row.
   // Non-fatal: mirrors the surrounding ensureSchemaCurrent error semantics.
-  try {
-    const canonBasename = path.basename(root);
-    const { rows: legacyPackRows } = await db.query(
-      `SELECT DISTINCT subject FROM assertions
-       WHERE project_id = $1
-         AND predicate  = $2
-         AND suppressed = false
-         AND invalid_at IS NULL`,
-      [projectId, 'has_unpackaged_state']
-    );
-    for (const row of legacyPackRows) {
-      if (row.subject !== canonBasename) {
-        // This is a legacy/non-canonical subject row — suppress it.
-        const suppressStmt = db.buildSupersessionUpdate('1:1', projectId, row.subject, 'has_unpackaged_state', null);
-        await db.query(suppressStmt.sql, suppressStmt.params);
+  // Skipped under --dry-run (suppression UPDATE is a mutation; dry-run must be zero-mutation).
+  if (!dryRun) {
+    try {
+      const canonBasename = path.basename(root);
+      const { rows: legacyPackRows } = await db.query(
+        `SELECT DISTINCT subject FROM assertions
+         WHERE project_id = $1
+           AND predicate  = $2
+           AND suppressed = false
+           AND invalid_at IS NULL`,
+        [projectId, 'has_unpackaged_state']
+      );
+      for (const row of legacyPackRows) {
+        if (row.subject !== canonBasename) {
+          // This is a legacy/non-canonical subject row — suppress it.
+          const suppressStmt = db.buildSupersessionUpdate('1:1', projectId, row.subject, 'has_unpackaged_state', null);
+          await db.query(suppressStmt.sql, suppressStmt.params);
+        }
       }
+    } catch (legacyCleanupErr) {
+      process.stderr.write('[handoff] legacy has_unpackaged_state cleanup failed (non-fatal): ' + legacyCleanupErr.message + '\n');
     }
-  } catch (legacyCleanupErr) {
-    process.stderr.write('[handoff] legacy has_unpackaged_state cleanup failed (non-fatal): ' + legacyCleanupErr.message + '\n');
   }
 
   // ── Async extraction gate (opt-in, default OFF = synchronous as before) ──────
@@ -4601,60 +4607,70 @@ async function cmdClose(args) {
   //
   // This closes the close→close edge case.  Serve-time re-probe covers the
   // resume→close path (user does resume before next close — already covered).
-  try {
-    const { REALITY_CHECKS, runVerifyDispatch } = require('./lib/reality-checks');
-    const preWriteRoot = root;
-    const verifyPredicates = [...new Set(
-      REALITY_CHECKS.filter((c) => c.mode === 'verify').map((c) => c.predicate)
-    )];
-    if (verifyPredicates.length > 0) {
-      // Fetch all live rows for verify predicates in one query.
-      const placeholders = verifyPredicates.map((_, i) => `$${i + 2}`).join(', ');
-      let preWriteRows;
-      try {
-        const { rows } = await db.query(
-          `SELECT id, subject, predicate, object FROM assertions
-           WHERE project_id = $1
-             AND predicate  IN (${placeholders})
-             AND suppressed = false
-             AND invalid_at IS NULL`,
-          [projectId, ...verifyPredicates]
-        );
-        preWriteRows = rows;
-      } catch (_fetchErr) {
-        preWriteRows = [];
-      }
-
-      if (preWriteRows.length > 0) {
-        let preWriteResults;
+  //
+  // Skipped entirely under --dry-run: the UPDATE assertions SET reality_check
+  // write is a DB mutation.  The dry-run summary does not use these results, so
+  // skipping the whole block is correct and keeps dry-run zero-mutation.
+  if (!dryRun) {
+    try {
+      const { REALITY_CHECKS, runVerifyDispatch } = require('./lib/reality-checks');
+      const preWriteRoot = root;
+      const verifyPredicates = [...new Set(
+        REALITY_CHECKS.filter((c) => c.mode === 'verify').map((c) => c.predicate)
+      )];
+      if (verifyPredicates.length > 0) {
+        // Fetch all live rows for verify predicates in one query.
+        const placeholders = verifyPredicates.map((_, i) => `$${i + 2}`).join(', ');
+        let preWriteRows;
         try {
-          preWriteResults = await runVerifyDispatch(db, projectId, preWriteRoot, preWriteRows);
-        } catch (_dispatchErr) {
-          preWriteResults = [];
+          const { rows } = await db.query(
+            `SELECT id, subject, predicate, object FROM assertions
+             WHERE project_id = $1
+               AND predicate  IN (${placeholders})
+               AND suppressed = false
+               AND invalid_at IS NULL`,
+            [projectId, ...verifyPredicates]
+          );
+          preWriteRows = rows;
+        } catch (_fetchErr) {
+          preWriteRows = [];
         }
-        for (const res of preWriteResults) {
+
+        if (preWriteRows.length > 0) {
+          let preWriteResults;
           try {
-            await db.query(
-              `UPDATE assertions SET reality_check = $1 WHERE id = $2`,
-              [res.tag, res.id]
-            );
-          } catch (_tagErr) {
-            // Non-fatal — proceed with next row.
+            preWriteResults = await runVerifyDispatch(db, projectId, preWriteRoot, preWriteRows);
+          } catch (_dispatchErr) {
+            preWriteResults = [];
+          }
+          for (const res of preWriteResults) {
+            try {
+              await db.query(
+                `UPDATE assertions SET reality_check = $1 WHERE id = $2`,
+                [res.tag, res.id]
+              );
+            } catch (_tagErr) {
+              // Non-fatal — proceed with next row.
+            }
           }
         }
       }
+    } catch (_preWriteErr) {
+      // Fully non-fatal: L2 sees potentially stale reality_check (same as pre-fix behavior).
+      process.stderr.write(`[handoff] pre-write verify refresh failed (non-fatal): ${_preWriteErr.message}\n`);
     }
-  } catch (_preWriteErr) {
-    // Fully non-fatal: L2 sees potentially stale reality_check (same as pre-fix behavior).
-    process.stderr.write(`[handoff] pre-write verify refresh failed (non-fatal): ${_preWriteErr.message}\n`);
   }
 
   // ── Dry-run short-circuit ─────────────────────────────────────────────────────
   //
   // When --dry-run is set, print a summary of what WOULD be written and exit.
-  // ZERO mutations occur.  All DB queries above were read-only (probes, reality
-  // checks, pre-write verify refresh).  We do NOT call writeExtraction, do NOT
-  // update handoff.md, do NOT clear session_in_progress.
+  // ZERO mutations occur.  The following mutating passes are all guarded with
+  // if (!dryRun) above and do NOT execute on this path:
+  //   - legacy-settings reconciliation (DELETE project_settings)
+  //   - Deliverable B2 legacy has_unpackaged_state suppression (UPDATE assertions)
+  //   - pre-write verify refresh (UPDATE assertions SET reality_check)
+  // We do NOT call writeExtraction, do NOT update handoff.md, do NOT clear
+  // session_in_progress.
   //
   // What this dry-run does NOT rehearse:
   //   - C2 (retrieval outcome bias feedback) — requires DB writes + idempotency markers.
