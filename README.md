@@ -65,17 +65,17 @@ Full version: [docs/how-memory-works.md](docs/how-memory-works.md).
 
 ## The slash commands
 
-| Command | What it does | Reference |
-|---------|-------------|-----------|
-| `/handoff:init` | First-run setup for a new project — creates the database tables and starter files. | [commands/handoff/init.md](commands/handoff/init.md) |
-| `/handoff:status` | Quick check: project name, database connection, entry counts. | [commands/handoff/status.md](commands/handoff/status.md) |
-| `/handoff:close` | Wrap up the session and write today's journal entries. Run this before you're done. | [commands/handoff/close.md](commands/handoff/close.md) |
-| `/handoff:checkpoint` | Write entries mid-session without ending it. Useful for long sessions. | [commands/handoff/checkpoint.md](commands/handoff/checkpoint.md) |
-| `/handoff:resume` | Force-load prior context even if it's been a long time since the last session. | [commands/handoff/resume.md](commands/handoff/resume.md) |
-| `/handoff:drop` | Archive the current journal and start fresh. Use when a project phase is truly over. | [commands/handoff/drop.md](commands/handoff/drop.md) |
-| `/handoff:purge` | Delete everything. No undo. Use with care. | [commands/handoff/purge.md](commands/handoff/purge.md) |
-| `/handoff:promote` | Bump a journal entry into `CLAUDE.md` so it's always loaded, not just "when relevant." | [commands/handoff/promote.md](commands/handoff/promote.md) |
-| `/handoff:resurrect` | Pull decay-suppressed notes on a topic back to the surface; dry-run by default, pass `--revive` to un-suppress. | [commands/handoff/resurrect.md](commands/handoff/resurrect.md) |
+| Command | What it does | Parameters | Reference |
+|---------|-------------|-----------|-----------|
+| `/handoff:init [<name>] [-y]` | First-run setup for a new project — creates the database tables and starter files. | `<name>` optional project name; `-y` skip DB prompt | [commands/handoff/init.md](commands/handoff/init.md) |
+| `/handoff:status [--json] [--breakdown] [--stale-pointers]` | Quick check: project name, database connection, entry counts. | `--json` structured output; `--breakdown` trust-tier counts; `--stale-pointers` stale code-pointer count | [commands/handoff/status.md](commands/handoff/status.md) |
+| `/handoff:close [--json] [--dry-run]` | Wrap up the session and write today's journal entries. Run this before you're done. | `--json` read payload from stdin; `--dry-run` validate without writing | [commands/handoff/close.md](commands/handoff/close.md) |
+| `/handoff:checkpoint [--json] [--note "<text>"]` | Write entries mid-session without ending it. Useful for long sessions. | `--json` full payload from stdin; `--note "<text>"` single-line capture | [commands/handoff/checkpoint.md](commands/handoff/checkpoint.md) |
+| `/handoff:resume` | Force-load prior context even if it's been a long time since the last session. | — | [commands/handoff/resume.md](commands/handoff/resume.md) |
+| `/handoff:drop` | Archive the current journal and start fresh. Use when a project phase is truly over. | — | [commands/handoff/drop.md](commands/handoff/drop.md) |
+| `/handoff:purge [--yes] [--dry-run]` | Delete everything. No undo. Use with care. | `--yes` skip confirmation prompt; `--dry-run` preview row counts only | [commands/handoff/purge.md](commands/handoff/purge.md) |
+| `/handoff:promote <id>` or `--subject <s> --predicate <p>` | Bump a journal entry into `CLAUDE.md` so it's always loaded, not just "when relevant." | `<id>` assertion ID; `--subject/--predicate/--object` content match; `--demote <id>` reverse | [commands/handoff/promote.md](commands/handoff/promote.md) |
+| `/handoff:resurrect <topic> [--revive] [--limit=N] [--json]` | Pull decay-suppressed notes on a topic back to the surface; dry-run by default. | `<topic>` seed text; `--revive`/`-r` un-suppress; `--limit=N` cap candidate set | [commands/handoff/resurrect.md](commands/handoff/resurrect.md) |
 
 ---
 

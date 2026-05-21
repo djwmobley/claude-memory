@@ -6,6 +6,10 @@ Archive this project's notes and start fresh. All existing assertions are suppre
 
 Use this when a project phase is truly over and you want a clean slate. For a hard delete with no recovery path, use `/handoff:purge` instead.
 
+## Arguments
+
+None — this command takes no flags or positional arguments.
+
 ## What this does
 
 1. `UPDATE assertions SET confidence = 1.0, decay_rate = 999.0 WHERE project_id = $1`

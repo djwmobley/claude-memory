@@ -148,15 +148,15 @@ This is especially important for high-stakes facts — project status, ownership
 
 These are the commands you type to interact with the journal. Each one is a short recipe that tells Claude what to do.
 
-- `/handoff:init` — Set up the journal for a new project. Creates the database tables and the starter files. Run this once per project.
-- `/handoff:status` — Quick check on how the journal is doing. Shows your project name, database connection, and how many entries exist.
-- `/handoff:close` — Wrap up the session and write today's entries. Run this at the end of your work session. The librarian writes and saves all new notes. Code pointers (`file:line`) in the served output are validated against the live file tree at close time: stale line numbers are auto-corrected, and pointers whose anchor can no longer be located are flagged in the Reconciliation section.
-- `/handoff:checkpoint` — Write entries mid-session without ending the session. Useful for long sessions where you want to save progress partway through.
+- `/handoff:init` — Set up the journal for a new project. Creates the database tables and the starter files. Run this once per project. Pass an optional project name (`/handoff:init "my-project"`) and `-y` to skip the interactive DB-creation prompt.
+- `/handoff:status` — Quick check on how the journal is doing. Shows your project name, database connection, and how many entries exist. Add `--json` for structured output, `--breakdown` for per-tier counts, or `--stale-pointers` to count code pointers that no longer resolve.
+- `/handoff:close` — Wrap up the session and write today's entries. Run this at the end of your work session. Pass `--json` to supply the extraction payload via stdin; add `--dry-run` to validate and preview the write without touching the database. Code pointers (`file:line`) in the served output are validated against the live file tree at close time: stale line numbers are auto-corrected, and pointers whose anchor can no longer be located are flagged in the Reconciliation section.
+- `/handoff:checkpoint` — Write entries mid-session without ending the session. Useful for long sessions where you want to save progress partway through. Pass `--json` for a full payload via stdin, or `--note "<text>"` to capture a single line without composing a full payload.
 - `/handoff:resume` — Force the librarian to load context, even if it's been a long time. Normally the loader skips auto-injection if your last session was more than a week ago — this overrides that. Code pointers are validated against the live file tree on resume as well; stale line numbers are corrected in the served output, but corrections are not persisted (close is the mutation point).
 - `/handoff:drop` — Archive the current journal and start fresh. The old entries are kept but set aside. Use this when a project phase is truly over and you want a clean slate.
-- `/handoff:purge` — Delete everything. No undo. Use with care.
-- `/handoff:promote` — Bump a journal entry up to `CLAUDE.md`. Promoted entries are always loaded, not just "when relevant." Use this for facts that are so fundamental Claude should never be without them.
-- `/handoff:resurrect` — Pull specific dormant notes back to the surface by topic. Use this when you return to a project after a long gap and want to bring back decayed entries on a particular subject — for example, "resurrect notes about the auth bug." By default it is a dry-run (shows what would come back without changing anything); pass `--revive` to actually un-suppress the matched rows.
+- `/handoff:purge` — Delete everything. No undo. Use with care. Pass `--dry-run` to see row counts before committing, or `--yes` to skip the confirmation prompt.
+- `/handoff:promote` — Bump a journal entry up to `CLAUDE.md`. Promoted entries are always loaded, not just "when relevant." Pass an assertion ID (`/handoff:promote 42`) or use `--subject`/`--predicate`/`--object` to find the entry by content. To reverse a prior promotion, use `--demote <id>`.
+- `/handoff:resurrect` — Pull specific dormant notes back to the surface by topic. Use this when you return to a project after a long gap and want to bring back decayed entries on a particular subject — for example, "resurrect notes about the auth bug." By default it is a dry-run (shows what would come back without changing anything); pass `--revive` (or `-r`) to actually un-suppress the matched rows. Use `--limit=N` to cap the candidate set size, or `--json` for structured output.
 
 ---
 
