@@ -675,229 +675,120 @@ async function runTests() {
     await teardownProject(ctx);
   });
 
-  // ── P8: commit_merged not-merged→merged ──────────────────────────────────
-  await test('P8 commit_merged: asserted "<not-merged>" but now "merged" (mismatch → STALE)', async () => {
+  // ── P8: commit_merged asserted "merged" but sha NOT in main → mismatch ────
+  //
+  // Setup: create a commit on a side branch (not merged into main), then delete
+  // the branch.  The orphaned commit's sha is NOT an ancestor of main.
+  // Assert the object as "<branchSha> on main" (claiming the commit is merged).
+  // Probe: merge-base --is-ancestor branchSha main → exit 1 → returns '<not-merged>'.
+  // '<not-merged>' !== "<branchSha> on main" → mismatch → served as [STALE:].
+  await test('P8 commit_merged: sha NOT ancestor of main → [STALE: mismatch]', async () => {
     const ctx = await setupProject('p8');
     const { fakeRoot, projectId, db } = ctx;
     runInit(fakeRoot);
 
-    // Get the initial HEAD sha (it IS in the history, so merge-base returns 0).
-    // For "not-merged at close time", we make a commit on a branch but assert '<not-merged>'.
-    // Then by resume time the commit IS reachable from HEAD.
-    const initialSha = gitHeadSha(fakeRoot);
-
-    // Insert asserting '<not-merged>' for a commit that IS actually in history.
-    const row = await insertAssertion(db, projectId, {
-      subject: 'some-pr', predicate: 'commit_merged', object: '<not-merged>',
-      realityCheck: 'verified', sessionId: 'test-p8',
-    });
-
-    // We need the object to be the SHA so the probe can use it.
-    // Update object to be the initialSha (which IS merged into HEAD).
-    await db.query(
-      `UPDATE assertions SET object = $1 WHERE id = $2`,
-      [`${initialSha} on main`, row.id]
-    );
-
-    const snapBefore = await getAssertionById(db, row.id);
-    // snapBefore.object is now "<sha> on main"
-
-    // At serve time, probe will return 'merged' because initialSha IS in main.
-    // But we asserted '<not-merged>' wait — no we updated to '<sha> on main' above.
-    // We need to assert the SHA in object and it should return 'merged'.
-    // So the assertion is 'merged' but object was '<not-merged>' — we need to assert
-    // a state that will be a mismatch.
-    //
-    // Let's use a different approach: assert the sha but with object='<not-merged>'
-    // and have the probe check — but probe checks object as the sha-on-branch format.
-    // Re-think: We'll create a new commit on a branch (not yet merged into main),
-    // assert the object as '<sha> on main' (claiming it's merged), but the sha is
-    // NOT in main yet — so probe returns '<not-merged>' (mismatch).
-    //
-    // Actually let's just test the inverse: sha IS in main; we assert '<not-merged>';
-    // probe returns 'merged'; mismatch → [STALE: now "merged"].
-    //
-    // We need the object format to be a valid SHA for the probe parser.
-    // Set object to just the sha — probe returns 'merged' (it IS in HEAD).
-    await db.query(
-      `UPDATE assertions SET object = $1, reality_check = 'verified' WHERE id = $2`,
-      ['<not-merged>', row.id]
-    );
-    // Now we need subject to contain a SHA so the probe can extract it.
-    // Actually commit_merged probe uses object, not subject.
-    // object='<not-merged>' is not a valid SHA format → probe returns null → unverifiable.
-    // That's F-class not P8. Let's approach differently.
-    //
-    // The canonical approach: insert an assertion where object is a real SHA
-    // that IS in main, but asserted as '<not-merged>'.
-    // Wait — the probe parses the object. If object='<not-merged>', the SHA regex won't match.
-    // So for P8 we need: object = sha (or sha on branch) and expect 'merged'.
-    // But we want the assertion to say "not merged" (pre-drift state).
-    //
-    // Correct approach: use object = 'abc on main' where abc IS in main → returns 'merged'.
-    // Assertion was 'merged' at close, but now we want to simulate "it was NOT merged"...
-    // The drift direction P8 wants is: close-time says NOT merged; now it IS.
-    // That means: object = '<not-merged>' at close, but we need the probe to read the SHA.
-    //
-    // The probe reads `object` for the SHA. If object='<not-merged>', it returns null.
-    // So we need: subject carries some marker but object has the actual sha.
-    //
-    // Simplest working setup: object = initialSha (which IS in main) → probe returns 'merged'.
-    // The "assertion" was stored as initialSha, so the expected state is 'merged'.
-    // That's a VERIFIED case (P9), not a drift case.
-    //
-    // For drift: object = sha BUT the sha is NOT in main (so probe returns '<not-merged>').
-    // We can do this by making a commit on a side branch and storing that sha.
+    // Create an orphaned commit on a side branch (not in main).
     const branchSha = (() => {
       gitCreateBranch(fakeRoot, 'side-branch-p8');
-      const sha = gitMakeCommit(fakeRoot, 'side branch commit');
+      const sha = gitMakeCommit(fakeRoot, 'side branch commit p8');
       gitDeleteBranch(fakeRoot, 'side-branch-p8');
       return sha;
     })();
 
-    // Now branchSha is NOT in main (branch deleted, commit orphaned on HEAD of deleted branch).
-    // Actually after gitDeleteBranch, the commit is still in the object store but NOT in
-    // refs/heads/main. We verify: merge-base --is-ancestor branchSha main should exit 1.
-    // But wait — gitDeleteBranch does checkout main first, then branch -D.
-    // The orphan commit is NOT an ancestor of main. Probe returns '<not-merged>'.
-
-    // We want the drift: assertion says 'merged' (was merged at close) but now it's '<not-merged>'.
-    // That's actually harder to simulate without real git history.
-    // Let's use the simpler: assert initialSha as 'merged on main' (claim: merged),
-    // but make a NEW commit on main so initialSha is no longer the tip — though it's still
-    // an ancestor → still 'merged'. That's P9.
-    //
-    // For P8 (not-merged → merged): assert branchSha in object with 'merged on main',
-    // then merge the side branch into main.
-    //
-    // Re-do from scratch for this test: create a side branch commit, assert it as
-    // '<not-merged>' in object using the format the probe can read, then merge it.
-    // Since the probe reads object as "<sha>" or "<sha> on <branch>":
-    // We'll assert object=branchSha (just the sha), probe checks if it's ancestor of HEAD.
-    // branchSha is NOT in main → probe returns '<not-merged>'.
-    // But our assertion says 'merged' → probe sees '<not-merged>' vs 'merged' → mismatch.
-    // That tests the WRONG direction (was merged, now not-merged = P-something).
-    //
-    // For P8 (not-merged → merged): at close time, we say "NOT merged" and store object as
-    // something meaningful. But the probe reads object as the sha.
-    // We need: object was something non-sha (like '<not-merged>') but that → unverifiable.
-    // The only way to test "was not-merged, now merged" is to have the sha in object.
-    //
-    // Conclusion: P8 is more of an OPEN/CLOSED direction issue vs the probe's semantic.
-    // The real mismatch here is: object='merged' but probe returns '<not-merged>',
-    // i.e. we asserted it was merged, now it's not. Let's test THAT direction.
-    await db.query(
-      `UPDATE assertions SET object = $1, reality_check = 'verified' WHERE id = $2`,
-      ['merged', row.id]
-    );
-    // branchSha is NOT in main. Object is 'merged'. But probe needs a SHA in the object.
-    // Set object = branchSha and asserted-as-'merged'. Then probe finds it's '<not-merged>'.
-    await db.query(
-      `UPDATE assertions SET object = $1 WHERE id = $2`,
-      [branchSha, row.id]
-    );
+    // branchSha is NOT an ancestor of main (branch deleted, commit orphaned).
+    // Assert it using the canonical "sha on branch" format as if it WERE merged.
+    const object = `${branchSha} on main`;
+    const row = await insertAssertion(db, projectId, {
+      subject: 'pr-p8', predicate: 'commit_merged', object,
+      realityCheck: 'verified', sessionId: 'test-p8',
+    });
+    const snapBefore = await getAssertionById(db, row.id);
 
     const out = runResume(fakeRoot);
 
-    const after = await getAssertionById(db, row.id);
-    // Probe: branchSha is NOT ancestor of HEAD → returns '<not-merged>'.
-    // Object was branchSha → probe returns '<not-merged>' → mismatch (probe ≠ object).
-    assert.ok(out.includes('[STALE:'), `P8: expected [STALE: in output.\nGot:\n${out}`);
-    assert.strictEqual(after.reality_check, 'mismatch', `P8: expected mismatch`);
+    // Probe returns '<not-merged>' because branchSha is NOT an ancestor of main.
+    // '<not-merged>' !== object → mismatch → [STALE:] annotation in output.
+    assert.ok(out.includes('[STALE:'),
+      `P8: expected [STALE: in output.\nGot:\n${out}`);
+
+    const snapAfter = await getAssertionById(db, row.id);
+    assertSection7(snapBefore, snapAfter, 'P8');
+    assert.strictEqual(snapAfter.reality_check, 'mismatch',
+      `P8: expected reality_check='mismatch', got '${snapAfter.reality_check}'`);
 
     await teardownProject(ctx);
   });
 
-  // ── P9: commit_merged merged→still-merged (verified) ────────────────────
-  await test('P9 commit_merged: merged→still-merged → [verified✓]', async () => {
+  // ── P9: commit_merged sha IS ancestor of main → [verified✓] ─────────────
+  //
+  // This test is the CANONICAL regression guard for the defect:
+  //   OLD probe: returns 'merged' on success → 'merged' !== "<sha> on main" → always mismatch
+  //   FIXED probe: returns the asserted object on success → object === object → verified
+  //
+  // Negative-control result (validated locally before commit):
+  //   Against OLD probe (returning 'merged'): P9 FAILS — assertion shows mismatch,
+  //     output has no [verified✓], reality_check='mismatch'.
+  //   Against FIXED probe (echoing object): P9 PASSES — [verified✓] in output,
+  //     reality_check='verified'.
+  await test('P9 commit_merged: sha IS ancestor of main → [verified✓]', async () => {
     const ctx = await setupProject('p9');
     const { fakeRoot, projectId, db } = ctx;
     runInit(fakeRoot);
 
+    // The initial commit sha IS an ancestor of HEAD (it IS the HEAD).
     const sha = gitHeadSha(fakeRoot);
 
+    // Use the canonical documented format: "<sha> on <branch>".
+    const object = `${sha} on main`;
     const row = await insertAssertion(db, projectId, {
-      subject: 'merge-check', predicate: 'commit_merged', object: sha,
+      subject: 'pr-p9', predicate: 'commit_merged', object,
       realityCheck: null, sessionId: 'test-p9',
     });
+    const snapBefore = await getAssertionById(db, row.id);
 
     const out = runResume(fakeRoot);
-    // sha IS ancestor of HEAD → probe returns 'merged'. 'merged' !== sha → mismatch.
-    // Wait! The probe returns 'merged' but object is the sha. That is always a mismatch.
-    // We need object='merged' and the sha to be embedded in subject or we need
-    // a different object format.
-    //
-    // Looking at the probe: returns 'merged' when ancestor; checks object against probeResult.
-    // For verified: we need object='merged'. For sha-in-object: probeResult='merged' vs
-    // object=sha → always mismatch. So the canonical verified form is object='merged'
-    // with a SHA in subject or the sha "on branch" format doesn't apply here.
-    //
-    // Actually re-reading the probe: it parses object as "<sha> on <branch>" or "<sha>".
-    // It returns 'merged' or '<not-merged>'. So for verified: object must be 'merged'.
-    // For mismatch: object='merged' but sha not in main → probe returns '<not-merged>'.
-    //
-    // For P9 (stable/verified): we want object='merged' and sha IS in main.
-    // But the probe reads the SHA from object. If object='merged', SHA regex won't match.
-    // So probe returns null → unverifiable. That's never the verified path for commit_merged.
-    //
-    // Looking more carefully: the probe parses object with:
-    //   const onMatch = object.match(/^([0-9a-fA-F]{6,40})\s+on\s+(\S+)$/)
-    //   const shaMatch = object.match(/^([0-9a-fA-F]{6,40})$/)
-    // If neither matches, returns null (unverifiable).
-    // So for commit_merged, 'verified' only happens when: object is a sha-formatted string
-    // AND that sha IS an ancestor. probeResult='merged', object=sha → mismatch always.
-    //
-    // This means the probe design for commit_merged only ever yields 'unverifiable' or 'mismatch'
-    // — never 'verified' — because probeResult is always 'merged' | '<not-merged>', never the sha.
-    // This is a design gap: there is no verified state for commit_merged as written.
-    //
-    // The test should reflect this: a sha object → unverifiable (probe returns 'merged' but
-    // 'merged' !== sha → mismatch, not unverifiable). Actually 'merged' !== sha → mismatch.
-    // The probe IS working but there's no way for commit_merged to be 'verified' with current logic.
-    //
-    // For this test, we test the "stable" case: use "<sha> on main" format as object,
-    // which also yields 'merged' from probe, which ≠ '<sha> on main' → mismatch.
-    // Actually there is no verified path for commit_merged. Let's just test the stable
-    // mismatch path and mark this as expected behavior.
-    //
-    // For a more complete test: use a new row with object='merged' directly.
-    // Probe reads object='merged', doesn't match sha regex → null → unverifiable.
-    await db.query(`DELETE FROM assertions WHERE id = $1`, [row.id]);
 
-    // Insert with object='merged' — probe returns null → unverifiable.
-    const row2 = await insertAssertion(db, projectId, {
-      subject: 'merge-check-2', predicate: 'commit_merged', object: 'merged',
-      realityCheck: 'verified', sessionId: 'test-p9',
-    });
+    // Fixed probe: merge-base --is-ancestor sha main → exit 0 → returns object.
+    // object === object → tag='verified' → [verified✓] in served output.
+    assert.ok(out.includes('[verified✓]'),
+      `P9: expected [verified✓] in output (probe must echo object, not 'merged').\nGot:\n${out}`);
+    assert.ok(!out.includes('[STALE:'),
+      `P9: no [STALE:] expected when sha is a real ancestor.\nGot:\n${out}`);
 
-    const out2 = runResume(fakeRoot);
-    // 'merged' doesn't match sha regex → probe null → unverifiable → no annotation.
-    // This confirms the 'unverifiable' path for non-sha object.
-    const after2 = await getAssertionById(db, row2.id);
-    assert.strictEqual(after2.reality_check, 'unverifiable',
-      `P9: expected 'unverifiable' for non-sha object, got '${after2.reality_check}'`);
+    const snapAfter = await getAssertionById(db, row.id);
+    assertSection7(snapBefore, snapAfter, 'P9');
+    assert.strictEqual(snapAfter.reality_check, 'verified',
+      `P9: expected reality_check='verified', got '${snapAfter.reality_check}'`);
 
     await teardownProject(ctx);
   });
 
-  // ── P10: commit_merged bad-sha → unverifiable ────────────────────────────
-  await test('P10 commit_merged: bad-sha (not a hex string) → unverifiable', async () => {
+  // ── P10: commit_merged bad object (not a sha) → unverifiable ─────────────
+  //
+  // Object is not a hex sha string and does not match the "<sha> on <branch>"
+  // or bare-sha patterns, so the probe returns null → unverifiable.
+  // No [STALE:] annotation; reality_check stays 'unverifiable' (fail-soft).
+  await test('P10 commit_merged: non-sha object → unverifiable (fail-soft)', async () => {
     const ctx = await setupProject('p10');
     const { fakeRoot, projectId, db } = ctx;
     runInit(fakeRoot);
 
     const row = await insertAssertion(db, projectId, {
-      subject: 'pr-123', predicate: 'commit_merged', object: 'not-a-real-sha',
+      subject: 'pr-p10', predicate: 'commit_merged', object: 'not-a-real-sha',
       realityCheck: 'verified', sessionId: 'test-p10',
     });
 
     const out = runResume(fakeRoot);
-    // Bad sha → probe returns null → unverifiable → no STALE annotation.
-    assert.ok(!out.includes('[STALE:'), `P10: no [STALE:] expected for bad sha`);
+
+    // Non-sha object → probe returns null → unverifiable → no annotation.
+    assert.ok(!out.includes('[STALE:'),
+      `P10: no [STALE:] expected for non-sha object.\nGot:\n${out}`);
+    assert.ok(!out.includes('[verified✓]'),
+      `P10: no [verified✓] expected for non-sha object.\nGot:\n${out}`);
 
     const after = await getAssertionById(db, row.id);
     assert.strictEqual(after.reality_check, 'unverifiable',
-      `P10: expected 'unverifiable' for bad-sha, got '${after.reality_check}'`);
+      `P10: expected reality_check='unverifiable', got '${after.reality_check}'`);
 
     await teardownProject(ctx);
   });
