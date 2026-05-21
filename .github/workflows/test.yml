@@ -337,6 +337,22 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run predicate-vocabulary audit tests
+        # Guards that every predicate written to the assertions table is declared in
+        # scripts/lib/predicate-registry.json. Covers four invariants:
+        #   T1  auditAssertionPredicates detects an unregistered predicate in the DB
+        #       (the has_updated class — previously silently kept by permissive mode)
+        #   T2  auditAssertionPredicates returns [] when all rows use registered predicates
+        #   T3  validatePayload strict accepts a representative close vocabulary payload
+        #       (is_status, commit_merged, in_file, has_updated, shipped_at)
+        #   T4  findUnregisteredPredicates confirms has_updated and in_file ARE registered
+        #       and the pure helper correctly identifies truly-unknown predicates
+        # Reuses claude_memory_eval_test (created above); cleans up its own rows.
+        run: node test/handoff/test-predicate-vocabulary.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run end-to-end handoff subcommand tests
         # Golden-path coverage of every /handoff subcommand against a real Postgres:
         #   init/status/resume/close/checkpoint/drop/purge/resurrect — DB row counts,

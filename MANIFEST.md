@@ -40,6 +40,9 @@ It persists durable session state as queryable Postgres rows at the session boun
 | `commands/handoff/purge.md` | `/handoff:purge` — hard delete all project memory (confirmation required) | current |
 | `commands/handoff/resurrect.md` | `/handoff:resurrect` — pull a decayed topic back into active context | current |
 | `hooks/README.md` | SessionStart and Stop hook setup and behavior | current |
+| `scripts/lib/predicate-audit.js` | Exports `findUnregisteredPredicates` (pure) and `auditAssertionPredicates` (DB query) — detects predicates used in the assertions table that are not in the declared registry vocabulary | added |
+| `scripts/audit-predicates.js` | Ops CLI: connects to configured DB, runs `auditAssertionPredicates` across the live corpus (or a single project via `--project=<uuid>`), exits 0 (all registered), 2 (DB error), or 3 (drift found) | added |
+| `test/handoff/test-predicate-vocabulary.js` | CI guard: T1 DB-drift detection (has_updated class), T2 clean corpus passes, T3 strict-mode vocabulary guard, T4 pure helper + locks has_updated/in_file registration | added |
 | `test/north-star/test-caveman-economy.js` | North-star GREEN gate: dogfoods caveman/telegraphic authoring — proves leaner close payloads reduce bootstrap tokens with zero load-bearing loss (3 arms: economy, fidelity, function-word density) | added |
 | `test/north-star/fixtures/caveman-payload.json` | Telegraphic close fixture — identical load-bearing tokens to verbose-payload.json, function words stripped | added |
 | `test/north-star/fixtures/verbose-payload.json` | Full-prose close fixture — grammatical sentences, identical load-bearing tokens to caveman-payload.json | added |
