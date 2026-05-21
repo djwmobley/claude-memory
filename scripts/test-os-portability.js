@@ -186,9 +186,8 @@ function testP2() {
 
   const THIS_FILE = path.join(SCRIPTS_DIR, 'test-os-portability.js');
 
-  // Sanctioned exceptions: shell:true is permitted when the call site is
-  // intentional, the argument list is fully hard-coded (no user-supplied
-  // content), and the use is documented with a comment.
+  // Sanctioned exceptions: shell:true is permitted at exactly ONE call site in
+  // reality-checks.js.
   //
   //   reality-checks.js probePrState: shell:true is required on Windows to
   //   execute 'gh.cmd' batch-file wrappers (Windows cannot directly CreateProcess
@@ -196,9 +195,26 @@ function testP2() {
   //   ['pr', 'view', prNum, '--json', 'state'] where prNum is a \d+ match
   //   (digit-only string) — no shell injection risk.  On POSIX (Linux/macOS CI)
   //   this simply routes through /bin/sh, which is safe for this call shape.
-  const SHELL_ALLOWED = [
-    { file: path.join(SCRIPTS_DIR, 'lib', 'reality-checks.js') },
-  ];
+  //
+  // The exemption is count-capped: exactly ONE shell:true is permitted in
+  // reality-checks.js (the probePrState call).  A second occurrence — even
+  // inside the same file — fails P2, so a future unsafe addition is never masked.
+  const REALITY_CHECKS_FILE = path.join(SCRIPTS_DIR, 'lib', 'reality-checks.js');
+  const SANCTIONED_MAX_IN_REALITY_CHECKS = 1;
+
+  // Count non-comment shell:true occurrences in reality-checks.js separately
+  // before filtering them out of the main hit list.
+  const realityChecksHits = findInFile(REALITY_CHECKS_FILE, shellTrueRe).filter((h) =>
+    !h.text.startsWith('//') && !h.text.startsWith('*')
+  );
+  if (realityChecksHits.length > SANCTIONED_MAX_IN_REALITY_CHECKS) {
+    const detail = realityChecksHits.map((h) =>
+      `  ${path.relative(PROJECT_ROOT, REALITY_CHECKS_FILE)}:${h.line}: ${h.text}`
+    ).join('\n');
+    fail(label, `scripts/lib/reality-checks.js has ${realityChecksHits.length} shell:true occurrence(s); ` +
+      `only ${SANCTIONED_MAX_IN_REALITY_CHECKS} is sanctioned (probePrState — gh.cmd on Windows, digit-only args):\n${detail}`);
+    return;
+  }
 
   const hits = findInFiles(allFiles, shellTrueRe).filter((h) => {
     // Skip comment lines.
@@ -206,10 +222,9 @@ function testP2() {
     // Skip this file itself — it contains the pattern in string literals used
     // for test labels and error messages, not in actual spawn call-sites.
     if (h.file === THIS_FILE) return false;
-    // Skip sanctioned exception sites.
-    for (const a of SHELL_ALLOWED) {
-      if (h.file === a.file) return false;
-    }
+    // Skip the sanctioned single occurrence in reality-checks.js (already
+    // count-checked above; any second occurrence already failed P2).
+    if (h.file === REALITY_CHECKS_FILE) return false;
     return true;
   });
 
