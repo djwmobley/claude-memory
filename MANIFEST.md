@@ -10,7 +10,7 @@ It persists durable session state as queryable Postgres rows at the session boun
 |---|---|---|
 | `README.md` | Project overview, install, quickstart pointer | updated (added parameter column to command table) |
 | `CLAUDE.md` | Project-level operating instructions for Claude Code | current |
-| `MANIFEST.md` | This file — tracked index of all documentation | updated (serve-time staleness fix docs) |
+| `MANIFEST.md` | This file — tracked index of all documentation | updated (command-parameter build: docs + test files tracked) |
 | `QUICKSTART.md` | Step-by-step setup guide for new users | updated (added /handoff:resurrect) |
 | `PREREQS.md` | System prerequisites (Node, Postgres, pgvector, vLLM) | current |
 | `CHANGELOG.md` | Version history and release notes | current |
