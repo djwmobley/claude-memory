@@ -4084,6 +4084,72 @@ async function runRerankerGate(db, projectId, root) {
 async function cmdCheckpoint(args) {
   console.log('Running: handoff:checkpoint');
 
+  // ── --note shortcut: single-line mid-session capture ──────────────────────
+  //
+  // checkpoint --note "<text>" writes ONE assertion through the normal gated
+  // write path and exits without requiring a full JSON payload.  The note uses:
+  //   subject:    project basename (same as session_tldr and quick_reference)
+  //   predicate:  session_note  (1:N — multiple notes accumulate over time)
+  //   object:     the note text
+  //   confidence: 8  (same as other session-intent rows)
+  //   source:     'user_stated'  (manual entry by user/agent)
+  //
+  // The JSON path (--json flag) is mutually exclusive with --note.
+  const noteIdx = args.indexOf('--note');
+  if (noteIdx !== -1) {
+    const noteText = args[noteIdx + 1];
+    if (!noteText || noteText.startsWith('--')) {
+      console.error('checkpoint --note requires a text argument, e.g.: checkpoint --note "discovered session_id threading issue"');
+      process.exit(2);
+    }
+
+    const projectId = resolveProjectId();
+    const root      = findProjectRoot();
+    const basename  = path.basename(root);
+
+    let db;
+    try {
+      db = await connectHandoff();
+    } catch (err) {
+      console.error(`DB connection failed: ${err.message}`);
+      process.exit(1);
+    }
+
+    const registryMode = await getSetting(db, projectId, 'predicate_registry_mode', 'permissive');
+
+    let written = false;
+    try {
+      written = await writeAssertionWithSupersession(
+        db,
+        projectId,
+        {
+          subject:    basename,
+          predicate:  'session_note',
+          object:     noteText,
+          confidence: 8,
+          source:     'user_stated',
+        },
+        null,
+        registryMode
+      );
+    } catch (err) {
+      console.error(`checkpoint --note: write failed: ${err.message}`);
+      await db.end();
+      process.exit(1);
+    }
+
+    await db.end();
+
+    if (written) {
+      console.log(`\n  note captured: ${noteText}`);
+      console.log(`\nDone: handoff:checkpoint --note — session_note written (session marker preserved)`);
+    } else {
+      console.log(`\n  note skipped (predicate not recognized in strict mode): ${noteText}`);
+      console.log(`\nDone: handoff:checkpoint --note — session_note skipped`);
+    }
+    return;
+  }
+
   // Accept --json alone OR the legacy --json - form (backward compatible).
   const useJson = args.includes('--json');
   const projectId   = resolveProjectId();
@@ -4255,6 +4321,23 @@ async function resolveSessionId(db, projectId, payload) {
 
 async function cmdClose(args) {
   console.log('Running: handoff:close');
+
+  // ── --dry-run: rehearse without mutating anything ─────────────────────────
+  //
+  // When --dry-run is set:
+  //   - Payload is parsed and validated (same predicate-registry + validatePayload checks).
+  //   - L3 authoritative reality-check probes run (read-only: they compute results,
+  //     but DB writes are suppressed — reality_check column is NOT updated).
+  //   - Contradiction gate and pointer-staleness gate both run (read-only).
+  //   - CLAUDE.md promotion candidates are computed.
+  //   - A summary of WHAT WOULD HAPPEN is printed: rows to write, rows to supersede,
+  //     pointer rewrite findings, degraded subsystems, promotion candidates.
+  //   - ZERO DB mutations. handoff.md is NOT written. session_in_progress is NOT cleared.
+  //   - C2 / C3 passes are SKIPPED (they require DB writes + idempotency markers).
+  //     This is flagged clearly in the dry-run output.
+  //   - L4 degraded-close record is NOT written.
+  //
+  const dryRun = args.includes('--dry-run');
 
   // Accept --json alone OR the legacy --json - form (backward compatible).
   const useJson = args.includes('--json');
@@ -4564,6 +4647,138 @@ async function cmdClose(args) {
   } catch (_preWriteErr) {
     // Fully non-fatal: L2 sees potentially stale reality_check (same as pre-fix behavior).
     process.stderr.write(`[handoff] pre-write verify refresh failed (non-fatal): ${_preWriteErr.message}\n`);
+  }
+
+  // ── Dry-run short-circuit ─────────────────────────────────────────────────────
+  //
+  // When --dry-run is set, print a summary of what WOULD be written and exit.
+  // ZERO mutations occur.  All DB queries above were read-only (probes, reality
+  // checks, pre-write verify refresh).  We do NOT call writeExtraction, do NOT
+  // update handoff.md, do NOT clear session_in_progress.
+  //
+  // What this dry-run does NOT rehearse:
+  //   - C2 (retrieval outcome bias feedback) — requires DB writes + idempotency markers.
+  //   - C3 (contract evolution) — same.
+  //   - L4 degraded-close record — only written on real close.
+  //   - CLAUDE.md auto-promotion write — computed and shown but not written.
+  //
+  if (dryRun) {
+    console.log('\n  ── DRY-RUN: nothing will be written ──');
+
+    // Count what WOULD be written.
+    const wouldWriteEntities   = (payload.entities   || []).length;
+    const wouldWriteAssertions = (payload.assertions || []).length;
+    const wouldWriteEdges      = (payload.edges      || []).length;
+    const wouldWriteContract   = payload.contract ? 'yes' : 'no';
+
+    console.log(`\n  payload validation:`);
+    const dryRegistryMode = await getSetting(db, projectId, 'predicate_registry_mode', 'permissive');
+    const dryValidation   = (function() {
+      try { return require('./lib/payload-schema').validatePayload(payload, dryRegistryMode); }
+      catch (_) { return { warnings: [], errors: [] }; }
+    })();
+    if (dryValidation.errors.length > 0) {
+      for (const e of dryValidation.errors) console.log(`    [ERROR] ${e}`);
+    }
+    if (dryValidation.warnings.length > 0) {
+      for (const w of dryValidation.warnings) console.log(`    [WARN]  ${w}`);
+    }
+    if (dryValidation.errors.length === 0 && dryValidation.warnings.length === 0) {
+      console.log('    OK — all predicates recognized');
+    }
+
+    console.log(`\n  rows that WOULD be written:`);
+    console.log(`    entities:   ${wouldWriteEntities}`);
+    console.log(`    assertions: ${wouldWriteAssertions}`);
+    console.log(`    edges:      ${wouldWriteEdges}`);
+    console.log(`    contract:   ${wouldWriteContract}`);
+
+    // Show which assertions would be superseded (1:1 predicates that have live rows).
+    const assertionsToCheck = (payload.assertions || []).filter((a) => {
+      try {
+        const cls = classifyPredicate(a.predicate, 'permissive');
+        return cls.cardinality === '1:1';
+      } catch (_) { return false; }
+    });
+    if (assertionsToCheck.length > 0) {
+      let supersededCount = 0;
+      for (const a of assertionsToCheck) {
+        try {
+          const { rows: liveRows } = await db.query(
+            `SELECT id, object FROM assertions
+             WHERE project_id = $1 AND predicate = $2
+               AND LOWER(TRIM(subject)) = LOWER(TRIM($3))
+               AND suppressed = false AND invalid_at IS NULL
+             LIMIT 3`,
+            [projectId, a.predicate, a.subject]
+          );
+          if (liveRows.length > 0) {
+            supersededCount += liveRows.length;
+            for (const lr of liveRows) {
+              console.log(`    [supersede] id=${lr.id} ${a.subject} ${a.predicate} "${lr.object}" → "${a.object}"`);
+            }
+          }
+        } catch (_) {}
+      }
+      if (supersededCount === 0) {
+        console.log('    (no 1:1 supersessions detected for payload assertions)');
+      }
+    }
+
+    // Session-intent rows that would be written.
+    if (payload.tldr)            console.log(`\n  session_tldr:       would write (subject=${path.basename(root)})`);
+    if ((payload.open_threads || []).length > 0)
+                                 console.log(`  open_thread rows:   would write ${payload.open_threads.length} row(s)`);
+    if (payload.quick_references) console.log(`  quick_reference:    would write (subject=${path.basename(root)})`);
+
+    // CLAUDE.md promotion candidates (same query as real close — read-only).
+    try {
+      const dryMultiSessionPred = db.buildEpochSecondsDiffPredicate('last_reinforced', 'created_at', '>', 86400);
+      const { rows: dryCandidates } = await db.query(
+        `SELECT id, subject, predicate, object, confidence, tier
+         FROM assertions
+         WHERE project_id = $1
+           AND suppressed = false
+           AND confidence >= 9
+           AND source = 'user_stated'
+           AND tier = 'consolidated'
+           AND ${dryMultiSessionPred}
+         ORDER BY confidence DESC`,
+        [projectId]
+      );
+      if (dryCandidates.length > 0) {
+        console.log(`\n  CLAUDE.md promotion candidates (would be surfaced — NOT written in dry-run):`);
+        for (const r of dryCandidates) {
+          console.log(`    [conf=${r.confidence}] ${r.subject} ${r.predicate} ${r.object}`);
+        }
+      }
+    } catch (_) {}
+
+    // Pointer-gate (read-only pass — just show findings, write nothing).
+    try {
+      await _backfillMissingAnchors(db, projectId, root);
+      const dryGateResult = await runPointerGate(
+        {
+          tldr:            payload.tldr || '(none)',
+          openThreads:     (payload.open_threads || []).map((t) => `- ${t}`).join('\n') || '- (none)',
+          quickReferences: payload.quick_references || '(none)',
+        },
+        root, db, projectId, 'dry-run'
+      );
+      if (dryGateResult.findings.length > 0) {
+        console.log(`\n  pointer-staleness gate findings (informational — not written):`);
+        for (const f of dryGateResult.findings) {
+          console.log(`    [${f.rule}] ${f.message}`);
+        }
+      }
+    } catch (_) {}
+
+    // Skipped subsystems.
+    console.log('\n  skipped in dry-run: writeExtraction, handoff.md render, session_in_progress clear, C2, C3, L4 degraded record');
+
+    await db.end();
+    console.log('\nDone: handoff:close --dry-run — no mutations performed');
+    return;
   }
 
   // ── Synchronous path (default) — unchanged behavior ──────────────────────────
@@ -5508,16 +5723,12 @@ async function cmdLoaderStop() {
  *   assertion_id — integer primary key from the assertions table.
  */
 async function cmdPromote(args) {
-  const idArg = args[0];
-  if (!idArg) {
-    console.error('Usage: node scripts/handoff.js promote <assertion_id>');
-    process.exit(2);
-  }
-  const assertionId = parseInt(idArg, 10);
-  if (isNaN(assertionId)) {
-    console.error(`promote: invalid assertion_id "${idArg}" — must be an integer`);
-    process.exit(2);
-  }
+  // ── Parse flags ─────────────────────────────────────────────────────────────
+  //
+  // Three invocation forms:
+  //   promote <id>                          — promote by integer id (original)
+  //   promote --subject S [--predicate P] [--object O]  — promote by content
+  //   promote --demote <id>                 — reverse a prior promote
 
   const root        = findProjectRoot();
   const projectId   = resolveProjectId();
@@ -5529,6 +5740,148 @@ async function cmdPromote(args) {
   } catch (err) {
     console.error(`DB connection failed: ${err.message}`);
     process.exit(1);
+  }
+
+  // ── --demote <id> ────────────────────────────────────────────────────────────
+  const demoteIdx = args.indexOf('--demote');
+  if (demoteIdx !== -1) {
+    const demoteIdArg = args[demoteIdx + 1];
+    if (!demoteIdArg || demoteIdArg.startsWith('--')) {
+      await db.end();
+      console.error('promote --demote requires an assertion_id argument');
+      process.exit(2);
+    }
+    const demoteId = parseInt(demoteIdArg, 10);
+    if (isNaN(demoteId)) {
+      await db.end();
+      console.error(`promote --demote: invalid assertion_id "${demoteIdArg}" — must be an integer`);
+      process.exit(2);
+    }
+
+    // Fetch the row.
+    const { rows: demoteRows } = await db.query(
+      `SELECT id, subject, predicate, object, confidence, promoted, promoted_at
+       FROM assertions WHERE id = $1 AND project_id = $2`,
+      [demoteId, projectId]
+    );
+    if (demoteRows.length === 0) {
+      await db.end();
+      console.error(`promote --demote: assertion id=${demoteId} not found in this project`);
+      process.exit(2);
+    }
+    const demoteRow = demoteRows[0];
+
+    if (!demoteRow.promoted) {
+      await db.end();
+      console.log(`promote --demote: assertion id=${demoteId} is not currently promoted — nothing to demote`);
+      process.exit(0);
+    }
+
+    // Clear the promoted flag in the DB.
+    await db.query(
+      `UPDATE assertions SET promoted = false, promoted_at = NULL WHERE id = $1`,
+      [demoteId]
+    );
+
+    // Remove the matching lines from CLAUDE.md.
+    // We look for the annotation line (source_assertion=<id>) and the fact line that follows it.
+    if (fs.existsSync(claudeMdPath)) {
+      const claudeContent = fs.readFileSync(claudeMdPath, 'utf8');
+      // Match the annotation line (HTML comment) and the fact line immediately after it.
+      const annotationPattern = new RegExp(
+        `<!-- promoted:[^>]*source_assertion=${demoteId}[^>]*-->\\n- \\[conf=[^\\]]+\\] [^\\n]+\\n?`,
+        'g'
+      );
+      const demoted = claudeContent.replace(annotationPattern, '');
+      if (demoted !== claudeContent) {
+        fs.writeFileSync(claudeMdPath, demoted, 'utf8');
+        console.log(`  removed CLAUDE.md entry for assertion id=${demoteId}`);
+      } else {
+        console.log(`  note: no matching CLAUDE.md line found for assertion id=${demoteId} (may have been manually edited)`);
+      }
+    }
+
+    await db.end();
+
+    const factLine = `- [conf=${demoteRow.confidence}] ${demoteRow.subject} ${demoteRow.predicate} ${demoteRow.object}`;
+    console.log(`demoted: ${factLine}`);
+    console.log(`\nDone: handoff:promote --demote — assertion id=${demoteId} demotion complete`);
+    return;
+  }
+
+  // ── Promote by content: --subject/--predicate/--object ──────────────────────
+  const hasSubjectFlag = args.includes('--subject');
+  if (hasSubjectFlag) {
+    const subjectIdx   = args.indexOf('--subject');
+    const predicateIdx = args.indexOf('--predicate');
+    const objectIdx    = args.indexOf('--object');
+
+    const subjectVal   = subjectIdx   !== -1 ? args[subjectIdx + 1]   : null;
+    const predicateVal = predicateIdx !== -1 ? args[predicateIdx + 1] : null;
+    const objectVal    = objectIdx    !== -1 ? args[objectIdx + 1]    : null;
+
+    if (!subjectVal || subjectVal.startsWith('--')) {
+      await db.end();
+      console.error('promote --subject requires a value, e.g.: promote --subject "vLLM" --predicate "is_model" --object "Qwen3-Embedding-8B"');
+      process.exit(2);
+    }
+
+    // Build the query dynamically based on which filters were supplied.
+    let filterSql   = 'project_id = $1 AND suppressed = false AND invalid_at IS NULL AND LOWER(TRIM(subject)) = LOWER(TRIM($2))';
+    const filterParams = [projectId, subjectVal];
+    let paramIndex = 3;
+
+    if (predicateVal && !predicateVal.startsWith('--')) {
+      filterSql += ` AND predicate = $${paramIndex++}`;
+      filterParams.push(predicateVal);
+    }
+    if (objectVal && !objectVal.startsWith('--')) {
+      filterSql += ` AND object = $${paramIndex++}`;
+      filterParams.push(objectVal);
+    }
+
+    const { rows: contentRows } = await db.query(
+      `SELECT id, subject, predicate, object, confidence, source, promoted, promoted_at
+       FROM assertions WHERE ${filterSql} ORDER BY id`,
+      filterParams
+    );
+
+    if (contentRows.length === 0) {
+      await db.end();
+      console.error(`promote: no live assertion matches subject="${subjectVal}"${predicateVal ? ` predicate="${predicateVal}"` : ''}${objectVal ? ` object="${objectVal}"` : ''}`);
+      console.error(`  Hint: check spelling with /handoff:status or query the assertions table directly.`);
+      process.exit(2);
+    }
+
+    if (contentRows.length > 1) {
+      await db.end();
+      console.error(`promote: ${contentRows.length} live assertions match — disambiguate by id:`);
+      for (const r of contentRows) {
+        console.error(`  id=${r.id}  ${r.subject} ${r.predicate} ${r.object}  [conf=${r.confidence}|${r.source}]`);
+      }
+      console.error(`  Re-run: promote <id>   or add --predicate/--object to narrow the match.`);
+      process.exit(2);
+    }
+
+    // Exactly one match — delegate to the promote-by-id path using the resolved id.
+    args = [String(contentRows[0].id)];
+    // Fall through to promote-by-id path below.
+  }
+
+  // ── Original promote-by-id path ─────────────────────────────────────────────
+  const idArg = args[0];
+  if (!idArg) {
+    await db.end();
+    console.error('Usage: node scripts/handoff.js promote <assertion_id>');
+    console.error('       node scripts/handoff.js promote --subject <s> [--predicate <p>] [--object <o>]');
+    console.error('       node scripts/handoff.js promote --demote <id>');
+    process.exit(2);
+  }
+  const assertionId = parseInt(idArg, 10);
+  if (isNaN(assertionId)) {
+    await db.end();
+    console.error(`promote: invalid assertion_id "${idArg}" — must be an integer`);
+    process.exit(2);
   }
 
   // Look up the assertion.

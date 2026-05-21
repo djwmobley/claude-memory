@@ -32,10 +32,10 @@ It persists durable session state as queryable Postgres rows at the session boun
 | `commands/handoff/README.md` | Overview of all `/handoff:*` slash commands | updated (added /handoff:resurrect) |
 | `commands/handoff/init.md` | `/handoff:init` — first-run provisioning command | updated (removed phantom $2 description positional) |
 | `commands/handoff/status.md` | `/handoff:status` — read-only project memory status | updated (added --json, --breakdown, --stale-pointers flags with Arguments table + examples) |
-| `commands/handoff/close.md` | `/handoff:close` — end-of-session extraction and session-intent persistence | updated (--json alone now reads stdin; legacy --json - still works; docs reflect both forms) |
+| `commands/handoff/close.md` | `/handoff:close` — end-of-session extraction and session-intent persistence | updated (--dry-run flag added: Arguments table + expected output + what is/is not rehearsed; --json alone still works) |
 | `commands/handoff/resume.md` | `/handoff:resume` — explicit context load; surfaces `### Session intent` section | updated (serve-time reality re-probe description added) |
-| `commands/handoff/checkpoint.md` | `/handoff:checkpoint` — mid-session save without ending the session | updated (--json alone now reads stdin; legacy --json - still works; docs reflect both forms) |
-| `commands/handoff/promote.md` | `/handoff:promote` — promote an assertion to CLAUDE.md durable facts | current |
+| `commands/handoff/checkpoint.md` | `/handoff:checkpoint` — mid-session save without ending the session | updated (--note flag added: Arguments table + expected output; --json alone still works) |
+| `commands/handoff/promote.md` | `/handoff:promote` — promote an assertion to CLAUDE.md durable facts | updated (--subject/--predicate/--object promote-by-content + --demote added; Arguments table + full expected-output examples + exit codes) |
 | `commands/handoff/drop.md` | `/handoff:drop` — archive prior session memory and start fresh | current |
 | `commands/handoff/purge.md` | `/handoff:purge` — hard delete all project memory (confirmation required) | updated (added --dry-run flag with Arguments table + expected output) |
 | `commands/handoff/resurrect.md` | `/handoff:resurrect` — pull a decayed topic back into active context | updated (added --json flag to Flags table + JSON output example + invocation examples) |
@@ -44,6 +44,8 @@ It persists durable session state as queryable Postgres rows at the session boun
 | `scripts/audit-predicates.js` | Ops CLI: connects to configured DB, runs `auditAssertionPredicates` across the live corpus (or a single project via `--project=<uuid>`), exits 0 (all registered), 2 (DB error), or 3 (drift found) | added |
 | `test/handoff/test-predicate-vocabulary.js` | CI guard: T1 DB-drift detection (has_updated class), T2 clean corpus passes, T3 strict-mode vocabulary guard, T4 pure helper + locks has_updated/in_file registration | added |
 | `test/handoff/test-cmd-params.js` | Focused tests for new command-parameter flags: status --json/--breakdown/--stale-pointers, purge --dry-run, close/checkpoint --json-alone, resurrect --json | added |
+| `test/handoff/test-write-path-params.js` | Tests for write-path command parameters: checkpoint --note writes session_note row; promote by content (single/zero/multi match); promote --demote; close --dry-run performs no writes | added |
+| `scripts/lib/predicate-registry.json` | Authoritative predicate vocabulary registry | updated (session_note predicate added as 1:N, added_version 1.3) |
 | `test/north-star/test-caveman-economy.js` | North-star GREEN gate: dogfoods caveman/telegraphic authoring — proves leaner close payloads reduce bootstrap tokens with zero load-bearing loss (3 arms: economy, fidelity, function-word density) | added |
 | `test/north-star/fixtures/caveman-payload.json` | Telegraphic close fixture — identical load-bearing tokens to verbose-payload.json, function words stripped | added |
 | `test/north-star/fixtures/verbose-payload.json` | Full-prose close fixture — grammatical sentences, identical load-bearing tokens to caveman-payload.json | added |
