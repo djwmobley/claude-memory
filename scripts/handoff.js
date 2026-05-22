@@ -1014,6 +1014,7 @@ function readStdin() {
         'entities', 'assertions', 'edges', 'decisions',
         'contract', 'session_id', 'confirm_claude_md_promotion',
         'retrieval_outcome', 'retrieval_outcome_notes',
+        'resolved_threads',
       ]);
       for (const k of Object.keys(parsed)) {
         if (!ALLOWED_KEYS.has(k)) {
@@ -1067,6 +1068,29 @@ function readStdin() {
           if (item.length > STRING_MAX) {
             return reject(new Error(
               `stdin JSON: "open_threads[${i}]" exceeds max length (${item.length} > ${STRING_MAX})`
+            ));
+          }
+        }
+      }
+
+      // resolved_threads: array of strings, each <= STRING_MAX, array length <= 200.
+      if ('resolved_threads' in parsed) {
+        if (!Array.isArray(parsed.resolved_threads)) {
+          return reject(new Error('stdin JSON: "resolved_threads" must be an array'));
+        }
+        if (parsed.resolved_threads.length > 200) {
+          return reject(new Error(
+            `stdin JSON: "resolved_threads" array length ${parsed.resolved_threads.length} exceeds max 200`
+          ));
+        }
+        for (let i = 0; i < parsed.resolved_threads.length; i++) {
+          const item = parsed.resolved_threads[i];
+          if (typeof item !== 'string') {
+            return reject(new Error(`stdin JSON: "resolved_threads[${i}]" must be a string`));
+          }
+          if (item.length > STRING_MAX) {
+            return reject(new Error(
+              `stdin JSON: "resolved_threads[${i}]" exceeds max length (${item.length} > ${STRING_MAX})`
             ));
           }
         }
@@ -3904,6 +3928,34 @@ async function persistSessionIntent(db, projectId, payload, projectBasename) {
   // only with a genuine quality corroborator), never an auto-forge.
   const registryMode = await getSetting(db, projectId, 'predicate_registry_mode', 'permissive');
   for (const intent of intents) {
+    // Re-author guard: skip open_thread intents whose subject was previously retired
+    // (suppressed=superseded). Prevents a resolved thread from re-entering as live.
+    if (intent.predicate === 'open_thread') {
+      let skipWrite = false;
+      try {
+        const { rows: retiredRows } = await db.query(
+          `SELECT 1 FROM assertions
+           WHERE project_id = $1 AND predicate = 'open_thread'
+             AND LOWER(TRIM(subject)) = LOWER(TRIM($2))
+             AND suppressed = true AND suppression_kind = 'superseded'
+           LIMIT 1`,
+          [projectId, intent.subject]
+        );
+        if (retiredRows.length > 0) {
+          skipWrite = true;
+          process.stderr.write(
+            `[handoff] re-author guard: skipped open_thread "${intent.subject}" — previously retired (suppressed=superseded)\n`
+          );
+        }
+      } catch (guardErr) {
+        // Non-fatal: on query error fall through and write normally.
+        process.stderr.write(
+          `[handoff] re-author guard query failed for "${intent.subject}" (non-fatal, writing anyway): ${guardErr.message}\n`
+        );
+      }
+      if (skipWrite) continue;
+    }
+
     try {
       await writeAssertionWithSupersession(
         db,
@@ -4028,6 +4080,30 @@ async function writeExtraction(db, projectId, payload, opts) {
       await recordContractChange(db, projectId, 'default', payload.contract, changeNote);
     } catch (contractErr) {
       process.stderr.write(`[handoff] contract history record failed (non-fatal): ${contractErr.message}\n`);
+    }
+  }
+
+  // Auto-retire resolved open_thread rows BEFORE persistSessionIntent so the re-author
+  // guard in persistSessionIntent sees the freshly-suppressed rows in this same close.
+  for (const text of (payload.resolved_threads || [])) {
+    const subject = deriveIntentSubject(String(text || '').trim());
+    if (!subject) continue;
+    try {
+      const { rowCount } = await db.query(
+        `UPDATE assertions
+         SET suppressed = true, invalid_at = now(), suppression_kind = 'superseded'
+         WHERE project_id = $1 AND predicate = 'open_thread'
+           AND LOWER(TRIM(subject)) = LOWER(TRIM($2))
+           AND suppressed = false AND invalid_at IS NULL
+           AND (pinned = false OR pinned IS NULL)`,
+        [projectId, subject]
+      );
+      const n = rowCount != null ? Number(rowCount) : 0;
+      if (n > 0) {
+        process.stderr.write(`[handoff] auto-retire: suppressed ${n} open_thread row(s) for resolved subject "${subject}"\n`);
+      }
+    } catch (retireErr) {
+      process.stderr.write(`[handoff] auto-retire failed for subject "${subject}" (non-fatal): ${retireErr.message}\n`);
     }
   }
 
@@ -4819,6 +4895,29 @@ async function cmdClose(args) {
       if (supersededCount === 0) {
         console.log('    (no 1:1 supersessions detected for payload assertions)');
       }
+    }
+
+    // Preview resolved_threads suppressions (read-only — no mutations in dry-run).
+    if ((payload.resolved_threads || []).length > 0) {
+      const resolvedSubjects = [];
+      let totalWouldSuppress = 0;
+      for (const text of payload.resolved_threads) {
+        const subject = deriveIntentSubject(String(text || '').trim());
+        if (!subject) continue;
+        resolvedSubjects.push(subject);
+        try {
+          const { rows: liveRows } = await db.query(
+            `SELECT id FROM assertions
+             WHERE project_id = $1 AND predicate = 'open_thread'
+               AND LOWER(TRIM(subject)) = LOWER(TRIM($2))
+               AND suppressed = false AND invalid_at IS NULL
+               AND (pinned = false OR pinned IS NULL)`,
+            [projectId, subject]
+          );
+          totalWouldSuppress += liveRows.length;
+        } catch (_) {}
+      }
+      console.log(`\n  resolved_threads:   would suppress ${totalWouldSuppress} open_thread row(s): [${resolvedSubjects.join(', ')}]`);
     }
 
     // Session-intent rows that would be written.
