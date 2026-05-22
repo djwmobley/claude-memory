@@ -12,7 +12,18 @@ A suffix appended to a served assertion line when the serve-time reality re-prob
 - [model_extracted|conf=9] feat/my-feature branch_exists exists [STALE: now "<absent>"]
 ```
 
-The annotation appears only for predicates registered with `mode:'verify'` in the L3 reality-check registry (`scripts/lib/reality-checks.js`). Rows that still match get `[verified✓]`; rows whose probe cannot run are left unannotated (`unverifiable`). The `reality_check` column is refreshed in the database at the same time (fail-soft; only `reality_check` is written — confidence, source, tier, and object are never modified). See also: **serve-time reality re-probe**, **reality_check**.
+The annotation appears only for predicates registered with `mode:'verify'` in the L3 reality-check registry (`scripts/lib/reality-checks.js`). Rows that still match get `[verified✓]`; rows whose probe cannot run are left unannotated (`unverifiable`). The `reality_check` column is refreshed in the database at the same time (fail-soft; only `reality_check` is written — confidence, source, tier, and object are never modified). For `open_thread` rows, the annotation fires when a cited PR number (`#NNN`) is found in the local git log as a merged commit — the message reads `[STALE: now "merged: #NNN — verify thread is still open"]`. See also: **serve-time reality re-probe**, **reality_check**, **annotateOnly**, **open_thread**.
+
+### annotateOnly
+
+An optional boolean flag on `mode:'verify'` entries in the L3 reality-check registry (`scripts/lib/reality-checks.js`). When `annotateOnly: true`, the entry participates **only** in the serve-time annotation pass — it is excluded from both close-time passes:
+
+- The **pre-write reconcile pass** (which auto-suppresses mismatched rows) skips the predicate entirely.
+- The **post-write L3 verify pass** (which records `degraded_close` alarms on mismatch) skips the predicate via an early `continue`.
+
+Serve-time annotation (the `[STALE: now "…"]` suffix) still fires normally.
+
+Use `annotateOnly` for predicates whose object is freeform model belief text rather than a stable comparable value — where a mismatch signal is a useful nudge but not a safe basis for auto-suppression or degraded-close alarms. `open_thread` is the canonical example. See also: **open_thread**, **[STALE: now "…"] annotation**, **serve-time reality re-probe**, **reality reconciliation**.
 
 ### Assertion
 
@@ -131,7 +142,11 @@ Search by meaning, not exact words. If you ask "find me anything about login fai
 
 ### open_thread
 
-A predicate (cardinality 1:1) that persists a session-driving next-action as a queryable Postgres assertion row. One live row exists per thread-key (the subject, derived from the thread text). When a thread changes, the new row supersedes the prior one via the 1:1 uniqueness path. Written at `/handoff:close` through the gated assertion write path. Surfaced on resume in the `### Session intent` section. See also: **session_tldr**, **quick_reference**, **session intent section**.
+A predicate (cardinality 1:1) that persists a session-driving next-action as a queryable Postgres assertion row. One live row exists per thread-key (the subject, derived from the thread text). When a thread changes, the new row supersedes the prior one via the 1:1 uniqueness path. Written at `/handoff:close` through the gated assertion write path. Surfaced on resume in the `### Session intent` section.
+
+**Serve-time staleness gate:** at resume time the system checks whether any PR numbers cited in the thread's subject or object (e.g. `#106`, `#119`) appear in the local git log as squash-merged commit subjects of the form `(#NNN)`. If any cited PR is found merged, the served line is annotated `[STALE: now "merged: #NNN — verify thread is still open"]` — a nudge to verify the thread, not an assertion of resolution. This uses the `annotateOnly` flag in the L3 registry: open_thread rows are **never** suppressed, superseded, reconciled, or degraded at close time, because a merged base PR does not imply the follow-up work is complete. The annotation fires only at serve time. If no PR number is cited, or git log is unavailable, no annotation is added.
+
+See also: **[STALE: now "…"] annotation**, **annotateOnly**, **serve-time reality re-probe**, **session_tldr**, **quick_reference**, **session intent section**.
 
 ### quick_reference
 
@@ -175,7 +190,11 @@ A column on the `assertions` table that records the most recent probe result for
 
 ### serve-time reality re-probe
 
-The mechanism that re-runs `mode:'verify'` probes against live ground truth every time assertions are served (resume, resurrect, SessionStart hook). Addresses the frozen-tag problem: close-time verify tags freeze at the point the close runs; between sessions, real-world state can shift (a branch deleted, a PR merged, a file moved). The re-probe refreshes `reality_check` in the database and annotates mismatched rows with `[STALE: now "…"]` in the served output. Feature-gated via `serve_time_reality_check` project setting (default `'enabled'`). The serve path is read-annotate only — it never suppresses or supersedes rows. Close-time reconciliation (see: **reality reconciliation**) is a separate, write-path-only operation. See also: **[STALE: now "…"] annotation**, **reality_check**, **in_file**, **branch_exists**, **commit_merged**, **pr_state**, **reality reconciliation**.
+The mechanism that re-runs `mode:'verify'` probes against live ground truth every time assertions are served (resume, resurrect, SessionStart hook). Addresses the frozen-tag problem: close-time verify tags freeze at the point the close runs; between sessions, real-world state can shift (a branch deleted, a PR merged, a file moved). The re-probe refreshes `reality_check` in the database and annotates mismatched rows with `[STALE: now "…"]` in the served output. Feature-gated via `serve_time_reality_check` project setting (default `'enabled'`). The serve path is read-annotate only — it never suppresses or supersedes rows. Close-time reconciliation (see: **reality reconciliation**) is a separate, write-path-only operation.
+
+`open_thread` rows are now also re-probed at serve time: any PR number cited in the thread's text is checked against the local git log. If a cited PR was squash-merged, the served line is annotated `[STALE: now "merged: #NNN — verify thread is still open"]`. Because `open_thread` uses `annotateOnly: true`, this annotation never triggers close-time suppression or degraded-close alarms.
+
+See also: **[STALE: now "…"] annotation**, **reality_check**, **annotateOnly**, **in_file**, **branch_exists**, **commit_merged**, **pr_state**, **open_thread**, **reality reconciliation**.
 
 ### reality reconciliation
 

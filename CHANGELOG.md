@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Serve-time `open_thread` staleness gate** — `open_thread` rows are now
+  reality-checked at serve time (resume / resurrect) against local git merge
+  state. Any PR numbers cited in the thread text (e.g. `#106`) are checked
+  against `git log --format=%s -n 2000`; if a cited PR was squash-merged
+  (appears as `(#NNN)` in a commit subject), the served line is annotated
+  `[STALE: now "merged: #NNN — verify thread is still open"]`. This is an
+  informational nudge — a merged base PR does not imply the follow-up work is
+  complete. The `open_thread` entry uses `annotateOnly: true` in the L3
+  registry, which excludes it from both close-time passes (pre-write reconcile
+  and post-write L3 verify), so `open_thread` rows are **never** suppressed,
+  superseded, reconciled, or degraded-alarmed by this gate. Serve-time
+  annotation only. New exported helpers: `getMergedPrSet(root)` (memoized git
+  log parse), `probeOpenThread(root, object, subject)` (fail-soft probe).
+  `annotateOnly` boolean added to the L3 registry entry-shape contract.
+  (`scripts/lib/reality-checks.js`, `scripts/handoff.js`,
+  `test/handoff/test-open-thread-verify.js`)
+
 ### Changed
 
 - **Refactor: de-duplicate `scripts/test-both-backends.js` helpers** — hoisted

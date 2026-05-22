@@ -212,7 +212,11 @@ ON CONFLICT (project_id, key) DO UPDATE SET value = 'disabled';
 
 With the gate disabled, served output is byte-identical to pre-feature output.
 
-**Volatile predicates.** Only predicates with a `mode:'verify'` entry in the registry are probed. The current set: `in_file`, `branch_exists`, `commit_merged`, `pr_state`. Historical then-state predicates (`is_at_commit`, `shipped_at`) are deliberately excluded — they record fixed historical points and must not be re-verified against now-state.
+**Volatile predicates.** Only predicates with a `mode:'verify'` entry in the registry are probed. The current set: `in_file`, `branch_exists`, `commit_merged`, `pr_state`, and `open_thread`. Historical then-state predicates (`is_at_commit`, `shipped_at`) are deliberately excluded — they record fixed historical points and must not be re-verified against now-state.
+
+**open_thread staleness gate.** `open_thread` rows are now reality-checked at serve time against local git merge state. The probe looks for any PR numbers cited in the thread text (e.g. `#106`) and checks whether they appear in `git log` as squash-merged commit subjects of the form `(#NNN)`. If any cited PR is found merged, the served line is annotated `[STALE: now "merged: #NNN — verify thread is still open"]`. This is an informational nudge, not a claim that the thread is resolved — a merged base PR may have follow-up work still pending.
+
+Because `open_thread` objects are freeform prose with no stable comparable value, the `open_thread` registry entry uses `annotateOnly: true`. This means `open_thread` rows are **excluded from both close-time passes**: the pre-write reconcile pass does not auto-suppress them, and the post-write L3 verify pass does not create degraded-close alarms for them. The annotation fires only at serve time.
 
 **Close-time reconciliation.** When the close-path L3 verify pass (which runs before `writeExtraction`) detects a mismatch on a pre-existing row, it does not simply flag the row and write a degraded-close record. It **reconciles** the stale row to reality:
 

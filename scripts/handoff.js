@@ -4718,7 +4718,7 @@ async function cmdClose(args) {
       const preWriteRoot = root;
       const preWriteSessionId = payload.session_id || null;
       const verifyPredicates = [...new Set(
-        REALITY_CHECKS.filter((c) => c.mode === 'verify').map((c) => c.predicate)
+        REALITY_CHECKS.filter((c) => c.mode === 'verify' && !c.annotateOnly).map((c) => c.predicate)
       )];
       if (verifyPredicates.length > 0) {
         // Fetch all live rows for verify predicates in one query.
@@ -5076,6 +5076,8 @@ async function cmdClose(args) {
 
     for (const check of REALITY_CHECKS) {
       if (check.mode !== 'verify') continue;
+      // annotateOnly entries are serve-time only — skip both close-time passes.
+      if (check.annotateOnly) continue;
 
       let verifyRows;
       try {
