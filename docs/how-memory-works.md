@@ -249,6 +249,16 @@ For the full design-goals framing behind this model — the three things the sys
 
 This is the relay-baton design, not a defect. The baton carries what you hand it. Hand it the important things.
 
+### Project isolation and shared databases
+
+**Isolation is logical, not physical — the blast radius is the whole database.** All projects share a single Postgres schema and the same tables (`entities`, `assertions`, `edges`, `retrieval_contract`, `project_settings`, and so on). There is no table-per-project, schema-per-project, or database-per-project. Every query filters on a `project_id` column, so cross-project leakage does not occur under normal operation, but that `WHERE` clause is the only thing standing between projects. A bad migration, a destructive query that omits the filter, or a schema corruption event affects all projects at once.
+
+**`project_id` is the finest isolation grain — there is no per-user or per-author dimension.** A `session_id` column exists on some rows, but the retrieval path (including the semantic/vector cosine search) does not filter on it. Within a single project, every semantic search returns the full project history regardless of which person or session created the rows.
+
+**On a shared Postgres, two developers on the same project see each other's memory.** The `.claude-memory` marker file holding the project UUID is committed to the repo by default, so every clone inherits the same `project_id`. If two developers point at a shared or team-hosted Postgres instance, one developer's retrieval — semantic search included — will surface the other's assertions, with nothing in the data model preventing it. The default local-per-machine database already isolates developers by the machine boundary even when they share a `project_id`; the exposure only materializes when a shared remote Postgres is introduced.
+
+**Several mitigation levers exist, each with trade-offs.** The simplest is the default: keep Postgres local to each developer's machine, which provides isolation without any configuration. Gitignoring `.claude-memory` causes each clone to mint its own UUID, isolating per-clone even on a shared database — but if no marker file is present the system falls back to `encodeCwd(<absolute path>)`, which can collide if two developers use the same absolute project path. For hard multi-tenant isolation on a shared database, escalate to a Postgres schema-per-project (via `search_path`) or a database-per-project; either approach prevents the logical-only failure mode, at the cost of fanning every migration out across all tenants.
+
 ---
 
 ## What's NOT in this page
