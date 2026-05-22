@@ -106,6 +106,43 @@ function makeEnv(db = SMOKE_DB, projectDir = TEMP_PROJECT_DIR) {
   };
 }
 
+// ── Module-level test helpers ─────────────────────────────────────────────────
+
+/**
+ * Strip variable token-count line from output so two runs can be compared.
+ * Normalizes: "tokens used: ~N / M (sections: ~S)" → "tokens used: ~X"
+ *
+ * @param {string} s
+ * @returns {string}
+ */
+function normalizeTokenLine(s) {
+  return s.replace(/tokens used: ~\d+(?: \/ \d+)?(?: \(sections: ~\d+\))?/g, 'tokens used: ~X');
+}
+
+/**
+ * Assert trusted-canon ordering invariant: the OPERATING CANON preamble must
+ * appear before (or without) the untrusted retrieved-context block.
+ * Used by W3, W4, and any section that checks resume/loader output ordering.
+ *
+ * @param {string}   out   - subprocess stdout to inspect
+ * @param {string}   label - test label (forwarded to fail)
+ * @param {Function} fail  - section fail reporter: (label, msg) => void
+ * @returns {boolean} true if ordering is valid
+ */
+function assertCanonOrdering(out, label, fail) {
+  const canonIdx     = out.indexOf('=== OPERATING CANON (trusted');
+  const untrustedIdx = out.indexOf('=== BEGIN RETRIEVED CONTEXT (untrusted)');
+  if (canonIdx === -1) {
+    fail(label, 'OPERATING CANON preamble not found in resume output');
+    return false;
+  }
+  if (untrustedIdx !== -1 && canonIdx > untrustedIdx) {
+    fail(label, 'OPERATING CANON appears AFTER untrusted block — ordering violated');
+    return false;
+  }
+  return true;
+}
+
 // ── Tracking ──────────────────────────────────────────────────────────────────
 
 let lcPassed  = 0;
@@ -2114,16 +2151,7 @@ async function w3Step4_noRegressionEmptyTable(w3Db, w3ProjectId, w3ProjectDir) {
     }
 
     // Trusted canon before untrusted block.
-    const canonIdx     = out.indexOf('=== OPERATING CANON (trusted');
-    const untrustedIdx = out.indexOf('=== BEGIN RETRIEVED CONTEXT (untrusted)');
-    if (canonIdx === -1) {
-      w3Fail(4, label, 'OPERATING CANON preamble not found in resume output');
-      return false;
-    }
-    if (untrustedIdx !== -1 && canonIdx > untrustedIdx) {
-      w3Fail(4, label, 'OPERATING CANON appears AFTER untrusted block — ordering violated');
-      return false;
-    }
+    if (!assertCanonOrdering(out, label, (lbl, msg) => w3Fail(4, lbl, msg))) return false;
 
     w3Pass(4, label);
     return true;
@@ -2824,16 +2852,7 @@ async function w4Step6_loaderNoRegression(w4Db, w4ProjectId, w4ProjectDir) {
     }
 
     // Trusted canon must precede untrusted block.
-    const canonIdx     = out.indexOf('=== OPERATING CANON (trusted');
-    const untrustedIdx = out.indexOf('=== BEGIN RETRIEVED CONTEXT (untrusted)');
-    if (canonIdx === -1) {
-      w4Fail(6, label, 'OPERATING CANON preamble not found in resume output');
-      return false;
-    }
-    if (untrustedIdx !== -1 && canonIdx > untrustedIdx) {
-      w4Fail(6, label, 'OPERATING CANON appears AFTER untrusted block — ordering violated');
-      return false;
-    }
+    if (!assertCanonOrdering(out, label, (lbl, msg) => w4Fail(6, lbl, msg))) return false;
 
     w4Pass(6, label);
     return true;
@@ -3175,9 +3194,8 @@ async function c1Step4_loaderOutputUnchanged(c1Db, c1ProjectId, c1ProjectDir) {
     }
 
     // Strip the "tokens used" line (counts are stable but token count may vary slightly).
-    const normalize = (s) => s.replace(/tokens used: ~\d+(?: \/ \d+)?(?: \(sections: ~\d+\))?/g, 'tokens used: ~X');
-    const out1 = normalize(r1.stdout || '');
-    const out2 = normalize(r2.stdout || '');
+    const out1 = normalizeTokenLine(r1.stdout || '');
+    const out2 = normalizeTokenLine(r2.stdout || '');
     if (out1 !== out2) {
       c1Fail(4, label, 'Two consecutive loader-load calls produced different stdout — output not stable');
       return false;
@@ -3334,9 +3352,8 @@ async function c2Step1_gateOffNoOp(c2Db, c2ProjectId, c2ProjectDir) {
     }
 
     // Normalize token count line (can vary between runs due to reinforcement timestamp drift).
-    const normalize = (s) => s.replace(/tokens used: ~\d+(?: \/ \d+)?(?: \(sections: ~\d+\))?/g, 'tokens used: ~X');
-    const out1 = normalize(r1.stdout || '');
-    const out2 = normalize(r2.stdout || '');
+    const out1 = normalizeTokenLine(r1.stdout || '');
+    const out2 = normalizeTokenLine(r2.stdout || '');
     if (out1 !== out2) {
       c2Fail(1, label, 'Two loader-load calls produced different stdout — output not stable with gate OFF');
       return false;
@@ -5748,8 +5765,7 @@ async function grStep2_gateOff(grDb, grProjectId, grProjectDir) {
       return;
     }
 
-    const normalize = (s) => s.replace(/tokens used: ~\d+(?: \/ \d+)?(?: \(sections: ~\d+\))?/g, 'tokens used: ~X');
-    if (normalize(rDisabled.stdout || '') !== normalize(rNoGraph.stdout || '')) {
+    if (normalizeTokenLine(rDisabled.stdout || '') !== normalizeTokenLine(rNoGraph.stdout || '')) {
       grFail(2, label, 'gate-disabled output differs from no-graph baseline');
       return;
     }
@@ -5833,8 +5849,7 @@ async function grStep4_defaultContractRegression(grDb, grProjectId, grProjectDir
 
     if (r1.status !== 0 || r2.status !== 0) { grFail(4, label, `loader-load failed: ${r1.status}/${r2.status}`); return; }
 
-    const normalize = (s) => s.replace(/tokens used: ~\d+(?: \/ \d+)?(?: \(sections: ~\d+\))?/g, 'tokens used: ~X');
-    if (normalize(r1.stdout || '') !== normalize(r2.stdout || '')) {
+    if (normalizeTokenLine(r1.stdout || '') !== normalizeTokenLine(r2.stdout || '')) {
       grFail(4, label, 'Two runs of no-graph contract produced different output — regression');
       return;
     }

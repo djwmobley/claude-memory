@@ -40,21 +40,6 @@ const PLUGIN_JSON    = path.join(REPO_ROOT, '.claude-plugin', 'plugin.json');
 const MARKET_JSON    = path.join(REPO_ROOT, '.claude-plugin', 'marketplace.json');
 const HOOKS_JSON     = path.join(REPO_ROOT, 'hooks', 'hooks.json');
 
-// ── Test helpers ──────────────────────────────────────────────────────────────
-
-let passCount = 0;
-let failCount = 0;
-
-function pass(label) {
-  console.log(`  PASS  ${label}`);
-  passCount++;
-}
-
-function fail(label, reason) {
-  console.error(`  FAIL  ${label}: ${reason}`);
-  failCount++;
-}
-
 // ── P1: Manifest validity ─────────────────────────────────────────────────────
 
 test('P1a: .claude-plugin/plugin.json is valid JSON with required fields', () => {

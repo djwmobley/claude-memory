@@ -93,6 +93,31 @@ function fail(section, step, label, reason) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/**
+ * Extract a named section from loader-load stdout.
+ * Returns the section body (text after the header up to the next blank line),
+ * or '' if the section header is absent.
+ *
+ * @param {string} stdout      - subprocess stdout
+ * @param {string} sectionName - section header string (e.g. '### Related (graph)')
+ * @returns {string}
+ */
+function extractGraphSection(stdout, sectionName) {
+  if (!stdout.includes(sectionName)) return '';
+  return stdout.split(sectionName)[1]?.split('\n\n')[0] || '';
+}
+
+/**
+ * Strip variable token-count line from output so two runs can be compared.
+ * Normalizes: "tokens used: ~N / M (sections: ~S)" → "tokens used: ~X"
+ *
+ * @param {string} s
+ * @returns {string}
+ */
+function normalizeTokenLine(s) {
+  return s.replace(/tokens used: ~\d+(?: \/ \d+)?(?: \(sections: ~\d+\))?/g, 'tokens used: ~X');
+}
+
 function encodeCwd(p) {
   return p.replace(/[/\\]+$/, '').replace(/[^A-Za-z0-9-]/g, '-');
 }
@@ -297,9 +322,7 @@ async function sectionA_linearChain(aDb, aProjectId, aProjectDir) {
       // Check all expected are present.
       const missing = expected.filter((e) => !out.includes(`- ${e} (`));
       // Check no entity outside expected appears in the graph section.
-      const graphSection = out.includes('### Related (graph)')
-        ? out.split('### Related (graph)')[1]?.split('\n\n')[0] || ''
-        : '';
+      const graphSection = extractGraphSection(out, '### Related (graph)');
       const allFound = graphSection.split('\n')
         .filter((l) => l.startsWith('- '))
         .map((l) => l.replace(/^- /, '').split(' ')[0]);
@@ -365,9 +388,7 @@ async function sectionA_cycle(aDb, aProjectId, aProjectDir) {
     }
 
     // Verify CYC_A does not appear as a reached node (it's the seed, excluded).
-    const graphSection = out.includes('### Related (graph)')
-      ? out.split('### Related (graph)')[1]?.split('\n\n')[0] || ''
-      : '';
+    const graphSection = extractGraphSection(out, '### Related (graph)');
     if (graphSection.includes('- CYC_A (')) {
       fail('A', 'A-2', label, 'Seed CYC_A appears in graph output — should be excluded');
       return;
@@ -416,9 +437,7 @@ async function sectionA_selfLoop(aDb, aProjectId, aProjectDir) {
     }
 
     const out = r.stdout || '';
-    const graphSection = out.includes('### Related (graph)')
-      ? out.split('### Related (graph)')[1]?.split('\n\n')[0] || ''
-      : '';
+    const graphSection = extractGraphSection(out, '### Related (graph)');
     // SL_A is the seed — it must NOT appear as a reached node.
     if (graphSection.includes('- SL_A (')) {
       fail('A', 'A-3', label, 'SL_A appears in graph output — self-loop seed should be excluded');
@@ -459,9 +478,7 @@ async function sectionA_diamond(aDb, aProjectId, aProjectDir) {
     }
 
     const out = r.stdout || '';
-    const graphSection = out.includes('### Related (graph)')
-      ? out.split('### Related (graph)')[1]?.split('\n\n')[0] || ''
-      : '';
+    const graphSection = extractGraphSection(out, '### Related (graph)');
 
     // DIA_D must appear exactly once.
     const dCount = (graphSection.match(/- DIA_D \(/g) || []).length;
@@ -634,9 +651,7 @@ async function sectionA_fanOutStar(aDb, aProjectId, aProjectDir) {
     }
 
     const out = r.stdout || '';
-    const graphSection = out.includes('### Related (graph)')
-      ? out.split('### Related (graph)')[1]?.split('\n\n')[0] || ''
-      : '';
+    const graphSection = extractGraphSection(out, '### Related (graph)');
     const leafLines = (graphSection.match(/- STAR_LEAF_\d+/g) || []);
     if (leafLines.length > 25) {
       fail('A', 'A-7', label, `${leafLines.length} leaves returned — cap of 25 exceeded`);
@@ -681,9 +696,7 @@ async function sectionA_weightOrdering(aDb, aProjectId, aProjectDir) {
     }
 
     const out = r.stdout || '';
-    const graphSection = out.includes('### Related (graph)')
-      ? out.split('### Related (graph)')[1]?.split('\n\n')[0] || ''
-      : '';
+    const graphSection = extractGraphSection(out, '### Related (graph)');
     const lines = graphSection.split('\n').filter((l) => l.startsWith('- WO_'));
     if (lines.length !== 3) {
       fail('A', 'A-8', label, `expected 3 WO_ lines, got ${lines.length}: ${graphSection}`);
@@ -899,13 +912,8 @@ async function sectionA_determinism(aDb, aProjectId, aProjectDir) {
     }
 
     // Extract graph section from each run.
-    function extractGraphSection(stdout) {
-      if (!stdout.includes('### Related (graph)')) return '';
-      return stdout.split('### Related (graph)')[1]?.split('\n\n')[0] || '';
-    }
-
-    const s1 = extractGraphSection(r1.stdout || '');
-    const s2 = extractGraphSection(r2.stdout || '');
+    const s1 = extractGraphSection(r1.stdout || '', '### Related (graph)');
+    const s2 = extractGraphSection(r2.stdout || '', '### Related (graph)');
 
     if (s1 !== s2) {
       fail('A', 'A-12', label, `Graph sections differ:\nRun1: ${JSON.stringify(s1)}\nRun2: ${JSON.stringify(s2)}`);
@@ -1227,8 +1235,7 @@ async function sectionB_gatingDisabled(bDb, bProjectId, bProjectDir) {
 
     // Compare disabled-gate with no-graph-query output (normalize token count).
     // Mask the full token line: ~TRUE / BUDGET (sections: ~SECT) — all three numbers vary.
-    const normalize = (s) => s.replace(/tokens used: ~\d+(?: \/ \d+)?(?: \(sections: ~\d+\))?/g, 'tokens used: ~X');
-    if (normalize(outDisabled) !== normalize(rNoGraph.stdout || '')) {
+    if (normalizeTokenLine(outDisabled) !== normalizeTokenLine(rNoGraph.stdout || '')) {
       fail('B', 'B-5', label, 'gate-disabled output differs from no-graph-query baseline');
       return;
     }
@@ -1270,9 +1277,8 @@ async function sectionB_noGraphQuery_regressionGuard(bDb, bProjectId, bProjectDi
     }
 
     // Mask the full token line: ~TRUE / BUDGET (sections: ~SECT) — all three numbers vary.
-    const normalize = (s) => s.replace(/tokens used: ~\d+(?: \/ \d+)?(?: \(sections: ~\d+\))?/g, 'tokens used: ~X');
-    const out1 = normalize(r1.stdout || '');
-    const out2 = normalize(r2.stdout || '');
+    const out1 = normalizeTokenLine(r1.stdout || '');
+    const out2 = normalizeTokenLine(r2.stdout || '');
 
     if (out1 !== out2) {
       fail('B', 'B-6', label, 'Two runs with no-graph contract produced different output — regression');
@@ -1686,9 +1692,7 @@ async function runSectionD() {
           fail('D', 'D-2', label, `elapsed ${elapsed}ms exceeds 5s bound`);
         } else {
           const out         = r.stdout || '';
-          const graphSection = out.includes('### Related (graph)')
-            ? out.split('### Related (graph)')[1]?.split('\n\n')[0] || ''
-            : '';
+          const graphSection = extractGraphSection(out, '### Related (graph)');
           const leafCount = (graphSection.match(/- DSTAR_LEAF_/g) || []).length;
           if (leafCount > 25) {
             fail('D', 'D-2', label, `${leafCount} leaves returned — cap of 25 exceeded`);
