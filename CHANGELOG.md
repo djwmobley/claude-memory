@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Refactor: de-duplicate `scripts/test-both-backends.js` helpers** — hoisted
+  6 inline-duplicated constructs to module scope: (1) `HANDOFF_SRC` — replaces
+  16 per-test `fs.readFileSync(HANDOFF_JS)` calls; (2) `dialectHelpers(db)` —
+  replaces 26 per-section `isPostgres`/`suppTrue`/`suppFalse`/`nowExpr` blocks;
+  (3) `isSuppressed(row)` / `isActive(row)` — replaces 27 inline
+  `.suppressed === 0/false/1/true` expressions; (4) `PAYLOAD_STAGING_RE` — removes
+  4 identical inline regex declarations inside S12.b; (5) `totalCount(db, id)` —
+  removes 3 identical inline `async function` bodies inside S13/S14/S15; (6)
+  `freshPid(prefix)` — replaces 12 inline template-literal uniqueness expressions
+  in S18/S19. `seedCorpus` copies (S13/S14/S15) and `withThrowawayPgDb` blocks
+  (S14.3/S15a-pg) left inline — they differ in table coverage, predicates, or
+  variable names. No assertions, expected values, test names, dialect behavior,
+  or control flow changed. Net: -29 lines.
+
 - **Refactor: hoist duplicated test helpers + remove dead code** — in
   `scripts/smoketest-handoff.js`: hoisted 4 identical `normalize` lambdas to
   module-level `normalizeTokenLine(s)` and extracted 2 identical trusted-canon

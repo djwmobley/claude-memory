@@ -72,6 +72,64 @@ const HANDOFF_JS    = path.resolve(__dirname, 'handoff.js');
 const DB_SEAM_JS    = path.resolve(__dirname, 'lib', 'db-seam.js');
 const PROJECT_ROOT  = path.resolve(__dirname, '..');
 
+// ── Hoisted: static source read ───────────────────────────────────────────────
+// Read once at module load; all static-analysis sections share this reference.
+const HANDOFF_SRC = fs.readFileSync(HANDOFF_JS, 'utf8');
+
+// ── Hoisted: PAYLOAD_STAGING_RE ───────────────────────────────────────────────
+// Declared once; S12.b uses it in three consecutive sub-tests.
+const PAYLOAD_STAGING_RE = /^(?:\.)?handoff-close-payload.*\.json$/i;
+
+// ── Hoisted: dialectHelpers(db) ───────────────────────────────────────────────
+// Returns the four dialect-specific SQL fragments used across every per-backend test.
+// Each call site destructures only the names it actually uses.
+function dialectHelpers(db) {
+  const isPostgres = db.dialect === 'postgres';
+  const suppTrue   = isPostgres ? 'true'  : '1';
+  const suppFalse  = isPostgres ? 'false' : '0';
+  const nowExpr    = isPostgres ? "now()" : "datetime('now')";
+  return { isPostgres, suppTrue, suppFalse, nowExpr };
+}
+
+// ── Hoisted: isSuppressed / isActive row-level helpers ────────────────────────
+// Both dialects: SQLite returns 0/1, Postgres returns false/true.
+function isSuppressed(row) {
+  return row.suppressed === 1 || row.suppressed === true;
+}
+function isActive(row) {
+  return row.suppressed === 0 || row.suppressed === false;
+}
+
+// ── Hoisted: freshPid(prefix) ─────────────────────────────────────────────────
+// Generates a unique project_id string for throwaway test rows.
+function freshPid(prefix) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+// ── Hoisted: PROJECT_ID_TABLES + totalCount(db, projectId) ───────────────────
+// PROJECT_ID_TABLES is the canonical table list from project-identity; lazily
+// populated on first use so the require does not run at parse time.
+let _PROJECT_ID_TABLES = null;
+function getProjectIdTables() {
+  if (!_PROJECT_ID_TABLES) {
+    ({ PROJECT_ID_TABLES: _PROJECT_ID_TABLES } = require('./lib/project-identity'));
+  }
+  return _PROJECT_ID_TABLES;
+}
+
+async function totalCount(db, projectId) {
+  let total = 0;
+  for (const table of getProjectIdTables()) {
+    try {
+      const { rows } = await db.query(
+        `SELECT COUNT(*) AS n FROM ${table} WHERE project_id=$1`, [projectId]
+      );
+      total += parseInt(rows[0] && (rows[0].n || rows[0].count || 0), 10);
+    } catch (_) {}
+  }
+  return total;
+}
+
 // ── Tracking ─────────────────────────────────────────────────────────────────
 let passed   = 0;
 let failed   = 0;
@@ -327,9 +385,7 @@ async function runS2() {
     'probation lifecycle: live → downvoted_probation (excluded from retrieval) → rehabilitated → re-downable',
     async (db) => {
       const PID = 's2-prob-lifecycle';
-      const isPostgres = db.dialect === 'postgres';
-      const suppTrue   = isPostgres ? 'true' : '1';
-      const suppFalse  = isPostgres ? 'false' : '0';
+      const { isPostgres, suppTrue, suppFalse } = dialectHelpers(db);
 
       // Step 1: insert a live row.
       await db.query(
@@ -383,8 +439,7 @@ async function runS2() {
       const { rows: rehabbed } = await db.query(
         `SELECT suppressed, invalid_at, suppression_kind FROM assertions WHERE id=$1`, [rowId]
       );
-      const suppressedFalsy = rehabbed[0].suppressed === 0 || rehabbed[0].suppressed === false;
-      assertTrue(suppressedFalsy, 'S2: rehabilitated: suppressed cleared');
+      assertTrue(isActive(rehabbed[0]), 'S2: rehabilitated: suppressed cleared');
       assertEqual(rehabbed[0].invalid_at, null, 'S2: rehabilitated: invalid_at NULL');
       assertEqual(rehabbed[0].suppression_kind, null, 'S2: rehabilitated: suppression_kind NULL');
 
@@ -417,9 +472,7 @@ async function runS2() {
     'probation: buildProbationRehabUpdate is idempotent (double-rehab is safe)',
     async (db) => {
       const PID = 's2-rehab-idem';
-      const isPostgres = db.dialect === 'postgres';
-      const suppTrue   = isPostgres ? 'true' : '1';
-      const nowExpr    = isPostgres ? "now()" : "datetime('now')";
+      const { isPostgres, suppTrue, nowExpr } = dialectHelpers(db);
 
       await db.query(
         `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source,
@@ -440,8 +493,7 @@ async function runS2() {
       const { rows: [row] } = await db.query(
         `SELECT suppressed, invalid_at, suppression_kind FROM assertions WHERE id=$1`, [id]
       );
-      const suppressedFalsy = row.suppressed === 0 || row.suppressed === false;
-      assertTrue(suppressedFalsy, 'S2-idem: still rehabilitated after double-rehab');
+      assertTrue(isActive(row), 'S2-idem: still rehabilitated after double-rehab');
       assertEqual(row.invalid_at, null, 'S2-idem: invalid_at still NULL');
       assertEqual(row.suppression_kind, null, 'S2-idem: suppression_kind still NULL');
     }
@@ -458,9 +510,7 @@ async function runS3() {
     'downvoted_terminal row is NOT rehabilitated by buildProbationRehabUpdate',
     async (db) => {
       const PID = 's3-terminal';
-      const isPostgres = db.dialect === 'postgres';
-      const suppTrue   = isPostgres ? 'true' : '1';
-      const nowExpr    = isPostgres ? "now()" : "datetime('now')";
+      const { isPostgres, suppTrue, nowExpr } = dialectHelpers(db);
 
       await db.query(
         `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source,
@@ -479,8 +529,7 @@ async function runS3() {
       const { rows: [row] } = await db.query(
         `SELECT suppressed, suppression_kind FROM assertions WHERE id=$1`, [id]
       );
-      const suppressedTruthy = row.suppressed === 1 || row.suppressed === true;
-      assertTrue(suppressedTruthy, 'S3: terminal row should remain suppressed after rehab attempt');
+      assertTrue(isSuppressed(row), 'S3: terminal row should remain suppressed after rehab attempt');
       assertEqual(row.suppression_kind, 'downvoted_terminal',
         'S3: terminal suppression_kind unchanged');
     }
@@ -490,9 +539,7 @@ async function runS3() {
     'superseded row is NOT rehabilitated by buildProbationRehabUpdate',
     async (db) => {
       const PID = 's3-superseded';
-      const isPostgres = db.dialect === 'postgres';
-      const suppTrue   = isPostgres ? 'true' : '1';
-      const nowExpr    = isPostgres ? "now()" : "datetime('now')";
+      const { isPostgres, suppTrue, nowExpr } = dialectHelpers(db);
 
       await db.query(
         `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source,
@@ -510,8 +557,7 @@ async function runS3() {
       const { rows: [row] } = await db.query(
         `SELECT suppressed, suppression_kind FROM assertions WHERE id=$1`, [id]
       );
-      const suppressedTruthy = row.suppressed === 1 || row.suppressed === true;
-      assertTrue(suppressedTruthy, 'S3: superseded row should remain suppressed after rehab attempt');
+      assertTrue(isSuppressed(row), 'S3: superseded row should remain suppressed after rehab attempt');
       assertEqual(row.suppression_kind, 'superseded',
         'S3: superseded suppression_kind unchanged');
     }
@@ -521,9 +567,7 @@ async function runS3() {
     'mixed batch: rehab only touches probation rows in multi-id call',
     async (db) => {
       const PID = 's3-mixed';
-      const isPostgres = db.dialect === 'postgres';
-      const suppTrue   = isPostgres ? 'true' : '1';
-      const nowExpr    = isPostgres ? "now()" : "datetime('now')";
+      const { isPostgres, suppTrue, nowExpr } = dialectHelpers(db);
 
       // Insert one probation, one terminal, one superseded.
       for (const [subj, kind] of [
@@ -607,8 +651,7 @@ async function runS4() {
         [PID, pred]
       );
 
-      const suppressedFalsy = row.suppressed === 0 || row.suppressed === false;
-      assertTrue(suppressedFalsy, 'S4: pinned row should NOT be auto-suppressed');
+      assertTrue(isActive(row), 'S4: pinned row should NOT be auto-suppressed');
       assertEqual(row.suppression_kind, null, 'S4: pinned suppression_kind should remain NULL');
     }
   );
@@ -618,8 +661,7 @@ async function runS4() {
     async (db) => {
       const PID  = 's4-nonpinned';
       const pred = 'nonpin_pred_s4';
-      const isPostgres = db.dialect === 'postgres';
-      const suppFalse = isPostgres ? 'false' : '0';
+      const { isPostgres, suppFalse } = dialectHelpers(db);
 
       await db.query(
         `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
@@ -636,8 +678,7 @@ async function runS4() {
         [PID, pred]
       );
 
-      const suppressedTruthy = row.suppressed === 1 || row.suppressed === true;
-      assertTrue(suppressedTruthy, 'S4: non-pinned row SHOULD be suppressed (control)');
+      assertTrue(isSuppressed(row), 'S4: non-pinned row SHOULD be suppressed (control)');
       assertEqual(row.suppression_kind, 'superseded', 'S4: non-pinned suppression_kind=superseded');
       assertTrue(row.invalid_at !== null, 'S4: non-pinned invalid_at should be set');
     }
@@ -682,8 +723,7 @@ async function runS4() {
          WHERE project_id=$1 AND subject='ex-subj' AND predicate=$2`,
         [PID, pred]
       );
-      const suppressedTruthy = row.suppressed === 1 || row.suppressed === true;
-      assertTrue(suppressedTruthy, 'S4: explicit operator override CAN suppress a pinned row');
+      assertTrue(isSuppressed(row), 'S4: explicit operator override CAN suppress a pinned row');
       assertEqual(row.suppression_kind, 'superseded',
         'S4: explicit override sets suppression_kind=superseded even on pinned row');
     }
@@ -713,8 +753,7 @@ async function runS4() {
          WHERE project_id=$1 AND subject='p1n-subj' AND predicate=$2 AND object=$3`,
         [PID, pred, obj]
       );
-      const suppressedFalsy = row.suppressed === 0 || row.suppressed === false;
-      assertTrue(suppressedFalsy, 'S4: pinned 1:N row NOT auto-suppressed');
+      assertTrue(isActive(row), 'S4: pinned 1:N row NOT auto-suppressed');
       assertEqual(row.suppression_kind, null, 'S4: pinned 1:N suppression_kind remains NULL');
     }
   );
@@ -730,8 +769,7 @@ async function runS5() {
     'variant-spelled prior row is superseded; stored subject is byte-unchanged (§7)',
     async (db) => {
       const PID = 's5-variant';
-      const isPostgres = db.dialect === 'postgres';
-      const suppFalse  = isPostgres ? 'false' : '0';
+      const { isPostgres, suppFalse } = dialectHelpers(db);
 
       // Insert prior row with variant spelling (extra spaces + mixed case).
       const variantSubject   = 'Claude-Memory  Main';
@@ -796,15 +834,13 @@ async function runS5() {
         'S5 §7 proof: prior row stored subject MUST be the original variant spelling');
 
       // Prior row is suppressed.
-      const priorSuppTruthy = priorRow.suppressed === 1 || priorRow.suppressed === true;
-      assertTrue(priorSuppTruthy, 'S5: prior row should be suppressed');
+      assertTrue(isSuppressed(priorRow), 'S5: prior row should be suppressed');
       assertEqual(priorRow.suppression_kind, 'superseded', 'S5: prior row kind=superseded');
       assertTrue(priorRow.invalid_at !== null, 'S5: prior row invalid_at set');
 
       // New row is live with canonical subject.
       assertEqual(newRow.subject, canonNewSubject, 'S5: new row has canonical subject');
-      const newSuppFalsy = newRow.suppressed === 0 || newRow.suppressed === false;
-      assertTrue(newSuppFalsy, 'S5: new row should be live');
+      assertTrue(isActive(newRow), 'S5: new row should be live');
       assertEqual(newRow.suppression_kind, null, 'S5: new row suppression_kind NULL');
       assertEqual(newRow.invalid_at, null, 'S5: new row invalid_at NULL');
     }
@@ -836,8 +872,7 @@ async function runS5() {
     async (db) => {
       const PID = 's5-1n-coexist';
       const pred = 'depends_on';
-      const isPostgres = db.dialect === 'postgres';
-      const suppFalse  = isPostgres ? 'false' : '0';
+      const { isPostgres, suppFalse } = dialectHelpers(db);
 
       // Insert two prior rows with different objects.
       const variantSubj = '  Bundle  A  ';
@@ -897,8 +932,7 @@ async function runS5() {
 
       // dep-Y: still live (untouched — different object).
       assertEqual(depYRows.length, 1, 'S5-1N: dep-Y should have 1 row');
-      const depYSuppFalsy = depYRows[0].suppressed === 0 || depYRows[0].suppressed === false;
-      assertTrue(depYSuppFalsy, 'S5-1N: dep-Y row should remain live');
+      assertTrue(isActive(depYRows[0]), 'S5-1N: dep-Y row should remain live');
     }
   );
 }
@@ -913,9 +947,7 @@ async function runS6() {
     'prune by suppression_kind=downvoted_probation removes only probation trail',
     async (db) => {
       const PID = 's6-prune-kind';
-      const isPostgres = db.dialect === 'postgres';
-      const suppTrue   = isPostgres ? 'true' : '1';
-      const nowExpr    = isPostgres ? "now()" : "datetime('now')";
+      const { isPostgres, suppTrue, nowExpr } = dialectHelpers(db);
 
       // Insert rows with different kinds + 1 live row.
       for (const [subj, kind] of [
@@ -956,8 +988,7 @@ async function runS6() {
     'prune: pinned rows survive default prune (buildPruneDelete pinned-safe)',
     async (db) => {
       const PID = 's6-pinned-safe';
-      const isPostgres = db.dialect === 'postgres';
-      const suppTrue   = isPostgres ? 'true' : '1';
+      const { isPostgres, suppTrue } = dialectHelpers(db);
       const pinOne     = isPostgres ? 'true' : '1';
       const nowExpr    = isPostgres ? "now()" : "datetime('now')";
 
@@ -992,8 +1023,7 @@ async function runS6() {
     'prune: dry-run (buildPruneSelect) mutates nothing',
     async (db) => {
       const PID = 's6-dry-run';
-      const isPostgres = db.dialect === 'postgres';
-      const suppTrue   = isPostgres ? 'true' : '1';
+      const { isPostgres, suppTrue } = dialectHelpers(db);
 
       for (let i = 0; i < 3; i++) {
         await db.query(
@@ -1023,8 +1053,7 @@ async function runS6() {
     'prune: --apply is idempotent (second delete is a no-op)',
     async (db) => {
       const PID = 's6-idem';
-      const isPostgres = db.dialect === 'postgres';
-      const suppTrue   = isPostgres ? 'true' : '1';
+      const { isPostgres, suppTrue } = dialectHelpers(db);
 
       await db.query(
         `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
@@ -1045,8 +1074,7 @@ async function runS6() {
     async (db) => {
       const PID_A = 's6-scope-A';
       const PID_B = 's6-scope-B';
-      const isPostgres = db.dialect === 'postgres';
-      const suppTrue   = isPostgres ? 'true' : '1';
+      const { isPostgres, suppTrue } = dialectHelpers(db);
 
       for (const pid of [PID_A, PID_B]) {
         await db.query(
@@ -1082,7 +1110,7 @@ async function runS7() {
   }
 
   // Extract the two assertion query SQL strings from handoff.js.
-  const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+  const engineSrc = HANDOFF_SRC;
 
   // Find the gate-ON assertion SQL block.
   const gateOnMatch = engineSrc.match(
@@ -1179,7 +1207,7 @@ async function runS8() {
   console.log('\n=== S8: Abstraction invariant — zero dialect conditionals outside composition root ===');
   console.log('These are the same checks as Section 13 in test-sqlite-seam.js, extended to cover prune/canon code paths.');
 
-  const engineSrc  = fs.readFileSync(HANDOFF_JS, 'utf8');
+  const engineSrc  = HANDOFF_SRC;
   const dbSeamSrc  = fs.readFileSync(DB_SEAM_JS, 'utf8');
 
   const label1 = 'handoff.js contains ZERO db.dialect checks outside composition root';
@@ -1320,7 +1348,7 @@ async function runS8() {
 async function runS9() {
   console.log('\n=== S9: Do-not-touch constants — 86400 JS constants are present and unchanged ===');
 
-  const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+  const engineSrc = HANDOFF_SRC;
   const dbSeamSrc = fs.readFileSync(DB_SEAM_JS, 'utf8');
 
   const label1 = 'handoff.js line 300: daysSince uses 86400000 (ms per day)';
@@ -1377,7 +1405,7 @@ async function runS9() {
 async function runS10() {
   console.log('\n=== S10: No-backfill guarantee — no UPDATE SET subject path in engine (§7) ===');
 
-  const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+  const engineSrc = HANDOFF_SRC;
 
   const label1 = 'handoff.js: no UPDATE...SET subject= on assertions table (§7 no-corpus-mutation)';
   try {
@@ -1483,8 +1511,7 @@ async function runS11() {
   await bothBackends(
     'S11.1: tier / consolidated_at / corroboration_count columns present on both backends',
     async (db) => {
-      const isPostgres = db.dialect === 'postgres';
-      const nowExpr    = isPostgres ? 'now()' : "datetime('now')";
+      const { isPostgres, nowExpr } = dialectHelpers(db);
       // Insert a row explicitly setting all three new columns.
       await db.query(
         `INSERT INTO assertions
@@ -1624,7 +1651,7 @@ async function runS11() {
       const { rows: allRows } = await db.query(
         `SELECT tier, corroboration_count, suppressed FROM assertions WHERE project_id=$1`, [PID]
       );
-      const liveRows = allRows.filter((r) => r.suppressed === false || r.suppressed === 0);
+      const liveRows = allRows.filter((r) => isActive(r));
       assertEqual(liveRows.length, 1, 'S11.2d: after cross-session write → 1 live row');
       assertEqual(liveRows[0].tier, 'consolidated', 'S11.2d: cross-session corroboration → consolidated');
       assertEqual(Number(liveRows[0].corroboration_count), 2, 'S11.2d: corroboration_count=2');
@@ -1712,10 +1739,10 @@ async function runS11() {
   await bothBackends(
     'S11.3: cmdPromote → tier=consolidated, consolidated_at set on targeted row',
     async (db) => {
-      const isPostgres = db.dialect === 'postgres';
+      const { isPostgres, nowExpr } = dialectHelpers(db);
       const PID = 's11-3-promote';
       // Insert a probationary row directly
-      const nowExpr = isPostgres ? 'now()' : "datetime('now')";
+
       await db.query(
         `INSERT INTO assertions
            (project_id, subject, predicate, object, confidence, source, tier, corroboration_count)
@@ -1749,8 +1776,7 @@ async function runS11() {
     'S11.4 (I2): grandfathered row (tier IS NULL) ranks with consolidated, never below probationary',
     async (db) => {
       const PID = 's11-4-grandfather';
-      const isPostgres = db.dialect === 'postgres';
-      const suppFalse  = isPostgres ? 'false' : '0';
+      const { isPostgres, suppFalse } = dialectHelpers(db);
 
       // Insert a grandfathered row (tier IS NULL) and a probationary row
       await db.query(
@@ -1786,8 +1812,7 @@ async function runS11() {
     'S11.5: retrieval gate ON — consolidated/NULL rank above probationary; probationary rows STILL present (I1)',
     async (db) => {
       const PID = 's11-5-gate';
-      const isPostgres = db.dialect === 'postgres';
-      const suppFalse  = isPostgres ? 'false' : '0';
+      const { isPostgres, suppFalse } = dialectHelpers(db);
 
       // Insert: probationary (high confidence), consolidated (low confidence), grandfathered (NULL tier)
       await db.query(
@@ -1832,7 +1857,7 @@ async function runS11() {
   // ── S11.6: Retrieval gate OFF — byte-identical to pre-feature SQL (I4) ───────
   // Static test: check the ORDER BY SQL strings in handoff.js for the tier prefix.
   {
-    const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+    const engineSrc = HANDOFF_SRC;
     const label6a = 'S11.6a: gate OFF — ORDER BY SQL contains no CASE WHEN tier term (I4 byte-identical guarantee)';
     try {
       // When tierPrefix is '' (gate OFF), the ORDER BY should be byte-identical to pre-feature.
@@ -1869,7 +1894,7 @@ async function runS11() {
 
   // ── S11.7: Gate composition — 4 combinations ─────────────────────────────────
   {
-    const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+    const engineSrc = HANDOFF_SRC;
     const label7 = 'S11.7: gate composition — handoff.js uses ${tierPrefix} in both feedback branches';
     try {
       // Both the feedbackOn and feedbackOff ORDER BY strings must use ${tierPrefix}.
@@ -1906,8 +1931,7 @@ async function runS11() {
     'S11.8 (I1 adversarial): probationary row CANNOT be excluded — adversarial trace: conf=1 probationary present in LIMIT-30',
     async (db) => {
       const PID = 's11-i1';
-      const isPostgres = db.dialect === 'postgres';
-      const suppFalse  = isPostgres ? 'false' : '0';
+      const { isPostgres, suppFalse } = dialectHelpers(db);
       // Insert 30 high-confidence consolidated rows + 1 probationary row
       for (let i = 0; i < 30; i++) {
         await db.query(
@@ -1937,7 +1961,7 @@ async function runS11() {
       // The probationary row will NOT appear because LIMIT excludes it — LIMIT is not a WHERE filter.
       // Invariant I1: no WHERE clause excludes probationary.
       // We verify the WHERE clause in handoff.js does NOT mention tier as a filter.
-      const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+      const engineSrc = HANDOFF_SRC;
       assertFalse(
         /WHERE\b[^;`]*\btier\b[^;`]*\band\b[^;`]*suppressed/i.test(engineSrc) ||
         /AND\s+tier\s*(!?=|IS)/i.test(engineSrc.split('ORDER BY')[0] || ''),
@@ -1954,8 +1978,7 @@ async function runS11() {
     'S11.8 (I2 adversarial): NULL tier row ranks equally with consolidated, never below probationary',
     async (db) => {
       const PID = 's11-i2';
-      const isPostgres = db.dialect === 'postgres';
-      const suppFalse  = isPostgres ? 'false' : '0';
+      const { isPostgres, suppFalse } = dialectHelpers(db);
       await db.query(
         `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
          VALUES ($1,'null-tier','depends_on','nt-obj',5,'user_stated',${suppFalse})`,
@@ -1981,7 +2004,7 @@ async function runS11() {
 
   // I3: No UPDATE sets tier on pre-existing grandfathered rows via write path
   {
-    const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+    const engineSrc = HANDOFF_SRC;
     const label3 = 'S11.8 (I3 adversarial): write path never issues UPDATE SET tier on pre-existing rows';
     try {
       // Extract writeAssertionWithSupersession body
@@ -2009,7 +2032,7 @@ async function runS11() {
   // I4: Gate-OFF ORDER BY is byte-identical to baseline (verified via static analysis S11.6 above)
   // Already covered in S11.6 static tests. Add one more runtime check:
   {
-    const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+    const engineSrc = HANDOFF_SRC;
     const label4 = 'S11.8 (I4 adversarial): tier retrieval gate OFF produces no CASE WHEN tier in SQL';
     try {
       // When tierAware !== 'enabled', tierPrefix = ''.
@@ -2029,7 +2052,7 @@ async function runS11() {
   // I5: Corroboration strictly requires DISTINCT non-null session_ids (already covered in S11.2e,f)
   // Add static check that the corroboration condition in handoff.js explicitly guards both nulls.
   {
-    const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+    const engineSrc = HANDOFF_SRC;
     const label5 = 'S11.8 (I5 adversarial): corroboration guard in write path checks both session_ids non-null AND distinct';
     try {
       // Extract writeAssertionWithSupersession body
@@ -2052,7 +2075,7 @@ async function runS11() {
 
   // I6: 1:1 supersession never triggers corroboration path
   {
-    const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+    const engineSrc = HANDOFF_SRC;
     const label6 = 'S11.8 (I6 adversarial): corroboration path gated on cardinality===1:N (never fires for 1:1)';
     try {
       const fnStart = engineSrc.indexOf('async function writeAssertionWithSupersession(');
@@ -2329,8 +2352,7 @@ async function runS12() {
       }
 
       // Verify: exactly 1 live has_unpackaged_state row, object = canonical 'clean'.
-      const isPostgres = db.dialect === 'postgres';
-      const suppFalse  = isPostgres ? 'false' : '0';
+      const { isPostgres, suppFalse } = dialectHelpers(db);
       const { rows } = await db.query(
         `SELECT subject, object, confidence, source
          FROM assertions
@@ -2381,8 +2403,7 @@ async function runS12() {
         await writeAssertionWithSupersession(db, PID, ass, 'sess-s12a2', 'permissive');
       }
 
-      const isPostgres = db.dialect === 'postgres';
-      const suppFalse  = isPostgres ? 'false' : '0';
+      const { isPostgres, suppFalse } = dialectHelpers(db);
       const { rows } = await db.query(
         `SELECT object FROM assertions WHERE project_id=$1 AND predicate='has_unpackaged_state' AND suppressed=${suppFalse} AND invalid_at IS NULL`,
         [PID]
@@ -2398,7 +2419,7 @@ async function runS12() {
     // Test the static filter logic in detectUnpackagedState (Deliverable B.2).
     // Since the function is embedded in handoff.js, we test its behavior via static
     // source analysis (verify the filter is present) and via a direct simulation.
-    const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+    const engineSrc = HANDOFF_SRC;
 
     const label_b1 = 'S12.b1: detectUnpackagedState contains PAYLOAD_STAGING_RE filter for reserved filenames';
     try {
@@ -2415,8 +2436,6 @@ async function runS12() {
 
     const label_b2 = 'S12.b2: PAYLOAD_STAGING_RE correctly identifies reserved payload filename';
     try {
-      // Replicate the regex from detectUnpackagedState.
-      const PAYLOAD_STAGING_RE = /^(?:\.)?handoff-close-payload.*\.json$/i;
       // Matches
       assertTrue(PAYLOAD_STAGING_RE.test('handoff-close-payload.json'),     'S12.b2: plain payload matches');
       assertTrue(PAYLOAD_STAGING_RE.test('.handoff-close-payload.json'),    'S12.b2: dotfile payload matches');
@@ -2431,7 +2450,6 @@ async function runS12() {
     const label_b3 = 'S12.b3: porcelain line filter correctly strips payload line, keeps real dirty file';
     try {
       // Simulate the filteredLines logic from the updated detectUnpackagedState.
-      const PAYLOAD_STAGING_RE = /^(?:\.)?handoff-close-payload.*\.json$/i;
       const pathMod = require('path');
       // Fake porcelain output: one payload file + one real dirty file
       const fakePortcelain = [
@@ -2452,7 +2470,6 @@ async function runS12() {
 
     const label_b4 = 'S12.b4: porcelain filter → dirty=false when ONLY untracked is reserved payload file';
     try {
-      const PAYLOAD_STAGING_RE = /^(?:\.)?handoff-close-payload.*\.json$/i;
       const pathMod = require('path');
       const fakePortcelainPayloadOnly = '?? handoff-close-payload.json\n';
       const filteredLines = fakePortcelainPayloadOnly.split('\n').filter((line) => {
@@ -2467,7 +2484,6 @@ async function runS12() {
 
     const label_b5 = 'S12.b5: porcelain filter → dirty=true for genuine unrelated untracked file';
     try {
-      const PAYLOAD_STAGING_RE = /^(?:\.)?handoff-close-payload.*\.json$/i;
       const pathMod = require('path');
       const fakePortcelainRealFile = '?? real-untracked-file.ts\n';
       const filteredLines = fakePortcelainRealFile.split('\n').filter((line) => {
@@ -2575,7 +2591,7 @@ async function runS12() {
   // ── S12.d: Static checks — Deliverable A wire-in points present in handoff.js ─
 
   {
-    const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+    const engineSrc = HANDOFF_SRC;
 
     const label_d1 = 'S12.d1: applyAdditiveSchema function exists in handoff.js';
     try {
@@ -2915,9 +2931,7 @@ async function runS13() {
   // Helper: seed multi-table corpus under a given projectId on the given DB adapter.
   async function seedCorpus(db, projectId, opts = {}) {
     const rows = opts.rows || 3;
-    const isPostgres = db.dialect === 'postgres';
-    const suppFalse  = isPostgres ? 'false' : '0';
-    const nowExpr    = isPostgres ? 'now()' : "datetime('now')";
+    const { isPostgres, suppFalse, nowExpr } = dialectHelpers(db);
 
     for (let i = 0; i < rows; i++) {
       // entities
@@ -2965,19 +2979,6 @@ async function runS13() {
     }
   }
 
-  // Helper: count rows across ALL project-id tables for a given id.
-  async function totalCount(db, projectId) {
-    let total = 0;
-    for (const table of PROJECT_ID_TABLES) {
-      try {
-        const { rows } = await db.query(
-          `SELECT COUNT(*) AS n FROM ${table} WHERE project_id=$1`, [projectId]
-        );
-        total += parseInt(rows[0] && (rows[0].n || rows[0].count || 0), 10);
-      } catch (_) {}
-    }
-    return total;
-  }
 
   // ── S13.1: Marker module — readMarker / writeMarker basics ───────────────
 
@@ -3661,8 +3662,7 @@ async function runS14() {
   // Helper: seed multi-table corpus (reuse S13's seedCorpus pattern).
   async function seedCorpus(db, projectId, opts = {}) {
     const rows = opts.rows || 3;
-    const isPostgres = db.dialect === 'postgres';
-    const suppFalse  = isPostgres ? 'false' : '0';
+    const { isPostgres, suppFalse } = dialectHelpers(db);
     for (let i = 0; i < rows; i++) {
       try {
         await db.query(
@@ -3681,18 +3681,6 @@ async function runS14() {
     }
   }
 
-  async function totalCount(db, projectId) {
-    let total = 0;
-    for (const table of PROJECT_ID_TABLES) {
-      try {
-        const { rows } = await db.query(
-          `SELECT COUNT(*) AS n FROM ${table} WHERE project_id=$1`, [projectId]
-        );
-        total += parseInt(rows[0] && (rows[0].n || rows[0].count || 0), 10);
-      } catch (_) {}
-    }
-    return total;
-  }
 
   // ── S14.1: acquireMigrationLock port method exists on both adapters ──────
 
@@ -4095,7 +4083,7 @@ async function runS14() {
   {
     const label = 'S14.10: PROJECT_ROOT is passed to child_process spawns in handoff.js (subprocess-safe identity)';
     try {
-      const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+      const engineSrc = HANDOFF_SRC;
 
       // Find the detectUnpackagedState function body and verify PROJECT_ROOT is in the env.
       const fnStart = engineSrc.indexOf('function detectUnpackagedState(');
@@ -4132,7 +4120,7 @@ async function runS14() {
   {
     const label = 'S14.11: race-free settings writes — all project_settings INSERT statements use ON CONFLICT';
     try {
-      const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+      const engineSrc = HANDOFF_SRC;
 
       // Extract all template literals containing INSERT INTO project_settings.
       const violations = [];
@@ -4194,7 +4182,7 @@ async function runS14() {
   {
     const label = 'S14.13: no new dialect conditionals introduced outside db-seam.js (S8 extension for hardening paths)';
     try {
-      const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+      const engineSrc = HANDOFF_SRC;
       const identSrc  = fs.readFileSync(path.resolve(__dirname, 'lib', 'project-identity.js'), 'utf8');
 
       // Check project-identity.js for dialect conditionals (should be zero).
@@ -4243,24 +4231,9 @@ async function runS15() {
   const { encodeCwd }    = require('./lib/encoded-cwd');
   const { execFileSync } = require('child_process');
 
-  // ── Helper: count rows across all project-id tables ─────────────────────────
-  async function totalCount(db, projectId) {
-    let total = 0;
-    for (const table of PROJECT_ID_TABLES) {
-      try {
-        const { rows } = await db.query(
-          `SELECT COUNT(*) AS n FROM ${table} WHERE project_id=$1`, [projectId]
-        );
-        total += parseInt(rows[0] && (rows[0].n || rows[0].count || 0), 10);
-      } catch (_) {}
-    }
-    return total;
-  }
-
   // ── Helper: seed a multi-table legacy corpus ─────────────────────────────────
   async function seedCorpus(db, projectId, rowCount) {
-    const isPostgres = db.dialect === 'postgres';
-    const suppFalse  = isPostgres ? 'false' : '0';
+    const { isPostgres, suppFalse } = dialectHelpers(db);
     for (let i = 0; i < rowCount; i++) {
       try {
         await db.query(
@@ -4597,8 +4570,7 @@ async function runS16() {
     'S16.1: buildEpochSecondsDiffPredicate — rows clearly >1 day apart qualify; <1 day do not; boundary (=86400s) excluded',
     async (db) => {
       const PID = 's16-hole-a';
-      const isPostgres = db.dialect === 'postgres';
-      const suppFalse  = isPostgres ? 'false' : '0';
+      const { isPostgres, suppFalse } = dialectHelpers(db);
 
       // Row A: last_reinforced is 2 days after created_at → difference = 172800s > 86400 → QUALIFIES.
       await db.query(
@@ -4857,7 +4829,7 @@ async function runS17() {
   {
     const label = 'S17.3 (static): raw `>= now() - ($N || \' days\')::interval` no longer literal in handoff.js';
     try {
-      const engineSrc = fs.readFileSync(HANDOFF_JS, 'utf8');
+      const engineSrc = HANDOFF_SRC;
       const holeBRaw  = /retrieved_at\s*>=\s*now\s*\(\s*\)\s*-\s*\(\s*\$\d+\s*\|\|\s*' days'\s*\)\s*::interval/;
       assertFalse(holeBRaw.test(engineSrc),
         'S17.3: handoff.js must not contain raw `>= now() - ($N || \' days\')::interval` — moved to port method');
@@ -4879,7 +4851,7 @@ async function runS18() {
     'S18.1: 1:N same-session exact repeat → last_reinforced bumped; valid_at unchanged; 0 suppressed; tier=probationary; corrob=1',
     async (db) => {
       const { writeAssertionWithSupersession } = requireHandoffFunctions();
-      const pid = `s18-1-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const pid = freshPid('s18-1');
       const ass = { subject: 's18-subj-1n', predicate: 'depends_on', object: 's18-obj-1n', confidence: 7, source: 'model_extracted' };
       // First write — establishes the row; capture DB-generated valid_at.
       await writeAssertionWithSupersession(db, pid, ass, SESSION_A);
@@ -4901,8 +4873,8 @@ async function runS18() {
          WHERE project_id=$1 AND subject='s18-subj-1n' AND predicate='depends_on'`,
         [pid]
       );
-      const liveRows = afterRows.filter(r => r.suppressed === false || r.suppressed === 0);
-      const suppRows = afterRows.filter(r => r.suppressed === true  || r.suppressed === 1);
+      const liveRows = afterRows.filter(r => isActive(r));
+      const suppRows = afterRows.filter(r => isSuppressed(r));
 
       assertEqual(liveRows.length, 1,  'S18.1: must still be exactly 1 live row');
       assertEqual(suppRows.length, 0,  'S18.1: must be 0 suppressed rows');
@@ -4932,7 +4904,7 @@ async function runS18() {
     'S18.2: writeAssertionWithSupersession returns false on same-session exact repeat (caller counter discipline)',
     async (db) => {
       const { writeAssertionWithSupersession } = requireHandoffFunctions();
-      const pid = `s18-2-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const pid = freshPid('s18-2');
       const ass = { subject: 's18-subj-ret', predicate: 'depends_on', object: 's18-obj-ret', confidence: 6, source: 'user_stated' };
       const ret1 = await writeAssertionWithSupersession(db, pid, ass, SESSION_A);
       assertEqual(ret1, true,  'S18.2: first write must return true');
@@ -4946,7 +4918,7 @@ async function runS18() {
     'S18.3: cross-session exact repeat still → 1 live, tier=consolidated, corrob=2 (regression guard for S11.2d)',
     async (db) => {
       const { writeAssertionWithSupersession } = requireHandoffFunctions();
-      const pid = `s18-3-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const pid = freshPid('s18-3');
       const ass = { subject: 's18-subj-cross', predicate: 'depends_on', object: 's18-obj-cross', confidence: 7, source: 'model_extracted' };
       await writeAssertionWithSupersession(db, pid, ass, SESSION_A);
       // Stamp reality_check='verified' on the first row (from SESSION_A) before the second write.
@@ -4966,7 +4938,7 @@ async function runS18() {
          WHERE project_id=$1 AND subject='s18-subj-cross' AND predicate='depends_on' AND object='s18-obj-cross'`,
         [pid]
       );
-      const liveRows = rows.filter(r => r.suppressed === false || r.suppressed === 0);
+      const liveRows = rows.filter(r => isActive(r));
       assertEqual(liveRows.length, 1, 'S18.3: must be exactly 1 live row');
       assertEqual(liveRows[0].tier, 'consolidated', 'S18.3: tier must be consolidated after cross-session corroboration');
       const corrob = typeof liveRows[0].corroboration_count === 'number'
@@ -4981,7 +4953,7 @@ async function runS18() {
     'S18.4: 1:1 same-session exact (same object) → touch-only: 1 live, 0 suppressed, valid_at unchanged, last_reinforced>=va1, returns false',
     async (db) => {
       const { writeAssertionWithSupersession } = requireHandoffFunctions();
-      const pid = `s18-4-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const pid = freshPid('s18-4');
       const ass = { subject: 's18-subj-11', predicate: 'is_status', object: 'active', confidence: 8, source: 'user_stated' };
       await writeAssertionWithSupersession(db, pid, ass, SESSION_A);
       const { rows: firstRows } = await db.query(
@@ -5000,8 +4972,8 @@ async function runS18() {
          WHERE project_id=$1 AND subject='s18-subj-11' AND predicate='is_status'`,
         [pid]
       );
-      const liveRows = afterRows.filter(r => r.suppressed === false || r.suppressed === 0);
-      const suppRows = afterRows.filter(r => r.suppressed === true  || r.suppressed === 1);
+      const liveRows = afterRows.filter(r => isActive(r));
+      const suppRows = afterRows.filter(r => isSuppressed(r));
       assertEqual(liveRows.length, 1,  'S18.4: must be exactly 1 live row');
       assertEqual(suppRows.length, 0,  'S18.4: must be 0 suppressed rows');
       assertEqual(liveRows[0].id, id1, 'S18.4: row id must be unchanged');
@@ -5022,7 +4994,7 @@ async function runS18() {
     'S18.5: 1:1 same-session DIFFERENT object → still supersedes: 1 live (new object), 1 suppressed (prior object)',
     async (db) => {
       const { writeAssertionWithSupersession } = requireHandoffFunctions();
-      const pid = `s18-5-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const pid = freshPid('s18-5');
       const ass5a = { subject: 's18-subj-11b', predicate: 'is_status', object: 'active',   confidence: 7, source: 'model_extracted' };
       const ass5b = { subject: 's18-subj-11b', predicate: 'is_status', object: 'inactive', confidence: 7, source: 'model_extracted' };
       await writeAssertionWithSupersession(db, pid, ass5a, SESSION_A);
@@ -5033,8 +5005,8 @@ async function runS18() {
          WHERE project_id=$1 AND subject='s18-subj-11b' AND predicate='is_status'`,
         [pid]
       );
-      const liveRows = rows.filter(r => r.suppressed === false || r.suppressed === 0);
-      const suppRows = rows.filter(r => r.suppressed === true  || r.suppressed === 1);
+      const liveRows = rows.filter(r => isActive(r));
+      const suppRows = rows.filter(r => isSuppressed(r));
       assertEqual(liveRows.length, 1, 'S18.5: must be 1 live row');
       assertEqual(suppRows.length, 1, 'S18.5: must be 1 suppressed row');
       assertEqual(liveRows[0].object, 'inactive', 'S18.5: live row must have new object (inactive)');
@@ -5048,7 +5020,7 @@ async function runS18() {
     'S18.6 (adversarial): NULL sessionId → touch-only bypassed → suppress+reinsert: 1 live + 1 suppressed; new id or new valid_at',
     async (db) => {
       const { writeAssertionWithSupersession } = requireHandoffFunctions();
-      const pid = `s18-6-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const pid = freshPid('s18-6');
       const ass = { subject: 's18-subj-null', predicate: 'depends_on', object: 's18-obj-null', confidence: 6, source: 'model_extracted' };
       // First write with a real session.
       await writeAssertionWithSupersession(db, pid, ass, SESSION_A);
@@ -5070,8 +5042,8 @@ async function runS18() {
          WHERE project_id=$1 AND subject='s18-subj-null' AND predicate='depends_on' AND object='s18-obj-null'`,
         [pid]
       );
-      const liveRows = afterRows.filter(r => r.suppressed === false || r.suppressed === 0);
-      const suppRows = afterRows.filter(r => r.suppressed === true  || r.suppressed === 1);
+      const liveRows = afterRows.filter(r => isActive(r));
+      const suppRows = afterRows.filter(r => isSuppressed(r));
       assertEqual(liveRows.length, 1, 'S18.6: must be 1 live row');
       assertEqual(suppRows.length, 1, 'S18.6: must be 1 suppressed row');
       // New row must differ from the first by id OR valid_at (suppress+reinsert occurred).
@@ -5103,7 +5075,7 @@ async function runS19() {
   await bothBackends(
     'S19-I1: with-object retires exactly the matched row; other object untouched',
     async (db) => {
-      const pid = `s19-i1-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const pid = freshPid('s19-i1');
       const isPostgres = db.dialect === 'postgres';
       // Insert 2 rows: same subject+predicate, different objects.
       await db.query(
@@ -5129,8 +5101,8 @@ async function runS19() {
       const ruleB = rows.find((r) => r.object === 'rule-B');
 
       // Dialect-normalize suppressed value.
-      const aSupp = ruleA.suppressed === true || ruleA.suppressed === 1;
-      const bSupp = ruleB.suppressed === true || ruleB.suppressed === 1;
+      const aSupp = isSuppressed(ruleA);
+      const bSupp = isSuppressed(ruleB);
 
       assertTrue(aSupp, 'S19-I1: rule-A must be suppressed');
       assertEqual(ruleA.suppression_kind, 'retired', 'S19-I1: rule-A suppression_kind=retired');
@@ -5143,7 +5115,7 @@ async function runS19() {
   await bothBackends(
     'S19-I2: without-object retires ALL live rows for (subject,predicate) only',
     async (db) => {
-      const pid = `s19-i2-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const pid = freshPid('s19-i2');
       // Insert 3 rows: 2 for never_uses (should be retired), 1 for must_do (should be untouched).
       for (const [subj, pred, obj] of [
         ['agent', 'never_uses', 'tool-A'],
@@ -5169,9 +5141,9 @@ async function runS19() {
       const toolB  = rows.find((r) => r.predicate === 'never_uses' && r.object === 'tool-B');
       const checkC = rows.find((r) => r.predicate === 'must_do');
 
-      const toolASupp = toolA.suppressed === true || toolA.suppressed === 1;
-      const toolBSupp = toolB.suppressed === true || toolB.suppressed === 1;
-      const checkCSupp = checkC.suppressed === true || checkC.suppressed === 1;
+      const toolASupp = isSuppressed(toolA);
+      const toolBSupp = isSuppressed(toolB);
+      const checkCSupp = isSuppressed(checkC);
 
       assertTrue(toolASupp, 'S19-I2: tool-A must be retired');
       assertEqual(toolA.suppression_kind, 'retired', 'S19-I2: tool-A kind=retired');
@@ -5184,7 +5156,7 @@ async function runS19() {
   await bothBackends(
     'S19-I3: retired row excluded from live retrieval (suppressed=false AND invalid_at IS NULL)',
     async (db) => {
-      const pid = `s19-i3-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const pid = freshPid('s19-i3');
       await db.query(
         `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
          VALUES ($1,'svc','policy','no-debug',7,'user_stated')`,
@@ -5205,7 +5177,7 @@ async function runS19() {
   await bothBackends(
     'S19-I4: retired row still in table (NOT deleted — recoverable)',
     async (db) => {
-      const pid = `s19-i4-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const pid = freshPid('s19-i4');
       await db.query(
         `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
          VALUES ($1,'svc','enforces','auth-check',7,'user_stated')`,
@@ -5231,9 +5203,8 @@ async function runS19() {
   await bothBackends(
     "S19-I5: suppression_kind='retired' accepted by both schemas (no constraint violation)",
     async (db) => {
-      const pid = `s19-i5-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      const isPostgres = db.dialect === 'postgres';
-      const nowExpr    = isPostgres ? 'now()' : "datetime('now')";
+      const pid = freshPid('s19-i5');
+      const { isPostgres, nowExpr } = dialectHelpers(db);
       const trueVal    = isPostgres ? 'true'  : '1';
       // Direct INSERT of a row with suppression_kind='retired' — must not throw.
       await db.query(
@@ -5252,7 +5223,7 @@ async function runS19() {
   await bothBackends(
     'S19-I6: idempotency — re-running buildRetirementUpdate on already-retired rows is a no-op',
     async (db) => {
-      const pid = `s19-i6-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const pid = freshPid('s19-i6');
       await db.query(
         `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
          VALUES ($1,'svc','is_constraint','c-1',7,'user_stated')`,

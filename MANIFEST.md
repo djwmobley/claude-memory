@@ -13,7 +13,7 @@ It persists durable session state as queryable Postgres rows at the session boun
 | `MANIFEST.md` | This file — tracked index of all documentation | updated (command-parameter build: docs + test files tracked) |
 | `QUICKSTART.md` | Step-by-step setup guide for new users | updated (added /handoff:resurrect) |
 | `PREREQS.md` | System prerequisites (Node, Postgres, pgvector, vLLM) | current |
-| `CHANGELOG.md` | Version history and release notes | updated (Unreleased section backfilled with post-1.0.0 changes from PRs #59–#113; chore: handoff.js dead-code + helper dedup + require hoisting; refactor: lib/ dead-code removal + URL-parse dedup; refactor: hoist duplicated test helpers + remove dead code in smoketest, graph-traversal, plugin-packaging) |
+| `CHANGELOG.md` | Version history and release notes | updated (Unreleased section backfilled with post-1.0.0 changes from PRs #59–#113; chore: handoff.js dead-code + helper dedup + require hoisting; refactor: lib/ dead-code removal + URL-parse dedup; refactor: hoist duplicated test helpers + remove dead code in smoketest, graph-traversal, plugin-packaging; refactor: de-duplicate test-both-backends.js helpers) |
 | `CONTRIBUTING.md` | Contribution guidelines and workflow | current |
 | `CODE_OF_CONDUCT.md` | Community standards | current |
 | `SECURITY.md` | Security policy and disclosure process | current |
@@ -53,3 +53,4 @@ It persists durable session state as queryable Postgres rows at the session boun
 | `test/handoff/test-reality-reconcile.js` | Tests for reality-mismatch reconcile (Part 1 + Part 2): R1 branch_exists 1:1 reconcile, R2 idempotency, R3 in_file 1:N reconcile + §7 no-backfill, R4 degraded_close retention prune (keep-most-recent-100 policy) | updated (R4 rewritten for keep-100 policy) |
 | `test/handoff/test-degraded-close-retention.js` | Focused unit tests for pruneDegradedClose() in isolation — seeds 110/2/8 records, asserts keep-most-recent-100 invariants, runs on both Postgres and SQLite | added |
 | `scripts/test-doc-lint.js` | CI gate enforcing glossary See-also cross-reference resolution, doc-to-real-command validity (/handoff: slash commands + handoff.js engine subcommands), and suppression_kind enum sync across SQL schema, cmdPrune validKinds, and the glossary Prune bullet | added |
+| `scripts/test-both-backends.js` | Dual-backend (Postgres + SQLite) integration test harness — S1–S19 covering schema, prune, seam, project-identity, migration, suppression, and both-backend parity | updated (refactor: hoisted HANDOFF_SRC, dialectHelpers, isSuppressed/isActive, PAYLOAD_STAGING_RE, totalCount, freshPid to module scope; -29 net lines) |
