@@ -13,7 +13,7 @@
  *   predicate:     string     — exact predicate name matched against assertions
  *   subjectMatch:  (subject: string, root: string) => boolean
  *                             — true if this entry applies to the given subject
- *   probe:         (root: string, object: string) => string | null
+ *   probe:         (root: string, object: string, subject: string) => string | null
  *                             — synchronous probe that returns the authoritative
  *                               object value, or null if the probe cannot run
  *                               (fail-soft: any thrown error yields null; the
@@ -27,6 +27,18 @@
  *                               each matching assertion with reality_check=
  *                               'verified' | 'mismatch' | 'unverifiable' based
  *                               on probe output vs asserted object
+ *   annotateOnly:  boolean (optional, verify-mode only)
+ *                             — when true, this entry participates ONLY in the
+ *                               serve-time annotation pass.  It is EXCLUDED from:
+ *                               (a) the close-time PRE-WRITE reconcile pass
+ *                                   (which would auto-suppress mismatched rows), and
+ *                               (b) the close-time POST-WRITE L3 verify pass
+ *                                   (which would record a degraded_close alarm).
+ *                             — Use annotateOnly for predicates like open_thread
+ *                               whose object is pure freeform model belief — a
+ *                               merged anchor is a strong "verify this" nudge, but
+ *                               suppressing or degrading on it would destroy
+ *                               legitimate follow-up work.
  * }
  *
  * Design invariants (enforced by test-l3-reality-checks.js):
@@ -42,6 +54,10 @@
  *     handoff.js without any other changes.
  *   - is_at_commit / shipped_at are historical then-state predicates and are
  *     deliberately EXCLUDED from verify mode — do not add them here.
+ *   - annotateOnly entries are EXCLUDED from both close-time passes; they
+ *     participate only in serve-time annotation.  open_thread is the canonical
+ *     example: a merged anchor PR# is a staleness nudge, not a safe basis for
+ *     auto-suppression or degraded-close alarms on freeform belief text.
  *
  * Serve-time re-probe (runVerifyDispatch):
  *   The shared helper runVerifyDispatch() can be called at both close time AND
@@ -49,8 +65,25 @@
  *   each probe LIVE against current ground truth, and returns per-row results.
  *   Callers decide what to do with the results:
  *     - close path: writes reality_check to DB + routes mismatches through L4.
+ *       EXCEPTION: annotateOnly entries are excluded from the close path entirely
+ *       (neither the pre-write reconcile pass nor the post-write L3 verify pass
+ *       will fetch, reconcile, suppress, or degrade-alarm annotateOnly rows).
  *     - serve path: annotates served lines + refreshes reality_check column
  *                   (fail-soft DB write; bounded by served-row count).
+ *       annotateOnly entries participate fully in the serve path.
+ *
+ * Volatile now-state predicates (mode:'verify'):
+ *   - in_file         — file exists at the asserted path
+ *   - branch_exists   — git branch exists locally or on origin
+ *   - commit_merged   — commit SHA is merged (ancestor of ref)
+ *   - pr_state        — current GitHub PR state (open/closed/merged)
+ *   - open_thread     — serve-time only: any cited PR # found in git log is flagged
+ *                       as merged → nudge to verify the thread is still open
+ *                       (annotateOnly: never suppressed or degraded at close time)
+ *
+ * Historical then-state predicates (EXCLUDED — never add as 'verify'):
+ *   - is_at_commit    — records a specific commit at ship time
+ *   - shipped_at      — records a specific tag/ref at ship time
  */
 
 const path = require('path');
@@ -379,6 +412,138 @@ function probePrState(root, object, subject) {
   }
 }
 
+// ─── Merged-PR-set memo ──────────────────────────────────────────────────────
+
+/**
+ * Module-level memo: maps project root → Set<string> of merged PR number-strings.
+ * Populated lazily by getMergedPrSet().  The memo persists for the lifetime of
+ * the process (one serve pass), so multiple rows probed in the same pass share
+ * a single git-log call per root.
+ */
+const _mergedPrSetCache = new Map();
+
+/**
+ * getMergedPrSet — Parse merged PR numbers from git log commit subjects.
+ *
+ * Runs `git log --format=%s -n 2000` in the given root to get the last 2000
+ * commit subjects, then extracts all `(#NNN)` occurrences (the squash-merge
+ * pattern used by this repo: e.g. "feat: add foo (#119)").
+ *
+ * Returns a Set<string> of number-strings on success (may be empty if the log
+ * ran but found no matching patterns).  Returns null on ANY failure (git absent,
+ * not a git repository, timeout, or any other error).  Distinguishing null
+ * (failure) from empty-set (success, no merges) matters: null means the probe
+ * is unverifiable; empty-set means no merged PRs found and no annotation is added.
+ *
+ * Memoized per root for the duration of the process.
+ *
+ * @param {string} root - absolute project root
+ * @returns {Set<string> | null}
+ */
+function getMergedPrSet(root) {
+  if (_mergedPrSetCache.has(root)) {
+    return _mergedPrSetCache.get(root);
+  }
+  try {
+    const { execFileSync } = require('child_process');
+    // Uses execFileSync (not exec) — no shell interpolation; args are hard-coded
+    // literals with no user-supplied content, so no injection risk.
+    const out = execFileSync(
+      'git',
+      ['-C', root, 'log', '--format=%s', '-n', '2000'],
+      {
+        encoding: 'utf8',
+        timeout: 5000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }
+    );
+    // Extract every (#NNN) occurrence from the commit subjects.
+    const merged = new Set();
+    const re = /\(#(\d+)\)/g;
+    let m;
+    while ((m = re.exec(out)) !== null) {
+      merged.add(m[1]);
+    }
+    _mergedPrSetCache.set(root, merged);
+    return merged;
+  } catch (_) {
+    // git unavailable, not a repo, timeout, or any other error → unverifiable.
+    // Do NOT cache null: a transient failure should not poison the memo for later
+    // callers in the same process (e.g. retry after git becomes available).
+    return null;
+  }
+}
+
+/**
+ * probeOpenThread — Serve-time staleness probe for open_thread assertions.
+ *
+ * open_thread objects are pure freeform model belief; there is no stable
+ * authoritative value to compare against.  Instead, this probe looks for
+ * cited PR numbers (any #NNN token in subject or object) and checks whether
+ * any of them appear in the local git log as a merged squash-merge subject
+ * of the form "(#NNN)".  If one or more are found merged, it returns a
+ * human-readable staleness hint; otherwise null (unverifiable / no signal).
+ *
+ * Return value encoding:
+ *   null   — unverifiable: no #NNN anchor cited, or git log unavailable, or
+ *            none of the cited PR numbers appear in the merged set.
+ *            runVerifyDispatch tags these rows 'unverifiable' → no annotation.
+ *   string — a human-readable description such as
+ *            "merged: #106 — verify thread is still open"
+ *            This will never equal row.object (freeform prose), so
+ *            runVerifyDispatch tags it 'mismatch' → serve path annotates
+ *            [STALE: now "merged: #106 — verify thread is still open"].
+ *
+ * Design note: a merged anchor is NOT proof the thread is done — the original
+ * PR could be a base fix and the thread may describe follow-up work.  That is
+ * why the message says "verify" rather than asserting the thread is resolved.
+ * annotateOnly: true ensures this probe never triggers auto-suppression or
+ * degraded-close alarms at close time.
+ *
+ * Fail-soft: all errors caught; returns null on any exception.
+ *
+ * @param {string} root    - absolute project root
+ * @param {string} object  - asserted object value (freeform prose)
+ * @param {string} subject - assertion subject (may also cite PR numbers)
+ * @returns {string | null}
+ */
+function probeOpenThread(root, object, subject) {
+  try {
+    // Combine subject and object into one haystack to find any cited PR numbers.
+    const hay = `${subject || ''} ${object || ''}`;
+    const cited = [];
+    const re = /#(\d+)/g;
+    let m;
+    while ((m = re.exec(hay)) !== null) {
+      cited.push(m[1]);
+    }
+    if (cited.length === 0) {
+      // No #NNN anchor in this thread — no basis for a signal.
+      return null;
+    }
+
+    const merged = getMergedPrSet(root);
+    if (merged === null) {
+      // git log failed — unverifiable; stay silent.
+      return null;
+    }
+
+    const mergedCited = cited.filter((n) => merged.has(n));
+    if (mergedCited.length === 0) {
+      // None of the cited PR numbers are in the merged set — no signal.
+      return null;
+    }
+
+    // One or more cited PRs are merged → emit a staleness hint.
+    // Deduplicate while preserving order.
+    const seen = new Set();
+    const unique = mergedCited.filter((n) => (seen.has(n) ? false : seen.add(n) || true));
+    return `merged: ${unique.map((n) => '#' + n).join(', ')} — verify thread is still open`;
+  } catch (_) {
+    return null; // fail-soft: any error → unverifiable
+  }
+}
+
 // ─── Shared verify-dispatch helper (DRY) ────────────────────────────────────
 
 /**
@@ -500,12 +665,19 @@ async function runVerifyDispatch(db, projectId, root, rows) {
  *                   one network probe returns null (offline / timeout) in a
  *                   pass, all subsequent network probes in that pass are
  *                   short-circuited to null ('unverifiable') without waiting.
+ *   annotateOnly  — optional boolean (verify-mode only); when true, this entry
+ *                   is excluded from both close-time passes:
+ *                     (a) the pre-write reconcile pass (.filter excludes it), and
+ *                     (b) the post-write L3 verify pass (skipped via `continue`).
+ *                   Serve-time annotation still runs normally.  See header doc.
  *
  * Volatile now-state predicates (mode:'verify'):
  *   - in_file         — file exists at the asserted path
  *   - branch_exists   — git branch exists locally or on origin
  *   - commit_merged   — commit SHA is merged (ancestor of ref)
  *   - pr_state        — current GitHub PR state (open/closed/merged)
+ *   - open_thread     — annotateOnly; any cited #NNN in git merged set → staleness
+ *                       nudge at serve time; never suppressed or degraded at close
  *
  * Historical then-state predicates (EXCLUDED — never add as 'verify'):
  *   - is_at_commit    — records a specific commit at ship time
@@ -625,6 +797,42 @@ const REALITY_CHECKS = [
     mode: 'verify',
     network: true,
   },
+
+  // ── Entry 6: open_thread (verify, annotateOnly) ───────────────────────────
+  //
+  // Serve-time-only staleness gate for open_thread assertions.
+  //
+  // open_thread objects are freeform model prose — there is no stable
+  // authoritative value to compare against, so the standard
+  // reconcile-on-mismatch and degraded-close flows MUST NOT fire for this
+  // predicate.  annotateOnly: true enforces this: the pre-write reconcile
+  // pass and the post-write L3 verify pass both skip open_thread rows.
+  //
+  // The probe (probeOpenThread) looks for #NNN PR-number citations in the
+  // subject + object combined haystack, then checks which (if any) appear
+  // in `git log` as squash-merged commit subjects of the form "(#NNN)".
+  //
+  // Returns:
+  //   null   — no #NNN cited, git unavailable, or none of the cited PRs are
+  //            merged → 'unverifiable' → no annotation (clean floor for
+  //            anchorless threads and threads whose base PRs are not yet merged).
+  //   string — e.g. "merged: #106 — verify thread is still open"
+  //            → 'mismatch' → served line annotated [STALE: now "merged: ..."].
+  //            This is an informational nudge, NOT a claim of resolution.
+  //
+  // Safety invariant (critical): annotateOnly prevents ANY close from
+  // suppressing, superseding, reconciling, or degraded-alarming an open_thread
+  // row, even if a cited anchor PR has been merged.  A merged base PR does not
+  // imply the follow-up work is complete — the annotation just signals "verify".
+  {
+    predicate: 'open_thread',
+    subjectMatch: () => true,
+    probe: (root, object, subject) => {
+      return probeOpenThread(root, object, subject);
+    },
+    mode: 'verify',
+    annotateOnly: true, // serve-time annotation ONLY — never close-time reconcile/suppress/degrade
+  },
 ];
 
 module.exports = {
@@ -635,4 +843,6 @@ module.exports = {
   probeBranchExists,
   probeCommitMerged,
   probePrState,
+  getMergedPrSet,
+  probeOpenThread,
 };

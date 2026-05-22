@@ -467,6 +467,24 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run open_thread serve-time staleness gate tests
+        # Tests the serve-time open_thread staleness probe (feat/serve-time-open-thread-staleness-gate):
+        #   OT1  Replay real bug: open_thread citing merged PR → [STALE: in resume output
+        #   OT1b Probe against real repo git log → merged PR found
+        #   OT2  PR not in git log → NO annotation
+        #   OT3  No # anchor → probeOpenThread returns null
+        #   OT4  Fail-soft: non-git directory → null, no throw
+        #   OT5  Safety (annotateOnly): close with merged-PR open_thread → row unchanged,
+        #        suppression_kind=NULL, no degraded_close record (critical invariant)
+        #   OT6a getMergedPrSet: parses (#NNN) subjects, memoizes
+        #   OT6b getMergedPrSet: null on non-git directory
+        #   OT6c probeOpenThread: deduplicates repeated PR numbers in output
+        # Reuses claude_memory_eval_test (created by Create handoff test database step above).
+        run: node test/handoff/test-open-thread-verify.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: "North-star: caveman economy (GREEN gate — caveman tokens < verbose, no fidelity loss)"
         run: node test/north-star/test-caveman-economy.js
         env:
