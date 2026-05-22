@@ -13,7 +13,7 @@ It persists durable session state as queryable Postgres rows at the session boun
 | `MANIFEST.md` | This file — tracked index of all documentation | updated (command-parameter build: docs + test files tracked) |
 | `QUICKSTART.md` | Step-by-step setup guide for new users | updated (added /handoff:resurrect) |
 | `PREREQS.md` | System prerequisites (Node, Postgres, pgvector, vLLM) | current |
-| `CHANGELOG.md` | Version history and release notes | updated (Unreleased section backfilled with post-1.0.0 changes from PRs #59–#113; chore: handoff.js dead-code + helper dedup + require hoisting; refactor: lib/ dead-code removal + URL-parse dedup) |
+| `CHANGELOG.md` | Version history and release notes | updated (Unreleased section backfilled with post-1.0.0 changes from PRs #59–#113; chore: handoff.js dead-code + helper dedup + require hoisting; refactor: lib/ dead-code removal + URL-parse dedup; refactor: hoist duplicated test helpers + remove dead code in smoketest, graph-traversal, plugin-packaging) |
 | `CONTRIBUTING.md` | Contribution guidelines and workflow | current |
 | `CODE_OF_CONDUCT.md` | Community standards | current |
 | `SECURITY.md` | Security policy and disclosure process | current |

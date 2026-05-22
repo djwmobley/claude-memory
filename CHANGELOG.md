@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Refactor: hoist duplicated test helpers + remove dead code** — in
+  `scripts/smoketest-handoff.js`: hoisted 4 identical `normalize` lambdas to
+  module-level `normalizeTokenLine(s)` and extracted 2 identical trusted-canon
+  ordering checks (W3/W4) into `assertCanonOrdering(out, label, fail)`; copies
+  1 and 2 (LC and HD sections) differ in guard logic or failure message and
+  remain inline. In `scripts/test-graph-traversal.js`: hoisted a module-level
+  `extractGraphSection(stdout, sectionName)` replacing 6 inline ternary
+  extractions in A-1 through A-8 plus D-2 (the A-12 local function is replaced
+  by the module-level version; C-1 omits the includes-guard and is left inline);
+  hoisted `normalizeTokenLine(s)` replacing 2 identical local `normalize`
+  lambdas in B-5 and B-6. In `scripts/test-plugin-packaging.js`: removed dead
+  `pass()`, `fail()`, `passCount`, and `failCount` that were never called (file
+  uses `node:test` + `node:assert/strict` directly). No test assertions,
+  expected values, test names, or control flow changed.
+
 - **Refactor: extract `scripts/lib/test-pg-helpers.js`** — de-duplicates the PG
   test-harness helpers (`pgConnect`, `createDb`/`createTestDb`,
   `dropDb`/`dropTestDb`, `setSetting`, `getSettingsLike`, `setContract`,
