@@ -324,17 +324,13 @@ const VLLM_RERANK_MODEL = 'Qwen/Qwen3-Reranker-4B';
 const EMBED_DIMS = parseInt(process.env.EMBED_DIMS || '4000', 10);
 
 /**
- * Call a vLLM-compatible OpenAI /v1/embeddings endpoint to generate vector
- * embeddings for one or more texts. Returns an array of embedding arrays
- * (one per input text), matching the same signature as ollamaEmbed.
+ * Parse a base URL string into { hostname, port, basePath }.
+ * Falls back to localhost:8800 with an empty basePath on parse failure.
  *
- * @param {string[]} texts - Array of strings to embed.
- * @param {object}   [opts] - Optional overrides (currently unused; reserved).
- * @returns {Promise<number[][]>}
+ * @param {string} baseUrl
+ * @returns {{ hostname: string, port: number, basePath: string }}
  */
-function vllmEmbed(texts, opts) {
-  const baseUrl = process.env.VLLM_EMBED_URL || 'http://localhost:8800';
-  // Parse hostname, port, and base path from the URL.
+function _parseBaseUrl(baseUrl) {
   let hostname = 'localhost';
   let port = 8800;
   let basePath = '';
@@ -346,6 +342,21 @@ function vllmEmbed(texts, opts) {
   } catch (_) {
     // keep defaults
   }
+  return { hostname, port, basePath };
+}
+
+/**
+ * Call a vLLM-compatible OpenAI /v1/embeddings endpoint to generate vector
+ * embeddings for one or more texts. Returns an array of embedding arrays
+ * (one per input text), matching the same signature as ollamaEmbed.
+ *
+ * @param {string[]} texts - Array of strings to embed.
+ * @param {object}   [opts] - Optional overrides (currently unused; reserved).
+ * @returns {Promise<number[][]>}
+ */
+function vllmEmbed(texts, opts) {
+  const baseUrl = process.env.VLLM_EMBED_URL || 'http://localhost:8800';
+  const { hostname, port, basePath } = _parseBaseUrl(baseUrl);
   const reqPath = basePath + '/v1/embeddings';
 
   return new Promise((resolve, reject) => {
@@ -520,15 +531,7 @@ function ollamaGenerateBlurb(parentName, heading, content, opts) {
  */
 function vllmTokenize(text, opts) {
   const baseUrl = (opts && opts.baseUrl) || process.env.VLLM_EMBED_URL || 'http://localhost:8800';
-  let hostname = 'localhost';
-  let port = 8800;
-  let basePath = '';
-  try {
-    const parsed = new URL(baseUrl);
-    hostname = parsed.hostname;
-    port = parseInt(parsed.port) || (parsed.protocol === 'https:' ? 443 : 80);
-    basePath = parsed.pathname.replace(/\/$/, '');
-  } catch (_) {}
+  const { hostname, port, basePath } = _parseBaseUrl(baseUrl);
 
   const body = JSON.stringify({
     model: VLLM_MODEL,
@@ -581,15 +584,7 @@ function vllmTokenize(text, opts) {
  */
 function vllmTokenEmbed(text, opts) {
   const baseUrl = (opts && opts.baseUrl) || process.env.VLLM_EMBED_URL || 'http://localhost:8800';
-  let hostname = 'localhost';
-  let port = 8800;
-  let basePath = '';
-  try {
-    const parsed = new URL(baseUrl);
-    hostname = parsed.hostname;
-    port = parseInt(parsed.port) || (parsed.protocol === 'https:' ? 443 : 80);
-    basePath = parsed.pathname.replace(/\/$/, '');
-  } catch (_) {}
+  const { hostname, port, basePath } = _parseBaseUrl(baseUrl);
 
   const body = JSON.stringify({
     model: VLLM_MODEL,
