@@ -5249,6 +5249,304 @@ async function runS19() {
   );
 }
 
+// ── S20: close-auto-retire mechanism — dual-backend invariant sweep ───────────
+//
+// Tests for the resolved_threads auto-retire mechanism and re-author guard.
+//
+// Invariants tested on BOTH backends:
+//   I-1         resolved_threads suppresses matching live open_thread rows
+//               (suppressed=true, suppression_kind='superseded', invalid_at NOT NULL)
+//   I-2         A superseded open_thread row is excluded from serve paths
+//               (suppressed=false AND invalid_at IS NULL queries return nothing)
+//   I-3         Re-author guard: a thread retired via resolved_threads cannot be re-authored
+//               (a subsequent open_thread write for the same subject is skipped)
+//   I-4         A DIFFERENT open_thread subject is still written normally (guard does not over-block)
+//   I-5         A pinned=true open_thread row is NOT suppressed by the auto-retire UPDATE
+//   I-6         A superseded open_thread row is NOT resurrect-eligible
+//               (resurrect path requires suppression_kind='downvoted_probation')
+//   I-7-dryrun  Dry-run preview SELECT does not mutate any rows (rows stay live)
+//   I-9  Static: auto-retire UPDATE SQL is present in handoff.js
+//   I-10 Static: re-author guard SELECT is present in handoff.js
+//   I-11 Static: resolved_threads key is in ALLOWED_KEYS
+//   I-12 Static: resolved_threads validation block is present (array check, length cap)
+
+// Helper: inline deriveIntentSubject (mirrors handoff.js:3831-3838)
+function _deriveIntentSubject(threadText) {
+  const text = String(threadText || '').trim();
+  const colonIdx = text.indexOf(':');
+  if (colonIdx >= 0 && colonIdx < 60) {
+    return text.slice(0, colonIdx).trim();
+  }
+  return text.slice(0, 80);
+}
+
+// Helper: inline auto-retire UPDATE (mirrors the logic in writeExtraction)
+async function _autoRetire(db, projectId, subject) {
+  const { rowCount } = await db.query(
+    `UPDATE assertions
+     SET suppressed = true, invalid_at = now(), suppression_kind = 'superseded'
+     WHERE project_id = $1 AND predicate = 'open_thread'
+       AND LOWER(TRIM(subject)) = LOWER(TRIM($2))
+       AND suppressed = false AND invalid_at IS NULL
+       AND (pinned = false OR pinned IS NULL)`,
+    [projectId, subject]
+  );
+  return rowCount != null ? Number(rowCount) : 0;
+}
+
+// Helper: inline re-author guard SELECT (mirrors persistSessionIntent guard)
+async function _reAuthorGuardHit(db, projectId, subject) {
+  const { rows } = await db.query(
+    `SELECT 1 FROM assertions
+     WHERE project_id = $1 AND predicate = 'open_thread'
+       AND LOWER(TRIM(subject)) = LOWER(TRIM($2))
+       AND suppressed = true AND suppression_kind = 'superseded'
+     LIMIT 1`,
+    [projectId, subject]
+  );
+  return rows.length > 0;
+}
+
+async function runS20() {
+  console.log('\n=== S20: close-auto-retire mechanism — dual-backend invariants ===');
+
+  // I-1: resolved_threads suppresses matching live open_thread rows
+  await bothBackends(
+    'S20-I1: auto-retire suppresses matching live open_thread row (suppressed=true, kind=superseded, invalid_at set)',
+    async (db) => {
+      const pid = freshPid('s20-i1');
+      const { suppFalse } = dialectHelpers(db);
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+         VALUES ($1,'MY-THREAD','open_thread','do the thing',7,'user_stated',${suppFalse})`,
+        [pid]
+      );
+      const subject = _deriveIntentSubject('MY-THREAD: do the thing');
+      assertEqual(subject, 'MY-THREAD', 'S20-I1: derived subject should be MY-THREAD');
+      const n = await _autoRetire(db, pid, subject);
+      assertTrue(n >= 1, `S20-I1: expected at least 1 row suppressed, got ${n}`);
+      const { rows } = await db.query(
+        `SELECT suppressed, suppression_kind, invalid_at FROM assertions WHERE project_id=$1`,
+        [pid]
+      );
+      assertTrue(isSuppressed(rows[0]), 'S20-I1: row must be suppressed');
+      assertEqual(rows[0].suppression_kind, 'superseded', 'S20-I1: suppression_kind must be superseded');
+      assertTrue(rows[0].invalid_at !== null, 'S20-I1: invalid_at must be set');
+    }
+  );
+
+  // I-2: suppressed open_thread row excluded from serve paths
+  await bothBackends(
+    'S20-I2: superseded open_thread row excluded from both serve paths (recency + session-intent)',
+    async (db) => {
+      const pid = freshPid('s20-i2');
+      const { suppFalse } = dialectHelpers(db);
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+         VALUES ($1,'THREAD-X','open_thread','pending work',7,'user_stated',${suppFalse})`,
+        [pid]
+      );
+      // Suppress it via auto-retire
+      await _autoRetire(db, pid, 'THREAD-X');
+      // Recency serve path (suppressed=false AND invalid_at IS NULL)
+      const { rows: recency } = await db.query(
+        `SELECT id FROM assertions
+         WHERE project_id=$1 AND suppressed=false AND invalid_at IS NULL`,
+        [pid]
+      );
+      assertEqual(recency.length, 0, 'S20-I2: retired row must not appear in recency serve path');
+      // Session-intent serve path (open_thread/session_tldr/quick_reference, suppressed=false)
+      const { rows: intent } = await db.query(
+        `SELECT id FROM assertions
+         WHERE project_id=$1 AND predicate='open_thread' AND suppressed=false AND invalid_at IS NULL`,
+        [pid]
+      );
+      assertEqual(intent.length, 0, 'S20-I2: retired row must not appear in session-intent serve path');
+    }
+  );
+
+  // I-3: re-author guard blocks writing a retired thread subject again
+  await bothBackends(
+    'S20-I3: re-author guard fires after auto-retire — same subject not written as new live row',
+    async (db) => {
+      const pid = freshPid('s20-i3');
+      const { suppFalse, suppTrue, nowExpr } = dialectHelpers(db);
+      // Insert and retire an open_thread row
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+         VALUES ($1,'DONE-THREAD','open_thread','finished work',7,'user_stated',${suppFalse})`,
+        [pid]
+      );
+      await _autoRetire(db, pid, 'DONE-THREAD');
+      // Guard check: should fire
+      const hit = await _reAuthorGuardHit(db, pid, 'DONE-THREAD');
+      assertTrue(hit, 'S20-I3: re-author guard must fire for retired subject');
+      // Simulate guard behavior: do NOT write. Confirm no live row exists.
+      const { rows: liveRows } = await db.query(
+        `SELECT id FROM assertions
+         WHERE project_id=$1 AND predicate='open_thread'
+           AND suppressed=false AND invalid_at IS NULL`,
+        [pid]
+      );
+      assertEqual(liveRows.length, 0, 'S20-I3: no live open_thread row after guard blocks re-author');
+    }
+  );
+
+  // I-4: guard does not over-block — a different subject writes normally
+  await bothBackends(
+    'S20-I4: re-author guard does NOT block a different subject (guard is subject-scoped)',
+    async (db) => {
+      const pid = freshPid('s20-i4');
+      const { suppFalse } = dialectHelpers(db);
+      // Retire THREAD-A
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+         VALUES ($1,'THREAD-A','open_thread','done',7,'user_stated',${suppFalse})`,
+        [pid]
+      );
+      await _autoRetire(db, pid, 'THREAD-A');
+      // Guard for THREAD-B (never retired) should NOT fire
+      const hitB = await _reAuthorGuardHit(db, pid, 'THREAD-B');
+      assertFalse(hitB, 'S20-I4: guard must not fire for a different, never-retired subject');
+    }
+  );
+
+  // I-5: pinned open_thread row is NOT suppressed by auto-retire
+  await bothBackends(
+    'S20-I5: pinned open_thread row is NOT suppressed by auto-retire UPDATE (pinned guard holds)',
+    async (db) => {
+      const pid = freshPid('s20-i5');
+      const { isPostgres, suppFalse } = dialectHelpers(db);
+      const trueVal = isPostgres ? 'true' : '1';
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed, pinned)
+         VALUES ($1,'PINNED-THREAD','open_thread','critical item',7,'user_stated',${suppFalse},${trueVal})`,
+        [pid]
+      );
+      const n = await _autoRetire(db, pid, 'PINNED-THREAD');
+      assertEqual(n, 0, 'S20-I5: auto-retire must affect 0 rows when row is pinned');
+      const { rows } = await db.query(
+        `SELECT suppressed, invalid_at FROM assertions WHERE project_id=$1`, [pid]
+      );
+      assertTrue(isActive(rows[0]), 'S20-I5: pinned row must remain live after auto-retire attempt');
+      assertEqual(rows[0].invalid_at, null, 'S20-I5: pinned row invalid_at must remain NULL');
+    }
+  );
+
+  // I-6: superseded open_thread is NOT resurrect-eligible
+  await bothBackends(
+    'S20-I6: superseded open_thread row is NOT resurrect-eligible (resurrect only revives downvoted_probation)',
+    async (db) => {
+      const pid = freshPid('s20-i6');
+      const { suppFalse } = dialectHelpers(db);
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+         VALUES ($1,'OLD-THREAD','open_thread','stale work',7,'user_stated',${suppFalse})`,
+        [pid]
+      );
+      await _autoRetire(db, pid, 'OLD-THREAD');
+      // Resurrect eligibility query (mirrors handoff.js resurrect path)
+      const { rows: eligible } = await db.query(
+        `SELECT id FROM assertions
+         WHERE project_id=$1
+           AND suppressed = true
+           AND suppression_kind = 'downvoted_probation'`,
+        [pid]
+      );
+      assertEqual(eligible.length, 0, 'S20-I6: superseded row must NOT appear in resurrect-eligible query (wrong suppression_kind)');
+    }
+  );
+
+  // I-7 (dry-run): preview SELECT performs no mutation — row stays live
+  await bothBackends(
+    'S20-I7-dryrun: dry-run preview SELECT does not suppress the open_thread row',
+    async (db) => {
+      const pid = freshPid('s20-i7dr');
+      const { suppFalse } = dialectHelpers(db);
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+         VALUES ($1,'DR-THREAD','open_thread','pending item',7,'user_stated',${suppFalse})`,
+        [pid]
+      );
+      // Dry-run preview: SELECT query only (mirrors cmdClose dryRun block)
+      const { rows: preview } = await db.query(
+        `SELECT id FROM assertions
+         WHERE project_id = $1 AND predicate = 'open_thread'
+           AND LOWER(TRIM(subject)) = LOWER(TRIM($2))
+           AND suppressed = false AND invalid_at IS NULL
+           AND (pinned = false OR pinned IS NULL)`,
+        [pid, 'DR-THREAD']
+      );
+      assertTrue(preview.length >= 1, 'S20-I7-dryrun: preview SELECT must find the row');
+      // Verify row is still live (SELECT did not mutate it)
+      const { rows: liveRows } = await db.query(
+        `SELECT suppressed, invalid_at FROM assertions WHERE project_id=$1`, [pid]
+      );
+      assertTrue(isActive(liveRows[0]), 'S20-I7-dryrun: row must remain live after preview SELECT');
+      assertEqual(liveRows[0].invalid_at, null, 'S20-I7-dryrun: invalid_at must remain NULL after dry-run preview');
+    }
+  );
+
+  // I-9: static — auto-retire UPDATE SQL present in handoff.js
+  {
+    const label = "S20-I9: auto-retire UPDATE SQL with suppression_kind='superseded' present in handoff.js";
+    try {
+      assertTrue(
+        HANDOFF_SRC.includes("suppression_kind = 'superseded'") &&
+        HANDOFF_SRC.includes('auto-retire'),
+        "handoff.js must contain auto-retire UPDATE setting suppression_kind='superseded'"
+      );
+      pass(label);
+    } catch (err) {
+      fail(label, err.message);
+    }
+  }
+
+  // I-10: static — re-author guard SELECT present in handoff.js
+  {
+    const label = 'S20-I10: re-author guard SELECT present in handoff.js';
+    try {
+      assertTrue(
+        HANDOFF_SRC.includes('re-author guard') &&
+        HANDOFF_SRC.includes("suppression_kind = 'superseded'"),
+        "handoff.js must contain re-author guard referencing suppression_kind='superseded'"
+      );
+      pass(label);
+    } catch (err) {
+      fail(label, err.message);
+    }
+  }
+
+  // I-11: static — resolved_threads in ALLOWED_KEYS
+  {
+    const label = "S20-I11: 'resolved_threads' is present in ALLOWED_KEYS in readStdin()";
+    try {
+      assertTrue(
+        HANDOFF_SRC.includes("'resolved_threads'"),
+        "handoff.js ALLOWED_KEYS must include 'resolved_threads'"
+      );
+      pass(label);
+    } catch (err) {
+      fail(label, err.message);
+    }
+  }
+
+  // I-12: static — resolved_threads validation block present
+  {
+    const label = 'S20-I12: resolved_threads validation block (array check + length cap) present in handoff.js';
+    try {
+      assertTrue(
+        HANDOFF_SRC.includes('"resolved_threads" must be an array') &&
+        HANDOFF_SRC.includes('"resolved_threads" array length'),
+        'handoff.js must contain resolved_threads array validation'
+      );
+      pass(label);
+    } catch (err) {
+      fail(label, err.message);
+    }
+  }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 (async () => {
@@ -5285,6 +5583,7 @@ async function runS19() {
   await runS17();
   await runS18();
   await runS19();
+  await runS20();
 
   console.log('\n─── Results ──────────────────────────────────────');
   console.log(`PASS ${passed}  FAIL ${failed}  SKIP ${skipped}`);

@@ -54,6 +54,11 @@ function buildPayloadSchema() {
         maxItems: 200,
         items: { type: 'string', maxLength: 4000 },
       },
+      resolved_threads: {
+        type: 'array',
+        maxItems: 200,
+        items: { type: 'string', maxLength: 4000 },
+      },
       quick_references: { type: 'string', maxLength: 4000 },
       session_id: { type: 'string', maxLength: 4000 },
       confirm_claude_md_promotion: { type: 'boolean' },
@@ -225,4 +230,34 @@ function validatePayload(payload, mode) {
   return { ok, warnings, errors };
 }
 
-module.exports = { buildPayloadSchema, validatePayload };
+/**
+ * Validate the `resolved_threads` field if present.
+ * Mirrors the structural validation in readStdin() for this field.
+ * Returns { ok, error } where error is a string on failure, null on success.
+ *
+ * @param {object} payload
+ * @returns {{ ok: boolean, error: string|null }}
+ */
+function validateResolvedThreads(payload) {
+  const STRING_MAX = 4000;
+  if (!('resolved_threads' in payload)) return { ok: true, error: null };
+  const rt = payload.resolved_threads;
+  if (!Array.isArray(rt)) {
+    return { ok: false, error: 'stdin JSON: "resolved_threads" must be an array' };
+  }
+  if (rt.length > 200) {
+    return { ok: false, error: `stdin JSON: "resolved_threads" array length ${rt.length} exceeds max 200` };
+  }
+  for (let i = 0; i < rt.length; i++) {
+    const item = rt[i];
+    if (typeof item !== 'string') {
+      return { ok: false, error: `stdin JSON: "resolved_threads[${i}]" must be a string` };
+    }
+    if (item.length > STRING_MAX) {
+      return { ok: false, error: `stdin JSON: "resolved_threads[${i}]" exceeds max length (${item.length} > ${STRING_MAX})` };
+    }
+  }
+  return { ok: true, error: null };
+}
+
+module.exports = { buildPayloadSchema, validatePayload, validateResolvedThreads };

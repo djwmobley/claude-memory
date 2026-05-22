@@ -34,7 +34,7 @@
  */
 
 const path = require('path');
-const { buildPayloadSchema, validatePayload } = require(path.join(__dirname, 'lib', 'payload-schema'));
+const { buildPayloadSchema, validatePayload, validateResolvedThreads } = require(path.join(__dirname, 'lib', 'payload-schema'));
 const { recognizedPredicates } = require(path.join(__dirname, 'lib', 'predicate-registry'));
 
 // ── Tracking ──────────────────────────────────────────────────────────────────
@@ -264,6 +264,76 @@ async function main() {
     const registryList = recognizedPredicates().slice().sort();
     const schemaEnum   = (schema.properties.assertions.items.properties.predicate.enum || []).slice().sort();
     assertEqual(JSON.stringify(schemaEnum), JSON.stringify(registryList), 'schema predicate enum must equal sorted recognizedPredicates()');
+  });
+
+  // T18 — buildPayloadSchema() includes resolved_threads with correct shape
+  await runTest('T18: buildPayloadSchema() includes resolved_threads array field with maxItems=200 and item maxLength=4000', () => {
+    const schema = buildPayloadSchema();
+    const rt = schema.properties.resolved_threads;
+    assertTrue(rt && typeof rt === 'object', 'schema must have resolved_threads property');
+    assertEqual(rt.type, 'array', 'resolved_threads must be type array');
+    assertEqual(rt.maxItems, 200, 'resolved_threads maxItems must be 200');
+    assertEqual(rt.items.type, 'string', 'resolved_threads items must be type string');
+    assertEqual(rt.items.maxLength, 4000, 'resolved_threads items maxLength must be 4000');
+  });
+
+  // T19 — resolved_threads absent — ok (optional field)
+  await runTest('T19: validateResolvedThreads — absent field returns ok=true', () => {
+    const result = validateResolvedThreads({});
+    assertTrue(result.ok, 'absent resolved_threads must be ok');
+    assertEqual(result.error, null, 'error must be null when field absent');
+  });
+
+  // T20 — resolved_threads valid array
+  await runTest('T20: validateResolvedThreads — valid array of strings returns ok=true', () => {
+    const result = validateResolvedThreads({ resolved_threads: ['THREAD-A: done', 'THREAD-B: also done'] });
+    assertTrue(result.ok, 'valid resolved_threads array must be ok');
+    assertEqual(result.error, null, 'no error for valid array');
+  });
+
+  // T21 — resolved_threads is a string (not array) — rejected
+  await runTest('T21: validateResolvedThreads — non-array (string) rejected', () => {
+    const result = validateResolvedThreads({ resolved_threads: 'not-an-array' });
+    assertFalse(result.ok, 'string resolved_threads must be rejected');
+    assertTrue(result.error !== null && result.error.includes('must be an array'), `error must mention array: ${result.error}`);
+  });
+
+  // T22 — resolved_threads is an object — rejected
+  await runTest('T22: validateResolvedThreads — non-array (object) rejected', () => {
+    const result = validateResolvedThreads({ resolved_threads: { key: 'val' } });
+    assertFalse(result.ok, 'object resolved_threads must be rejected');
+    assertTrue(result.error !== null, 'error must be set');
+  });
+
+  // T23 — resolved_threads length > 200 — rejected
+  await runTest('T23: validateResolvedThreads — array length > 200 rejected', () => {
+    const big = new Array(201).fill('thread');
+    const result = validateResolvedThreads({ resolved_threads: big });
+    assertFalse(result.ok, 'array length 201 must be rejected');
+    assertTrue(result.error !== null && result.error.includes('201'), `error must cite length 201: ${result.error}`);
+  });
+
+  // T24 — resolved_threads item is a number (not string) — rejected
+  await runTest('T24: validateResolvedThreads — non-string item (number) rejected', () => {
+    const result = validateResolvedThreads({ resolved_threads: ['ok-item', 42] });
+    assertFalse(result.ok, 'non-string item must be rejected');
+    assertTrue(result.error !== null && result.error.includes('resolved_threads[1]'), `error must mention index: ${result.error}`);
+  });
+
+  // T25 — resolved_threads item length > 4000 — rejected
+  await runTest('T25: validateResolvedThreads — item exceeding 4000 chars rejected', () => {
+    const longStr = 'x'.repeat(4001);
+    const result = validateResolvedThreads({ resolved_threads: [longStr] });
+    assertFalse(result.ok, 'item > 4000 chars must be rejected');
+    assertTrue(result.error !== null && result.error.includes('exceeds max length'), `error must mention max length: ${result.error}`);
+  });
+
+  // T26 — resolved_threads exactly 200 items — accepted (boundary)
+  await runTest('T26: validateResolvedThreads — exactly 200 items accepted (boundary)', () => {
+    const exactly200 = new Array(200).fill('valid-thread');
+    const result = validateResolvedThreads({ resolved_threads: exactly200 });
+    assertTrue(result.ok, 'exactly 200 items must be accepted');
+    assertEqual(result.error, null, 'no error at boundary');
   });
 
   // ── Summary ───────────────────────────────────────────────────────────────────
