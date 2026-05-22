@@ -17,7 +17,7 @@ const path = require("path");
 const { execFileSync } = require("child_process");
 
 // ── Paths ──────────────────────────────────────────────────────────────────
-const HOOKS_DIR  = "C:\\Users\\djwmo\\.claude\\hooks";
+const HOOKS_DIR  = __dirname;
 const DEBUG_LOG  = path.join(HOOKS_DIR, "pr-independence-debug.log");
 const REGISTRY   = path.join(HOOKS_DIR, "pr-authoring-registry.jsonl");
 

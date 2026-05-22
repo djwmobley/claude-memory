@@ -14,14 +14,19 @@
 # Source: https://docs.vllm.ai/en/latest/examples/pooling/score
 #
 # Launch as a persistent daemon:
-#   nohup bash /mnt/c/Users/djwmo/dev/claude-memory/start-vllm-reranker.sh > /tmp/vllm-reranker.log 2>&1 &
+#   nohup bash /path/to/claude-memory/start-vllm-reranker.sh > /tmp/vllm-reranker.log 2>&1 &
 
 export HF_HUB_DISABLE_SYMLINKS_WARNING=1
 
-exec /home/djwmo/.venv/vllm/bin/vllm serve Qwen/Qwen3-Reranker-4B \
+# Resolve paths relative to this script so the launcher is machine-independent.
+# Override VLLM_BIN if your vLLM venv lives elsewhere.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VLLM_BIN="${VLLM_BIN:-$HOME/.venv/vllm/bin/vllm}"
+
+exec "$VLLM_BIN" serve Qwen/Qwen3-Reranker-4B \
   --runner pooling \
   --hf_overrides '{"architectures": ["Qwen3ForSequenceClassification"], "classifier_from_token": ["no", "yes"], "is_original_qwen3_reranker": true}' \
-  --chat-template /mnt/c/Users/djwmo/dev/claude-memory/scripts/qwen3_reranker.jinja \
+  --chat-template "$SCRIPT_DIR/scripts/qwen3_reranker.jinja" \
   --quantization bitsandbytes \
   --load-format bitsandbytes \
   --dtype auto \

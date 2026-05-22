@@ -38,7 +38,7 @@
  *     to suppress and nothing to resurrect.
  *
  * Run (worktrees lack scripts/node_modules — point NODE_PATH at the main checkout):
- *   NODE_PATH="C:\\Users\\djwmo\\dev\\claude-memory\\scripts\\node_modules" \
+ *   NODE_PATH="/path/to/claude-memory/scripts/node_modules" \
  *     node test/north-star/test-lifecycle-roundtrip.js
  *
  * Exit codes (from the shared run() epilogue): 0 all-pass, 1 any failure,
