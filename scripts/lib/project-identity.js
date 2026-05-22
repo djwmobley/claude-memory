@@ -141,11 +141,7 @@ async function dumpRecoverySnapshot(db, legacyId, snapshotDir, targetUUID) {
       `SELECT * FROM ${table} WHERE project_id = $1`,
       [legacyId]
     );
-    if (rows.length > 0 || rows !== undefined) {
-      snapshot.tables[table] = { count: rows.length, rows };
-    } else {
-      snapshot.tables[table] = { count: 0, rows: [], note: 'table absent or empty' };
-    }
+    snapshot.tables[table] = { count: rows.length, rows };
   }
 
   // Write to temp then atomic-rename (I1 + I5 collision-safety).
@@ -759,13 +755,11 @@ async function _hasAnyRows(db, projectId) {
 }
 
 function _legacyHandoffPath(legacyId) {
-  const os = require('os');
-  return require('path').join(os.homedir(), '.claude', 'projects', legacyId, 'handoff.md');
+  return path.join(os.homedir(), '.claude', 'projects', legacyId, 'handoff.md');
 }
 
 function _newHandoffPath(uuid) {
-  const os = require('os');
-  return require('path').join(os.homedir(), '.claude', 'projects', uuid, 'handoff.md');
+  return path.join(os.homedir(), '.claude', 'projects', uuid, 'handoff.md');
 }
 
 /**
