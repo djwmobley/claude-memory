@@ -65,6 +65,9 @@ const {
   reconcileLegacySettings,
 } = require('./lib/project-identity');
 const { embedQuery }                               = require('./lib/embed');
+const { execFileSync }                             = require('child_process');
+const crypto                                       = require('crypto');
+const { REALITY_CHECKS, runVerifyDispatch }        = require('./lib/reality-checks');
 
 process.on('exit', () => {
   const ms = Number(process.hrtime.bigint() - __startNs) / 1e6;
@@ -264,7 +267,6 @@ function writeHandoffMd(handoffPath, vars) {
  */
 function gitObjectExists(root, sha) {
   try {
-    const { execFileSync } = require('child_process');
     execFileSync('git', ['cat-file', '-e', sha], {
       cwd: root,
       timeout: 3000,
@@ -759,6 +761,22 @@ function validatePointers(text, projectRoot, storedAnchors, derivedAnchors, corr
   }
 
   return { rewrittenText: rewritten, findings };
+}
+
+/**
+ * Extract the set of assertion indices referenced by strict-mode validation errors.
+ * Error messages have the form `assertions[N]...`; any error that does not match is
+ * ignored (it refers to the payload top-level, not a specific assertion).
+ *
+ * @param {string[]} errors  — validation.errors array from validatePayload()
+ * @returns {Set<number>}
+ */
+function _badAssertionIndices(errors) {
+  return new Set(
+    errors
+      .map((e) => { const m = e.match(/^assertions\[(\d+)\]/); return m ? parseInt(m[1], 10) : null; })
+      .filter((n) => n !== null)
+  );
 }
 
 async function _loadStoredAnchors(db, projectId, ptrs) {
@@ -1294,7 +1312,6 @@ function detectMultiAuthor(cwd) {
   }
 
   try {
-    const { execFileSync } = require('child_process');
     const out = execFileSync(
       'git',
       ['-C', cwd, 'log', '--format=%ae', '--since=1 year ago'],
@@ -1326,7 +1343,6 @@ function detectMultiAuthor(cwd) {
  */
 function detectUnpackagedState(root) {
   try {
-    const { execFileSync } = require('child_process');
     // Pass PROJECT_ROOT so any transitive subprocess resolves the correct project root.
     const execOpts = {
       encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'],
@@ -1384,7 +1400,6 @@ const _schemaHashCache = new Map();
  * Caches by (filePath + mtime) so file I/O is amortized within a process run.
  */
 function _hashSchemaFile(filePath) {
-  const crypto = require('crypto');
   let mtime;
   try {
     mtime = fs.statSync(filePath).mtimeMs;
@@ -1407,7 +1422,6 @@ function _hashSchemaFile(filePath) {
 function _computeSchemaFingerprint() {
   const pgFile     = path.join(_ENGINE_ROOT, 'scripts', 'sql', 'handoff-core-schema.sql');
   const sqliteFile = path.join(_ENGINE_ROOT, 'scripts', 'sql', 'handoff-sqlite-schema.sql');
-  const crypto = require('crypto');
   return crypto.createHash('sha256')
     .update(_hashSchemaFile(pgFile))
     .update(_hashSchemaFile(sqliteFile))
@@ -2315,7 +2329,6 @@ async function runResurrectQuery(db, projectId, q, opts = {}) {
     const annotationMap = new Map();
     if (serveTimeRcEnabled === 'enabled' && serveRoot) {
       try {
-        const { runVerifyDispatch } = require('./lib/reality-checks');
         // Build probe-compatible row objects (need id/subject/predicate/object).
         const probeRows = resurrectRows.map((r) => ({
           id:        r.id,
@@ -2712,24 +2725,13 @@ async function cmdLoaderLoad(opts = {}) {
       // Recency queries are ordered by last_reinforced DESC regardless of gate state;
       // decay is not factored into the ORDER BY for recency (recency stays recency-ordered).
       // LIMIT 20 is the guaranteed top-N floor; suppressed = false still excludes suppressed rows.
-      let recencyQuerySql;
-      if (feedbackLoopEnabled === 'enabled') {
-        // Gate ON: no cutoff filter; recency order unchanged.
-        // PR-B: exclude bi-temporally invalidated rows (invalid_at IS NULL = still live).
-        recencyQuerySql = `SELECT id, subject, predicate, object, confidence FROM assertions
+      // Ordered by last_reinforced DESC; suppressed=false and invalid_at IS NULL
+      // exclude suppressed rows and bi-temporally invalidated (superseded) rows.
+      const recencyQuerySql = `SELECT id, subject, predicate, object, confidence FROM assertions
          WHERE project_id = $1
            AND suppressed = false
            AND invalid_at IS NULL
          ORDER BY last_reinforced DESC LIMIT 20`;
-      } else {
-        // Gate OFF: no cutoff filter; recency order unchanged.
-        // PR-B: invalid_at IS NULL applies in both gate states.
-        recencyQuerySql = `SELECT id, subject, predicate, object, confidence FROM assertions
-         WHERE project_id = $1
-           AND suppressed = false
-           AND invalid_at IS NULL
-         ORDER BY last_reinforced DESC LIMIT 20`;
-      }
       const { rows } = await db.query(recencyQuerySql, [projectId]);
       if (rows.length) {
         // Accumulate rows one-at-a-time, bounded by sectionBudget.
@@ -3086,7 +3088,6 @@ async function cmdLoaderLoad(opts = {}) {
   // NEVER abort or throw out of a serve path.
   if (serveTimeRcEnabled === 'enabled' && servedAssertionRows.length > 0) {
     try {
-      const { runVerifyDispatch } = require('./lib/reality-checks');
       const serveRoot = findProjectRoot();
 
       // Build a quick lookup: assertion line text → result, keyed by the baseline
@@ -4077,8 +4078,6 @@ async function runRerankerGate(db, projectId, root) {
     return;
   }
 
-  const { execFileSync } = require('child_process');
-
   let vectorP5 = null;
   let rerankP5 = null;
 
@@ -4234,11 +4233,7 @@ async function cmdCheckpoint(args) {
         process.stderr.write(`[handoff] checkpoint async strict: skipping assertion — ${e}\n`);
       }
       // Build a filtered payload with only clean assertions.
-      const badIndices = new Set(
-        validation.errors
-          .map((e) => { const m = e.match(/^assertions\[(\d+)\]/); return m ? parseInt(m[1], 10) : null; })
-          .filter((n) => n !== null)
-      );
+      const badIndices = _badAssertionIndices(validation.errors);
       payloadToEnqueue = Object.assign({}, payload, {
         assertions: (payload.assertions || []).filter((_, i) => !badIndices.has(i)),
       });
@@ -4450,8 +4445,6 @@ async function cmdClose(args) {
   // The subject, confidence, and source of each injected assertion are determined
   // by the registry entry's probe and the canonical injection shape below.
   {
-    const { REALITY_CHECKS } = require('./lib/reality-checks');
-
     for (const check of REALITY_CHECKS) {
       if (check.mode !== 'authoritative') continue;
 
@@ -4564,11 +4557,7 @@ async function cmdClose(args) {
       for (const e of validation.errors) {
         process.stderr.write(`[handoff] close async strict: skipping assertion — ${e}\n`);
       }
-      const badIndices = new Set(
-        validation.errors
-          .map((e) => { const m = e.match(/^assertions\[(\d+)\]/); return m ? parseInt(m[1], 10) : null; })
-          .filter((n) => n !== null)
-      );
+      const badIndices = _badAssertionIndices(validation.errors);
       payloadToEnqueue = Object.assign({}, payload, {
         assertions: (payload.assertions || []).filter((_, i) => !badIndices.has(i)),
       });
@@ -4650,7 +4639,6 @@ async function cmdClose(args) {
   // skipping the whole block is correct and keeps dry-run zero-mutation.
   if (!dryRun) {
     try {
-      const { REALITY_CHECKS, runVerifyDispatch } = require('./lib/reality-checks');
       const preWriteRoot = root;
       const preWriteSessionId = payload.session_id || null;
       const verifyPredicates = [...new Set(
@@ -4985,7 +4973,6 @@ async function cmdClose(args) {
   //   - Only the reality_check column is written.
   //   - is_at_commit is NOT included.
   try {
-    const { REALITY_CHECKS, runVerifyDispatch } = require('./lib/reality-checks');
     const verifySessionId = payload.session_id || null;
 
     for (const check of REALITY_CHECKS) {
@@ -6316,11 +6303,7 @@ async function cmdQueueDrain(args) {
       for (const e of validation.errors) {
         process.stderr.write(`[queue-drain] row ${rowId} strict: skipping — ${e}\n`);
       }
-      const badIndices = new Set(
-        validation.errors
-          .map((e) => { const m = e.match(/^assertions\[(\d+)\]/); return m ? parseInt(m[1], 10) : null; })
-          .filter((n) => n !== null)
-      );
+      const badIndices = _badAssertionIndices(validation.errors);
       payloadToWrite = Object.assign({}, payload, {
         assertions: (payload.assertions || []).filter((_, i) => !badIndices.has(i)),
       });
