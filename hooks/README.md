@@ -52,7 +52,7 @@ The hook is registered in `.claude/settings.local.json` as a PreToolUse Bash
 hook. The relevant entry is:
 
 ```
-"Bash(node C:/Users/djwmo/.claude/hooks/pr-independence.js)"
+"Bash(node ~/.claude/hooks/pr-independence.js)"
 ```
 
 The hook reads the tool-use event JSON from stdin and exits 0 (allow) or 2
