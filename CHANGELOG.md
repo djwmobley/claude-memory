@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Refactor: extract `scripts/lib/test-pg-helpers.js`** — de-duplicates the PG
+  test-harness helpers (`pgConnect`, `createDb`/`createTestDb`,
+  `dropDb`/`dropTestDb`, `setSetting`, `getSettingsLike`, `setContract`,
+  `makeEnv`, `runHandoff`, `runClose`, `applySchema`, `resolveProjectId`,
+  `resolveHandoffMdPath`, `cleanupHandoffMd`, `setupProject`) that were
+  copy-pasted across six test scripts; each file now imports the shared module
+  and deletes its local definitions. No test assertions or behaviors changed.
+
 ### Added
 
 - **Documentation lint CI gate** (`scripts/test-doc-lint.js`): pure-Node static
@@ -99,6 +109,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Hoisted three inline `require(...)` calls (`child_process`, `crypto`,
     `./lib/reality-checks`) that were re-evaluated on every function entry to the
     top-level require block, where Node.js caches them after the first load.
+- **`scripts/lib/` dead-code removal and URL-parse dedup** (behavior-preserving):
+  - Removed a dead `else` branch in `project-identity.js` snapshot capture whose
+    condition (`rows.length > 0 || rows !== undefined`) is always true; replaced
+    if/else with a single unconditional assignment.
+  - Hoisted two inline `require('os')` / `require('path')` calls in
+    `_legacyHandoffPath` and `_newHandoffPath` to the top-level bindings already
+    present in the module.
+  - Extracted a `_parseBaseUrl(baseUrl)` helper in `shared.js` consolidating the
+    identical hostname/port/basePath parse block that was duplicated across
+    `vllmEmbed`, `vllmTokenize`, and `vllmTokenEmbed`.
 - **`OLLAMA_SKIP` / `--ollama-skip` renamed to `EMBED_SKIP` / `--embed-skip`**: the
   skip-live-embedding switch is not Ollama-specific; the real embedding backend is
   vLLM Qwen3-Embedding-8B. Renamed repo-wide to the backend-neutral form. No alias

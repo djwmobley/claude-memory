@@ -46,11 +46,22 @@
  * Exit 0 = all tests passed. Exit 1 = any failure.
  */
 
-const { spawnSync } = require('child_process');
 const fs   = require('fs');
 const os   = require('os');
 const path = require('path');
-const { Client } = require('pg');
+
+const {
+  pgConnect,
+  createDb,
+  dropDb,
+  setSetting,
+  makeEnv,
+  runHandoff,
+  runClose,
+  resolveProjectId,
+  cleanupHandoffMd,
+  setupProject,
+} = require('./lib/test-pg-helpers');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -66,117 +77,6 @@ const failures = [];
 
 function pass(label)         { console.log(`PASS  ${label}`); passed++; }
 function fail(label, reason) { console.log(`FAIL  ${label}: ${reason}`); failures.push({ label, reason }); failed++; }
-
-// ── DB helpers ────────────────────────────────────────────────────────────────
-
-async function pgConnect(database = 'postgres') {
-  const cfg = {
-    host:     process.env.PGHOST     || 'localhost',
-    port:     parseInt(process.env.PGPORT || '5432', 10),
-    user:     process.env.PGUSER     || 'postgres',
-    password: process.env.PGPASSWORD || 'postgres',
-    database,
-  };
-  const client = new Client(cfg);
-  await client.connect();
-  return client;
-}
-
-async function createDb(dbName, projectDir) {
-  const sysDb = await pgConnect('postgres');
-  const exists = await sysDb.query('SELECT 1 FROM pg_database WHERE datname = $1', [dbName]);
-  if (exists.rows.length === 0) {
-    await sysDb.query(`CREATE DATABASE "${dbName}"`);
-  }
-  await sysDb.end();
-  fs.mkdirSync(projectDir, { recursive: true });
-}
-
-async function dropDb(dbName, projectDir) {
-  if (fs.existsSync(projectDir)) {
-    try { fs.rmSync(projectDir, { recursive: true, force: true }); } catch (_) {}
-  }
-  let sysDb = null;
-  try {
-    sysDb = await pgConnect('postgres');
-    await sysDb.query(
-      `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1 AND pid<>pg_backend_pid()`,
-      [dbName]
-    );
-    await sysDb.query(`DROP DATABASE IF EXISTS "${dbName}"`);
-  } catch (_) {
-  } finally {
-    if (sysDb) { try { await sysDb.end(); } catch (_) {} }
-  }
-}
-
-async function setSetting(db, projectId, key, value) {
-  await db.query(
-    `INSERT INTO project_settings (project_id, key, value) VALUES ($1, $2, $3)
-     ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
-    [projectId, key, String(value)]
-  );
-}
-
-// ── Subprocess helpers ────────────────────────────────────────────────────────
-
-function makeEnv(db, projectDir, extraEnv = {}) {
-  return {
-    ...process.env,
-    HANDOFF_DB:   db,
-    PROJECT_ROOT: projectDir,
-    ...extraEnv,
-  };
-}
-
-function runHandoff(sub, extraArgs = [], stdin = null, db, projectDir, extraEnv = {}) {
-  const opts = {
-    cwd:      PROJECT_ROOT,
-    env:      makeEnv(db, projectDir, extraEnv),
-    encoding: 'utf8',
-    timeout:  30000,
-  };
-  if (stdin !== null) {
-    opts.input = stdin;
-  }
-  return spawnSync(process.execPath, [HANDOFF_SCRIPT, sub, ...extraArgs], opts);
-}
-
-function runClose(payload, db, projectDir, extraEnv = {}) {
-  return runHandoff('close', ['--json', '-'], JSON.stringify(payload), db, projectDir, extraEnv);
-}
-
-// ── Project helpers ───────────────────────────────────────────────────────────
-
-function encodeCwd(p) {
-  return p.replace(/[/\\]+$/, '').replace(/[^A-Za-z0-9-]/g, '-');
-}
-
-function resolveProjectId(projectDir) {
-  const markerPath = path.join(projectDir, '.claude-memory');
-  if (fs.existsSync(markerPath)) {
-    try {
-      const data = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
-      if (data.uuid) return data.uuid;
-    } catch (_) {}
-  }
-  return encodeCwd(projectDir);
-}
-
-function cleanupHandoffMd(projectId) {
-  const handoffDir = path.join(os.homedir(), '.claude', 'projects', projectId);
-  if (fs.existsSync(handoffDir)) {
-    try { fs.rmSync(handoffDir, { recursive: true, force: true }); } catch (_) {}
-  }
-}
-
-async function setupProject(dbName, projectDir) {
-  const r = runHandoff('init', ['-y'], null, dbName, projectDir);
-  if (r.status !== 0) {
-    throw new Error(`cmdInit failed: ${r.stderr || r.stdout}`);
-  }
-  return resolveProjectId(projectDir);
-}
 
 // ── T1: Attack-1 closed — single self-stamped close stays probationary ────────
 

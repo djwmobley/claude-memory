@@ -33,8 +33,17 @@ const { spawnSync } = require('child_process');
 const fs            = require('fs');
 const os            = require('os');
 const path          = require('path');
-const { Client }    = require('pg');
 const { readMarker } = require('./lib/project-marker');
+
+const {
+  encodeCwd,
+  pgConnect,
+  createTestDb,
+  dropTestDb,
+  applySchema,
+  setSetting,
+  setContract,
+} = require('./lib/test-pg-helpers');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -61,70 +70,14 @@ function fail(step, label, reason) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function encodeCwd(p) {
-  return p.replace(/[/\\]+$/, '').replace(/[^A-Za-z0-9-]/g, '-');
-}
-
 function markerUUIDOrFallback(dir) {
   const m = readMarker(dir);
   return (m && m.uuid) ? m.uuid : encodeCwd(dir);
 }
 
-async function pgConnect(database = 'postgres') {
-  const cfg = {
-    host:     process.env.PGHOST     || 'localhost',
-    port:     parseInt(process.env.PGPORT || '5432', 10),
-    user:     process.env.PGUSER     || 'postgres',
-    password: process.env.PGPASSWORD || 'postgres',
-    database,
-  };
-  const client = new Client(cfg);
-  await client.connect();
-  return client;
-}
-
-async function createTestDb(dbName, projectDir) {
-  const sysDb = await pgConnect('postgres');
-  const exists = await sysDb.query('SELECT 1 FROM pg_database WHERE datname = $1', [dbName]);
-  if (exists.rows.length > 0) {
-    await sysDb.end();
-    throw new Error(`DB ${dbName} already exists — naming collision`);
-  }
-  await sysDb.query(`CREATE DATABASE "${dbName}"`);
-  await sysDb.end();
-  fs.mkdirSync(projectDir, { recursive: true });
-}
-
-async function dropTestDb(dbName, projectDir) {
-  try {
-    if (fs.existsSync(projectDir)) fs.rmSync(projectDir, { recursive: true, force: true });
-  } catch (_) {}
-  let sysDb;
-  try {
-    sysDb = await pgConnect('postgres');
-    await sysDb.query(
-      `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-       WHERE datname = $1 AND pid <> pg_backend_pid()`,
-      [dbName]
-    );
-    await sysDb.query(`DROP DATABASE IF EXISTS "${dbName}"`);
-    await sysDb.end();
-    console.log(`[TEARDOWN] Dropped DB: ${dbName}`);
-  } catch (err) {
-    if (sysDb) { try { await sysDb.end(); } catch (_) {} }
-    console.error(`[TEARDOWN] WARNING: cleanup failed — ${err.message}`);
-  }
-}
-
-async function applySchema(dbName) {
-  const sql = fs.readFileSync(SCHEMA_FILE, 'utf8');
-  const db  = await pgConnect(dbName);
-  await db.query('BEGIN');
-  await db.query(sql);
-  await db.query('COMMIT');
-  await db.end();
-}
-
+/**
+ * Spawn handoff.js with EMBED_SKIP=1 and a 60 s timeout (resurrect-specific).
+ */
 function runHandoff(sub, extraArgs = [], stdin = null, dbName, projectDir) {
   const env = {
     ...process.env,
@@ -157,22 +110,6 @@ async function bootstrapDb(dbName, projectDir) {
   if (initR.status !== 0) {
     throw new Error(`init failed: ${(initR.stderr || initR.stdout || '').slice(0, 400)}`);
   }
-}
-
-async function setSetting(db, projectId, key, value) {
-  await db.query(
-    `INSERT INTO project_settings (project_id, key, value) VALUES ($1, $2, $3)
-     ON CONFLICT (project_id, key) DO UPDATE SET value = $3`,
-    [projectId, key, value]
-  );
-}
-
-async function setContract(db, projectId, queries) {
-  await db.query(
-    `UPDATE retrieval_contract SET queries = $2::jsonb, updated_at = now()
-     WHERE project_id = $1 AND name = 'default'`,
-    [projectId, JSON.stringify({ queries })]
-  );
 }
 
 /**

@@ -40,6 +40,8 @@ const os   = require('os');
 const path = require('path');
 const { Client } = require('pg');
 
+const { encodeCwd: encodeCwdLocal, pgConnect } = require('./lib/test-pg-helpers');
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const PROJECT_ROOT   = path.resolve(__dirname, '..');
@@ -75,19 +77,6 @@ function assertFalse(v, msg) {
 
 // ── PG helpers ────────────────────────────────────────────────────────────────
 
-async function pgConnect(dbName) {
-  const cfg = {
-    host:     process.env.PGHOST     || 'localhost',
-    port:     parseInt(process.env.PGPORT || '5432', 10),
-    user:     process.env.PGUSER     || 'postgres',
-    password: process.env.PGPASSWORD || 'postgres',
-    database: dbName,
-  };
-  const client = new Client(cfg);
-  await client.connect();
-  return client;
-}
-
 let _pgAvail = null;
 async function isPgAvailable() {
   if (_pgAvail !== null) return _pgAvail;
@@ -100,11 +89,6 @@ async function isPgAvailable() {
     console.log('[INFO] Postgres unavailable — subprocess tests will be SKIPPED.');
   }
   return _pgAvail;
-}
-
-/** Encode a filesystem path into a project_id the same way handoff.js does. */
-function encodeCwdLocal(p) {
-  return p.replace(/[/\\]+$/, '').replace(/[^A-Za-z0-9-]/g, '-');
 }
 
 /** Spawn a handoff.js subcommand with the throwaway DB and the TEMP_DIR as PROJECT_ROOT. */
