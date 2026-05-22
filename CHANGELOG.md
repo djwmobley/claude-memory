@@ -89,6 +89,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`scripts/handoff.js` dead-code removal and simplification** (behavior-preserving):
+  - Collapsed a dead `if/else` in the recency-query path whose two branches
+    assigned byte-identical SQL; replaced with a single `const` assignment with a
+    clarifying comment.
+  - Extracted a `_badAssertionIndices(errors)` helper that was duplicated verbatim
+    at three strict-mode assertion-filtering sites (checkpoint async, close async,
+    queue-drain); all three sites now call the helper.
+  - Hoisted three inline `require(...)` calls (`child_process`, `crypto`,
+    `./lib/reality-checks`) that were re-evaluated on every function entry to the
+    top-level require block, where Node.js caches them after the first load.
 - **`OLLAMA_SKIP` / `--ollama-skip` renamed to `EMBED_SKIP` / `--embed-skip`**: the
   skip-live-embedding switch is not Ollama-specific; the real embedding backend is
   vLLM Qwen3-Embedding-8B. Renamed repo-wide to the backend-neutral form. No alias
