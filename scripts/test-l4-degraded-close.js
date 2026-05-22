@@ -33,11 +33,23 @@
  * Exit 0 = all tests passed. Exit 1 = any failure.
  */
 
-const { spawnSync } = require('child_process');
 const fs   = require('fs');
 const os   = require('os');
 const path = require('path');
-const { Client } = require('pg');
+
+const {
+  pgConnect,
+  createDb      : createL4Db,
+  dropDb        : dropL4Db,
+  setSetting,
+  getSettingsLike,
+  makeEnv,
+  runHandoff    : _runHandoff,
+  resolveProjectId,
+  resolveHandoffMdPath,
+  cleanupHandoffMd,
+  setupProject  : _setupProject,
+} = require('./lib/test-pg-helpers');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -59,138 +71,14 @@ const failures = [];
 function pass(label)         { console.log(`PASS  ${label}`); passed++; }
 function fail(label, reason) { console.log(`FAIL  ${label}: ${reason}`); failures.push({ label, reason }); failed++; }
 
-// ── DB helpers ────────────────────────────────────────────────────────────────
+// ── L4-local wrappers with module-level defaults ──────────────────────────────
 
-async function pgConnect(database = 'postgres') {
-  const cfg = {
-    host:     process.env.PGHOST     || 'localhost',
-    port:     parseInt(process.env.PGPORT || '5432', 10),
-    user:     process.env.PGUSER     || 'postgres',
-    password: process.env.PGPASSWORD || 'postgres',
-    database,
-  };
-  const client = new Client(cfg);
-  await client.connect();
-  return client;
-}
-
-async function createL4Db(dbName, projectDir) {
-  const sysDb = await pgConnect('postgres');
-  const exists = await sysDb.query('SELECT 1 FROM pg_database WHERE datname = $1', [dbName]);
-  if (exists.rows.length === 0) {
-    await sysDb.query(`CREATE DATABASE "${dbName}"`);
-  }
-  await sysDb.end();
-  fs.mkdirSync(projectDir, { recursive: true });
-}
-
-async function dropL4Db(dbName, projectDir) {
-  // Clean up temp dirs
-  if (fs.existsSync(projectDir)) {
-    try { fs.rmSync(projectDir, { recursive: true, force: true }); } catch (_) {}
-  }
-  let sysDb = null;
-  try {
-    sysDb = await pgConnect('postgres');
-    await sysDb.query(
-      `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1 AND pid<>pg_backend_pid()`,
-      [dbName]
-    );
-    await sysDb.query(`DROP DATABASE IF EXISTS "${dbName}"`);
-  } catch (_) {
-  } finally {
-    if (sysDb) { try { await sysDb.end(); } catch (_) {} }
-  }
-}
-
-// ── Subprocess helpers ────────────────────────────────────────────────────────
-
-function makeEnv(db, projectDir, extraEnv = {}) {
-  return {
-    ...process.env,
-    HANDOFF_DB:   db,
-    PROJECT_ROOT: projectDir,
-    ...extraEnv,
-  };
-}
-
+/**
+ * Spawn handoff.js with L4's module-level default db/projectDir.
+ * Wraps the shared runHandoff with per-module defaults for db and projectDir.
+ */
 function runHandoff(sub, extraArgs = [], stdin = null, db = L4_DB, projectDir = TEMP_DIR_MAIN, extraEnv = {}) {
-  const opts = {
-    cwd:      PROJECT_ROOT,
-    env:      makeEnv(db, projectDir, extraEnv),
-    encoding: 'utf8',
-    timeout:  30000,
-  };
-  if (stdin !== null) {
-    opts.input = stdin;
-  }
-  return spawnSync(process.execPath, [HANDOFF_SCRIPT, sub, ...extraArgs], opts);
-}
-
-/** Read the project_id from the .claude-memory marker file, or fall back to encodeCwd. */
-function encodeCwd(p) {
-  return p.replace(/[/\\]+$/, '').replace(/[^A-Za-z0-9-]/g, '-');
-}
-
-function resolveProjectId(projectDir) {
-  // Try to read the .claude-memory marker UUID.
-  const markerPath = path.join(projectDir, '.claude-memory');
-  if (fs.existsSync(markerPath)) {
-    try {
-      const data = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
-      if (data.uuid) return data.uuid;
-    } catch (_) {}
-  }
-  return encodeCwd(projectDir);
-}
-
-function resolveHandoffMdPath(projectId) {
-  return path.join(os.homedir(), '.claude', 'projects', projectId, 'handoff.md');
-}
-
-/** Clean up handoff.md files for a project. */
-function cleanupHandoffMd(projectId) {
-  const handoffDir = path.join(os.homedir(), '.claude', 'projects', projectId);
-  if (fs.existsSync(handoffDir)) {
-    try { fs.rmSync(handoffDir, { recursive: true, force: true }); } catch (_) {}
-  }
-}
-
-// ── Test setup: init a project in the throwaway DB ───────────────────────────
-
-/**
- * Run cmdInit in the given throwaway DB / project dir, then return the project id.
- * @param {string} dbName     — throwaway DB name
- * @param {string} projectDir — temp project root dir
- */
-async function setupProject(dbName, projectDir) {
-  const r = runHandoff('init', ['-y'], null, dbName, projectDir);
-  if (r.status !== 0) {
-    throw new Error(`cmdInit failed: ${r.stderr || r.stdout}`);
-  }
-  return resolveProjectId(projectDir);
-}
-
-/**
- * Set a project_settings key directly in the DB.
- */
-async function setSetting(db, projectId, key, value) {
-  await db.query(
-    `INSERT INTO project_settings (project_id, key, value) VALUES ($1, $2, $3)
-     ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
-    [projectId, key, String(value)]
-  );
-}
-
-/**
- * Get all project_settings rows where key LIKE pattern.
- */
-async function getSettingsLike(db, projectId, pattern) {
-  const { rows } = await db.query(
-    `SELECT key, value FROM project_settings WHERE project_id = $1 AND key LIKE $2 ORDER BY key`,
-    [projectId, pattern]
-  );
-  return rows;
+  return _runHandoff(sub, extraArgs, stdin, db, projectDir, extraEnv);
 }
 
 /**
@@ -200,6 +88,15 @@ async function getSettingsLike(db, projectId, pattern) {
  */
 function runClose(payload = {}, db = L4_DB, projectDir = TEMP_DIR_MAIN, extraEnv = {}) {
   return runHandoff('close', ['--json', '-'], JSON.stringify(payload), db, projectDir, extraEnv);
+}
+
+/**
+ * Run cmdInit in the given throwaway DB / project dir, then return the project id.
+ * @param {string} dbName     — throwaway DB name
+ * @param {string} projectDir — temp project root dir
+ */
+async function setupProject(dbName, projectDir) {
+  return _setupProject(dbName, projectDir);
 }
 
 // ── T1: Clean close ───────────────────────────────────────────────────────────

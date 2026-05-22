@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Refactor: extract `scripts/lib/test-pg-helpers.js`** — de-duplicates the PG
+  test-harness helpers (`pgConnect`, `createDb`/`createTestDb`,
+  `dropDb`/`dropTestDb`, `setSetting`, `getSettingsLike`, `setContract`,
+  `makeEnv`, `runHandoff`, `runClose`, `applySchema`, `resolveProjectId`,
+  `resolveHandoffMdPath`, `cleanupHandoffMd`, `setupProject`) that were
+  copy-pasted across six test scripts; each file now imports the shared module
+  and deletes its local definitions. No test assertions or behaviors changed.
+
 ### Added
 
 - **Documentation lint CI gate** (`scripts/test-doc-lint.js`): pure-Node static

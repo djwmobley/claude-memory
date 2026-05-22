@@ -37,11 +37,22 @@
  * Requires Postgres at PGHOST/PGUSER/PGPASSWORD (or localhost/postgres).
  */
 
-const { spawnSync } = require('child_process');
 const fs   = require('fs');
 const os   = require('os');
 const path = require('path');
-const { Client } = require('pg');
+
+const {
+  pgConnect,
+  createDb,
+  dropDb,
+  setSetting,
+  makeEnv,
+  runHandoff,
+  runClose,
+  resolveProjectId,
+  cleanupHandoffMd,
+  setupProject,
+} = require('./lib/test-pg-helpers');
 
 const PROJECT_ROOT   = path.resolve(__dirname, '..');
 const HANDOFF_SCRIPT = path.join(PROJECT_ROOT, 'scripts', 'handoff.js');
@@ -53,81 +64,6 @@ function fail(label, reason) {
   console.log('FAIL  ' + label + ': ' + reason);
   failures.push({ label: label, reason: reason });
   failed++;
-}
-
-async function pgConnect(database) {
-  database = database || 'postgres';
-  const client = new Client({
-    host: process.env.PGHOST || 'localhost',
-    port: parseInt(process.env.PGPORT || '5432', 10),
-    user: process.env.PGUSER || 'postgres',
-    password: process.env.PGPASSWORD || 'postgres',
-    database: database,
-  });
-  await client.connect();
-  return client;
-}
-
-async function createDb(dbName, projectDir) {
-  const s = await pgConnect('postgres');
-  const e = await s.query('SELECT 1 FROM pg_database WHERE datname=$1', [dbName]);
-  if (!e.rows.length) await s.query('CREATE DATABASE "' + dbName + '"');
-  await s.end();
-  fs.mkdirSync(projectDir, { recursive: true });
-}
-
-async function dropDb(dbName, projectDir) {
-  if (fs.existsSync(projectDir)) {
-    try { fs.rmSync(projectDir, { recursive: true, force: true }); } catch (_) {}
-  }
-  let s = null;
-  try {
-    s = await pgConnect('postgres');
-    await s.query('SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1 AND pid<>pg_backend_pid()', [dbName]);
-    await s.query('DROP DATABASE IF EXISTS "' + dbName + '"');
-  } catch (_) {} finally { if (s) { try { await s.end(); } catch (_) {} } }
-}
-
-async function setSetting(db, projectId, key, value) {
-  await db.query(
-    'INSERT INTO project_settings (project_id,key,value) VALUES ($1,$2,$3) ON CONFLICT (project_id,key) DO UPDATE SET value=EXCLUDED.value',
-    [projectId, key, String(value)]
-  );
-}
-
-function makeEnv(db, projectDir, extra) {
-  return Object.assign({}, process.env, { HANDOFF_DB: db, PROJECT_ROOT: projectDir }, extra || {});
-}
-
-function runHandoff(sub, extraArgs, stdin, db, projectDir, extraEnv) {
-  const opts = { cwd: PROJECT_ROOT, env: makeEnv(db, projectDir, extraEnv), encoding: 'utf8', timeout: 30000 };
-  if (stdin != null) opts.input = stdin;
-  return spawnSync(process.execPath, [HANDOFF_SCRIPT, sub].concat(extraArgs || []), opts);
-}
-
-function runClose(payload, db, projectDir, env) {
-  return runHandoff('close', ['--json', '-'], JSON.stringify(payload), db, projectDir, env);
-}
-
-function encodeCwd(p) { return p.replace(/[/\\]+$/, '').replace(/[^A-Za-z0-9-]/g, '-'); }
-
-function resolveProjectId(projectDir) {
-  const mp = path.join(projectDir, '.claude-memory');
-  if (fs.existsSync(mp)) {
-    try { const d = JSON.parse(fs.readFileSync(mp, 'utf8')); if (d.uuid) return d.uuid; } catch (_) {}
-  }
-  return encodeCwd(projectDir);
-}
-
-function cleanupHandoffMd(projectId) {
-  const d = path.join(os.homedir(), '.claude', 'projects', projectId);
-  if (fs.existsSync(d)) { try { fs.rmSync(d, { recursive: true, force: true }); } catch (_) {} }
-}
-
-async function setupProject(dbName, projectDir) {
-  const r = runHandoff('init', ['-y'], null, dbName, projectDir);
-  if (r.status !== 0) throw new Error('cmdInit failed: ' + (r.stderr || r.stdout));
-  return resolveProjectId(projectDir);
 }
 
 async function insertPriorRow(db, projectId, o) {
