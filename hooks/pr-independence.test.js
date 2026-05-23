@@ -1,6 +1,6 @@
 "use strict";
 // pr-independence.test.js
-// Unit tests for the scrubDataRegions function and detection logic.
+// Unit tests for scrubDataRegions, extractRepoFlag, extractCdTarget, and decide.
 // Run with:  node hooks/pr-independence.test.js
 //
 // Uses node:test + node:assert (Node v18+ built-ins; Node v22 available here).
@@ -8,7 +8,7 @@
 const { test } = require("node:test");
 const assert   = require("node:assert/strict");
 
-const { scrubDataRegions } = require("./pr-independence.js");
+const { scrubDataRegions, extractRepoFlag, extractCdTarget, decide } = require("./pr-independence.js");
 
 // ── Detection helpers (mirrors what the hook does) ───────────────────────────
 function detectCreate(s)  { return /\bgh\s+pr\s+create\b/.test(s); }
@@ -237,4 +237,202 @@ test("Bonus4: <<- heredoc with tab-indented closing delimiter → body stripped"
     !detectMerge(scrubbed),
     `merge should NOT be detected in <<- heredoc body; scrubbed: ${JSON.stringify(scrubbed)}`
   );
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// extractRepoFlag tests
+// ═════════════════════════════════════════════════════════════════════════════
+
+// RF1: --repo long form
+test("RF1: extractRepoFlag — --repo a/b → 'a/b'", () => {
+  const cmd = "gh pr merge 11 --repo djwmobley/dataverse-linter --squash";
+  const result = extractRepoFlag(cmd);
+  assert.equal(result, "djwmobley/dataverse-linter",
+    `expected "djwmobley/dataverse-linter", got ${JSON.stringify(result)}`);
+});
+
+// RF2: -R short form
+test("RF2: extractRepoFlag — -R a/b → 'a/b'", () => {
+  const cmd = "gh pr merge 11 -R owner/repo --squash";
+  const result = extractRepoFlag(cmd);
+  assert.equal(result, "owner/repo",
+    `expected "owner/repo", got ${JSON.stringify(result)}`);
+});
+
+// RF3: no flag → null
+test("RF3: extractRepoFlag — no repo flag → null", () => {
+  const cmd = "gh pr merge 11 --squash";
+  const result = extractRepoFlag(cmd);
+  assert.equal(result, null,
+    `expected null, got ${JSON.stringify(result)}`);
+});
+
+// RF4: --repo inside a scrubbed data region is already gone — verify a normal
+//      merge command with an unquoted --repo still parses correctly.
+test("RF4: extractRepoFlag — real --repo in unquoted merge command → parsed", () => {
+  // Simulate what main() does: scrub the command, then extract.
+  const raw = 'gh pr merge 7 --repo foo/bar --squash';
+  const scrubbed = scrubDataRegions(raw);
+  const result = extractRepoFlag(scrubbed);
+  assert.equal(result, "foo/bar",
+    `expected "foo/bar" after scrub, got ${JSON.stringify(result)}`);
+});
+
+// RF5: --repo value that would have been inside a double-quoted string is gone
+//      after scrubbing (the scrubber strips quoted content before extractRepoFlag runs).
+test("RF5: extractRepoFlag — --repo inside double-quoted string is scrubbed away → null", () => {
+  // The --repo token appears inside a commit message string, not as a real flag.
+  const raw = 'git commit -m "use gh pr merge --repo fake/repo"';
+  const scrubbed = scrubDataRegions(raw);
+  const result = extractRepoFlag(scrubbed);
+  assert.equal(result, null,
+    `expected null (scrubbed away), got ${JSON.stringify(result)}`);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// extractCdTarget tests
+// ═════════════════════════════════════════════════════════════════════════════
+
+// CT1: MSYS-style path before &&
+test("CT1: extractCdTarget — cd /c/gemini/x && gh pr merge 5 → 'C:/gemini/x'", () => {
+  const cmd = "cd /c/gemini/x && gh pr merge 5 --squash";
+  const result = extractCdTarget(cmd);
+  assert.equal(result, "C:/gemini/x",
+    `expected "C:/gemini/x", got ${JSON.stringify(result)}`);
+});
+
+// CT2: double-quoted path with spaces
+test("CT2: extractCdTarget — cd \"C:/a b/x\" && gh ... → 'C:/a b/x'", () => {
+  const cmd = 'cd "C:/a b/x" && gh pr merge 3 --squash';
+  const result = extractCdTarget(cmd);
+  assert.equal(result, "C:/a b/x",
+    `expected "C:/a b/x", got ${JSON.stringify(result)}`);
+});
+
+// CT3: single-quoted path with spaces
+test("CT3: extractCdTarget — cd 'C:/a b/x' && gh ... → 'C:/a b/x'", () => {
+  const cmd = "cd 'C:/a b/x' && gh pr merge 3 --squash";
+  const result = extractCdTarget(cmd);
+  assert.equal(result, "C:/a b/x",
+    `expected "C:/a b/x", got ${JSON.stringify(result)}`);
+});
+
+// CT4: no leading cd → null
+test("CT4: extractCdTarget — gh pr merge 5 (no cd) → null", () => {
+  const cmd = "gh pr merge 5 --squash";
+  const result = extractCdTarget(cmd);
+  assert.equal(result, null,
+    `expected null, got ${JSON.stringify(result)}`);
+});
+
+// CT5: native Windows path (unquoted, no MSYS conversion needed)
+test("CT5: extractCdTarget — cd C:/foo && gh pr merge 2 → 'C:/foo'", () => {
+  const cmd = "cd C:/foo && gh pr merge 2";
+  const result = extractCdTarget(cmd);
+  assert.equal(result, "C:/foo",
+    `expected "C:/foo", got ${JSON.stringify(result)}`);
+});
+
+// CT6: cd AFTER gh pr is ignored (security: only leading cd counts)
+test("CT6: extractCdTarget — gh pr merge 5 && cd /c/evil → null", () => {
+  const cmd = "gh pr merge 5 --squash && cd /c/evil/path";
+  const result = extractCdTarget(cmd);
+  assert.equal(result, null,
+    `expected null (cd is after gh pr, not before), got ${JSON.stringify(result)}`);
+});
+
+// CT7: semicolon separator instead of &&
+test("CT7: extractCdTarget — cd /c/gemini/linter ; gh pr merge 11 → 'C:/gemini/linter'", () => {
+  const cmd = "cd /c/gemini/linter ; gh pr merge 11 --squash";
+  const result = extractCdTarget(cmd);
+  assert.equal(result, "C:/gemini/linter",
+    `expected "C:/gemini/linter", got ${JSON.stringify(result)}`);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// decide() tests — all four decision-tree outcomes
+// ═════════════════════════════════════════════════════════════════════════════
+
+// DT1: ROOT → always block regardless of branch/creatorSet
+test("DT1: decide — caller ROOT → block", () => {
+  const result = decide({
+    caller:     "ROOT",
+    branch:     "some-feature-branch",
+    branchErr:  null,
+    creatorSet: new Set(),
+  });
+  assert.equal(result.action, "block",
+    `expected "block" for ROOT caller, got ${JSON.stringify(result)}`);
+  assert.ok(result.reason.includes("root orchestrator"),
+    `expected reason to mention root orchestrator; got: ${result.reason}`);
+});
+
+// DT2: branch resolved AND caller is in the creator set → block
+test("DT2: decide — creator-in-set → block", () => {
+  const creatorSet = new Set(["agent-abc"]);
+  const result = decide({
+    caller:     "agent-abc",
+    branch:     "feature/my-work",
+    branchErr:  null,
+    creatorSet,
+  });
+  assert.equal(result.action, "block",
+    `expected "block" for creator attempting merge; got ${JSON.stringify(result)}`);
+  assert.ok(result.reason.includes("agent-abc"),
+    `expected reason to mention caller agent-abc; got: ${result.reason}`);
+});
+
+// DT3: branch NOT resolved (null) → fail-closed (block)
+test("DT3: decide — branch null (unresolved) → block (fail-closed)", () => {
+  const result = decide({
+    caller:     "agent-xyz",
+    branch:     null,
+    branchErr:  "gh error: no such PR",
+    creatorSet: new Set(),
+  });
+  assert.equal(result.action, "block",
+    `expected "block" when branch is unresolved; got ${JSON.stringify(result)}`);
+  assert.ok(result.reason.includes("unresolved"),
+    `expected reason to mention "unresolved"; got: ${result.reason}`);
+});
+
+// DT4: branch resolved AND caller NOT in creator set → allow
+test("DT4: decide — independent caller (branch set, not in creatorSet) → allow", () => {
+  const creatorSet = new Set(["agent-author"]);
+  const result = decide({
+    caller:     "agent-merger",
+    branch:     "feature/independent-work",
+    branchErr:  null,
+    creatorSet,
+  });
+  assert.equal(result.action, "allow",
+    `expected "allow" for independent caller; got ${JSON.stringify(result)}`);
+  assert.ok(result.reason.includes("agent-merger"),
+    `expected reason to mention caller agent-merger; got: ${result.reason}`);
+});
+
+// DT5: empty creator set + branch resolved → allow (no prior create recorded)
+test("DT5: decide — empty creatorSet (no prior create recorded) → allow", () => {
+  const result = decide({
+    caller:     "agent-new",
+    branch:     "main",
+    branchErr:  null,
+    creatorSet: new Set(),
+  });
+  assert.equal(result.action, "allow",
+    `expected "allow" when creatorSet is empty; got ${JSON.stringify(result)}`);
+});
+
+// DT6: branch null + branchErr null → block with "unknown error" in reason
+test("DT6: decide — branch null, branchErr null → block with unknown-error fallback", () => {
+  const result = decide({
+    caller:     "agent-xyz",
+    branch:     null,
+    branchErr:  null,
+    creatorSet: new Set(),
+  });
+  assert.equal(result.action, "block",
+    `expected "block"; got ${JSON.stringify(result)}`);
+  assert.ok(result.reason.includes("unknown error"),
+    `expected "unknown error" fallback; got: ${result.reason}`);
 });
