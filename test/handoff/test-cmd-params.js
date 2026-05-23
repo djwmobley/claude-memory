@@ -234,7 +234,7 @@ async function runTests() {
   const projectId = global.__projectId;
 
   // ── Provision the project ─────────────────────────────────────────────────
-  runHelper('init', [], { fakeRoot });
+  runHelper('init', ['-y'], { fakeRoot });
 
   // ── Seed some data so counts are non-zero ─────────────────────────────────
   const seedPayload = {
@@ -391,7 +391,7 @@ async function runTests() {
 
   await test('close --json alone reads stdin (no "-" token required)', async () => {
     // Re-init to ensure project exists after any prior manipulation.
-    runHelper('init', [], { fakeRoot });
+    runHelper('init', ['-y'], { fakeRoot });
 
     const payload = {
       entities:  [{ name: 'JsonAloneEntity', entity_type: 'concept', description: 'JSON-alone test' }],
@@ -417,7 +417,7 @@ async function runTests() {
   });
 
   await test('close --json - (legacy form with dash) still works', () => {
-    runHelper('init', [], { fakeRoot });
+    runHelper('init', ['-y'], { fakeRoot });
     const payload = {
       entities: [], assertions: [], edges: [],
       contract: { queries: [{ type: 'recency', token_budget: 300 }] },
@@ -432,7 +432,7 @@ async function runTests() {
   // ── 6. checkpoint --json (without trailing '-') ───────────────────────────
 
   await test('checkpoint --json alone reads stdin (no "-" token required)', async () => {
-    runHelper('init', [], { fakeRoot });
+    runHelper('init', ['-y'], { fakeRoot });
 
     // Seed a session_in_progress marker so checkpoint can retain it.
     await db.query(
@@ -458,7 +458,7 @@ async function runTests() {
   });
 
   await test('checkpoint --json - (legacy form with dash) still works', () => {
-    runHelper('init', [], { fakeRoot });
+    runHelper('init', ['-y'], { fakeRoot });
     const payload = {
       entities: [], assertions: [], edges: [],
       contract: { queries: [{ type: 'recency', token_budget: 300 }] },

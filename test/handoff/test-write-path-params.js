@@ -241,7 +241,7 @@ async function runTests() {
   const projectId = global.__projectId;
 
   // Provision the project.
-  runHelper('init', [], { fakeRoot });
+  runHelper('init', ['-y'], { fakeRoot });
 
   // ─── Feature 1: checkpoint --note ─────────────────────────────────────────
 

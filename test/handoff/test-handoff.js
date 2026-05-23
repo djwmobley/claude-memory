@@ -250,7 +250,7 @@ async function runTests() {
   }
 
   await test('init: creates project_settings defaults', async () => {
-    runHelper('init', [], { fakeRoot });
+    runHelper('init', ['-y'], { fakeRoot });
     const { rows } = await db.query(
       'SELECT COUNT(*) AS n FROM project_settings WHERE project_id = $1',
       [encodedRoot]
@@ -279,7 +279,7 @@ async function runTests() {
 
   await test('init is idempotent (can be run twice)', () => {
     // Should not throw on second run
-    runHelper('init', [], { fakeRoot });
+    runHelper('init', ['-y'], { fakeRoot });
   });
 
   // ── Test 2: status is read-only and outputs expected fields ──────────────
@@ -849,7 +849,7 @@ async function runTests() {
   // close), so all tests expect exit 0 and a valid Done line.
   //
   // Setup: re-run init to ensure the project row exists (purge may have wiped it).
-  runHelper('init', [], { fakeRoot });
+  runHelper('init', ['-y'], { fakeRoot });
 
   // Helper: resolve the actual handoff.md path for a given project root.
   // After init, ensureProjectIdentity may mint a UUID-based marker in .claude-memory,
@@ -905,7 +905,7 @@ async function runTests() {
   // ── Test 12 (byte-identity): clean close → no Reconciliation notice ──────
   await test('reconciliation byte-identity: clean payload → no notice, no literal placeholder', () => {
     // Re-init (purge may have run, so ensure the project row is fresh).
-    runHelper('init', [], { fakeRoot });
+    runHelper('init', ['-y'], { fakeRoot });
     const payload = {
       tldr: 'Everything looks great — quiet session with minor housekeeping.',
       open_threads: ['follow up on documentation'],
@@ -933,7 +933,7 @@ async function runTests() {
 
   // ── Test 13 (C-2): fix-keyword adjacent to degraded label → fires ─────────
   await test('reconciliation C-2: fix-keyword adjacent to degraded label in tldr → notice in handoff.md', () => {
-    runHelper('init', [], { fakeRoot });
+    runHelper('init', ['-y'], { fakeRoot });
     const payload = {
       // "fixed" is within 60 chars of "C2" and session_id is omitted so C2 degrades.
       // Both C-1 (label "C2" present in tldr) and C-2 ("fixed" adjacent to "C2") fire.
@@ -964,7 +964,7 @@ async function runTests() {
 
   // ── Test 14 (C-3): retrieval_outcome=success + C2 degraded → fires ────────
   await test('reconciliation C-3: retrieval_outcome success + C2 degraded → notice in handoff.md', () => {
-    runHelper('init', [], { fakeRoot });
+    runHelper('init', ['-y'], { fakeRoot });
     const payload = {
       tldr: 'Retrieval worked well this session.',
       open_threads: [],
@@ -1019,7 +1019,7 @@ knowledge:
       // Run init on the temp git root.
       execFileSync(
         process.execPath,
-        [HELPER, 'init'],
+        [HELPER, 'init', '-y'],
         {
           cwd: gitTestRoot,
           env: { ...process.env, PROJECT_ROOT: gitTestRoot },
@@ -1072,7 +1072,7 @@ knowledge:
 
   // ── Test 16 (C-4 excluded / acceptable divergence — must NOT fire) ─────────
   await test('reconciliation acceptable divergence: open_threads mentions C2 without fix-claim in tldr → no notice', () => {
-    runHelper('init', [], { fakeRoot });
+    runHelper('init', ['-y'], { fakeRoot });
     const payload = {
       // tldr does NOT mention C2 or any fix-claim keywords next to a degraded label.
       // open_threads mentions C2 (acceptable — C-4 is intentionally excluded).
