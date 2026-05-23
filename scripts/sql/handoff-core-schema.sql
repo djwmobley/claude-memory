@@ -115,8 +115,7 @@ ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMPTZ;
 --              still supersede a pinned row — pinned blocks AUTO actions only, not explicit writes.
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS valid_at TIMESTAMPTZ;
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS invalid_at TIMESTAMPTZ;
-ALTER TABLE assertions ADD COLUMN IF NOT EXISTS suppression_kind TEXT
-  CHECK (suppression_kind IN ('superseded', 'downvoted_terminal', 'downvoted_probation', 'retired'));
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS suppression_kind TEXT;
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT false;
 
 -- ── Two-tier durability: probationary → consolidated ──────────────────────────
@@ -155,23 +154,36 @@ ALTER TABLE assertions ADD COLUMN IF NOT EXISTS tier TEXT
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS consolidated_at TIMESTAMPTZ;
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS corroboration_count INTEGER NOT NULL DEFAULT 1;
 
--- ── L5 suppression_kind CHECK widening: add 'retired' ────────────────────────
+-- ── suppression_kind CHECK — single authoritative block ──────────────────────
 --
--- The ADD COLUMN IF NOT EXISTS above installs the widened CHECK on fresh DBs.
--- On existing DBs that already have the suppression_kind column with the prior
--- three-value CHECK, the ADD COLUMN is a no-op and the old constraint remains.
--- This DO block drops the old constraint (by any auto-generated or legacy name)
--- and re-adds the widened CHECK including 'retired'.  It is fully idempotent:
---   - If the column does not yet have a CHECK (e.g. added by a very old script
---     before the CHECK was introduced), the drop-constraint step is a no-op.
---   - If the column already has the widened 4-value CHECK, the constraint name
---     clash on re-add is caught and silently ignored.
+-- DESIGN PRINCIPLE — MONOTONIC WIDENING:
+--   The CHECK constraint on suppression_kind must NEVER be re-added with a value
+--   set narrower than values already present in the table.  On any DB that has an
+--   assertions row with suppression_kind='reality_reconciled', installing a 4-value
+--   CHECK (omitting that value) fails with "check constraint ... is violated by some
+--   row", aborting the entire Phase A transaction before the widening step can run.
+--
+--   The fix: define the constraint in EXACTLY ONE PLACE — this DO block — with the
+--   full canonical 5-value set.  The ADD COLUMN IF NOT EXISTS above adds the column
+--   with no inline CHECK so that fresh-DB and existing-DB paths both reach this block
+--   without any intermediate narrow constraint in flight.
+--
+-- IDEMPOTENCY:
+--   The block first drops any existing CHECK constraint that references
+--   suppression_kind (by any name — catches auto-generated names from older schema
+--   revisions).  It then re-adds the constraint with the canonical name and the full
+--   5-value set.  A duplicate_object error (constraint already exists with identical
+--   definition) is caught and silently ignored.
+--
+-- CANONICAL VALUE SET (authoritative — edit here when adding new values):
+--   superseded            cardinality-driven (1:1 predicate replaced by newer row)
+--   downvoted_terminal    C2 auto-downvote; not auto-revivable
+--   downvoted_probation   C2 auto-downvote soft-exclusion; revivable by positive feedback
+--   retired               operator-retired via cmdRetire (L5); non-destructive
+--   reality_reconciled    close-time mismatch reconciliation; audit trail distinct from supersession
 --
 -- Constraint name: assertions_suppression_kind_check  (Postgres auto-name for a
--- column-level CHECK on the assertions table).  If your instance uses a
--- different name (e.g. from a manual migration), the DO block drops all inline
--- CHECK constraints on suppression_kind via the catalog and re-adds with the
--- canonical name.
+-- column-level CHECK on the assertions table).
 DO $$
 DECLARE
   r RECORD;
@@ -190,45 +202,13 @@ BEGIN
     EXECUTE 'ALTER TABLE assertions DROP CONSTRAINT IF EXISTS ' || quote_ident(r.conname);
   END LOOP;
 
-  -- Add the widened CHECK (idempotent: catch duplicate-constraint error).
-  BEGIN
-    ALTER TABLE assertions
-      ADD CONSTRAINT assertions_suppression_kind_check
-        CHECK (suppression_kind IN ('superseded','downvoted_terminal','downvoted_probation','retired'));
-  EXCEPTION
-    WHEN duplicate_object THEN NULL;  -- already widened
-  END;
-END $$;
-
--- ── Reality-reconciliation: widen suppression_kind CHECK to add 'reality_reconciled' ──
---
--- Close-time mismatch reconciliation (Part 1) suppresses stale verify-mode rows
--- with suppression_kind='reality_reconciled' so the audit trail is distinct from
--- ordinary supersession.  Widen the CHECK to include this new value.
--- Idempotent: the DROP/re-ADD pattern mirrors the L5 widening above.
-DO $$
-DECLARE
-  r RECORD;
-BEGIN
-  FOR r IN
-    SELECT con.conname
-    FROM   pg_constraint con
-    JOIN   pg_class      rel ON rel.oid = con.conrelid
-    JOIN   pg_namespace  ns  ON ns.oid  = rel.relnamespace
-    WHERE  con.contype   = 'c'
-      AND  rel.relname   = 'assertions'
-      AND  ns.nspname    = current_schema()
-      AND  pg_get_constraintdef(con.oid) LIKE '%suppression_kind%'
-  LOOP
-    EXECUTE 'ALTER TABLE assertions DROP CONSTRAINT IF EXISTS ' || quote_ident(r.conname);
-  END LOOP;
-
+  -- Add the full canonical CHECK (idempotent: catch duplicate-constraint error).
   BEGIN
     ALTER TABLE assertions
       ADD CONSTRAINT assertions_suppression_kind_check
         CHECK (suppression_kind IN ('superseded','downvoted_terminal','downvoted_probation','retired','reality_reconciled'));
   EXCEPTION
-    WHEN duplicate_object THEN NULL;
+    WHEN duplicate_object THEN NULL;  -- constraint already present with identical definition
   END;
 END $$;
 
