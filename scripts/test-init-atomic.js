@@ -104,6 +104,40 @@ function rmTempDir(dir) {
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
 }
 
+/**
+ * Probe whether the OS enforces read-only permission on directories.
+ *
+ * Creates a temporary probe directory, chmod 0o555 it, then attempts to write
+ * a file inside it.  If the write SUCCEEDS the OS does not honour read-only
+ * directory bits (no enforcement — e.g. Windows running as owner), so
+ * chmod-based injection tests cannot be relied upon.  If the write THROWS
+ * (EACCES / EPERM) the capability is present.
+ *
+ * The probe directory is always restored to 0o755 and removed in a finally
+ * block so it cannot leak regardless of outcome.
+ *
+ * Returns true  → read-only-directory enforcement IS available (run A8).
+ * Returns false → enforcement NOT available (skip A8).
+ */
+function chmodDirEnforced() {
+  const probeDir = path.join(os.tmpdir(), `handoff_atomic_probe_${Date.now()}`);
+  fs.mkdirSync(probeDir, { recursive: true });
+  try {
+    fs.chmodSync(probeDir, 0o555);
+    try {
+      fs.writeFileSync(path.join(probeDir, 'probe'), 'x', 'utf8');
+      // Write succeeded — chmod not enforced on directories here.
+      return false;
+    } catch (_) {
+      // Write threw (EACCES/EPERM) — enforcement is available.
+      return true;
+    }
+  } finally {
+    try { fs.chmodSync(probeDir, 0o755); } catch (_) {}
+    try { fs.rmSync(probeDir, { recursive: true, force: true }); } catch (_) {}
+  }
+}
+
 /** Spawn handoff.js init in the given projectDir, using the given DB name. */
 function runInit(dbName, projectDir, extraEnv = {}) {
   return spawnSync(
@@ -478,13 +512,15 @@ async function testA7() {
 //   (c) handoff.md for the new UUID is absent (removed by unwind)
 //   (d) output does NOT falsely say "No FS writes made" (ledger was non-empty)
 //
-// POSIX only (chmod directory semantics not enforced on Windows; skipped there).
+// Requires read-only-directory enforcement (chmod 0o555 on a directory must
+// prevent file creation inside it).  Skipped when that capability is absent —
+// detected at runtime via a write probe, without referencing process.platform.
 // Requires live Postgres (skipped if unavailable).
 
 async function testA8() {
   const label = 'A8: FS-ledger unwind — read-only project root causes CLAUDE.md EACCES, handoff.md rolled back (POSIX)';
-  if (process.platform === 'win32') {
-    console.log(`SKIP  ${label} (chmod directory semantics not enforced on Windows)`);
+  if (!chmodDirEnforced()) {
+    console.log(`SKIP  ${label} (read-only-directory enforcement not available on this platform)`);
     return;
   }
   const pgAvail = await isPgAvailable();
