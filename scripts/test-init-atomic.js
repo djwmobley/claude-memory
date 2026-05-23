@@ -19,20 +19,32 @@
  *   A1  persistMarker() unit: writes a valid marker with a caller-supplied UUID.
  *   A2  persistMarker() unit: throws if marker already exists (no overwrite).
  *   A3  mintUUID() unit: returns a valid UUID v4; two calls produce distinct values.
- *   A4  Failure before FS writes leaves no marker (DB connect failure injection).
- *       Mechanism: set PGHOST to an unreachable host so db connect fails before
- *       any FS write, assert no .claude-memory in temp dir afterward.
- *   A5  Failure output does not claim cleanliness while a file persists.
- *       Piggybacks on A4: output must NOT say "No FS writes made" (old false msg).
+ *   A4  Core atomicity: failure before FS writes leaves no .claude-memory marker.
+ *       Injection: subprocess points at an UNREACHABLE Postgres port (59999) via a
+ *       minimal pipeline.yml in the temp project dir.  Preflight's Postgres-
+ *       reachability check is fatal and exits before handoff.md or CLAUDE.md are
+ *       written, so the ledger is empty and no marker can appear.
+ *       PLATFORM-AGNOSTIC — no chmod required; runs on all platforms.
+ *       NON-VACUOUS: the OLD code wrote the marker before any DB contact, so it
+ *       WOULD leave a .claude-memory file here; the fixed code defers to last.
+ *   A5  Failure message accuracy: output must NOT contain the stale pre-fix string
+ *       "No FS writes made." when the ledger is empty.  Piggybacks on A4 setup.
+ *       PLATFORM-AGNOSTIC.
  *   A6  Success path writes the marker LAST and produces a valid marker file.
  *       Uses a live throwaway DB (skipped if Postgres unavailable).
  *   A7  Re-init idempotency: running init twice on an already-provisioned project
  *       is safe and does NOT rewrite or duplicate the marker.
  *       Uses a live throwaway DB (skipped if Postgres unavailable).
- *   A8  FS-ledger unwind: CLAUDE.md write failure (read-only file, EPERM) triggers
- *       unwind that removes handoff.md (already in ledger) and never writes the
- *       marker. Asserts "Rolled back" in output. Uses a live throwaway DB (skipped
- *       if Postgres unavailable or on Windows). POSIX only (chmod injection).
+ *   A8  FS-ledger unwind: handoff.md write succeeds, then CLAUDE.md write fails
+ *       because the project ROOT DIRECTORY is non-writable (EACCES on new file
+ *       creation).  Unwind removes handoff.md; marker is never written.
+ *       Injection: fs.chmodSync(projectRoot, 0o555) — makes the directory itself
+ *       read-only so creating a new file inside it fails with EACCES regardless
+ *       of the target filename.  cmdInit checks fs.existsSync(claudeMdPath) first
+ *       and only skips the write when the FILE already exists — a non-existent
+ *       CLAUDE.md in a read-only directory is NOT skipped; the open()/write fails.
+ *       POSIX only (chmod directory semantics; skipped on Windows).
+ *       Asserts: "Rolled back" in output, no .claude-memory, handoff.md removed.
  *
  * Usage:
  *   node scripts/test-init-atomic.js
@@ -109,6 +121,27 @@ function runInit(dbName, projectDir, extraEnv = {}) {
       timeout:  30000,
     }
   );
+}
+
+/**
+ * Write a minimal pipeline.yml into <projectDir>/.claude/ so that loadConfig()
+ * picks up a custom host/port instead of the ambient defaults.
+ * Used by A4/A5 to point init at an unreachable Postgres port.
+ */
+function writePipelineYml(projectDir, host, port, dbName) {
+  const claudeDir = path.join(projectDir, '.claude');
+  fs.mkdirSync(claudeDir, { recursive: true });
+  const yml = [
+    'project:',
+    `  name: atomic-test-${Date.now()}`,
+    'knowledge:',
+    `  host: ${host}`,
+    `  port: ${port}`,
+    `  database: ${dbName}`,
+    '  user: postgres',
+    '  tier: postgres',
+  ].join('\n') + '\n';
+  fs.writeFileSync(path.join(claudeDir, 'pipeline.yml'), yml, 'utf8');
 }
 
 /** Check Postgres availability (memoized). */
@@ -223,164 +256,96 @@ async function testA3() {
   }
 }
 
-// ── A4: FS-write failure after DB succeeds leaves no marker ───────────────────
+// ── A4: Core atomicity — DB-failure before FS writes leaves no marker ─────────
 //
-// Injection strategy: run a successful phase-1 init to provision the DB, then
-// strip the marker + handoff.md, and make CLAUDE.md read-only (EPERM on write).
-// Re-init writes handoff.md (OK), then tries to write CLAUDE.md (EPERM) → failure.
-// At that point the marker must NOT be on disk (step 12 follows step 11).
+// Injection: write a minimal pipeline.yml inside the temp project dir that
+// points to an UNREACHABLE Postgres port (59999).  loadConfig() picks this up
+// because PROJECT_ROOT is set to the temp dir, so it finds .claude/pipeline.yml
+// there.  runInitPreflight()'s "Postgres reachable" step (Step 3) fires first —
+// it tries to open a TCP connection to port 59999 on localhost, which fails with
+// ECONNREFUSED.  That step is fatal and cmdInit calls process.exit(1) before
+// handoff.md or CLAUDE.md are written.  The FS ledger is therefore empty.
 //
-// Note: fs.chmodSync for read-only enforcement is POSIX-native; on Windows node
-// it may not prevent writes.  The test skips on Windows and in CI always runs
-// on Linux where chmod is reliable.  A1-A3 cover the persistMarker unit contract
-// on all platforms; A6/A7 prove the success path cross-platform.
+// PLATFORM-AGNOSTIC — no chmod, no admin rights required.
+//
+// NON-VACUOUS: the OLD code wrote the .claude-memory marker as the very first
+// action (before DB contact), so it WOULD leave the file behind here.  The fixed
+// code defers the marker write to step 12 (last), so it is never reached when
+// preflight fails at step 3.
+//
+// HANDOFF_DB is set to a throwaway name so that even if the port were somehow
+// reachable the DB name is unknown and a second failure-gate exists.
 
 async function testA4() {
-  const label = 'A4: FS-write failure after DB succeeds leaves no .claude-memory marker (POSIX)';
-  if (process.platform === 'win32') {
-    console.log(`SKIP  ${label} (chmod-based injection not reliable on Windows; covered by A1-A3 unit tests)`);
-    return;
-  }
-  const pgAvail = await isPgAvailable();
-  if (!pgAvail) { console.log(`SKIP  ${label} (Postgres unavailable)`); return; }
-
-  const dbName  = `handoff_atomic_a4_${TS}`;
-  const tmpDir  = makeTempDir('a4');
-  let   projId  = null;
-
+  const label = 'A4: core atomicity — unreachable Postgres at preflight leaves no .claude-memory marker';
+  const tmpDir = makeTempDir('a4');
   try {
-    await createDb(dbName, tmpDir);
+    // Point loadConfig() at a guaranteed-closed port via a local pipeline.yml.
+    const throwawayDb = `handoff_atomic_a4_unreachable_${TS}`;
+    writePipelineYml(tmpDir, 'localhost', 59999, throwawayDb);
 
-    // Phase 1: successful init.
-    const r1 = runInit(dbName, tmpDir);
-    if (r1.status !== 0) {
-      fail(label, `phase-1 init failed: ${r1.stderr || r1.stdout}`); return;
-    }
-    const marker1 = readMarker(tmpDir);
-    if (!marker1) { fail(label, 'no marker after phase-1 init'); return; }
-    projId = marker1.uuid;
+    const r = runInit(throwawayDb, tmpDir);
 
-    // Strip marker and handoff.md so re-init creates fresh FS writes.
-    fs.rmSync(path.join(tmpDir, MARKER_FILENAME), { force: true });
-    cleanupHandoffMd(projId);
-
-    // Make CLAUDE.md read-only so fs.writeFileSync fails with EPERM.
-    // cmdInit checks fs.existsSync first; a read-only EXISTING file passes that
-    // check and then fails on the write — this is the correct failure injection.
-    const claudeMdPath = path.join(tmpDir, 'CLAUDE.md');
-    // Ensure CLAUDE.md exists as a file (phase-1 may have created it).
-    if (!fs.existsSync(claudeMdPath)) {
-      fs.writeFileSync(claudeMdPath, '# placeholder\n', 'utf8');
-    }
-    // BUT: if it exists, cmdInit skips it (already present). We need it absent
-    // so cmdInit tries to write it.  Remove it, then re-create as read-only.
-    fs.rmSync(claudeMdPath, { force: true });
-    fs.writeFileSync(claudeMdPath, '# blocked\n', 'utf8');
-    fs.chmodSync(claudeMdPath, 0o444);  // read-only — write will throw EPERM
-
-    // Phase 2: re-init — step 11 (CLAUDE.md write) must fail.
-    let r2;
-    try {
-      r2 = runInit(dbName, tmpDir);
-    } finally {
-      try { fs.chmodSync(claudeMdPath, 0o644); } catch (_) {}
+    // Preflight must have failed (non-zero exit).
+    if (r.status === 0) {
+      fail(label, 'init unexpectedly succeeded with unreachable Postgres — injection did not fire'); return;
     }
 
-    if (r2.status === 0) {
-      // If init somehow succeeded (e.g. CLAUDE.md was treated as pre-existing),
-      // this is a test-design failure — report it clearly.
-      const out = (r2.stdout || '');
-      if (out.includes('CLAUDE.md already exists')) {
-        fail(label, 'test-design: cmdInit skipped CLAUDE.md write (treated read-only file as pre-existing) — injection did not fire'); return;
-      }
-      fail(label, 're-init unexpectedly succeeded despite read-only CLAUDE.md'); return;
+    // Self-check: confirm the failure was Postgres-reachability, not something else.
+    const combined = (r.stdout || '') + (r.stderr || '');
+    if (!combined.includes('59999') && !combined.includes('reachable') && !combined.includes('connect')) {
+      fail(label, `injection may not have fired — output does not mention port/reachable/connect: ${combined.slice(0, 400)}`); return;
     }
 
+    // Core assertion: no .claude-memory marker written.
     const markerPath = path.join(tmpDir, MARKER_FILENAME);
     if (fs.existsSync(markerPath)) {
-      fail(label, '.claude-memory written despite CLAUDE.md step failing — atomicity violated'); return;
+      fail(label, '.claude-memory written despite Postgres preflight failure — atomicity violated'); return;
     }
 
     pass(label);
   } catch (err) {
     fail(label, err.message);
   } finally {
-    const claudeMdPath = path.join(tmpDir, 'CLAUDE.md');
-    try { fs.chmodSync(claudeMdPath, 0o644); } catch (_) {}
-    if (projId) cleanupHandoffMd(projId);
-    await dropDb(dbName, tmpDir);
+    rmTempDir(tmpDir);
   }
 }
 
-// ── A5: failure output does not falsely claim "No FS writes made" ─────────────
+// ── A5: failure message accuracy — stale pre-fix string must not appear ────────
 //
-// Runs the same failure scenario as A4 (read-only CLAUDE.md) and inspects the
-// output.  The old false message must not appear verbatim.
+// Piggybacks on the same unreachable-Postgres setup as A4.  The old code emitted
+// the hardcoded string "No FS writes made." regardless of ledger state.  The new
+// code derives the message from the ledger: empty ledger → "No filesystem changes
+// were made." (accurate); non-empty ledger → "Rolled back filesystem writes..."
+// (accurate).  Either is acceptable here (ledger IS empty for a preflight failure).
+// What must NOT appear is the stale hardcoded pre-fix string.
 
 async function testA5() {
-  const label = 'A5: failure output does not contain stale "No FS writes made." message (POSIX)';
-  if (process.platform === 'win32') {
-    console.log(`SKIP  ${label} (chmod-based injection not reliable on Windows)`);
-    return;
-  }
-  const pgAvail = await isPgAvailable();
-  if (!pgAvail) { console.log(`SKIP  ${label} (Postgres unavailable)`); return; }
-
-  const dbName  = `handoff_atomic_a5_${TS}`;
-  const tmpDir  = makeTempDir('a5');
-  let   projId  = null;
-
+  const label = 'A5: failure output does not contain stale "No FS writes made." message';
+  const tmpDir = makeTempDir('a5');
   try {
-    await createDb(dbName, tmpDir);
+    const throwawayDb = `handoff_atomic_a5_unreachable_${TS}`;
+    writePipelineYml(tmpDir, 'localhost', 59999, throwawayDb);
 
-    // Phase 1: successful init.
-    const r1 = runInit(dbName, tmpDir);
-    if (r1.status !== 0) {
-      fail(label, `phase-1 init failed: ${r1.stderr || r1.stdout}`); return;
-    }
-    const marker1 = readMarker(tmpDir);
-    if (!marker1) { fail(label, 'no marker after phase-1 init'); return; }
-    projId = marker1.uuid;
+    const r = runInit(throwawayDb, tmpDir);
 
-    // Strip marker + handoff.md so re-init tries to create fresh files.
-    fs.rmSync(path.join(tmpDir, MARKER_FILENAME), { force: true });
-    cleanupHandoffMd(projId);
+    const combined = (r.stdout || '') + (r.stderr || '');
 
-    // Make CLAUDE.md read-only.
-    const claudeMdPath = path.join(tmpDir, 'CLAUDE.md');
-    fs.rmSync(claudeMdPath, { force: true });
-    fs.writeFileSync(claudeMdPath, '# blocked\n', 'utf8');
-    fs.chmodSync(claudeMdPath, 0o444);
-
-    let r2;
-    try {
-      r2 = runInit(dbName, tmpDir);
-    } finally {
-      try { fs.chmodSync(claudeMdPath, 0o644); } catch (_) {}
-    }
-
-    const combined = (r2.stdout || '') + (r2.stderr || '');
-
+    // Core assertion: stale hardcoded pre-fix message must not appear.
     if (combined.includes('No FS writes made.')) {
       fail(label, 'output still contains stale "No FS writes made." message'); return;
     }
 
-    if (r2.status === 0) {
-      const out = (r2.stdout || '');
-      if (out.includes('CLAUDE.md already exists')) {
-        fail(label, 'test-design: cmdInit skipped CLAUDE.md — injection did not fire'); return;
-      }
-      fail(label, 'init unexpectedly succeeded despite read-only CLAUDE.md'); return;
+    // Sanity: init must have failed (preflight fatal).
+    if (r.status === 0) {
+      fail(label, 'init unexpectedly succeeded with unreachable Postgres — injection did not fire'); return;
     }
 
     pass(label);
   } catch (err) {
     fail(label, err.message);
   } finally {
-    const claudeMdPath = path.join(tmpDir, 'CLAUDE.md');
-    try { fs.chmodSync(claudeMdPath, 0o644); } catch (_) {}
-    if (projId) cleanupHandoffMd(projId);
-    await dropDb(dbName, tmpDir);
+    rmTempDir(tmpDir);
   }
 }
 
@@ -482,23 +447,44 @@ async function testA7() {
   }
 }
 
-// ── A8: FS-ledger unwind — handoff.md removed, marker never written ───────────
+// ── A8: FS-ledger unwind — read-only project root triggers CLAUDE.md failure ──
 //
 // Prove the multi-file ledger unwind path: when handoff.md write succeeds but
 // CLAUDE.md write fails, the unwind removes handoff.md AND the marker is never
-// written (it is step 12, after CLAUDE.md step 11).
+// written (step 12 follows step 11).
 //
-// Injection: read-only CLAUDE.md (same as A4).  After failed re-init, assert:
-//   (a) .claude-memory absent (marker never written)
-//   (b) output contains "Rolled back" (unwind log appeared)
-//   (c) handoff.md absent for the new UUID minted by re-init
+// Injection: fs.chmodSync(tmpDir, 0o555) — make the PROJECT ROOT DIRECTORY
+// itself non-writable.  This is the correct injection because:
 //
-// POSIX only (chmod-based injection; skipped on Windows and when PG unavailable).
+//   1. handoff.md is written to ~/.claude/projects/<uuid>/handoff.md — a
+//      DIFFERENT directory that remains writable.  The write succeeds.
+//   2. CLAUDE.md is written to <projectRoot>/CLAUDE.md.  cmdInit calls
+//      fs.existsSync(claudeMdPath) first; since no CLAUDE.md exists in the
+//      fresh tempDir, the existsSync check returns false and cmdInit does NOT
+//      skip the write.  The subsequent fs.writeFileSync() call tries to create
+//      a new file in a read-only directory, which fails with EACCES.
+//   3. The ledger at that point contains [handoff.md].  unwindFsLedger() removes
+//      it.  The marker (step 12) is never reached.
+//
+// Why a read-only FILE was wrong: cmdInit checks fs.existsSync(claudeMdPath)
+// at step 11 and skips the write when the file already exists.  A pre-created
+// read-only CLAUDE.md passes that check and the write is silently skipped —
+// the injection never fires.  Making the DIRECTORY non-writable instead forces
+// the open() syscall to fail on a file that does NOT exist yet.
+//
+// Assertions after failed re-init:
+//   (a) .claude-memory absent (marker never written — step 12 never reached)
+//   (b) output contains "Rolled back" (unwind log emitted by unwindFsLedger)
+//   (c) handoff.md for the new UUID is absent (removed by unwind)
+//   (d) output does NOT falsely say "No FS writes made" (ledger was non-empty)
+//
+// POSIX only (chmod directory semantics not enforced on Windows; skipped there).
+// Requires live Postgres (skipped if unavailable).
 
 async function testA8() {
-  const label = 'A8: FS-ledger unwind — handoff.md removed and marker never written (POSIX)';
+  const label = 'A8: FS-ledger unwind — read-only project root causes CLAUDE.md EACCES, handoff.md rolled back (POSIX)';
   if (process.platform === 'win32') {
-    console.log(`SKIP  ${label} (chmod-based injection not reliable on Windows)`);
+    console.log(`SKIP  ${label} (chmod directory semantics not enforced on Windows)`);
     return;
   }
   const pgAvail = await isPgAvailable();
@@ -507,11 +493,12 @@ async function testA8() {
   const dbName  = `handoff_atomic_a8_${TS}`;
   const tmpDir  = makeTempDir('a8');
   let   projId  = null;
+  let   dirLocked = false;
 
   try {
     await createDb(dbName, tmpDir);
 
-    // Phase 1: successful init to provision the DB.
+    // Phase 1: successful init to provision the DB schema.
     const r1 = runInit(dbName, tmpDir);
     if (r1.status !== 0) {
       fail(label, `phase-1 init failed: ${r1.stderr || r1.stdout}`); return;
@@ -520,31 +507,39 @@ async function testA8() {
     if (!marker1) { fail(label, 'no marker after phase-1 init'); return; }
     projId = marker1.uuid;
 
-    // Remove marker and handoff.md so re-init creates fresh FS writes.
+    // Remove marker and handoff.md so re-init goes through fresh FS writes.
     fs.rmSync(path.join(tmpDir, MARKER_FILENAME), { force: true });
     cleanupHandoffMd(projId);
 
-    // Make CLAUDE.md read-only (must be present as a file for cmdInit to try to write it).
+    // Remove CLAUDE.md if phase-1 wrote it (it must be absent so cmdInit tries
+    // to create a new one — which fails because the directory is read-only).
     const claudeMdPath = path.join(tmpDir, 'CLAUDE.md');
     fs.rmSync(claudeMdPath, { force: true });
-    fs.writeFileSync(claudeMdPath, '# blocked\n', 'utf8');
-    fs.chmodSync(claudeMdPath, 0o444);
 
-    // Phase 2: re-init — handoff.md write succeeds, CLAUDE.md write fails with EPERM.
-    // Ledger at that point: [handoff.md]. Unwind removes handoff.md; marker never written.
-    let r2;
-    try {
-      r2 = runInit(dbName, tmpDir);
-    } finally {
-      try { fs.chmodSync(claudeMdPath, 0o644); } catch (_) {}
-    }
+    // Lock the project root directory.  Any attempt to create a new file inside
+    // it (such as CLAUDE.md) will fail with EACCES.
+    fs.chmodSync(tmpDir, 0o555);
+    dirLocked = true;
 
+    // Phase 2: re-init.
+    //   - handoff.md write → ~/.claude/projects/<newUUID>/handoff.md → SUCCEEDS
+    //   - CLAUDE.md write  → <tmpDir>/CLAUDE.md → EACCES (dir is read-only)
+    //   - unwindFsLedger() → removes handoff.md
+    //   - process.exit(1)
+    const r2 = runInit(dbName, tmpDir);
+
+    // Restore directory writability for cleanup (must happen before assertions
+    // so rmTempDir() / dropDb() can proceed regardless of assertion outcome).
+    fs.chmodSync(tmpDir, 0o755);
+    dirLocked = false;
+
+    // Self-check: injection must have fired (non-zero exit).
     if (r2.status === 0) {
       const out = (r2.stdout || '');
       if (out.includes('CLAUDE.md already exists')) {
-        fail(label, 'test-design: cmdInit skipped CLAUDE.md — injection did not fire'); return;
+        fail(label, 'test-design: cmdInit found CLAUDE.md already present and skipped the write — injection did not fire'); return;
       }
-      fail(label, 're-init unexpectedly succeeded despite read-only CLAUDE.md'); return;
+      fail(label, 're-init unexpectedly succeeded despite read-only project directory'); return;
     }
 
     const combined = (r2.stdout || '') + (r2.stderr || '');
@@ -555,12 +550,12 @@ async function testA8() {
       fail(label, '.claude-memory written despite CLAUDE.md failure — atomicity violated'); return;
     }
 
-    // (b) Output must mention "Rolled back".
+    // (b) Output must mention "Rolled back" (unwind fired).
     if (!combined.includes('Rolled back')) {
-      fail(label, `output does not mention "Rolled back": ${combined.slice(0, 400)}`); return;
+      fail(label, `output does not mention "Rolled back" — unwind may not have fired: ${combined.slice(0, 400)}`); return;
     }
 
-    // (c) handoff.md for the new UUID must have been removed by unwind.
+    // (c) handoff.md for the new UUID must be absent (removed by unwind).
     const uuidMatch = combined.match(/uuid=([0-9a-f-]{36})/i);
     if (uuidMatch) {
       const newUuid     = uuidMatch[1];
@@ -571,12 +566,20 @@ async function testA8() {
       cleanupHandoffMd(newUuid);
     }
 
+    // (d) Must NOT claim "No FS writes made" — the ledger had handoff.md in it.
+    if (combined.includes('No filesystem changes were made.')) {
+      fail(label, 'output falsely claims no FS changes while handoff.md was created and rolled back'); return;
+    }
+
     pass(label);
   } catch (err) {
     fail(label, err.message);
   } finally {
-    const claudeMdPath = path.join(tmpDir, 'CLAUDE.md');
-    try { fs.chmodSync(claudeMdPath, 0o644); } catch (_) {}
+    // Restore directory writability before cleanup, in case an early return left
+    // it locked.
+    if (dirLocked) {
+      try { fs.chmodSync(tmpDir, 0o755); } catch (_) {}
+    }
     if (projId) cleanupHandoffMd(projId);
     await dropDb(dbName, tmpDir);
   }
