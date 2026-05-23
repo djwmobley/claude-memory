@@ -259,7 +259,7 @@ function runResume(fakeRoot, extraEnv) {
 function runInit(fakeRoot) {
   return execFileSync(
     process.execPath,
-    [HELPER, 'init'],
+    [HELPER, 'init', '-y'],
     { cwd: fakeRoot, env: helperEnv(fakeRoot), encoding: 'utf8', timeout: 60000 }
   );
 }

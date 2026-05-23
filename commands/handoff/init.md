@@ -58,23 +58,44 @@ PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" init "my-project" -y
 | Argument / flag | Default | Description |
 |---|---|---|
 | `<name>` | directory basename | Optional project name positional. Sets the human-readable project label written to `project_settings`. |
-| `-y` | off | Skip the interactive DB-creation prompt and auto-create the database if absent. |
+| `-y` / `--yes` / `--force` | off | Bypass the confirmation prompt and auto-create the database if absent. Required for non-interactive / agent / CI use. |
+
+## Confirmation gate
+
+`init` always prints the resolved target DB and its source tier before touching any
+schema. When running interactively (stdin is a TTY) without a bypass flag, it prompts:
+
+```
+  Apply handoff schema to database '<DB>' (source: <source>)? [y/N]:
+```
+
+Answering anything other than `y` / `yes` aborts with no changes.
+
+When stdin is **not** a TTY (script, agent, CI pipeline) and no bypass flag is present,
+`init` **safe-fails** immediately with a clear message — it never hangs waiting for input.
+Pass `-y` (or `--yes` / `--force`) to bypass confirmation in those contexts.
 
 ## Expected output
 
 ```
 Running: handoff:init
 
-  init complete:
-  OK    schema migration: phase2-schema.sql
-  OK    schema migration: phase3b-schema.sql
-  OK    project_settings defaults inserted (5 keys, idempotent)
-  OK    created handoff.md: ~/.claude/projects/<encoded_cwd>/handoff.md
-  OK    created CLAUDE.md: <project_root>/CLAUDE.md
-  NOTE  CLAUDE.md should be git-committed.
-  OK    retrieval_contract 'default' row ensured
+  [OK]    .claude-memory marker minted (deferred): uuid=<uuid>
+          Path: <project_root>/.claude-memory (written last on success)
+  Resolved target DB: claude_memory_eval_test  (source: built-in default)
+  [OK]    Node version >= 18
+  [OK]    Database 'claude_memory_eval_test' present
+  [OK]    Schema file present: handoff-core-schema.sql
+  [OK]    Schema applied: handoff-core-schema.sql
+  [OK]    project_settings defaults ensured (27 keys, idempotent)
+  [OK]    retrieval_contract 'default' row ensured
+  [OK]    retrieval_contract_history baseline ensured (idempotent)
+  [OK]    handoff.md created: ~/.claude/projects/<uuid>/handoff.md
+  [OK]    CLAUDE.md created: <project_root>/CLAUDE.md
+  [NOTE]  CLAUDE.md should be git-committed.
+  [OK]    .claude-memory marker written: uuid=<uuid>
 
-Done: handoff:init — project <encoded_cwd> provisioned
+Done: handoff:init — project <uuid> provisioned
 ```
 
 > Done: handoff:init — project initialized

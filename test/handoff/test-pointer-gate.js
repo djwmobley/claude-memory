@@ -378,7 +378,7 @@ async function runTests() {
       const srcFile = path.join(srcDir, 'target.js');
       fs.writeFileSync(srcFile, 'const x = 1;\nfunction anchorFunc() {\n  return 42;\n}\n', 'utf8');
 
-      runHelper('init', [], { fakeRoot });
+      runHelper('init', ['-y'], { fakeRoot });
 
       // Close with a tldr referencing scripts/target.js:2 (where anchorFunc is)
       const payload1 = minimalClosePayload(
@@ -432,7 +432,7 @@ async function runTests() {
       const srcFile = path.join(srcDir, 'multi.js');
       fs.writeFileSync(srcFile, 'function sharedFunc() {\n  return 1;\n}\n', 'utf8');
 
-      runHelper('init', [], { fakeRoot });
+      runHelper('init', ['-y'], { fakeRoot });
 
       // Close with tldr and quick_references both referencing scripts/multi.js:1
       const payload = minimalClosePayload(
@@ -481,7 +481,7 @@ async function runTests() {
       const srcFile = path.join(srcDir, 'recon.js');
       fs.writeFileSync(srcFile, 'function reconFunc() { return 0; }\n', 'utf8');
 
-      runHelper('init', [], { fakeRoot });
+      runHelper('init', ['-y'], { fakeRoot });
 
       // First close: plant an assertion with a pointer and establish anchor
       const payload1 = minimalClosePayload(
@@ -607,7 +607,7 @@ async function runTests() {
       fs.writeFileSync(path.join(scriptsDir, 'handoff.js'), lines.join('\n'), 'utf8');
 
       // Connect to the throwaway DB and provision the schema
-      runHelper('init', [], { fakeRoot });
+      runHelper('init', ['-y'], { fakeRoot });
 
       // Read the project_id from the .claude-memory marker written by init
       const markerPath = path.join(fakeRoot, '.claude-memory');

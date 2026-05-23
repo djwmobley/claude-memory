@@ -84,6 +84,18 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run init confirmation gate tests
+        # Regression guard for the init DB-confirmation gate (#126).
+        # C1: resolved DB name and source tier printed before DDL (pipeline.yml tier).
+        # C2: -y bypass proceeds — init completes and writes .claude-memory marker.
+        # C3: non-TTY safe-fail — exits non-zero, prints refusal, no marker, no hang
+        #     (enforced by 5-second subprocess timeout; key non-vacuous test).
+        # C1/C2 use throwaway DBs; C3 does NOT require Postgres (gate fires before preflight).
+        run: node scripts/test-init-confirm.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run graph edge-traversal tests
         # Exhaustive harness for kind:'graph' recursive-CTE retrieval feature.
         # Creates/drops throwaway DBs; uses the same Postgres service as the other steps.
