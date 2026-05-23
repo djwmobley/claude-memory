@@ -70,6 +70,20 @@ jobs:
         run: psql -h localhost -U postgres -c "CREATE DATABASE claude_memory_eval_test" || true
         env:
           PGPASSWORD: postgres
+      - name: Run init atomicity tests
+        # Regression guard for the handoff init atomicity fix (#125).
+        # A1-A3: pure unit tests for mintUUID() / persistMarker() (no Postgres required).
+        # A4-A5: subprocess injection — unreachable PGHOST forces DB-connect failure;
+        #        asserts no .claude-memory marker written and no false "No FS writes made".
+        # A6-A7: live Postgres — success path writes marker last; re-init idempotency.
+        # A8:    FS-ledger unwind — failed handoff.md write cleans up; marker never written
+        #        (POSIX chmod injection; skipped on Windows).
+        # Creates/drops throwaway DBs for A6/A7/A8; does NOT use claude_memory_eval_test.
+        run: node scripts/test-init-atomic.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run graph edge-traversal tests
         # Exhaustive harness for kind:'graph' recursive-CTE retrieval feature.
         # Creates/drops throwaway DBs; uses the same Postgres service as the other steps.

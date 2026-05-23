@@ -27,6 +27,17 @@
  *     Mint a new UUID and write the marker file. Throws if write fails.
  *     Never overwrites an existing marker.
  *
+ *   mintUUID() → string
+ *     Mint a fresh UUID v4 without touching the filesystem. Use when a stable
+ *     project id is needed before the caller is ready to persist the marker
+ *     (e.g. deferred marker writes during handoff init for atomicity).
+ *
+ *   persistMarker(rootDir, uuid) → { uuid, created_at, schema_version }
+ *     Write a marker file using a CALLER-SUPPLIED uuid. Throws if a marker
+ *     already exists. Produces the same JSON shape as writeMarker (uuid,
+ *     created_at, schema_version). Use together with mintUUID() when the UUID
+ *     must be known before the marker is written to disk.
+ *
  *   resolveMarkerUUID(rootDir) → string
  *     Read the UUID from an existing marker. Throws if not found or malformed.
  *     Use when the caller knows the marker must exist.
@@ -106,13 +117,47 @@ function readMarker(rootDir) {
  * @returns {{ uuid: string, created_at: string, schema_version: number }}
  */
 function writeMarker(rootDir) {
+  const uuid = mintUUID();
+  return persistMarker(rootDir, uuid);
+}
+
+/**
+ * Mint a fresh UUID v4 without touching the filesystem.
+ *
+ * Use when a stable project id is needed before the caller is ready to write
+ * the marker file (e.g. cmdInit defers the marker write until after all DB
+ * steps succeed, but needs the UUID for DB inserts beforehand).
+ *
+ * @returns {string} UUID v4 string.
+ */
+function mintUUID() {
+  return crypto.randomUUID();
+}
+
+/**
+ * Write a marker file using a CALLER-SUPPLIED uuid.
+ * NEVER overwrites an existing marker — throws if one already exists.
+ *
+ * Produces the same JSON shape as writeMarker (uuid, created_at,
+ * schema_version). Use together with mintUUID() when the UUID must be known
+ * before the marker can be written to disk (deferred-write pattern for init
+ * atomicity).
+ *
+ * @param {string} rootDir - Project root directory.
+ * @param {string} uuid    - UUID v4 string minted by mintUUID().
+ * @returns {{ uuid: string, created_at: string, schema_version: number }}
+ */
+function persistMarker(rootDir, uuid) {
   const markerPath = path.join(rootDir, MARKER_FILENAME);
 
   if (fs.existsSync(markerPath)) {
-    throw new Error(`writeMarker: marker already exists at ${markerPath} — use readMarker() instead`);
+    throw new Error(`persistMarker: marker already exists at ${markerPath} — use readMarker() instead`);
   }
 
-  const uuid       = crypto.randomUUID();
+  if (!isValidUUID(uuid)) {
+    throw new Error(`persistMarker: uuid argument is not a valid UUID v4: ${uuid}`);
+  }
+
   const created_at = new Date().toISOString();
   const payload    = {
     uuid,
@@ -154,6 +199,8 @@ module.exports = {
   findProjectRootByMarker,
   readMarker,
   writeMarker,
+  mintUUID,
+  persistMarker,
   resolveMarkerUUID,
   isValidUUID,  // exported for tests
 };
