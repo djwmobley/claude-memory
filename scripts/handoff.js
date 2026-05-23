@@ -1660,9 +1660,44 @@ async function cmdInit(args) {
 
   const handoffPath  = resolveHandoffMdPath(projectId);
   const claudeMdPath = path.join(root, 'CLAUDE.md');
-  const autoCreate   = args.includes('-y');
+  // -y / --yes / --force all bypass the confirmation gate and enable DB auto-create.
+  const autoCreate   = args.includes('-y') || args.includes('--yes') || args.includes('--force');
 
   const cfg = loadConfig();
+
+  // ── Resolved target DB announcement ──────────────────────────────────────
+  // Always print before any DDL so the operator knows which DB will be touched.
+  console.log(`  Resolved target DB: ${TARGET_DB}  (source: ${_rawTargetDbSource})`);
+
+  // ── Confirmation gate — BEFORE any DDL ───────────────────────────────────
+  //
+  // Policy: no schema (CREATE DATABASE or schema apply) executes without explicit
+  // acknowledgment.  Three paths:
+  //   1. bypass flag (-y / --yes / --force) → skip prompt, proceed immediately.
+  //   2. stdin is a TTY → interactive y/N prompt; non-yes answer aborts, exit 1.
+  //   3. stdin is NOT a TTY and no bypass flag → safe-fail with a clear message,
+  //      exit 1.  NEVER open a readline interface in this path — that hangs.
+  if (!autoCreate) {
+    if (process.stdin.isTTY) {
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      const answer = await new Promise((resolve) => {
+        rl.question(
+          `  Apply handoff schema to database '${TARGET_DB}' (source: ${_rawTargetDbSource})? [y/N]: `,
+          (a) => { rl.close(); resolve(a.trim()); }
+        );
+      });
+      if (!/^y(es)?$/i.test(answer)) {
+        console.log(`  Aborted — no schema changes were made.`);
+        process.exit(1);
+      }
+    } else {
+      // Non-interactive context with no bypass flag — safe-fail immediately.
+      // Do NOT open readline here; that would hang agent/CI invocations indefinitely.
+      console.log(`  Refusing to apply DDL without confirmation in a non-interactive context.`);
+      console.log(`  Re-run with -y (or --force) to proceed, or run init in an interactive terminal.`);
+      process.exit(1);
+    }
+  }
 
   // ── Pre-flight checks ─────────────────────────────────────────────────────
 
