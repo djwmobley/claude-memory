@@ -59,6 +59,8 @@ const {
   findProjectRootByMarker,
   readMarker,
   writeMarker,
+  mintUUID,
+  persistMarker,
 } = require('./lib/project-marker');
 const {
   ensureProjectIdentity,
@@ -1609,33 +1611,56 @@ async function cmdInit(args) {
   const markerRoot = findProjectRootByMarker(initCwd);
   const root       = markerRoot || findProjectRoot();
 
-  // Resolve or mint the project marker so projectId is UUID-based.
-  // cmdInit is special: it doesn't have a live DB yet, so we can't call
-  // ensureProjectIdentity. Instead we read an existing marker or mint a new one.
+  // ── Resolve or mint the project UUID (FS-deferred for atomicity) ──────────
+  //
+  // When no marker exists yet, we mint the UUID in memory and defer writing
+  // the .claude-memory file to the very last step — AFTER all DB operations
+  // and all other FS writes succeed.  This ensures a failed init cannot leave
+  // the project appearing handoff-enabled when the DB was never provisioned.
+  //
+  // When a marker already exists (re-init), we read the UUID as normal and
+  // skip the deferred write; idempotency is preserved.
+  //
+  // fsLedger — tracks only the files THIS run creates (not pre-existing ones).
+  // On any failure after we start writing files, unwindFsLedger() deletes
+  // exactly those files in reverse order.
+  const fsLedger = [];      // entries: absolute file path strings, push-ordered
+  let   markerDeferred = false; // true when the marker is not yet on disk
+
+  function unwindFsLedger() {
+    const created = [...fsLedger].reverse();
+    for (const filePath of created) {
+      try { fs.rmSync(filePath, { force: true }); } catch (_) { /* best-effort */ }
+    }
+    if (created.length > 0) {
+      console.log(`          Rolled back filesystem writes (${created.length} file(s) removed):`);
+      for (const filePath of created) {
+        console.log(`            - ${filePath}`);
+      }
+    } else {
+      console.log(`          No filesystem changes were made.`);
+    }
+  }
+
   let projectId;
   {
     const existingMarker = readMarker(root);
     if (existingMarker) {
       projectId = existingMarker.uuid;
       console.log(`  [OK]    .claude-memory marker present: uuid=${projectId}`);
+      // marker already exists — no deferred write needed
     } else {
-      // Mint a new marker.
-      let newMarker;
-      try {
-        newMarker = writeMarker(root);
-      } catch (markerErr) {
-        console.log(`  [FAIL]  Could not write .claude-memory marker — ${markerErr.message}`);
-        process.exit(1);
-      }
-      projectId = newMarker.uuid;
-      console.log(`  [OK]    .claude-memory marker created: uuid=${projectId}`);
-      console.log(`          Path: ${path.join(root, MARKER_FILENAME)}`);
+      // Mint UUID in memory; do NOT write the marker file yet.
+      projectId     = mintUUID();
+      markerDeferred = true;
+      console.log(`  [OK]    .claude-memory marker minted (deferred): uuid=${projectId}`);
+      console.log(`          Path: ${path.join(root, MARKER_FILENAME)} (written last on success)`);
     }
   }
 
-  const handoffPath = resolveHandoffMdPath(projectId);
+  const handoffPath  = resolveHandoffMdPath(projectId);
   const claudeMdPath = path.join(root, 'CLAUDE.md');
-  const autoCreate  = args.includes('-y');
+  const autoCreate   = args.includes('-y');
 
   const cfg = loadConfig();
 
@@ -1748,7 +1773,8 @@ async function cmdInit(args) {
     try { await db.query('ROLLBACK'); } catch (_) { /* ignore */ }
     await db.end();
     console.log(`  [FAIL]  Schema apply failed — ${err.message}`);
-    console.log(`          Transaction rolled back. No FS writes made.`);
+    console.log(`  [FAIL]  Transaction rolled back.`);
+    unwindFsLedger();  // ledger is empty at this point — prints accurate status
     process.exit(1);
   }
 
@@ -1876,43 +1902,76 @@ async function cmdInit(args) {
 
   await db.end();
 
+  // ── FS writes — begin post-DB phase (ledger-tracked for atomicity) ─────────
+
   // Step 10: Write handoff.md (only if all DB steps succeeded)
   if (fs.existsSync(handoffPath)) {
     console.log(`  [OK]    handoff.md already exists — skipped: ${handoffPath}`);
   } else {
-    fs.mkdirSync(path.dirname(handoffPath), { recursive: true });
-    writeHandoffMd(handoffPath, {
-      PROJECT_ID:          projectId,
-      LAST_CLOSE:          new Date().toISOString(),
-      CONTRACT:            'default',
-      ENTITIES_WRITTEN:    '0',
-      ASSERTIONS_WRITTEN:  '0',
-      EDGES_WRITTEN:       '0',
-      PROJECT_NAME:        path.basename(root),
-      TLDR:                '(init — no sessions closed yet)',
-      OPEN_THREADS:        '- (none)',
-      QUICK_REFERENCES:    '(none)',
-      DEGRADED_SECTION:    '',
-      RECONCILIATION_SECTION: '',
-    });
-    console.log(`  [OK]    handoff.md created: ${handoffPath}`);
+    try {
+      fs.mkdirSync(path.dirname(handoffPath), { recursive: true });
+      writeHandoffMd(handoffPath, {
+        PROJECT_ID:          projectId,
+        LAST_CLOSE:          new Date().toISOString(),
+        CONTRACT:            'default',
+        ENTITIES_WRITTEN:    '0',
+        ASSERTIONS_WRITTEN:  '0',
+        EDGES_WRITTEN:       '0',
+        PROJECT_NAME:        path.basename(root),
+        TLDR:                '(init — no sessions closed yet)',
+        OPEN_THREADS:        '- (none)',
+        QUICK_REFERENCES:    '(none)',
+        DEGRADED_SECTION:    '',
+        RECONCILIATION_SECTION: '',
+      });
+      fsLedger.push(handoffPath);
+      console.log(`  [OK]    handoff.md created: ${handoffPath}`);
+    } catch (err) {
+      console.log(`  [FAIL]  Could not write handoff.md — ${err.message}`);
+      unwindFsLedger();
+      process.exit(1);
+    }
   }
 
   // Step 11: Write CLAUDE.md (only if all DB steps succeeded)
   if (fs.existsSync(claudeMdPath)) {
     console.log(`  [OK]    CLAUDE.md already exists — skipped: ${claudeMdPath}`);
   } else {
-    const projectName = args.find((a) => !a.startsWith('-')) || path.basename(root);
-    const projectDesc = `Memory and retrieval infrastructure project.`;
-    const content = renderTemplate(PROJECT_CLAUDE_MD_TEMPLATE, {
-      PROJECT_NAME:        projectName,
-      PROJECT_DESCRIPTION: projectDesc,
-      HANDOFF_MD_PATH:     handoffPath,
-      PROJECT_ROOT:        root,
-    });
-    fs.writeFileSync(claudeMdPath, content, 'utf8');
-    console.log(`  [OK]    CLAUDE.md created: ${claudeMdPath}`);
-    console.log(`  [NOTE]  CLAUDE.md should be git-committed.`);
+    try {
+      const projectName = args.find((a) => !a.startsWith('-')) || path.basename(root);
+      const projectDesc = `Memory and retrieval infrastructure project.`;
+      const content = renderTemplate(PROJECT_CLAUDE_MD_TEMPLATE, {
+        PROJECT_NAME:        projectName,
+        PROJECT_DESCRIPTION: projectDesc,
+        HANDOFF_MD_PATH:     handoffPath,
+        PROJECT_ROOT:        root,
+      });
+      fs.writeFileSync(claudeMdPath, content, 'utf8');
+      fsLedger.push(claudeMdPath);
+      console.log(`  [OK]    CLAUDE.md created: ${claudeMdPath}`);
+      console.log(`  [NOTE]  CLAUDE.md should be git-committed.`);
+    } catch (err) {
+      console.log(`  [FAIL]  Could not write CLAUDE.md — ${err.message}`);
+      unwindFsLedger();
+      process.exit(1);
+    }
+  }
+
+  // Step 12 (LAST): Persist the deferred .claude-memory marker.
+  // Only reached after ALL DB operations and ALL other FS writes succeed.
+  // A failure here is extremely unlikely (directory exists, disk not full) but
+  // we unwind the other FS writes to leave the project in a clean state.
+  if (markerDeferred) {
+    try {
+      persistMarker(root, projectId);
+      fsLedger.push(path.join(root, MARKER_FILENAME));
+      console.log(`  [OK]    .claude-memory marker written: uuid=${projectId}`);
+    } catch (err) {
+      console.log(`  [FAIL]  Could not persist .claude-memory marker — ${err.message}`);
+      // Remove handoff.md and CLAUDE.md that were written above (marker not in ledger yet).
+      unwindFsLedger();
+      process.exit(1);
+    }
   }
 
   // Multi-author detection — inform once per invocation; no behavior change today.
