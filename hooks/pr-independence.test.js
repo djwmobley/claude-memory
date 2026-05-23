@@ -1,7 +1,7 @@
 "use strict";
 // pr-independence.test.js
 // Unit tests for scrubDataRegions, extractRepoFlag, extractCdTarget, and decide.
-// Run with:  node C:\Users\djwmo\.claude\hooks\pr-independence.test.js
+// Run with:  node hooks/pr-independence.test.js
 //
 // Uses node:test + node:assert (Node v18+ built-ins; Node v22 available here).
 
