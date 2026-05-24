@@ -154,6 +154,19 @@ jobs:
         # no-silent-SQLite-fallback guard in plugin mode.
         # Pure Node — no Postgres or Ollama required.
         run: node scripts/test-plugin-packaging.js
+      - name: Run install engine-path tests
+        # Tests install.js .engine-path recording (standalone-install path discovery)
+        # and static consistency checks across all 9 command files:
+        #   A1  Normal install writes .engine-path with correct absolute engine path
+        #   A2  --dry-run writes nothing (no .engine-path created)
+        #   A3  .engine-path content is a forward-slash path ending in /scripts/handoff.js
+        #   A4  .engine-path is co-located with command files in destDir
+        #   B1  Every command file has the HANDOFF_ENGINE tier-1 override check
+        #   B2  Every command file has the .engine-path fallback
+        #   B3  No command file has the old bare "is this a claude-memory project?" error
+        #   B4  Every command file has the improved standalone error with both fix options
+        # Pure Node — no Postgres or Ollama required; writes to OS temp dir only.
+        run: node scripts/test-install-engine-path.js
       - name: Run L4 degraded-close tests
         # Tests Lever L4: fail-loud, persist-to-DB, resume-visible skip record when
         # C2 (feedback bias) or C3 (contract evolution) skip due to unresolvable

@@ -68,6 +68,11 @@ const repoRootFwd  = repoRoot.replace(/\\/g, '/');
 const hookLoader   = `node ${repoRootFwd}/scripts/handoff.js loader-hook`;
 const hookStop     = `node ${repoRootFwd}/scripts/handoff.js loader-stop`;
 
+// Engine path recorded for standalone installs so command files can find the engine.
+// Content: absolute forward-slash path to scripts/handoff.js in this repo.
+const enginePathFile    = path.join(destDir, '.engine-path');
+const enginePathContent = `${repoRootFwd}/scripts/handoff.js`;
+
 // ─── GUARD: SOURCE DIR MUST EXIST ────────────────────────────────────────────
 
 if (!fs.existsSync(srcDir)) {
@@ -139,6 +144,8 @@ async function main() {
   if (dryRun) console.log('(dry-run — nothing will be written)');
   console.log('');
   console.log(`  Copy ${files.length} command file(s) to ${destDir}`);
+  console.log(`  Record engine path: ${enginePathFile}`);
+  console.log(`    → ${enginePathContent}`);
   console.log(`  ${settingsExists ? 'Merge hooks into' : 'Create'} ${settingsPath}`);
   console.log(`    SessionStart → ${hookLoader}`);
   console.log(`    Stop         → ${hookStop}`);
@@ -173,6 +180,13 @@ async function main() {
       if (!dryRun) fs.copyFileSync(path.join(srcDir, file), dest);
       copied.push(file);
     }
+  }
+
+  // ── Step 1b: Record engine path for standalone installs ───────────────────
+  // Written as a plain text file containing the absolute forward-slash engine
+  // path so that command files can find the engine without CLAUDE_PLUGIN_ROOT.
+  if (!dryRun) {
+    fs.writeFileSync(enginePathFile, enginePathContent + '\n', 'utf8');
   }
 
   // ── Step 2: Wire hooks ────────────────────────────────────────────────────
@@ -219,6 +233,14 @@ async function main() {
   console.log('  Slash commands:');
   for (const f of copied)  console.log(`    copied   ${f}`);
   for (const f of skipped) console.log(`    skipped  ${f} (already exists — use --force to overwrite)`);
+  console.log('');
+  if (dryRun) {
+    console.log(`  Engine path: would write ${enginePathFile}`);
+    console.log(`    → ${enginePathContent}`);
+  } else {
+    console.log(`  Engine path recorded: ${enginePathFile}`);
+    console.log(`    → ${enginePathContent}`);
+  }
   console.log('');
   console.log(`  Hooks (${hooksAction} ${settingsPath}):`);
   console.log(`    SessionStart: ${addedStart ? 'added' : 'already present — skipped'}`);
