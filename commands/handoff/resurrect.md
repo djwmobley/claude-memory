@@ -38,32 +38,44 @@ invariant is preserved). Rows with `suppression_kind='downvoted_terminal'`,
 ## How to invoke
 
 ```bash
-# Resolve engine script and project root.
-# Plugin mode: CLAUDE_PLUGIN_ROOT is set by the Claude Code runtime when loaded as a plugin.
-# Standalone mode: walk up from cwd to find the project root containing scripts/handoff.js.
-if [ -n "$CLAUDE_PLUGIN_ROOT" ]; then
+# ── Engine resolution (4-tier; independent of project-root resolution) ──────
+# Tier 1: explicit override via HANDOFF_ENGINE env var
+if [ -n "$HANDOFF_ENGINE" ] && [ -f "$HANDOFF_ENGINE" ]; then
+  : # use as-is
+# Tier 2: plugin mode (CLAUDE_PLUGIN_ROOT set by Claude Code runtime)
+elif [ -n "$CLAUDE_PLUGIN_ROOT" ]; then
   HANDOFF_ENGINE="$CLAUDE_PLUGIN_ROOT/scripts/handoff.js"
-  PROJECT_ROOT=$(pwd)
-  while [ ! -f "$PROJECT_ROOT/.claude-memory" ] && [ "$PROJECT_ROOT" != "/" ]; do
-    PROJECT_ROOT=$(dirname "$PROJECT_ROOT")
-  done
-  if [ ! -f "$PROJECT_ROOT/.claude-memory" ]; then
-    echo "Error: no .claude-memory marker found — run /handoff:init first."
-    exit 1
-  fi
+# Tier 3: clone mode — walk up from cwd for scripts/handoff.js
 else
-  PROJECT_ROOT=$(pwd)
-  while [ ! -f "$PROJECT_ROOT/.claude-memory" ] && [ ! -d "$PROJECT_ROOT/.git" ] && [ "$PROJECT_ROOT" != "/" ]; do
-    PROJECT_ROOT=$(dirname "$PROJECT_ROOT")
+  _CLONE_ROOT=$(pwd)
+  while [ ! -f "$_CLONE_ROOT/scripts/handoff.js" ] && [ "$_CLONE_ROOT" != "/" ]; do
+    _CLONE_ROOT=$(dirname "$_CLONE_ROOT")
   done
-  if [ "$PROJECT_ROOT" = "/" ] && [ ! -f "$PROJECT_ROOT/.claude-memory" ] && [ ! -d "$PROJECT_ROOT/.git" ]; then
-    PROJECT_ROOT=$(pwd)
-  fi
-  if [ ! -f "$PROJECT_ROOT/scripts/handoff.js" ]; then
-    echo "Error: scripts/handoff.js not found — is this a claude-memory project?"
+  if [ -f "$_CLONE_ROOT/scripts/handoff.js" ]; then
+    HANDOFF_ENGINE="$_CLONE_ROOT/scripts/handoff.js"
+  # Tier 4: standalone install — read engine path recorded by install.js
+  elif [ -f "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/commands/handoff/.engine-path" ]; then
+    HANDOFF_ENGINE=$(cat "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/commands/handoff/.engine-path" | tr -d '[:space:]')
+  else
+    echo "Error: handoff engine not found. This looks like a standalone install with no recorded engine path."
+    echo "  Fix option A: set HANDOFF_ENGINE=/abs/path/to/scripts/handoff.js"
+    echo "  Fix option B: re-run node /path/to/claude-memory/scripts/install.js to record .engine-path"
     exit 1
   fi
-  HANDOFF_ENGINE="$PROJECT_ROOT/scripts/handoff.js"
+fi
+if [ ! -f "$HANDOFF_ENGINE" ]; then
+  echo "Error: resolved engine path does not exist: $HANDOFF_ENGINE"
+  exit 1
+fi
+
+# ── Project-root resolution ──────────────────────────────────────────────────
+# Walk up from cwd for .claude-memory marker first, then fall back to .git.
+PROJECT_ROOT=$(pwd)
+while [ ! -f "$PROJECT_ROOT/.claude-memory" ] && [ ! -d "$PROJECT_ROOT/.git" ] && [ "$PROJECT_ROOT" != "/" ]; do
+  PROJECT_ROOT=$(dirname "$PROJECT_ROOT")
+done
+if [ "$PROJECT_ROOT" = "/" ] && [ ! -f "$PROJECT_ROOT/.claude-memory" ] && [ ! -d "$PROJECT_ROOT/.git" ]; then
+  PROJECT_ROOT=$(pwd)
 fi
 
 # Dry-run (default — no rows modified):

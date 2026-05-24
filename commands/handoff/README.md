@@ -89,6 +89,34 @@ use `/handoff:drop` instead.
 
 ---
 
+## Install modes and engine resolution
+
+The slash commands support three install modes; each resolves the engine script in a
+different way:
+
+| Mode | How it works |
+|------|-------------|
+| **Plugin** | `CLAUDE_PLUGIN_ROOT` is set by the Claude Code runtime. Engine: `$CLAUDE_PLUGIN_ROOT/scripts/handoff.js`. |
+| **Clone** | Commands are loaded from `commands/handoff/` inside the repo checkout. Engine: found by walking up from `cwd` for `scripts/handoff.js`. |
+| **Standalone** | Commands are copied to `~/.claude/commands/handoff/` by `scripts/install.js`. The engine lives outside the target project tree. |
+
+For **standalone** installs, `scripts/install.js` writes `~/.claude/commands/handoff/.engine-path`
+at install time. The command files read this file to locate the engine. No configuration is
+needed after running the installer.
+
+You can also override the engine location at any time with the `HANDOFF_ENGINE` environment
+variable — this takes precedence over all other discovery methods:
+
+```bash
+export HANDOFF_ENGINE=/path/to/claude-memory/scripts/handoff.js
+```
+
+If a standalone install can not find the engine (`.engine-path` absent and `HANDOFF_ENGINE`
+unset), the commands print a clear error with two fix options: set `HANDOFF_ENGINE` or
+re-run `node /path/to/claude-memory/scripts/install.js`.
+
+---
+
 ## Maintenance notes
 
 After pulling a change to `scripts/.npmrc` (e.g., the switch to `node-linker=hoisted`),
