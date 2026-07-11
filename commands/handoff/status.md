@@ -21,6 +21,20 @@ Quick health check. Shows when the last session closed, how many entities, asser
 
 Flags may be combined freely: `--json --breakdown --stale-pointers` emits a single JSON object that includes all three enhancements.
 
+## Preferred path — MCP
+
+If the `mcp__handoff__handoff_status` tool is available in this session, call it directly — it returns the same structured fields as `status --json` (project_id, entity/assertion/edge counts, handoff.md path, last_close/days_since, contracts, session_active, session_id, packaging) without a shell round-trip. Read-only — makes no writes.
+
+```
+ToolSearch({ query: "select:mcp__handoff__handoff_status" })
+mcp__handoff__handoff_status({ projectRoot: "<absolute path to project root>" })
+```
+
+`--breakdown` and `--stale-pointers` are not currently exposed as MCP tool parameters — use the CLI form below if you need those.
+
+If `mcp__handoff__handoff_status` is not available, fall back to the CLI recipe below.
+
+
 ## How to invoke
 
 ```bash

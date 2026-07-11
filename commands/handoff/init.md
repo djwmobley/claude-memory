@@ -12,6 +12,22 @@ First-run setup. Creates the database tables, writes a project-level `CLAUDE.md`
 4. Creates `CLAUDE.md` at the project root if absent (should be git-committed).
 5. Inserts a default `retrieval_contract` row for this project if absent.
 
+## Preferred path — MCP
+
+If the `mcp__handoff__handoff_init` tool is available in this session, call it directly:
+
+```
+ToolSearch({ query: "select:mcp__handoff__handoff_init" })
+mcp__handoff__handoff_init({ projectRoot: "<absolute path to project root>" })
+# or with an explicit name:
+mcp__handoff__handoff_init({ projectRoot: "<absolute path to project root>", name: "my-project" })
+```
+
+It always runs non-interactively (equivalent to `-y`), matching the agent/CI usage pattern below — there is no interactive-confirmation mode over MCP. Returns the structured `[OK]`/`[NOTE]` provisioning report lines and the summary line. Safe to re-run — idempotent.
+
+If `mcp__handoff__handoff_init` is not available, fall back to the CLI recipe below.
+
+
 ## How to invoke
 
 Find the project root (walk up from `pwd` looking for `.claude-memory` marker first,

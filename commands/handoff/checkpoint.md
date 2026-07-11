@@ -43,6 +43,37 @@ Before calling the helper, extract the following from this conversation:
 
 6. **Open threads** — list of pending decisions or tasks.
 
+## Preferred path — MCP
+
+If the `mcp__handoff__handoff_checkpoint` tool is available in this session, call it directly instead of the CLI recipe below — no tempfile, no shell engine-resolution dance, no manual JSON escaping. Tools are not hot-loadable mid-session; if it doesn't show up yet, it will after the server is registered and a new session starts (see the CLI fallback below in the meantime).
+
+```
+ToolSearch({ query: "select:mcp__handoff__handoff_checkpoint" })
+```
+
+Extract entities/assertions/edges/contract/tldr/open_threads per the instructions above, then:
+
+```
+mcp__handoff__handoff_checkpoint({
+  projectRoot: "<absolute path to project root>",
+  payload: {
+    tldr: "3–5 sentences.",
+    entities: [{ "name": "entity-name", "entity_type": "system", "description": "..." }],
+    assertions: [{ "subject": "X", "predicate": "uses", "object": "Y", "confidence": 8, "source": "model_extracted" }],
+    edges: [{ "from_entity": "X", "edge_type": "depends_on", "to_entity": "Y" }],
+    contract: { "queries": [{ "type": "recency", "token_budget": 500 }] },
+    open_threads: ["item 1", "item 2"]
+  }
+})
+```
+
+The tool validates `payload` is a plain object client-side; the engine enforces the full payload schema (string length caps, predicate vocabulary, enums) server-side — a schema violation comes back as a tool error with the engine's stderr tail, not a silent partial write. Returns `entitiesWritten`/`assertionsWritten`/`edgesWritten` and the engine's summary line.
+
+The lightweight `--note` form has no dedicated MCP tool yet — use the CLI form below for that, or call `handoff_checkpoint` with a payload containing a single low-confidence `assertions` row.
+
+If `mcp__handoff__handoff_checkpoint` is not available, fall back to the CLI recipe below.
+
+
 ## How to invoke
 
 ```bash

@@ -30,6 +30,11 @@ UPDATE — only `reality_check` is written; confidence, source, tier, object are
 changed). Feature-gated via `serve_time_reality_check` project setting (default `enabled`).
 </details>
 
+## Preferred path — MCP
+
+`handoff-mcp`'s initial tool surface (ADO Task #4566: `handoff_status`, `handoff_checkpoint`, `handoff_close`, `handoff_init`, `persist_decisions`) does not include a `handoff_resume` tool — resume stays CLI-only for now; use the recipe below. This is a real gap, not an oversight left undocumented: a `handoff_resume` MCP tool (returning the same structured context-load result as `resume`) is a reasonable follow-up if manual CLI resume proves to be a frequent friction point. Flagged for the ticket verifier / a future task rather than silently working around it here.
+
+
 ## Arguments
 
 None — this command takes no flags or positional arguments.
