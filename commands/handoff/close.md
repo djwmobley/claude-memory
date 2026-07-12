@@ -16,6 +16,37 @@ When `extraction_async_enabled` is set to `'true'` in project settings, the writ
 deferred: the payload is enqueued and written by the deterministic background worker
 (`node scripts/handoff.js queue-drain`). Default behavior is synchronous.
 
+## Preferred path — MCP
+
+If the `mcp__handoff__handoff_close` tool is available in this session, call it directly instead of the CLI recipe below — no tempfile, no shell engine-resolution dance, no manual JSON escaping.
+
+```
+ToolSearch({ query: "select:mcp__handoff__handoff_close" })
+```
+
+Extract entities/assertions/edges/contract/tldr/open_threads per the instructions below, then:
+
+```
+mcp__handoff__handoff_close({
+  projectRoot: "<absolute path to project root>",
+  payload: {
+    tldr: "3–5 sentences.",
+    entities: [{ "name": "entity-name", "entity_type": "system", "description": "..." }],
+    assertions: [{ "subject": "X", "predicate": "uses", "object": "Y", "confidence": 8, "source": "model_extracted" }],
+    edges: [{ "from_entity": "X", "edge_type": "depends_on", "to_entity": "Y" }],
+    contract: { "queries": [{ "type": "recency", "token_budget": 500 }] },
+    open_threads: ["item 1", "item 2"]
+  }
+})
+```
+
+This runs the same session-intent persistence, close-time reality reconciliation, and CLAUDE.md-promotion surfacing described above — the tool is a thin wrapper around `handoff.js close --json -`, not a different code path. Returns `entitiesWritten`/`assertionsWritten`/`edgesWritten` and the engine's summary line. A schema violation comes back as a tool error with the engine's stderr tail.
+
+`--dry-run` has no dedicated MCP tool parameter yet — use the CLI form below if you need a preview-only pass.
+
+If `mcp__handoff__handoff_close` is not available, fall back to the CLI recipe below.
+
+
 ## Arguments
 
 | Flag | Default | Description |
