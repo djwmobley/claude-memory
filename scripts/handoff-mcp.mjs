@@ -362,6 +362,45 @@ async function toolPersistDecisions({ rows, verifyQuery }) {
   }
 }
 
+// ── Shared extraction-payload contract doc (checkpoint + close) ─────────────
+//
+// Both handoff_checkpoint and handoff_close accept the SAME extraction payload
+// shape. This text is the MCP-path substitute for reading commands/handoff/
+// close.md by hand — a caller on the MCP path never opens that file, so the
+// full contract (field types, caveman authoring mandate, probe-able volatile
+// predicates) has to live here, in the tool description itself. Keep this in
+// sync with commands/handoff/close.md and the stdin validator in
+// scripts/handoff.js (readStdin(): ALLOWED_KEYS / STRING_FIELDS).
+const EXTRACTION_PAYLOAD_FIELD_CONTRACT =
+  'Allowed top-level payload keys: tldr, open_threads, quick_references, entities, assertions, edges, ' +
+  'decisions, contract, session_id, confirm_claude_md_promotion, retrieval_outcome, retrieval_outcome_notes, ' +
+  'resolved_threads.\n\n' +
+  'Field types (engine-enforced; a violation surfaces as a tool error with the engine\'s stderr tail):\n' +
+  '- tldr: string, <=4000 chars.\n' +
+  '- open_threads: array of strings, each <=4000 chars, array length <=200.\n' +
+  '- quick_references: a SINGLE STRING, NOT an array. Sending an array fails with ' +
+  '`stdin JSON: "quick_references" must be a string` — join multiple references into one string.\n' +
+  '- entities: array of { name: string, entity_type: "person"|"system"|"concept"|"decision"|"file", description: string }.\n' +
+  '- assertions: array of { subject: string, predicate: string (MUST be a value from ' +
+  'scripts/lib/predicate-registry.json — do not invent one; unknown predicates are flagged (permissive mode) ' +
+  'or rejected (strict mode)), object: string, confidence: integer 1-10, source: "user_stated"|"model_extracted"|' +
+  '"doc_quoted"|"retrieved_from_prior" }.\n' +
+  '- edges: array of { from_entity: string, edge_type: "depends_on"|"implements"|"blocks"|"owns"|"calls"|"produces", ' +
+  'to_entity: string }.\n' +
+  '- contract: { queries: [...] } — a next-session retrieval contract; supported query types are entity/assertion/' +
+  'recency/vector (see commands/handoff/close.md §4 for the exact shape of each).\n\n' +
+  'Caveman/telegraphic authoring is MANDATORY for tldr, open_threads, and quick_references: strip function words ' +
+  '(a/an/the, is/are/was/were, of/to/in/for/and/or/but, with/that/this/it/as/at/on/by/be) while keeping every ' +
+  'load-bearing token verbatim — identifiers, file paths, line refs, PR numbers, commit SHAs, names, numbers, ' +
+  'decisions. All three are persisted verbatim as queryable Postgres rows (session_tldr/open_thread/quick_reference) ' +
+  '— the engine does not compress them, so leaner authoring directly reduces next-resume bootstrap tokens.\n\n' +
+  'Volatile now-state facts (anything whose truth may change between sessions) should be authored with a predicate ' +
+  'that has a mode:\'verify\' entry in scripts/lib/reality-checks.js, so the next resume\'s reality re-probe can ' +
+  'verify and annotate them automatically: `in_file` (object = file path — checks existence on disk), ' +
+  '`branch_exists` (subject = branch name, object = "exists"), `commit_merged` (object = "<sha>" or ' +
+  '"<sha> on <branch>"), `pr_state` (object = "open"|"closed"|"merged", subject must contain the PR number). Do NOT ' +
+  'use these predicates for historical then-state — use is_at_commit/shipped_at/is_status for that instead.';
+
 // ── Server wiring ────────────────────────────────────────────────────────────
 
 function buildServer() {
@@ -393,17 +432,16 @@ function buildServer() {
     {
       title: 'Mid-session handoff checkpoint (full extraction payload)',
       description:
-        'Writes a mid-session extraction payload (entities/assertions/edges/contract/tldr/open_threads/etc.) ' +
-        'to the handoff store without ending the session. The payload is validated to be a plain JSON object, ' +
-        'written to a temp file, and piped to `handoff.js checkpoint --json -`. Allowed top-level payload keys: ' +
-        'tldr, open_threads, quick_references, entities, assertions, edges, decisions, contract, session_id, ' +
-        'confirm_claude_md_promotion, retrieval_outcome, retrieval_outcome_notes, resolved_threads. Returns ' +
-        'entitiesWritten/assertionsWritten/edgesWritten and the engine summary line. The engine itself enforces ' +
-        'the full payload schema (string length caps, predicate vocabulary, enums) — validation errors surface ' +
-        'as a tool error with the engine\'s stderr tail.',
+        'Writes a mid-session extraction payload to the handoff store WITHOUT ending the session. Payload is ' +
+        'validated to be a plain JSON object, written to a temp file, and piped to `handoff.js checkpoint --json -`. ' +
+        'Checkpoint payloads MAY be partial — there is no completeness bar here (contrast with handoff_close, which ' +
+        'is single-pass and MUST carry the full extraction). Use a checkpoint at a natural decision point in a long ' +
+        'session; the session stays open.\n\n' +
+        EXTRACTION_PAYLOAD_FIELD_CONTRACT +
+        '\n\nReturns entitiesWritten/assertionsWritten/edgesWritten and the engine summary line.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
-        payload: z.record(z.string(), z.any()).describe('Extraction payload object — see description for allowed keys.'),
+        payload: z.record(z.string(), z.any()).describe('Extraction payload object — see description for allowed keys and field types.'),
       },
     },
     async (args) => {
@@ -418,16 +456,30 @@ function buildServer() {
   server.registerTool(
     'handoff_close',
     {
-      title: 'End-of-session handoff close (full extraction payload)',
+      title: 'End-of-session handoff close (full extraction payload — SINGLE-PASS, must be complete)',
       description:
-        'Same extraction payload contract as handoff_checkpoint, but ends the session (clears the ' +
-        'session_in_progress marker, archives handoff.md). Payload is validated to be a plain JSON object, ' +
-        'written to a temp file, and piped to `handoff.js close --json -`. Returns entitiesWritten/' +
-        'assertionsWritten/edgesWritten and the engine summary line. Validation errors surface as a tool error ' +
-        'with the engine\'s stderr tail.',
+        'Ends the session: clears the session_in_progress marker, runs close-time reality reconciliation, and ' +
+        'archives handoff.md. Payload is validated to be a plain JSON object, written to a temp file, and piped ' +
+        'to `handoff.js close --json -`.\n\n' +
+        '**CLOSE IS SINGLE-PASS.** Author the COMPLETE extraction — entities, assertions, edges, contract, and the ' +
+        'caveman-authored tldr/open_threads/quick_references — in ONE call. An intent-only close (no entities, no ' +
+        'assertions, no edges) is INCOMPLETE: the engine still writes the intent rows and reports success, but it ' +
+        'now also prints a non-fatal "WARNING: extraction-empty close" line in the close output, because the close ' +
+        'contract was not met. Never plan a supplementary second close to backfill a thin first one — if this call ' +
+        'is about to omit entities/assertions/edges, that is the signal to go re-read the conversation and extract ' +
+        'them now, not to close thin and patch later.\n\n' +
+        EXTRACTION_PAYLOAD_FIELD_CONTRACT +
+        '\n\n`has_unpackaged_state` is CODE-OWNED: `handoff.js` computes it authoritatively at close time via a ' +
+        'live git probe. If the payload includes a `has_unpackaged_state` assertion, it is silently discarded and ' +
+        'replaced by the code-computed value — do not author one.\n\n' +
+        'Returns entitiesWritten/assertionsWritten/edgesWritten and the engine summary line. `--dry-run` has no ' +
+        'dedicated parameter here yet — use the CLI form (commands/handoff/close.md) for a preview-only pass.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
-        payload: z.record(z.string(), z.any()).describe('Extraction payload object — same shape as handoff_checkpoint.'),
+        payload: z.record(z.string(), z.any()).describe(
+          'COMPLETE extraction payload object — same field shapes as handoff_checkpoint, but close is single-pass: ' +
+          'entities/assertions/edges should be populated in this one call, not deferred to a follow-up close.'
+        ),
       },
     },
     async (args) => {

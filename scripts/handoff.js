@@ -4549,6 +4549,19 @@ async function cmdClose(args) {
     payload = await readStdin();
   }
 
+  // ── Extraction-empty detection snapshot ───────────────────────────────────
+  // Captured immediately after parsing, BEFORE any code-side mutation of
+  // `payload` (e.g. the L3 has_unpackaged_state authoritative-assertion
+  // injection below, which always adds at least one assertion regardless of
+  // what the caller supplied). Reflects what the CALLER actually authored —
+  // used later to warn on a close whose extraction was entirely empty
+  // (zero entities, zero assertions, zero edges) even though intent rows
+  // (tldr/open_threads/quick_references) may still have been written.
+  const extractionEmptyAtEntry =
+    (!Array.isArray(payload.entities)   || payload.entities.length   === 0) &&
+    (!Array.isArray(payload.assertions) || payload.assertions.length === 0) &&
+    (!Array.isArray(payload.edges)      || payload.edges.length      === 0);
+
   let db;
   try {
     db = await connectHandoff();
@@ -4782,6 +4795,17 @@ async function cmdClose(args) {
     console.log(`  assertions:  0 (queued)`);
     console.log(`  edges:       0 (queued)`);
     console.log(`  contract:    queued`);
+
+    // Extraction-empty warning (non-fatal). Uses the pre-injection snapshot
+    // captured at entry — see extractionEmptyAtEntry above.
+    if (extractionEmptyAtEntry) {
+      console.log(
+        '\n  WARNING: extraction-empty close — payload carried no entities/assertions/edges. ' +
+        'The close contract expects the full extraction in one pass (see commands/handoff/close.md §1-§4). ' +
+        'Queued for async extraction anyway.'
+      );
+    }
+
     console.log(`\nDone: handoff:close — payload queued for async extraction, session marker cleared`);
     return;
   }
@@ -4958,6 +4982,19 @@ async function cmdClose(args) {
     console.log(`    assertions: ${wouldWriteAssertions}`);
     console.log(`    edges:      ${wouldWriteEdges}`);
     console.log(`    contract:   ${wouldWriteContract}`);
+
+    // Extraction-empty warning (non-fatal, read-only — dry-run framing).
+    // See the matching warning at the real-close and async-queue summary
+    // sites below; detection uses the pre-mutation snapshot captured at
+    // entry so the code-injected has_unpackaged_state assertion never
+    // masks a caller payload that carried no real extraction.
+    if (extractionEmptyAtEntry) {
+      console.log(
+        '\n  WARNING: extraction-empty close — payload carries no entities/assertions/edges. ' +
+        'The close contract expects the full extraction in one pass (see commands/handoff/close.md §1-§4). ' +
+        'Intent rows (if any) would still be written on a real close.'
+      );
+    }
 
     // Show which assertions would be superseded (1:1 predicates that have live rows).
     const assertionsToCheck = (payload.assertions || []).filter((a) => {
@@ -5777,6 +5814,20 @@ async function cmdClose(args) {
   console.log(`  assertions written:  ${assertionsWritten}`);
   console.log(`  edges written:       ${edgesWritten}`);
   console.log(`  contract:            updated`);
+
+  // Extraction-empty warning (non-fatal, does not block the close or change
+  // the exit code). Detection uses extractionEmptyAtEntry — the snapshot
+  // taken before the L3 has_unpackaged_state authoritative-assertion
+  // injection, so a close whose caller-supplied payload was empty still
+  // reads as empty even though the engine itself added one assertion.
+  if (extractionEmptyAtEntry) {
+    console.log(
+      '\n  WARNING: extraction-empty close — payload carried no entities/assertions/edges. ' +
+      'The close contract expects the full extraction in one pass (see commands/handoff/close.md §1-§4). ' +
+      'Intent rows were still written.'
+    );
+  }
+
   console.log(`\nDone: handoff:close — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written, session marker cleared`);
 
   // L4: Exit-code gate — 'strict' mode exits 3 when any subsystem ran degraded.
