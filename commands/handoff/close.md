@@ -46,6 +46,26 @@ This runs the same session-intent persistence, close-time reality reconciliation
 
 If `mcp__handoff__handoff_close` is not available, fall back to the CLI recipe below.
 
+## MCP path (handoff_close tool)
+
+Closing via `mcp__handoff__handoff_close` is subject to the **exact same extraction contract**
+as this command — the tool is a thin wrapper around `handoff.js close --json -`, not a
+relaxed or different code path. A caller on the MCP path never opens this file directly,
+so the tool's own `description` string (in `scripts/handoff-mcp.mjs`) carries the full
+contract inline: field types, the `predicate-registry.json` constraint, the caveman/
+telegraphic authoring mandate for `tldr`/`open_threads`/`quick_references`, and the
+probe-able volatile predicates (`in_file`, `branch_exists`, `commit_merged`, `pr_state`).
+Keep that description in sync with this file if either changes.
+
+**Close is single-pass.** Author the complete payload — entities, assertions, edges,
+contract, and the three caveman-authored intent fields — in ONE `handoff_close` call.
+A second, supplementary close issued to backfill a thin first close is a **process bug**,
+not an acceptable pattern: if a close went out with an empty or near-empty extraction,
+the fix is to correct the tooling/contract (or re-extract properly before closing), not
+to compensate with a follow-up call. The engine detects this case — a close whose payload
+carries zero entities, zero assertions, and zero edges — and prints a non-fatal
+`WARNING: extraction-empty close` line in the close output as a signal that the contract
+was not met; it does not block the close or change its exit code.
 
 ## Arguments
 

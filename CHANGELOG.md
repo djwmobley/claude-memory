@@ -188,6 +188,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`handoff_close` made single-pass — MCP descriptions now carry the full
+  extraction contract; engine warns on an extraction-empty close**: a field
+  incident showed an MCP-path close that wrote only intent rows (tldr/
+  open_threads/quick_references), requiring a second supplementary close to
+  backfill entities/assertions/edges — flagged as a tooling bug, not an
+  acceptable pattern. Three fixes: (1) `scripts/handoff-mcp.mjs` — the
+  `handoff_checkpoint`/`handoff_close` tool `description` strings now state
+  the exact field types (`quick_references` is a single string, not an
+  array — a prior field incident sent it as an array and hit
+  `stdin JSON: "quick_references" must be a string`), the
+  `predicate-registry.json` constraint, the caveman/telegraphic authoring
+  mandate for `tldr`/`open_threads`/`quick_references`, the probe-able
+  volatile predicates (`in_file`/`branch_exists`/`commit_merged`/`pr_state`),
+  and — for `handoff_close` specifically — that close is single-pass and an
+  intent-only payload is incomplete; `handoff_checkpoint`'s description notes
+  checkpoint payloads MAY be partial, unlike close. A caller on the MCP path
+  never reads `commands/handoff/close.md` by hand, so this contract now lives
+  in the tool description itself. (2) `scripts/handoff.js` — `cmdClose` now
+  detects a payload with zero entities, zero assertions, and zero edges
+  (checked against the pre-injection snapshot, so the code-computed
+  `has_unpackaged_state` assertion never masks a genuinely empty caller
+  payload) and prints a non-fatal `WARNING: extraction-empty close` line in
+  the close output (real close, `--dry-run`, and the async-queued path all
+  covered); exit code and mutation behavior are unchanged. (3)
+  `commands/handoff/close.md` gains an "MCP path (handoff_close tool)"
+  section stating the MCP path is bound to the same contract and that a
+  supplementary close to backfill a thin one is a process bug;
+  `commands/handoff/checkpoint.md` gains a short note that checkpoint MAY be
+  partial, contrasting with close. (`scripts/handoff-mcp.mjs`,
+  `scripts/handoff.js`, `commands/handoff/close.md`,
+  `commands/handoff/checkpoint.md`, `test/handoff/test-handoff.js`)
 - **`cmdPrune --suppression-kind` full canonical set**: `validKinds` now
   includes `reality_reconciled` (previously missing, making `reality_reconciled`
   rows unprunable by kind); the requires-a-value error hint and the

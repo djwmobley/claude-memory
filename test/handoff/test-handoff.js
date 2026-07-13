@@ -373,6 +373,26 @@ async function runTests() {
     assert.ok(out.includes('Done: handoff:close'), 'close should emit Done line');
   });
 
+  // ── Test 3b: extraction-empty close warning (non-fatal, engine-level) ─────
+  await test('close: no WARNING line when payload carries entities/assertions/edges', () => {
+    const out = runHelper('close', ['--json', '-'], { fakeRoot, stdin: JSON.stringify(closePayload) });
+    assert.ok(!out.includes('WARNING: extraction-empty close'),
+      'close with a full extraction payload should not emit the extraction-empty warning');
+  });
+
+  await test('close: WARNING line when payload carries no entities/assertions/edges', () => {
+    const thinPayload = {
+      tldr: 'Thin close — no extraction this pass.',
+      open_threads: [],
+      quick_references: 'nothing new',
+    };
+    const out = runHelper('close', ['--json', '-'], { fakeRoot, stdin: JSON.stringify(thinPayload) });
+    assert.ok(out.includes('WARNING: extraction-empty close'),
+      'close with zero entities/assertions/edges should emit the extraction-empty warning');
+    assert.ok(out.includes('Done: handoff:close'),
+      'the warning must be non-fatal — close should still succeed');
+  });
+
   // ── Test 4: checkpoint writes rows but does NOT clear session_in_progress ─
   const checkpointPayload = {
     ...closePayload,

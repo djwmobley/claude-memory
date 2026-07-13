@@ -69,6 +69,13 @@ mcp__handoff__handoff_checkpoint({
 
 The tool validates `payload` is a plain object client-side; the engine enforces the full payload schema (string length caps, predicate vocabulary, enums) server-side — a schema violation comes back as a tool error with the engine's stderr tail, not a silent partial write. Returns `entitiesWritten`/`assertionsWritten`/`edgesWritten` and the engine's summary line.
 
+**Checkpoint payloads MAY be partial.** Unlike `/handoff:close`, checkpoint has no single-pass
+completeness requirement — it's fine to write a checkpoint with just a `tldr` and no
+entities/assertions/edges yet, then checkpoint again later in the same session with more.
+Close is the one that must carry the full extraction in one call; see
+`commands/handoff/close.md`'s "MCP path (handoff_close tool)" section if you're closing,
+not checkpointing.
+
 The lightweight `--note` form has no dedicated MCP tool yet — use the CLI form below for that, or call `handoff_checkpoint` with a payload containing a single low-confidence `assertions` row.
 
 If `mcp__handoff__handoff_checkpoint` is not available, fall back to the CLI recipe below.
