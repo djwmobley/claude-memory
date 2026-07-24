@@ -2,6 +2,8 @@
 
 Memory and retrieval infrastructure project.
 
+**If `START-HERE-CONSOLIDATION.md` and `CONSOLIDATION-RUNBOOK.md` are present in your working tree, read them before touching schema/scripts here — navigate the runbook via `RUNBOOK-INDEX.md`, not top to bottom.** These are local planning documents that reference private infrastructure and are not distributed with this public repo.
+
 ---
 
 ## Operating canon (non-negotiable)

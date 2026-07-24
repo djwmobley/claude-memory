@@ -45,3 +45,11 @@ scripts/decisions_backup*.csv
 .claude/scheduled_tasks.lock
 /BUNDLE-A-SPEC.md
 /social-posts.md
+
+# Local consolidation/planning docs that reference private infrastructure
+# (private DB names, personal filesystem paths, private project names,
+# private orchestration tooling) — never distributed with the public repo.
+/CONSOLIDATION-RUNBOOK.md
+/RUNBOOK-INDEX.md
+/START-HERE-CONSOLIDATION.md
+/FIELD-REPORT-*.md
