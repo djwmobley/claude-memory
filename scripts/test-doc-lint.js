@@ -363,91 +363,118 @@ function isPipeLine(line) {
   return t.startsWith('|') && t.endsWith('|');
 }
 
-// Locate the documentation-index table's line range (0-based, inclusive) by
-// anchoring on the "## Documentation index" heading, skipping any narrative
-// prose between the heading and the table (MANIFEST.md has an explanatory
-// paragraph there), and then taking the maximal contiguous run of
-// pipe-delimited lines up to (but not past) the next heading. MANIFEST.md
-// currently contains exactly one markdown table in the whole file (the
-// index itself); anchoring on the heading rather than a fixed line number
-// means prose is never mistaken for a row, and if a second, unrelated table
-// were ever added elsewhere in the file it would not be pulled into this
-// scan -- only the block between this heading and the next one is in scope.
-function findDocIndexTableRange(lines) {
+// Locate every pipe-delimited line belonging to the documentation-index
+// table by anchoring on the "## Documentation index" heading and scanning
+// the whole region up to (but not past) the next heading -- or end of file
+// if there is none. Deliberately does NOT stop at the first non-pipe line:
+// it collects every pipe-delimited line in the region, however many
+// non-pipe lines (blank or otherwise) separate them, so a stray blank line
+// mid-table can never cause a row to fall out of scope. `gaps` separately
+// records any non-pipe line found between the first and last pipe line --
+// a table that isn't contiguous is a malformed-structure error the caller
+// must fail on, not something to silently tolerate.
+// MANIFEST.md currently contains exactly one markdown table in the whole
+// file (the index itself); anchoring on the heading rather than a fixed
+// line number means prose is never mistaken for a row, and a second,
+// unrelated table elsewhere in the file would not be pulled into this scan.
+function findDocIndexTableLines(lines) {
   const headingIdx = lines.findIndex(function(l) { return DOC_INDEX_HEADING_RE.test(l.trim()); });
   if (headingIdx === -1) {
     throw new Error('could not locate the "## Documentation index" heading in MANIFEST.md -- table scan has no anchor');
   }
 
-  let start = -1;
+  let regionEnd = lines.length; // exclusive
   for (let i = headingIdx + 1; i < lines.length; i++) {
-    if (isPipeLine(lines[i])) { start = i; break; }
-    if (/^#+\s/.test(lines[i].trim())) break; // hit the next heading before finding a table
+    if (/^#+\s/.test(lines[i].trim())) { regionEnd = i; break; }
   }
-  if (start === -1) {
+
+  const pipeIndices = [];
+  for (let i = headingIdx + 1; i < regionEnd; i++) {
+    if (isPipeLine(lines[i])) pipeIndices.push(i);
+  }
+
+  if (pipeIndices.length === 0) {
     throw new Error('found "## Documentation index" heading at line ' + (headingIdx + 1) + ' but no table appears before the next heading (or end of file)');
   }
 
-  let end = start;
-  for (let i = start; i < lines.length; i++) {
-    if (!isPipeLine(lines[i])) break;
-    end = i;
+  const first = pipeIndices[0];
+  const last = pipeIndices[pipeIndices.length - 1];
+  const gaps = [];
+  for (let i = first; i <= last; i++) {
+    if (!isPipeLine(lines[i])) gaps.push(i);
   }
 
-  return { start: start, end: end };
+  return { pipeIndices: pipeIndices, gaps: gaps };
 }
 
-// Classify every row inside the documentation-index table's line range.
-// This is a total invariant: every row is EXACTLY one of --
-//   1. the header row (first table line; first cell literally "Path"),
-//   2. the separator row (second table line; every cell matches the
-//      markdown separator pattern, e.g. "---" or ":---:"), or
+// Classify every pipe-delimited line found inside the documentation-index
+// table region. This is a total invariant: every such line is EXACTLY one
+// of --
+//   1. the header row (1st pipe line; first cell literally "Path"),
+//   2. the separator row (2nd pipe line; every cell matches the markdown
+//      separator pattern, e.g. "---" or ":---:"), or
 //   3. a valid entry (first cell is a single backtick-wrapped path).
-// Anything else -- prose, an unwrapped path, a malformed header/separator --
-// is collected into `malformed` and fails the gate. There is no
-// extension/shape allow-list; unlike a "does this look like a path"
-// heuristic, this cannot leave a silent hole for an unanticipated cell
-// shape, because every row must resolve to one of the three cases or it
-// is a failure by construction.
+// Classification is positional WITHIN THE PIPE-LINE SEQUENCE (1st, 2nd,
+// rest), not by raw line adjacency, so a blank line mid-table cannot shift
+// or drop any row out of enforcement -- every pipe line is still visited
+// and classified. Anything that fails its check, plus every gap line
+// reported by findDocIndexTableLines (a non-contiguous table), is
+// collected into `malformed` and fails the gate. There is no
+// extension/shape allow-list; every row (and every gap) must resolve to a
+// known case or it is a failure by construction.
 function parseManifestRows() {
   const src = readFile(MANIFEST_MD);
   const lines = src.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
 
-  const { start, end } = findDocIndexTableRange(lines);
+  const { pipeIndices, gaps } = findDocIndexTableLines(lines);
 
   const rows = [];
   const malformed = [];
 
-  for (let idx = start; idx <= end; idx++) {
+  pipeIndices.forEach(function(idx, posInTable) {
     const line = lines[idx];
     const trimmed = line.trim();
     const cells = trimmed.slice(1, -1).split('|');
     const firstCell = (cells[0] || '').trim();
     const lineNo = idx + 1;
 
-    if (idx === start) {
+    if (posInTable === 0) {
       if (firstCell !== 'Path') {
         malformed.push({ lineNo: lineNo, rawLine: line, reason: 'expected the table header row (first cell "Path") but found first cell ' + JSON.stringify(firstCell) });
       }
-      continue;
+      return;
     }
 
-    if (idx === start + 1) {
+    if (posInTable === 1) {
       const allCellsAreSeparators = cells.every(function(c) { return /^:?-+:?$/.test(c.trim()); });
       if (!allCellsAreSeparators) {
         malformed.push({ lineNo: lineNo, rawLine: line, reason: 'expected the markdown table separator row (each cell matching /^:?-+:?$/) but found ' + JSON.stringify(trimmed) });
       }
-      continue;
+      return;
     }
 
     const backtickMatch = firstCell.match(/^`([^`]+)`$/);
     if (!backtickMatch) {
       malformed.push({ lineNo: lineNo, rawLine: line, reason: 'first cell is not a single backtick-wrapped path: ' + JSON.stringify(firstCell) });
-      continue;
+      return;
     }
 
     rows.push({ relPath: backtickMatch[1].trim(), lineNo: lineNo, rawLine: line });
+  });
+
+  if (gaps.length > 0) {
+    const firstRowLineNo = pipeIndices[0] + 1;
+    const lastRowLineNo = pipeIndices[pipeIndices.length - 1] + 1;
+    for (const gapIdx of gaps) {
+      malformed.push({
+        lineNo: gapIdx + 1,
+        rawLine: lines[gapIdx],
+        reason: 'the documentation-index table must be contiguous -- this line is not a table row (it does not start and end with "|"), but it falls between the table\'s first row (line ' + firstRowLineNo + ') and its last row (line ' + lastRowLineNo + '); remove it or move it outside the table so the table has no gaps',
+      });
+    }
   }
+
+  malformed.sort(function(a, b) { return a.lineNo - b.lineNo; });
 
   return { rows, malformed };
 }
