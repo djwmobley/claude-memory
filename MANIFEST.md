@@ -6,6 +6,8 @@ It persists durable session state as queryable Postgres rows at the session boun
 
 ## Documentation index
 
+This index covers documentation that ships in the repository. Local-only planning documents that are excluded via `.gitignore` are intentionally omitted — their absence is deliberate, not an oversight to be corrected.
+
 | Path | Purpose | Status |
 |---|---|---|
 | `README.md` | Project overview, install, quickstart pointer | updated (added parameter column to command table) |
