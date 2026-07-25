@@ -25,9 +25,14 @@
  *
  *   D4 -- MANIFEST index integrity: every path referenced in the
  *        MANIFEST.md documentation-index table must (a) exist on disk,
- *        and (b) not be gitignored. MANIFEST.md is tracked and public;
- *        it documents shipped docs only, so a gitignored path in the
- *        index would advertise a file a cloner never receives.
+ *        (b) not be gitignored, and (c) be recognized as an index entry
+ *        in the first place -- a table row whose first cell looks
+ *        path-like (contains "/" or ends in a known doc/code extension)
+ *        but is not backtick-wrapped is a malformed entry that would
+ *        otherwise be silently skipped and never reach (a) or (b).
+ *        MANIFEST.md is tracked and public; it documents shipped docs
+ *        only, so a gitignored path in the index would advertise a file
+ *        a cloner never receives.
  *
  * Usage:
  *   node scripts/test-doc-lint.js
@@ -344,19 +349,43 @@ function testD3() {
 
 // -- D4 -- MANIFEST index integrity ---------------------------------------------
 
+// Extensions that mark a bare (non-backtick-wrapped) table cell as plausibly
+// a documentation path rather than incidental prose. Kept narrow and
+// doc/code-focused -- this repo's MANIFEST rows only ever reference source,
+// docs, and data files, never e.g. images or binaries.
+const PATH_LIKE_EXTENSIONS = ['.md', '.js', '.mjs', '.json', '.sql'];
+
+// True if `cellText` plausibly names a repo path: it contains a "/" (any
+// real MANIFEST path is at least one directory deep, e.g. `docs/glossary.md`
+// or `README.md` has no slash but does carry a recognized extension) or ends
+// in one of PATH_LIKE_EXTENSIONS. Backticks are stripped before the check so
+// a partially-malformed cell (e.g. a stray single backtick) still matches.
+function looksPathLike(cellText) {
+  const stripped = cellText.replace(/`/g, '').trim();
+  if (stripped.includes('/')) return true;
+  const lower = stripped.toLowerCase();
+  return PATH_LIKE_EXTENSIONS.some(function(ext) { return lower.endsWith(ext); });
+}
+
 // Parse MANIFEST.md's documentation-index table into { path, lineNo, rawLine }
 // rows. Only lines that look like genuine table rows AND whose first cell is a
 // backtick-wrapped path are treated as index entries. Header rows ("| Path |
-// Purpose | Status |"), the "|---|---|---|" separator row, and any other
-// pipe-delimited line whose first cell is not a backtick-wrapped path are
-// skipped -- each skip is logged with its reason so nothing is silently
-// dropped from consideration.
+// Purpose | Status |") and the "|---|---|---|" separator row are skipped
+// without complaint. Any other pipe-delimited line whose first cell is not a
+// backtick-wrapped path is either:
+//   - logged as a harmless skip, if the first cell does not look path-like
+//     (genuinely not an index entry -- e.g. stray prose), or
+//   - collected into `unwrapped`, if the first cell DOES look path-like
+//     (contains "/" or ends in a recognized doc/code extension) but was not
+//     backtick-wrapped -- this is a malformed entry that must fail the
+//     check rather than silently escape D4a/D4b validation.
 function parseManifestRows() {
   const src = readFile(MANIFEST_MD);
   const lines = src.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
 
   const rows = [];
   const skipped = [];
+  const unwrapped = [];
 
   lines.forEach(function(line, idx) {
     const trimmed = line.trim();
@@ -378,14 +407,18 @@ function parseManifestRows() {
 
     const backtickMatch = firstCell.match(/^`([^`]+)`$/);
     if (!backtickMatch) {
-      skipped.push('line ' + lineNo + ': first cell is not a single backtick-wrapped path (' + JSON.stringify(firstCell) + ') -- not an index entry');
+      if (looksPathLike(firstCell)) {
+        unwrapped.push({ firstCell: firstCell, lineNo: lineNo, rawLine: line });
+      } else {
+        skipped.push('line ' + lineNo + ': first cell is not a single backtick-wrapped path (' + JSON.stringify(firstCell) + ') -- not an index entry');
+      }
       return;
     }
 
     rows.push({ relPath: backtickMatch[1].trim(), lineNo: lineNo, rawLine: line });
   });
 
-  return { rows, skipped };
+  return { rows, skipped, unwrapped };
 }
 
 // Batch every MANIFEST path through `git check-ignore` in as few invocations
@@ -419,12 +452,27 @@ function gitCheckIgnore(relPaths) {
 function testD4() {
   const labelA = 'D4a: MANIFEST index integrity -- every indexed path exists on disk';
   const labelB = 'D4b: MANIFEST index integrity -- every indexed path is not gitignored (shipped docs only)';
+  const labelC = 'D4c: MANIFEST index integrity -- every path-like first cell is backtick-wrapped';
 
-  const { rows, skipped } = parseManifestRows();
+  const { rows, skipped, unwrapped } = parseManifestRows();
 
   if (skipped.length > 0) {
     console.log('  [D4] Skipped non-entry rows while parsing MANIFEST.md:');
     for (const s of skipped) console.log('    - ' + s);
+  }
+
+  // Sub-check D4c: a table row whose first cell looks path-like but was not
+  // backtick-wrapped would otherwise fall into `skipped` above and never be
+  // checked by D4a/D4b -- that is the exact hole this sub-check closes. Run
+  // it before the rows.length===0 early-return so an all-unwrapped MANIFEST
+  // still reports the real problem instead of a generic "no rows parsed".
+  if (unwrapped.length > 0) {
+    const issues = unwrapped.map(function(u) {
+      return 'MANIFEST.md:' + u.lineNo + ": first cell '" + u.firstCell + "' looks like a documentation path (contains '/' or a recognized extension) but is not backtick-wrapped, so it was not validated by D4a/D4b -- wrap it as `" + u.firstCell + "` (row: " + u.rawLine.trim() + ')';
+    });
+    fail(labelC, '\n  ' + issues.join('\n  '));
+  } else {
+    pass(labelC);
   }
 
   if (rows.length === 0) {
