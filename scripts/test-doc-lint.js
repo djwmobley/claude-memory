@@ -2,9 +2,10 @@
 
 /**
  * test-doc-lint.js -- Static documentation lint: glossary cross-refs,
- * command references, and suppression_kind enum sync.
+ * command references, suppression_kind enum sync, and MANIFEST index
+ * integrity.
  *
- * Catches documentation drift before it reaches main. Three checks:
+ * Catches documentation drift before it reaches main. Four checks:
  *
  *   D1 -- Glossary cross-reference resolution: every bold term in a
  *        "See also:" line must resolve to a defined ### heading in
@@ -22,15 +23,24 @@
  *        constraint (currently: superseded, downvoted_terminal,
  *        downvoted_probation, retired, reality_reconciled).
  *
+ *   D4 -- MANIFEST index integrity: every path referenced in the
+ *        MANIFEST.md documentation-index table must (a) exist on disk,
+ *        and (b) not be gitignored. MANIFEST.md is tracked and public;
+ *        it documents shipped docs only, so a gitignored path in the
+ *        index would advertise a file a cloner never receives.
+ *
  * Usage:
  *   node scripts/test-doc-lint.js
  *
  * No Postgres, vLLM, or external deps required. Pure static analysis.
- * Exit 0 = all checks pass. Exit 1 = any check fails.
+ * D4's gitignore check shells out to `git check-ignore`; every other
+ * check is filesystem-only. Exit 0 = all checks pass. Exit 1 = any
+ * check fails.
  */
 
-const fs   = require('fs');
-const path = require('path');
+const fs            = require('fs');
+const path          = require('path');
+const { spawnSync } = require('child_process');
 
 // -- Constants -----------------------------------------------------------------
 
@@ -42,6 +52,7 @@ const COMMANDS_DIR = path.join(PROJECT_ROOT, 'commands', 'handoff');
 const GLOSSARY_MD  = path.join(DOCS_DIR, 'glossary.md');
 const HANDOFF_JS   = path.join(SCRIPTS_DIR, 'handoff.js');
 const SCHEMA_SQL   = path.join(SCRIPTS_DIR, 'sql', 'handoff-core-schema.sql');
+const MANIFEST_MD  = path.join(PROJECT_ROOT, 'MANIFEST.md');
 
 // -- Tracking ------------------------------------------------------------------
 
@@ -331,6 +342,138 @@ function testD3() {
   }
 }
 
+// -- D4 -- MANIFEST index integrity ---------------------------------------------
+
+// Parse MANIFEST.md's documentation-index table into { path, lineNo, rawLine }
+// rows. Only lines that look like genuine table rows AND whose first cell is a
+// backtick-wrapped path are treated as index entries. Header rows ("| Path |
+// Purpose | Status |"), the "|---|---|---|" separator row, and any other
+// pipe-delimited line whose first cell is not a backtick-wrapped path are
+// skipped -- each skip is logged with its reason so nothing is silently
+// dropped from consideration.
+function parseManifestRows() {
+  const src = readFile(MANIFEST_MD);
+  const lines = src.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+
+  const rows = [];
+  const skipped = [];
+
+  lines.forEach(function(line, idx) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('|')) return; // not a table row at all; not a skip worth logging
+    if (!trimmed.endsWith('|')) return;   // stray leading-pipe prose line, not a real row
+
+    const cells = trimmed.slice(1, -1).split('|');
+    const firstCell = (cells[0] || '').trim();
+    const lineNo = idx + 1;
+
+    if (firstCell === 'Path') {
+      skipped.push('line ' + lineNo + ': header row ("Path" column label)');
+      return;
+    }
+    if (/^:?-+:?$/.test(firstCell)) {
+      skipped.push('line ' + lineNo + ': markdown table separator row');
+      return;
+    }
+
+    const backtickMatch = firstCell.match(/^`([^`]+)`$/);
+    if (!backtickMatch) {
+      skipped.push('line ' + lineNo + ': first cell is not a single backtick-wrapped path (' + JSON.stringify(firstCell) + ') -- not an index entry');
+      return;
+    }
+
+    rows.push({ relPath: backtickMatch[1].trim(), lineNo: lineNo, rawLine: line });
+  });
+
+  return { rows, skipped };
+}
+
+// Batch every MANIFEST path through `git check-ignore` in as few invocations
+// as practical (well within Windows/POSIX argv limits for this repo's index
+// size, so one call). `git check-ignore` prints exactly the subset of the
+// given paths that ARE ignored, one per line, regardless of exit code --
+// exit 1 ("no path is ignored") is the all-clear case here, not an error;
+// only an exit >= 2 (malformed invocation) is a real error.
+function gitCheckIgnore(relPaths) {
+  if (relPaths.length === 0) return new Set();
+  const result = spawnSync('git', ['check-ignore', '--'].concat(relPaths), {
+    cwd: PROJECT_ROOT,
+    encoding: 'utf8',
+  });
+  if (result.error) {
+    throw new Error('failed to invoke `git check-ignore`: ' + result.error.message);
+  }
+  if (result.status !== 0 && result.status !== 1) {
+    throw new Error('`git check-ignore` exited ' + result.status + ' (expected 0 or 1): ' + (result.stderr || '').trim());
+  }
+  const ignored = new Set(
+    (result.stdout || '')
+      .replace(/\r\n/g, '\n')
+      .split('\n')
+      .map(function(l) { return l.trim(); })
+      .filter(Boolean)
+  );
+  return ignored;
+}
+
+function testD4() {
+  const labelA = 'D4a: MANIFEST index integrity -- every indexed path exists on disk';
+  const labelB = 'D4b: MANIFEST index integrity -- every indexed path is not gitignored (shipped docs only)';
+
+  const { rows, skipped } = parseManifestRows();
+
+  if (skipped.length > 0) {
+    console.log('  [D4] Skipped non-entry rows while parsing MANIFEST.md:');
+    for (const s of skipped) console.log('    - ' + s);
+  }
+
+  if (rows.length === 0) {
+    fail(labelA, 'no index rows parsed from MANIFEST.md -- table format may have changed');
+    fail(labelB, 'no index rows parsed from MANIFEST.md -- table format may have changed');
+    return;
+  }
+
+  console.log('  [D4] Parsed ' + rows.length + ' MANIFEST index rows');
+
+  // Sub-check D4a: every path exists on disk.
+  const missing = [];
+  for (const row of rows) {
+    const abs = path.join(PROJECT_ROOT, row.relPath);
+    if (!fs.existsSync(abs)) {
+      missing.push('MANIFEST.md:' + row.lineNo + " references '" + row.relPath + "' which does not exist on disk (row: " + row.rawLine.trim() + ')');
+    }
+  }
+  if (missing.length > 0) {
+    fail(labelA, '\n  ' + missing.join('\n  '));
+  } else {
+    pass(labelA);
+  }
+
+  // Sub-check D4b: no path is gitignored. Only meaningful for paths that
+  // exist -- a missing path is already flagged by D4a and checking ignore
+  // status for something that isn't there adds no signal.
+  const existingRows = rows.filter(function(row) { return fs.existsSync(path.join(PROJECT_ROOT, row.relPath)); });
+  let ignoredSet;
+  try {
+    ignoredSet = gitCheckIgnore(existingRows.map(function(row) { return row.relPath; }));
+  } catch (err) {
+    fail(labelB, err.message);
+    return;
+  }
+
+  const ignoredViolations = [];
+  for (const row of existingRows) {
+    if (ignoredSet.has(row.relPath)) {
+      ignoredViolations.push('MANIFEST.md:' + row.lineNo + " references '" + row.relPath + "' which is gitignored -- a cloner of this public repo will never receive this file (row: " + row.rawLine.trim() + ')');
+    }
+  }
+  if (ignoredViolations.length > 0) {
+    fail(labelB, '\n  ' + ignoredViolations.join('\n  '));
+  } else {
+    pass(labelB);
+  }
+}
+
 // -- Main ----------------------------------------------------------------------
 
 async function main() {
@@ -338,6 +481,7 @@ async function main() {
   testD1();
   testD2();
   testD3();
+  testD4();
   console.log('');
   console.log('Results: ' + passed + ' passed, ' + failed + ' failed');
   if (failures.length > 0) {
