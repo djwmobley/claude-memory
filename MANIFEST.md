@@ -41,7 +41,9 @@ This index covers documentation that ships in the repository. Local-only plannin
 | `commands/handoff/drop.md` | `/handoff:drop` — archive prior session memory and start fresh | updated (added "Arguments: none" section) |
 | `commands/handoff/purge.md` | `/handoff:purge` — hard delete all project memory (confirmation required) | updated (added --dry-run flag with Arguments table + expected output) |
 | `commands/handoff/resurrect.md` | `/handoff:resurrect` — pull a decayed topic back into active context | updated (added --json flag to Flags table + JSON output example + invocation examples) |
-| `hooks/README.md` | SessionStart and Stop hook setup and behavior | current |
+| `hooks/README.md` | SessionStart and Stop hook setup and behavior | updated (added agent-adversary-floor section) |
+| `hooks/agent-adversary-floor.js` | PreToolUse hook (matcher `Agent\|SendMessage`) — floor requiring a blind-spot/completeness clause or a well-formed `[adversary-exempt: <reason>]` marker on subagent spawns of write-capable agent types. Exports pure functions for unit-test isolation. | added |
+| `hooks/agent-adversary-floor.test.js` | 59-test suite (node:test / node:assert/strict) covering pattern/marker detection, the global multi-marker validation fix, exempt-type handling, and the fail-open contract | added |
 | `scripts/lib/test-pg-helpers.js` | Shared PG test-harness helpers (pgConnect, createDb/createTestDb, dropDb/dropTestDb, setSetting, getSettingsLike, setContract, makeEnv, runHandoff, runClose, applySchema, resolveProjectId, resolveHandoffMdPath, cleanupHandoffMd, setupProject) extracted from six test scripts | added |
 | `scripts/lib/predicate-audit.js` | Exports `findUnregisteredPredicates` (pure) and `auditAssertionPredicates` (DB query) — detects predicates used in the assertions table that are not in the declared registry vocabulary | added |
 | `scripts/audit-predicates.js` | Ops CLI: connects to configured DB, runs `auditAssertionPredicates` across the live corpus (or a single project via `--project=<uuid>`), exits 0 (all registered), 2 (DB error), or 3 (drift found) | added |
