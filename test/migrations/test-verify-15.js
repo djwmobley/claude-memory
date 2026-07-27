@@ -303,6 +303,64 @@ async function testT0SourcelessClassification() {
   }
 }
 
+async function testT0InverseDirection() {
+  // Closes the open gap named in this PR's own blind-spot section: a
+  // forgotten roster reclassification (a manifest source with no roster
+  // entry) must now trip T0 loud, not stay invisible forever.
+  const target = await pgConnect(TARGET_DB);
+  try {
+    await shared.applyDdl(target);
+    await truncateAll(target, ['migration_manifest']);
+
+    const rosterPath = writeTmpJson('t0-inverse-roster.json', BASE_ROSTER);
+
+    // Satisfy the forward direction for both BASE_ROSTER entries first, so
+    // any FAIL below is unambiguously the INVERSE direction firing.
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint, excluded_reason)
+       VALUES ($1,'decisions','proj-a',1,'fp-decisions',NULL), ($1,'tasks','proj-a',1,'fp-tasks',NULL)`,
+      [SOURCE_DB]
+    );
+
+    // (i) A non-excluded manifest pair with NO roster entry -> T0 FAILs,
+    // listing it by name.
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint, excluded_reason)
+       VALUES ($1,'gotchas','proj-a',3,'fp-gotchas',NULL)`,
+      [SOURCE_DB]
+    );
+    const r1 = runScript('verify-15-t0-roster.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    const out1 = r1.stdout + r1.stderr;
+    if (r1.status !== 0 && /FAIL \(inverse\)/.test(out1) && new RegExp(`${SOURCE_DB} / gotchas`).test(out1) && /unregistered source/.test(out1)) {
+      pass('T0-inverse-i', 'non-excluded manifest pair with no roster entry -> T0 FAILs, listing it');
+    } else {
+      fail('T0-inverse-i', 'non-excluded manifest pair with no roster entry -> T0 FAILs, listing it', `status=${r1.status} stdout=${r1.stdout} stderr=${r1.stderr}`);
+    }
+
+    // (ii) Same shape, but EXCLUDED -> T0 still PASSes (no false positive).
+    // Replace the non-excluded 'gotchas' leak with an excluded one under a
+    // DIFFERENT never-rostered source_db (an EPHEMERAL-DROP-shaped case).
+    await truncateAll(target, ['migration_manifest']);
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint, excluded_reason)
+       VALUES ($1,'decisions','proj-a',1,'fp-decisions',NULL), ($1,'tasks','proj-a',1,'fp-tasks',NULL)`,
+      [SOURCE_DB]
+    );
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint, excluded_reason)
+       VALUES ('ephemeral_never_rostered_db','whatever_table','proj-a',5,'fp-ephemeral','ephemeral-db-triage-drop')`
+    );
+    const r2 = runScript('verify-15-t0-roster.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r2.status === 0 && /OK \(inverse\)/.test(r2.stdout)) {
+      pass('T0-inverse-ii', 'excluded manifest pair with no roster entry -> T0 still PASSes (no false positive)');
+    } else {
+      fail('T0-inverse-ii', 'excluded manifest pair with no roster entry -> T0 still PASSes (no false positive)', `status=${r2.status} stdout=${r2.stdout} stderr=${r2.stderr}`);
+    }
+  } finally {
+    await target.end();
+  }
+}
+
 async function testMalformedNetNewFatal() {
   // (iii) Malformed net-new: (empty suffix) -> loader fatal.
   const malformedRoster = writeTmpJson('t0-malformed-netnew.json', [
@@ -1194,6 +1252,7 @@ async function main() {
 
     await testT0();
     await testT0SourcelessClassification();
+    await testT0InverseDirection();
     await testMalformedNetNewFatal();
     await testT0Completeness();
     await testT1Snapshot();

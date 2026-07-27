@@ -37,9 +37,38 @@ const AUTHORED_BY = 'sonnet-t-battery-author-2026-07-27';
  * explicitly, every run, so "sourceless" reads as a checked classification
  * on the page, not an unexplained absence.
  *
+ * INVERSE DIRECTION — every non-excluded manifest pair has a roster entry
+ * (closes the open gap named in this PR's own blind-spot section: a
+ * forgotten roster reclassification — e.g. §18.3's future
+ * migrate-12-backfill-feature-token-usage.js eventually writing real
+ * migration_manifest rows under a real source_db while the roster's
+ * corresponding entry still says `net-new:` — would otherwise silently
+ * stop being verified by T3/T3b/T1's roster-side check forever, with zero
+ * FAIL anywhere). Mirror image of the roster→manifest direction above: a
+ * NOT EXISTS anti-join from a manifest-derived set against the SAME roster
+ * temp table, the other way round.
+ *
+ * SCOPED TO excluded_reason IS NULL — deliberately, not the whole
+ * migration_manifest table. Excluded manifest rows (EPHEMERAL-DROP
+ * snapshots, eval-junk slices, §16.3) must remain RECORDABLE without
+ * requiring roster membership: T1 has to be able to snapshot-and-exclude a
+ * source that was NEVER meant to be part of the migration's real scope in
+ * the first place, and demanding a roster entry for it would force
+ * enrolling a deliberately-out-of-scope source into the SAME total
+ * classification that names what's actually migrating — a category
+ * confusion. Excluded rows' visibility already lives in T9's loop over
+ * migration_manifest's own distinct excluded_reason values (§15.2) — that
+ * is where an excluded source is verified, not here. A NON-excluded
+ * manifest pair with no roster entry, by contrast, is a LIVE migration
+ * source nothing names as in-scope — exactly the forgotten-reclassification
+ * shape above, PLUS the original A-1 hazard read from the opposite
+ * direction: any migrate-NN-*.js script pointed at a table nobody
+ * registered in the roster.
+ *
  * Usage: node scripts/migrations/verify-15-t0-roster.js [--db <target>]
- * Exit codes: 0 = PASS (every SOURCED entry has >=1 manifest row), 1 = FAIL
- * or refused target.
+ * Exit codes: 0 = PASS (every SOURCED roster entry has >=1 manifest row,
+ * AND every non-excluded manifest pair has a roster entry), 1 = FAIL or
+ * refused target.
  */
 
 const shared = require('./lib/verify15-shared');
@@ -62,15 +91,28 @@ async function main() {
   try {
     await shared.applyDdl(client);
 
+    await client.query('BEGIN');
+    // Populated with SOURCED entries ONLY — sourceless (net-new:) entries'
+    // source_db values (e.g. "net-new:memory_manager") can never equal a
+    // REAL migration_manifest.source_db (T1 only ever connects to actual
+    // database names; the net-new: shape fails the DB-name regex outright),
+    // so they are irrelevant to BOTH directions' anti-joins below and are
+    // deliberately left out — including them in the forward direction would
+    // resurrect the exact spurious-FAIL bug the net-new: fix (PR #152)
+    // exists to close; including them in the inverse direction would just
+    // be dead weight, since no real manifest row could ever match one.
+    // Always created, even with zero SOURCED entries -- the INVERSE
+    // direction below needs a roster_t0 to anti-join against regardless.
+    await client.query('CREATE TEMP TABLE roster_t0 (source_db TEXT NOT NULL, source_table TEXT NOT NULL) ON COMMIT DROP');
+    for (const entry of sourced) {
+      await client.query('INSERT INTO roster_t0 (source_db, source_table) VALUES ($1, $2)', [entry.source_db, entry.source_table]);
+    }
+
+    // ── Forward direction: every SOURCED roster entry has >=1 manifest row ──
     if (sourced.length === 0) {
-      console.log('[T0] OK: zero SOURCED roster entries — nothing to check (this is a legitimate PASS, not a skip; every roster entry is either accounted for above or has no manifest requirement).');
+      console.log('[T0] OK (forward): zero SOURCED roster entries — nothing to check (this is a legitimate PASS, not a skip; every roster entry is either accounted for above or has no manifest requirement).');
     } else {
-      await client.query('BEGIN');
-      await client.query('CREATE TEMP TABLE roster_t0 (source_db TEXT NOT NULL, source_table TEXT NOT NULL) ON COMMIT DROP');
-      for (const entry of sourced) {
-        await client.query('INSERT INTO roster_t0 (source_db, source_table) VALUES ($1, $2)', [entry.source_db, entry.source_table]);
-      }
-      const { rows } = await client.query(`
+      const { rows: forwardGaps } = await client.query(`
         SELECT r.source_db, r.source_table
         FROM roster_t0 r
         WHERE NOT EXISTS (
@@ -79,15 +121,38 @@ async function main() {
         )
         ORDER BY r.source_db, r.source_table
       `);
-      await client.query('COMMIT');
 
-      if (rows.length) {
+      if (forwardGaps.length) {
         failed = true;
-        console.error(`[T0] FAIL: ${rows.length} SOURCED roster entr${rows.length === 1 ? 'y has' : 'ies have'} zero migration_manifest rows:`);
-        for (const r of rows) console.error(`  - ${r.source_db} / ${r.source_table}`);
+        console.error(`[T0] FAIL (forward): ${forwardGaps.length} SOURCED roster entr${forwardGaps.length === 1 ? 'y has' : 'ies have'} zero migration_manifest rows:`);
+        for (const r of forwardGaps) console.error(`  - ${r.source_db} / ${r.source_table}`);
       } else {
-        console.log(`[T0] OK: all ${sourced.length} SOURCED roster entries have >=1 migration_manifest row.`);
+        console.log(`[T0] OK (forward): all ${sourced.length} SOURCED roster entries have >=1 migration_manifest row.`);
       }
+    }
+
+    // ── Inverse direction: every non-excluded manifest pair has a roster
+    // entry (see header comment for the excluded_reason IS NULL scoping) ──
+    const { rows: inverseGaps } = await client.query(`
+      SELECT DISTINCT m.source_db, m.source_table
+      FROM migration_manifest m
+      WHERE m.excluded_reason IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM roster_t0 r
+          WHERE r.source_db = m.source_db AND r.source_table = m.source_table
+        )
+      ORDER BY m.source_db, m.source_table
+    `);
+    await client.query('COMMIT');
+
+    if (inverseGaps.length) {
+      failed = true;
+      console.error(`[T0] FAIL (inverse): ${inverseGaps.length} non-excluded migration_manifest pair(s) have NO roster entry:`);
+      for (const r of inverseGaps) {
+        console.error(`  - ${r.source_db} / ${r.source_table} — unregistered source: roster is the total classification; if this is a newly-landed backfill source, reclassify the target's sourceless roster entry to this real source.`);
+      }
+    } else {
+      console.log('[T0] OK (inverse): every non-excluded migration_manifest pair has a roster entry.');
     }
   } finally {
     await client.end();
