@@ -236,6 +236,51 @@ function validateRosterSourceDbShapes(roster, rosterPath) {
 }
 
 /**
+ * Validate that the SOURCED and SOURCELESS partitions' targetTable sets
+ * are DISJOINT — a categorical fix (final-review finding, PR #152), not a
+ * per-consumer patch. Without this, a targetTable claimed by BOTH a
+ * sourced entry (a real migration source) and a sourceless entry (a
+ * net-new:-classified "no source exists" claim) is a self-contradictory
+ * roster state: T3b's two checks would handle it inconsistently
+ * (reverseContainment would over-exclude it via sourcelessTargetTables;
+ * totalRowcountReconciliation would under-exclude it, since `sourced`
+ * still includes the table's OTHER, sourced entries). Making the
+ * inconsistent state UNREPRESENTABLE at load time — rather than patching
+ * every downstream consumer to reason about a table that is simultaneously
+ * "definitely has no source" and "definitely has a source" — is the
+ * categorical fix: a genuinely net-new table cannot also have a legacy
+ * source, and a table with any real source must be sourced EVERYWHERE it
+ * appears in the roster, never partially.
+ */
+function validateRosterPartitionDisjoint(roster, rosterPath) {
+  const { sourced, sourceless } = partitionRoster(roster);
+  const sourcedByTable = new Map(); // targetTable -> [entries]
+  for (const entry of sourced) {
+    if (!sourcedByTable.has(entry.targetTable)) sourcedByTable.set(entry.targetTable, []);
+    sourcedByTable.get(entry.targetTable).push(entry);
+  }
+  const overlaps = [];
+  for (const entry of sourceless) {
+    if (sourcedByTable.has(entry.targetTable)) {
+      overlaps.push({ targetTable: entry.targetTable, sourcelessEntry: entry, sourcedEntries: sourcedByTable.get(entry.targetTable) });
+    }
+  }
+  if (overlaps.length) {
+    console.error(`FATAL: roster at "${rosterPath}" has ${overlaps.length} targetTable(s) claimed by BOTH a sourced AND a sourceless entry:`);
+    for (const o of overlaps) {
+      console.error(`  - targetTable="${o.targetTable}":`);
+      console.error(`      SOURCELESS claim: source_db="${o.sourcelessEntry.source_db}" source_table="${o.sourcelessEntry.source_table}"`);
+      for (const s of o.sourcedEntries) {
+        console.error(`      SOURCED claim:    source_db="${s.source_db}" source_table="${s.source_table}"`);
+      }
+    }
+    console.error('  A table cannot be genuinely net-new AND have a legacy source. If this table now has a real');
+    console.error('  migration source, remove its net-new: entry entirely and keep only the sourced entry (or entries).');
+    process.exit(1);
+  }
+}
+
+/**
  * Load + shape-validate the real source-table-roster.json. Loud fatal, never
  * a silent empty-array fallback, when the real roster is missing — names
  * both the env var and the example file so the operator knows exactly what
@@ -272,6 +317,7 @@ function loadRoster() {
   }
   validateRosterShape(roster, rosterPath);
   validateRosterSourceDbShapes(roster, rosterPath);
+  validateRosterPartitionDisjoint(roster, rosterPath);
   return roster;
 }
 
@@ -503,6 +549,37 @@ async function applyDdl(client) {
   await client.query(DDL_SQL);
 }
 
+// Table names this battery's OWN DDL creates, DERIVED FROM DDL_SQL's own
+// text (never a hand-maintained second list — same "no hand-enumerated
+// table lists" posture as migrate-01-canonical-db.js's deriveExpectedObjects,
+// which this regex is deliberately styled after). Used by T0's live-table
+// total classification (final-review finding, PR #152) to recognize this
+// battery's own infrastructure tables (migration_manifest,
+// containment_evidence, …) as a distinct class from engine-core or
+// roster/inventory-declared tables.
+const DDL_TABLE_RE = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"?([a-zA-Z_][a-zA-Z0-9_]*)"?/gi;
+
+function getBatteryInfraTables() {
+  const tables = new Set();
+  let m;
+  DDL_TABLE_RE.lastIndex = 0;
+  while ((m = DDL_TABLE_RE.exec(DDL_SQL))) tables.add(m[1].toLowerCase());
+  return tables;
+}
+
+/**
+ * The engine-core table/view set, derived at RUNTIME by reusing
+ * migrate-01-canonical-db.js's OWN deriveExpectedObjects() over its OWN
+ * four SCHEMA_FILES — never a duplicated parser or a second hand-maintained
+ * list (final-review finding, PR #152: "import it; if not exported, export
+ * it — do not duplicate the parser." It was already exported.)
+ *
+ * @returns {{ tables: Set<string>, views: Set<string> }}
+ */
+function getEngineCoreObjects() {
+  return migrateOne.deriveExpectedObjects(migrateOne.SCHEMA_FILES);
+}
+
 // ─── containment_evidence WRITER (T4/F1-F4, §15.2.1) ─────────────────────────
 
 async function writeContainmentEvidence(client, { checkId, queryText, result, recordedBy, projectId = null }) {
@@ -551,6 +628,7 @@ module.exports = {
   classifyRosterSourceDb,
   partitionRoster,
   validateRosterSourceDbShapes,
+  validateRosterPartitionDisjoint,
   loadRoster,
   NULL_SENTINEL,
   rowHash,
@@ -561,6 +639,8 @@ module.exports = {
   buildLoadBearingColsFromRoster,
   DDL_SQL,
   applyDdl,
+  getBatteryInfraTables,
+  getEngineCoreObjects,
   writeContainmentEvidence,
   loadHarnessAuthorship,
 };

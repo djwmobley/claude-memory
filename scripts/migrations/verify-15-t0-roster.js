@@ -65,13 +65,81 @@ const AUTHORED_BY = 'sonnet-t-battery-author-2026-07-27';
  * direction: any migrate-NN-*.js script pointed at a table nobody
  * registered in the roster.
  *
+ * LIVE-TABLE TOTAL CLASSIFICATION — T0's natural completion (final-review
+ * finding, PR #152, closes the "absent from both artifacts" hole). A table
+ * physically present in the target but absent from BOTH
+ * source-table-roster.json and inventory-manifest.json was invisible to
+ * every check that existed before this section: T0-completeness is a pure
+ * roster-vs-inventory FILE diff (it never looks at the live target at
+ * all); migrate-01-canonical-db.js's verifyTarget() computes extraTables
+ * but explicitly EXCLUDES them from its own pass/fail (by design — that
+ * script only asserts its OWN four SQL files' expected set, treating
+ * anything else as "later-phase or unknown" and moving on).
+ *
+ * Since T0 is already the roster-TOTALITY check, this is its natural third
+ * section: enumerate every BASE TABLE and VIEW in the target's `public`
+ * schema (information_schema.tables already excludes temp objects — they
+ * live in a pg_temp_N schema, never `public`) and TOTAL-classify each into
+ * EXACTLY one of:
+ *   (a) engine-core     — derived at RUNTIME from migrate-01-canonical-db.js's
+ *                         OWN deriveExpectedObjects() over its OWN
+ *                         SCHEMA_FILES (shared.getEngineCoreObjects() —
+ *                         never a duplicated parser or second list);
+ *   (b) battery-infra    — this battery's OWN DDL tables, derived from
+ *                         DDL_SQL's own text (shared.getBatteryInfraTables()
+ *                         — never a hand list);
+ *   (c) roster/inventory — present as a targetTable anywhere in the loaded
+ *                         roster (sourced OR sourceless — a "no source"
+ *                         claim on a table is still a claim ABOUT that
+ *                         table), OR a table name in inventory-manifest.json;
+ *   (d) ELSE             — a loud T0 FAIL naming the table: "unclassified
+ *                         table present in target — register it in the
+ *                         roster/inventory in the same change that created
+ *                         it, or it is invisible to every containment check."
+ * Per-class counts are always printed, even on a clean PASS — the same
+ * "checked classification on the page, never an unexplained absence"
+ * posture the sourceless-entry section above already established.
+ *
  * Usage: node scripts/migrations/verify-15-t0-roster.js [--db <target>]
  * Exit codes: 0 = PASS (every SOURCED roster entry has >=1 manifest row,
- * AND every non-excluded manifest pair has a roster entry), 1 = FAIL or
- * refused target.
+ * every non-excluded manifest pair has a roster entry, AND every live
+ * table/view in target classifies), 1 = FAIL or refused target.
  */
 
 const shared = require('./lib/verify15-shared');
+const { loadInventory } = require('./verify-15-t0-roster-completeness');
+
+/**
+ * Total-classify every BASE TABLE/VIEW live in the target's public schema
+ * into engine-core / battery-infra / roster-or-inventory / unclassified.
+ * Standalone + exported so the test suite can exercise it directly against
+ * a variety of fixture schemas.
+ */
+async function classifyLiveTables(client, roster) {
+  const engineCore = shared.getEngineCoreObjects();
+  const engineCoreNames = new Set([...engineCore.tables, ...engineCore.views]);
+  const batteryInfraNames = shared.getBatteryInfraTables();
+
+  const rosterInventoryNames = new Set();
+  for (const entry of roster) rosterInventoryNames.add(entry.targetTable.toLowerCase());
+  for (const t of loadInventory()) rosterInventoryNames.add(t.toLowerCase());
+
+  const { rows } = await client.query(`
+    SELECT table_name FROM information_schema.tables
+    WHERE table_schema = 'public'
+    ORDER BY table_name
+  `);
+
+  const classified = { engineCore: [], batteryInfra: [], rosterInventory: [], unclassified: [] };
+  for (const r of rows) {
+    const name = r.table_name.toLowerCase();
+    if (engineCoreNames.has(name)) classified.engineCore.push(r.table_name);
+    else if (batteryInfraNames.has(name)) classified.batteryInfra.push(r.table_name);
+    else if (rosterInventoryNames.has(name)) classified.rosterInventory.push(r.table_name);
+    else classified.unclassified.push(r.table_name);
+  }
+  return classified;
+}
 
 async function main() {
   const argv = process.argv.slice(2);
@@ -154,6 +222,24 @@ async function main() {
     } else {
       console.log('[T0] OK (inverse): every non-excluded migration_manifest pair has a roster entry.');
     }
+
+    // ── Live-table total classification (see header comment) ──────────────
+    const classification = await classifyLiveTables(client, roster);
+    console.log(
+      `[T0] live-table classification: engine-core=${classification.engineCore.length}, ` +
+      `battery-infra=${classification.batteryInfra.length}, ` +
+      `roster/inventory=${classification.rosterInventory.length}, ` +
+      `unclassified=${classification.unclassified.length}`
+    );
+    if (classification.unclassified.length) {
+      failed = true;
+      console.error(`[T0] FAIL (live-table): ${classification.unclassified.length} unclassified table(s) present in target:`);
+      for (const t of classification.unclassified) {
+        console.error(`  - ${t} — unclassified table present in target: register it in the roster/inventory in the same change that created it, or it is invisible to every containment check.`);
+      }
+    } else {
+      console.log('[T0] OK (live-table): every table/view in target classifies as engine-core, battery-infra, or roster/inventory.');
+    }
   } finally {
     await client.end();
   }
@@ -167,4 +253,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { AUTHORED_BY };
+module.exports = { AUTHORED_BY, classifyLiveTables };

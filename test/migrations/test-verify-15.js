@@ -35,8 +35,20 @@ const scriptsRequire = createRequire(require.resolve('../../scripts/package.json
 const { Client } = scriptsRequire('pg');
 
 const shared = require(path.join(MIGRATIONS_DIR, 'lib', 'verify15-shared.js'));
+const migrateOne = require(path.join(MIGRATIONS_DIR, 'migrate-01-canonical-db.js'));
 
 const TS = Date.now();
+
+/** Applies the REAL engine-core schema (migrate-01's own four SQL files) to
+ * an already-connected client — used by T0's live-table classification test
+ * to prove engine-core tables classify cleanly against the SAME derivation
+ * shared.getEngineCoreObjects() uses at runtime, not a synthetic stand-in. */
+async function applyRealEngineSchema(client) {
+  await migrateOne.ensureExtensions(client);
+  for (const file of migrateOne.SCHEMA_FILES) {
+    await migrateOne.applySqlFile(client, file);
+  }
+}
 
 // ── Tracking ────────────────────────────────────────────────────────────────
 
@@ -102,7 +114,8 @@ const TARGET_DB = `verify15_target_${TS}_staging`;
 const SOURCE_DB = `verify15_source_${TS}_staging`;
 const FREEZE_WRITABLE_DB = `verify15_freezewritable_${TS}_staging`;
 const FREEZE_FROZEN_DB = `verify15_freezefrozen_${TS}_staging`;
-const CREATED_DBS = [TARGET_DB, SOURCE_DB, FREEZE_WRITABLE_DB, FREEZE_FROZEN_DB];
+const LIVE_TABLE_DB = `verify15_livetable_${TS}_staging`;
+const CREATED_DBS = [TARGET_DB, SOURCE_DB, FREEZE_WRITABLE_DB, FREEZE_FROZEN_DB, LIVE_TABLE_DB];
 
 // ── Scratch temp files (roster/fixture JSON, OUTSIDE the repo) ───────────────
 
@@ -169,10 +182,6 @@ async function setupTargetSchema(client) {
       id SERIAL PRIMARY KEY,
       entry_id INTEGER,
       project_id TEXT
-    );
-    CREATE TABLE IF NOT EXISTS no_project_id_table (
-      id SERIAL PRIMARY KEY,
-      label TEXT
     );
     CREATE TABLE IF NOT EXISTS routing_profiles (
       id SERIAL PRIMARY KEY,
@@ -361,6 +370,68 @@ async function testT0InverseDirection() {
   }
 }
 
+async function testT0LiveTableClassification() {
+  // Final-review finding (PR #152): a table physically present in the
+  // target but absent from BOTH the roster and inventory-manifest.json is
+  // invisible to every check that existed before this section. Uses a
+  // DEDICATED scratch DB (LIVE_TABLE_DB) so this test's schema state never
+  // interferes with other test groups' fixture tables (or vice versa).
+  const target = await pgConnect(LIVE_TABLE_DB);
+  try {
+    // A trivial single-entry roster: sourceless, so the forward direction
+    // auto-passes (zero SOURCED entries) and the inverse direction
+    // auto-passes (fresh DB, empty migration_manifest) -- isolating every
+    // assertion below to the live-table classification section alone.
+    const trivialRoster = writeTmpJson('t0-livetable-roster.json', [
+      { source_db: 'net-new:test_store', source_table: 'placeholder', targetTable: 'placeholder_table',
+        loadBearingCols: ['x'], hasContentBearingText: false, requires_project_id_scope: false },
+    ]);
+
+    // (i) An unclassified table planted in the scratch target -> T0 FAILs, naming it.
+    await target.query('CREATE TABLE IF NOT EXISTS mystery_orphan_table (id SERIAL PRIMARY KEY)');
+    const r1 = runScript('verify-15-t0-roster.js', ['--db', LIVE_TABLE_DB], rosterEnv(trivialRoster));
+    const out1 = r1.stdout + r1.stderr;
+    if (r1.status !== 0 && /FAIL \(live-table\)/.test(out1) && /mystery_orphan_table/.test(out1)) {
+      pass('T0-livetable-i', 'unclassified table planted in scratch target -> T0 FAILs, naming it');
+    } else {
+      fail('T0-livetable-i', 'unclassified table planted in scratch target -> T0 FAILs, naming it', `status=${r1.status} stdout=${r1.stdout} stderr=${r1.stderr}`);
+    }
+    await target.query('DROP TABLE mystery_orphan_table');
+
+    // (ii) Engine-core + battery-infra tables in a fresh target classify
+    // cleanly -- no false positive. Applies the REAL migrate-01 schema
+    // (the SAME four SQL files shared.getEngineCoreObjects() parses at
+    // runtime) plus this battery's own DDL (applied automatically inside
+    // T0's own main()).
+    await applyRealEngineSchema(target);
+    const r2 = runScript('verify-15-t0-roster.js', ['--db', LIVE_TABLE_DB], rosterEnv(trivialRoster));
+    const out2 = r2.stdout + r2.stderr;
+    if (r2.status === 0 && /engine-core=1[0-9]/.test(out2) && /battery-infra=[1-9]/.test(out2) && /unclassified=0/.test(out2)) {
+      pass('T0-livetable-ii', 'real engine-core schema + battery-infra tables classify cleanly in a fresh target (no false positive)');
+    } else {
+      fail('T0-livetable-ii', 'real engine-core schema + battery-infra tables classify cleanly in a fresh target (no false positive)', `status=${r2.status} stdout=${r2.stdout} stderr=${r2.stderr}`);
+    }
+
+    // (iii) A roster-known targetTable present -> class (c), PASS.
+    await target.query('CREATE TABLE IF NOT EXISTS decisions_livetable_marker (id SERIAL PRIMARY KEY)');
+    const rosterWithMarker = writeTmpJson('t0-livetable-roster-marker.json', [
+      { source_db: 'net-new:test_store', source_table: 'placeholder', targetTable: 'placeholder_table',
+        loadBearingCols: ['x'], hasContentBearingText: false, requires_project_id_scope: false },
+      { source_db: 'net-new:test_store2', source_table: 'marker_source', targetTable: 'decisions_livetable_marker',
+        loadBearingCols: ['x'], hasContentBearingText: false, requires_project_id_scope: false },
+    ]);
+    const r3 = runScript('verify-15-t0-roster.js', ['--db', LIVE_TABLE_DB], rosterEnv(rosterWithMarker));
+    const out3 = r3.stdout + r3.stderr;
+    if (r3.status === 0 && /unclassified=0/.test(out3) && /roster\/inventory=[1-9]/.test(out3)) {
+      pass('T0-livetable-iii', 'roster-known targetTable present -> classified via roster/inventory (class c), overall PASS');
+    } else {
+      fail('T0-livetable-iii', 'roster-known targetTable present -> classified via roster/inventory (class c), overall PASS', `status=${r3.status} stdout=${r3.stdout} stderr=${r3.stderr}`);
+    }
+  } finally {
+    await target.end();
+  }
+}
+
 async function testMalformedNetNewFatal() {
   // (iii) Malformed net-new: (empty suffix) -> loader fatal.
   const malformedRoster = writeTmpJson('t0-malformed-netnew.json', [
@@ -371,6 +442,23 @@ async function testMalformedNetNewFatal() {
     pass('malformed-netnew', 'empty net-new: suffix -> loader FATAL, loud, non-zero exit');
   } else {
     fail('malformed-netnew', 'empty net-new: suffix -> loader FATAL, loud, non-zero exit', `status=${r.status} stdout=${r.stdout} stderr=${r.stderr}`);
+  }
+}
+
+async function testDisjointnessValidation() {
+  // Final-review finding (PR #152): a targetTable claimed by BOTH a sourced
+  // and a sourceless entry is a structurally impossible roster state --
+  // loadRoster() must refuse it at load time, loud, before any check runs.
+  const overlapRoster = writeTmpJson('t0-disjointness-overlap.json', [
+    { ...SOURCELESS_ROSTER_ENTRY, targetTable: 'decisions' }, // sourceless claim on 'decisions'
+    BASE_ROSTER[0], // sourced claim on the SAME 'decisions' targetTable
+  ]);
+  const r = runScript('verify-15-t0-roster.js', ['--db', TARGET_DB], rosterEnv(overlapRoster));
+  const out = r.stdout + r.stderr;
+  if (r.status !== 0 && /claimed by BOTH a sourced AND a sourceless entry/.test(out) && /targetTable="decisions"/.test(out)) {
+    pass('disjointness', 'sourced/sourceless targetTable overlap -> loader FATAL, naming the table and both claiming entries');
+  } else {
+    fail('disjointness', 'sourced/sourceless targetTable overlap -> loader FATAL, naming the table and both claiming entries', `status=${r.status} stdout=${r.stdout} stderr=${r.stderr}`);
   }
 }
 
@@ -1236,6 +1324,7 @@ async function main() {
     await createDb(SOURCE_DB);
     await createDb(FREEZE_WRITABLE_DB);
     await createDb(FREEZE_FROZEN_DB);
+    await createDb(LIVE_TABLE_DB);
 
     const target = await pgConnect(TARGET_DB);
     try {
@@ -1253,7 +1342,9 @@ async function main() {
     await testT0();
     await testT0SourcelessClassification();
     await testT0InverseDirection();
+    await testT0LiveTableClassification();
     await testMalformedNetNewFatal();
+    await testDisjointnessValidation();
     await testT0Completeness();
     await testT1Snapshot();
     await testFreezePrecondition();
