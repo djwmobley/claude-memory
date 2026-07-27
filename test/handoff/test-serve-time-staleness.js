@@ -37,6 +37,7 @@ const { execFileSync } = require('child_process');
 
 const { loadConfig }  = require('../../scripts/lib/shared');
 const { writeMarker } = require('../../scripts/lib/project-marker');
+const { resolveHandoffMdPath } = require('../../scripts/lib/handoff-paths');
 const { createRequire } = require('module');
 const scriptsRequire = createRequire(require.resolve('../../scripts/package.json'));
 const { Client } = scriptsRequire('pg');
@@ -147,7 +148,7 @@ async function teardown(ctx) {
   try { await db.end(); } catch (_) {}
   try { fs.rmSync(fakeRoot, { recursive: true, force: true }); } catch (_) {}
   try {
-    const dir = path.join(os.homedir(), '.claude', 'projects', projectId);
+    const dir = path.dirname(resolveHandoffMdPath(projectId));
     if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
   } catch (_) {}
 }
@@ -349,7 +350,7 @@ async function runTests() {
   // ── TEST (d): Token-budget — trueServedTokens in output ───────────────────
   await test('(d) token-budget: tokens used line reports true served tokens', async () => {
     // Write a non-trivial handoff.md body so trueServedTokens > sections-only tokensUsed.
-    const handoffMdPath = path.join(os.homedir(), '.claude', 'projects', projectId, 'handoff.md');
+    const handoffMdPath = resolveHandoffMdPath(projectId);
     if (fs.existsSync(handoffMdPath)) {
       const raw  = fs.readFileSync(handoffMdPath, 'utf8');
       const fmMatch = raw.match(/^---[\s\S]*?---\r?\n/);

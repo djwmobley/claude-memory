@@ -7,6 +7,16 @@
  * migration's collision-safety.
  *
  * Coverage:
+ *   S1      Repo-sweep: no file outside handoff-paths.js (and an explicit,
+ *           commented exemption list) may hand-roll the os.homedir()+'.claude'
+ *           base-dir pattern that handoff-paths.js exists to centralize. Total
+ *           classification, not an allow-list of known-bad files: every hit is
+ *           either on the exemption list (with a stated reason) or the sweep
+ *           fails — a new 10th such file can never be silently added. Matches
+ *           on the co-occurrence of `os.homedir()` and the literal fragment
+ *           `.claude` within a small line window, independent of quote style
+ *           or path.join vs string-concatenation — see testS1_noHandRolledBaseDir
+ *           for the documented limits of that detection.
  *   M1-M7   Dual-marker same-directory classification (project-marker.js):
  *           only-new, only-legacy, both-same-uuid, both-different-uuid (HARD
  *           ERROR, proof-of-firing), both-corrupt (HARD ERROR, proof-of-firing),
@@ -128,6 +138,211 @@ function withPlatform(platform, fn) {
   } finally {
     Object.defineProperty(process, 'platform', orig);
   }
+}
+
+// ── S1: Repo-sweep — no hand-rolled os.homedir()+'.claude' base-dir duplicate ──
+
+const PROJECT_ROOT = path.resolve(__dirname, '..');
+const SWEEP_DIRS    = [
+  path.join(PROJECT_ROOT, 'scripts'),
+  path.join(PROJECT_ROOT, 'hooks'),
+  path.join(PROJECT_ROOT, 'test'),
+];
+const HANDOFF_PATHS_JS = path.join(PROJECT_ROOT, 'scripts', 'lib', 'handoff-paths.js');
+
+/**
+ * EXEMPTION LIST — every file where `os.homedir()` legitimately co-occurs with
+ * the literal fragment `.claude` WITHOUT going through handoff-paths.js. Each
+ * entry states WHY it is not a duplicate of the HANDOFF_BASE_DIR concept.
+ * This list is the ONLY escape hatch from the sweep below — adding a file here
+ * without a real justification defeats the purpose of the gate.
+ */
+const SWEEP_EXEMPTIONS = [
+  {
+    file: HANDOFF_PATHS_JS,
+    reason: 'This IS the resolver. Its default branch and its own doc comments ' +
+            'are the canonical single source of truth the rest of the repo must ' +
+            'import — not a duplicate of itself.',
+  },
+  {
+    file: path.join(PROJECT_ROOT, 'scripts', 'lib', 'encoded-cwd.js'),
+    reason: "getClaudeProjectDir() resolves Claude Code's OWN session-transcript " +
+            'storage location (~/.claude/projects/<encoded-cwd>/), read by the ' +
+            'separate pipeline-memory-loader.js chunker subsystem — not our ' +
+            'handoff.md. HANDOFF_BASE_DIR governs OUR file; honoring it here would ' +
+            "make this function stop finding Claude Code's real transcripts.",
+  },
+  {
+    file: path.join(PROJECT_ROOT, 'scripts', 'install.js'),
+    reason: 'Installs the /handoff:* slash-command files to ~/.claude/commands/handoff/ ' +
+            '— a Claude-Code-only concept (other MCP clients have no slash-command ' +
+            'directory convention at all) and out of #135\'s scope, which covers ' +
+            'handoff.md / the project marker / the promotion file, not command install location.',
+  },
+  {
+    file: path.join(PROJECT_ROOT, 'scripts', 'pipeline-memory-loader.js'),
+    reason: "Reads Claude Code's GLOBAL ~/.claude/CLAUDE.md (the user-level preferences " +
+            'file, a distinct concept from our PROJECT-level promotion file governed by ' +
+            'HANDOFF_PROMOTION_FILE). Out of scope for the project-level path resolvers.',
+  },
+  {
+    file: path.join(PROJECT_ROOT, 'scripts', 'sync-hooks.js'),
+    reason: 'Deploys hook files to ~/.claude/hooks/ (the documented live hook deploy ' +
+            'target per hooks/README.md) — deployment tooling for a Claude-Code-only ' +
+            'directory, unrelated to handoff.md storage.',
+  },
+  {
+    file: path.join(PROJECT_ROOT, 'scripts', 'test-host-agnostic-naming.js'),
+    reason: 'This file. Its B-series assertions must independently compute the REAL ' +
+            'default (os.homedir()+.claude) to assert resolveBaseDir() returns exactly ' +
+            'that when HANDOFF_BASE_DIR is unset — it is the test oracle, not a duplicate.',
+  },
+  {
+    file: path.join(PROJECT_ROOT, 'test', 'eval', 'eval-retrieval.js'),
+    reason: 'Stages fixture files at getClaudeProjectDir(tempCwd)+"/memory" so that ' +
+            'pipeline-memory-loader.js (itself exempt, see encoded-cwd.js above) finds ' +
+            'them at the exact real-homedir location it hardcodes. Routing this through ' +
+            'HANDOFF_BASE_DIR would desync it from the unmodified loader and break the test ' +
+            'the moment HANDOFF_BASE_DIR is set — this is deliberately NOT the handoff.md concept.',
+  },
+  {
+    file: path.join(PROJECT_ROOT, 'scripts', 'test-install-engine-path.js'),
+    reason: "Comment-only mention describing install.js's os.homedir() usage; no path " +
+            'is actually constructed here.',
+  },
+  {
+    file: path.join(PROJECT_ROOT, 'hooks', 'agent-adversary-floor.js'),
+    reason: 'Comment-only mention ("not a hardcoded personal path, and not an ' +
+            'os.homedir()") describing what the code does NOT do; no path is ' +
+            'actually constructed here.',
+  },
+];
+
+function collectJsFilesForSweep(dir) {
+  const results = [];
+  if (!fs.existsSync(dir)) return results;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === 'node_modules' || entry.name === '.claude') continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      results.push(...collectJsFilesForSweep(full));
+    } else if (entry.isFile() && (entry.name.endsWith('.js') || entry.name.endsWith('.mjs'))) {
+      results.push(full);
+    }
+  }
+  return results;
+}
+
+/**
+ * S1 — Repo-sweep for the hand-rolled os.homedir()+'.claude' base-dir pattern.
+ *
+ * Detection is on the SEMANTIC co-occurrence of `os.homedir()` and the literal
+ * fragment `.claude` within a small line window (default: the same line, or
+ * up to 3 lines below — covers a path.join(...) call split across lines) —
+ * NOT on one exact syntactic shape. This is deliberate: a narrower regex tied
+ * to a specific quote style or path.join specifically is exactly the kind of
+ * allow-list-of-spellings a differently-written 10th offender could evade.
+ * See the function-level comment on testS1 in the test file's header for the
+ * documented limit of this approach (a window, not full semantic analysis).
+ */
+function findHandRolledBaseDirHits(dirs = SWEEP_DIRS, exemptions = SWEEP_EXEMPTIONS) {
+  const allFiles = dirs.flatMap(collectJsFilesForSweep);
+  const exemptSet = new Set(exemptions.map((e) => e.file));
+  const hits = [];
+
+  for (const filePath of allFiles) {
+    if (exemptSet.has(filePath)) continue;
+    const lines = fs.readFileSync(filePath, 'utf8').split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      if (!/os\.homedir\(\)/.test(lines[i])) continue;
+      // Skip pure comment lines (// or leading * in a block comment) — the
+      // sweep targets executable code, not prose that happens to mention the
+      // API name (matches the convention in test-os-portability.js's P2/P3).
+      const trimmed = lines[i].trim();
+      if (trimmed.startsWith('//') || trimmed.startsWith('*')) continue;
+      const windowEnd = Math.min(lines.length, i + 4);
+      const window = lines.slice(i, windowEnd).join('\n');
+      if (window.includes('.claude')) {
+        hits.push({ file: filePath, line: i + 1, text: lines[i].trim() });
+      }
+    }
+  }
+  return hits;
+}
+
+function testS1_noHandRolledBaseDir() {
+  const label = 'S1 (repo-sweep): no hand-rolled os.homedir()+.claude base-dir pattern outside handoff-paths.js or an exempted file';
+  try {
+    // Sanity: the exemption list itself must point at real files — an exemption
+    // for a typo'd or deleted path would silently exempt nothing while looking
+    // like coverage.
+    const missingExemptions = SWEEP_EXEMPTIONS.filter((e) => !fs.existsSync(e.file));
+    if (missingExemptions.length > 0) {
+      fail(label, `exemption list references non-existent file(s): ${JSON.stringify(missingExemptions.map((e) => e.file))}`);
+      return;
+    }
+
+    const hits = findHandRolledBaseDirHits();
+    if (hits.length > 0) {
+      const detail = hits.map((h) => `  ${path.relative(PROJECT_ROOT, h.file)}:${h.line}: ${h.text}`).join('\n');
+      fail(label, `hand-rolled os.homedir()+.claude pattern found outside handoff-paths.js and the exemption list:\n${detail}\n` +
+        `  Fix: import resolveHandoffMdPath/resolveBaseDir from scripts/lib/handoff-paths.js, ` +
+        `or add a justified entry to SWEEP_EXEMPTIONS in this file.`);
+      return;
+    }
+    pass(label);
+  } catch (err) { fail(label, err.message); }
+}
+
+// PROOF-OF-FIRING: exercises the REAL findHandRolledBaseDirHits() (not a
+// re-implemented copy of its predicate) against a synthetic tree, so this
+// test cannot silently drift out of sync with the actual detector.
+function testS1b_sweepFiresOnPlantedDuplicate() {
+  const label = 'S1b (proof-of-firing): findHandRolledBaseDirHits() detects a freshly planted hand-rolled duplicate';
+  const dir = makeTempDir('s1b-sweep');
+  try {
+    fs.writeFileSync(
+      path.join(dir, 'planted.js'),
+      "const p = path.join(os.homedir(), '.claude', 'projects', id, 'handoff.md');\n",
+      'utf8'
+    );
+    const hits = findHandRolledBaseDirHits([dir], []); // no exemptions — must fire
+    if (hits.length !== 1) {
+      fail(label, `expected exactly 1 hit against the planted file, got ${hits.length}: ${JSON.stringify(hits)}`);
+      return;
+    }
+    if (!hits[0].file.endsWith('planted.js')) {
+      fail(label, `hit did not point at the planted file: ${JSON.stringify(hits[0])}`);
+      return;
+    }
+    pass(label);
+  } catch (err) { fail(label, err.message); } finally { rmTempDir(dir); }
+}
+
+// PROOF-OF-FIRING (variant spellings): the co-occurrence predicate must not be
+// tied to one exact syntactic shape (double quotes, string concatenation, a
+// multi-line path.join split across lines) — a narrow single-shape regex is
+// exactly the allow-list-of-spellings this sweep exists to avoid.
+function testS1c_sweepFiresOnSpellingVariants() {
+  const label = 'S1c (proof-of-firing): sweep detects double-quote, concatenation, and multi-line variants';
+  const dir = makeTempDir('s1c-sweep');
+  try {
+    fs.writeFileSync(path.join(dir, 'double-quotes.js'),
+      'const p = path.join(os.homedir(), ".claude", "projects", id);\n', 'utf8');
+    fs.writeFileSync(path.join(dir, 'concat.js'),
+      "const p = os.homedir() + '/.claude/projects/' + id;\n", 'utf8');
+    fs.writeFileSync(path.join(dir, 'multiline.js'),
+      "const p = path.join(\n  os.homedir(),\n  '.claude',\n  'projects',\n  id\n);\n", 'utf8');
+
+    const hits = findHandRolledBaseDirHits([dir], []);
+    const hitFiles = new Set(hits.map((h) => path.basename(h.file)));
+    const missing = ['double-quotes.js', 'concat.js', 'multiline.js'].filter((f) => !hitFiles.has(f));
+    if (missing.length > 0) {
+      fail(label, `sweep missed spelling variant(s): ${JSON.stringify(missing)} (hits: ${JSON.stringify(hits)})`);
+      return;
+    }
+    pass(label);
+  } catch (err) { fail(label, err.message); } finally { rmTempDir(dir); }
 }
 
 // ── M1-M7: Dual-marker same-directory classification ──────────────────────────
@@ -718,6 +933,10 @@ async function runMigrationTests() {
 
 async function main() {
   console.log('=== test-host-agnostic-naming.js (#135) ===\n');
+
+  testS1_noHandRolledBaseDir();
+  testS1b_sweepFiresOnPlantedDuplicate();
+  testS1c_sweepFiresOnSpellingVariants();
 
   testM1_onlyNew();
   testM2_onlyLegacy();

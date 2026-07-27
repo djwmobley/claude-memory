@@ -33,6 +33,7 @@ const { execFileSync } = require('child_process');
 
 const { loadConfig }   = require('../../scripts/lib/shared');
 const { writeMarker }  = require('../../scripts/lib/project-marker');
+const { resolveHandoffMdPath } = require('../../scripts/lib/handoff-paths');
 const {
   getMergedPrSet,
   probeOpenThread,
@@ -163,7 +164,7 @@ async function teardown(ctx) {
   try { await db.end(); } catch (_) {}
   try { fs.rmSync(fakeRoot, { recursive: true, force: true }); } catch (_) {}
   try {
-    const dir = path.join(os.homedir(), '.claude', 'projects', projectId);
+    const dir = path.dirname(resolveHandoffMdPath(projectId));
     if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
   } catch (_) {}
 }

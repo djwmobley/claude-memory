@@ -2928,6 +2928,7 @@ async function runS13() {
   } = require('./lib/project-identity');
 
   const { encodeCwd } = require('./lib/encoded-cwd');
+  const { resolveHandoffMdPath } = require('./lib/handoff-paths');
 
   // Helper: seed multi-table corpus under a given projectId on the given DB adapter.
   async function seedCorpus(db, projectId, opts = {}) {
@@ -3226,8 +3227,8 @@ async function runS13() {
             db,
             legacyId,
             marker.uuid,
-            path.join(os.homedir(), '.claude', 'projects', legacyId, 'handoff.md'),
-            path.join(os.homedir(), '.claude', 'projects', marker.uuid, 'handoff.md'),
+            resolveHandoffMdPath(legacyId),
+            resolveHandoffMdPath(marker.uuid),
             (msg) => { fatalCalled = true; fatalMsg = msg; throw new Error(msg); }
           );
         } catch (_) {}

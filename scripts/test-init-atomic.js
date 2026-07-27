@@ -74,6 +74,7 @@ const {
   isValidUUID,
   MARKER_FILENAME,
 } = require('./lib/project-marker');
+const { resolveHandoffMdPath } = require('./lib/handoff-paths');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -595,7 +596,7 @@ async function testA8() {
     const uuidMatch = combined.match(/uuid=([0-9a-f-]{36})/i);
     if (uuidMatch) {
       const newUuid     = uuidMatch[1];
-      const handoffPath = path.join(os.homedir(), '.claude', 'projects', newUuid, 'handoff.md');
+      const handoffPath = resolveHandoffMdPath(newUuid);
       if (fs.existsSync(handoffPath)) {
         fail(label, 'handoff.md still exists after unwind — ledger did not clean it up'); return;
       }

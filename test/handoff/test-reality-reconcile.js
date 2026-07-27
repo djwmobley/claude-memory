@@ -42,6 +42,7 @@ const { execFileSync } = require('child_process');
 
 const { loadConfig }  = require('../../scripts/lib/shared');
 const { writeMarker } = require('../../scripts/lib/project-marker');
+const { resolveHandoffMdPath } = require('../../scripts/lib/handoff-paths');
 const { createRequire } = require('module');
 const scriptsRequire  = createRequire(require.resolve('../../scripts/package.json'));
 const { Client }      = scriptsRequire('pg');
@@ -138,7 +139,7 @@ async function teardown(ctx) {
   try { await db.end(); } catch (_) {}
   try { fs.rmSync(fakeRoot, { recursive: true, force: true }); } catch (_) {}
   try {
-    const dir = path.join(os.homedir(), '.claude', 'projects', projectId);
+    const dir = path.dirname(resolveHandoffMdPath(projectId));
     if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
   } catch (_) {}
 }
@@ -235,8 +236,7 @@ async function runTests() {
         `Expected no reality_verify degraded_close row, found ${realityVerifyDc.length}`);
 
       // handoff.md must NOT contain "## Degraded".
-      const handoffDir = path.join(os.homedir(), '.claude', 'projects', projectId);
-      const handoffPath = path.join(handoffDir, 'handoff.md');
+      const handoffPath = resolveHandoffMdPath(projectId);
       if (fs.existsSync(handoffPath)) {
         const content = fs.readFileSync(handoffPath, 'utf8');
         assert.ok(!content.includes('## Degraded'),

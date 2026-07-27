@@ -42,6 +42,7 @@ const { loadConfig } = require('../../../scripts/lib/shared');
 // project-marker.js exports writeMarker/readMarker/resolveMarkerUUID/MARKER_FILENAME
 // (verified: project-marker.js:152-159).
 const { writeMarker } = require('../../../scripts/lib/project-marker');
+const { resolveHandoffMdPath } = require('../../../scripts/lib/handoff-paths');
 
 // pg lives in scripts/node_modules — use createRequire anchored to
 // scripts/package.json so the import is portable across any pnpm/npm/yarn
@@ -305,10 +306,9 @@ async function setupNs(opts = {}) {
     // Remove the fake project root.
     try { fs.rmSync(fakeRoot, { recursive: true, force: true }); } catch (_) {}
 
-    // Remove ~/.claude/projects/<UUID>/ where handoff.md actually lives
-    // (resolveHandoffMdPath — handoff.js:210-213).
+    // Remove the handoff.md project dir where it actually lives (resolveHandoffMdPath).
     try {
-      const dir = path.join(os.homedir(), '.claude', 'projects', projectId);
+      const dir = path.dirname(resolveHandoffMdPath(projectId));
       if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
     } catch (_) {}
   }
@@ -423,14 +423,15 @@ function runResurrect(fakeRoot, topic, opts = {}) {
 // ─── HANDOFF.MD PRIMITIVES ─────────────────────────────────────────────────────
 
 /**
- * Resolve the handoff.md path for a project_id. Verified: handoff.js:210-213 —
- * ~/.claude/projects/<projectId>/handoff.md (projectId is the marker UUID).
+ * Resolve the handoff.md path for a project_id. Delegates to the same
+ * resolveHandoffMdPath() handoff.js uses (honors HANDOFF_BASE_DIR) — never a
+ * parallel copy of the base-dir resolution logic (#135).
  *
  * @param {string} projectId
  * @returns {string} absolute path.
  */
 function handoffMdPath(projectId) {
-  return path.join(os.homedir(), '.claude', 'projects', projectId, 'handoff.md');
+  return resolveHandoffMdPath(projectId);
 }
 
 /**
