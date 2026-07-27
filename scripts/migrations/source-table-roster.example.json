@@ -1,0 +1,38 @@
+[
+  {
+    "_comment": "SYNTHETIC EXAMPLE ONLY — obviously-fake values throughout. The real source-table-roster.json carries private estate data (real source DB names, real filesystem paths) and is gitignored, never committed. This file documents the required SHAPE every entry must carry; scripts/migrations/lib/verify15-shared.js's loadRoster() enforces the required-field list at runtime.",
+    "source_db": "example_source_db",
+    "source_table": "example_decisions",
+    "targetTable": "decisions",
+    "loadBearingCols": ["topic", "decision", "reason"],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "example_source_db",
+    "source_table": "example_session_chunks",
+    "targetTable": "session_chunks",
+    "loadBearingCols": ["chunk_text"],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true,
+    "embeddingCol": "embedding",
+    "contentCol": "chunk_text"
+  },
+  {
+    "source_db": "filesystem:/path/to/HANDOFF.md",
+    "source_table": "handoff_session_blocks",
+    "targetTable": "memory_entries",
+    "loadBearingCols": ["body"],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true,
+    "contentCol": "body"
+  },
+  {
+    "source_db": "example_source_db",
+    "source_table": "example_tasks",
+    "targetTable": "tasks",
+    "loadBearingCols": ["title", "status"],
+    "hasContentBearingText": false,
+    "requires_project_id_scope": true
+  }
+]

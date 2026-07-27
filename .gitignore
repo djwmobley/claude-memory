@@ -53,3 +53,10 @@ scripts/decisions_backup*.csv
 /RUNBOOK-INDEX.md
 /START-HERE-CONSOLIDATION.md
 /FIELD-REPORT-*.md
+
+# §15 acceptance-battery roster + fixture files carry private estate data
+# (real source DB names, real filesystem paths, real project queries) — the
+# committed *.example.json files document the required shape; these two
+# stay local only. See scripts/migrations/lib/verify15-shared.js loadRoster().
+/scripts/migrations/source-table-roster.json
+/scripts/migrations/recall-equivalence-queries.json

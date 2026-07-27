@@ -1,0 +1,164 @@
+'use strict';
+
+const AUTHORED_BY = 'sonnet-t-battery-author-2026-07-27';
+
+/**
+ * verify-15-t1-snapshot.js — T1, per-source snapshot (§15.2).
+ *
+ * Before touching any source, captures authoritative row counts + a
+ * content fingerprint per (source_db, source_table, project_id_or_null)
+ * slice into migration_manifest, plus a per-row hash into
+ * migration_manifest_row_hashes (the table T3/T3b's live comparisons and
+ * T9's provenance check both read).
+ *
+ * Scope of this cut: SQL-shaped sources only (source_db is a real database
+ * name). filesystem:-prefixed roster entries (markdown sources, §6.1(h)/(i))
+ * are SKIPPED here with an explicit, non-silent WARN — migrate-08/09, the
+ * scripts that would actually read those files, do not exist yet in this
+ * repo (out of this task's scope). This is a documented, known gap, not a
+ * silent omission — see this script's blind-spot note in the PR body.
+ *
+ * content_fingerprint is a T8-ONLY field (closes A-11, §15.2's own note).
+ * Because it's an order-DEPENDENT aggregate over source row ids, it is
+ * USELESS for any source-vs-target comparison (target ids are re-minted on
+ * migration) — its only consumer is T8's idempotency check, where the SAME
+ * staging database's ids are stable across a before/after re-run. It is
+ * computed here as md5(concat(per-row rowHash ordered by source row id)),
+ * using the SAME rowHash() algorithm (NULL sentinel, JSON.stringify of the
+ * value array, no .trim()) as migration_manifest_row_hashes.source_hash and
+ * T3's live comparison — a deliberate, documented implementation choice:
+ * the spec's own SQL sketch (md5(string_agg(md5(coalesce(col,'')),'' ORDER
+ * BY id))) is functionally equivalent for this field's ONLY real use
+ * (same-DB before/after idempotency diff) as long as the SAME formula is
+ * used both times, which it always is here.
+ *
+ * Usage:
+ *   node scripts/migrations/verify-15-t1-snapshot.js --source-db <name> [--db <target>] [--excluded-reason <text>]
+ * Exit codes: 0 = every matching roster entry snapshotted, 1 = refused /
+ * error / no matching roster entries found for --source-db.
+ */
+
+const crypto = require('crypto');
+const shared = require('./lib/verify15-shared');
+
+function parseArgs(argv) {
+  const parsed = { excludedReason: null };
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--excluded-reason') parsed.excludedReason = argv[++i];
+    else if (argv[i].startsWith('--excluded-reason=')) parsed.excludedReason = argv[i].slice('--excluded-reason='.length);
+  }
+  return parsed;
+}
+
+async function tableHasColumn(client, table, column) {
+  const { rows } = await client.query(
+    `SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2`,
+    [table, column]
+  );
+  return rows.length > 0;
+}
+
+function computeContentFingerprint(rowsOrderedById, cols) {
+  const concatenated = rowsOrderedById.map((r) => shared.rowHash(cols, r)).join('');
+  return crypto.createHash('md5').update(concatenated).digest('hex');
+}
+
+/**
+ * Snapshot one roster entry: fetch every row (id, project_id if present,
+ * load-bearing cols) from the source table, group by project_id (or a
+ * single NULL-scoped slice if the table has no project_id column), write one
+ * migration_manifest row per slice plus one migration_manifest_row_hashes
+ * row per source row.
+ */
+async function snapshotEntry(srcClient, tgtClient, entry, excludedReason) {
+  const hasProjectId = await tableHasColumn(srcClient, entry.source_table, 'project_id');
+  const cols = entry.loadBearingCols;
+  const selectCols = ['id', ...(hasProjectId ? ['project_id'] : []), ...cols].filter((c, i, a) => a.indexOf(c) === i);
+  const { rows } = await srcClient.query(`SELECT ${selectCols.map((c) => `"${c}"`).join(', ')} FROM ${entry.source_table} ORDER BY id`);
+
+  const slices = new Map(); // project_id_or_null -> rows[]
+  for (const r of rows) {
+    const key = hasProjectId ? (r.project_id === null || r.project_id === undefined ? null : r.project_id) : null;
+    if (!slices.has(key)) slices.set(key, []);
+    slices.get(key).push(r);
+  }
+  if (slices.size === 0) slices.set(null, []); // empty table still gets ONE row_count=0 manifest row
+
+  const results = [];
+  for (const [projectIdOrNull, sliceRows] of slices) {
+    const fingerprint = computeContentFingerprint(sliceRows, cols);
+    const { rows: mRows } = await tgtClient.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint, excluded_reason)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [entry.source_db, entry.source_table, projectIdOrNull, sliceRows.length, fingerprint, excludedReason]
+    );
+    for (const r of sliceRows) {
+      const h = shared.rowHash(cols, r);
+      await tgtClient.query(
+        `INSERT INTO migration_manifest_row_hashes (source_db, source_table, project_id_or_null, source_row_id, source_hash)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [entry.source_db, entry.source_table, projectIdOrNull, String(r.id), h]
+      );
+    }
+    results.push({ manifestId: mRows[0].id, projectIdOrNull, rowCount: sliceRows.length });
+  }
+  return results;
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  const { excludedReason } = parseArgs(argv);
+  const { name: target, source: targetSource } = shared.resolveAndClassifyTargetDb(argv);
+  const sourceDb = shared.resolveAndClassifySourceDb(argv);
+
+  if (!sourceDb) {
+    console.error('Usage: node scripts/migrations/verify-15-t1-snapshot.js --source-db <name> [--db <target>] [--excluded-reason <text>]');
+    console.error('  --source-db is required (or SOURCE_DB env var) — T1 snapshots exactly ONE source at a time.');
+    process.exit(1);
+  }
+
+  const roster = shared.loadRoster();
+  const sqlEntries = roster.filter((e) => e.source_db === sourceDb && !e.source_db.startsWith('filesystem:'));
+  const skippedFilesystemEntries = roster.filter((e) => e.source_db === sourceDb && e.source_db.startsWith('filesystem:'));
+
+  if (sqlEntries.length === 0 && skippedFilesystemEntries.length === 0) {
+    console.error(`FATAL: no roster entries found with source_db="${sourceDb}".`);
+    process.exit(1);
+  }
+
+  console.log(`verify-15-t1-snapshot: source_db="${sourceDb}", target="${target}" (resolved from ${targetSource})`);
+  if (skippedFilesystemEntries.length) {
+    console.log(`  [WARN] ${skippedFilesystemEntries.length} filesystem:-prefixed roster entr${skippedFilesystemEntries.length === 1 ? 'y' : 'ies'} skipped — markdown-source snapshotting (migrate-08/09) is out of this battery's cut. NOT counted as a pass.`);
+  }
+
+  const srcClient = await shared.connect(sourceDb);
+  const tgtClient = await shared.connect(target);
+  let failed = false;
+  try {
+    await shared.applyDdl(tgtClient);
+    for (const entry of sqlEntries) {
+      try {
+        const results = await snapshotEntry(srcClient, tgtClient, entry, excludedReason);
+        for (const r of results) {
+          console.log(`  [OK] ${entry.source_table} project_id_or_null=${r.projectIdOrNull ?? 'NULL'} row_count=${r.rowCount} manifest_id=${r.manifestId}`);
+        }
+      } catch (err) {
+        failed = true;
+        console.error(`  [FAIL] ${entry.source_table}: ${err.message}`);
+      }
+    }
+  } finally {
+    await srcClient.end();
+    await tgtClient.end();
+  }
+  process.exit(failed ? 1 : 0);
+}
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err && err.stack ? err.stack : err);
+    process.exit(1);
+  });
+}
+
+module.exports = { AUTHORED_BY, snapshotEntry, computeContentFingerprint, tableHasColumn };
