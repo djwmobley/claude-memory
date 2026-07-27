@@ -147,6 +147,12 @@ jobs:
         # and the detection logic vendored from ~/.claude/hooks/pr-independence.js.
         # Pure Node — no Postgres or Ollama required; reuses the Node 22 setup above.
         run: node hooks/pr-independence.test.js
+      - name: Run agent-adversary-floor hook tests
+        # Regression guard for the PreToolUse hook that blocks Agent-tool spawns
+        # to write-capable subagents unless the prompt carries a blind-spot/
+        # completeness framing clause or a well-formed exemption marker (#147).
+        # Pure Node — no Postgres or Ollama required; reuses the Node 22 setup above.
+        run: node hooks/agent-adversary-floor.test.js
       - name: Run plugin packaging tests
         # Validates the Claude Code plugin manifest (.claude-plugin/plugin.json,
         # marketplace.json, hooks/hooks.json), CLAUDE_PLUGIN_ROOT asset resolution,
