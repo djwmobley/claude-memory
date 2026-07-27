@@ -22,13 +22,17 @@
  *           ERROR, proof-of-firing), both-corrupt (HARD ERROR, proof-of-firing),
  *           per-level walk-up (nearer directory wins regardless of marker name),
  *           write-time collision check against BOTH names (proof-of-firing).
- *   B1-B10  HANDOFF_BASE_DIR validation matrix (handoff-paths.js resolveBaseDir):
+ *   B1-B14  HANDOFF_BASE_DIR validation matrix (handoff-paths.js resolveBaseDir):
  *           unset/empty/whitespace-only default; win32 drive-letter accepted;
  *           win32 MSYS-trap rejected (proof-of-firing); win32 non-absolute
  *           rejected; POSIX absolute accepted; POSIX relative rejected
  *           (proof-of-firing); POSIX Windows-style rejected; surrounding
  *           whitespace trimmed consistently for both the validity check and
- *           the actual path join.
+ *           the actual path join; '..' traversal rejected on both win32 and
+ *           POSIX absolute forms (proof-of-firing — a drive-letter-rooted or
+ *           POSIX-absolute value can still climb outside the intended
+ *           directory), while a legitimate directory name containing '..' as
+ *           a substring within one segment (not its own segment) is accepted.
  *   P1-P12  HANDOFF_PROMOTION_FILE validation matrix (handoff-paths.js
  *           resolvePromotionFilePath): unset/empty/whitespace-only default;
  *           valid custom name accepted; reserved-name collisions rejected
@@ -637,6 +641,49 @@ function testB_surroundingWhitespaceTrimmedConsistently() {
   });
 }
 
+// PROOF-OF-FIRING: the exact reviewer-constructed input — a drive-letter-rooted,
+// absolute-per-the-earlier-check value that still climbs out via '..' segments.
+function testB_win32DotDotTraversalRejected() {
+  const label = "B12 (proof-of-firing): HANDOFF_BASE_DIR=C:\\Users\\x\\.claude\\..\\..\\Windows\\System32 on win32 — HARD ERROR ('..' traversal)";
+  withPlatform('win32', () => {
+    withEnv({ HANDOFF_BASE_DIR: 'C:\\Users\\x\\.claude\\..\\..\\Windows\\System32' }, () => {
+      let threw = false, msg = '';
+      try { resolveBaseDir(); } catch (err) { threw = true; msg = err.message; }
+      if (!threw) { fail(label, "resolveBaseDir() accepted a drive-letter-rooted value containing '..' segments — traversal not caught"); return; }
+      if (!/\.\./.test(msg)) { fail(label, `error message should mention the '..' segment; got: ${msg}`); return; }
+      pass(label);
+    });
+  });
+}
+
+// PROOF-OF-FIRING: the same class of input in its POSIX-absolute form.
+function testB_posixDotDotTraversalRejected() {
+  const label = "B13 (proof-of-firing): HANDOFF_BASE_DIR=/home/x/.claude/../../etc on POSIX — HARD ERROR ('..' traversal)";
+  withPlatform('linux', () => {
+    withEnv({ HANDOFF_BASE_DIR: '/home/x/.claude/../../etc' }, () => {
+      let threw = false;
+      try { resolveBaseDir(); } catch (_) { threw = true; }
+      if (!threw) { fail(label, "resolveBaseDir() accepted a POSIX-absolute value containing '..' segments — traversal not caught"); return; }
+      pass(label);
+    });
+  });
+}
+
+// A legitimate directory name containing consecutive dots as a SUBSTRING
+// (not a standalone '..' segment) must NOT false-positive — the check is
+// segment-wise, not a substring match.
+function testB_consecutiveDotsSubstringAccepted() {
+  const label = "B14: HANDOFF_BASE_DIR=C:\\Users\\x\\my..dir ('..' as a substring within one segment, not its own segment) — accepted";
+  withPlatform('win32', () => {
+    withEnv({ HANDOFF_BASE_DIR: 'C:\\Users\\x\\my..dir' }, () => {
+      let got;
+      try { got = resolveBaseDir(); } catch (err) { fail(label, `unexpected throw on a legitimate '..'-substring directory name: ${err.message}`); return; }
+      if (got !== 'C:\\Users\\x\\my..dir') { fail(label, `expected verbatim value, got ${got}`); return; }
+      pass(label);
+    });
+  });
+}
+
 // ── P1-P12: HANDOFF_PROMOTION_FILE validation matrix ──────────────────────────
 
 function testP_unsetDefault() {
@@ -958,6 +1005,9 @@ async function main() {
   testB_posixRelativeRejected();
   testB_posixWindowsStyleRejected();
   testB_surroundingWhitespaceTrimmedConsistently();
+  testB_win32DotDotTraversalRejected();
+  testB_posixDotDotTraversalRejected();
+  testB_consecutiveDotsSubstringAccepted();
 
   testP_unsetDefault();
   testP_emptyDefault();

@@ -37,6 +37,16 @@ const HANDOFF_MD_FILENAME        = 'handoff.md';
  *       (the MSYS trap) — rejected with a message showing the corrected form.
  *   - set (non-empty after trim), POSIX:
  *       must start with '/' — else HARD ERROR.
+ *   - contains a '..' path segment (checked on BOTH '/' and '\' splits,
+ *     regardless of platform) → HARD ERROR.
+ *       A drive-letter-rooted or POSIX-absolute value can still climb out of
+ *       the intended directory via '..' segments (e.g.
+ *       'C:\Users\x\.claude\..\..\Windows\System32' passes the drive-letter
+ *       check above but resolves outside ~/.claude entirely) — same
+ *       friction-over-silent-misplacement principle as the HANDOFF_PROMOTION_FILE
+ *       '..'-segment check. Segment-wise, not a substring match: a directory
+ *       legitimately named '..foo' (its own distinct segment) is NOT flagged —
+ *       only an exact '..' segment is.
  *
  * The SAME trimmed string is used for both the validation check and the actual
  * path.join — never trim-for-check-but-raw-for-join (that divergence would let
@@ -44,7 +54,7 @@ const HANDOFF_MD_FILENAME        = 'handoff.md';
  *
  * @returns {string} absolute base directory
  * @throws {Error} if HANDOFF_BASE_DIR is set but not a valid absolute path for
- *                 the current platform.
+ *                 the current platform, or contains a '..' segment.
  */
 function resolveBaseDir() {
   const raw     = process.env.HANDOFF_BASE_DIR;
@@ -68,6 +78,20 @@ function resolveBaseDir() {
     throw new Error(
       `HANDOFF_BASE_DIR is set to '${trimmed}', which is not an absolute POSIX path. It must ` +
       `start with '/', e.g. '/home/you/.claude'.`
+    );
+  }
+
+  // Segment-wise '..' check (not a substring match — '..foo' as its own
+  // segment is legitimate and must not false-positive). Checked on both
+  // separators regardless of platform: a Windows value can contain '/'
+  // segments and vice versa is harmless to also check.
+  if (trimmed.split(/[\\/]/).some((seg) => seg === '..')) {
+    throw new Error(
+      `HANDOFF_BASE_DIR is set to '${trimmed}', which contains a '..' path segment. A ` +
+      `drive-letter-rooted or POSIX-absolute value can still climb outside the intended ` +
+      `directory via '..' — e.g. 'C:\\Users\\you\\.claude\\..\\..\\Windows\\System32' passes ` +
+      `the absolute-path check above but resolves entirely outside '.claude'. Use a direct ` +
+      `path with no '..' segments.`
     );
   }
 
