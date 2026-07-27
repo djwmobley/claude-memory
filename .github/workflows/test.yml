@@ -104,6 +104,30 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run migrate-01-canonical-db tests
+        # Tests scripts/migrations/migrate-01-canonical-db.js, the first migration
+        # that stands up a consolidation target database (staging-first: default
+        # target memory_manager_staging). No cutover/data-migration of any kind.
+        # Covers: fresh apply + verification PASS, refusal on a non-empty target
+        # without --allow-existing, idempotent re-run with --allow-existing (zero
+        # net change), proof-of-firing (verifyTarget FAILS and names a table
+        # dropped post-apply), the refusal branch for --db claude_memory_eval_test
+        # firing before any DB connection is opened (unreachable-PGHOST proof),
+        # refusal of pipeline_*/claude_policy_framework/unrecognized names (total
+        # classification — unknown names are refused by default, not allowed
+        # through), rejection of an invalid identifier, HANDOFF_DB being ignored
+        # (behavioral proof via --db vs HANDOFF_DB divergence), MIGRATE_TARGET_DB
+        # env resolution, the built-in default (unit-tested only — never invokes
+        # the CLI with no --db, so memory_manager_staging is never created here),
+        # and CREATE DATABASE race-safety under real concurrency (both the 42P04
+        # and the empirically-observed 23505/pg_database_datname_index shapes).
+        # Creates/drops its own _staging-suffixed scratch DBs; never touches
+        # claude_memory_eval_test beyond the connection-avoidance assertion.
+        run: node test/migrations/test-migrate-01.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run smoketest (all sections)
         # Runs the full smoketest suite — all 13 sections including collision (OQ-5
         # supersession invariant) and registry (SQL-1:1-index-vs-registry-JSON drift).
