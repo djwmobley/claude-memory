@@ -3,14 +3,14 @@
 /**
  * test-init-atomic.js — Regression suite for handoff init atomicity (#125).
  *
- * Before the fix, cmdInit wrote the .claude-memory marker as its FIRST action,
+ * Before the fix, cmdInit wrote the project marker as its FIRST action,
  * before any DB operations.  A failure in the Phase-A schema transaction left
  * the marker on disk while printing "No FS writes made." — both false and
  * dangerous (every future session would try to load state from a DB that was
  * never provisioned).
  *
  * After the fix:
- *   - The UUID is minted in memory; the .claude-memory file is written LAST.
+ *   - The UUID is minted in memory; the marker file is written LAST.
  *   - A FS-write ledger tracks every file this run creates.
  *   - On any failure the ledger is unwound in reverse (no orphaned files).
  *   - The failure message is accurate (ledger-based, not hard-coded).
@@ -19,14 +19,14 @@
  *   A1  persistMarker() unit: writes a valid marker with a caller-supplied UUID.
  *   A2  persistMarker() unit: throws if marker already exists (no overwrite).
  *   A3  mintUUID() unit: returns a valid UUID v4; two calls produce distinct values.
- *   A4  Core atomicity: failure before FS writes leaves no .claude-memory marker.
+ *   A4  Core atomicity: failure before FS writes leaves no project marker.
  *       Injection: subprocess points at an UNREACHABLE Postgres port (59999) via a
  *       minimal pipeline.yml in the temp project dir.  Preflight's Postgres-
  *       reachability check is fatal and exits before handoff.md or CLAUDE.md are
  *       written, so the ledger is empty and no marker can appear.
  *       PLATFORM-AGNOSTIC — no chmod required; runs on all platforms.
  *       NON-VACUOUS: the OLD code wrote the marker before any DB contact, so it
- *       WOULD leave a .claude-memory file here; the fixed code defers to last.
+ *       WOULD leave a marker file here; the fixed code defers to last.
  *   A5  Failure message accuracy: output must NOT contain the stale pre-fix string
  *       "No FS writes made." when the ledger is empty.  Piggybacks on A4 setup.
  *       PLATFORM-AGNOSTIC.
@@ -44,7 +44,7 @@
  *       and only skips the write when the FILE already exists — a non-existent
  *       CLAUDE.md in a read-only directory is NOT skipped; the open()/write fails.
  *       POSIX only (chmod directory semantics; skipped on Windows).
- *       Asserts: "Rolled back" in output, no .claude-memory, handoff.md removed.
+ *       Asserts: "Rolled back" in output, no project marker, handoff.md removed.
  *
  * Usage:
  *   node scripts/test-init-atomic.js
@@ -211,7 +211,7 @@ async function testA1() {
 
     const markerPath = path.join(tmpDir, MARKER_FILENAME);
     if (!fs.existsSync(markerPath)) {
-      fail(label, '.claude-memory file not written to disk'); return;
+      fail(label, 'marker file not written to disk'); return;
     }
 
     const read = readMarker(tmpDir);
@@ -230,7 +230,7 @@ async function testA1() {
 // ── A2: persistMarker unit — throws if marker already exists ──────────────────
 
 async function testA2() {
-  const label = 'A2: persistMarker() throws if .claude-memory already exists (no overwrite)';
+  const label = 'A2: persistMarker() throws if marker already exists (no overwrite)';
   const tmpDir = makeTempDir('a2');
   try {
     const uuid1 = mintUUID();
@@ -302,7 +302,7 @@ async function testA3() {
 //
 // PLATFORM-AGNOSTIC — no chmod, no admin rights required.
 //
-// NON-VACUOUS: the OLD code wrote the .claude-memory marker as the very first
+// NON-VACUOUS: the OLD code wrote the project marker as the very first
 // action (before DB contact), so it WOULD leave the file behind here.  The fixed
 // code defers the marker write to step 12 (last), so it is never reached when
 // preflight fails at step 3.
@@ -311,7 +311,7 @@ async function testA3() {
 // reachable the DB name is unknown and a second failure-gate exists.
 
 async function testA4() {
-  const label = 'A4: core atomicity — unreachable Postgres at preflight leaves no .claude-memory marker';
+  const label = 'A4: core atomicity — unreachable Postgres at preflight leaves no project marker';
   const tmpDir = makeTempDir('a4');
   try {
     // Point loadConfig() at a guaranteed-closed port via a local pipeline.yml.
@@ -331,10 +331,10 @@ async function testA4() {
       fail(label, `injection may not have fired — output does not mention port/reachable/connect: ${combined.slice(0, 400)}`); return;
     }
 
-    // Core assertion: no .claude-memory marker written.
+    // Core assertion: no project marker written.
     const markerPath = path.join(tmpDir, MARKER_FILENAME);
     if (fs.existsSync(markerPath)) {
-      fail(label, '.claude-memory written despite Postgres preflight failure — atomicity violated'); return;
+      fail(label, 'marker written despite Postgres preflight failure — atomicity violated'); return;
     }
 
     pass(label);
@@ -386,7 +386,7 @@ async function testA5() {
 // ── A6: success path writes marker LAST and produces a valid marker file ──────
 
 async function testA6() {
-  const label = 'A6: successful init writes .claude-memory marker last with valid UUID';
+  const label = 'A6: successful init writes project marker last with valid UUID';
   const pgAvail = await isPgAvailable();
   if (!pgAvail) { console.log(`SKIP  ${label} (Postgres unavailable)`); return; }
 
@@ -404,7 +404,7 @@ async function testA6() {
 
     const markerPath = path.join(tmpDir, MARKER_FILENAME);
     if (!fs.existsSync(markerPath)) {
-      fail(label, '.claude-memory file missing after successful init'); return;
+      fail(label, 'marker file missing after successful init'); return;
     }
 
     const marker = readMarker(tmpDir);
@@ -507,7 +507,7 @@ async function testA7() {
 // the open() syscall to fail on a file that does NOT exist yet.
 //
 // Assertions after failed re-init:
-//   (a) .claude-memory absent (marker never written — step 12 never reached)
+//   (a) marker absent (marker never written — step 12 never reached)
 //   (b) output contains "Rolled back" (unwind log emitted by unwindFsLedger)
 //   (c) handoff.md for the new UUID is absent (removed by unwind)
 //   (d) output does NOT falsely say "No FS writes made" (ledger was non-empty)
@@ -583,7 +583,7 @@ async function testA8() {
     // (a) Marker must not exist.
     const markerPath = path.join(tmpDir, MARKER_FILENAME);
     if (fs.existsSync(markerPath)) {
-      fail(label, '.claude-memory written despite CLAUDE.md failure — atomicity violated'); return;
+      fail(label, 'marker written despite CLAUDE.md failure — atomicity violated'); return;
     }
 
     // (b) Output must mention "Rolled back" (unwind fired).

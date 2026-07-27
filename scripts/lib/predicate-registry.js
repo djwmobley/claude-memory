@@ -116,6 +116,21 @@ function loadRegistry() {
       );
     }
 
+    // "grandfathered_aliases" is optional; if present it must be a non-empty
+    // array of non-empty strings — the OLD predicate name(s) this entry was
+    // renamed from. Permanent: never removed without first proving zero rows
+    // remain under the old name across all live databases (#135).
+    if ('grandfathered_aliases' in entry) {
+      const aliases = entry.grandfathered_aliases;
+      if (!Array.isArray(aliases) || aliases.length === 0 ||
+          !aliases.every((a) => typeof a === 'string' && a.length > 0)) {
+        throw new Error(
+          `predicate-registry: entry "${entry.predicate}" has invalid "grandfathered_aliases" value — ` +
+          `must be a non-empty array of non-empty strings`
+        );
+      }
+    }
+
     if (byPredicate.has(entry.predicate)) {
       throw new Error(
         `predicate-registry: duplicate predicate "${entry.predicate}" in registry`
@@ -218,4 +233,30 @@ function isDirective(predicate) {
   return !!(entry && entry.directive === true);
 }
 
-module.exports = { loadRegistry, cardinalityOf, classifyPredicate, recognizedPredicates, isDirective };
+/**
+ * Return a flat array of every grandfathered_aliases entry across the whole
+ * registry (i.e. every OLD predicate name that some current entry was renamed
+ * from). Used by the registry/index drift guard (smoketest-handoff.js
+ * COLLISION 5/5) to compute the expected 1:1-index predicate set as the
+ * registry's current 1:1 set UNION all grandfathered aliases — a renamed
+ * predicate's old name must stay in the SQL index's IN(...) list forever
+ * (permanent grandfathering), even though it is no longer a registry entry
+ * in its own right.
+ *
+ * @returns {string[]}
+ */
+function allGrandfatheredAliases() {
+  const { byPredicate } = loadRegistry();
+  const aliases = [];
+  for (const entry of byPredicate.values()) {
+    if (Array.isArray(entry.grandfathered_aliases)) {
+      aliases.push(...entry.grandfathered_aliases);
+    }
+  }
+  return aliases;
+}
+
+module.exports = {
+  loadRegistry, cardinalityOf, classifyPredicate, recognizedPredicates, isDirective,
+  allGrandfatheredAliases,
+};

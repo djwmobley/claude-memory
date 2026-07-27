@@ -12,7 +12,7 @@
  *   Uses resolveProjectId() from handoff.js's own inline logic, replicated here
  *   because handoff.js does not export it as a module. Resolution order:
  *     1. --project-id=<id> CLI flag (explicit override)
- *     2. .claude-memory marker UUID walked up from PROJECT_ROOT env or cwd
+ *     2. project marker UUID walked up from PROJECT_ROOT env or cwd
  *     3. encodeCwd(root) fallback for backward compatibility
  *   This mirrors exactly what cmdResurrect calls in handoff.js.
  *
@@ -128,7 +128,7 @@ Backfill assertions.embedding (halfvec 4000) for rows with NULL embedding.
 
 Options:
   --project-id=<id>  Explicit project UUID to target.
-                     Default: auto-resolved from cwd (.claude-memory marker or
+                     Default: auto-resolved from cwd (project marker or
                      encodeCwd fallback), honoring PROJECT_ROOT env var.
   --dry-run          Count and sample rows that would be embedded; do not write.
   --batch-size=N     Rows per BEGIN/COMMIT batch (default: 10).
@@ -170,7 +170,7 @@ if (isNaN(BATCH_SIZE)) {
 
 // ─── Project-id resolution ────────────────────────────────────────────────────
 // Mirrors resolveProjectId() in handoff.js (not exported, so replicated here).
-// Resolution order: .claude-memory marker UUID → encodeCwd fallback.
+// Resolution order: project marker UUID → encodeCwd fallback.
 
 function resolveProjectId() {
   if (ARG_PID) return ARG_PID;

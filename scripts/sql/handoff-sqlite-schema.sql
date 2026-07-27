@@ -131,7 +131,9 @@ ALTER TABLE assertions ADD COLUMN IF NOT EXISTS reality_check TEXT;
 -- NULL for rows that predate this feature or have no pointer in their object field.
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS anchor TEXT;
 
--- 1:1 partial unique index (same predicate set as Postgres version)
+-- 1:1 partial unique index (same predicate set as Postgres version, including
+-- grandfathered aliases — see the comment above assertions_1to1_unique in
+-- handoff-core-schema.sql for the total invariant this list must satisfy)
 CREATE UNIQUE INDEX IF NOT EXISTS assertions_1to1_unique
   ON assertions (project_id, subject, predicate)
   WHERE suppressed = 0
@@ -140,6 +142,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS assertions_1to1_unique
       'added_via',
       'affirmed',
       'are_safe_outside_claude-memory',
+      'are_safe_outside_this_project',
       'chose',
       'cmdDrop_refactor',
       'converged',
@@ -176,6 +179,30 @@ CREATE UNIQUE INDEX IF NOT EXISTS assertions_1to1_unique
       'user_directed',
       'uses_db'
     );
+
+-- ── Predicate rename: are_safe_outside_claude-memory → are_safe_outside_this_project ──
+-- #135 (host-agnostic naming). Same two-step collision-safe migration as
+-- handoff-core-schema.sql, in SQLite's plain-statement form (SQLite has no
+-- DO block): step 1 suppresses the old-name row wherever a live new-name row
+-- already exists for the same subject (never DELETE); step 2 then renames the
+-- predicate on every remaining old-name row, now collision-free by
+-- construction. SQLite is seam-test-only (see handoff-core-schema.sql for the
+-- authoritative rationale and the production/rolling-deploy considerations).
+UPDATE assertions
+  SET suppressed = 1, invalid_at = datetime('now'), suppression_kind = 'superseded'
+  WHERE assertions.suppressed = 0
+    AND assertions.predicate = 'are_safe_outside_claude-memory'
+    AND EXISTS (
+      SELECT 1 FROM assertions AS new_rows
+      WHERE new_rows.suppressed = 0
+        AND new_rows.predicate = 'are_safe_outside_this_project'
+        AND new_rows.project_id = assertions.project_id
+        AND new_rows.subject    = assertions.subject
+    );
+
+UPDATE assertions
+  SET predicate = 'are_safe_outside_this_project'
+  WHERE predicate = 'are_safe_outside_claude-memory';
 
 -- 1:N exact-duplicate index
 CREATE UNIQUE INDEX IF NOT EXISTS assertions_1ton_exact_unique

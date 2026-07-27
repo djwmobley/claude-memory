@@ -17,6 +17,14 @@ title: Bundle A — Substrate: Spec
 > relational. The pgvector dependency in `app-retrieval-events-schema.sql` documented below no
 > longer applies when the SQLite backend is used.
 
+> **Host-agnostic naming note (#135):** The `~/.claude/projects/{encoded_cwd}/handoff.md` path and
+> the marker filename described below were client-specific and are now configurable, for use with
+> non-Claude-Code MCP clients: the base directory (`~/.claude` in this spec) is overridable via
+> `HANDOFF_BASE_DIR`; the marker file is now named `.memory-engine` (the old `.claude-memory` name
+> described below is kept as a permanent read-fallback); and the `CLAUDE.md` promotion target is
+> overridable via `HANDOFF_PROMOTION_FILE`. Identity is keyed by the marker's UUID (not
+> `encoded_cwd`) since PR-3a, superseding the encodeCwd-keyed path shown below as well.
+
 ---
 
 ## 1. Operative Scope

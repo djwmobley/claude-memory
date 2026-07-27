@@ -69,12 +69,13 @@ if [ ! -f "$HANDOFF_ENGINE" ]; then
 fi
 
 # ── Project-root resolution ──────────────────────────────────────────────────
-# Walk up from cwd for .claude-memory marker first, then fall back to .git.
+# Walk up from cwd for a .memory-engine marker (or the legacy .claude-memory
+# name, still recognized as a read-fallback) first, then fall back to .git.
 PROJECT_ROOT=$(pwd)
-while [ ! -f "$PROJECT_ROOT/.claude-memory" ] && [ ! -d "$PROJECT_ROOT/.git" ] && [ "$PROJECT_ROOT" != "/" ]; do
+while [ ! -f "$PROJECT_ROOT/.memory-engine" ] && [ ! -f "$PROJECT_ROOT/.claude-memory" ] && [ ! -d "$PROJECT_ROOT/.git" ] && [ "$PROJECT_ROOT" != "/" ]; do
   PROJECT_ROOT=$(dirname "$PROJECT_ROOT")
 done
-if [ "$PROJECT_ROOT" = "/" ] && [ ! -f "$PROJECT_ROOT/.claude-memory" ] && [ ! -d "$PROJECT_ROOT/.git" ]; then
+if [ "$PROJECT_ROOT" = "/" ] && [ ! -f "$PROJECT_ROOT/.memory-engine" ] && [ ! -f "$PROJECT_ROOT/.claude-memory" ] && [ ! -d "$PROJECT_ROOT/.git" ]; then
   PROJECT_ROOT=$(pwd)
 fi
 

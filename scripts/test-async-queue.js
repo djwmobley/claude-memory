@@ -190,7 +190,7 @@ async function runTest(label, fn) {
 // ── Test setup: init the project so handoff.js can resolve a project_id ───────
 
 async function setupProject(db) {
-  // handoff.js init creates the project_settings row and the .claude-memory marker.
+  // handoff.js init creates the project_settings row and the project marker.
   // We need to run init so a project_id exists in the DB.
   const r = runHandoff('init', ['-y']);
   if (r.status !== 0) {

@@ -14,10 +14,11 @@
 
 const { spawnSync } = require('child_process');
 const fs            = require('fs');
-const os            = require('os');
 const path          = require('path');
 const { Client }    = require('pg');
 const { encodeCwd } = require('./encoded-cwd');
+const { findProjectRootByMarker, readMarker } = require('./project-marker');
+const { resolveHandoffMdPath }                = require('./handoff-paths');
 
 const PROJECT_ROOT   = path.resolve(__dirname, '..', '..');
 const HANDOFF_SCRIPT = path.join(PROJECT_ROOT, 'scripts', 'handoff.js');
@@ -238,33 +239,30 @@ function runHandoffLong(sub, extraArgs = [], stdin = null, dbName, projectDir, e
 }
 
 // ── Project ID helpers ────────────────────────────────────────────────────────
+//
+// resolveProjectId and resolveHandoffMdPath MUST import the real implementations
+// (project-marker.js / handoff-paths.js) rather than restate them — a hand-rolled
+// duplicate here is exactly the drift risk #135 removed (it hardcoded the legacy
+// '.claude-memory' marker name only, with no dual-marker/HANDOFF_BASE_DIR support).
 
 /**
- * Read the project_id from the .claude-memory marker file, or fall back to encodeCwd.
+ * Read the project_id from the project marker (new name, or legacy
+ * .claude-memory), or fall back to encodeCwd.
  */
 function resolveProjectId(projectDir) {
-  const markerPath = path.join(projectDir, '.claude-memory');
-  if (fs.existsSync(markerPath)) {
-    try {
-      const data = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
-      if (data.uuid) return data.uuid;
-    } catch (_) {}
+  const markerRoot = findProjectRootByMarker(projectDir);
+  if (markerRoot) {
+    const marker = readMarker(markerRoot);
+    if (marker) return marker.uuid;
   }
   return encodeCwd(projectDir);
-}
-
-/**
- * Resolve the path to handoff.md for a given project ID.
- */
-function resolveHandoffMdPath(projectId) {
-  return path.join(os.homedir(), '.claude', 'projects', projectId, 'handoff.md');
 }
 
 /**
  * Remove the handoff.md directory for a project (cleanup helper).
  */
 function cleanupHandoffMd(projectId) {
-  const handoffDir = path.join(os.homedir(), '.claude', 'projects', projectId);
+  const handoffDir = path.dirname(resolveHandoffMdPath(projectId));
   if (fs.existsSync(handoffDir)) {
     try { fs.rmSync(handoffDir, { recursive: true, force: true }); } catch (_) {}
   }

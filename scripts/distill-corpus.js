@@ -35,15 +35,20 @@
  *        can inject a pre-extracted JSON payload for a given source file.
  *
  *        **OQ (OPEN QUESTION, distillation):** Programmatic invocation of the
- *        extraction model (Anthropic API or equivalent) from within this Node.js
- *        script is not currently implemented because the project has no committed
- *        Anthropic SDK dependency and the extraction prompt is skill-defined in
- *        Claude Code commands (not a standalone function).  Recommended lean:
- *        add an @anthropic-ai/sdk dependency + a dedicated extraction prompt in a
- *        follow-on commit and wire it here; the DB-write and supersession halves
- *        of the pipeline are already implemented and tested.  The existing skill-
- *        based path (running /handoff:close --json - with model-extracted JSON
- *        piped to stdin) remains the fully-operational path for production use.
+ *        extraction model from within this Node.js script is not currently
+ *        implemented because the project has no committed model-provider SDK
+ *        dependency and the extraction prompt is skill-defined in Claude Code
+ *        commands (not a standalone function).  Recommended lean: introduce a
+ *        provider-agnostic "extraction provider" interface (config-selected —
+ *        e.g. a pipeline.yml setting choosing which provider's SDK/endpoint to
+ *        call — never a single vendor's SDK hard-coded as the lean) + a
+ *        dedicated extraction prompt in a follow-on commit and wire it here;
+ *        the DB-write and supersession halves of the pipeline are already
+ *        implemented and tested.  The existing skill-based path (running
+ *        /handoff:close --json - with model-extracted JSON piped to stdin)
+ *        remains the fully-operational path for production use, and is
+ *        itself already provider-agnostic since it runs inside whatever
+ *        MCP-speaking client the operator is using.
  *
  *     3. Apply cardinality-aware two-step supersession (same contract as 4A):
  *        1:1 predicates → suppress any live (project_id, subject, predicate) row.

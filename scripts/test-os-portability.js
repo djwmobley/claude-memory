@@ -14,9 +14,15 @@
  *   P2 — no `shell: true` and no shell-string child_process anywhere in
  *        scripts/, scripts/lib/, hooks/, test/ — every spawn/exec uses an argv
  *        array (makes the suite bash/PowerShell-agnostic).
- *   P3 — the single sanctioned platform branch is runWinBin only: the ONLY
- *        process.platform === 'win32' / os.platform() site is shared.js
- *        runWinBin (and the non-branching renameSync comment in project-identity.js).
+ *   P3 — the sanctioned platform branches are runWinBin, the test-staleness-
+ *        permutations.js cross-platform shim, and handoff-paths.js's
+ *        HANDOFF_BASE_DIR absolute-path validation (#135 — this one validates
+ *        an env var's format against the current OS's path semantics, which
+ *        cannot be done without consulting process.platform; a naive
+ *        path.isAbsolute() check would accept the MSYS-style '/c/Users/x' trap
+ *        on Windows) — the ONLY process.platform === 'win32' / os.platform()
+ *        sites are those three (plus the non-branching renameSync comment in
+ *        project-identity.js).
  *   P4 — marker/handoff writes are LF-only: project-marker.js and project-identity.js
  *        terminate marker writes with literal '\n' (not '\r\n'), and a physically
  *        written marker contains zero \r bytes.
@@ -48,6 +54,7 @@ const HANDOFF_JS          = path.join(SCRIPTS_DIR, 'handoff.js');
 const SHARED_JS           = path.join(SCRIPTS_DIR, 'lib', 'shared.js');
 const PROJECT_IDENTITY_JS = path.join(SCRIPTS_DIR, 'lib', 'project-identity.js');
 const PROJECT_MARKER_JS   = path.join(SCRIPTS_DIR, 'lib', 'project-marker.js');
+const HANDOFF_PATHS_JS    = path.join(SCRIPTS_DIR, 'lib', 'handoff-paths.js');
 
 // ── Tracking ───────────────────────────────────────────────────────────────────
 
@@ -240,7 +247,7 @@ function testP2() {
 // ── P3 — single sanctioned platform branch is runWinBin ───────────────────────
 
 function testP3() {
-  const label = 'P3: only sanctioned platform branch is shared.js runWinBin (and renameSync comment)';
+  const label = 'P3: only sanctioned platform branches are runWinBin, handoff-paths.js, and the staleness-permutations shim';
 
   const dirs = [SCRIPTS_DIR, HOOKS_DIR, TEST_DIR];
   const allFiles = dirs.flatMap(collectJsFiles);
@@ -254,6 +261,12 @@ function testP3() {
   //     (PATH separator ';' vs ':', POSIX shell script vs .cmd) — these are
   //     intentional test-harness-only platform branches required to build a fake-gh
   //     shim that works on both Linux CI and Windows dev environments.
+  //   - handoff-paths.js (#135): HANDOFF_BASE_DIR validation requires a drive-letter-
+  //     rooted path on win32 and a POSIX-rooted path elsewhere. This is validating an
+  //     env var's value against the CURRENT OS's path semantics — not diverging engine
+  //     behavior by platform — but there is no way to express "what counts as absolute
+  //     on this OS" without consulting process.platform, so it is sanctioned alongside
+  //     runWinBin rather than folded into it (different function, different module).
   //
   // We allowlist by file + approximate pattern.
   const ALLOWED = [
@@ -266,6 +279,11 @@ function testP3() {
       file: path.join(TEST_DIR, 'handoff', 'test-staleness-permutations.js'),
       // Platform branch is in createGhShim / shimPath helpers — cross-platform
       // shim construction for the fake gh binary in the adversarial test harness.
+      textRe: /process\.platform\s*===\s*['"]win32['"]/,
+    },
+    {
+      file: HANDOFF_PATHS_JS,
+      // resolveBaseDir(): HANDOFF_BASE_DIR absolute-path validation (see module header).
       textRe: /process\.platform\s*===\s*['"]win32['"]/,
     },
   ];
@@ -332,9 +350,9 @@ function testP4() {
   const tmpRoot = path.join(os.tmpdir(), `p4_marker_test_${TS}`);
   fs.mkdirSync(tmpRoot, { recursive: true });
   try {
-    const { writeMarker } = require(PROJECT_MARKER_JS);
+    const { writeMarker, MARKER_FILENAME } = require(PROJECT_MARKER_JS);
     writeMarker(tmpRoot);
-    const markerPath = path.join(tmpRoot, '.claude-memory');
+    const markerPath = path.join(tmpRoot, MARKER_FILENAME);
     const markerBytes = fs.readFileSync(markerPath);
     const crIdx = markerBytes.indexOf(0x0d); // 0x0d = \r
     if (crIdx !== -1) {

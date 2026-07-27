@@ -201,7 +201,7 @@ async function applySchemas(db) {
 /**
  * Provision an isolated test environment for one sibling file.
  *
- * Creates a UNIQUE fake project root, pre-mints its .claude-memory marker so
+ * Creates a UNIQUE fake project root, pre-mints its project marker so
  * handoff.js resolves a stable, isolated project_id (UUID) for this namespace,
  * applies both schemas, and returns the connected db plus a cleanup() closure.
  *
@@ -249,7 +249,7 @@ async function setupNs(opts = {}) {
     'utf8'
   );
 
-  // Pre-mint the .claude-memory marker → stable, isolated project_id (UUID).
+  // Pre-mint the project marker → stable, isolated project_id (UUID).
   // writeMarker throws if a marker already exists; the temp dir is fresh so it
   // never does (project-marker.js:108-125).
   const marker    = writeMarker(fakeRoot);

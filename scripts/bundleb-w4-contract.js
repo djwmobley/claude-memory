@@ -60,7 +60,7 @@ const TARGET_DB = _rawTargetDb;
 
 /**
  * Resolve project_id for the current working directory.
- * Mirrors the resolution logic in handoff.js: check for a .claude-memory marker
+ * Mirrors the resolution logic in handoff.js: check for a project marker
  * first (UUID-based identity), fall back to encodeCwd(root) for legacy projects.
  */
 function resolveProjectId() {

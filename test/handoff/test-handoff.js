@@ -24,9 +24,10 @@ const fs     = require('fs');
 const os     = require('os');
 const { execFileSync, spawnSync } = require('child_process');
 
-const { loadConfig }   = require('../../scripts/lib/shared');
-const { encodeCwd }    = require('../../scripts/lib/encoded-cwd');
-const { writeMarker }  = require('../../scripts/lib/project-marker');
+const { loadConfig }              = require('../../scripts/lib/shared');
+const { encodeCwd }               = require('../../scripts/lib/encoded-cwd');
+const { writeMarker, readMarker } = require('../../scripts/lib/project-marker');
+const { resolveHandoffMdPath }    = require('../../scripts/lib/handoff-paths');
 // pg lives in scripts/node_modules — use createRequire anchored to scripts/package.json
 // so the import is portable across any pnpm/npm/yarn layout (hoisted or symlink-store).
 const { createRequire } = require('module');
@@ -139,7 +140,7 @@ knowledge:
   // Symlink is cross-platform-awkward; copy just enough for the check
   // The command files check for `scripts/handoff.js` existence in their walk-up logic
 
-  // Pre-mint the .claude-memory marker so init/close/checkpoint/drop/purge all
+  // Pre-mint the project marker so init/close/checkpoint/drop/purge all
   // resolve project_id to a known UUID. Without this, ensureProjectIdentity()
   // auto-mints a UUID at first helper invocation and DB rows go to that UUID
   // while the test still looks up by encodeCwd(fakeRoot) — the cause of the
@@ -222,10 +223,10 @@ async function teardown() {
     fs.rmSync(fakeRoot, { recursive: true, force: true });
   } catch (_) {}
 
-  // Remove ~/.claude/projects/<UUID>/ where handoff.md actually lives.
+  // Remove the handoff.md project dir where it actually lives.
   try {
     if (projectUuid) {
-      const dir = path.join(os.homedir(), '.claude', 'projects', projectUuid);
+      const dir = path.dirname(resolveHandoffMdPath(projectUuid));
       if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
     }
   } catch (_) {}
@@ -244,9 +245,9 @@ async function runTests() {
   // handoff.js's resolveProjectId() reads the marker when present.
   const encodedRoot = global.__projectId;
   // Helper: claude per-project dir resolved via the UUID, not the legacy
-  // encodeCwd path. Mirrors handoff.js's getHandoffPath() at line ~210.
+  // encodeCwd path. Delegates to the same resolveHandoffMdPath() handoff.js uses.
   function claudeProjectDir() {
-    return path.join(os.homedir(), '.claude', 'projects', encodedRoot);
+    return path.dirname(resolveHandoffMdPath(encodedRoot));
   }
 
   await test('init: creates project_settings defaults', async () => {
@@ -440,18 +441,11 @@ async function runTests() {
 
   await test('resume: seeds session_in_progress marker', async () => {
     // Resume may have triggered identity resolution (ensureProjectIdentity), which mints a
-    // .claude-memory UUID marker in fakeRoot and writes all DB rows under that UUID — not
-    // under the legacy encodedRoot.  Resolve the actual project_id by reading the marker
-    // if present; fall back to encodedRoot for repos that have not yet been migrated.
-    const markerPath = path.join(fakeRoot, '.claude-memory');
-    let resumeProjectId = encodedRoot;
-    if (fs.existsSync(markerPath)) {
-      try {
-        const markerText = fs.readFileSync(markerPath, 'utf8');
-        const uuidMatch  = markerText.match(/"uuid"\s*:\s*"([^"]+)"/);
-        if (uuidMatch) resumeProjectId = uuidMatch[1];
-      } catch (_) { /* ignore — fall back to encodedRoot */ }
-    }
+    // UUID marker in fakeRoot and writes all DB rows under that UUID — not under the
+    // legacy encodedRoot.  Resolve the actual project_id by reading the marker if
+    // present; fall back to encodedRoot for repos that have not yet been migrated.
+    const marker = readMarker(fakeRoot);
+    const resumeProjectId = marker ? marker.uuid : encodedRoot;
 
     // Clear any existing marker under whichever project_id resume will use.
     await db.query(
@@ -627,18 +621,11 @@ async function runTests() {
   // Re-open a fresh DB connection for the resurrect tests (the previous one
   // was closed above by the teardown-adjacent db.end() — but teardown hasn't
   // run yet; we just need to re-resolve the project_id now that init has
-  // minted a .claude-memory marker UUID in fakeRoot).
+  // minted a project marker UUID in fakeRoot).
   {
     // Resolve the live project_id (may be a UUID marker, not just encodedRoot).
-    const markerPath = path.join(fakeRoot, '.claude-memory');
-    let resurrectProjectId = encodedRoot;
-    if (fs.existsSync(markerPath)) {
-      try {
-        const txt = fs.readFileSync(markerPath, 'utf8');
-        const m   = txt.match(/"uuid"\s*:\s*"([^"]+)"/);
-        if (m) resurrectProjectId = m[1];
-      } catch (_) { /* fall back to encodedRoot */ }
-    }
+    const resurrectMarker = readMarker(fakeRoot);
+    const resurrectProjectId = resurrectMarker ? resurrectMarker.uuid : encodedRoot;
 
     // Re-connect for resurrect tests.
     const rdb = await connectDb();
@@ -776,15 +763,8 @@ async function runTests() {
   const c2db = await connectDb();
 
   // Resolve the live project_id (may be a UUID marker after init minted it).
-  const markerPath2 = require('path').join(fakeRoot, '.claude-memory');
-  let c2ProjectId = encodedRoot;
-  if (require('fs').existsSync(markerPath2)) {
-    try {
-      const txt = require('fs').readFileSync(markerPath2, 'utf8');
-      const m   = txt.match(/"uuid"\s*:\s*"([^"]+)"/);
-      if (m) c2ProjectId = m[1];
-    } catch (_) { /* fall back to encodedRoot */ }
-  }
+  const c2Marker    = readMarker(fakeRoot);
+  const c2ProjectId = c2Marker ? c2Marker.uuid : encodedRoot;
 
   // Test A: C2 does not degrade when payload omits session_id but DB marker is set.
   await test('close: C2 does not degrade when payload omits session_id but DB marker is set', async () => {
@@ -872,21 +852,12 @@ async function runTests() {
   runHelper('init', ['-y'], { fakeRoot });
 
   // Helper: resolve the actual handoff.md path for a given project root.
-  // After init, ensureProjectIdentity may mint a UUID-based marker in .claude-memory,
-  // so the handoff.md lives under ~/.claude/projects/<uuid>/handoff.md, not under
-  // the encodeCwd(root) path. Read the marker when present.
+  // After init, ensureProjectIdentity may mint a UUID-based project marker,
+  // so the handoff.md lives under resolveHandoffMdPath(uuid), not under the
+  // encodeCwd(root) path. Read the marker when present.
   function resolveHandoffPath(root) {
-    const os2 = require('os');
-    const markerPath = path.join(root, '.claude-memory');
-    if (fs.existsSync(markerPath)) {
-      try {
-        const txt = fs.readFileSync(markerPath, 'utf8');
-        const m = txt.match(/"uuid"\s*:\s*"([^"]+)"/);
-        if (m) {
-          return path.join(os2.homedir(), '.claude', 'projects', m[1], 'handoff.md');
-        }
-      } catch (_) { /* fall back to encodeCwd */ }
-    }
+    const marker = readMarker(root);
+    if (marker) return resolveHandoffMdPath(marker.uuid);
     const { getClaudeProjectDir } = require('../../scripts/lib/encoded-cwd');
     return path.join(getClaudeProjectDir(root), 'handoff.md');
   }

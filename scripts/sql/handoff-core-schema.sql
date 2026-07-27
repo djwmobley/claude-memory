@@ -305,15 +305,24 @@ CREATE INDEX IF NOT EXISTS assertions_confidence_idx
 --
 -- IMPORTANT — 1:1 index predicate list is registry-derived:
 --   The IN(...) list below enumerates every predicate whose cardinality is '1:1'
---   in scripts/lib/predicate-registry.json at the time of this schema revision
---   (registry_version 1.1, 38 predicates).  A test in scripts/smoketest-handoff.js
---   (section "collision") asserts that this list is exactly the registry's current
---   1:1 set — any registry/index drift will fail CI.  When adding a 1:1 predicate
---   to the registry, also update this index (and the drift test will catch
---   omissions automatically).
+--   in scripts/lib/predicate-registry.json at the time of this schema revision,
+--   PLUS every predicate's grandfathered_aliases (renamed predicates whose old
+--   name is kept permanently so historical rows written under the old name stay
+--   covered by the uniqueness guarantee). A test in scripts/smoketest-handoff.js
+--   (section "collision") asserts that this list is exactly the registry's
+--   current 1:1 set UNION all grandfathered_aliases — any registry/index drift
+--   will fail CI. When adding a 1:1 predicate to the registry, also update this
+--   index (and the drift test will catch omissions automatically). When
+--   renaming a predicate, add the OLD name to this list as a permanent
+--   grandfathered alias (never remove it without first proving, across all live
+--   databases, that zero rows remain under the old name) — see the
+--   are_safe_outside_claude-memory / are_safe_outside_this_project rename below
+--   (#135) for the worked example, including the collision-safe data migration
+--   that must run whenever a rename introduces the risk of a live old-name row
+--   and a live new-name row coexisting for the same subject.
 --
 -- 1:1 partial unique index: at most one live row per (project_id, subject, predicate)
--- for any predicate that the registry declares cardinality 1:1.
+-- for any predicate that the registry declares cardinality 1:1 (or its grandfathered alias).
 DROP INDEX IF EXISTS assertions_1to1_unique;
 CREATE UNIQUE INDEX assertions_1to1_unique
   ON assertions (project_id, subject, predicate)
@@ -323,6 +332,7 @@ CREATE UNIQUE INDEX assertions_1to1_unique
       'added_via',
       'affirmed',
       'are_safe_outside_claude-memory',
+      'are_safe_outside_this_project',
       'branch_exists',
       'chose',
       'cmdDrop_refactor',
@@ -365,6 +375,52 @@ CREATE UNIQUE INDEX assertions_1to1_unique
       'user_directed',
       'uses_db'
     );
+
+-- ── Predicate rename: are_safe_outside_claude-memory → are_safe_outside_this_project ──
+--
+-- #135 (host-agnostic naming): the old predicate name embedded this project's
+-- own name; renamed to a client/project-neutral name. Placed textually AFTER
+-- assertions_1to1_unique above so a full raw apply of this file (fresh-DB init,
+-- test harness applySchema) sees the widened index (both names already in the
+-- IN(...) list) before this block runs. NOTE: applyAdditiveSchema() in
+-- handoff.js extracts assertions_1to1_unique into a separate non-transactional
+-- "Phase B" that runs AFTER this block commits (so the incremental drift-apply
+-- path does NOT get that ordering) — the collision-safety below is therefore
+-- deliberately NOT dependent on the index already being widened; it uses an
+-- explicit EXISTS-based duplicate check instead, so it is correct under BOTH
+-- apply paths regardless of index timing. Idempotent and safe to re-run
+-- against a DB with a mix of old-name and new-name live rows (e.g.
+-- mid-rolling-deploy, where a newly-deployed writer may already emit the new
+-- name before this schema apply has run against a given DB):
+--
+--   1. For any (project_id, subject) that has BOTH a live old-name row and a
+--      live new-name row, suppress the old-name row via the same
+--      suppress-mechanism the write path already uses (never DELETE) — this
+--      makes step 2 collision-free by construction, independent of whether
+--      assertions_1to1_unique has been widened yet in this apply.
+--   2. Rename the predicate on every remaining old-name row (live or already
+--      suppressed). Because step 1 already eliminated every subject that
+--      could collide, this UPDATE can never produce a live duplicate under
+--      the new name (a bare UPDATE without step 1 first could silently create
+--      one, or abort the transaction if the widened index is already active).
+DO $$
+BEGIN
+  UPDATE assertions
+    SET suppressed = true, invalid_at = now(), suppression_kind = 'superseded'
+    WHERE assertions.suppressed = false
+      AND assertions.predicate = 'are_safe_outside_claude-memory'
+      AND EXISTS (
+        SELECT 1 FROM assertions AS new_rows
+        WHERE new_rows.suppressed = false
+          AND new_rows.predicate = 'are_safe_outside_this_project'
+          AND new_rows.project_id = assertions.project_id
+          AND new_rows.subject    = assertions.subject
+      );
+
+  UPDATE assertions
+    SET predicate = 'are_safe_outside_this_project'
+    WHERE predicate = 'are_safe_outside_claude-memory';
+END $$;
 
 -- 1:N exact-duplicate index: at most one live row per (project_id, subject, predicate, object).
 -- Registry-independent: applies to all predicates equally, preventing exact-duplicate 1:N rows
