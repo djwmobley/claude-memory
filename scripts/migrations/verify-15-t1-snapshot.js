@@ -105,10 +105,35 @@ async function snapshotEntry(srcClient, tgtClient, entry, excludedReason) {
   return results;
 }
 
+/** Peek at the raw --source-db / SOURCE_DB value BEFORE regex validation, so
+ * a net-new:-prefixed value gets the specific "sourceless, nothing to
+ * snapshot" message instead of falling through to
+ * resolveAndClassifySourceDb's generic "invalid identifier" regex refusal
+ * (a net-new: value contains a colon, which the DB-name regex would reject
+ * anyway — but with a less specific, more confusing message than this
+ * dedicated check gives).
+ */
+function peekRawSourceDb(argv) {
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--source-db') return argv[i + 1];
+    if (argv[i].startsWith('--source-db=')) return argv[i].slice('--source-db='.length);
+  }
+  return process.env.SOURCE_DB || null;
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   const { excludedReason } = parseArgs(argv);
   const { name: target, source: targetSource } = shared.resolveAndClassifyTargetDb(argv);
+
+  const rawSourceDb = peekRawSourceDb(argv);
+  if (rawSourceDb && rawSourceDb.startsWith(shared.NET_NEW_PREFIX)) {
+    console.error(`FATAL: --source-db "${rawSourceDb}" is a SOURCELESS (net-new:) roster source — there is nothing to snapshot.`);
+    console.error('  net-new: entries have no migration source by classification (see scripts/migrations/lib/verify15-shared.js');
+    console.error('  classifyRosterSourceDb) — T1 never applies to them. See verify-15-t0-roster.js for how they are covered instead.');
+    process.exit(1);
+  }
+
   const sourceDb = shared.resolveAndClassifySourceDb(argv);
 
   if (!sourceDb) {

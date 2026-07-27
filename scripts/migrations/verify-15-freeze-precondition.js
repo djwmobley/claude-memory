@@ -32,6 +32,13 @@ const AUTHORED_BY = 'sonnet-t-battery-author-2026-07-27';
  * path to probe — freeze there means filesystem permissions, which this
  * script does not check (documented blind spot, see PR body).
  *
+ * `net-new:<store>`-prefixed sources (§9/§17/§18 tables with no migration
+ * source — see shared.classifyRosterSourceDb) ALSO have nothing to probe:
+ * there is no source system to freeze in the first place, since nothing is
+ * ever migrated FROM one. Skipped explicitly, with a printed count — never
+ * silently dropped from `distinctSqlSourceDbs`'s output without comment.
+ *
+
  * Usage: node scripts/migrations/verify-15-freeze-precondition.js
  * (reads --source-db repeated, or defaults to every distinct source_db in
  * the roster)
@@ -46,6 +53,8 @@ function distinctSqlSourceDbs(roster) {
   const map = new Map(); // source_db -> first source_table
   for (const entry of roster) {
     if (entry.source_db.startsWith('filesystem:')) continue;
+    const { isSourceless } = shared.classifyRosterSourceDb(entry.source_db, `roster entry targetTable=${entry.targetTable}`);
+    if (isSourceless) continue; // net-new: no source system exists to freeze
     if (!map.has(entry.source_db)) map.set(entry.source_db, entry.source_table);
   }
   return map;
@@ -82,6 +91,11 @@ async function main() {
   }
 
   const roster = shared.loadRoster();
+  const { sourceless } = shared.partitionRoster(roster);
+  if (sourceless.length) {
+    console.log(`[freeze-precondition] ${sourceless.length} sourceless (net-new:) roster entr${sourceless.length === 1 ? 'y' : 'ies'} excluded from probing — no source system exists to freeze:`);
+    for (const e of sourceless) console.log(`  - ${e.source_db} -> ${e.targetTable}`);
+  }
   const allSources = distinctSqlSourceDbs(roster);
 
   let toProbe;

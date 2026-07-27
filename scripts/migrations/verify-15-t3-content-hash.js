@@ -61,6 +61,15 @@ const AUTHORED_BY = 'sonnet-t-battery-author-2026-07-27';
  * matching source hash, and excluded rows never migrate, so they are
  * simply absent from the target-side multiset T3b scans. No change needed.
  *
+ * SOURCELESS (net-new:) ROSTER ENTRIES have no source to hash at all — T3's
+ * whole PREMISE (a source-side multiset compared to a target-side one)
+ * does not apply. groupRosterBySourceDb partitions these out explicitly
+ * (never lets one become a "source_db" T3 tries to connect() to, which
+ * would just surface as a confusing connection-refused FAIL); this
+ * script's main loop prints one SKIP line per sourceless entry, distinct
+ * from the filesystem: skip line, then continues hashing every SOURCED
+ * table in the same run.
+ *
  * Usage: node scripts/migrations/verify-15-t3-content-hash.js [--db <target>]
  * Exit codes: 0 = every source hash found in target (multiset-complete),
  * 1 = any multiset mismatch, refused target, or roster mapping gap.
@@ -68,19 +77,29 @@ const AUTHORED_BY = 'sonnet-t-battery-author-2026-07-27';
 
 const shared = require('./lib/verify15-shared');
 
-/** Group roster entries by source_db, dropping filesystem:-prefixed ones. */
+/**
+ * Group roster entries by source_db, dropping filesystem:-prefixed ones
+ * (markdown, out of this battery's cut) and sourceless net-new: ones
+ * (nothing to hash — see header comment) into their own labeled buckets.
+ */
 function groupRosterBySourceDb(roster) {
   const bySource = new Map();
   const skipped = [];
+  const sourceless = [];
   for (const entry of roster) {
     if (entry.source_db.startsWith('filesystem:')) {
       skipped.push(entry);
       continue;
     }
+    const { isSourceless } = shared.classifyRosterSourceDb(entry.source_db, `roster entry targetTable=${entry.targetTable}`);
+    if (isSourceless) {
+      sourceless.push(entry);
+      continue;
+    }
     if (!bySource.has(entry.source_db)) bySource.set(entry.source_db, []);
     bySource.get(entry.source_db).push(entry);
   }
-  return { bySource, skipped };
+  return { bySource, skipped, sourceless };
 }
 
 async function main() {
@@ -91,9 +110,13 @@ async function main() {
   const roster = shared.loadRoster();
   shared.buildLoadBearingColsFromRoster(roster); // fatal-on-gap validation, result unused here (per-source below)
 
-  const { bySource, skipped } = groupRosterBySourceDb(roster);
+  const { bySource, skipped, sourceless } = groupRosterBySourceDb(roster);
   if (skipped.length) {
     console.log(`  [WARN] ${skipped.length} filesystem:-prefixed roster entr${skipped.length === 1 ? 'y' : 'ies'} skipped — markdown-source hashing (migrate-08/09) is out of this battery's cut.`);
+  }
+  if (sourceless.length) {
+    console.log(`  [SKIP] ${sourceless.length} SOURCELESS (net-new:) roster entr${sourceless.length === 1 ? 'y' : 'ies'} excluded from T3's forward-containment scan — no source to hash:`);
+    for (const e of sourceless) console.log(`    - ${e.source_db} -> ${e.targetTable}`);
   }
   if (bySource.size === 0) {
     console.error('[T3] FATAL: no SQL-shaped source_db entries found in the roster.');

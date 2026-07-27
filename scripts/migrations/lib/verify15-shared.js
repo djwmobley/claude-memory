@@ -159,6 +159,82 @@ function validateRosterShape(roster, rosterPath) {
   }
 }
 
+const NET_NEW_PREFIX = 'net-new:';
+
+/**
+ * Total classification of a roster entry's `source_db` SHAPE:
+ *   - `net-new:<non-empty store name>` → SOURCELESS. These are §9/§17/§18
+ *     tables (agent_exchange, audit_log, model_registry,
+ *     embedding_providers, routing_profiles, routing_session_overrides,
+ *     turn_usage, session_usage, …) that MUST have a roster entry — for
+ *     T0-completeness's bidirectional match against inventory-manifest.json
+ *     and for T5/T6's roster-driven target-side enumeration — but have NO
+ *     migration source: nothing is ever migrated INTO them from an old
+ *     store, so T1 will never snapshot one and no migration_manifest row
+ *     will ever exist for one. (Snapshotting them with a row_count=0
+ *     manifest row would be WRONG in the other direction: it would make T2
+ *     expect exactly 0 target rows forever, spuriously failing the moment
+ *     the live harness writes real routing/telemetry/exchange data.)
+ *   - everything else (a plain database name, or a `filesystem:<path>`
+ *     markdown source) → SOURCED — the DEFAULT, STRICT branch. An
+ *     unrecognized `source_db` shape lands here, not in a silent
+ *     "unknown → skip" bucket: the failure mode for a shape this
+ *     classifier doesn't recognize is FRICTION (an ordinary
+ *     migration_manifest requirement it then fails, which an operator
+ *     investigates), never a silent escape from coverage.
+ * A malformed `net-new:` value (empty store-name suffix) is a LOUD FATAL,
+ * not silently folded into either branch — see loadRoster's call to this
+ * for every entry at load time.
+ *
+ * @param {string} sourceDb
+ * @param {string} [contextLabel] — extra context for the fatal-error message
+ * @returns {{ isSourceless: boolean, storeName: string|null }}
+ */
+function classifyRosterSourceDb(sourceDb, contextLabel) {
+  if (typeof sourceDb === 'string' && sourceDb.startsWith(NET_NEW_PREFIX)) {
+    const storeName = sourceDb.slice(NET_NEW_PREFIX.length);
+    if (!storeName) {
+      console.error(
+        `FATAL: malformed net-new source_db "${sourceDb}"${contextLabel ? ` (${contextLabel})` : ''} — ` +
+        `the "${NET_NEW_PREFIX}" prefix requires a non-empty store name, e.g. "${NET_NEW_PREFIX}memory_manager".`
+      );
+      process.exit(1);
+    }
+    return { isSourceless: true, storeName };
+  }
+  return { isSourceless: false, storeName: null };
+}
+
+/**
+ * Partition a roster into SOURCED entries (ordinary migration_manifest
+ * coverage requirement applies) and SOURCELESS entries (net-new:-prefixed,
+ * no migration source — see classifyRosterSourceDb). The single function
+ * every verify-15-*.js script should call rather than re-implementing the
+ * `source_db.startsWith('net-new:')` check inline.
+ */
+function partitionRoster(roster) {
+  const sourced = [];
+  const sourceless = [];
+  for (const entry of roster) {
+    const { isSourceless } = classifyRosterSourceDb(entry.source_db, `roster entry targetTable=${entry.targetTable}`);
+    if (isSourceless) sourceless.push(entry);
+    else sourced.push(entry);
+  }
+  return { sourced, sourceless };
+}
+
+/**
+ * Validate every roster entry's source_db SHAPE (fatal on a malformed
+ * `net-new:` value) at load time — a shape bug in the roster surfaces
+ * immediately, at the loader, not later inside whichever check happens to
+ * touch that entry first.
+ */
+function validateRosterSourceDbShapes(roster, rosterPath) {
+  roster.forEach((entry) => {
+    classifyRosterSourceDb(entry.source_db, `roster entry targetTable=${entry.targetTable}, from ${rosterPath}`);
+  });
+}
+
 /**
  * Load + shape-validate the real source-table-roster.json. Loud fatal, never
  * a silent empty-array fallback, when the real roster is missing — names
@@ -195,6 +271,7 @@ function loadRoster() {
     process.exit(1);
   }
   validateRosterShape(roster, rosterPath);
+  validateRosterSourceDbShapes(roster, rosterPath);
   return roster;
 }
 
@@ -470,6 +547,10 @@ module.exports = {
   REQUIRED_ROSTER_FIELDS,
   resolveRosterPath,
   validateRosterShape,
+  NET_NEW_PREFIX,
+  classifyRosterSourceDb,
+  partitionRoster,
+  validateRosterSourceDbShapes,
   loadRoster,
   NULL_SENTINEL,
   rowHash,

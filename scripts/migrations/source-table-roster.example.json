@@ -34,5 +34,14 @@
     "loadBearingCols": ["title", "status"],
     "hasContentBearingText": false,
     "requires_project_id_scope": true
+  },
+  {
+    "_comment": "SOURCELESS example — source_db uses the 'net-new:<store>' convention (see scripts/migrations/lib/verify15-shared.js classifyRosterSourceDb). This entry maps a §17/§18-shaped table (routing_profiles) that has NO migration source at all: nothing is ever migrated INTO it from an old store, so T1 never snapshots it and it never gets a migration_manifest row — by classification, not by omission. T0 (verify-15-t0-roster.js) exempts sourceless entries from the manifest-row requirement explicitly (prints them, never silently skips them); T3/T3b exclude them from source-hash comparisons and the total-rowcount anti-join for the identical reason. T5/T6 still enumerate this entry normally via their target-side (roster-driven) checks — sourceless does not mean untested, only 'no migration to reconcile.' source_table mirrors targetTable here since there is no real source-side table name to record.",
+    "source_db": "net-new:memory_manager",
+    "source_table": "routing_profiles",
+    "targetTable": "routing_profiles",
+    "loadBearingCols": ["role", "preferred_model"],
+    "hasContentBearingText": false,
+    "requires_project_id_scope": true
   }
 ]

@@ -174,6 +174,11 @@ async function setupTargetSchema(client) {
       id SERIAL PRIMARY KEY,
       label TEXT
     );
+    CREATE TABLE IF NOT EXISTS routing_profiles (
+      id SERIAL PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      role TEXT, preferred_model TEXT
+    );
   `);
 }
 
@@ -210,6 +215,15 @@ const BASE_ROSTER = [
   },
 ];
 
+// A SOURCELESS (net-new:) roster entry — a §17/§18-shaped table with no
+// migration source. Reused across T0/T3/T3b's sourceless-classification
+// tests below.
+const SOURCELESS_ROSTER_ENTRY = {
+  source_db: 'net-new:memory_manager', source_table: 'routing_profiles', targetTable: 'routing_profiles',
+  loadBearingCols: ['role', 'preferred_model'], hasContentBearingText: false,
+  requires_project_id_scope: true,
+};
+
 // ── Test sections ─────────────────────────────────────────────────────────────
 
 async function testT0() {
@@ -238,6 +252,129 @@ async function testT0() {
       pass('T0-b', 'empty-but-snapshotted table (row_count=0 manifest row) -> PASS');
     } else {
       fail('T0-b', 'empty-but-snapshotted table (row_count=0 manifest row) -> PASS', `status=${r2.status} stdout=${r2.stdout} stderr=${r2.stderr}`);
+    }
+  } finally {
+    await target.end();
+  }
+}
+
+async function testT0SourcelessClassification() {
+  // (i) A roster with ONLY a sourceless (net-new:) entry, zero
+  // migration_manifest rows -> T0 PASS, with the explicit sourceless line
+  // printed (never a silent skip).
+  const target = await pgConnect(TARGET_DB);
+  try {
+    await shared.applyDdl(target);
+    await truncateAll(target, ['migration_manifest']);
+
+    const sourcelessOnlyRoster = writeTmpJson('t0-sourceless-only.json', [SOURCELESS_ROSTER_ENTRY]);
+    const r1 = runScript('verify-15-t0-roster.js', ['--db', TARGET_DB], rosterEnv(sourcelessOnlyRoster));
+    if (r1.status === 0 && /SOURCELESS/.test(r1.stdout) && /net-new:memory_manager -> routing_profiles/.test(r1.stdout)) {
+      pass('T0-sourceless-i', 'net-new entry with zero manifest rows -> T0 PASS, explicit sourceless line printed');
+    } else {
+      fail('T0-sourceless-i', 'net-new entry with zero manifest rows -> T0 PASS, explicit sourceless line printed', `status=${r1.status} stdout=${r1.stdout} stderr=${r1.stderr}`);
+    }
+
+    // (ii) Mixed roster: sourced entry with zero manifest rows still FAILs,
+    // even though the sourceless entry in the SAME roster is fine.
+    const mixedRoster = writeTmpJson('t0-sourceless-mixed.json', [BASE_ROSTER[0], SOURCELESS_ROSTER_ENTRY]);
+    const r2 = runScript('verify-15-t0-roster.js', ['--db', TARGET_DB], rosterEnv(mixedRoster));
+    if (r2.status !== 0 && /SOURCED roster entr/.test(r2.stdout + r2.stderr) && /SOURCELESS/.test(r2.stdout)) {
+      pass('T0-sourceless-ii', 'sourced entry with zero manifest rows still FAILs, even alongside a satisfied sourceless entry (sourceless line still printed)');
+    } else {
+      fail('T0-sourceless-ii', 'sourced entry with zero manifest rows still FAILs, even alongside a satisfied sourceless entry (sourceless line still printed)', `status=${r2.status} stdout=${r2.stdout} stderr=${r2.stderr}`);
+    }
+
+    // Same mixed roster, sourced entry NOW satisfied -> T0 PASS overall,
+    // sourceless line still printed.
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint)
+       VALUES ($1,'decisions','proj-a',1,'fp')`,
+      [SOURCE_DB]
+    );
+    const r3 = runScript('verify-15-t0-roster.js', ['--db', TARGET_DB], rosterEnv(mixedRoster));
+    if (r3.status === 0 && /SOURCELESS/.test(r3.stdout)) {
+      pass('T0-sourceless-iii', 'mixed roster, sourced entry satisfied -> T0 PASS overall, sourceless entry still named explicitly');
+    } else {
+      fail('T0-sourceless-iii', 'mixed roster, sourced entry satisfied -> T0 PASS overall, sourceless entry still named explicitly', `status=${r3.status} stdout=${r3.stdout} stderr=${r3.stderr}`);
+    }
+  } finally {
+    await target.end();
+  }
+}
+
+async function testMalformedNetNewFatal() {
+  // (iii) Malformed net-new: (empty suffix) -> loader fatal.
+  const malformedRoster = writeTmpJson('t0-malformed-netnew.json', [
+    { ...SOURCELESS_ROSTER_ENTRY, source_db: 'net-new:' },
+  ]);
+  const r = runScript('verify-15-t0-roster.js', ['--db', TARGET_DB], rosterEnv(malformedRoster));
+  if (r.status !== 0 && /malformed net-new source_db/.test(r.stdout + r.stderr)) {
+    pass('malformed-netnew', 'empty net-new: suffix -> loader FATAL, loud, non-zero exit');
+  } else {
+    fail('malformed-netnew', 'empty net-new: suffix -> loader FATAL, loud, non-zero exit', `status=${r.status} stdout=${r.stdout} stderr=${r.stderr}`);
+  }
+}
+
+async function testT3SourcelessSkip() {
+  // (iv) T3 skips a sourceless entry with the explicit line, and still
+  // hash-checks sourced tables in the same run.
+  const source = await pgConnect(SOURCE_DB);
+  const target = await pgConnect(TARGET_DB);
+  try {
+    await setupSourceSchema(source);
+    await truncateAll(source, ['decisions']);
+    await truncateAll(target, ['decisions', 'routing_profiles']);
+
+    await source.query(`INSERT INTO decisions (project_id, topic, decision, reason) VALUES ('proj-a','t','d','r')`);
+    await target.query(`INSERT INTO decisions (project_id, topic, decision, reason) VALUES ('proj-a','t','d','r')`);
+
+    const rosterPath = writeTmpJson('t3-sourceless.json', [BASE_ROSTER[0], SOURCELESS_ROSTER_ENTRY]);
+    const r = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    const out = r.stdout + r.stderr;
+    if (r.status === 0 && /\[SKIP\]/.test(out) && /net-new:memory_manager -> routing_profiles/.test(out) && /\[T3\] OK: decisions -> decisions/.test(out)) {
+      pass('T3-sourceless', 'T3 SKIPs the sourceless entry with an explicit line, and still hash-checks the sourced table in the same run');
+    } else {
+      fail('T3-sourceless', 'T3 SKIPs the sourceless entry with an explicit line, and still hash-checks the sourced table in the same run', `status=${r.status} stdout=${r.stdout} stderr=${r.stderr}`);
+    }
+  } finally {
+    await source.end();
+    await target.end();
+  }
+}
+
+async function testT3bSourceless() {
+  // Bonus coverage for the T3b code change made as part of this same fix
+  // (the finding named T3b's "project_id-based anti-join" explicitly):
+  // a sourceless targetTable's rows must NEVER be flagged as "unaccounted"
+  // by totalRowcountReconciliation, nor as a "reverse containment gap" by
+  // reverseContainment — both would otherwise be permanently, spuriously
+  // broken by real net-new-table data (routing_profiles, turn_usage, …).
+  const target = await pgConnect(TARGET_DB);
+  try {
+    await shared.applyDdl(target);
+    await truncateAll(target, ['migration_manifest', 'migration_manifest_row_hashes', 'memory_manager_staging_row_hashes', 'decisions', 'routing_profiles']);
+
+    // A real routing_profiles row with NO migration_manifest coverage at
+    // all for its project_id (exactly what live routing writes would look
+    // like) -- must NOT be flagged by totalRowcountReconciliation.
+    await target.query(`INSERT INTO routing_profiles (project_id, role, preferred_model) VALUES ('proj-live-routing','draft','some-model')`);
+    // A staging_row_hashes entry for routing_profiles with no matching
+    // migration_manifest_row_hashes source hash -- must NOT be flagged by
+    // reverseContainment either.
+    await target.query(`INSERT INTO memory_manager_staging_row_hashes (target_table, project_id, target_row_id, target_hash) VALUES ('routing_profiles','proj-live-routing','1','live-routing-hash-1')`);
+
+    const rosterPath = writeTmpJson('t3b-sourceless.json', [BASE_ROSTER[0], SOURCELESS_ROSTER_ENTRY]);
+    const r = runScript('verify-15-t3b-reverse-containment.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    const out = r.stdout + r.stderr;
+    // status===0 proves NEITHER check flagged the routing_profiles rows
+    // (either would have set failed=true -> non-zero exit otherwise); the
+    // explicit exclusion log line proves it wasn't a coincidental pass from
+    // an empty/no-op scan.
+    if (r.status === 0 && /SOURCELESS.*targetTable\(s\) excluded/.test(out) && /routing_profiles/.test(out)) {
+      pass('T3b-sourceless', 'sourceless targetTable rows are excluded from BOTH T3b checks (never flagged as unaccounted or as a reverse-containment gap)');
+    } else {
+      fail('T3b-sourceless', 'sourceless targetTable rows are excluded from BOTH T3b checks (never flagged as unaccounted or as a reverse-containment gap)', `status=${r.status} stdout=${r.stdout} stderr=${r.stderr}`);
     }
   } finally {
     await target.end();
@@ -1056,6 +1193,8 @@ async function main() {
     }
 
     await testT0();
+    await testT0SourcelessClassification();
+    await testMalformedNetNewFatal();
     await testT0Completeness();
     await testT1Snapshot();
     await testFreezePrecondition();
@@ -1063,7 +1202,9 @@ async function main() {
     await testT25Dualwrite();
     await testT3ContentHash();
     await testT3ExclusionAwareness();
+    await testT3SourcelessSkip();
     await testT3bReverseContainment();
+    await testT3bSourceless();
     await testT4RecallEquivalence();
     await testT5EmbeddingCoverage();
     await testT6ReferentialIntegrity();
