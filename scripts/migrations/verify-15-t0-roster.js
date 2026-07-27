@@ -77,10 +77,8 @@ const AUTHORED_BY = 'sonnet-t-battery-author-2026-07-27';
  * anything else as "later-phase or unknown" and moving on).
  *
  * Since T0 is already the roster-TOTALITY check, this is its natural third
- * section: enumerate every BASE TABLE and VIEW in the target's `public`
- * schema (information_schema.tables already excludes temp objects — they
- * live in a pg_temp_N schema, never `public`) and TOTAL-classify each into
- * EXACTLY one of:
+ * section: enumerate every user-visible relation in the target's `public`
+ * schema and TOTAL-classify each into EXACTLY one of:
  *   (a) engine-core     — derived at RUNTIME from migrate-01-canonical-db.js's
  *                         OWN deriveExpectedObjects() over its OWN
  *                         SCHEMA_FILES (shared.getEngineCoreObjects() —
@@ -100,20 +98,54 @@ const AUTHORED_BY = 'sonnet-t-battery-author-2026-07-27';
  * "checked classification on the page, never an unexplained absence"
  * posture the sourceless-entry section above already established.
  *
+ * ENUMERATION MECHANISM — pg_class relkind, not information_schema.tables
+ * (closes a review finding, empirically verified: information_schema.tables
+ * structurally EXCLUDES materialized views — a matview created in the
+ * target would be silently invisible to this classification, the exact
+ * silent-escape shape this whole check exists to close). Queries
+ * pg_class/pg_namespace directly, filtered to a TOTAL, STATED set of
+ * relkinds — every relkind is either explicitly handled or explicitly named
+ * as out of scope, never a residual "whatever information_schema.tables
+ * happened to include":
+ *   r = ordinary table, p = partitioned table (parent), v = view,
+ *   m = materialized view, f = foreign table — ALL FIVE enumerated and
+ *   classified identically (no legitimate matview/foreign-table/partitioned-
+ *   table CLASS exists today, so one found unclassified is a loud FAIL, the
+ *   same as any other unclassified relation — stated in the failure message
+ *   itself, not left implicit).
+ *   Explicitly OUT OF SCOPE, not silently dropped: i = index, S = sequence,
+ *   t = TOAST table (lives in pg_toast, never public, in any case), c =
+ *   composite type, I = partitioned index — none of these are data-bearing
+ *   containers an operator registers in a roster; they are structural
+ *   objects always owned BY a relkind this check already covers, not
+ *   independent "tables" a migration could ever leave uncounted.
+ *
  * Usage: node scripts/migrations/verify-15-t0-roster.js [--db <target>]
  * Exit codes: 0 = PASS (every SOURCED roster entry has >=1 manifest row,
  * every non-excluded manifest pair has a roster entry, AND every live
- * table/view in target classifies), 1 = FAIL or refused target.
+ * relation in target classifies), 1 = FAIL or refused target.
  */
 
 const shared = require('./lib/verify15-shared');
 const { loadInventory } = require('./verify-15-t0-roster-completeness');
 
+// Total, stated relkind classification — see header comment. Enumerated:
+// ordinary + partitioned tables, views, materialized views, foreign tables.
+// Human-readable labels used only in this script's own log/FAIL output.
+const ENUMERATED_RELKINDS = ['r', 'p', 'v', 'm', 'f'];
+const RELKIND_LABELS = {
+  r: 'table',
+  p: 'partitioned table',
+  v: 'view',
+  m: 'materialized view',
+  f: 'foreign table',
+};
+
 /**
- * Total-classify every BASE TABLE/VIEW live in the target's public schema
- * into engine-core / battery-infra / roster-or-inventory / unclassified.
- * Standalone + exported so the test suite can exercise it directly against
- * a variety of fixture schemas.
+ * Total-classify every user-visible relation (see ENUMERATED_RELKINDS) live
+ * in the target's public schema into engine-core / battery-infra /
+ * roster-or-inventory / unclassified. Standalone + exported so the test
+ * suite can exercise it directly against a variety of fixture schemas.
  */
 async function classifyLiveTables(client, roster) {
   const engineCore = shared.getEngineCoreObjects();
@@ -124,19 +156,25 @@ async function classifyLiveTables(client, roster) {
   for (const entry of roster) rosterInventoryNames.add(entry.targetTable.toLowerCase());
   for (const t of loadInventory()) rosterInventoryNames.add(t.toLowerCase());
 
-  const { rows } = await client.query(`
-    SELECT table_name FROM information_schema.tables
-    WHERE table_schema = 'public'
-    ORDER BY table_name
-  `);
+  const { rows } = await client.query(
+    `SELECT c.relname AS table_name, c.relkind
+       FROM pg_class c
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public'
+        AND c.relkind = ANY($1::"char"[])
+      ORDER BY c.relname`,
+    [ENUMERATED_RELKINDS]
+  );
 
   const classified = { engineCore: [], batteryInfra: [], rosterInventory: [], unclassified: [] };
   for (const r of rows) {
     const name = r.table_name.toLowerCase();
-    if (engineCoreNames.has(name)) classified.engineCore.push(r.table_name);
-    else if (batteryInfraNames.has(name)) classified.batteryInfra.push(r.table_name);
-    else if (rosterInventoryNames.has(name)) classified.rosterInventory.push(r.table_name);
-    else classified.unclassified.push(r.table_name);
+    const label = RELKIND_LABELS[r.relkind] || r.relkind;
+    const entry = { name: r.table_name, label };
+    if (engineCoreNames.has(name)) classified.engineCore.push(entry);
+    else if (batteryInfraNames.has(name)) classified.batteryInfra.push(entry);
+    else if (rosterInventoryNames.has(name)) classified.rosterInventory.push(entry);
+    else classified.unclassified.push(entry);
   }
   return classified;
 }
@@ -233,12 +271,12 @@ async function main() {
     );
     if (classification.unclassified.length) {
       failed = true;
-      console.error(`[T0] FAIL (live-table): ${classification.unclassified.length} unclassified table(s) present in target:`);
+      console.error(`[T0] FAIL (live-table): ${classification.unclassified.length} unclassified relation(s) present in target:`);
       for (const t of classification.unclassified) {
-        console.error(`  - ${t} — unclassified table present in target: register it in the roster/inventory in the same change that created it, or it is invisible to every containment check.`);
+        console.error(`  - ${t.name} (${t.label}) — unclassified relation present in target: register it in the roster/inventory in the same change that created it, or it is invisible to every containment check. (No legitimate ${t.label} class exists today — this applies to a materialized view exactly like any other unclassified relation.)`);
       }
     } else {
-      console.log('[T0] OK (live-table): every table/view in target classifies as engine-core, battery-infra, or roster/inventory.');
+      console.log('[T0] OK (live-table): every table/view/materialized-view/foreign-table in target classifies as engine-core, battery-infra, or roster/inventory.');
     }
   } finally {
     await client.end();

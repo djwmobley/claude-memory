@@ -427,6 +427,20 @@ async function testT0LiveTableClassification() {
     } else {
       fail('T0-livetable-iii', 'roster-known targetTable present -> classified via roster/inventory (class c), overall PASS', `status=${r3.status} stdout=${r3.stdout} stderr=${r3.stderr}`);
     }
+
+    // (iv) A materialized view planted -> T0 FAILs, naming it. Closes the
+    // review finding that information_schema.tables structurally excludes
+    // matviews -- the enumeration was switched to a pg_class relkind query
+    // specifically so this case is no longer a silent escape.
+    await target.query('CREATE MATERIALIZED VIEW mystery_matview AS SELECT 1 AS id');
+    const r4 = runScript('verify-15-t0-roster.js', ['--db', LIVE_TABLE_DB], rosterEnv(trivialRoster));
+    const out4 = r4.stdout + r4.stderr;
+    if (r4.status !== 0 && /FAIL \(live-table\)/.test(out4) && /mystery_matview/.test(out4) && /materialized view/.test(out4)) {
+      pass('T0-livetable-iv', 'materialized view planted in scratch target -> T0 FAILs, naming it (relkind label included)');
+    } else {
+      fail('T0-livetable-iv', 'materialized view planted in scratch target -> T0 FAILs, naming it (relkind label included)', `status=${r4.status} stdout=${r4.stdout} stderr=${r4.stderr}`);
+    }
+    await target.query('DROP MATERIALIZED VIEW mystery_matview');
   } finally {
     await target.end();
   }
@@ -996,17 +1010,29 @@ async function testT6ReferentialIntegrity() {
   try {
     await truncateAll(target, ['edges', 'entities', 'memory_entries', 'memory_entry_chunks']);
 
-    // Roster-scoped fixture table with project_id column entirely MISSING -> FAIL.
+    // Roster-scoped fixture table EXISTS but is missing the project_id
+    // column entirely -> FAIL. This is the SUBTLER case A-6 closed (a
+    // table that HAS the column but is nullable is a different, simpler
+    // bar this same check also enforces) -- the table is created LOCALLY,
+    // scoped to this test, and dropped in a nested finally, so it never
+    // leaks into T0's live-table classification tests (which run earlier
+    // and share TARGET_DB) the way an earlier shared-setup version of this
+    // fixture used to.
     const rosterMissingCol = [
       { source_db: SOURCE_DB, source_table: 'no_project_id_table', targetTable: 'no_project_id_table',
         loadBearingCols: ['label'], hasContentBearingText: false, requires_project_id_scope: true },
     ];
     const rosterPath1 = writeTmpJson('t6-roster-missing-col.json', rosterMissingCol);
-    const r1 = runScript('verify-15-t6-referential-integrity.js', ['--db', TARGET_DB], rosterEnv(rosterPath1));
-    if (r1.status !== 0 && /project_id column MISSING entirely/.test(r1.stdout + r1.stderr)) {
-      pass('T6-a', 'roster-scoped table with project_id column entirely MISSING -> FAIL');
-    } else {
-      fail('T6-a', 'roster-scoped table with project_id column entirely MISSING -> FAIL', `status=${r1.status} stdout=${r1.stdout} stderr=${r1.stderr}`);
+    await target.query('CREATE TABLE no_project_id_table (id SERIAL PRIMARY KEY, label TEXT)');
+    try {
+      const r1 = runScript('verify-15-t6-referential-integrity.js', ['--db', TARGET_DB], rosterEnv(rosterPath1));
+      if (r1.status !== 0 && /project_id column MISSING entirely/.test(r1.stdout + r1.stderr)) {
+        pass('T6-a', 'roster-scoped table EXISTS but is missing the project_id column entirely -> FAIL');
+      } else {
+        fail('T6-a', 'roster-scoped table EXISTS but is missing the project_id column entirely -> FAIL', `status=${r1.status} stdout=${r1.stdout} stderr=${r1.stderr}`);
+      }
+    } finally {
+      await target.query('DROP TABLE IF EXISTS no_project_id_table');
     }
 
     // Orphan edge -> FAIL.
