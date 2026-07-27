@@ -239,6 +239,62 @@ async function hashTableMultiset(client, table, cols, { idCol = 'id', projectCol
 }
 
 /**
+ * Same as hashTableMultiset, but excludes rows whose project_id is in
+ * `excludedProjectIds` — used by T3's forward-containment scan to keep
+ * DELIBERATELY-EXCLUDED source rows (T9's exclusion scenario) out of the
+ * source-side multiset, since those rows correctly never migrate and would
+ * otherwise spuriously fail T3's "every source row survived" proof.
+ *
+ * NOT EXISTS against unnest($1::text[]), never NOT IN (closes the
+ * finding raised in PR #152 review — this repo's canon forbids NOT IN
+ * (subquery) in any authored SQL, and this is exactly that shape if written
+ * naively). Passing an empty array is equivalent to hashTableMultiset with
+ * no filter (the WHERE clause is omitted entirely in that case, not run
+ * with an empty unnest — cheaper and avoids a degenerate-array edge case).
+ */
+async function hashTableMultisetExcludingProjects(client, table, cols, excludedProjectIds, { idCol = 'id', projectCol = 'project_id' } = {}) {
+  const selectCols = [idCol, projectCol, ...cols].filter((c, i, a) => a.indexOf(c) === i);
+  let sql = `SELECT ${selectCols.map((c) => `"${c}"`).join(', ')} FROM ${table}`;
+  const params = [];
+  if (excludedProjectIds && excludedProjectIds.length > 0) {
+    sql += ` t WHERE NOT EXISTS (SELECT 1 FROM unnest($1::text[]) AS ex(pid) WHERE ex.pid = t."${projectCol}")`;
+    params.push(excludedProjectIds);
+  }
+  const { rows } = await client.query(sql, params);
+  const counts = new Map();
+  for (const r of rows) {
+    const h = rowHash(cols, r);
+    const entry = counts.get(h) || { count: 0, sample: [] };
+    entry.count += 1;
+    if (entry.sample.length < 3) entry.sample.push({ id: r[idCol], project_id: r[projectCol] });
+    counts.set(h, entry);
+  }
+  return counts;
+}
+
+/**
+ * Load T1-recorded exclusions for one (source_db, source_table) pair from
+ * migration_manifest, split into the NULL-scoped (whole-DB/whole-table)
+ * exclusion, if any, and the list of project-scoped exclusions. Used by T3
+ * to scope its forward-containment source-side multiset to non-excluded
+ * rows only (closes the PR #152 review finding: T3 previously never
+ * consulted excluded_reason at all).
+ *
+ * @returns {Promise<{ nullScoped: object|null, projectScoped: object[] }>}
+ */
+async function loadExclusionsFor(tgtClient, sourceDb, sourceTable) {
+  const { rows } = await tgtClient.query(
+    `SELECT project_id_or_null, row_count, excluded_reason
+     FROM migration_manifest
+     WHERE source_db = $1 AND source_table = $2 AND excluded_reason IS NOT NULL`,
+    [sourceDb, sourceTable]
+  );
+  const nullScoped = rows.find((r) => r.project_id_or_null === null) || null;
+  const projectScoped = rows.filter((r) => r.project_id_or_null !== null);
+  return { nullScoped, projectScoped };
+}
+
+/**
  * Build the roster-derived load-bearing-columns map (targetTable ->
  * loadBearingCols). Fatal on any roster entry missing a mapping — never a
  * silent partial map (closes A-2).
@@ -418,6 +474,8 @@ module.exports = {
   NULL_SENTINEL,
   rowHash,
   hashTableMultiset,
+  hashTableMultisetExcludingProjects,
+  loadExclusionsFor,
   hashAndStoreStagingRows,
   buildLoadBearingColsFromRoster,
   DDL_SQL,

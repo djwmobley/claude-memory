@@ -462,6 +462,110 @@ async function testT3ContentHash() {
   }
 }
 
+async function testT3ExclusionAwareness() {
+  // Regression coverage for the PR #152 review finding: T3 must consult
+  // migration_manifest.excluded_reason and scope its source-side multiset
+  // to NON-excluded slices only — otherwise it spuriously FAILs whenever a
+  // source table has both an excluded slice and a legitimately-migrating
+  // slice (exactly T9's exclusion scenario).
+  const source = await pgConnect(SOURCE_DB);
+  const target = await pgConnect(TARGET_DB);
+  try {
+    await shared.applyDdl(target);
+    await setupSourceSchema(source);
+    await truncateAll(source, ['decisions']);
+    await truncateAll(target, ['migration_manifest', 'decisions']);
+
+    // Migrating slice: proj-migrate, 2 rows, migrated verbatim.
+    await source.query(`INSERT INTO decisions (project_id, topic, decision, reason) VALUES ('proj-migrate','t1','d1','r1'), ('proj-migrate','t2','d2','r2')`);
+    await target.query(`INSERT INTO decisions (project_id, topic, decision, reason) VALUES ('proj-migrate','t1','d1','r1'), ('proj-migrate','t2','d2','r2')`);
+    // Excluded slice: proj-excluded, 2 rows, correctly absent from target.
+    await source.query(`INSERT INTO decisions (project_id, topic, decision, reason) VALUES ('proj-excluded','ex1','exd1','exr1'), ('proj-excluded','ex2','exd2','exr2')`);
+
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint, excluded_reason)
+       VALUES ($1,'decisions','proj-migrate',2,'fp-migrate',NULL), ($1,'decisions','proj-excluded',2,'fp-excluded','eval-junk-project-id')`,
+      [SOURCE_DB]
+    );
+
+    const rosterPath = writeTmpJson('t3-excl-roster.json', [BASE_ROSTER[0]]);
+
+    // REGRESSION PROOF: the pre-fix behavior (hash the WHOLE source table,
+    // unscoped by exclusion) would find the excluded slice's hashes with
+    // zero match in target -- demonstrate that directly against the SAME
+    // fixture using the still-exported, still-unscoped hashTableMultiset.
+    const unscopedSrc = await shared.hashTableMultiset(source, 'decisions', BASE_ROSTER[0].loadBearingCols);
+    const unscopedTgt = await shared.hashTableMultiset(target, 'decisions', BASE_ROSTER[0].loadBearingCols);
+    let wouldHaveFailed = false;
+    for (const [hash, { count: srcCount }] of unscopedSrc) {
+      const tgtCount = (unscopedTgt.get(hash) || { count: 0 }).count;
+      if (tgtCount < srcCount) wouldHaveFailed = true;
+    }
+    if (wouldHaveFailed) {
+      pass('T3-excl-regression', 'unscoped whole-table hashing on this fixture DOES find a mismatch (proves the pre-fix bug shape is real on this fixture)');
+    } else {
+      fail('T3-excl-regression', 'unscoped whole-table hashing on this fixture DOES find a mismatch (proves the pre-fix bug shape is real on this fixture)', 'unscoped hashing unexpectedly found no mismatch -- fixture does not exercise the bug');
+    }
+
+    // THE FIX: the actual (current, exclusion-aware) script must PASS on
+    // this exact fixture, and must log the per-slice exclusion line.
+    const r1 = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r1.status === 0 && /excluding 2 row\(s\) for project_id=proj-excluded/.test(r1.stdout + r1.stderr)) {
+      pass('T3-excl-a', 'mixed table (excluded slice + migrating slice, target holds only migrating rows) -> PASS with explicit exclusion log line');
+    } else {
+      fail('T3-excl-a', 'mixed table (excluded slice + migrating slice, target holds only migrating rows) -> PASS with explicit exclusion log line', `status=${r1.status} stdout=${r1.stdout} stderr=${r1.stderr}`);
+    }
+
+    // Forward containment must NOT be weakened: remove one migrating-slice
+    // row from target -> T3 still FAILs.
+    await target.query(`DELETE FROM decisions WHERE topic = 't2' AND project_id = 'proj-migrate'`);
+    const r2 = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r2.status !== 0 && /multiset mismatch/.test(r2.stdout + r2.stderr)) {
+      pass('T3-excl-b', 'migrating-slice row missing from target -> T3 still FAILs (fix does not weaken forward containment)');
+    } else {
+      fail('T3-excl-b', 'migrating-slice row missing from target -> T3 still FAILs (fix does not weaken forward containment)', `status=${r2.status} stdout=${r2.stdout} stderr=${r2.stderr}`);
+    }
+    // Restore for the next sub-test.
+    await target.query(`INSERT INTO decisions (project_id, topic, decision, reason) VALUES ('proj-migrate','t2','d2','r2')`);
+
+    // NULL-scoped whole-DB exclusion -> table explicitly skipped by T3.
+    await truncateAll(target, ['migration_manifest']);
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint, excluded_reason)
+       VALUES ($1,'decisions',NULL,4,'fp-nullscoped','ephemeral-db-triage-drop')`,
+      [SOURCE_DB]
+    );
+    const r3 = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r3.status === 0 && /SKIP: .*whole-DB exclusion/.test(r3.stdout + r3.stderr)) {
+      pass('T3-excl-c', 'NULL-scoped whole-DB exclusion -> table explicitly SKIPped by T3 (never silent), exit 0');
+    } else {
+      fail('T3-excl-c', 'NULL-scoped whole-DB exclusion -> table explicitly SKIPped by T3 (never silent), exit 0', `status=${r3.status} stdout=${r3.stdout} stderr=${r3.stderr}`);
+    }
+
+    // The existing T9 NULL-scoped provenance fixture is UNCHANGED by this
+    // T3 fix -- re-confirm it still catches a leaked row under the SAME
+    // NULL-scoped exclusion recorded above (T9 never consults T3's scope
+    // decisions; it reads migration_manifest provenance directly).
+    const t9mod = require(scriptPath('verify-15-t9-negative.js'));
+    const roster = JSON.parse(fs.readFileSync(rosterPath, 'utf8'));
+    const provenanceIntact = await t9mod.checkExclusion(target, roster, {
+      excluded_reason: 'ephemeral-db-triage-drop', source_table: 'decisions', project_id_or_null: null,
+    });
+    await truncateAll(target, ['migration_manifest']); // simulate the leak: no confirming manifest row
+    const provenanceBroken = await t9mod.checkExclusion(target, roster, {
+      excluded_reason: 'ephemeral-db-triage-drop', source_table: 'decisions', project_id_or_null: null,
+    });
+    if (provenanceIntact.ok === true && provenanceBroken.ok === false) {
+      pass('T3-excl-t9-unaffected', 'T9 NULL-scoped provenance check still catches a leaked row after the T3 exclusion-awareness fix (no interaction/regression)');
+    } else {
+      fail('T3-excl-t9-unaffected', 'T9 NULL-scoped provenance check still catches a leaked row after the T3 exclusion-awareness fix (no interaction/regression)', `provenanceIntact=${JSON.stringify(provenanceIntact)} provenanceBroken=${JSON.stringify(provenanceBroken)}`);
+    }
+  } finally {
+    await source.end();
+    await target.end();
+  }
+}
+
 async function testT3bReverseContainment() {
   const target = await pgConnect(TARGET_DB);
   try {
@@ -958,6 +1062,7 @@ async function main() {
     await testT2Rowcount();
     await testT25Dualwrite();
     await testT3ContentHash();
+    await testT3ExclusionAwareness();
     await testT3bReverseContainment();
     await testT4RecallEquivalence();
     await testT5EmbeddingCoverage();

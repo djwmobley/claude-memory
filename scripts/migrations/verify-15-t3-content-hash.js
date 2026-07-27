@@ -34,6 +34,33 @@ const AUTHORED_BY = 'sonnet-t-battery-author-2026-07-27';
  * same documented scope boundary as T1 (migrate-08/09 don't exist yet in
  * this repo).
  *
+ * EXCLUSION-AWARE SCOPING (fix for the PR #152 review finding — the
+ * runbook's own §15.3 reference implementation had this same gap, amended
+ * in parallel). T3's forward-containment proof is "every source row that
+ * was SUPPOSED to migrate, survived" — it is NOT "every row that ever
+ * existed in the source table, regardless of T9's deliberate exclusions,
+ * survived." Before hashing a source table, this script loads that table's
+ * recorded exclusions from migration_manifest (excluded_reason IS NOT
+ * NULL, via shared.loadExclusionsFor):
+ *   - a NULL-scoped (whole-DB) exclusion takes the ENTIRE (source_db,
+ *     source_table) pair OUT of T3's forward scope entirely — an explicit
+ *     SKIP log line is printed, never silent; leakage detection for that
+ *     case remains T9's provenance check (§15.2's own structural note: a
+ *     roster-scoped TARGET table can never hold project_id IS NULL, so a
+ *     live source-vs-target hash comparison structurally cannot prove
+ *     anything about a whole-DB exclusion either way — T9 already owns
+ *     this proof via migration_manifest provenance, not T3);
+ *   - project-scoped exclusions filter THOSE projects' rows out of the
+ *     source-side multiset only (shared.hashTableMultisetExcludingProjects,
+ *     NOT EXISTS against unnest($1::text[]) — never NOT IN), with an
+ *     explicit per-slice log line naming the row count and excluded_reason.
+ * T3b (reverse containment, target⊆source) is UNCHANGED by this fix —
+ * excluded rows' hashes being present in migration_manifest_row_hashes
+ * (T1 snapshots ALL rows, excluded or not) does not create any EXTRA
+ * target-side row for T3b to flag; T3b only ever flags target rows with NO
+ * matching source hash, and excluded rows never migrate, so they are
+ * simply absent from the target-side multiset T3b scans. No change needed.
+ *
  * Usage: node scripts/migrations/verify-15-t3-content-hash.js [--db <target>]
  * Exit codes: 0 = every source hash found in target (multiset-complete),
  * 1 = any multiset mismatch, refused target, or roster mapping gap.
@@ -88,9 +115,31 @@ async function main() {
       try {
         for (const entry of entries) {
           const cols = entry.loadBearingCols;
+
+          let exclusions;
+          try {
+            exclusions = await shared.loadExclusionsFor(tgtClient, sourceDb, entry.source_table);
+          } catch (err) {
+            failed = true;
+            console.error(`[T3] FAIL: ${entry.source_table}: could not load exclusions from migration_manifest: ${err.message}`);
+            continue;
+          }
+
+          if (exclusions.nullScoped) {
+            console.log(`[T3] SKIP: ${sourceDb}.${entry.source_table}: whole-DB exclusion recorded (excluded_reason='${exclusions.nullScoped.excluded_reason}') — out of T3's forward scope; leakage detection is T9's provenance check, not T3.`);
+            continue;
+          }
+
+          for (const ex of exclusions.projectScoped) {
+            console.log(`[T3] ${entry.source_table}: excluding ${ex.row_count} row(s) for project_id=${ex.project_id_or_null} from T3 scope as '${ex.excluded_reason}'.`);
+          }
+          const excludedProjectIds = exclusions.projectScoped.map((ex) => ex.project_id_or_null);
+
           let srcCounts, tgtCounts;
           try {
-            srcCounts = await shared.hashTableMultiset(srcClient, entry.source_table, cols);
+            srcCounts = excludedProjectIds.length > 0
+              ? await shared.hashTableMultisetExcludingProjects(srcClient, entry.source_table, cols, excludedProjectIds)
+              : await shared.hashTableMultiset(srcClient, entry.source_table, cols);
           } catch (err) {
             failed = true;
             console.error(`[T3] FAIL: ${sourceDb}.${entry.source_table}: source query error: ${err.message}`);
