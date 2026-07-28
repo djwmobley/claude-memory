@@ -14,6 +14,23 @@
  *        record.  Proves annotateOnly prevents close-time mutation.
  *   OT6  getMergedPrSet unit: parses (#NNN) from subjects, memoizes, returns null
  *        on git failure from a non-git directory.
+ *   OT7  Regression (issue #150): qualified cross-repo refs ("foreignrepo#N",
+ *        "owner/repo#N") whose N IS in the local merged set → probe returns
+ *        null (no false [STALE:]).
+ *   OT8  Named tradeoff: prose-glued local form "PR#N" with N merged → probe
+ *        returns null (locked as intended behavior, not a future bug).
+ *   OT9  Non-weakening: bare "(#N)" and whitespace-preceded "#N" with N
+ *        merged still return the staleness hint (existing OT1/OT1b/OT6c
+ *        signal must survive the #150 fix untouched).
+ *   OT10 Start-of-string "#N" (no preceding char) → still a local candidate.
+ *   OT11 Chained "#12#13" shape → second token suppressed (digit precedes
+ *        its "#"); a lookbehind artifact in the safe (suppress) direction.
+ *   OT12 (adversary finding #11) getMergedPrSet parens-adjacency immunity:
+ *        commit subject "fix cross-repo (foreignrepo#16) handling (#150)"
+ *        → merged set contains "150", does NOT contain "16".
+ *   OT13 Unicode-preceded "#N" (em-dash / non-ASCII letter directly before
+ *        "#") → local candidate (locks the ASCII-only class against a
+ *        future `\p{L}`/`\w` "improvement" that would reintroduce #150).
  *
  * Uses the claude_memory_eval_test database (same as other test/handoff tests).
  * Each test with DB access uses an isolated projectId and cleans up after itself.
@@ -37,6 +54,7 @@ const { resolveHandoffMdPath } = require('../../scripts/lib/handoff-paths');
 const {
   getMergedPrSet,
   probeOpenThread,
+  OPEN_THREAD_TOKEN_RE,
 } = require('../../scripts/lib/reality-checks');
 const { createRequire } = require('module');
 const scriptsRequire    = createRequire(require.resolve('../../scripts/package.json'));
@@ -503,6 +521,214 @@ async function runTests() {
       const occurrences = (result.match(/#9006/g) || []).length;
       assert.strictEqual(occurrences, 1,
         `Expected #9006 mentioned exactly once in deduped output, got ${occurrences}: ${result}`);
+    } finally {
+      try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}
+    }
+  });
+
+  // ── OT7: Regression (#150) — qualified cross-repo refs never match local set ──
+  //
+  // The bug: `foreignrepo#12` or `owner/repo#12` had its `#12` intersected
+  // with LOCAL PR numbers.  Seed a temp repo where #12 IS locally merged, then
+  // probe with qualified-ref haystacks citing #12 — must return null.
+  await test('(OT7) regression #150: qualified cross-repo refs → NO false annotation', async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ot7-qualified-'));
+    try {
+      const gitEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: 'test', GIT_AUTHOR_EMAIL: 'test@test',
+        GIT_COMMITTER_NAME: 'test', GIT_COMMITTER_EMAIL: 'test@test',
+      };
+      execFileSync('git', ['init'], { cwd: tmpRoot, encoding: 'utf8', timeout: 5000 });
+      execFileSync('git', ['commit', '--allow-empty', '-m', 'feat: thing (#12)', '--no-gpg-sign'],
+        { cwd: tmpRoot, encoding: 'utf8', timeout: 5000, env: gitEnv });
+
+      const foreignRepoForm = probeOpenThread(tmpRoot, 'see foreignrepo#12 for context', 'subj');
+      assert.strictEqual(foreignRepoForm, null,
+        `Expected null for "foreignrepo#12" haystack (local #12 IS merged), got: ${foreignRepoForm}`);
+
+      const ownerRepoForm = probeOpenThread(tmpRoot, 'tracked in owner/repo#12', 'subj');
+      assert.strictEqual(ownerRepoForm, null,
+        `Expected null for "owner/repo#12" haystack (local #12 IS merged), got: ${ownerRepoForm}`);
+    } finally {
+      try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}
+    }
+  });
+
+  // ── OT8: Named tradeoff — glued "PR#N" form is intentionally lossy ─────────
+  await test('(OT8) named tradeoff: glued "PR#N" form → NO annotation (locked, not a bug)', async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ot8-glued-'));
+    try {
+      const gitEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: 'test', GIT_AUTHOR_EMAIL: 'test@test',
+        GIT_COMMITTER_NAME: 'test', GIT_COMMITTER_EMAIL: 'test@test',
+      };
+      execFileSync('git', ['init'], { cwd: tmpRoot, encoding: 'utf8', timeout: 5000 });
+      execFileSync('git', ['commit', '--allow-empty', '-m', 'feat: thing (#152)', '--no-gpg-sign'],
+        { cwd: tmpRoot, encoding: 'utf8', timeout: 5000, env: gitEnv });
+
+      const result = probeOpenThread(tmpRoot, 'see PR#152 for the base change', 'subj');
+      assert.strictEqual(result, null,
+        `Expected null for glued "PR#152" (accepted tradeoff — ambiguous forms are ` +
+        `never distinguished from qualified cross-repo refs), got: ${result}`);
+    } finally {
+      try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}
+    }
+  });
+
+  // ── OT9: Non-weakening — bare "(#N)" and whitespace-preceded "#N" still fire ──
+  await test('(OT9) non-weakening: "(#N)" and whitespace-preceded "#N" still return staleness hint', async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ot9-nonweak-'));
+    try {
+      const gitEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: 'test', GIT_AUTHOR_EMAIL: 'test@test',
+        GIT_COMMITTER_NAME: 'test', GIT_COMMITTER_EMAIL: 'test@test',
+      };
+      execFileSync('git', ['init'], { cwd: tmpRoot, encoding: 'utf8', timeout: 5000 });
+      execFileSync('git', ['commit', '--allow-empty', '-m', 'feat: thing (#9009)', '--no-gpg-sign'],
+        { cwd: tmpRoot, encoding: 'utf8', timeout: 5000, env: gitEnv });
+
+      const parenForm = probeOpenThread(tmpRoot, 'follow-up work (#9009) pending', 'subj');
+      assert.ok(typeof parenForm === 'string' && parenForm.includes('#9009'),
+        `Expected staleness hint for "(#9009)" form, got: ${parenForm}`);
+
+      const wsForm = probeOpenThread(tmpRoot, 'follow-up work item #9009 pending', 'subj');
+      assert.ok(typeof wsForm === 'string' && wsForm.includes('#9009'),
+        `Expected staleness hint for whitespace-preceded "#9009" form, got: ${wsForm}`);
+    } finally {
+      try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}
+    }
+  });
+
+  // ── OT10: Start-of-string "#N" (no preceding char) → still a local candidate ──
+  //
+  // probeOpenThread's real haystack is always `subject + ' ' + object`, so a
+  // literal index-0 "#" is unreachable through its public interface (there is
+  // always at least a joining space before the object's content, even when
+  // subject is empty).  To lock the TRUE start-of-string boundary condition
+  // — the negative lookbehind at index 0, where there is no preceding
+  // character at all for it to inspect — this test exercises the exported
+  // OPEN_THREAD_TOKEN_RE pattern directly against a string that begins with
+  // "#N", plus an end-to-end confirmation via probeOpenThread using a
+  // whitespace-preceded token (the closest reachable equivalent, already
+  // covered structurally by the same "not an ownership char" branch).
+  await test('(OT10) start-of-string "#N" (no preceding char) → local candidate', async () => {
+    // Direct pattern lock: index 0 of the string, nothing precedes "#".
+    const re = new RegExp(OPEN_THREAD_TOKEN_RE.source, OPEN_THREAD_TOKEN_RE.flags);
+    const m = re.exec('#9010 needs follow-up');
+    assert.ok(m !== null, 'Expected OPEN_THREAD_TOKEN_RE to match "#9010" at true start-of-string');
+    assert.strictEqual(m.index, 0, `Expected match at index 0, got index ${m && m.index}`);
+    assert.strictEqual(m[1], '9010', `Expected captured digits "9010", got: ${m && m[1]}`);
+
+    // End-to-end confirmation via the real probe (reachable equivalent).
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ot10-startofstring-'));
+    try {
+      const gitEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: 'test', GIT_AUTHOR_EMAIL: 'test@test',
+        GIT_COMMITTER_NAME: 'test', GIT_COMMITTER_EMAIL: 'test@test',
+      };
+      execFileSync('git', ['init'], { cwd: tmpRoot, encoding: 'utf8', timeout: 5000 });
+      execFileSync('git', ['commit', '--allow-empty', '-m', 'feat: thing (#9010)', '--no-gpg-sign'],
+        { cwd: tmpRoot, encoding: 'utf8', timeout: 5000, env: gitEnv });
+
+      const result = probeOpenThread(tmpRoot, '#9010 needs follow-up', '');
+      assert.ok(typeof result === 'string' && result.includes('#9010'),
+        `Expected staleness hint when "#9010" is the first token in the object, got: ${result}`);
+    } finally {
+      try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}
+    }
+  });
+
+  // ── OT11: Chained "#12#13" — second token suppressed (digit precedes it) ────
+  await test('(OT11) chained "#N#M": second token suppressed (lookbehind artifact, safe direction)', async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ot11-chained-'));
+    try {
+      const gitEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: 'test', GIT_AUTHOR_EMAIL: 'test@test',
+        GIT_COMMITTER_NAME: 'test', GIT_COMMITTER_EMAIL: 'test@test',
+      };
+      execFileSync('git', ['init'], { cwd: tmpRoot, encoding: 'utf8', timeout: 5000 });
+      // Both #9011 and #9012 are locally merged.
+      execFileSync('git', ['commit', '--allow-empty', '-m', 'feat: thing (#9011)', '--no-gpg-sign'],
+        { cwd: tmpRoot, encoding: 'utf8', timeout: 5000, env: gitEnv });
+      execFileSync('git', ['commit', '--allow-empty', '-m', 'feat: other (#9012)', '--no-gpg-sign'],
+        { cwd: tmpRoot, encoding: 'utf8', timeout: 5000, env: gitEnv });
+
+      // "#9011#9012" — the digit "1" (last char of "9011") immediately
+      // precedes the second "#", so #9012 is suppressed even though it is
+      // itself a plausible local ref and is in the merged set.  Only #9011
+      // (start-of-token, unsuppressed) should appear in the result.
+      const result = probeOpenThread(tmpRoot, '#9011#9012', 'subj');
+      assert.ok(typeof result === 'string', `Expected a string result (at least #9011 fires), got: ${result}`);
+      assert.ok(result.includes('#9011'), `Expected #9011 in result, got: ${result}`);
+      assert.ok(!result.includes('#9012'),
+        `Expected #9012 to be suppressed (digit "1" precedes its "#"), got: ${result}`);
+    } finally {
+      try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}
+    }
+  });
+
+  // ── OT12 (adversary finding #11): parens-adjacency immunity ─────────────────
+  //
+  // Locks getMergedPrSet's `\(#(\d+)\)` pattern against a future refactor:
+  // a commit subject that contains a qualified cross-repo ref INSIDE the same
+  // subject as a real parenthesized squash-merge anchor must only harvest the
+  // parenthesized number, never the qualified one, even though both are
+  // present in the same string.
+  await test('(OT12) getMergedPrSet: parens-adjacency immunizes against qualified refs in the same subject', async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ot12-parens-immunity-'));
+    try {
+      const gitEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: 'test', GIT_AUTHOR_EMAIL: 'test@test',
+        GIT_COMMITTER_NAME: 'test', GIT_COMMITTER_EMAIL: 'test@test',
+      };
+      execFileSync('git', ['init'], { cwd: tmpRoot, encoding: 'utf8', timeout: 5000 });
+      execFileSync(
+        'git',
+        ['commit', '--allow-empty', '-m', 'fix cross-repo (foreignrepo#16) handling (#150)', '--no-gpg-sign'],
+        { cwd: tmpRoot, encoding: 'utf8', timeout: 5000, env: gitEnv }
+      );
+
+      const mergedSet = getMergedPrSet(tmpRoot);
+      assert.ok(mergedSet !== null, 'getMergedPrSet should succeed on a valid git repo');
+      assert.ok(mergedSet.has('150'), `Expected "150" in merged set; got: ${[...mergedSet]}`);
+      assert.ok(!mergedSet.has('16'),
+        `Expected "16" NOT in merged set (qualified ref inside parens-adjacent subject ` +
+        `must not be harvested); got: ${[...mergedSet]}`);
+    } finally {
+      try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}
+    }
+  });
+
+  // ── OT13: Unicode-preceded "#N" → local candidate (locks ASCII-only class) ──
+  await test('(OT13) Unicode-preceded "#N" (em-dash / non-ASCII letter) → local candidate', async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ot13-unicode-'));
+    try {
+      const gitEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: 'test', GIT_AUTHOR_EMAIL: 'test@test',
+        GIT_COMMITTER_NAME: 'test', GIT_COMMITTER_EMAIL: 'test@test',
+      };
+      execFileSync('git', ['init'], { cwd: tmpRoot, encoding: 'utf8', timeout: 5000 });
+      execFileSync('git', ['commit', '--allow-empty', '-m', 'feat: thing (#9013)', '--no-gpg-sign'],
+        { cwd: tmpRoot, encoding: 'utf8', timeout: 5000, env: gitEnv });
+
+      // Em-dash directly before "#".
+      const emDashForm = probeOpenThread(tmpRoot, 'follow-up work—#9013 pending', 'subj');
+      assert.ok(typeof emDashForm === 'string' && emDashForm.includes('#9013'),
+        `Expected staleness hint for em-dash-preceded "#9013", got: ${emDashForm}`);
+
+      // Non-ASCII letter directly before "#" (must NOT be treated as an
+      // ownership char even though it IS a letter — this is what locks the
+      // ASCII-only decision against a future \p{L}/\w "improvement").
+      const unicodeLetterForm = probeOpenThread(tmpRoot, 'café#9013 pending', 'subj');
+      assert.ok(typeof unicodeLetterForm === 'string' && unicodeLetterForm.includes('#9013'),
+        `Expected staleness hint for non-ASCII-letter-preceded "#9013", got: ${unicodeLetterForm}`);
     } finally {
       try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}
     }

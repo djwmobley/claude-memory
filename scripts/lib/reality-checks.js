@@ -475,6 +475,30 @@ function getMergedPrSet(root) {
 }
 
 /**
+ * OPEN_THREAD_TOKEN_RE — the #NNN token-classification pattern used by
+ * probeOpenThread (issue #150 fix).
+ *
+ * Matches a "#" immediately followed by one or more digits, EXCLUDING any
+ * occurrence where the single character immediately preceding "#" is an
+ * "ownership char" — [A-Za-z0-9_.-], deliberately ASCII-only (GitHub
+ * owner/repo names are ASCII-only; do not widen to \w with Unicode
+ * semantics or \p{L} — see the classification comment inside probeOpenThread
+ * for the full rationale and the accepted "PR#152" tradeoff).
+ *
+ * Hoisted to module scope as the single source of truth for this pattern,
+ * and exported for direct test introspection (see OT10 in
+ * test-open-thread-verify.js, which locks the true start-of-string boundary
+ * condition that is otherwise unreachable through probeOpenThread's public
+ * interface, since its haystack always joins `subject + ' ' + object`).
+ *
+ * 'g'-flagged and therefore stateful (lastIndex) — callers that need to
+ * exec() this pattern more than once, or across a fresh string each time,
+ * MUST clone it first (`new RegExp(OPEN_THREAD_TOKEN_RE.source, OPEN_THREAD_TOKEN_RE.flags)`)
+ * to avoid lastIndex bleed between calls.
+ */
+const OPEN_THREAD_TOKEN_RE = /(?<![A-Za-z0-9_.-])#(\d+)/g;
+
+/**
  * probeOpenThread — Serve-time staleness probe for open_thread assertions.
  *
  * open_thread objects are pure freeform model belief; there is no stable
@@ -500,6 +524,14 @@ function getMergedPrSet(root) {
  * annotateOnly: true ensures this probe never triggers auto-suppression or
  * degraded-close alarms at close time.
  *
+ * WARNING (self-amplification risk — behavioral, not code-reachable): the
+ * served [STALE: ...] annotation this probe produces is presentation-layer
+ * only.  Never copy-paste an annotated served line verbatim into a NEW
+ * assertion object — doing so would bake the probe's own prior output back
+ * in as freeform prose, which is itself just another #NNN citation the next
+ * probe pass would re-evaluate (and, if authored in a glued form, silently
+ * lose its staleness signal — see the SUPPRESSED-branch tradeoff below).
+ *
  * Fail-soft: all errors caught; returns null on any exception.
  *
  * @param {string} root    - absolute project root
@@ -511,14 +543,62 @@ function probeOpenThread(root, object, subject) {
   try {
     // Combine subject and object into one haystack to find any cited PR numbers.
     const hay = `${subject || ''} ${object || ''}`;
+
+    // Token classification (issue #150, adversary-hardened spec).
+    //
+    // The original implementation matched every "#N" token in the haystack
+    // against the local merged-PR set, with no regard for what precedes the
+    // "#".  A QUALIFIED cross-repo reference like "memory-manager#12" or
+    // "owner/repo#12" was therefore matched against LOCAL PR numbers,
+    // producing false [STALE:] annotations whenever the local set happened
+    // to contain the same number as a foreign issue/PR.
+    //
+    // Fix: for every "#N" token, let P be the single character immediately
+    // preceding "#" (direct adjacency).  This is a TOTAL classification —
+    // every token lands in exactly one of two branches; there is no third
+    // "ambiguous" case:
+    //
+    //   SUPPRESSED (excluded from `cited` by the negative lookbehind below):
+    //     P exists and P is in [A-Za-z0-9_.-] — deliberately ASCII-only,
+    //     because GitHub owner/repo names are ASCII-only.  Do NOT widen this
+    //     to \w (Unicode word chars) or \p{L}: a WIDER class only pushes
+    //     MORE tokens into this safe (suppressed) branch, never fewer, so it
+    //     can't reintroduce the bug — but a narrower or Unicode-aware class
+    //     could let a qualified ref (e.g. "café#12") slip through as a
+    //     local candidate.  This one branch deliberately covers BOTH true
+    //     qualified cross-repo refs ("repo#N", "owner/repo#N") AND
+    //     prose-glued local refs ("PR#152", "commit#12", "fix.#12",
+    //     "bullet-#12") — the classifier does NOT try to distinguish them;
+    //     ambiguity always resolves to no-annotation (friction over a false
+    //     positive).
+    //     ACCEPTED TRADEOFF: glued local refs like "PR#152" lose their
+    //     staleness signal.  This is unavoidable — they are textually
+    //     identical to the cross-repo form that caused the bug.  This
+    //     repo's squash-merge convention always parenthesizes merged-PR
+    //     anchors ("(#N)", never "PR#N"), so close.md-authored anchors never
+    //     take the lossy glued form in practice.
+    //   LOCAL-CANDIDATE (matched by the regex, checked against the merged
+    //     set exactly as before): P is undefined (start of haystack) or P is
+    //     NOT in that set — whitespace, "(", "[", ",", ":", quotes,
+    //     backtick, em-dash, a Unicode letter, etc.
+    //
+    // Chained "#12#13": the second token's preceding character is the digit
+    // "2" (an ownership char), so it is suppressed even though it reads like
+    // a plausible local ref on its own.  This is an artifact of the
+    // lookbehind resolving in the safe (suppress) direction, not a
+    // deliberate design decision about chained refs specifically.
     const cited = [];
-    const re = /#(\d+)/g;
+    // Fresh RegExp per call (module-level OPEN_THREAD_TOKEN_RE is 'g'-flagged
+    // and stateful via lastIndex; sharing one instance across calls would be
+    // unsafe under concurrent/interleaved use).
+    const re = new RegExp(OPEN_THREAD_TOKEN_RE.source, OPEN_THREAD_TOKEN_RE.flags);
     let m;
     while ((m = re.exec(hay)) !== null) {
       cited.push(m[1]);
     }
     if (cited.length === 0) {
-      // No #NNN anchor in this thread — no basis for a signal.
+      // No #NNN anchor in this thread (or every #NNN token was suppressed
+      // as a qualified/glued ref) — no basis for a signal.
       return null;
     }
 
@@ -845,4 +925,5 @@ module.exports = {
   probePrState,
   getMergedPrSet,
   probeOpenThread,
+  OPEN_THREAD_TOKEN_RE,
 };
