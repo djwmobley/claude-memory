@@ -123,7 +123,7 @@ function encodeCwd(p) {
 }
 
 /**
- * Read the .claude-memory marker UUID from a directory.
+ * Read the project marker UUID from a directory.
  * Returns the UUID string if present and valid, or the encodeCwd fallback otherwise.
  *
  * @param {string} dir

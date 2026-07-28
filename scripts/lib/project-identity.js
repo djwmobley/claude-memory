@@ -55,10 +55,12 @@ const crypto = require('crypto');
 const { encodeCwd }               = require('./encoded-cwd');
 const {
   MARKER_FILENAME,
+  LEGACY_MARKER_FILENAME,
   findProjectRootByMarker,
   readMarker,
   writeMarker,
 } = require('./project-marker');
+const { resolveHandoffMdPath }    = require('./handoff-paths');
 
 /**
  * Walk upward from `startDir` looking for a `.git` directory — the legacy
@@ -186,8 +188,9 @@ function verifyByteIdentical(srcPath, newPath) {
  * @returns {{ uuid, created_at, schema_version }}
  */
 function writeMarkerAtomic(rootDir) {
-  const markerPath = path.join(rootDir, MARKER_FILENAME);
-  const tmpPath    = markerPath + '.tmp.' + process.pid + '.' + crypto.randomBytes(4).toString('hex');
+  const markerPath       = path.join(rootDir, MARKER_FILENAME);
+  const legacyMarkerPath = path.join(rootDir, LEGACY_MARKER_FILENAME);
+  const tmpPath           = markerPath + '.tmp.' + process.pid + '.' + crypto.randomBytes(4).toString('hex');
 
   // Delegate UUID generation + serialization to the existing writeMarker helper
   // but write to the tmp path instead.  We avoid calling writeMarker() directly
@@ -202,9 +205,13 @@ function writeMarkerAtomic(rootDir) {
   // overwrites the destination even if it exists (no EEXIST thrown).  To provide
   // collision-detection on both platforms, check existence BEFORE the rename and
   // clean up the temp file if the marker is already present.
-  if (fs.existsSync(markerPath)) {
+  //
+  // C10: check BOTH the new-name and legacy-name markers — a single-name existence
+  // check is an allow-list of one; the write-time collision check must be total.
+  if (fs.existsSync(markerPath) || fs.existsSync(legacyMarkerPath)) {
     try { fs.unlinkSync(tmpPath); } catch (_) {}
-    throw new Error(`writeMarker: marker already exists at ${markerPath} — concurrent process won the race`);
+    const existingPath = fs.existsSync(markerPath) ? markerPath : legacyMarkerPath;
+    throw new Error(`writeMarker: marker already exists at ${existingPath} — concurrent process won the race`);
   }
   try {
     fs.renameSync(tmpPath, markerPath);
@@ -500,7 +507,7 @@ async function ensureProjectIdentity(db, opts = {}) {
   // in shared.js. Explicit opts.cwd overrides both.
   const cwd = opts.cwd || process.env.PROJECT_ROOT || process.cwd();
 
-  // ── Step 1: Try to locate the project root via the .claude-memory marker ──
+  // ── Step 1: Try to locate the project root via the project marker ────────
   const markerRoot = findProjectRootByMarker(cwd);
 
   if (markerRoot) {
@@ -508,7 +515,7 @@ async function ensureProjectIdentity(db, opts = {}) {
     if (!marker) {
       // Marker file exists but is malformed — fatal.
       _fatalIdentity(
-        `[handoff:identity] FATAL — .claude-memory marker exists at ${path.join(markerRoot, MARKER_FILENAME)} ` +
+        `[handoff:identity] FATAL — project marker exists at ${path.join(markerRoot, MARKER_FILENAME)} ` +
         `but could not be parsed. The file may be corrupt.\n` +
         `  Please delete it and re-run to mint a fresh marker, OR restore from backup.\n`
       );
@@ -590,7 +597,7 @@ async function ensureProjectIdentity(db, opts = {}) {
         );
       }
       _fatalIdentity(
-        `[handoff:identity] FATAL — could not write .claude-memory marker: ${markerErr.message}\n` +
+        `[handoff:identity] FATAL — could not write project marker: ${markerErr.message}\n` +
         `  Project root: ${legacyRoot}\n` +
         `  Migration aborted.\n`
       );
@@ -630,7 +637,7 @@ async function ensureProjectIdentity(db, opts = {}) {
       }
     }
     _fatalIdentity(
-      `[handoff:identity] FATAL — could not mint .claude-memory marker for fresh project: ${markerErr.message}\n` +
+      `[handoff:identity] FATAL — could not mint project marker for fresh project: ${markerErr.message}\n` +
       `  Project root: ${legacyRoot}\n`
     );
   }
@@ -754,12 +761,15 @@ async function _hasAnyRows(db, projectId) {
   return false;
 }
 
+// Delegates to the shared resolveHandoffMdPath (honors HANDOFF_BASE_DIR) —
+// never a parallel copy of the base-dir resolution logic (same rule as the
+// deleted hand-rolled duplicates in test-pg-helpers.js; see #135).
 function _legacyHandoffPath(legacyId) {
-  return path.join(os.homedir(), '.claude', 'projects', legacyId, 'handoff.md');
+  return resolveHandoffMdPath(legacyId);
 }
 
 function _newHandoffPath(uuid) {
-  return path.join(os.homedir(), '.claude', 'projects', uuid, 'handoff.md');
+  return resolveHandoffMdPath(uuid);
 }
 
 /**

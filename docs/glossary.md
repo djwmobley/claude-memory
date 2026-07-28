@@ -35,7 +35,7 @@ A fancy word for "we track two different timestamps for every fact." The first t
 
 ### CLAUDE.md
 
-A plain text file at the root of your project that Claude reads automatically at the start of every session. It's where standing instructions, preferences, and high-confidence durable facts live. Think of it as the briefing sheet Claude gets every morning before the workday starts. Running `/handoff:init` creates one for you.
+A plain text file at the root of your project that Claude reads automatically at the start of every session. It's where standing instructions, preferences, and high-confidence durable facts live. Think of it as the briefing sheet Claude gets every morning before the workday starts. Running `/handoff:init` creates one for you. The filename is the default durable-facts promotion target; a non-Claude-Code MCP client can point it at a different file via `HANDOFF_PROMOTION_FILE`.
 
 ### Confidence
 
@@ -59,7 +59,7 @@ A thing Claude is tracking — a project, a person, a decision, a file, a bug, a
 
 ### Handoff.md (thin pointer)
 
-A markdown file that lives outside your repo (in a private `~/.claude/projects/` folder). After the north-star inversion, this file is a **thin pointer** — it carries only the project metadata header (project ID, last close time, contract name, session summary counts) and refers to Postgres for TL;DR, open threads, and quick references. It is not the prose store of session state. You do not edit it by hand — `/handoff:close` renders it; the loader reads the contract name from it at session start. See also: **north-star inversion**, **North star**, **session intent section**, **session seam**.
+A markdown file that lives outside your repo (by default, in a private `~/.claude/projects/` folder — the base directory is configurable via `HANDOFF_BASE_DIR` for non-Claude-Code clients). After the north-star inversion, this file is a **thin pointer** — it carries only the project metadata header (project ID, last close time, contract name, session summary counts) and refers to Postgres for TL;DR, open threads, and quick references. It is not the prose store of session state. You do not edit it by hand — `/handoff:close` renders it; the loader reads the contract name from it at session start. See also: **north-star inversion**, **North star**, **session intent section**, **session seam**.
 
 ### HNSW
 

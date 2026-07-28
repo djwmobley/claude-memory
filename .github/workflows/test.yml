@@ -422,6 +422,34 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run host-agnostic naming tests
+        # Regression guard for #135 (host-agnostic naming generalization):
+        #   M1-M7  Dual-marker same-directory classification (new .memory-engine
+        #          name + legacy .claude-memory read-fallback): only-new,
+        #          only-legacy, both-same-uuid, both-different-uuid (HARD ERROR),
+        #          both-corrupt (HARD ERROR), per-level walk-up (nearer dir wins
+        #          regardless of marker name), write-time collision check against
+        #          BOTH names.
+        #   B1-B11 HANDOFF_BASE_DIR validation matrix, including the win32
+        #          drive-letter requirement and the /c/Users MSYS-trap rejection
+        #          (process.platform is mocked so both the win32 and POSIX
+        #          branches run deterministically in one CI job).
+        #   P1-P13 HANDOFF_PROMOTION_FILE validation matrix: default, reserved-name
+        #          collisions (case-insensitive), whitespace rejection,
+        #          separator/'..'/absolute rejection, on-disk case-collision reuse.
+        #   D1-D4  are_safe_outside_claude-memory -> are_safe_outside_this_project
+        #          predicate migration collision-safety: a subject with dual
+        #          live rows survives the schema re-apply with no unique
+        #          violation; a legacy-only subject is renamed in place;
+        #          idempotent on a second re-apply.
+        # M/B/P tests are pure unit/filesystem tests; D tests use the
+        # claude_memory_eval_test DB (created above) with an isolated namespaced
+        # schema; drops the namespace on exit — no public schema or real data touched.
+        run: node scripts/test-host-agnostic-naming.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run pointer-staleness gate tests
         # Tests the pointer-staleness gate added in feat/pointer-staleness-gate-v2:
         #   T1  symbol anchor matches at cited lines → emit unchanged

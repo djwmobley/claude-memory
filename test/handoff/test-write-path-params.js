@@ -36,6 +36,7 @@ const { execFileSync, spawnSync } = require('child_process');
 const { loadConfig }  = require('../../scripts/lib/shared');
 const { encodeCwd }   = require('../../scripts/lib/encoded-cwd');
 const { writeMarker } = require('../../scripts/lib/project-marker');
+const { resolveHandoffMdPath } = require('../../scripts/lib/handoff-paths');
 
 const { createRequire } = require('module');
 const scriptsRequire = createRequire(require.resolve('../../scripts/package.json'));
@@ -227,7 +228,7 @@ async function teardown() {
   try { if (fakeRoot) fs.rmSync(fakeRoot, { recursive: true, force: true }); } catch (_) {}
   try {
     if (projectUuid) {
-      const dir = path.join(os.homedir(), '.claude', 'projects', projectUuid);
+      const dir = path.dirname(resolveHandoffMdPath(projectUuid));
       if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
     }
   } catch (_) {}

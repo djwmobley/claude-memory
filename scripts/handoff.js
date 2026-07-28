@@ -42,7 +42,6 @@ const __startNs = process.hrtime.bigint();
 
 const fs    = require('fs');
 const path  = require('path');
-const os    = require('os');
 const readline = require('readline');
 
 const { loadConfig, connect, c, findProjectRoot } = require('./lib/shared');
@@ -56,6 +55,7 @@ const {
 const { canonicalize }                             = require('./lib/subject-canon');
 const {
   MARKER_FILENAME,
+  LEGACY_MARKER_FILENAME,
   findProjectRootByMarker,
   readMarker,
   writeMarker,
@@ -66,6 +66,10 @@ const {
   ensureProjectIdentity,
   reconcileLegacySettings,
 } = require('./lib/project-identity');
+const {
+  resolveHandoffMdPath,
+  resolvePromotionFilePath,
+} = require('./lib/handoff-paths');
 const { embedQuery }                               = require('./lib/embed');
 const { execFileSync }                             = require('child_process');
 const crypto                                       = require('crypto');
@@ -191,7 +195,8 @@ async function connectHandoff() {
  * available id WITHOUT running the one-shot migration.
  *
  * Resolution order:
- *   1. If a .claude-memory marker exists at/above cwd → return the UUID.
+ *   1. If a project marker (new name, or legacy .claude-memory) exists at/above
+ *      cwd → return the UUID.
  *   2. Otherwise fall back to encodeCwd(root) for backward compatibility.
  *
  * For the authoritative identity (with migration), use ensureProjectIdentity()
@@ -212,10 +217,8 @@ function resolveProjectId() {
   return encodeCwd(root);
 }
 
-/** Resolve the ~/.claude/projects/<projectId>/handoff.md path. */
-function resolveHandoffMdPath(projectId) {
-  return path.join(os.homedir(), '.claude', 'projects', projectId, 'handoff.md');
-}
+// resolveHandoffMdPath is imported from ./lib/handoff-paths (honors HANDOFF_BASE_DIR;
+// defaults to ~/.claude/projects/<projectId>/handoff.md). See the import block above.
 
 /** Read handoff.md frontmatter as a plain object. Returns {} if missing. */
 function readHandoffFrontmatter(handoffPath) {
@@ -1604,8 +1607,9 @@ function printPreflightLine(result, stepDesc) {
 async function cmdInit(args) {
   console.log('Running: handoff:init\n');
 
-  // Determine project root: prefer the .claude-memory marker if present, else
-  // fall back to the .git walk (same as legacy behavior for the init case).
+  // Determine project root: prefer the project marker (new name, or legacy
+  // .claude-memory) if present, else fall back to the .git walk (same as
+  // legacy behavior for the init case).
   // Honor PROJECT_ROOT env var as the starting point, matching findProjectRoot().
   const initCwd    = process.env.PROJECT_ROOT || process.cwd();
   const markerRoot = findProjectRootByMarker(initCwd);
@@ -1614,7 +1618,7 @@ async function cmdInit(args) {
   // ── Resolve or mint the project UUID (FS-deferred for atomicity) ──────────
   //
   // When no marker exists yet, we mint the UUID in memory and defer writing
-  // the .claude-memory file to the very last step — AFTER all DB operations
+  // the project marker file to the very last step — AFTER all DB operations
   // and all other FS writes succeed.  This ensures a failed init cannot leave
   // the project appearing handoff-enabled when the DB was never provisioned.
   //
@@ -1647,19 +1651,19 @@ async function cmdInit(args) {
     const existingMarker = readMarker(root);
     if (existingMarker) {
       projectId = existingMarker.uuid;
-      console.log(`  [OK]    .claude-memory marker present: uuid=${projectId}`);
+      console.log(`  [OK]    project marker present: uuid=${projectId}`);
       // marker already exists — no deferred write needed
     } else {
       // Mint UUID in memory; do NOT write the marker file yet.
       projectId     = mintUUID();
       markerDeferred = true;
-      console.log(`  [OK]    .claude-memory marker minted (deferred): uuid=${projectId}`);
+      console.log(`  [OK]    project marker minted (deferred): uuid=${projectId}`);
       console.log(`          Path: ${path.join(root, MARKER_FILENAME)} (written last on success)`);
     }
   }
 
   const handoffPath  = resolveHandoffMdPath(projectId);
-  const claudeMdPath = path.join(root, 'CLAUDE.md');
+  const claudeMdPath = resolvePromotionFilePath(root);
   // -y / --yes / --force all bypass the confirmation gate and enable DB auto-create.
   const autoCreate   = args.includes('-y') || args.includes('--yes') || args.includes('--force');
 
@@ -1968,9 +1972,12 @@ async function cmdInit(args) {
     }
   }
 
-  // Step 11: Write CLAUDE.md (only if all DB steps succeeded)
+  // Step 11: Write the durable-facts promotion file (only if all DB steps
+  // succeeded). Filename is configurable via HANDOFF_PROMOTION_FILE (default
+  // CLAUDE.md) — resolvePromotionFilePath() already validated it above.
+  const promotionFilename = path.basename(claudeMdPath);
   if (fs.existsSync(claudeMdPath)) {
-    console.log(`  [OK]    CLAUDE.md already exists — skipped: ${claudeMdPath}`);
+    console.log(`  [OK]    ${promotionFilename} already exists — skipped: ${claudeMdPath}`);
   } else {
     try {
       const projectName = args.find((a) => !a.startsWith('-')) || path.basename(root);
@@ -1983,16 +1990,16 @@ async function cmdInit(args) {
       });
       fs.writeFileSync(claudeMdPath, content, 'utf8');
       fsLedger.push(claudeMdPath);
-      console.log(`  [OK]    CLAUDE.md created: ${claudeMdPath}`);
-      console.log(`  [NOTE]  CLAUDE.md should be git-committed.`);
+      console.log(`  [OK]    ${promotionFilename} created: ${claudeMdPath}`);
+      console.log(`  [NOTE]  ${promotionFilename} should be git-committed.`);
     } catch (err) {
-      console.log(`  [FAIL]  Could not write CLAUDE.md — ${err.message}`);
+      console.log(`  [FAIL]  Could not write ${promotionFilename} — ${err.message}`);
       unwindFsLedger();
       process.exit(1);
     }
   }
 
-  // Step 12 (LAST): Persist the deferred .claude-memory marker.
+  // Step 12 (LAST): Persist the deferred project marker.
   // Only reached after ALL DB operations and ALL other FS writes succeed.
   // A failure here is extremely unlikely (directory exists, disk not full) but
   // we unwind the other FS writes to leave the project in a clean state.
@@ -2000,10 +2007,10 @@ async function cmdInit(args) {
     try {
       persistMarker(root, projectId);
       fsLedger.push(path.join(root, MARKER_FILENAME));
-      console.log(`  [OK]    .claude-memory marker written: uuid=${projectId}`);
+      console.log(`  [OK]    project marker written: uuid=${projectId}`);
     } catch (err) {
-      console.log(`  [FAIL]  Could not persist .claude-memory marker — ${err.message}`);
-      // Remove handoff.md and CLAUDE.md that were written above (marker not in ledger yet).
+      console.log(`  [FAIL]  Could not persist project marker — ${err.message}`);
+      // Remove handoff.md and the promotion file written above (marker not in ledger yet).
       unwindFsLedger();
       process.exit(1);
     }
@@ -2025,7 +2032,7 @@ async function cmdInit(args) {
       await flagDb.end();
     } catch (_) { /* non-fatal */ }
     process.stderr.write(
-      '[handoff] multi-author repo detected — see README#trust-model before relying on CLAUDE.md auto-promotion\n'
+      `[handoff] multi-author repo detected — see README#trust-model before relying on ${promotionFilename} auto-promotion\n`
     );
   }
 
@@ -5057,8 +5064,10 @@ async function cmdClose(args) {
                                  console.log(`  open_thread rows:   would write ${payload.open_threads.length} row(s)`);
     if (payload.quick_references) console.log(`  quick_reference:    would write (subject=${path.basename(root)})`);
 
-    // CLAUDE.md promotion candidates (same query as real close — read-only).
+    // Durable-facts promotion candidates (same query as real close — read-only).
+    // Target filename is configurable via HANDOFF_PROMOTION_FILE (default CLAUDE.md).
     try {
+      const dryPromotionFilename = path.basename(resolvePromotionFilePath(root));
       const dryMultiSessionPred = db.buildEpochSecondsDiffPredicate('last_reinforced', 'created_at', '>', 86400);
       const { rows: dryCandidates } = await db.query(
         `SELECT id, subject, predicate, object, confidence, tier
@@ -5073,7 +5082,7 @@ async function cmdClose(args) {
         [projectId]
       );
       if (dryCandidates.length > 0) {
-        console.log(`\n  CLAUDE.md promotion candidates (would be surfaced — NOT written in dry-run):`);
+        console.log(`\n  ${dryPromotionFilename} promotion candidates (would be surfaced — NOT written in dry-run):`);
         for (const r of dryCandidates) {
           console.log(`    [conf=${r.confidence}] ${r.subject} ${r.predicate} ${r.object}`);
         }
@@ -5142,17 +5151,19 @@ async function cmdClose(args) {
      ORDER BY confidence DESC`,
     [projectId]
   );
+  const closePromotionPath     = resolvePromotionFilePath(root);
+  const closePromotionFilename = path.basename(closePromotionPath);
   if (candidates.length > 0) {
-    console.log('\n  CLAUDE.md promotion candidates (confidence >= 9, user_stated, consolidated, multi-session):');
+    console.log(`\n  ${closePromotionFilename} promotion candidates (confidence >= 9, user_stated, consolidated, multi-session):`);
     for (const row of candidates) {
       console.log(`    [conf=${row.confidence}] ${row.subject} ${row.predicate} ${row.object}`);
     }
-    console.log('  Review and run /handoff:close with confirm_claude_md_promotion=true to write to CLAUDE.md.');
+    console.log(`  Review and run /handoff:close with confirm_claude_md_promotion=true to write to ${closePromotionFilename}.`);
   }
 
-  // Write to CLAUDE.md if requested and candidates exist
+  // Write to the promotion file if requested and candidates exist.
   if (payload.confirm_claude_md_promotion && candidates.length > 0) {
-    const claudeMdPath = path.join(root, 'CLAUDE.md');
+    const claudeMdPath = closePromotionPath;
     if (fs.existsSync(claudeMdPath)) {
       const existing  = fs.readFileSync(claudeMdPath, 'utf8');
       const today     = new Date().toISOString().slice(0, 10);
@@ -5167,7 +5178,7 @@ async function cmdClose(args) {
             `## Durable facts\n${additions}\n`)
         : existing + `\n## Durable facts\n${additions}\n`;
       fs.writeFileSync(claudeMdPath, durableFacts, 'utf8');
-      console.log(`\n  CLAUDE.md updated with ${candidates.length} durable fact(s).`);
+      console.log(`\n  ${closePromotionFilename} updated with ${candidates.length} durable fact(s).`);
     }
   }
 
@@ -5178,7 +5189,7 @@ async function cmdClose(args) {
       await setSetting(db, projectId, 'multi_author_detected', 'true');
     } catch (_) { /* non-fatal */ }
     process.stderr.write(
-      '[handoff] multi-author repo detected — see README#trust-model before relying on CLAUDE.md auto-promotion\n'
+      `[handoff] multi-author repo detected — see README#trust-model before relying on ${closePromotionFilename} auto-promotion\n`
     );
   }
 
@@ -6055,7 +6066,8 @@ async function cmdLoaderStop() {
 // ── promote ───────────────────────────────────────────────────────────────────
 
 /**
- * Explicitly promote a single assertion to CLAUDE.md durable facts.
+ * Explicitly promote a single assertion to the durable-facts promotion file
+ * (default CLAUDE.md; configurable via HANDOFF_PROMOTION_FILE).
  * Idempotent: re-running on an already-promoted assertion prints a notice and exits 0.
  *
  * Usage: node scripts/handoff.js promote <assertion_id>
@@ -6071,7 +6083,8 @@ async function cmdPromote(args) {
 
   const root        = findProjectRoot();
   const projectId   = resolveProjectId();
-  const claudeMdPath = path.join(root, 'CLAUDE.md');
+  const claudeMdPath = resolvePromotionFilePath(root);
+  const promoteFilename = path.basename(claudeMdPath);
 
   let db;
   try {
@@ -6122,7 +6135,7 @@ async function cmdPromote(args) {
       [demoteId]
     );
 
-    // Remove the matching lines from CLAUDE.md.
+    // Remove the matching lines from the promotion file.
     // We look for the annotation line (source_assertion=<id>) and the fact line that follows it.
     if (fs.existsSync(claudeMdPath)) {
       const claudeContent = fs.readFileSync(claudeMdPath, 'utf8');
@@ -6134,9 +6147,9 @@ async function cmdPromote(args) {
       const demoted = claudeContent.replace(annotationPattern, '');
       if (demoted !== claudeContent) {
         fs.writeFileSync(claudeMdPath, demoted, 'utf8');
-        console.log(`  removed CLAUDE.md entry for assertion id=${demoteId}`);
+        console.log(`  removed ${promoteFilename} entry for assertion id=${demoteId}`);
       } else {
-        console.log(`  note: no matching CLAUDE.md line found for assertion id=${demoteId} (may have been manually edited)`);
+        console.log(`  note: no matching ${promoteFilename} line found for assertion id=${demoteId} (may have been manually edited)`);
       }
     }
 
@@ -6253,10 +6266,10 @@ async function cmdPromote(args) {
   const annotation = `<!-- promoted: session=explicit, conf=${row.confidence}, date=${today}, source_assertion=${row.id} -->`;
   const factLine   = `- [conf=${row.confidence}] ${row.subject} ${row.predicate} ${row.object}`;
 
-  // Append to CLAUDE.md under ## Durable facts.
+  // Append to the promotion file under ## Durable facts.
   if (!fs.existsSync(claudeMdPath)) {
     await db.end();
-    console.error(`promote: CLAUDE.md not found at ${claudeMdPath} — run /handoff:init first`);
+    console.error(`promote: ${promoteFilename} not found at ${claudeMdPath} — run /handoff:init first`);
     process.exit(1);
   }
 
@@ -6290,7 +6303,7 @@ async function cmdPromote(args) {
 
   console.log(`promoted: ${annotation}`);
   console.log(`          ${factLine}`);
-  console.log(`\nDone: handoff:promote — assertion id=${assertionId} promoted to CLAUDE.md`);
+  console.log(`\nDone: handoff:promote — assertion id=${assertionId} promoted to ${promoteFilename}`);
 }
 
 // ── resurrect ────────────────────────────────────────────────────────────────

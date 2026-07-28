@@ -43,6 +43,12 @@ This is advisory only — it does **not** change runtime behavior. The environme
 
 This is the highest-risk path in the system; the default posture is **off**.
 
+`CLAUDE.md` is the default durable-facts promotion target; a non-Claude-Code MCP
+client can point promotion at a different file via `HANDOFF_PROMOTION_FILE`
+(rejecting a handful of reserved/unsafe names — see `docs/how-memory-works.md`).
+The trust-model properties below apply identically to whichever file is
+resolved as the promotion target.
+
 Promotion of high-confidence assertions into the repo-tracked `CLAUDE.md` `## Durable facts` section happens **only** when the `/handoff:close` payload explicitly includes `confirm_claude_md_promotion: true`. When that flag is absent or `false`, the tool prints the candidate list to the console and writes nothing to disk.
 
 Additionally, the `/handoff:close` skill instructs the assistant to ask the user for confirmation before any CLAUDE.md write, and its example payload defaults the flag to `false`.

@@ -21,8 +21,8 @@
  *   C2  -y bypass proceeds: successful init -y completes and creates the marker
  *       (uses live test DB; cleans up).
  *   C3  Non-TTY safe-fail: invoke init WITHOUT -y as a subprocess with stdin
- *       NOT a TTY; assert exit non-zero, refusal message printed, no .claude-memory
- *       marker created, and the process does NOT hang (5-second timeout enforced).
+ *       NOT a TTY; assert exit non-zero, refusal message printed, no project marker
+ *       created, and the process does NOT hang (5-second timeout enforced).
  *       This is the key non-vacuous test — it would NOT pass before this change.
  *
  * Usage:
@@ -198,10 +198,10 @@ async function testC1() {
 // ── C2: -y bypass proceeds to successful init ─────────────────────────────────
 //
 // Confirm that passing -y bypasses the gate and init completes normally.
-// The .claude-memory marker must be written on success.
+// The project marker must be written on success.
 
 async function testC2() {
-  const label = 'C2: -y bypass proceeds — init completes and writes .claude-memory marker';
+  const label = 'C2: -y bypass proceeds — init completes and writes project marker';
   const pgAvail = await isPgAvailable();
   if (!pgAvail) { console.log(`SKIP  ${label} (Postgres unavailable)`); return; }
 
@@ -220,7 +220,7 @@ async function testC2() {
 
     const markerPath = path.join(tmpDir, MARKER_FILENAME);
     if (!fs.existsSync(markerPath)) {
-      fail(label, '.claude-memory marker missing after successful init -y'); return;
+      fail(label, 'marker missing after successful init -y'); return;
     }
 
     const marker = readMarker(tmpDir);
@@ -253,7 +253,7 @@ async function testC2() {
 // Assertions:
 //   (a) exits non-zero
 //   (b) prints the refusal message
-//   (c) does NOT create a .claude-memory marker in the temp dir
+//   (c) does NOT create a project marker in the temp dir
 //   (d) does NOT hang (enforced by a 5-second timeout on the subprocess)
 //
 // This test does NOT require live Postgres: the gate fires before preflight.
@@ -302,10 +302,10 @@ async function testC3() {
       fail(label, `refusal message not found in output: ${combined.slice(0, 500)}`); return;
     }
 
-    // (c) No .claude-memory marker created.
+    // (c) No project marker created.
     const markerPath = path.join(tmpDir, MARKER_FILENAME);
     if (fs.existsSync(markerPath)) {
-      fail(label, '.claude-memory marker was created despite safe-fail — gate did not prevent FS write'); return;
+      fail(label, 'marker was created despite safe-fail — gate did not prevent FS write'); return;
     }
 
     pass(label);

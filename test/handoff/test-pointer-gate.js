@@ -27,6 +27,8 @@ const os     = require('os');
 const { execFileSync } = require('child_process');
 
 const { getClaudeProjectDir } = require('../../scripts/lib/encoded-cwd');
+const { readMarker }          = require('../../scripts/lib/project-marker');
+const { resolveHandoffMdPath } = require('../../scripts/lib/handoff-paths');
 const { createRequire } = require('module');
 const scriptsRequire = createRequire(require.resolve('../../scripts/package.json'));
 const { Client } = scriptsRequire('pg');
@@ -175,14 +177,8 @@ function runHelper(sub, extraArgs, opts = {}) {
 }
 
 function resolveHandoffPath(root) {
-  const markerPath = path.join(root, '.claude-memory');
-  if (fs.existsSync(markerPath)) {
-    try {
-      const txt = fs.readFileSync(markerPath, 'utf8');
-      const m   = txt.match(/"uuid"\s*:\s*"([^"]+)"/);
-      if (m) return path.join(os.homedir(), '.claude', 'projects', m[1], 'handoff.md');
-    } catch (_) { /* fall through */ }
-  }
+  const marker = readMarker(root);
+  if (marker) return resolveHandoffMdPath(marker.uuid);
   return path.join(getClaudeProjectDir(root), 'handoff.md');
 }
 
@@ -609,13 +605,10 @@ async function runTests() {
       // Connect to the throwaway DB and provision the schema
       runHelper('init', ['-y'], { fakeRoot });
 
-      // Read the project_id from the .claude-memory marker written by init
-      const markerPath = path.join(fakeRoot, '.claude-memory');
-      assert.ok(fs.existsSync(markerPath), '.claude-memory marker must exist after init');
-      const markerTxt = fs.readFileSync(markerPath, 'utf8');
-      const uuidMatch = markerTxt.match(/"uuid"\s*:\s*"([^"]+)"/);
-      assert.ok(uuidMatch, '.claude-memory must contain a uuid field');
-      const testProjectId = uuidMatch[1];
+      // Read the project_id from the project marker written by init
+      const markerAfterInit = readMarker(fakeRoot);
+      assert.ok(markerAfterInit, 'project marker must exist after init');
+      const testProjectId = markerAfterInit.uuid;
 
       // Open a direct DB connection to insert test rows
       const db = await pgConnect(TARGET_DB);

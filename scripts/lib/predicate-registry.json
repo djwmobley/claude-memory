@@ -47,10 +47,11 @@
       "added_version": "1.1"
     },
     {
-      "predicate": "are_safe_outside_claude-memory",
+      "predicate": "are_safe_outside_this_project",
       "cardinality": "1:1",
-      "description": "Safety classification flag indicating whether a set of operations is safe outside the claude-memory project boundary",
-      "added_version": "1.1"
+      "description": "Safety classification flag indicating whether a set of operations is safe outside this project's boundary",
+      "added_version": "1.1",
+      "grandfathered_aliases": ["are_safe_outside_claude-memory"]
     },
     {
       "predicate": "behavior",

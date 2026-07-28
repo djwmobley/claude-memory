@@ -276,7 +276,7 @@ function createProjectDir(suffix) {
  * Bootstrap a new project in the shared throwaway DB.
  *
  * Runs `handoff init -y` which:
- *   1. Writes a .claude-memory marker file with a stable UUID.
+ *   1. Writes a project marker file with a stable UUID.
  *   2. Inserts default project_settings rows keyed by that UUID.
  *   3. Inserts a default retrieval_contract row.
  *
@@ -299,7 +299,7 @@ async function bootstrapProject(db, projectDir) {
   if (initR.status !== 0) {
     throw new Error(`init failed for ${projectDir}: ${(initR.stderr || initR.stdout || '').slice(0, 400)}`);
   }
-  // Resolve the actual project_id: the UUID written by init into .claude-memory.
+  // Resolve the actual project_id: the UUID written by init into the project marker.
   const marker = readMarker(projectDir);
   if (marker && marker.uuid) return marker.uuid;
   // Fallback (should not be reached on a fresh project dir).

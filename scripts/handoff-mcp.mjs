@@ -415,7 +415,7 @@ function buildServer() {
         'entity/assertion/edge counts, handoff.md path, last_close/days_since, contracts, session_active, ' +
         'session_id, and packaging state (e.g. "UNPACKAGED (dirty working tree)" or "clean"). Read-only — makes no writes.',
       inputSchema: {
-        projectRoot: z.string().describe('Absolute path to the project root (the directory containing .claude-memory / .git).'),
+        projectRoot: z.string().describe('Absolute path to the project root (the directory containing the project marker / .git).'),
       },
     },
     async (args) => {
@@ -497,9 +497,10 @@ function buildServer() {
       title: 'First-run handoff provisioning for a project',
       description:
         'Runs `handoff.js init [name] -y` for the given project root: applies schema migrations, ensures ' +
-        'project_settings defaults, creates handoff.md and CLAUDE.md if absent, and mints the .claude-memory ' +
-        'marker. Always passes -y (non-interactive bypass) since this runs over a non-TTY stdio pipe. Safe to ' +
-        're-run — idempotent. Returns the structured [OK]/[NOTE] provisioning report lines and the summary line.',
+        'project_settings defaults, creates handoff.md and the durable-facts promotion file (CLAUDE.md by ' +
+        'default) if absent, and mints the project marker. Always passes -y (non-interactive bypass) since ' +
+        'this runs over a non-TTY stdio pipe. Safe to re-run — idempotent. Returns the structured [OK]/[NOTE] ' +
+        'provisioning report lines and the summary line.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root to provision.'),
         name: z.string().optional().describe('Optional human-readable project name (defaults to the directory basename).'),

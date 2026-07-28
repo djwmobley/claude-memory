@@ -18,6 +18,7 @@ const { spawnSync } = require('child_process');
 const fs   = require('fs');
 const os   = require('os');
 const { readMarker } = require('./lib/project-marker');
+const { resolveHandoffMdPath } = require('./lib/handoff-paths');
 const path = require('path');
 const { Client } = require('pg');
 
@@ -52,17 +53,17 @@ function encodeCwd(p) {
 }
 
 // Project IDs: resolved after cmdInit runs. Initially the legacy-encoded form;
-// updated to the marker UUID once cmdInit mints the .claude-memory marker.
+// updated to the marker UUID once cmdInit mints the project marker.
 // Use mutable let so step2 (cmdInit) can update them to the UUID form.
 let PROJECT_ID         = encodeCwd(TEMP_PROJECT_DIR);
 let PROJECT_ID_HOOKS   = encodeCwd(TEMP_PROJECT_DIR_HOOKS);
 let PROJECT_ID_HARDEN  = encodeCwd(TEMP_PROJECT_DIR_HARDEN);
-let HANDOFF_PATH       = path.join(os.homedir(), '.claude', 'projects', PROJECT_ID, 'handoff.md');
-let HANDOFF_PATH_HOOKS   = path.join(os.homedir(), '.claude', 'projects', PROJECT_ID_HOOKS, 'handoff.md');
-let HANDOFF_PATH_HARDEN  = path.join(os.homedir(), '.claude', 'projects', PROJECT_ID_HARDEN, 'handoff.md');
+let HANDOFF_PATH       = resolveHandoffMdPath(PROJECT_ID);
+let HANDOFF_PATH_HOOKS   = resolveHandoffMdPath(PROJECT_ID_HOOKS);
+let HANDOFF_PATH_HARDEN  = resolveHandoffMdPath(PROJECT_ID_HARDEN);
 
 /**
- * Read the .claude-memory marker UUID from a directory.
+ * Read the project marker UUID from a directory.
  * Returns the UUID string if present and valid, or null otherwise.
  *
  * @param {string} dir
@@ -74,7 +75,7 @@ function markerUUID(dir) {
 }
 
 /**
- * After cmdInit runs for a project dir, read the .claude-memory marker UUID and
+ * After cmdInit runs for a project dir, read the project marker UUID and
  * update the project-id and handoff-path variables for that section.
  *
  * @param {'main'|'hooks'|'harden'} which
@@ -87,13 +88,13 @@ function updateProjectIdFromMarker(which) {
   if (!uuid) return;  // No marker — keep legacy form.
   if (which === 'main') {
     PROJECT_ID   = uuid;
-    HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', PROJECT_ID, 'handoff.md');
+    HANDOFF_PATH = resolveHandoffMdPath(PROJECT_ID);
   } else if (which === 'hooks') {
     PROJECT_ID_HOOKS   = uuid;
-    HANDOFF_PATH_HOOKS = path.join(os.homedir(), '.claude', 'projects', PROJECT_ID_HOOKS, 'handoff.md');
+    HANDOFF_PATH_HOOKS = resolveHandoffMdPath(PROJECT_ID_HOOKS);
   } else if (which === 'harden') {
     PROJECT_ID_HARDEN   = uuid;
-    HANDOFF_PATH_HARDEN = path.join(os.homedir(), '.claude', 'projects', PROJECT_ID_HARDEN, 'handoff.md');
+    HANDOFF_PATH_HARDEN = resolveHandoffMdPath(PROJECT_ID_HARDEN);
   }
 }
 
@@ -476,7 +477,7 @@ async function step2_cmdInit_fresh() {
       return false;
     }
 
-    // After cmdInit mints the .claude-memory marker, update PROJECT_ID to the UUID.
+    // After cmdInit mints the project marker, update PROJECT_ID to the UUID.
     updateProjectIdFromMarker('main');
 
     const lines = (r.stdout || '').split('\n').filter((l) => l.match(/\s+\[(OK|WARN)\]\s+/));
@@ -2383,7 +2384,7 @@ async function runW3Section() {
     await w3Step5_clusterExpansion(W3_DB, W3_PROJECT_ID, W3_PROJ_DIR);
 
   } finally {
-    const W3_HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', W3_PROJECT_ID, 'handoff.md');
+    const W3_HANDOFF_PATH = resolveHandoffMdPath(W3_PROJECT_ID);
     await dropSmokeDb(W3_DB, W3_PROJ_DIR, W3_HANDOFF_PATH).catch(() => {});
   }
 }
@@ -2936,7 +2937,7 @@ async function runW4Section() {
     await w4Step6_loaderNoRegression(W4_DB, W4_PROJECT_ID, W4_PROJ_DIR);
 
   } finally {
-    const W4_HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', W4_PROJECT_ID, 'handoff.md');
+    const W4_HANDOFF_PATH = resolveHandoffMdPath(W4_PROJECT_ID);
     await dropSmokeDb(W4_DB, W4_PROJ_DIR, W4_HANDOFF_PATH).catch(() => {});
   }
 }
@@ -2983,7 +2984,7 @@ async function runW2Section() {
     await w2Step3_idempotencyPredicate(W2_DB, W2_PROJECT_ID);
 
   } finally {
-    const W2_HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', W2_PROJECT_ID, 'handoff.md');
+    const W2_HANDOFF_PATH = resolveHandoffMdPath(W2_PROJECT_ID);
     await dropSmokeDb(W2_DB, W2_PROJ_DIR, W2_HANDOFF_PATH).catch(() => {});
   }
 }
@@ -3272,7 +3273,7 @@ async function runC1Section() {
     await c1Step4_loaderOutputUnchanged(C1_DB, C1_PROJECT_ID, C1_PROJ_DIR);
 
   } finally {
-    const C1_HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', C1_PROJECT_ID, 'handoff.md');
+    const C1_HANDOFF_PATH = resolveHandoffMdPath(C1_PROJECT_ID);
     await dropSmokeDb(C1_DB, C1_PROJ_DIR, C1_HANDOFF_PATH).catch(() => {});
   }
 }
@@ -3892,7 +3893,7 @@ async function runC2Section() {
     await c2Step5_pinnedNotDownvoted(C2_DB, C2_PROJECT_ID, C2_PROJ_DIR);
 
   } finally {
-    const C2_HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', C2_PROJECT_ID, 'handoff.md');
+    const C2_HANDOFF_PATH = resolveHandoffMdPath(C2_PROJECT_ID);
     await dropSmokeDb(C2_DB, C2_PROJ_DIR, C2_HANDOFF_PATH).catch(() => {});
   }
 }
@@ -4496,7 +4497,7 @@ async function runC3Section() {
     await c3Step5_rollback(C3_DB, C3_PROJECT_ID, C3_PROJ_DIR);
 
   } finally {
-    const C3_HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', C3_PROJECT_ID, 'handoff.md');
+    const C3_HANDOFF_PATH = resolveHandoffMdPath(C3_PROJECT_ID);
     await dropSmokeDb(C3_DB, C3_PROJ_DIR, C3_HANDOFF_PATH).catch(() => {});
   }
 }
@@ -4792,7 +4793,7 @@ async function rgStep7_writePathNonRegression() {
     rgFail(7, label, err.message);
     return false;
   } finally {
-    const RG_HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', RG_PROJECT_ID, 'handoff.md');
+    const RG_HANDOFF_PATH = resolveHandoffMdPath(RG_PROJECT_ID);
     await dropSmokeDb(RG_DB, RG_PROJ_DIR, RG_HANDOFF_PATH).catch(() => {});
   }
 }
@@ -5287,7 +5288,7 @@ async function runQueueSection() {
     console.log(`[QUEUE] Unexpected error: ${err.message}`);
     // Any unhandled error means the remaining steps did not run.
   } finally {
-    const Q_HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', Q_PROJECT_ID, 'handoff.md');
+    const Q_HANDOFF_PATH = resolveHandoffMdPath(Q_PROJECT_ID);
     await dropSmokeDb(Q_DB, Q_PROJ_DIR, Q_HANDOFF_PATH).catch(() => {});
   }
 }
@@ -5440,18 +5441,24 @@ async function colStep4_historyKind(colDb, colProjectId, colProjectDir) {
  * COLLISION 5/5 — Registry / 1:1-index drift guard (pure, no Postgres).
  *
  * The assertions_1to1_unique index in handoff-core-schema.sql enumerates a specific
- * set of predicate strings.  This test asserts the set is exactly the current 1:1
- * predicate set in predicate-registry.json.  Drift = CI failure.
+ * set of predicate strings. This test asserts the set is exactly the current 1:1
+ * predicate set in predicate-registry.json UNION every entry's grandfathered_aliases
+ * (renamed predicates' old names, which must stay in the index forever — see #135).
+ * Drift = CI failure. Exact equality, never loosened to subset/superset (a renamed
+ * predicate whose old name is missing from the index would silently stop enforcing
+ * uniqueness on historical rows still carrying that old name).
  */
 async function colStep5_registryIndexDrift() {
-  const label = 'registry/index drift: schema IN(...) list === registry 1:1 predicate set';
+  const label = 'registry/index drift: schema IN(...) list === registry 1:1 predicate set (+ grandfathered aliases)';
   try {
-    const { loadRegistry: loadReg } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'predicate-registry.js'));
+    const { loadRegistry: loadReg, allGrandfatheredAliases } =
+      require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'predicate-registry.js'));
     const reg = loadReg();
     const registry1to1 = new Set();
     for (const [pred, entry] of reg.byPredicate) {
       if (entry.cardinality === '1:1') registry1to1.add(pred);
     }
+    for (const alias of allGrandfatheredAliases()) registry1to1.add(alias);
 
     const schemaPath = path.join(PROJECT_ROOT, 'scripts', 'sql', 'handoff-core-schema.sql');
     const sql = fs.readFileSync(schemaPath, 'utf8');
@@ -5471,8 +5478,8 @@ async function colStep5_registryIndexDrift() {
 
     if (missingFromIndex.length > 0 || extraInIndex.length > 0) {
       const msgs = [];
-      if (missingFromIndex.length > 0) msgs.push(`registry 1:1 not in index: ${JSON.stringify(missingFromIndex)}`);
-      if (extraInIndex.length > 0)     msgs.push(`index predicate not 1:1 in registry: ${JSON.stringify(extraInIndex)}`);
+      if (missingFromIndex.length > 0) msgs.push(`registry 1:1 (+ aliases) not in index: ${JSON.stringify(missingFromIndex)}`);
+      if (extraInIndex.length > 0)     msgs.push(`index predicate not 1:1 in registry and not a grandfathered alias: ${JSON.stringify(extraInIndex)}`);
       colFail(5, label, msgs.join('; '));
       return false;
     }
@@ -5658,7 +5665,7 @@ async function runCollisionSection() {
   }
 
   try {
-    const HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', PROJ_ID, 'handoff.md');
+    const HANDOFF_PATH = resolveHandoffMdPath(PROJ_ID);
     await dropSmokeDb(COL_DB, PROJ_DIR, HANDOFF_PATH).catch(() => {});
   } catch (_) {}
 }
@@ -5913,7 +5920,7 @@ async function runGraphSection() {
     await grStep4_defaultContractRegression(GR_DB, GR_PROJ_ID, GR_PROJ_DIR);
 
   } finally {
-    const GR_HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', GR_PROJ_ID, 'handoff.md');
+    const GR_HANDOFF_PATH = resolveHandoffMdPath(GR_PROJ_ID);
     await dropSmokeDb(GR_DB, GR_PROJ_DIR, GR_HANDOFF_PATH).catch(() => {});
   }
 }
@@ -6106,7 +6113,7 @@ async function runDecaySection() {
     }
 
   } finally {
-    const DC_HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', DC_PROJ_ID, 'handoff.md');
+    const DC_HANDOFF_PATH = resolveHandoffMdPath(DC_PROJ_ID);
     await dropSmokeDb(DC_DB, DC_PROJ_DIR, DC_HANDOFF_PATH).catch(() => {});
   }
 }
@@ -6378,7 +6385,7 @@ async function runPruneSection() {
     }
 
   } finally {
-    const PN_HANDOFF_PATH = path.join(os.homedir(), '.claude', 'projects', PN_PROJ_ID, 'handoff.md');
+    const PN_HANDOFF_PATH = resolveHandoffMdPath(PN_PROJ_ID);
     await dropSmokeDb(PN_DB, PN_PROJ_DIR, PN_HANDOFF_PATH).catch(() => {});
   }
 }

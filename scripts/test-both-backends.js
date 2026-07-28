@@ -2911,6 +2911,7 @@ async function runS13() {
   // Import the modules under test (lazy, inside the section).
   const {
     MARKER_FILENAME,
+    LEGACY_MARKER_FILENAME,
     findProjectRootByMarker,
     readMarker,
     writeMarker,
@@ -2927,6 +2928,7 @@ async function runS13() {
   } = require('./lib/project-identity');
 
   const { encodeCwd } = require('./lib/encoded-cwd');
+  const { resolveHandoffMdPath } = require('./lib/handoff-paths');
 
   // Helper: seed multi-table corpus under a given projectId on the given DB adapter.
   async function seedCorpus(db, projectId, opts = {}) {
@@ -3225,8 +3227,8 @@ async function runS13() {
             db,
             legacyId,
             marker.uuid,
-            path.join(os.homedir(), '.claude', 'projects', legacyId, 'handoff.md'),
-            path.join(os.homedir(), '.claude', 'projects', marker.uuid, 'handoff.md'),
+            resolveHandoffMdPath(legacyId),
+            resolveHandoffMdPath(marker.uuid),
             (msg) => { fatalCalled = true; fatalMsg = msg; throw new Error(msg); }
           );
         } catch (_) {}
@@ -3534,7 +3536,7 @@ async function runS13() {
       try {
         // Write a .git FILE (worktree style: "gitdir: ../real/.git").
         fs.writeFileSync(path.join(tmpDir, '.git'), 'gitdir: ../real/.git\n', 'utf8');
-        // No .claude-memory marker yet.
+        // No project marker yet.
         const identity = await ensureProjectIdentity(db, { cwd: tmpDir, silent: true });
         assertTrue(isValidUUID(identity.projectId), 'S13.12b: UUID issued with .git as file');
         // The marker must have been written at tmpDir (identity doesn't care about .git).
@@ -3640,6 +3642,7 @@ async function runS14() {
 
   const {
     MARKER_FILENAME,
+    LEGACY_MARKER_FILENAME,
     findProjectRootByMarker,
     readMarker,
     writeMarker,
@@ -3922,8 +3925,13 @@ async function runS14() {
         assertTrue(marker !== null, 'S14.6: marker exists');
         assertEqual(marker.uuid, id1.projectId, 'S14.6: marker UUID matches returned UUID');
 
-        // No duplicate marker files.
-        const files = fs.readdirSync(tmpDir).filter((f) => f === MARKER_FILENAME || f.startsWith(MARKER_FILENAME));
+        // No duplicate marker files (either name — C6: the legacy-name clause is
+        // required so a concurrent STATE-3/4 race can never leave a stray legacy
+        // marker uncounted).
+        const files = fs.readdirSync(tmpDir).filter((f) =>
+          f === MARKER_FILENAME || f.startsWith(MARKER_FILENAME) ||
+          f === LEGACY_MARKER_FILENAME || f.startsWith(LEGACY_MARKER_FILENAME)
+        );
         assertEqual(files.length, 1, 'S14.6: exactly one marker file in tmpDir');
       } finally {
         try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
@@ -4223,6 +4231,7 @@ async function runS15() {
 
   const {
     MARKER_FILENAME,
+    LEGACY_MARKER_FILENAME,
     readMarker,
     writeMarker,
     isValidUUID,
@@ -4299,11 +4308,12 @@ async function runS15() {
         assertTrue(marker !== null, 'S15a: exactly one marker file');
         assertEqual(marker.uuid, uuid, 'S15a: marker UUID matches returned UUID');
 
-        // Single marker file: no duplicate .claude-memory files.
+        // Single marker file: no duplicate marker files under either name (C6).
         const markerFiles = fs.readdirSync(tmpDir).filter(
-          (f) => f === MARKER_FILENAME || f.startsWith(MARKER_FILENAME)
+          (f) => f === MARKER_FILENAME || f.startsWith(MARKER_FILENAME) ||
+                 f === LEGACY_MARKER_FILENAME || f.startsWith(LEGACY_MARKER_FILENAME)
         );
-        assertEqual(markerFiles.length, 1, 'S15a: exactly one .claude-memory file in tmpDir');
+        assertEqual(markerFiles.length, 1, 'S15a: exactly one project marker file in tmpDir');
       } finally {
         try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
       }
@@ -4429,9 +4439,10 @@ async function runS15() {
         assertTrue(read !== null, 'S15b: marker still readable after failed second write');
         assertEqual(read.uuid, marker1.uuid, 'S15b: UUID unchanged — no corruption from second write');
 
-        // Exactly one marker file.
+        // Exactly one marker file (either name — C6).
         const markerFiles = fs.readdirSync(tmpDir).filter(
-          (f) => f === MARKER_FILENAME || f.startsWith(MARKER_FILENAME)
+          (f) => f === MARKER_FILENAME || f.startsWith(MARKER_FILENAME) ||
+                 f === LEGACY_MARKER_FILENAME || f.startsWith(LEGACY_MARKER_FILENAME)
         );
         assertEqual(markerFiles.length, 1, 'S15b: exactly one marker file (no duplicate or temp)');
 

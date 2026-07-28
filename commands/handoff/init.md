@@ -2,14 +2,14 @@
 
 > Running: handoff:init
 
-First-run setup. Creates the database tables, writes a project-level `CLAUDE.md`, and registers the default retrieval contract. Run once per project. Safe to re-run — it won't overwrite anything that already exists.
+First-run setup. Creates the database tables, writes a project-level durable-facts promotion file (`CLAUDE.md` by default), and registers the default retrieval contract. Run once per project. Safe to re-run — it won't overwrite anything that already exists.
 
 ## What this does
 
 1. Applies Phase 2 schema migrations to `claude_memory_eval_test` (idempotent DDL).
 2. Inserts default `project_settings` rows (staleness_days, loader_token_budget, etc.) if absent.
-3. Creates `~/.claude/projects/{encoded_cwd}/handoff.md` from the template if absent.
-4. Creates `CLAUDE.md` at the project root if absent (should be git-committed).
+3. Creates `~/.claude/projects/{project_id}/handoff.md` from the template if absent (base directory configurable via `HANDOFF_BASE_DIR`; default `~/.claude`).
+4. Creates the durable-facts promotion file at the project root if absent (should be git-committed). Default filename `CLAUDE.md`; configurable via `HANDOFF_PROMOTION_FILE`.
 5. Inserts a default `retrieval_contract` row for this project if absent.
 
 ## Preferred path — MCP
@@ -30,7 +30,8 @@ If `mcp__handoff__handoff_init` is not available, fall back to the CLI recipe be
 
 ## How to invoke
 
-Find the project root (walk up from `pwd` looking for `.claude-memory` marker first,
+Find the project root (walk up from `pwd` looking for a `.memory-engine` marker
+first — or the legacy `.claude-memory` name, still recognized as a read-fallback —
 then fall back to `.git`), then run:
 
 ```bash
@@ -107,8 +108,8 @@ Pass `-y` (or `--yes` / `--force`) to bypass confirmation in those contexts.
 ```
 Running: handoff:init
 
-  [OK]    .claude-memory marker minted (deferred): uuid=<uuid>
-          Path: <project_root>/.claude-memory (written last on success)
+  [OK]    project marker minted (deferred): uuid=<uuid>
+          Path: <project_root>/.memory-engine (written last on success)
   Resolved target DB: claude_memory_eval_test  (source: built-in default)
   [OK]    Node version >= 18
   [OK]    Database 'claude_memory_eval_test' present
@@ -120,7 +121,7 @@ Running: handoff:init
   [OK]    handoff.md created: ~/.claude/projects/<uuid>/handoff.md
   [OK]    CLAUDE.md created: <project_root>/CLAUDE.md
   [NOTE]  CLAUDE.md should be git-committed.
-  [OK]    .claude-memory marker written: uuid=<uuid>
+  [OK]    project marker written: uuid=<uuid>
 
 Done: handoff:init — project <uuid> provisioned
 ```

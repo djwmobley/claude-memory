@@ -76,6 +76,7 @@ const { execFileSync, execSync } = require('child_process');
 
 const { loadConfig }  = require('../../scripts/lib/shared');
 const { writeMarker } = require('../../scripts/lib/project-marker');
+const { resolveHandoffMdPath } = require('../../scripts/lib/handoff-paths');
 const { createRequire } = require('module');
 const scriptsRequire = createRequire(require.resolve('../../scripts/package.json'));
 const { Client } = scriptsRequire('pg');
@@ -237,7 +238,7 @@ async function teardownProject(ctx) {
   try { await db.end(); } catch (_) {}
   try { fs.rmSync(fakeRoot, { recursive: true, force: true }); } catch (_) {}
   try {
-    const dir = path.join(os.homedir(), '.claude', 'projects', projectId);
+    const dir = path.dirname(resolveHandoffMdPath(projectId));
     if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
   } catch (_) {}
 }
@@ -1067,7 +1068,7 @@ async function runTests() {
     await db.query(`DELETE FROM retrieval_contract WHERE project_id = $1`, [projectId]);
     await db.end();
     fs.rmSync(nonGitRoot, { recursive: true, force: true });
-    const homeDir = path.join(os.homedir(), '.claude', 'projects', projectId);
+    const homeDir = path.dirname(resolveHandoffMdPath(projectId));
     if (fs.existsSync(homeDir)) fs.rmSync(homeDir, { recursive: true, force: true });
   });
 

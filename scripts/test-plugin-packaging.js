@@ -11,7 +11,7 @@
  *   P3  Engine asset resolution falls back to __dirname-relative paths when
  *       CLAUDE_PLUGIN_ROOT is unset (standalone / CI mode unchanged).
  *   P4  SessionStart hook (loader-hook) exits 0 with no output when the
- *       target project has no .claude-memory marker.
+ *       target project has no project marker.
  *   P5  Plugin mode rejects STORAGE_BACKEND=sqlite with exit 1 and a clear
  *       message — never silently falls through to SQLite.
  *
@@ -31,6 +31,8 @@ const os            = require('os');
 const path          = require('path');
 const { test }      = require('node:test');
 const assert        = require('node:assert/strict');
+const { MARKER_FILENAME } = require('./lib/project-marker');
+const { resolveHandoffMdPath } = require('./lib/handoff-paths');
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -146,7 +148,7 @@ test('P2: CLAUDE_PLUGIN_ROOT env var is used for asset paths when set', () => {
     fs.writeFileSync(path.join(tplDir, 'handoff.md.tpl'), '# stub\n');
     fs.writeFileSync(path.join(tplDir, 'project-claude-md.tpl'), '# stub\n');
 
-    // Use a project dir that has no .claude-memory so loader-hook exits 0 quickly.
+    // Use a project dir that has no project marker so loader-hook exits 0 quickly.
     const emptyProjectDir = path.join(tmpBase, 'empty-project');
     fs.mkdirSync(emptyProjectDir, { recursive: true });
 
@@ -227,7 +229,7 @@ test('P2: CLAUDE_PLUGIN_ROOT env var is used for asset paths when set', () => {
 // ── P3: Engine asset resolution without CLAUDE_PLUGIN_ROOT (standalone/CI) ───
 
 test('P3: __dirname fallback is used when CLAUDE_PLUGIN_ROOT is unset', () => {
-  // Run loader-hook from a cwd that is NOT the repo root and has no .claude-memory.
+  // Run loader-hook from a cwd that is NOT the repo root and has no project marker.
   // If asset paths were hard-coded to cwd-relative they would break; __dirname fallback
   // keeps them anchored to the actual scripts/ directory.
   const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'handoff-standalone-test-'));
@@ -284,9 +286,9 @@ test('P3: __dirname fallback is used when CLAUDE_PLUGIN_ROOT is unset', () => {
   }
 });
 
-// ── P4: loader-hook is inert when no .claude-memory marker is present ─────────
+// ── P4: loader-hook is inert when no project marker is present ────────────────
 
-test('P4: loader-hook exits 0 with no stdout when project has no .claude-memory', () => {
+test('P4: loader-hook exits 0 with no stdout when project has no project marker', () => {
   const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'handoff-noop-test-'));
 
   try {
@@ -366,12 +368,12 @@ test('P5: plugin mode exits 1 with actionable message when STORAGE_BACKEND=sqlit
   // Instead use `loader-load` or a small inline script that calls connectHandoff
   // by running handoff.js with a marker-bearing project dir so it doesn't no-op.
 
-  // Create a temp project with a .claude-memory marker so the hook doesn't no-op.
+  // Create a temp project with a project marker so the hook doesn't no-op.
   const tmpBase    = fs.mkdtempSync(path.join(os.tmpdir(), 'handoff-sqlite-guard-'));
   const projectDir = path.join(tmpBase, 'test-project');
   fs.mkdirSync(projectDir, { recursive: true });
 
-  // Write a minimal .claude-memory marker.
+  // Write a minimal marker under the current (non-legacy) name.
   // UUID must be valid v4 (version nibble=4, variant nibble∈{8,9,a,b}) so
   // readMarker's isValidUUID check passes and resolveProjectId returns the UUID.
   const marker = {
@@ -379,12 +381,12 @@ test('P5: plugin mode exits 1 with actionable message when STORAGE_BACKEND=sqlit
     created_at:     new Date().toISOString(),
     schema_version: 1,
   };
-  fs.writeFileSync(path.join(projectDir, '.claude-memory'), JSON.stringify(marker, null, 2) + '\n');
+  fs.writeFileSync(path.join(projectDir, MARKER_FILENAME), JSON.stringify(marker, null, 2) + '\n');
 
   // Write a stub handoff.md so the hook proceeds past the "no handoff.md → exit 0" gate.
-  const handoffDir = path.join(os.homedir(), '.claude', 'projects', marker.uuid);
+  const handoffPath = resolveHandoffMdPath(marker.uuid);
+  const handoffDir  = path.dirname(handoffPath);
   fs.mkdirSync(handoffDir, { recursive: true });
-  const handoffPath = path.join(handoffDir, 'handoff.md');
   const handoffCreated = !fs.existsSync(handoffPath);
   if (handoffCreated) {
     fs.writeFileSync(handoffPath, '---\nlast_close: 2026-01-01T00:00:00Z\n---\n');

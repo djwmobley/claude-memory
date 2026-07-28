@@ -28,9 +28,10 @@ const fs     = require('fs');
 const os     = require('os');
 const { execFileSync, spawnSync } = require('child_process');
 
-const { loadConfig }  = require('../../scripts/lib/shared');
-const { encodeCwd }   = require('../../scripts/lib/encoded-cwd');
-const { writeMarker } = require('../../scripts/lib/project-marker');
+const { loadConfig }             = require('../../scripts/lib/shared');
+const { encodeCwd }              = require('../../scripts/lib/encoded-cwd');
+const { writeMarker, readMarker } = require('../../scripts/lib/project-marker');
+const { resolveHandoffMdPath }   = require('../../scripts/lib/handoff-paths');
 
 const { createRequire } = require('module');
 const scriptsRequire = createRequire(require.resolve('../../scripts/package.json'));
@@ -220,7 +221,7 @@ async function teardown() {
   try { if (fakeRoot) fs.rmSync(fakeRoot, { recursive: true, force: true }); } catch (_) {}
   try {
     if (projectUuid) {
-      const dir = path.join(os.homedir(), '.claude', 'projects', projectUuid);
+      const dir = path.dirname(resolveHandoffMdPath(projectUuid));
       if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
     }
   } catch (_) {}
@@ -373,16 +374,9 @@ async function runTests() {
   });
 
   await test('purge --dry-run: handoff.md is NOT removed', () => {
-    const markerPath = path.join(fakeRoot, '.claude-memory');
-    let projectUuid  = projectId;
-    if (fs.existsSync(markerPath)) {
-      try {
-        const txt = fs.readFileSync(markerPath, 'utf8');
-        const m   = txt.match(/"uuid"\s*:\s*"([^"]+)"/);
-        if (m) projectUuid = m[1];
-      } catch (_) {}
-    }
-    const handoffPath = path.join(os.homedir(), '.claude', 'projects', projectUuid, 'handoff.md');
+    const marker      = readMarker(fakeRoot);
+    const projectUuid = marker ? marker.uuid : projectId;
+    const handoffPath = resolveHandoffMdPath(projectUuid);
     runHelper('purge', ['--dry-run'], { fakeRoot });
     assert.ok(fs.existsSync(handoffPath), 'handoff.md should still exist after purge --dry-run');
   });
