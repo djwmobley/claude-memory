@@ -26,6 +26,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`scripts/lib/reality-checks.js`, `scripts/handoff.js`,
   `test/handoff/test-open-thread-verify.js`)
 
+### Fixed
+
+- **`open_thread` serve-time staleness gate: qualified cross-repo refs no
+  longer false-positive against local PR numbers (#150)** — `probeOpenThread`
+  in `scripts/lib/reality-checks.js` extracted every `#N` token from an
+  `open_thread` assertion's subject+object haystack and intersected it with
+  the local merged-PR set, so a QUALIFIED cross-repo reference like
+  `memory-manager#12` or `owner/repo#12` had its `#12` matched against LOCAL
+  PR numbers, producing a false `[STALE: now "merged: #12 …"]` annotation.
+  Fix: for every `#N` token, classify by the single character immediately
+  preceding `#` (direct adjacency) — a total classification, no third
+  "ambiguous" branch. `P` in `[A-Za-z0-9_.-]` (ASCII-only — GitHub owner/repo
+  names are ASCII-only; deliberately not `\w`/`\p{L}`) → SUPPRESSED, never
+  checked against the merged set. This one branch covers true qualified refs
+  AND prose-glued local forms (`PR#152`, `commit#12`) alike — the classifier
+  does not try to tell them apart; ambiguity always resolves to no-annotation
+  (friction over a false positive). Otherwise (start of haystack, or `P` is
+  whitespace/punctuation/a Unicode character) → LOCAL-CANDIDATE, checked
+  exactly as before. **Accepted tradeoff**: glued local refs like `PR#152`
+  lose their staleness signal — unavoidable, since they are textually
+  identical to the cross-repo form that caused the bug; this repo's
+  squash-merge convention always parenthesizes merged-PR anchors (`(#N)`),
+  so close.md-authored anchors never take the lossy glued form in practice.
+  `getMergedPrSet` is unchanged — its `\(#(\d+)\)` pattern requires `(`
+  directly adjacent to `#`, which is structurally immune to qualified
+  prefixes inside parens. The classification pattern is hoisted to the new
+  exported `OPEN_THREAD_TOKEN_RE` constant (single source of truth, also used
+  directly by a test-only start-of-string boundary check). Also added a
+  docstring warning on `probeOpenThread`: a served `[STALE: ...]` annotation
+  must never be copy-pasted verbatim into a new assertion object
+  (self-amplification risk is behavioral, not code-reachable). 7 new tests
+  in `test/handoff/test-open-thread-verify.js` (OT7-OT13) cover the
+  regression, the named `PR#N` tradeoff, non-weakening of the existing
+  `(#N)`/whitespace-preceded signal, start-of-string, chained `#12#13`, the
+  `getMergedPrSet` parens-adjacency immunity against a qualified ref in the
+  same commit subject, and Unicode-preceded tokens.
+  (`scripts/lib/reality-checks.js`, `test/handoff/test-open-thread-verify.js`)
+
 ### Changed
 
 - **Refactor: de-duplicate `scripts/test-both-backends.js` helpers** — hoisted
