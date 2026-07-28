@@ -1,0 +1,31 @@
+{
+  "_comment": "SYNTHETIC EXAMPLE ONLY — obviously-fake project ids, database names, and queries. The real recall-equivalence-queries.json carries real project queries against real source/staging data and is gitignored, never committed. This file documents the required shape for verify-15-t4-recall-equivalence.js.",
+  "projects": [
+    {
+      "project_id": "example-project-a",
+      "queries": [
+        {
+          "table": "decisions",
+          "old_store": {
+            "database": "example_source_db",
+            "sql": "SELECT topic, decision, reason FROM decisions WHERE project = $1",
+            "params": ["example-project-a"]
+          },
+          "staging": {
+            "sql": "SELECT topic, decision, reason FROM decisions WHERE project_id = $1",
+            "params": ["example-project-a"]
+          },
+          "tuple_cols": ["topic", "decision", "reason"]
+        }
+      ]
+    }
+  ],
+  "isolation": [
+    {
+      "project_a": "example-project-a",
+      "project_b": "example-project-b",
+      "staging_sql": "SELECT project_id FROM decisions WHERE project_id = $1",
+      "params": ["example-project-a"]
+    }
+  ]
+}

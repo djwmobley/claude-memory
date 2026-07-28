@@ -128,6 +128,22 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run verify-15 acceptance-battery tests
+        # Tests scripts/migrations/verify-15-*.js, the §15 acceptance T-battery
+        # (13 checks + T10 aggregator) that gates staging->canonical promotion.
+        # Proof-of-firing coverage for every check (T0/T0-completeness/T1/
+        # freeze-precondition/T2/T2.5/T3/T3b/T4/T5/T6/T7/T8/T9), the T9 NULL-
+        # scoped provenance fixture, the T10 recorded_by independence
+        # cross-check, and a static sweep for zero live `NOT IN (` SQL in any
+        # authored script. Self-contained: creates/drops its own _staging-
+        # suffixed scratch DBs; writes roster/fixture JSON to the OS temp dir
+        # (never the repo); never touches claude_memory_eval_test/
+        # claude_policy_framework/pipeline_*/memory_manager_staging.
+        run: node test/migrations/test-verify-15.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run smoketest (all sections)
         # Runs the full smoketest suite — all 13 sections including collision (OQ-5
         # supersession invariant) and registry (SQL-1:1-index-vs-registry-JSON drift).
