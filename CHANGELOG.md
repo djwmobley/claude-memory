@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Schema-setup-only addenda migration** — a second migrations runner,
+  `scripts/migrations/migrate-schema-addenda.js`, applies six net-new,
+  idempotent SQL pieces on top of a `migrate-01-canonical-db.js` target:
+  `source_model`/`agent_id` attribution columns on `entities`/`assertions`/
+  `edges`; an assertions `carryover_status` column (open/resolved
+  carry-over tracking); a `model_registry` base table (lazily populated,
+  no seed rows — model-agnostic, no named-model CHECK anywhere); an
+  `embedding_providers` base table with one specified seed row
+  (`vllm-local`); a routing-harness table group (`routing_profiles`,
+  `routing_session_overrides`, plus routing columns added to
+  `model_registry`); and a usage-telemetry table group (`turn_usage`,
+  `session_usage`). No data migration of any kind — schema/DDL only. The
+  runner reuses `migrate-01-canonical-db.js`'s target resolution,
+  total-classification refusal, and SQL-apply helpers by import (never a
+  fork), refuses a target that does not yet exist or is missing the
+  engine-core tables this addendum alters, and derives its entire expected
+  object set — tables, columns and their declared types, CHECK constraints,
+  indexes (including partial-index `WHERE` clauses), UNIQUE constraints, and
+  the embedding-providers seed row's values — from the six SQL files' own
+  text at verify time, never from a hand-maintained list. New SQL files
+  under `scripts/migrations/sql/`; new test suite
+  `test/migrations/test-migrate-schema-addenda.js` (30 cases covering
+  prerequisite refusal on both an empty-but-existing and a never-created
+  target, fresh apply, idempotent re-run, refused target names, six
+  proof-of-firing perturbations against the derived verification, static
+  SQL-text invariant sweeps, derivation-helper unit cases, and a forced
+  mid-sequence apply failure with idempotent heal); wired into CI alongside
+  the existing migrations test steps. Also fixes
+  `scripts/migrations/inventory-manifest.json`'s section attribution for
+  `model_registry`/`embedding_providers` (their `CREATE TABLE` DDL
+  originates one section earlier than previously recorded; the consuming
+  completeness check keys only on table name, not on the section field, so
+  this is a documentation-accuracy fix with no behavioral effect).
+  (`scripts/migrations/sql/*.sql`, `scripts/migrations/migrate-schema-addenda.js`,
+  `test/migrations/test-migrate-schema-addenda.js`, `.github/workflows/test.yml`,
+  `scripts/migrations/inventory-manifest.json`)
+
 - **Serve-time `open_thread` staleness gate** — `open_thread` rows are now
   reality-checked at serve time (resume / resurrect) against local git merge
   state. Any PR numbers cited in the thread text (e.g. `#106`) are checked

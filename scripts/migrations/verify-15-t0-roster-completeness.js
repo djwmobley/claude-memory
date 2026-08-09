@@ -17,9 +17,9 @@ const AUTHORED_BY = 'sonnet-t-battery-author-2026-07-27';
  * This script diffs scripts/migrations/source-table-roster.json's
  * targetTable set against scripts/migrations/inventory-manifest.json — a
  * second, DELIBERATELY SEPARATE hand-maintained file enumerating every table
- * name §5.3's 13 absorbed-seam list, §9's four interop tables, §17's two
- * routing tables, and §18's two telemetry tables actually declare — in BOTH
- * directions:
+ * name §5.3's 13 absorbed-seam list, §5.6/§5.7's model-registry/embedding-
+ * providers base tables, §9's two interop tables, §17's two routing tables,
+ * and §18's two telemetry tables actually declare — in BOTH directions:
  *   1. every inventory-manifest.json table has >=1 matching roster entry
  *   2. every roster entry's targetTable is either in inventory-manifest.json
  *      OR is one of the pre-existing §5.1/§5.2 graph-core/corpus tables that
