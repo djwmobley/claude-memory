@@ -175,6 +175,35 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run route-resolve + verify-17 routing smoke tests
+        # Tests scripts/lib/route-resolve.js (the least-cost routing resolver:
+        # routeResolve/recommendLeastCost/resolveRequiredTier) and
+        # scripts/migrations/verify-17-routing-smoke.js, the §17.4 5-point
+        # operator-run smoke test (idempotency, directive + recommendation
+        # recording, least-cost tier-fit-before-cost selection, no-silent-
+        # downgrade with the two distinct empty-pool/cost-unconfigured errors,
+        # and cross-project isolation including the '*' global-default-pin
+        # contract). The smoke script runs its entire fixture lifecycle inside
+        # one transaction that is always rolled back -- safe to run against a
+        # live staging database.
+        # Covers: fresh apply -> exit 0 + all 5 checks PASS; routing_profiles
+        # dropped -> prerequisite refusal naming migrate-schema-addenda.js;
+        # refused target names; direct lib unit tests for precedence order
+        # (override > session override > project pin > global '*' pin >
+        # recommendation), required-tier resolution order + the unconfigured
+        # hard error, NULL-cost exclusion, deterministic label tiebreak, the
+        # distinct empty-pool vs cost-unconfigured errors, the insert-race
+        # loser path (and its distinct rationale string), input validation,
+        # turnIdx=0, a directive-present + unconfigured-role degrade-to-NULL
+        # case, a pin-tier-mismatch rationale case, and the string-vs-numeric
+        # cost boundary fixture (rate-sums 9 vs 10).
+        # Creates/drops its own _staging-suffixed scratch DBs; never touches
+        # claude_memory_eval_test beyond the connection-avoidance assertion.
+        run: node test/migrations/test-verify-17.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run smoketest (all sections)
         # Runs the full smoketest suite — all 13 sections including collision (OQ-5
         # supersession invariant) and registry (SQL-1:1-index-vs-registry-JSON drift).

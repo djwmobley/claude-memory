@@ -15,7 +15,7 @@ This index covers documentation that ships in the repository. Local-only plannin
 | `MANIFEST.md` | This file — tracked index of all documentation | updated (command-parameter build: docs + test files tracked) |
 | `QUICKSTART.md` | Step-by-step setup guide for new users | updated (added /handoff:resurrect) |
 | `PREREQS.md` | System prerequisites (Node, Postgres, pgvector, vLLM) | current |
-| `CHANGELOG.md` | Version history and release notes | updated (Unreleased: schema-setup-only addenda migration added; serve-time open_thread staleness gate; prior refactor entries retained) |
+| `CHANGELOG.md` | Version history and release notes | updated (Unreleased: least-cost routing resolver + verify-17 smoke test added; schema-setup-only addenda migration; serve-time open_thread staleness gate; prior refactor entries retained) |
 | `CONTRIBUTING.md` | Contribution guidelines and workflow | current |
 | `CODE_OF_CONDUCT.md` | Community standards | current |
 | `SECURITY.md` | Security policy and disclosure process | current |

@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Least-cost routing resolver + operator smoke test** —
+  `scripts/lib/route-resolve.js` exports `routeResolve`,
+  `recommendLeastCost`, and `resolveRequiredTier`: given a turn's identity
+  (project, session, turn index, agent role), resolves which model/provider
+  the turn should use and records the decision exactly once in
+  `turn_usage` (idempotent replay on a repeat call for the same key; a
+  losing concurrent insert re-selects and returns the winner's row rather
+  than diverging from it). Resolution precedence, first hit wins: an
+  idempotent replay, then a directive chain (per-turn override argument,
+  `routing_session_overrides`, an active project-scoped `routing_profiles`
+  pin, then an active `project_id='*'` global-default pin — matched only at
+  this step, never as a wildcard elsewhere), then a least-cost
+  recommendation. Required-tier resolution is a separate total
+  classification (explicit argument, then project-scoped, then `'*'`-scoped
+  `routing_profiles.capability_tier`); an unconfigured role is a hard error
+  naming the role and pointing at the (not-yet-built) routing init Q&A —
+  the role→tier suggestion table is deliberately never applied as a silent
+  fallback anywhere in this file. Least-cost selection is tier-fit before
+  cost (never reaches for a higher tier because it is cheaper), then
+  ascending rate-sum, then label as the deterministic tiebreak; a directive
+  bypasses the tier check outright (operator intent wins) but a registered
+  pin below the required tier is flagged in the returned `rationale`. All
+  NUMERIC cost columns (returned by `pg` as strings) are coerced through a
+  NULL-preserving numeric coercion before any comparison, sum, or
+  subtraction, and a non-finite `cost_delta_usd` is written as NULL, never
+  as NaN. New operator-run CLI `scripts/migrations/verify-17-routing-smoke.js`
+  (the runbook §17.4 5-point smoke test: idempotency, directive +
+  recommendation recording, least-cost tier-fit-before-cost selection,
+  no-silent-downgrade with two distinct empty-pool/cost-unconfigured
+  errors, and cross-project pin isolation including the `'*'` global-pin
+  contract) — reuses `migrate-01-canonical-db.js`'s target resolution and
+  refusal by import, runs its entire fixture lifecycle inside one
+  transaction that is always rolled back (safe against a live staging
+  database; zero residue by construction, including under a crash), and
+  refuses loudly, naming `migrate-schema-addenda.js`, when the
+  routing/telemetry prerequisite tables are absent. New test suite
+  `test/migrations/test-verify-17.js` (subprocess coverage of the smoke
+  script plus direct unit tests of the resolver: precedence order,
+  required-tier resolution order, NULL-cost exclusion, deterministic
+  tiebreak, the insert-race loser path, input validation, and a
+  string-vs-numeric cost-comparison boundary fixture); wired into CI. No
+  MCP tool wiring, no `usage_record`/`usage_query`, and no
+  `model_registry` auto-registration — out of scope for this change.
+  (`scripts/lib/route-resolve.js`, `scripts/migrations/verify-17-routing-smoke.js`,
+  `test/migrations/test-verify-17.js`, `.github/workflows/test.yml`)
+
 - **Schema-setup-only addenda migration** — a second migrations runner,
   `scripts/migrations/migrate-schema-addenda.js`, applies six net-new,
   idempotent SQL pieces on top of a `migrate-01-canonical-db.js` target:
