@@ -144,6 +144,37 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run migrate-schema-addenda tests
+        # Tests scripts/migrations/migrate-schema-addenda.js, the schema-only
+        # addenda runner that applies six net-new SQL pieces on top of a
+        # migrate-01-canonical-db.js target: attribution columns
+        # (source_model/agent_id on entities/assertions/edges),
+        # carryover_status, model_registry, embedding_providers (+ its
+        # vllm-local seed row), the routing-harness tables, and the
+        # usage-telemetry tables. No data migration.
+        # Covers: prerequisite-table refusal on an empty (but existing)
+        # target vs. a target that was never created at all (two distinct
+        # code paths), fresh apply + full derived verification (tables,
+        # columns, declared types, CHECK constraints, indexes/partial-index
+        # WHERE clauses, UNIQUE constraints, seed-row values), idempotent
+        # re-run, refused target names + a reference-identity proof that
+        # classifyTarget is imported from migrate-01 rather than forked,
+        # verification proof-of-firing for six distinct perturbations
+        # (dropped table, dropped column, pre-existing stub table with
+        # missing columns, a column present but its CHECK absent, a deleted
+        # seed row, a divergently-updated seed row), static SQL-text
+        # invariant sweeps (no INSERT INTO model_registry, every CREATE
+        # TABLE/ADD COLUMN uses IF NOT EXISTS, no DROP statements, no CHECK
+        # added to a pre-existing column), derivation-helper unit cases
+        # against a synthetic fixture, and a forced mid-sequence apply
+        # failure followed by an idempotent heal.
+        # Creates/drops its own _staging-suffixed scratch DBs; never touches
+        # claude_memory_eval_test beyond the connection-avoidance assertion.
+        run: node test/migrations/test-migrate-schema-addenda.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run smoketest (all sections)
         # Runs the full smoketest suite — all 13 sections including collision (OQ-5
         # supersession invariant) and registry (SQL-1:1-index-vs-registry-JSON drift).
