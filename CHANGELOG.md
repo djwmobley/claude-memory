@@ -9,6 +9,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Agent-to-agent exchange schema + tamper-evidence infrastructure +
+  interop contracts** — new schema-setup-only migration
+  `scripts/migrations/sql/migrate-13-agent-exchange.sql` (applied by
+  `scripts/migrations/migrate-13-agent-exchange.js`) adds `agent_exchange`,
+  a project-scoped, append-only log for agent-to-agent communication:
+  proposals, responses, threaded replies (`parent_id` self-FK), and
+  broadcasts (`to_agent IS NULL`), attributed via the same
+  `source_model`/`agent_id` columns every other table uses. There is no
+  `status`/`read_at` column by design — acknowledgment is a NEW row
+  (`kind='observation'`, `parent_id` set), never an UPDATE of the original;
+  the documented polling contract is a compound `(created_at, id)` cursor,
+  not `created_at` alone (every row inside one transaction shares one
+  `transaction_timestamp()` value, so `id`'s strict SERIAL advance is what
+  makes the cursor exercisable and immune to same-timestamp ties). The
+  `embedding halfvec(4000)` column and its HNSW index are added via the
+  same graceful-degradation `DO $$ ... EXCEPTION $$` pattern as
+  `assertions.embedding`, so a pgvector-absent target still gets every
+  other column — the whole file runs as one implicit transaction, so a
+  hard failure on the vector column would otherwise abort unrelated
+  statements too. `docket_id` conditionally FKs to a not-yet-shipped
+  `tasks` table: absent → deferred; present with no orphans → added
+  `NOT VALID` then `VALIDATE CONSTRAINT`s clean → validated; present with
+  pre-existing orphan `docket_id` rows → added but left `NOT VALID`,
+  orphans reported by id (capped at 20), never silently dropped; present
+  with the constraint absent after apply → the one FAIL branch. A total,
+  four-state classification, never a silent pass-through.
+
+  The same migration adds generic, reusable tamper-evidence infrastructure:
+  `audit_log` (`row_id BIGINT` — deliberately wider than the source
+  design's INTEGER) plus a `log_guarded_change()` AFTER UPDATE OR DELETE
+  trigger, wired via conditional per-table `DO` blocks onto every table
+  that both exists and has an `id` column — unconditionally onto
+  `assertions`/`edges`, and automatically (zero further schema changes)
+  onto 13 not-yet-shipped seam tables the moment each one exists.
+  `audit_log` itself is never self-wired. This is detection, not
+  prevention: a shared, credential-diverse localhost Postgres instance has
+  no per-agent role layer to `REVOKE` against, so a raw `UPDATE`/`DELETE`
+  on a guarded table still succeeds — but it is now captured
+  (`table_name`, `operation`, `row_id`, `db_user`, `old_row`, `new_row`,
+  the `embedding` key stripped from both snapshots to keep audit rows
+  bounded-size on the engine's most common write path). Sanctioned engine
+  writes (e.g. `assertions` supersession) generate audit rows exactly like
+  an unsanctioned mutation would, by design; `ON CONFLICT ... DO UPDATE`
+  fires the same trigger as an explicit `UPDATE`.
+
+  Two abstract contracts ship with zero concrete implementations by
+  design: `scripts/lib/agent-provider.js`'s `AgentProvider` (`label()`,
+  `async runHeadless(prompt, {cwd, env})`) and
+  `scripts/lib/embedding-provider.js`'s `EmbeddingProvider` (`async
+  embed(text)` → `{vector, dims, model}`, `storedDims()`), both throwing
+  "not implemented" on the base class — operators supply concrete
+  subclasses for their own headless-CLI and embedding backends.
+  `AgentProvider.label()` is one identity string stamped into three
+  consuming surfaces (attribution columns, `model_registry.label`,
+  `turn_usage.model_id`); `EmbeddingProvider` concrete providers are
+  registered by name as `embedding_providers` rows (data, not code) — this
+  PR does not rewire the engine's existing embedding call path onto it.
+
+  New operator-run CLI `scripts/migrations/verify-13-exchange-smoke.js` (7
+  checks: post + broadcast + compound-cursor watermark poll, threaded
+  reply reconstruction, a worked cross-agent example — adapted to write an
+  attributed `assertions` row in place of the not-yet-shipped `findings`
+  seam table — tamper-evidence UPDATE, tamper-evidence DELETE, a trigger-
+  coverage report across the full checklist, and the append-only-
+  convention sanity check) built on the shared
+  `scripts/migrations/lib/smoke-harness.js`; nothing is wiped (no
+  global-pool table is involved), only prefix-residue-scanned. New test
+  suite `test/migrations/test-verify-13.js` (20 cases: subprocess coverage
+  of both the migration runner and the smoke script, direct-client
+  verification proof-of-firing for the trigger/function/HNSW-index/FK
+  states, the conditional FK's three non-deferred-by-tasks-absence states,
+  audit-trigger firing on an ordinary `assertions` UPDATE, a negative test
+  that `audit_log` is never self-wired, and static SQL-text invariants
+  including a privacy-scrub floor); wired into CI. New doc
+  `docs/agent-interop.md`. Out of scope for this change: MCP
+  `exchange_append`/`exchange_read` tools, concrete `AgentProvider`/
+  `EmbeddingProvider` implementations, the not-yet-shipped seam tables
+  themselves, and any `handoff.js` change.
+  (`scripts/migrations/sql/migrate-13-agent-exchange.sql`,
+  `scripts/migrations/migrate-13-agent-exchange.js`,
+  `scripts/migrations/verify-13-exchange-smoke.js`,
+  `scripts/lib/agent-provider.js`, `scripts/lib/embedding-provider.js`,
+  `test/migrations/test-verify-13.js`, `docs/agent-interop.md`,
+  `.github/workflows/test.yml`)
+
 - **Usage-telemetry record/query library + operator smoke test** —
   `scripts/lib/usage-telemetry.js` exports `usageRecord`, `sessionUsageRollup`,
   and `usageQuery`: the measurement-side companion to

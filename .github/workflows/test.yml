@@ -245,6 +245,46 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run agent-exchange migration + verify-13 smoke tests
+        # Tests scripts/migrations/migrate-13-agent-exchange.js (the agent_exchange
+        # append-only A2A exchange log + generic audit_log/log_guarded_change()
+        # tamper-evidence infrastructure, wired onto every append-only table that
+        # exists in the target) and scripts/migrations/verify-13-exchange-smoke.js,
+        # its 7-check operator smoke test (post+broadcast+compound-cursor watermark
+        # poll, threaded reply reconstruction, a worked cross-agent example,
+        # tamper-evidence UPDATE/DELETE, a trigger-coverage report, and the
+        # append-only-convention sanity check). Reuses migrate-01-canonical-db.js's
+        # and migrate-schema-addenda.js's own exported helpers by reference (never
+        # forked); the generic tables/columns/indexes/checks/uniques/seeds
+        # verification pass is migrate-schema-addenda.js's own exported
+        # verifyAddenda, called with this migration's own SQL file list — no
+        # changes to migrate-schema-addenda.js itself. The smoke script runs its
+        # entire fixture lifecycle inside one transaction that is always rolled
+        # back -- safe to run against a live staging database; nothing is wiped
+        # (no global-pool table is involved), only prefix-residue-scanned.
+        # Covers: fresh apply -> exit 0 + MIGRATION_RESULT: PASS (FK deferred,
+        # tasks absent); idempotent re-run; assertions dropped -> prerequisite
+        # refusal naming migrate-01-canonical-db.js; refused target names; smoke
+        # fresh apply -> exit 0 + SMOKE13_RESULT: PASS + all 7 checks PASS;
+        # agent_exchange dropped -> smoke prerequisite refusal naming
+        # migrate-13-agent-exchange.js; direct-client verification proof-of-firing
+        # for a dropped trigger, a dropped function, a stubbed function body (body-
+        # content check, not just name-match), and a dropped HNSW index on a
+        # pgvector-present target (each perturbation healed via re-apply
+        # afterward); the conditional FK's three non-FAIL states (deferred when
+        # tasks is absent, validated once tasks exists with no orphans, added-
+        # not-validated when an orphan docket_id row predates tasks); audit-trigger
+        # firing on an ordinary assertions UPDATE (sanctioned mutations captured
+        # too, by design); a negative test that audit_log is never self-wired; and
+        # static SQL-text invariants (the privacy-scrub floor, no DROP TABLE, and
+        # CREATE TABLE ... IF NOT EXISTS discipline).
+        # Creates/drops its own _staging-suffixed scratch DBs; never touches
+        # claude_memory_eval_test beyond the connection-avoidance assertion.
+        run: node test/migrations/test-verify-13.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run smoketest (all sections)
         # Runs the full smoketest suite — all 13 sections including collision (OQ-5
         # supersession invariant) and registry (SQL-1:1-index-vs-registry-JSON drift).
