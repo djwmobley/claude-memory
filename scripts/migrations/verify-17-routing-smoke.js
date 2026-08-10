@@ -46,6 +46,13 @@
  * verifies zero COMMITTED rows carry its prefix (defense-in-depth scan,
  * including `project_id='*' AND role LIKE 'smoke17-%'`).
  *
+ * HARNESS EXTRACTION (runbook §18, ADVERSARY-PASS AMENDMENTS A-15/A-16):
+ * the transaction+rollback / run-prefix / residue-scan machinery described
+ * above now lives in scripts/migrations/lib/smoke-harness.js, shared with
+ * verify-18-usage-smoke.js. This file's own behavior and stdout shape are
+ * unchanged by that extraction -- see smoke-harness.js's header comment for
+ * the byte-identical-output acceptance contract this refactor must meet.
+ *
  * Usage:
  *   node scripts/migrations/verify-17-routing-smoke.js [--db <name>]
  *
@@ -53,7 +60,6 @@
  * any check FAIL, 2 = bad CLI usage.
  */
 
-const crypto = require('crypto');
 const { Client } = require('pg');
 
 const migrateOne = require('./migrate-01-canonical-db');
@@ -61,10 +67,26 @@ const {
   routeResolve,
   resolveRequiredTier,
 } = require('../lib/route-resolve');
+const smokeHarness = require('./lib/smoke-harness');
 
 // ─── The four prerequisite tables this resolver touches ──────────────────
 
 const PREREQUISITE_TABLES = ['model_registry', 'routing_profiles', 'routing_session_overrides', 'turn_usage'];
+
+// Only model_registry is ever wiped (A-15) -- the global recommendation
+// pool, made deterministic for the run's duration inside the
+// always-rolled-back transaction.
+const WIPE_TABLES = ['model_registry'];
+
+// Post-rollback residue-scan specs (A-15) -- one entry per table this
+// script's fixtures can touch. The routing_profiles clause additionally
+// matches the '*' sentinel project_id fixture via its run-prefixed role.
+const RESIDUE_SPECS = [
+  { table: 'model_registry', where: 'label LIKE $1' },
+  { table: 'routing_profiles', where: "project_id LIKE $1 OR (project_id = '*' AND role LIKE $1)" },
+  { table: 'routing_session_overrides', where: 'project_id LIKE $1' },
+  { table: 'turn_usage', where: 'project_id LIKE $1' },
+];
 
 // ─── CLI ARGS ──────────────────────────────────────────────────────────────
 
@@ -138,6 +160,10 @@ async function turnUsageCount(client, projectId, sessionId, turnIdx, role) {
 function assert(cond, msg) {
   if (!cond) throw new Error(msg);
 }
+
+// runCheck and scanForResidue now live in ./lib/smoke-harness.js (extracted,
+// A-15/A-16) -- called via smokeHarness.runCheck / smokeHarness.scanForResidue
+// below, using RESIDUE_SPECS declared above.
 
 // ─── The 5 checks ────────────────────────────────────────────────────────
 
@@ -294,17 +320,6 @@ async function checkCrossProjectIsolation(client, PREFIX) {
 
 // ─── Runner ────────────────────────────────────────────────────────────────
 
-async function runCheck(id, name, fn) {
-  try {
-    await fn();
-    console.log(`[SMOKE-17][${id}] PASS ${name}`);
-    return true;
-  } catch (err) {
-    console.log(`[SMOKE-17][${id}] FAIL ${name}: ${err.message}`);
-    return false;
-  }
-}
-
 async function checkPrerequisites(client) {
   const { rows } = await client.query(
     `SELECT table_name FROM information_schema.tables
@@ -313,29 +328,6 @@ async function checkPrerequisites(client) {
   const actual = new Set(rows.map((r) => r.table_name.toLowerCase()));
   const missing = PREREQUISITE_TABLES.filter((t) => !actual.has(t));
   return { ok: missing.length === 0, missing };
-}
-
-async function scanForResidue(client, PREFIX) {
-  const residue = [];
-  const like = `${PREFIX}%`;
-
-  const registry = await client.query(`SELECT count(*)::int AS n FROM model_registry WHERE label LIKE $1`, [like]);
-  if (registry.rows[0].n > 0) residue.push(`model_registry: ${registry.rows[0].n} row(s)`);
-
-  const profiles = await client.query(
-    `SELECT count(*)::int AS n FROM routing_profiles
-      WHERE project_id LIKE $1 OR (project_id = '*' AND role LIKE $1)`,
-    [like]
-  );
-  if (profiles.rows[0].n > 0) residue.push(`routing_profiles: ${profiles.rows[0].n} row(s)`);
-
-  const overrides = await client.query(`SELECT count(*)::int AS n FROM routing_session_overrides WHERE project_id LIKE $1`, [like]);
-  if (overrides.rows[0].n > 0) residue.push(`routing_session_overrides: ${overrides.rows[0].n} row(s)`);
-
-  const usage = await client.query(`SELECT count(*)::int AS n FROM turn_usage WHERE project_id LIKE $1`, [like]);
-  if (usage.rows[0].n > 0) residue.push(`turn_usage: ${usage.rows[0].n} row(s)`);
-
-  return residue;
 }
 
 async function main() {
@@ -380,7 +372,7 @@ async function main() {
     process.exit(1);
   }
 
-  const PREFIX = `smoke17-${crypto.randomBytes(4).toString('hex')}`;
+  const PREFIX = smokeHarness.makeRunPrefix('17');
   console.log(`  run prefix: ${PREFIX}`);
 
   try {
@@ -388,36 +380,30 @@ async function main() {
     if (!prereq.ok) {
       console.error(`Refused: target "${target}" is missing prerequisite table(s): ${prereq.missing.join(', ')}.`);
       console.error('Run migrate-schema-addenda.js against this target first to stand up the routing/telemetry schema, then re-run this smoke test.');
-      console.log('SMOKE17_RESULT: FAIL');
+      smokeHarness.printSummary('17', false);
       process.exitCode = 1;
       return;
     }
 
-    let overallOk = true;
-    try {
-      await client.query('BEGIN');
-      // In-transaction reset -- makes the recommendation pool deterministic
-      // regardless of what real operator-registered rows exist. Rolled
-      // back at the end, so nothing is ever actually removed.
-      await client.query('DELETE FROM model_registry');
-
+    // In-transaction reset -- makes the recommendation pool deterministic
+    // regardless of what real operator-registered rows exist. Rolled back
+    // at the end (unconditionally -- success or failure), so nothing is
+    // ever actually removed. This IS the entire cleanup mechanism
+    // (ADVERSARY-PASS AMENDMENT 4-1/4-2/4-3): zero residue by construction,
+    // safe even under crash/SIGKILL.
+    let overallOk = await smokeHarness.withTransactionRollback(client, WIPE_TABLES, async () => {
       const results = [];
-      results.push(await runCheck(1, 'IDEMPOTENCY', () => checkIdempotency(client, PREFIX)));
-      results.push(await runCheck(2, 'DIRECTIVE + RECOMMENDATION RECORDING', () => checkDirectiveAndRecommendationRecording(client, PREFIX)));
-      results.push(await runCheck(3, 'LEAST-COST', () => checkLeastCost(client, PREFIX)));
-      results.push(await runCheck(4, 'NO SILENT DOWNGRADE', () => checkNoSilentDowngrade(client, PREFIX)));
-      results.push(await runCheck(5, 'CROSS-PROJECT ISOLATION', () => checkCrossProjectIsolation(client, PREFIX)));
-      overallOk = results.every(Boolean);
-    } finally {
-      // Rolled back unconditionally -- success or failure. This IS the
-      // entire cleanup mechanism (ADVERSARY-PASS AMENDMENT 4-1/4-2/4-3):
-      // zero residue by construction, safe even under crash/SIGKILL.
-      await client.query('ROLLBACK');
-    }
+      results.push(await smokeHarness.runCheck('17', 1, 'IDEMPOTENCY', () => checkIdempotency(client, PREFIX)));
+      results.push(await smokeHarness.runCheck('17', 2, 'DIRECTIVE + RECOMMENDATION RECORDING', () => checkDirectiveAndRecommendationRecording(client, PREFIX)));
+      results.push(await smokeHarness.runCheck('17', 3, 'LEAST-COST', () => checkLeastCost(client, PREFIX)));
+      results.push(await smokeHarness.runCheck('17', 4, 'NO SILENT DOWNGRADE', () => checkNoSilentDowngrade(client, PREFIX)));
+      results.push(await smokeHarness.runCheck('17', 5, 'CROSS-PROJECT ISOLATION', () => checkCrossProjectIsolation(client, PREFIX)));
+      return results.every(Boolean);
+    });
 
     // Defense-in-depth: after the rollback, prove zero COMMITTED rows
     // carry this run's prefix.
-    const residue = await scanForResidue(client, PREFIX);
+    const residue = await smokeHarness.scanForResidue(client, PREFIX, RESIDUE_SPECS);
     if (residue.length > 0) {
       console.log(`[SMOKE-17][residue] FAIL post-rollback residue detected: ${residue.join('; ')}`);
       overallOk = false;
@@ -425,7 +411,7 @@ async function main() {
       console.log('[SMOKE-17][residue] PASS zero residue post-rollback');
     }
 
-    console.log(`SMOKE17_RESULT: ${overallOk ? 'PASS' : 'FAIL'}`);
+    smokeHarness.printSummary('17', overallOk);
     process.exitCode = overallOk ? 0 : 1;
   } finally {
     await client.end();
@@ -435,7 +421,7 @@ async function main() {
 if (require.main === module) {
   main().catch((err) => {
     console.error(err && err.stack ? err.stack : err);
-    console.log('SMOKE17_RESULT: FAIL');
+    smokeHarness.printSummary('17', false);
     process.exitCode = 1;
   });
 }
@@ -445,5 +431,4 @@ module.exports = {
   UsageError,
   PREREQUISITE_TABLES,
   checkPrerequisites,
-  scanForResidue,
 };
