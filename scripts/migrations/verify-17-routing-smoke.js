@@ -393,11 +393,11 @@ async function main() {
     // safe even under crash/SIGKILL.
     let overallOk = await smokeHarness.withTransactionRollback(client, WIPE_TABLES, async () => {
       const results = [];
-      results.push(await smokeHarness.runCheck('17', 1, 'IDEMPOTENCY', () => checkIdempotency(client, PREFIX)));
-      results.push(await smokeHarness.runCheck('17', 2, 'DIRECTIVE + RECOMMENDATION RECORDING', () => checkDirectiveAndRecommendationRecording(client, PREFIX)));
-      results.push(await smokeHarness.runCheck('17', 3, 'LEAST-COST', () => checkLeastCost(client, PREFIX)));
-      results.push(await smokeHarness.runCheck('17', 4, 'NO SILENT DOWNGRADE', () => checkNoSilentDowngrade(client, PREFIX)));
-      results.push(await smokeHarness.runCheck('17', 5, 'CROSS-PROJECT ISOLATION', () => checkCrossProjectIsolation(client, PREFIX)));
+      results.push(await smokeHarness.runCheck(client, '17', 1, 'IDEMPOTENCY', () => checkIdempotency(client, PREFIX)));
+      results.push(await smokeHarness.runCheck(client, '17', 2, 'DIRECTIVE + RECOMMENDATION RECORDING', () => checkDirectiveAndRecommendationRecording(client, PREFIX)));
+      results.push(await smokeHarness.runCheck(client, '17', 3, 'LEAST-COST', () => checkLeastCost(client, PREFIX)));
+      results.push(await smokeHarness.runCheck(client, '17', 4, 'NO SILENT DOWNGRADE', () => checkNoSilentDowngrade(client, PREFIX)));
+      results.push(await smokeHarness.runCheck(client, '17', 5, 'CROSS-PROJECT ISOLATION', () => checkCrossProjectIsolation(client, PREFIX)));
       return results.every(Boolean);
     });
 

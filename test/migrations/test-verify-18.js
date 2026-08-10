@@ -14,7 +14,7 @@
  *
  * Two groups:
  *   A. Subprocess tests of verify-18-usage-smoke.js itself (fresh-apply
- *      PASS with all 8 checks, prerequisite-missing FAIL naming the addenda
+ *      PASS with all 9 checks, prerequisite-missing FAIL naming the addenda
  *      runner, refused target names).
  *   B. Direct unit tests of scripts/lib/usage-telemetry.js against a live
  *      scratch database, covering every ADVERSARY-PASS AMENDMENT semantic
@@ -26,8 +26,16 @@
  *      the record path and the rollup/query read paths (A-9), rollup
  *      NULL-SUM semantics on a non-cost fixture, the zero-turn rollup
  *      (A-17), "(none)" grouping keys, project-scope staleness, groupBy
- *      total classification, pure coerceNumeric/round6 cases, and a
- *      genuine concurrent rollup (A-11).
+ *      total classification, pure coerceNumeric/round6 cases, a genuine
+ *      concurrent rollup (A-11), and the cost-range guard (post-review
+ *      fix): cost_usd/total_cost_usd are NUMERIC(12,6) -- a caller-supplied
+ *      or server-computed cost that is a real, finite number but exceeds
+ *      999999.999999 now throws a named CostOutOfRangeError before any
+ *      write, rather than either a silent NULL or a raw unhandled Postgres
+ *      "numeric field overflow", covering the caller-supplied path, the
+ *      server-computed path (the originally-reported repro: tokens near
+ *      Number.MAX_SAFE_INTEGER against a priced model, both fresh-key and
+ *      existing-row-left-unchanged cases), and the rollup aggregate path.
  *
  * Requires Postgres at PGHOST/PGUSER/PGPASSWORD (CI env) or
  * localhost/postgres, with pgvector available (migrate-01's schema files
@@ -48,7 +56,7 @@ const SMOKE_PATH = path.join(PROJECT_ROOT, 'scripts', 'migrations', 'verify-18-u
 const USAGE_TELEMETRY_PATH = path.join(PROJECT_ROOT, 'scripts', 'lib', 'usage-telemetry.js');
 
 const usageTelemetryLib = require(USAGE_TELEMETRY_PATH);
-const { usageRecord, sessionUsageRollup, usageQuery, coerceNumeric, round6 } = usageTelemetryLib;
+const { usageRecord, sessionUsageRollup, usageQuery, coerceNumeric, round6, MAX_NUMERIC_12_6, CostOutOfRangeError } = usageTelemetryLib;
 
 // scripts/ has its own node_modules (pg, etc.) — this test lives under
 // test/, outside that tree, so resolve 'pg' the same way the sibling
@@ -187,7 +195,7 @@ async function testSmokeFreshPass() {
   const r = runSmoke(['--db', DB_MAIN]);
   assert(r.status === 0, `expected exit 0, got ${r.status}. stdout=${r.stdout} stderr=${r.stderr}`);
   assert(/SMOKE18_RESULT: PASS/.test(r.stdout), `expected the PASS summary line. stdout=${r.stdout}`);
-  for (const n of [1, 2, 3, 4, 5, 6, 7, 8]) {
+  for (const n of [1, 2, 3, 4, 5, 6, 7, 8, 9]) {
     assert(new RegExp(`\\[SMOKE-18\\]\\[${n}\\] PASS`).test(r.stdout), `expected check ${n} to print a PASS line. stdout=${r.stdout}`);
   }
 }
@@ -545,11 +553,119 @@ async function testConcurrentRollup(client, concurrentClient) {
   assertEq(round6(fresh.totalCostUsd), 3);
 }
 
+// ── B15: cost-range guard — caller-supplied costUsd (reviewer defect fix) ──
+// cost_usd / total_cost_usd are NUMERIC(12,6): max magnitude 999999.999999.
+// A value that IS a real, finite number but exceeds that bound must now be
+// a named validation failure (CostOutOfRangeError), not a silent NULL and
+// not a raw unhandled Postgres "numeric field overflow".
+
+async function testCostRangeGuardCallerSupplied(client) {
+  const projectId = `b15-proj-${TS}`;
+  const sessionId = `b15-sess-${TS}`;
+  const role = `b15-role-${TS}`;
+
+  const r = await usageRecord(client, { projectId, sessionId, turnIdx: 0, agentRole: role, costUsd: MAX_NUMERIC_12_6 });
+  assertEq(r.costUsd, MAX_NUMERIC_12_6, 'a cost value exactly at the NUMERIC(12,6) bound must succeed');
+
+  let threw = null;
+  try {
+    await usageRecord(client, { projectId, sessionId, turnIdx: 1, agentRole: role, costUsd: MAX_NUMERIC_12_6 + 0.000001 });
+  } catch (err) {
+    threw = err;
+  }
+  assert(threw !== null, 'a caller-supplied cost just above the bound must throw');
+  assert(threw instanceof CostOutOfRangeError, `expected a CostOutOfRangeError instance, got ${threw.constructor.name}`);
+  assert(/out of range for NUMERIC\(12,6\)/.test(threw.message), `expected the named-error message shape, got: ${threw.message}`);
+  const n = await countTurnUsage(client, projectId, sessionId, 1, role);
+  assertEq(n, 0, 'no row may be written when the caller-supplied cost overflows -- validated before any SQL executes');
+
+  await assertThrows(
+    () => usageRecord(client, { projectId, sessionId, turnIdx: 2, agentRole: role, costUsd: 5000000 }),
+    /out of range for NUMERIC\(12,6\)/,
+    'a grossly out-of-range caller-supplied cost must also throw'
+  );
+}
+
+// ── B16: cost-range guard — server-computed cost (the reviewer's exact
+// repro: tokens near Number.MAX_SAFE_INTEGER x a priced model). Covers both
+// a fresh key (no row at all afterward) and an existing row (the row's
+// prior state must be completely UNCHANGED after the failed overflowing
+// update, not partially applied). ─────────────────────────────────────────
+
+async function testCostRangeGuardServerComputed(client) {
+  const projectId = `b16-proj-${TS}`;
+  const sessionId = `b16-sess-${TS}`;
+  const role = `b16-role-${TS}`;
+  const model = `b16-model-${TS}`;
+  await insertModel(client, { label: model, tier: 'low', costIn: 1, costOut: 1 });
+
+  // Fresh key: no row at all after the failed call.
+  let threw1 = null;
+  try {
+    await usageRecord(client, { projectId, sessionId, turnIdx: 0, agentRole: role, modelId: model, tokensIn: Number.MAX_SAFE_INTEGER, tokensOut: Number.MAX_SAFE_INTEGER });
+  } catch (err) {
+    threw1 = err;
+  }
+  assert(threw1 !== null, 'reviewer scenario: near-MAX_SAFE_INTEGER tokens x priced model must throw');
+  assert(threw1 instanceof CostOutOfRangeError, `expected a CostOutOfRangeError instance, got ${threw1.constructor.name}`);
+  assert(/out of range for NUMERIC\(12,6\)/.test(threw1.message), `expected the named-error message shape, got: ${threw1.message}`);
+  const n = await countTurnUsage(client, projectId, sessionId, 0, role);
+  assertEq(n, 0, 'no row may be written for a fresh key when the computed cost overflows');
+
+  // Existing row: a subsequent overflowing update must leave every field exactly as it was.
+  const baseline = await usageRecord(client, { projectId, sessionId, turnIdx: 1, agentRole: role, modelId: model, tokensIn: 10, tokensOut: 10, costUsd: 5 });
+  let threw2 = null;
+  try {
+    await usageRecord(client, { projectId, sessionId, turnIdx: 1, agentRole: role, tokensIn: Number.MAX_SAFE_INTEGER, tokensOut: Number.MAX_SAFE_INTEGER });
+  } catch (err) {
+    threw2 = err;
+  }
+  assert(threw2 !== null && threw2 instanceof CostOutOfRangeError, 'an overflowing update on an existing row must also throw CostOutOfRangeError');
+  const { rows } = await client.query(
+    `SELECT tokens_in, tokens_out, cost_usd, model_id FROM turn_usage WHERE project_id=$1 AND session_id=$2 AND turn_idx=1 AND agent_role=$3`,
+    [projectId, sessionId, role]
+  );
+  assertEq(coerceNumeric(rows[0].tokens_in), baseline.tokensIn, "the row's tokens_in must be UNCHANGED after a failed overflowing update");
+  assertEq(coerceNumeric(rows[0].tokens_out), baseline.tokensOut, "the row's tokens_out must be UNCHANGED after a failed overflowing update");
+  assertEq(coerceNumeric(rows[0].cost_usd), baseline.costUsd, "the row's cost_usd must be UNCHANGED after a failed overflowing update");
+  assertEq(rows[0].model_id, baseline.modelId, "the row's model_id must be UNCHANGED after a failed overflowing update");
+}
+
+// ── B17: cost-range guard — rollup path. Individually in-range costs whose
+// SUM overflows total_cost_usd must surface CostOutOfRangeError (caught and
+// rethrown from Postgres's own 22003), never a raw driver error, and never
+// a partially-written session_usage row. ───────────────────────────────────
+
+async function testCostRangeGuardRollupPath(client) {
+  const projectId = `b17-proj-${TS}`;
+  const sessionId = `b17-sess-${TS}`;
+  const role = `b17-role-${TS}`;
+
+  await usageRecord(client, { projectId, sessionId, turnIdx: 0, agentRole: role, costUsd: 700000 });
+  await usageRecord(client, { projectId, sessionId, turnIdx: 1, agentRole: role, costUsd: 700000 });
+
+  let threw = null;
+  try {
+    await sessionUsageRollup(client, { projectId, sessionId });
+  } catch (err) {
+    threw = err;
+  }
+  assert(threw !== null, 'expected the rollup to throw when the aggregate exceeds NUMERIC(12,6)');
+  assert(threw instanceof CostOutOfRangeError, `expected a CostOutOfRangeError instance, got ${threw.constructor.name}`);
+  assert(/out of range for NUMERIC\(12,6\)/.test(threw.message), `expected the named-error message shape, got: ${threw.message}`);
+
+  const sessionUsageRowCount = await countSessionUsageRows(client, projectId, sessionId);
+  assertEq(sessionUsageRowCount, 0, 'no session_usage row may exist when the rollup aggregate overflows');
+
+  const turnRowCount = await countTurnUsage(client, projectId, sessionId, 0, role);
+  assertEq(turnRowCount, 1, 'the individual turn_usage rows themselves are untouched by a failed rollup');
+}
+
 // ── Main ───────────────────────────────────────────────────────────────────
 
 async function main() {
   try {
-    await run('A1', 'verify-18-usage-smoke.js: fresh apply -> exit 0, SMOKE18_RESULT: PASS, all 8 checks PASS', testSmokeFreshPass);
+    await run('A1', 'verify-18-usage-smoke.js: fresh apply -> exit 0, SMOKE18_RESULT: PASS, all 9 checks PASS', testSmokeFreshPass);
     await run('A2', 'verify-18-usage-smoke.js: session_usage dropped -> prerequisite check FAILs loudly, names the addenda runner', testSmokePrereqFail);
     await run('A3', 'verify-18-usage-smoke.js: refused target names (total-classification default branch)', testSmokeRefusedNames);
 
@@ -571,6 +687,9 @@ async function main() {
       await run('B11', 'usageQuery: project-scoped view is stale-by-design until sessionUsageRollup runs', () => testProjectScopeStaleness(client));
       await run('B12', 'usageQuery: groupBy total classification — 4 valid session-scoped values, invalid hard-errors, project-scope model-only restriction, default', () => testGroupByTotalClassification(client));
       await run('B14', 'sessionUsageRollup: genuine concurrent rollup calls — no throw, no duplicate row, final state equals a fresh recompute (A-11)', () => testConcurrentRollup(client, concurrentClient));
+      await run('B15', 'usageRecord: cost-range guard — caller-supplied costUsd at/above NUMERIC(12,6) bound (named CostOutOfRangeError, no row written)', () => testCostRangeGuardCallerSupplied(client));
+      await run('B16', 'usageRecord: cost-range guard — server-computed cost overflow (reviewer repro: near-MAX_SAFE_INTEGER tokens x priced model); fresh key and existing-row-unchanged cases', () => testCostRangeGuardServerComputed(client));
+      await run('B17', 'sessionUsageRollup: cost-range guard — in-range costs whose SUM overflows total_cost_usd rethrows the same named error, no partial row', () => testCostRangeGuardRollupPath(client));
     } finally {
       await client.end();
       await concurrentClient.end();

@@ -54,20 +54,86 @@ function makeRunPrefix(label) {
  * a thrown error inside `fn` is caught and reported as a FAIL line carrying
  * the error's message, matching verify-17's original runCheck contract.
  *
+ * SAVEPOINT ISOLATION (added post-review, PR #157): every check runs inside
+ * its own named SAVEPOINT within the shared outer transaction, unconditionally
+ * ROLLBACK TO SAVEPOINT'd afterward -- success or failure. This does two
+ * things: (1) undoes whatever DML a passing check left behind (redundant
+ * with a well-behaved check's own cleanup, but harmless and now guaranteed
+ * rather than assumed); (2) HEALS the shared transaction when a check's
+ * failure was a genuine Postgres-level statement error (e.g. a NUMERIC
+ * column-range overflow), not merely a JS-level throw. Without this, a
+ * check that provokes a real Postgres error poisons the connection --
+ * "current transaction is aborted, commands ignored until end of
+ * transaction block" -- for every subsequent query on it, including that
+ * SAME check's own post-failure assertions and every check that runs after
+ * it. Discovered via verify-18-usage-smoke.js's COST RANGE GUARD check,
+ * whose rollup-overflow sub-case deliberately triggers a real Postgres
+ * 22003 (see usage-telemetry.js's CostOutOfRangeError); fixed here, at the
+ * shared harness level, rather than as a narrow point-fix local to that one
+ * check, so no future check in either smoke script can reintroduce the
+ * same class of bug. Every check in this repo currently uses a disjoint,
+ * PREFIX-suffixed fixture namespace (no check reads another check's
+ * leftover state), so per-check savepoint isolation is safe by construction
+ * -- verified against both verify-17-routing-smoke.js's and
+ * verify-18-usage-smoke.js's own checks.
+ *
+ * @param {import('pg').Client} client
  * @param {string} label -- e.g. "17" or "18"
  * @param {number|string} id -- the check's number within this smoke run
  * @param {string} name -- the check's display name
  * @param {() => Promise<void>} fn -- the check body; throws on failure
  * @returns {Promise<boolean>} true on PASS, false on FAIL
  */
-async function runCheck(label, id, name, fn) {
+async function runCheck(client, label, id, name, fn) {
+  const savepoint = `smoke_check_${label}_${id}`;
+  await client.query(`SAVEPOINT ${savepoint}`);
+  let ok;
   try {
     await fn();
     console.log(`[SMOKE-${label}][${id}] PASS ${name}`);
-    return true;
+    ok = true;
   } catch (err) {
     console.log(`[SMOKE-${label}][${id}] FAIL ${name}: ${err.message}`);
-    return false;
+    ok = false;
+  }
+  await client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+  return ok;
+}
+
+/**
+ * Run `fn` inside its own named SAVEPOINT within the current transaction.
+ * On success, RELEASE SAVEPOINT (keeps `fn`'s effects). On failure,
+ * ROLLBACK TO SAVEPOINT (undoes `fn`'s effects AND heals the transaction if
+ * `fn` triggered a genuine Postgres-level statement error, e.g. a NUMERIC
+ * column-range overflow) and then re-throws the original error unchanged --
+ * callers still see and can assert on it.
+ *
+ * runCheck's own per-check savepoint (above) protects LATER checks from an
+ * EARLIER check's DB-level error, but does nothing for code that runs
+ * AFTER the poisoning point but STILL INSIDE the same check (e.g. a
+ * post-failure row-count assertion in the same check function) -- the
+ * poisoned transaction persists until something issues a ROLLBACK [TO
+ * SAVEPOINT]. This helper is the fine-grained tool a check uses to wrap
+ * ONLY the specific sub-operation expected to trigger a genuine DB-level
+ * error, so the rest of that same check keeps running against a healthy
+ * transaction. (Discovered via verify-18-usage-smoke.js's COST RANGE GUARD
+ * check, whose rollup-overflow sub-case needed exactly this.)
+ *
+ * @param {import('pg').Client} client
+ * @param {string} name -- a valid SQL identifier, unique within its scope
+ * @param {() => Promise<T>} fn
+ * @returns {Promise<T>}
+ * @template T
+ */
+async function withSavepoint(client, name, fn) {
+  await client.query(`SAVEPOINT ${name}`);
+  try {
+    const result = await fn();
+    await client.query(`RELEASE SAVEPOINT ${name}`);
+    return result;
+  } catch (err) {
+    await client.query(`ROLLBACK TO SAVEPOINT ${name}`);
+    throw err;
   }
 }
 
@@ -151,6 +217,7 @@ async function scanForResidue(client, prefix, residueSpecs) {
 module.exports = {
   makeRunPrefix,
   runCheck,
+  withSavepoint,
   printSummary,
   withTransactionRollback,
   scanForResidue,

@@ -49,7 +49,7 @@ const { Client } = require('pg');
 
 const migrateOne = require('./migrate-01-canonical-db');
 const { routeResolve } = require('../lib/route-resolve');
-const { usageRecord, sessionUsageRollup, usageQuery } = require('../lib/usage-telemetry');
+const { usageRecord, sessionUsageRollup, usageQuery, MAX_NUMERIC_12_6 } = require('../lib/usage-telemetry');
 const smokeHarness = require('./lib/smoke-harness');
 
 // ─── Prerequisite tables (A-14) -- every table this run transitively
@@ -443,6 +443,62 @@ async function checkAllNullCostGroup(client, PREFIX) {
   assert(breakdownEntry.cost_usd === null, `expected NULL cost_usd in the model_breakdown entry, got ${breakdownEntry.cost_usd}`);
 }
 
+// CHECK 9: COST RANGE GUARD -- an in-range-but-Infinity-adjacent computed
+// cost (reviewer-reported defect: near-MAX_SAFE_INTEGER tokens against a
+// priced model passed Number.isFinite yet overflowed NUMERIC(12,6) as a raw
+// unhandled Postgres error at write time) must now be a named, self-
+// explanatory validation failure, thrown BEFORE any write, both for the
+// server-computed path and for a caller-supplied value; a value exactly at
+// the bound must still succeed; and an aggregate overflow at rollup time
+// must surface as the same named error class, never a raw driver crash.
+async function checkCostRangeGuard(client, PREFIX) {
+  const projectId = `${PREFIX}-proj-c9`;
+  const sessionId = `${PREFIX}-sess-c9`;
+  const role = `${PREFIX}-role-c9`;
+  const model = `${PREFIX}-model-c9`;
+
+  await insertModel(client, { label: model, tier: 'low', costIn: 1, costOut: 1 });
+
+  // (a) reviewer's exact scenario: server-computed cost overflows NUMERIC(12,6).
+  await assertThrows(
+    () => usageRecord(client, { projectId, sessionId, turnIdx: 0, agentRole: role, modelId: model, tokensIn: Number.MAX_SAFE_INTEGER, tokensOut: Number.MAX_SAFE_INTEGER }),
+    /out of range for NUMERIC\(12,6\)/,
+    'server-computed cost exceeding NUMERIC(12,6) must throw a named error, not silently null or crash raw'
+  );
+  const n1 = await countTurnUsage(client, projectId, sessionId, 0, role);
+  assertEq(n1, 0, 'no row may be written when the computed cost overflows');
+
+  // (b) caller-supplied cost just above the bound -- throws before any SQL.
+  await assertThrows(
+    () => usageRecord(client, { projectId, sessionId, turnIdx: 1, agentRole: role, costUsd: MAX_NUMERIC_12_6 + 0.000001 }),
+    /out of range for NUMERIC\(12,6\)/,
+    'caller-supplied cost just above the bound must throw before any SQL executes'
+  );
+  const n2 = await countTurnUsage(client, projectId, sessionId, 1, role);
+  assertEq(n2, 0, 'no row may be written when the caller-supplied cost overflows');
+
+  // (c) exactly at the bound succeeds.
+  const r3 = await usageRecord(client, { projectId, sessionId, turnIdx: 2, agentRole: role, costUsd: MAX_NUMERIC_12_6 });
+  assertEq(r3.costUsd, MAX_NUMERIC_12_6, 'a cost value exactly at the NUMERIC(12,6) bound must succeed');
+
+  // (d) rollup path: individually in-range costs whose SUM overflows total_cost_usd.
+  // sessionUsageRollup's overflow is a REAL Postgres statement error (22003),
+  // not a JS-level throw -- unlike (a)/(b) above, it poisons the shared
+  // transaction until something issues a ROLLBACK [TO SAVEPOINT]. Wrapped in
+  // smokeHarness.withSavepoint so the assertions AFTER the expected throw
+  // (the row-count check below) run against a healthy transaction.
+  const bigSessionId = `${PREFIX}-sess-c9-rollup`;
+  await usageRecord(client, { projectId, sessionId: bigSessionId, turnIdx: 0, agentRole: role, costUsd: 600000 });
+  await usageRecord(client, { projectId, sessionId: bigSessionId, turnIdx: 1, agentRole: role, costUsd: 600000 });
+  await assertThrows(
+    () => smokeHarness.withSavepoint(client, 'cost_range_guard_rollup', () => sessionUsageRollup(client, { projectId, sessionId: bigSessionId })),
+    /out of range for NUMERIC\(12,6\)/,
+    'a rollup whose aggregate cost exceeds NUMERIC(12,6) must throw the same named error, never a raw driver crash'
+  );
+  const rollupRowCount = await countSessionUsageRows(client, projectId, bigSessionId);
+  assertEq(rollupRowCount, 0, 'no session_usage row may exist when the rollup aggregate overflows');
+}
+
 // ─── Runner ────────────────────────────────────────────────────────────────
 
 async function checkPrerequisites(client) {
@@ -512,14 +568,15 @@ async function main() {
 
     let overallOk = await smokeHarness.withTransactionRollback(client, WIPE_TABLES, async () => {
       const results = [];
-      results.push(await smokeHarness.runCheck('18', 1, 'RECORD-AFTER-RESOLVE', () => checkRecordAfterResolve(client, PREFIX)));
-      results.push(await smokeHarness.runCheck('18', 2, 'RECORD-WITHOUT-RESOLVE', () => checkRecordWithoutResolve(client, PREFIX)));
-      results.push(await smokeHarness.runCheck('18', 3, 'SERVER-SIDE COST', () => checkServerSideCost(client, PREFIX)));
-      results.push(await smokeHarness.runCheck('18', 4, 'UPDATE-NOT-DUPLICATE', () => checkUpdateNotDuplicate(client, PREFIX)));
-      results.push(await smokeHarness.runCheck('18', 5, 'SESSION-SCOPED QUERY', () => checkSessionScopedQuery(client, PREFIX)));
-      results.push(await smokeHarness.runCheck('18', 6, 'ROLLUP + PROJECT-SCOPED QUERY', () => checkRollupAndProjectScopedQuery(client, PREFIX)));
-      results.push(await smokeHarness.runCheck('18', 7, 'VALIDATION + TOTAL CLASSIFICATION', () => checkValidationAndTotalClassification(client, PREFIX)));
-      results.push(await smokeHarness.runCheck('18', 8, 'ALL-NULL-COST GROUP', () => checkAllNullCostGroup(client, PREFIX)));
+      results.push(await smokeHarness.runCheck(client, '18', 1, 'RECORD-AFTER-RESOLVE', () => checkRecordAfterResolve(client, PREFIX)));
+      results.push(await smokeHarness.runCheck(client, '18', 2, 'RECORD-WITHOUT-RESOLVE', () => checkRecordWithoutResolve(client, PREFIX)));
+      results.push(await smokeHarness.runCheck(client, '18', 3, 'SERVER-SIDE COST', () => checkServerSideCost(client, PREFIX)));
+      results.push(await smokeHarness.runCheck(client, '18', 4, 'UPDATE-NOT-DUPLICATE', () => checkUpdateNotDuplicate(client, PREFIX)));
+      results.push(await smokeHarness.runCheck(client, '18', 5, 'SESSION-SCOPED QUERY', () => checkSessionScopedQuery(client, PREFIX)));
+      results.push(await smokeHarness.runCheck(client, '18', 6, 'ROLLUP + PROJECT-SCOPED QUERY', () => checkRollupAndProjectScopedQuery(client, PREFIX)));
+      results.push(await smokeHarness.runCheck(client, '18', 7, 'VALIDATION + TOTAL CLASSIFICATION', () => checkValidationAndTotalClassification(client, PREFIX)));
+      results.push(await smokeHarness.runCheck(client, '18', 8, 'ALL-NULL-COST GROUP', () => checkAllNullCostGroup(client, PREFIX)));
+      results.push(await smokeHarness.runCheck(client, '18', 9, 'COST RANGE GUARD', () => checkCostRangeGuard(client, PREFIX)));
       return results.every(Boolean);
     });
 

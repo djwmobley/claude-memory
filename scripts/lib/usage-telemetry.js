@@ -80,6 +80,16 @@
  *   semantics vary and no rate columns exist for them; an operator wanting
  *   cache-aware cost passes an explicit costUsd.
  *
+ *   RANGE GUARD (distinct from the fail-soft-NULL branches above): cost_usd
+ *   is NUMERIC(12,6) (max magnitude 999999.999999 -- MAX_NUMERIC_12_6). A
+ *   cost value that IS computable but exceeds that bound -- whether
+ *   caller-supplied or server-computed -- is a computable anomaly, not an
+ *   unknowable price, so it throws CostOutOfRangeError instead of silently
+ *   degrading to NULL (which would hide it). Caller-supplied costUsd is
+ *   checked before any SQL runs at all; a server-computed overflow is
+ *   checked before usageRecord's upsert statement is built, so no row is
+ *   ever written or modified when this throws.
+ *
  *   Returns the post-write row (aliased camelCase shape, every NUMERIC/
  *   BIGINT value coerced to a JS number-or-null, never a pg string) plus
  *   `{ created: boolean }` (true iff this call's own upsert performed the
@@ -176,6 +186,36 @@ const VALID_OUTCOMES = Object.freeze(['success', 'failure', 'downgraded', 'unkno
 const VALID_GROUP_BY = Object.freeze(['model', 'role', 'provider', 'day']);
 const RESERVED_MODEL_SENTINEL = '(none)';
 
+/**
+ * turn_usage.cost_usd and session_usage.total_cost_usd are both
+ * NUMERIC(12,6) (migrate-11-usage-telemetry.sql) -- 12 total digits, 6 after
+ * the decimal point, so the largest representable magnitude is
+ * 999999.999999. A cost value at or beyond this bound (caller-supplied OR
+ * server-computed) is a COMPUTABLE ANOMALY (a mispriced or miscounted
+ * turn), not an UNKNOWABLE price (the V9 fail-soft-NULL case) -- it hard-
+ * errors via CostOutOfRangeError rather than silently degrading to NULL,
+ * which would hide it. Friction over silent escape.
+ */
+const MAX_NUMERIC_12_6 = 999999.999999;
+
+/** Named error class for any cost value that would overflow NUMERIC(12,6) -- thrown directly by validation, and rethrown from a caught Postgres 22003 (numeric_value_out_of_range) so no raw driver error ever escapes this module. */
+class CostOutOfRangeError extends Error {}
+
+/**
+ * Throws CostOutOfRangeError if `value`'s magnitude exceeds MAX_NUMERIC_12_6.
+ * null passes through unchanged (callers apply this only to values already
+ * known to be real numbers headed for a NUMERIC(12,6) column).
+ */
+function assertCostWithinRange(value, name) {
+  if (value === null) return null;
+  if (Math.abs(value) > MAX_NUMERIC_12_6) {
+    throw new CostOutOfRangeError(
+      `usage-telemetry: "${name}" out of range for NUMERIC(12,6): ${value} (max magnitude ${MAX_NUMERIC_12_6})`
+    );
+  }
+  return value;
+}
+
 // ─── INPUT VALIDATION (A-19) ───────────────────────────────────────────────
 
 function requireNonEmptyString(value, name) {
@@ -235,6 +275,9 @@ function normalizeCostUsd(costUsd) {
       `non-negative number (got ${JSON.stringify(costUsd)})`
     );
   }
+  // Range guard runs before any SQL is built or executed -- an out-of-range
+  // caller-supplied cost is a validation failure, not a fail-soft-NULL case.
+  assertCostWithinRange(costUsd, 'costUsd');
   return { mode: COST_MODE.VALUE, value: costUsd };
 }
 
@@ -327,7 +370,12 @@ async function computeServerSideCost(pg, { projectId, sessionId, turnIdx, agentR
   if (costIn === null || costOut === null) return null; // V9 gap: rate(s) not configured
 
   const computed = (effectiveTokensIn * costIn + effectiveTokensOut * costOut) / 1e6;
-  return Number.isFinite(computed) ? computed : null;
+  if (!Number.isFinite(computed)) return null; // non-finite (e.g. would-be Infinity) -- fail-soft, unrelated to the NUMERIC(12,6) bound
+  // A finite computed cost that exceeds NUMERIC(12,6)'s range is a
+  // computable anomaly, not an unknowable price -- this throws (propagating
+  // out of usageRecord BEFORE its upsert statement is built or executed),
+  // it never fails soft to NULL like the branches above.
+  return assertCostWithinRange(computed, 'computed cost_usd');
 }
 
 /**
@@ -521,7 +569,25 @@ async function sessionUsageRollup(pg, args = {}) {
     RETURNING *
   `;
 
-  const { rows } = await pg.query(sql, [projectId, sessionId]);
+  // total_cost_usd is NUMERIC(12,6) same as turn_usage.cost_usd; each
+  // individual contributing cost_usd was already range-checked at
+  // usageRecord write time, but their SUM can still exceed the column's
+  // range. Rather than a redundant pre-check read, this catches Postgres's
+  // own 22003 (numeric_value_out_of_range) at the single write statement
+  // and rethrows it as the same named CostOutOfRangeError -- no raw driver
+  // error ever escapes this module.
+  let rows;
+  try {
+    ({ rows } = await pg.query(sql, [projectId, sessionId]));
+  } catch (err) {
+    if (err && err.code === '22003') {
+      throw new CostOutOfRangeError(
+        `usage-telemetry: sessionUsageRollup aggregate cost out of range for NUMERIC(12,6) ` +
+        `(project=${projectId} session=${sessionId}, max magnitude ${MAX_NUMERIC_12_6}) -- underlying Postgres error: ${err.message}`
+      );
+    }
+    throw err;
+  }
   const row = rows[0];
   return {
     projectId: row.project_id,
@@ -650,9 +716,12 @@ module.exports = {
   RESERVED_MODEL_SENTINEL,
   coerceNumeric,
   round6,
+  MAX_NUMERIC_12_6,
+  CostOutOfRangeError,
   // Exported test seams (not part of the "public" three-function surface,
   // but useful for direct unit exercise without a full call).
   computeServerSideCost,
   assertNoReservedNoneRows,
   sumPreserveNull,
+  assertCostWithinRange,
 };
