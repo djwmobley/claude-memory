@@ -204,6 +204,47 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run usage-telemetry + verify-18 usage smoke tests
+        # Tests scripts/lib/usage-telemetry.js (usageRecord/sessionUsageRollup/
+        # usageQuery) and scripts/migrations/verify-18-usage-smoke.js, the §18
+        # usage-telemetry smoke test (9 checks: record-after-resolve composing
+        # with route-resolve.js, record-without-resolve, server-side cost both
+        # ways, update-not-duplicate, session-scoped query across model/role/day,
+        # rollup + project-scoped query including the staleness contract, input
+        # validation + total classification, the all-NULL-cost group, and the
+        # cost-range guard). Also covers the shared transaction+rollback/
+        # run-prefix/residue-scan harness extracted into
+        # scripts/migrations/lib/smoke-harness.js and reused by
+        # verify-17-routing-smoke.js (test-verify-17.js passes unmodified against
+        # the extracted version -- see the step above), including the harness's
+        # per-check SAVEPOINT isolation and the withSavepoint primitive (post-
+        # review hardening: a check that provokes a genuine Postgres-level
+        # statement error, e.g. a NUMERIC overflow, no longer poisons the
+        # shared transaction for later checks or for that same check's own
+        # post-failure assertions). The smoke script runs its entire fixture
+        # lifecycle inside one transaction that is always rolled back -- safe
+        # to run against a live staging database; turn_usage/session_usage are
+        # never wiped, only prefix-residue-scanned.
+        # Covers: fresh apply -> exit 0 + all 9 checks PASS; session_usage
+        # dropped -> prerequisite refusal naming migrate-schema-addenda.js;
+        # refused target names; direct lib unit tests for the universal
+        # field-preservation matrix, the costUsd three-state machine, every
+        # cost fail-soft branch, the outcome DDL-default discipline across
+        # insert/update, a genuine concurrent-insert race, the token ceiling,
+        # the reserved "(none)" sentinel defense on both write and read paths,
+        # rollup NULL-SUM semantics, the zero-turn rollup, "(none)" grouping
+        # keys, project-scope staleness, groupBy total classification, pure
+        # coercion cases, a genuine concurrent rollup, and the cost-range
+        # guard (caller-supplied path, server-computed path -- including the
+        # originally-reported near-MAX_SAFE_INTEGER-tokens repro -- and the
+        # rollup aggregate path).
+        # Creates/drops its own _staging-suffixed scratch DBs; never touches
+        # claude_memory_eval_test beyond the connection-avoidance assertion.
+        run: node test/migrations/test-verify-18.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run smoketest (all sections)
         # Runs the full smoketest suite — all 13 sections including collision (OQ-5
         # supersession invariant) and registry (SQL-1:1-index-vs-registry-JSON drift).

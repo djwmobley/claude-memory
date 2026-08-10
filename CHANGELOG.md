@@ -9,6 +9,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Usage-telemetry record/query library + operator smoke test** —
+  `scripts/lib/usage-telemetry.js` exports `usageRecord`, `sessionUsageRollup`,
+  and `usageQuery`: the measurement-side companion to
+  `scripts/lib/route-resolve.js` (which decides a turn's model and records
+  that decision). `usageRecord` measures what actually happened for a turn
+  (tokens, cost, outcome) against the SAME `(project_id, session_id,
+  turn_idx, agent_role)` key, whether or not `routeResolve` ever ran for it —
+  a single race-safe `INSERT ... ON CONFLICT DO UPDATE` statement, matched
+  on that key: UPDATEs an existing row or INSERTs a fresh one with
+  `resolved_via` NULL. Every parameter except `costUsd` follows a universal
+  preservation rule (omitted on the update path preserves the existing
+  column value; only a provided value is written); `costUsd` is a
+  three-state machine instead — omitted computes server-side cost from
+  `model_registry` rates for the effective model and token counts, explicit
+  `null` forces the column NULL, and a finite non-negative number is used
+  verbatim. Server-side cost fails soft to NULL — never a guessed price,
+  never 0 — when there is no effective model, the model is unregistered,
+  either registered rate is NULL, or either effective token count is
+  unavailable; cache tokens are never priced. A cost value that IS a real,
+  finite number (caller-supplied or server-computed) but exceeds
+  `cost_usd`/`total_cost_usd`'s NUMERIC(12,6) range (max magnitude
+  999999.999999) is a distinct, DIFFERENT case from the fail-soft-NULL
+  branches above — a computable anomaly, not an unknowable price — and now
+  throws a named `CostOutOfRangeError` before any write, rather than
+  either silently degrading to NULL or letting a raw unhandled Postgres
+  "numeric field overflow" escape (the originally-reported defect: tokens
+  near `Number.MAX_SAFE_INTEGER` against a priced model passed the
+  `Number.isFinite` guard and then crashed raw at write time). The same
+  bound is enforced on `sessionUsageRollup`'s aggregate write by catching
+  Postgres's own 22003 and rethrowing it as the same named error class, so
+  no raw driver error ever escapes this module either way. `resolved_via`,
+  `recommended_model`, and `cost_delta_usd` are never touched by
+  `usageRecord` — those remain exclusively `route-resolve.js`'s fields. A
+  reserved `"(none)"` sentinel can never be written as a real `modelId`
+  through this API, and both `sessionUsageRollup` and the session-scoped
+  `usageQuery` path hard-error, naming the anomalous rows, if they encounter
+  that value stored via some other path — never silently merging it with
+  genuinely NULL-model rows. `sessionUsageRollup` recomputes and UPSERTs a
+  session's `session_usage` row as one SQL statement (a single internally-
+  consistent snapshot), aggregating `turn_usage` into a `model_breakdown`
+  JSONB map (NULL-model rows keyed `"(none)"`) using SQL SUM's own
+  NULL-preserving semantics — an all-NULL-cost group aggregates to NULL,
+  never a fabricated 0; a session with zero `turn_usage` rows still gets a
+  visible rollup row (`turn_count: 0`, every total NULL, `model_breakdown:
+  {}`), never a silent no-op. `usageQuery` supports `groupBy` in
+  `('model','role','provider','day')` (day computed once, in SQL, in UTC);
+  session-scoped aggregates `turn_usage` directly, while project-scoped
+  (no `sessionId`) reads `session_usage` rollups only — stale-by-design,
+  never falling back to scanning `turn_usage` — and supports `groupBy:
+  'model'` only, hard-erroring on any other dimension with an explanation
+  that per-role/provider/day detail requires a `sessionId`. All returned
+  numerics are JS numbers or null, never `pg` driver strings. New
+  operator-run CLI `scripts/migrations/verify-18-usage-smoke.js` (9 checks:
+  record-after-resolve — composing with `route-resolve.js`'s `routeResolve`
+  on the same key — record-without-resolve, server-side cost both ways,
+  update-not-duplicate, session-scoped query across model/role/day,
+  rollup + project-scoped query including the staleness contract,
+  input validation + total classification, a dedicated all-NULL-cost-
+  group check, and the cost-range guard) — reuses
+  `migrate-01-canonical-db.js`'s target resolution and refusal by import,
+  and runs its entire fixture lifecycle inside one transaction that is
+  always rolled back (safe against a live staging database);
+  `turn_usage`/`session_usage` are never wiped, only prefix-residue-scanned.
+  The transaction+rollback/run-prefix/residue-scan harness this shares
+  with `verify-17-routing-smoke.js` is now extracted into
+  `scripts/migrations/lib/smoke-harness.js` — `verify-17-routing-smoke.js`
+  was refactored onto it with byte-identical output for a passing run, and
+  its existing test suite (`test/migrations/test-verify-17.js`) passes
+  unmodified. The harness's `runCheck` now isolates every check inside its
+  own SAVEPOINT (unconditionally rolled back afterward), and exposes a
+  `withSavepoint` primitive checks can use directly around a specific
+  sub-operation expected to trigger a genuine Postgres-level error — a
+  check that provokes a real database error (e.g. the cost-range guard's
+  rollup-overflow case) no longer poisons the shared transaction for later
+  checks, or for that same check's own post-failure assertions. New test
+  suite `test/migrations/test-verify-18.js` (subprocess coverage of the
+  smoke script plus direct unit tests: the field-preservation matrix, the
+  `costUsd` state machine, every cost fail-soft branch, the outcome
+  DDL-default discipline across insert/update, a genuine concurrent-insert
+  race, the token ceiling, the reserved-sentinel defense on both write and
+  read paths, rollup NULL-SUM semantics, the zero-turn rollup, `"(none)"`
+  grouping keys, project-scope staleness, `groupBy` total classification,
+  the cost-range guard across the caller-supplied, server-computed, and
+  rollup-aggregate paths,
+  and a genuine concurrent rollup); wired into CI. No MCP tool wiring
+  (`usage_record`/`usage_query` tools), no `handoff.js` checkpoint/close
+  wiring of the rollup, and no `feature_token_usage` backfill — out of
+  scope for this change.
+  (`scripts/lib/usage-telemetry.js`, `scripts/migrations/verify-18-usage-smoke.js`,
+  `scripts/migrations/lib/smoke-harness.js`, `scripts/migrations/verify-17-routing-smoke.js`,
+  `test/migrations/test-verify-18.js`, `.github/workflows/test.yml`)
+
 - **Least-cost routing resolver + operator smoke test** —
   `scripts/lib/route-resolve.js` exports `routeResolve`,
   `recommendLeastCost`, and `resolveRequiredTier`: given a turn's identity
