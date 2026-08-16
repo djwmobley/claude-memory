@@ -50,7 +50,11 @@ const AUTHORED_BY = 'sonnet-t7-store-wide-gate-author-2026-08-16';
  * Usage as a CLI: `node test/north-star/test-caveman-economy-store-wide.js
  * [--db <name>]` — with NO --db, provisions its OWN throwaway `_staging`-
  * suffixed scratch database (migrate-01 -> schema-addenda -> migrate-13 ->
- * migrate-14 -> migrate-15 -> migrate-16), runs the gate against it, drops it, and exits
+ * migrate-14 -> migrate-15 -> migrate-16 -> verify15-shared's applyDdl (for
+ * own_graph_migration_ids) -> migrate-03's schema-only ADD COLUMN statements
+ * replicated directly (for memory_entries/memory_entry_chunks.project_id) —
+ * see provisionSchema()'s own doc comment for why the last two are NOT
+ * invoked as their real migrate-*.js scripts), runs the gate against it, drops it, and exits
  * 0/1/2 — this is the CI GREEN-gate entry point, mirroring how
  * test-caveman-economy.js is wired into .github/workflows/test.yml (a
  * single `node test/north-star/test-caveman-economy-store-wide.js` step,
@@ -367,7 +371,7 @@ function runScript(scriptPath, args, timeoutMs = 30000) {
 /** Apply the full §5 schema stack this gate needs against `dbName`. Throws
  * (with stdout/stderr context) on any step failure. Exported for reuse by
  * this gate's own test suite (test/migrations/test-caveman-gate-store-wide.js). */
-function provisionSchema(dbName) {
+async function provisionSchema(dbName) {
   const steps = [
     ['migrate-01-canonical-db', MIGRATE01],
     ['migrate-schema-addenda', ADDENDA],
@@ -381,6 +385,37 @@ function provisionSchema(dbName) {
     if (r.status !== 0) {
       throw new Error(`${label} fixture setup failed for "${dbName}": status=${r.status}\nstdout=${r.stdout}\nstderr=${r.stderr}`);
     }
+  }
+
+  // own_graph_migration_ids (§6.1(c), PRs #171/#174) + memory_entries.
+  // project_id / memory_entry_chunks.project_id (§6.1(d), PRs #170/#175)
+  // landed in the manifest (caveman-columns.json) after this stack was
+  // first written — same-change gap closed 2026-08-16. Neither is
+  // provisioned via a plain schema-only migrate-*.js CLI step the way the
+  // six above are:
+  //   - own_graph_migration_ids's canonical DDL lives in verify15-
+  //     shared.js's applyDdl() (shared, by reference, with every other §15
+  //     battery-infra table — migration_manifest, containment_evidence,
+  //     etc.) — reused here directly rather than invoking the full
+  //     migrate-verify-own-graph.js data-migration script, which requires
+  //     a --source-db and performs a real row-by-row migration; nothing
+  //     this scratch/empty DB needs for a SCHEMA-shape fixture.
+  //   - migrate-03-corpus-project-id.js is a real-estate-wide DISCOVERY +
+  //     backfill script (enumerates ALL of pg_database, walks the
+  //     filesystem project-marker tree) — wildly inappropriate to invoke
+  //     against one throwaway scratch DB. Its schema-only effect (`ALTER
+  //     TABLE ... ADD COLUMN IF NOT EXISTS project_id TEXT`, migrate-03's
+  //     own statement, verified against its source) is replicated directly
+  //     below instead. The scratch DB starts with zero corpus rows, so
+  //     there is nothing to backfill.
+  const client = new Client(shared.pgConfig(dbName));
+  await client.connect();
+  try {
+    await shared.applyDdl(client);
+    await client.query('ALTER TABLE memory_entries ADD COLUMN IF NOT EXISTS project_id TEXT');
+    await client.query('ALTER TABLE memory_entry_chunks ADD COLUMN IF NOT EXISTS project_id TEXT');
+  } finally {
+    await client.end();
   }
 }
 
@@ -418,7 +453,7 @@ async function cliMain() {
   console.log(`test-caveman-economy-store-wide: no --db given — provisioning scratch DB "${dbName}".`);
   let ok = false;
   try {
-    provisionSchema(dbName);
+    await provisionSchema(dbName);
     ok = await run(dbName);
   } finally {
     await dropScratchDb(dbName);
