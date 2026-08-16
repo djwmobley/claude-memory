@@ -363,6 +363,39 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run file-memory markdown migration tests (§6.1(i))
+        # Tests scripts/migrations/migrate-09-file-memory-markdown.js —
+        # parses file-memory MEMORY.md index + topic files STRUCTURALLY
+        # (frontmatter type -> entities.entity_type, one entities row per
+        # topic file keyed on the filename stem, one edges row per resolved
+        # [[wiki-link]]), distinct from step (f)'s raw-body corpus sync.
+        # Covers (pure, no DB): classifyProjectDir's enrolled/test-artifact-
+        # excluded/unmatched-flagged total classification; resolveEntityType's
+        # frontmatter.type -> frontmatter.metadata.type -> filename-prefix
+        # fallback -> unmatched-type(NULL) branches; listTopicFiles' MEMORY.md
+        # exclusion + the .md.bak-<ts> double-suffix extname-boundary fixture;
+        # extractWikiLinks' fenced-code/inline-code false-positive avoidance
+        # and |alias/#anchor stripping; parseMemoryIndex; and an end-to-end
+        # synthetic fixture tree exercising all of the above together.
+        # Covers (DB, "_staging"-suffixed scratch target): the prerequisite-
+        # table AND prerequisite-column (attribution-columns.sql) refusals;
+        # a happy-path migrate (entities/edges/manifest rows, entity_type
+        # NULL for the unmatched-type case); an idempotent re-run (proves
+        # edges_project_from_type_to_unique + the upsert, not a duplicate
+        # insert); the description-never-overwritten-by-another-writer
+        # upsert precedence; and --rollback's reference-count-gated entity
+        # cleanup (an entity a surviving, differently-tagged edge still
+        # references is preserved; one with none is deleted).
+        # Creates/drops its own scratch database (target "_staging"-suffixed
+        # to satisfy migrate-01's classifyTarget) and its own temp
+        # --projects-root fixture tree; never touches
+        # claude_policy_framework/memory_manager_staging or the real
+        # ~/.claude/projects.
+        run: node test/migrations/test-migrate-09-file-memory-markdown.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run own-graph verify/migrate tests (§6.1(c), memory-manager#11(c))
         # Tests scripts/migrations/migrate-verify-own-graph.js — verifies
         # whether claude-memory's own graph data (entities/assertions/edges/

@@ -94,3 +94,11 @@ scripts/decisions_backup*.csv
 # summaries), never committed. See migrate-08-handoff-markdown.js's
 # writeReport().
 /scripts/migrations/reports/
+
+# migrate-09-file-memory-markdown.js's project enrollment config — real
+# ~/.claude/projects directory names + real project identifiers (private
+# instance data), never committed.
+# scripts/migrations/file-memory-project-enrollment.example.json documents
+# the required shape. See migrate-09-file-memory-markdown.js's
+# loadEnrollmentConfig().
+/scripts/migrations/file-memory-project-enrollment.json
