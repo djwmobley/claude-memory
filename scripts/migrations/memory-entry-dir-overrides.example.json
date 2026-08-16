@@ -1,0 +1,15 @@
+{
+  "_comment": "SYNTHETIC EXAMPLE ONLY — obviously-fake directory names and filesystem paths throughout. The real memory-entry-dir-overrides.json carries private instance data (real ~/.claude/projects directory names, real absolute filesystem paths) and is gitignored, never committed. This file documents the required SHAPE and every semantic migrate-03-corpus-project-id.js's loadDirOverrides()/buildProjectDirIndex()/resolveProjectIdViaOverride() implement. DELIBERATELY mirrors topic-prefix-to-project.example.json's pattern (D-12) — this is a reuse of that already-adversary-hardened design (gitignored-real / committed-synthetic-example split, total-classification validation, 'consulted first, exact match, everything else unchanged' shape), not a new matcher class. UNLIKE the routing map, this file is OPTIONAL — the base transcript-cwd resolution mechanism works without it; overrides exist as a SECOND, owner-reviewable resolution source for directories the transcript mechanism structurally cannot cover (zero transcripts, cwds with no marker in their ancestry, mixed resolvable/unresolvable cwds). Each override entry supplies ONLY a projectRoot path — identity is still resolved at run time via findProjectRootByMarker(projectRoot), so a stale entry (the declared path's marker has since been deleted/moved/corrupted) is a loud FATAL that refuses the entire run, never a silent fallthrough to transcript resolution for that directory. An override entry whose dirName matches no directory actually present under ~/.claude/projects/ this run is reported as 'dangling' (informational, never an error — the directory may not exist yet). Exactly one override per dirName is allowed; a duplicate dirName is a loud FATAL, never 'first/last wins'.",
+  "overrides": [
+    {
+      "dirName": "C--home-example-user-dev-proj-alpha",
+      "projectRoot": "/home/example-user/dev/proj-alpha",
+      "note": "example row 1 — a directory with zero session transcripts (the loader never wrote any *.jsonl here), so the base transcript-cwd mechanism has nothing to scan at all."
+    },
+    {
+      "dirName": "C--home-example-user-old-machine-proj-beta",
+      "projectRoot": "/home/example-user/dev/proj-beta",
+      "note": "example row 2 — the directory's recorded transcript cwds point at a filesystem path from a retired machine/container that no longer exists on this host; the CURRENT real location is supplied here instead."
+    }
+  ]
+}

@@ -12,6 +12,17 @@
  * ever adds a column to, and backfills, the table where the row already
  * lives).
  *
+ * Field finding, fourth round: a real estate re-run of the resolver-
+ * totality fix proved the transcript-cwd mechanism structurally cannot
+ * cover most of an estate (25 dirs: 1 resolved, 24 unmapped -- 20 with
+ * zero transcripts, 2 with cwds carrying no marker in their ancestry, 1
+ * mixed). Orphan re-attribution can never fire for these without a
+ * SECOND, owner-reviewable resolution source. `memory-entry-dir-
+ * overrides.json` (see `loadDirOverrides` below) is that source --
+ * DELIBERATELY mirroring `topic-prefix-to-project.json`'s already-
+ * adversary-hardened design (D-12), a reuse of that validated pattern,
+ * not a new matcher class.
+ *
  * WHAT THIS SCRIPT DOES:
  *
  *   1. DISCOVERY (D3-4, total classification, BEFORE any ALTER anywhere):
@@ -38,7 +49,14 @@
  *   2. MAP-BUILDING (D3-1, filesystem walk, done ONCE, shared across every
  *      corpus DB found in step 1): for every directory directly under
  *      `<HANDOFF_BASE_DIR or ~/.claude>/projects/` that has a `memory/`
- *      subdirectory, resolves the REAL project id by (a) scanning EVERY
+ *      subdirectory, an OVERRIDE (see `loadDirOverrides`) whose `dirName`
+ *      exactly matches is consulted FIRST -- a matching override supplies
+ *      only a `projectRoot` path, resolved through the SAME
+ *      `findProjectRootByMarker` primitive used below (never a shortcut
+ *      that skips marker verification), and a directory with a matching
+ *      override never falls through to transcript resolution at all. A
+ *      directory with NO override proceeds exactly as follows, resolving
+ *      the REAL project id by (a) scanning EVERY
  *      line of EVERY one of that directory's own `*.jsonl` session
  *      transcripts for a string `cwd` field — never stopping at the first
  *      hit, collecting every DISTINCT raw value found (multiple distinct
@@ -190,6 +208,7 @@ const { findProjectRootByMarker, readMarker } = require('../lib/project-marker')
 const MIGRATIONS_DIR = __dirname;
 const DEFAULT_MAP_OUT_PATH = path.join(MIGRATIONS_DIR, 'memory-entry-project-map.json');
 const DEFAULT_BACKUP_DIR = path.join(MIGRATIONS_DIR, 'backups'); // already gitignored -- shared with migrate-02's backups
+const DEFAULT_DIR_OVERRIDES_PATH = path.join(MIGRATIONS_DIR, 'memory-entry-dir-overrides.json');
 const ORPHAN_PROJECT_ID = 'unmapped-orphan-memory-entry';
 const DEFAULT_BATCH_SIZE = 500;
 
@@ -209,6 +228,7 @@ function parseArgs(argv) {
   const parsed = {
     db: null, dbPrefix: null, batchSize: DEFAULT_BATCH_SIZE,
     mapOut: DEFAULT_MAP_OUT_PATH, backupDir: DEFAULT_BACKUP_DIR,
+    dirOverridesPath: DEFAULT_DIR_OVERRIDES_PATH,
     discoverOnly: false, rollback: false, help: false,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -223,6 +243,8 @@ function parseArgs(argv) {
     else if (a.startsWith('--map-out=')) parsed.mapOut = a.slice('--map-out='.length);
     else if (a === '--backup-dir') parsed.backupDir = argv[++i];
     else if (a.startsWith('--backup-dir=')) parsed.backupDir = a.slice('--backup-dir='.length);
+    else if (a === '--dir-overrides') parsed.dirOverridesPath = argv[++i];
+    else if (a.startsWith('--dir-overrides=')) parsed.dirOverridesPath = a.slice('--dir-overrides='.length);
     else if (a === '--discover-only') parsed.discoverOnly = true;
     else if (a === '--rollback') parsed.rollback = true;
     else if (a === '--help' || a === '-h') parsed.help = true;
@@ -238,7 +260,8 @@ function printUsage() {
   console.log([
     'Usage: node scripts/migrations/migrate-03-corpus-project-id.js [--db <target>]',
     '         [--db-prefix <prefix>] [--batch-size <n>] [--map-out <path>]',
-    '         [--backup-dir <path>] [--discover-only] [--rollback]',
+    '         [--backup-dir <path>] [--dir-overrides <path>] [--discover-only]',
+    '         [--rollback]',
     '',
     '  --db <name>          Bookkeeping target for migration_manifest rows (else',
     '                       MIGRATE_TARGET_DB env, else memory_manager_staging).',
@@ -257,6 +280,11 @@ function printUsage() {
     '                       dumps written before any mutation (default:',
     '                       scripts/migrations/backups/, gitignored, shared with',
     '                       migrate-02-decisions.js\'s backups).',
+    '  --dir-overrides <p>  Path to memory-entry-dir-overrides.json (default:',
+    '                       alongside this script). Consulted FIRST, before',
+    '                       transcript resolution, on an exact dirName match.',
+    '                       Optional -- a missing file means zero overrides;',
+    '                       a PRESENT but malformed file is a loud FATAL.',
     '  --discover-only      Print the discovery classification and exit -- no',
     '                       database is altered.',
     '  --rollback           Drop project_id from every corpus DB found in',
@@ -344,6 +372,105 @@ function printClassification(classifications, dbPrefix) {
 }
 
 // ─── MAP-BUILDING (D3-1/D3-2) ───────────────────────────────────────────────
+
+/**
+ * Field finding, fourth round: the transcript-cwd mechanism structurally
+ * cannot cover most of a real estate (a first estate-wide run: 25 dirs, 1
+ * resolved, 24 unmapped -- 20 with ZERO transcripts, 2 with cwds carrying
+ * no marker in their ancestry, 1 mixed). Orphan re-attribution (D3-8's
+ * widened predicate) can never fire for these without a SECOND,
+ * owner-reviewable resolution source. This is that source: an explicit
+ * overrides file, DELIBERATELY mirroring migrate-02-decisions.js's
+ * topic-prefix-to-project.json pattern (D-12) -- this is a REUSE of that
+ * already-adversary-hardened design, not a new matcher class: same
+ * gitignored-real/committed-synthetic-.example.json split, same total-
+ * classification validation posture (a malformed file is a loud FATAL
+ * before any DB work, never a silently-skipped bad entry), same
+ * "consulted first, exact match, everything else falls through unchanged"
+ * shape.
+ *
+ * UNLIKE topic-prefix-to-project.json, this file is OPTIONAL: the base
+ * transcript-resolution mechanism is the primary path and works without
+ * any overrides at all, so a MISSING overrides file is not an error --
+ * only a PRESENT-but-malformed one is (a real, broken file the operator
+ * should fix, never silently ignored).
+ *
+ * Shape: `{ "overrides": [ { "dirName": "<exact ~/.claude/projects/ entry
+ * name>", "projectRoot": "<absolute real path>" } ] }`. The override
+ * supplies ONLY the path -- identity is still resolved at run time via
+ * findProjectRootByMarker(projectRoot) (imported, never re-implemented;
+ * same primitive the transcript-cwd path uses), so a stale override
+ * (the declared path's marker has since been deleted/moved/corrupted)
+ * is a loud, detectable failure rather than a value baked into the
+ * config that could silently drift from reality.
+ *
+ * Total classification of a validation error (every malformed shape maps
+ * to an explicit FATAL message, never a silent skip of the bad entry):
+ *   - file present, unreadable                    -> FATAL
+ *   - file present, not valid JSON                 -> FATAL
+ *   - `overrides` field missing or not an array     -> FATAL
+ *   - an entry that is not a plain object           -> FATAL (per entry)
+ *   - `dirName` missing/empty/non-string             -> FATAL (per entry)
+ *   - `projectRoot` missing/empty/non-string         -> FATAL (per entry)
+ *   - `projectRoot` present but not an absolute path -> FATAL (per entry)
+ *   - a `dirName` repeated across two or more entries -> FATAL (ambiguous:
+ *     exactly one override per directory, never "first/last wins")
+ * Every violation found is collected and printed together before exiting
+ * 1 -- an operator fixing the file sees every problem in one pass, not a
+ * whack-a-mole one-error-per-run cycle.
+ */
+function loadDirOverrides(overridesPath) {
+  if (!fs.existsSync(overridesPath)) {
+    return { overrides: [], source: null };
+  }
+  let raw;
+  try {
+    raw = fs.readFileSync(overridesPath, 'utf8');
+  } catch (err) {
+    console.error(`FATAL: could not read dir-overrides file at "${overridesPath}": ${err.message}`);
+    process.exit(1);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    console.error(`FATAL: dir-overrides file at "${overridesPath}" is not valid JSON: ${err.message}`);
+    process.exit(1);
+  }
+  if (!Array.isArray(parsed.overrides)) {
+    console.error(`FATAL: dir-overrides file at "${overridesPath}" must carry an "overrides" array.`);
+    console.error('See scripts/migrations/memory-entry-dir-overrides.example.json for the required shape.');
+    process.exit(1);
+  }
+  const seenDirNames = new Set();
+  const problems = [];
+  parsed.overrides.forEach((entry, i) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      problems.push(`entry ${i}: must be a plain object, got ${JSON.stringify(entry)}`);
+      return;
+    }
+    const dirNameOk = typeof entry.dirName === 'string' && entry.dirName.trim().length > 0;
+    if (!dirNameOk) problems.push(`entry ${i}: "dirName" must be a non-empty string`);
+    const projectRootOk = typeof entry.projectRoot === 'string' && entry.projectRoot.trim().length > 0;
+    if (!projectRootOk) {
+      problems.push(`entry ${i}${dirNameOk ? ` (dirName="${entry.dirName}")` : ''}: "projectRoot" must be a non-empty string`);
+    } else if (!path.isAbsolute(entry.projectRoot)) {
+      problems.push(`entry ${i}${dirNameOk ? ` (dirName="${entry.dirName}")` : ''}: "projectRoot" must be an absolute path, got "${entry.projectRoot}"`);
+    }
+    if (dirNameOk) {
+      if (seenDirNames.has(entry.dirName)) {
+        problems.push(`entry ${i}: duplicate dirName "${entry.dirName}" -- exactly one override per directory is allowed, never "first/last wins"`);
+      }
+      seenDirNames.add(entry.dirName);
+    }
+  });
+  if (problems.length) {
+    console.error(`FATAL: dir-overrides file at "${overridesPath}" failed validation (${problems.length} problem(s)):`);
+    for (const p of problems) console.error(`  - ${p}`);
+    process.exit(1);
+  }
+  return { overrides: parsed.overrides, source: overridesPath };
+}
 
 /**
  * Light canonicalization used ONLY to DEDUPE raw `cwd` strings before
@@ -536,25 +663,91 @@ function resolveProjectIdForDir(dirAbsPath) {
 }
 
 /**
+ * Resolve one directory's project id via an explicit override entry --
+ * consulted in place of (never as a supplement to) transcript resolution.
+ * The override supplies ONLY `projectRoot`; identity still comes from
+ * findProjectRootByMarker(projectRoot) at run time (same primitive the
+ * transcript-cwd path uses, imported, never re-implemented), so a stale
+ * override (marker deleted/moved/corrupted since the override was
+ * authored) is DETECTED here, never silently trusted.
+ *
+ * Returns `{ projectId, unmappedReason, staleReason }`: `staleReason` is
+ * non-null iff the override's declared path failed to resolve to a live
+ * marker -- the caller (buildProjectDirIndex) collects every stale
+ * failure across the whole run and main() refuses the ENTIRE run on any
+ * of them (never a fallthrough to transcript resolution for that
+ * directory, and never a silent per-directory skip that could mask
+ * config drift elsewhere in the same file).
+ */
+function resolveProjectIdViaOverride(override) {
+  let root;
+  try {
+    root = findProjectRootByMarker(override.projectRoot);
+  } catch (err) {
+    const reason = `findProjectRootByMarker threw for override projectRoot="${override.projectRoot}": ${err.message}`;
+    return { projectId: null, unmappedReason: `stale override: ${reason}`, staleReason: reason };
+  }
+  if (!root) {
+    const reason = `no project marker found walking up from override projectRoot="${override.projectRoot}"`;
+    return { projectId: null, unmappedReason: `stale override: ${reason}`, staleReason: reason };
+  }
+  let marker;
+  try {
+    marker = readMarker(root);
+  } catch (err) {
+    const reason = `readMarker threw at override-resolved root="${root}": ${err.message}`;
+    return { projectId: null, unmappedReason: `stale override: ${reason}`, staleReason: reason };
+  }
+  if (!marker) {
+    const reason = `marker directory resolved at override-resolved root="${root}" but the marker file is missing/corrupt`;
+    return { projectId: null, unmappedReason: `stale override: ${reason}`, staleReason: reason };
+  }
+  return { projectId: marker.uuid, unmappedReason: null, staleReason: null };
+}
+
+/**
  * Walk `<baseDir>/projects/*` once. A directory qualifies as a candidate
  * ONLY if it has a `memory/` subdirectory (never a name-shape check --
  * the marker-UUID-named dirs and the encoded-cwd-named dirs are treated
  * identically; "has a memory/ subdir" is the total, content-based test).
- * Every qualifying directory's project id is resolved via
- * resolveProjectIdForDir (D3-1); its `memory/*.md` filenames are indexed
- * as normalized (via source-file-normalize) candidate keys regardless of
- * whether resolution succeeded (an unresolved directory's files are kept
- * out of the CANDIDATE list entirely -- see buildProjectDirIndex's
- * return shape: only `projectId !== null` dirs carry usable `files`).
+ *
+ * For each candidate directory, an override (see loadDirOverrides) whose
+ * `dirName` EXACTLY matches is consulted FIRST, before any transcript
+ * scanning -- a directory with a matching override never falls through
+ * to resolveProjectIdForDir at all (field finding, fourth round: this is
+ * the second, owner-reviewable resolution source the transcript mechanism
+ * alone cannot provide for the majority of a real estate). A directory
+ * with NO matching override proceeds through resolveProjectIdForDir (D3-1)
+ * completely unchanged. `memory/*.md` filenames are indexed as normalized
+ * (via source-file-normalize) candidate keys regardless of whether
+ * resolution succeeded (an unresolved directory's files are kept out of
+ * the CANDIDATE list entirely -- see the return shape: only
+ * `projectId !== null` dirs carry usable `files`).
+ *
+ * Return shape additions over the pre-overrides version: `appliedOverrides`
+ * (every override that successfully resolved, for the run report),
+ * `danglingOverrides` (every override entry whose `dirName` matched NO
+ * directory actually present under `projectsRoot` this run -- reported,
+ * never an error), and `staleOverrideFailures` (every override whose
+ * declared `projectRoot` failed to resolve to a live marker -- the caller
+ * refuses the entire run on any of these, per loadDirOverrides' header
+ * comment).
  */
-function buildProjectDirIndex(baseDir) {
+function buildProjectDirIndex(baseDir, dirOverrides) {
   const projectsRoot = path.join(baseDir, 'projects');
+  const emptyOverrideReport = { appliedOverrides: [], danglingOverrides: [], staleOverrideFailures: [] };
   let entries;
   try {
     entries = fs.readdirSync(projectsRoot, { withFileTypes: true });
   } catch (err) {
-    return { projectsRoot, dirs: [], error: `could not list ${projectsRoot}: ${err.message}` };
+    return { projectsRoot, dirs: [], error: `could not list ${projectsRoot}: ${err.message}`, ...emptyOverrideReport };
   }
+
+  const overridesList = (dirOverrides && dirOverrides.overrides) || [];
+  const overridesByDirName = new Map(overridesList.map((o) => [o.dirName, o]));
+  const matchedDirNames = new Set();
+  const appliedOverrides = [];
+  const staleOverrideFailures = [];
 
   const dirs = [];
   for (const entry of entries) {
@@ -568,11 +761,31 @@ function buildProjectDirIndex(baseDir) {
     } catch (_) {
       continue; // no memory/ subdirectory -- not a candidate directory
     }
-    const { projectId, unmappedReason } = resolveProjectIdForDir(dirAbsPath);
+
+    let projectId;
+    let unmappedReason;
+    const override = overridesByDirName.get(dirName);
+    if (override) {
+      matchedDirNames.add(dirName);
+      const resolved = resolveProjectIdViaOverride(override);
+      projectId = resolved.projectId;
+      unmappedReason = resolved.unmappedReason;
+      if (resolved.staleReason) {
+        staleOverrideFailures.push({ dirName, projectRoot: override.projectRoot, reason: resolved.staleReason });
+      } else {
+        appliedOverrides.push({ dirName, projectRoot: override.projectRoot, projectId });
+      }
+    } else {
+      ({ projectId, unmappedReason } = resolveProjectIdForDir(dirAbsPath));
+    }
+
     const files = new Set(memFiles.map((f) => sfn.normalize(path.posix.join('memory', f))));
     dirs.push({ dirName, dirAbsPath, projectId, unmappedReason, files, rawFileCount: memFiles.length });
   }
-  return { projectsRoot, dirs, error: null };
+
+  const danglingOverrides = overridesList.filter((o) => !matchedDirNames.has(o.dirName));
+
+  return { projectsRoot, dirs, error: null, appliedOverrides, danglingOverrides, staleOverrideFailures };
 }
 
 // ─── PER-DATABASE MAPPING (D3-3/D3-7) ──────────────────────────────────────
@@ -1006,13 +1219,45 @@ async function main() {
     }
 
     // ── Map-building (D3-1/D3-2), ONCE, shared across every corpus DB ────
+    const dirOverrides = loadDirOverrides(parsed.dirOverridesPath);
+    console.log(`Dir-overrides: ${dirOverrides.source ? `"${dirOverrides.source}"` : 'none present (optional -- transcript resolution only)'} — ${dirOverrides.overrides.length} entrie(s) loaded.`);
+
     const baseDir = resolveBaseDir();
-    const dirIndex = buildProjectDirIndex(baseDir);
+    const dirIndex = buildProjectDirIndex(baseDir, dirOverrides);
     if (dirIndex.error) {
       console.error(`Refused: ${dirIndex.error}`);
       process.exitCode = 1;
       return;
     }
+
+    // Stale overrides (req. 2): a marker missing/corrupt at an overridden
+    // path is a LOUD FAIL, refusing the ENTIRE run -- never a fallthrough
+    // to transcript resolution for that directory, never a silent skip.
+    // Scoped to the whole run (not just that directory) because a stale
+    // override signals the override FILE ITSELF has drifted from reality;
+    // other entries in the same file may share the same staleness/typo
+    // class, and an operator who only checks the exit code must not be
+    // able to miss this.
+    if (dirIndex.staleOverrideFailures.length) {
+      console.error(`Refused: ${dirIndex.staleOverrideFailures.length} stale override(s) in "${dirOverrides.source}" — a declared projectRoot no longer resolves to a live marker (stale-override protection). Nothing was applied to any database.`);
+      for (const f of dirIndex.staleOverrideFailures) {
+        console.error(`  - dirName="${f.dirName}" projectRoot="${f.projectRoot}": ${f.reason}`);
+      }
+      process.exitCode = 1;
+      return;
+    }
+
+    // Applied + dangling overrides (req. 4): every override applied, and
+    // every override entry whose dirName matched no existing directory
+    // this run (a dangling override is reported, never an error — the
+    // directory may legitimately not exist yet).
+    for (const a of dirIndex.appliedOverrides) {
+      console.log(`  [OVERRIDE] dirName="${a.dirName}" -> projectRoot="${a.projectRoot}" -> project_id="${a.projectId}"`);
+    }
+    for (const d of dirIndex.danglingOverrides) {
+      console.log(`  [DANGLING-OVERRIDE] dirName="${d.dirName}" (projectRoot="${d.projectRoot}") matched no existing directory under "${dirIndex.projectsRoot}"`);
+    }
+
     const resolvedCount = dirIndex.dirs.filter((d) => d.projectId).length;
     const unmappedCount = dirIndex.dirs.length - resolvedCount;
     console.log(`Map-building (D3-1): ${dirIndex.dirs.length} directorie(s) under "${dirIndex.projectsRoot}" carry a memory/ subdirectory — ${resolvedCount} resolved to a project id, ${unmappedCount} unmapped.`);
@@ -1139,6 +1384,8 @@ module.exports = {
   classifyDatabase,
   discoverAndClassify,
   printClassification,
+  loadDirOverrides,
+  resolveProjectIdViaOverride,
   cwdCompareKey,
   findCwdsFromTranscripts,
   resolveProjectIdForDir,
@@ -1160,6 +1407,7 @@ module.exports = {
   DEFAULT_BATCH_SIZE,
   DEFAULT_MAP_OUT_PATH,
   DEFAULT_BACKUP_DIR,
+  DEFAULT_DIR_OVERRIDES_PATH,
   ENTRIES_TABLE,
   CHUNKS_TABLE,
   ENTRIES_LOAD_BEARING_COLS,

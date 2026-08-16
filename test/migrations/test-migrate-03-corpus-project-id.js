@@ -61,6 +61,21 @@
  *     manifest slices stable (no duplication, no orphaned leftover slice).
  *   - Rollback: drops project_id from the corpus DB + clears this DB's
  *     manifest slices from the bookkeeping target.
+ *   - DIR OVERRIDES (D3-1, fourth round — the transcript-cwd mechanism
+ *     structurally cannot cover most of a real estate): loadDirOverrides
+ *     (missing file is fine, present-but-malformed is a loud FATAL);
+ *     buildProjectDirIndex consulting an override FIRST, before transcript
+ *     resolution, on an exact dirName match; named regressions
+ *     "override-resolves-zero-transcript-dir" (an override resolves a
+ *     directory the transcript mechanism has literally nothing to scan),
+ *     "stale-override-marker-missing-fails-loud" (unit AND full-CLI: a
+ *     declared projectRoot with no live marker refuses the ENTIRE run,
+ *     never a fallthrough to transcript resolution, nothing applied to
+ *     any database), "dangling-override-reported" (unit AND CLI: an
+ *     override matching no directory is a loud report line, never a
+ *     failure), and "no-override-unchanged-behavior" (a directory with no
+ *     matching override — including the worktree-cwd case — resolves
+ *     exactly as before, even with unrelated overrides loaded).
  *
  * Usage: node test/migrations/test-migrate-03-corpus-project-id.js
  * Exit 0 = all pass; nonzero = any failure.
@@ -491,6 +506,88 @@ async function main() {
     assert(c.status === 'unreachable', `expected unreachable, got ${c.status}`);
   });
 
+  await run('U14', 'loadDirOverrides: a missing file is NOT an error -- overrides are optional (unlike topic-prefix-to-project.json)', async () => {
+    const r = migrate03.loadDirOverrides(path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'm03-nofile-')), 'does-not-exist.json'));
+    assert(Array.isArray(r.overrides) && r.overrides.length === 0, 'expected an empty overrides array');
+    assert(r.source === null, 'expected null source for a missing file');
+  });
+
+  // ── Group 1b: dir-overrides pure unit tests (D3-1, fourth round) ────
+
+  await run('override-resolves-zero-transcript-dir', 'buildProjectDirIndex: an override resolves a directory that has ZERO transcripts -- the exact case the transcript mechanism structurally cannot cover (named regression, reviewer-requested)', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-ov-zero-'));
+    const checkoutRoot = path.join(base, 'checkout');
+    fs.mkdirSync(checkoutRoot, { recursive: true });
+    const { uuid } = projectMarker.writeMarker(checkoutRoot);
+    fs.mkdirSync(path.join(base, 'projects'), { recursive: true });
+    const dirName = 'zero-transcript-dir';
+    const memPath = path.join(base, 'projects', dirName, 'memory');
+    fs.mkdirSync(memPath, { recursive: true });
+    fs.writeFileSync(path.join(memPath, 'orphaned-forever-without-override.md'), 'x', 'utf8');
+    // deliberately NO *.jsonl written -- this directory has zero transcripts
+
+    const dirOverrides = { overrides: [{ dirName, projectRoot: checkoutRoot }], source: 'test' };
+    const idx = migrate03.buildProjectDirIndex(base, dirOverrides);
+    assert(idx.staleOverrideFailures.length === 0, `expected no stale failures, got ${JSON.stringify(idx.staleOverrideFailures)}`);
+    assert(idx.appliedOverrides.length === 1 && idx.appliedOverrides[0].projectId === uuid, `expected 1 applied override resolving to ${uuid}, got ${JSON.stringify(idx.appliedOverrides)}`);
+    const dir = idx.dirs.find((d) => d.dirName === dirName);
+    assert(dir && dir.projectId === uuid, `expected the zero-transcript dir to resolve to ${uuid} via the override, got ${JSON.stringify(dir)}`);
+  });
+
+  await run('stale-override-marker-missing-fails-loud (unit)', 'buildProjectDirIndex: an override whose projectRoot has NO marker in its ancestry is collected as a stale failure -- never a fallthrough to transcript resolution, never a silent skip', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-ov-stale-'));
+    const noMarkerRoot = path.join(base, 'checkout-no-marker');
+    fs.mkdirSync(noMarkerRoot, { recursive: true }); // deliberately no marker written
+    fs.mkdirSync(path.join(base, 'projects'), { recursive: true });
+    const dirName = 'stale-override-dir';
+    const memPath = path.join(base, 'projects', dirName, 'memory');
+    fs.mkdirSync(memPath, { recursive: true });
+    fs.writeFileSync(path.join(memPath, 'x.md'), 'x', 'utf8');
+
+    const dirOverrides = { overrides: [{ dirName, projectRoot: noMarkerRoot }], source: 'test' };
+    const idx = migrate03.buildProjectDirIndex(base, dirOverrides);
+    assert(idx.appliedOverrides.length === 0, `expected zero applied overrides, got ${JSON.stringify(idx.appliedOverrides)}`);
+    assert(idx.staleOverrideFailures.length === 1, `expected exactly 1 stale failure, got ${JSON.stringify(idx.staleOverrideFailures)}`);
+    assert(idx.staleOverrideFailures[0].dirName === dirName, 'expected the stale failure to name the correct dirName');
+    const dir = idx.dirs.find((d) => d.dirName === dirName);
+    assert(dir && dir.projectId === null, 'expected the directory itself to remain unresolved (projectId=null), never a fallthrough to transcript resolution');
+  });
+
+  await run('dangling-override-reported (unit)', 'buildProjectDirIndex: an override whose dirName matches no existing directory is reported as dangling -- informational, never an error, never affects any other directory', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-ov-dangling-'));
+    fs.mkdirSync(path.join(base, 'projects'), { recursive: true }); // zero project directories at all
+    const dirOverrides = { overrides: [{ dirName: 'this-directory-does-not-exist-anywhere', projectRoot: base }], source: 'test' };
+    const idx = migrate03.buildProjectDirIndex(base, dirOverrides);
+    assert(idx.error === null, 'expected no error');
+    assert(idx.staleOverrideFailures.length === 0, 'a dangling override must never be classified as stale -- it was never even attempted');
+    assert(idx.danglingOverrides.length === 1 && idx.danglingOverrides[0].dirName === 'this-directory-does-not-exist-anywhere', `expected exactly 1 dangling override, got ${JSON.stringify(idx.danglingOverrides)}`);
+  });
+
+  await run('no-override-unchanged-behavior', 'buildProjectDirIndex: a directory with NO matching override resolves via the UNCHANGED transcript/marker mechanism, including the worktree-cwd case, even with unrelated overrides loaded', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-ov-unaffected-'));
+    const repoRoot = path.join(base, 'repo');
+    fs.mkdirSync(repoRoot, { recursive: true });
+    const { uuid } = projectMarker.writeMarker(repoRoot);
+    const worktreeCwd = path.join(repoRoot, '.claude', 'worktrees', 'agent-x');
+    fs.mkdirSync(worktreeCwd, { recursive: true });
+    fs.mkdirSync(path.join(base, 'projects'), { recursive: true });
+    const dirName = 'no-override-here';
+    const memPath = path.join(base, 'projects', dirName, 'memory');
+    fs.mkdirSync(memPath, { recursive: true });
+    fs.writeFileSync(path.join(memPath, 'x.md'), 'x', 'utf8');
+    fs.writeFileSync(path.join(path.join(base, 'projects', dirName), 'a.jsonl'), JSON.stringify({ cwd: repoRoot }) + '\n', 'utf8');
+    fs.writeFileSync(path.join(path.join(base, 'projects', dirName), 'b.jsonl'), JSON.stringify({ cwd: worktreeCwd }) + '\n', 'utf8');
+
+    // Overrides ARE loaded this run, but carry an entry for a COMPLETELY
+    // UNRELATED dirName -- must have zero effect on this directory.
+    const dirOverrides = { overrides: [{ dirName: 'some-other-directory-entirely', projectRoot: base }], source: 'test' };
+    const idx = migrate03.buildProjectDirIndex(base, dirOverrides);
+    const dir = idx.dirs.find((d) => d.dirName === dirName);
+    assert(dir && dir.projectId === uuid, `expected unchanged transcript-resolution behavior (worktree case) -> ${uuid}, got ${JSON.stringify(dir)}`);
+    assert(idx.appliedOverrides.length === 0, 'expected zero applied overrides (this dir had none)');
+    assert(idx.danglingOverrides.length === 1, 'expected the unrelated override entry to be reported as dangling');
+  });
+
   // ── Group 2: full-stack DB integration tests ────────────────────────
 
   fixtureBase = makeFixtureBase();
@@ -542,6 +639,42 @@ async function main() {
       const has = await migrate03.columnExists(client, 'memory_entries', 'project_id');
       assert(has === false, 'discover-only must not add project_id');
     } finally { await client.end(); }
+  });
+
+  await run('stale-override-marker-missing-fails-loud (CLI)', 'CLI: a stale override (reviewer\'s exact repro-class) refuses the ENTIRE run before any database is touched -- exit non-zero, loud stderr, nothing applied', async () => {
+    const overridesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-cli-stale-'));
+    const overridesPath = path.join(overridesDir, 'dir-overrides.json');
+    const noMarkerRoot = path.join(overridesDir, 'no-marker-here');
+    fs.mkdirSync(noMarkerRoot, { recursive: true }); // deliberately no marker
+    fs.writeFileSync(overridesPath, JSON.stringify({ overrides: [{ dirName: 'dir-happy', projectRoot: noMarkerRoot }] }), 'utf8');
+
+    const r = runMigrate03(['--db', DB_TARGET, '--dir-overrides', overridesPath], { HANDOFF_BASE_DIR: fixtureBase });
+    assert(r.status !== 0, `expected a non-zero exit on a stale override, got ${r.status}`);
+    assert(/stale override/i.test(r.stderr), `expected "stale override" mentioned loudly in stderr, got: ${r.stderr}`);
+
+    const client = await pgConnect(DB_CORPUS_HAPPY);
+    try {
+      const has = await migrate03.columnExists(client, 'memory_entries', 'project_id');
+      assert(has === false, 'a stale override must refuse BEFORE any database is touched -- project_id must still be absent');
+    } finally { await client.end(); }
+  });
+
+  await run('dir-overrides-malformed-file-fails-loud (CLI)', 'CLI: a PRESENT but malformed dir-overrides file (not valid JSON) is a loud FATAL, distinct from a missing file (which is fine)', async () => {
+    const overridesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-cli-malformed-'));
+    const overridesPath = path.join(overridesDir, 'dir-overrides.json');
+    fs.writeFileSync(overridesPath, '{ this is not valid JSON', 'utf8');
+    const r = runMigrate03(['--db', DB_TARGET, '--dir-overrides', overridesPath], { HANDOFF_BASE_DIR: fixtureBase });
+    assert(r.status !== 0, `expected a non-zero exit on a malformed overrides file, got ${r.status}`);
+    assert(/not valid JSON/i.test(r.stderr), `expected the JSON-parse FATAL message, got: ${r.stderr}`);
+  });
+
+  await run('dangling-override-reported (CLI)', 'CLI: an override whose dirName matches nothing is reported (loud report line) but does NOT fail the run', async () => {
+    const overridesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-cli-dangling-'));
+    const overridesPath = path.join(overridesDir, 'dir-overrides.json');
+    fs.writeFileSync(overridesPath, JSON.stringify({ overrides: [{ dirName: 'nothing-matches-this-dirname', projectRoot: overridesDir }] }), 'utf8');
+    const r = runMigrate03(['--db', DB_TARGET, '--dir-overrides', overridesPath], { HANDOFF_BASE_DIR: fixtureBase });
+    assert(r.status === 0, `expected exit 0 (a dangling override is informational, never a failure), got ${r.status}\nstdout:${r.stdout}\nstderr:${r.stderr}`);
+    assert(/\[DANGLING-OVERRIDE\]/.test(r.stdout), `expected a [DANGLING-OVERRIDE] report line in stdout, got: ${r.stdout}`);
   });
 
   await run('I4', 'happy path: backfill resolves the real project id, applies NOT NULL, writes manifest', async () => {

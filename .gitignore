@@ -91,6 +91,15 @@ scripts/decisions_backup*.csv
 # shape. See migrate-03-corpus-project-id.js's writeMapArtifact().
 /scripts/migrations/memory-entry-project-map.json
 
+# migrate-03-corpus-project-id.js's owner-reviewable directory-resolution
+# override file — real ~/.claude/projects directory names + real absolute
+# filesystem paths, private instance data, never committed. Mirrors
+# topic-prefix-to-project.json's gitignored-real/committed-synthetic split
+# (D-12 pattern reuse). scripts/migrations/memory-entry-dir-overrides.example.json
+# documents the required shape. See migrate-03-corpus-project-id.js's
+# loadDirOverrides().
+/scripts/migrations/memory-entry-dir-overrides.json
+
 # migrate-08-handoff-markdown.js's per-project fail-soft parse reports —
 # may embed real HANDOFF.md/HANDOFF-HISTORY.md content (subjects, session
 # summaries), never committed. See migrate-08-handoff-markdown.js's
