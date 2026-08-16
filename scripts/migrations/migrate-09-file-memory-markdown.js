@@ -116,10 +116,15 @@
  *      pair, `source_table` values `file_memory_entities` /
  *      `file_memory_edges` (matching the runbook's own §15.2 markdown-
  *      coverage note), `source_db = 'filesystem:<project's memory dir,
- *      normalized>'` via the shared scripts/lib/fs-source-path.js
- *      normalizer (H-14's convention; §6.1(h) has not shipped its own copy
- *      in this repo as of this PR, so this module is the one both (h) and
- *      (i) import by reference going forward).
+ *      normalized>'` via `scripts/lib/fs-path-normalize.js`'s
+ *      `filesystemSourceDb()` — the ONE shared H-14/I-14 normalizer,
+ *      authored by §6.1(h)'s `migrate-08-handoff-markdown.js` (merged to
+ *      main first) and imported here by reference, never forked. (An
+ *      earlier revision of this script shipped its own equivalent
+ *      `scripts/lib/fs-source-path.js`, authored before (h) had merged;
+ *      that module's own header comment anticipated exactly this
+ *      collision and named its own deletion as the correct resolution —
+ *      done, in the reconciliation commit on this branch.)
  *  10. Report: per-project live file/entity/edge counts, diagnostic-only
  *      comparison against the documentary ~116-file baseline (I-2 — NEVER
  *      a gate), every unmatched-type / filename-prefix-fallback /
@@ -172,7 +177,11 @@ const { Client } = require('pg');
 
 const migrateOne = require('./migrate-01-canonical-db'); // reused by reference, never forked
 const shared = require('./lib/verify15-shared');          // reused by reference: rowHash, applyDdl
-const { fsSourceDb } = require('../lib/fs-source-path');   // reused by reference (H-14 convention)
+const { filesystemSourceDb } = require('../lib/fs-path-normalize'); // reused by reference — the
+                                                             // ONE shared H-14/I-14 normalizer
+                                                             // (authored by the merged §6.1(h)
+                                                             // migrate-08-handoff-markdown.js;
+                                                             // never a second hand-rolled copy)
 const { resolveBaseDir } = require('../lib/handoff-paths'); // reused by reference — single source of
                                                              // truth for the .claude base dir; honors
                                                              // HANDOFF_BASE_DIR. Never hand-roll
@@ -688,7 +697,7 @@ async function writeManifestSlice(client, sourceDb, sourceTable, projectId, cols
  */
 async function processProject(client, projectId, memoryDirPath) {
   const parsed = parseProjectMemoryDir(memoryDirPath);
-  const sourceDb = fsSourceDb(memoryDirPath);
+  const sourceDb = filesystemSourceDb(memoryDirPath);
 
   await client.query('BEGIN');
   try {

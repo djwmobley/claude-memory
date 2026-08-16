@@ -465,6 +465,31 @@ async function main() {
     }
   });
 
+  await run('T9b', 'DB: manifest source_db keys are produced by fs-path-normalize.js\'s filesystemSourceDb() (H-14/I-14 — the ONE shared normalizer)', async () => {
+    const { filesystemSourceDb } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'fs-path-normalize.js'));
+    const expectedSourceDb = filesystemSourceDb(fixture.memoryDir);
+    // Sanity on the expectation itself: forward-slashed, drive letter
+    // upper-cased, no backslashes -- proves this assertion is actually
+    // exercising the normalization, not just echoing whatever the
+    // migration happened to write.
+    assert(expectedSourceDb.startsWith('filesystem:'), expectedSourceDb);
+    assert(!expectedSourceDb.includes('\\'), `expected no backslashes, got ${expectedSourceDb}`);
+    if (/^filesystem:[a-zA-Z]:/.test(expectedSourceDb)) {
+      assert(/^filesystem:[A-Z]:/.test(expectedSourceDb), `expected an upper-cased drive letter, got ${expectedSourceDb}`);
+    }
+
+    const client = await pgConnect(dbName);
+    try {
+      const { rows } = await client.query(
+        `SELECT DISTINCT source_db FROM migration_manifest WHERE project_id_or_null = 'proj-alpha-test' AND source_table IN ('file_memory_entities','file_memory_edges')`
+      );
+      assert(rows.length === 1, `expected exactly one distinct source_db across both slices, got ${JSON.stringify(rows)}`);
+      assert(rows[0].source_db === expectedSourceDb, `manifest source_db must equal fs-path-normalize.js's filesystemSourceDb(memoryDir) exactly, got ${JSON.stringify(rows[0])} vs expected ${expectedSourceDb}`);
+    } finally {
+      await client.end();
+    }
+  });
+
   await run('T10', 'DB: idempotent re-run — no duplicate edges (proves unique index + upsert)', async () => {
     const r1 = runMigrate09(['--db', dbName, '--projects-root', fixtureRoot, '--enrollment-config', enrollmentConfigPath]);
     assert(r1.status === 0, `re-run 1 expected exit 0, got ${r1.status}; stderr=${r1.stderr}`);
