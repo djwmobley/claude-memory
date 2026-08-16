@@ -1,0 +1,7 @@
+{
+  "_comment": "SYNTHETIC EXAMPLE ONLY — obviously-fake project ids throughout. The real known-own-graph-project-ids.json carries private instance data (the real marker UUID + real encoded-cwd project id observed live in claude_memory_eval_test, CONSOLIDATION-RUNBOOK.md §6.1(c)'s C-1 amendment) and is gitignored, never committed. This file documents the required SHAPE migrate-verify-own-graph.js's loadKnownOwnGraphProjectIds()/classifyProjectId() implement, and is also what test/migrations/test-migrate-verify-own-graph.js loads (via --known-ids) so the suite runs green with no private data present, in CI or anywhere else. Total classification (C-1): every distinct project_id observed via the UNION query across every in-scope, project_id-bearing table is REAL if it appears in known_project_ids below, else JUNK — junk is the default branch, no third bucket, no allow-list escape hatch.",
+  "known_project_ids": [
+    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    "C--Users-example-dev-example-project"
+  ]
+}

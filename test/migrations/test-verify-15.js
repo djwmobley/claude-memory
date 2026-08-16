@@ -1210,6 +1210,51 @@ async function testT9Negative() {
     } else {
       fail('T9-e', 'provenance check unit: confirms PASS when manifest row present, FAIL when absent (proves the check actually fires)', `brokenResult=${JSON.stringify(brokenResult)} brokenResult2=${JSON.stringify(brokenResult2)}`);
     }
+
+    // C-7 regression (§6.1(c), memory-manager#11(c), 2026-08-16): TWO
+    // different source_dbs both excluding a same-named source_table
+    // ("decisions") at NULL scope under the SAME excluded_reason used to
+    // collapse under the pre-fix unscoped provenance query -- confirming
+    // source A's manifest row could wrongly "prove" source B's exclusion
+    // was accounted for even with B's own confirming row absent. With
+    // sourceDb supplied, each source is checked independently.
+    await truncateAll(target, ['migration_manifest']);
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint, excluded_reason)
+       VALUES ('ephemeral_source_a','decisions',NULL,1,'fp-a','ephemeral-db-triage-drop')`
+    );
+    // Deliberately NO confirming row for 'ephemeral_source_b' at all.
+    const t9SourceDbMod = require(scriptPath('verify-15-t9-negative.js'));
+    const scopedA = await t9SourceDbMod.checkExclusion(
+      target, roster,
+      { excluded_reason: 'ephemeral-db-triage-drop', source_table: 'decisions', project_id_or_null: null },
+      'ephemeral_source_a'
+    );
+    const scopedB = await t9SourceDbMod.checkExclusion(
+      target, roster,
+      { excluded_reason: 'ephemeral-db-triage-drop', source_table: 'decisions', project_id_or_null: null },
+      'ephemeral_source_b'
+    );
+    if (scopedA.ok === true && scopedB.ok === false) {
+      pass('T9-f-source-db-scoping', 'C-7: source_db-scoped provenance distinguishes two sources sharing a source_table+excluded_reason -- A confirmed, B (no confirming row) FAILs, never silently borrows A\'s manifest row');
+    } else {
+      fail('T9-f-source-db-scoping', 'C-7: source_db-scoped provenance distinguishes two sources sharing a source_table+excluded_reason -- A confirmed, B (no confirming row) FAILs, never silently borrows A\'s manifest row', `scopedA=${JSON.stringify(scopedA)} scopedB=${JSON.stringify(scopedB)}`);
+    }
+    // Unscoped call (sourceDb omitted) is UNCHANGED behavior -- proves the
+    // fix is additive, not a breaking change for pre-existing callers: the
+    // unscoped query still finds source A's row regardless of which source
+    // is actually being asked about (this is the EXACT pre-fix ambiguity,
+    // preserved on purpose for the omitted-argument code path per C-7's
+    // "behavior-preserving for existing callers" requirement).
+    const unscoped = await t9SourceDbMod.checkExclusion(
+      target, roster,
+      { excluded_reason: 'ephemeral-db-triage-drop', source_table: 'decisions', project_id_or_null: null }
+    );
+    if (unscoped.ok === true) {
+      pass('T9-g-unscoped-unchanged', 'C-7: omitting sourceDb keeps the ORIGINAL unscoped provenance behavior (backward-compatible for existing unit-test callers)');
+    } else {
+      fail('T9-g-unscoped-unchanged', 'C-7: omitting sourceDb keeps the ORIGINAL unscoped provenance behavior (backward-compatible for existing unit-test callers)', `unscoped=${JSON.stringify(unscoped)}`);
+    }
   } finally {
     await target.end();
   }
