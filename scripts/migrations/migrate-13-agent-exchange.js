@@ -104,16 +104,21 @@ const SQL_FILES = [SQL_FILE];
 // PREREQUISITE_TABLES.
 const PREREQUISITE_TABLES = ['entities', 'assertions', 'edges'];
 
-// 15-table audit-trigger wiring checklist (Deliverable 1b / §5.8 in the
-// origin design): assertions + edges (exist on any migrate-01 target —
-// effectively unconditional, but still run through the same guarded gate as
-// everything else, never special-cased) + the 13 §5.3 seam tables, expected
-// ABSENT today and wired automatically whenever this file is re-applied
-// after a later migration wave creates them. audit_log is deliberately NOT
-// in this list — see the SQL file's own comment (ADVERSARY-PASS B-3): an
-// audit_log_audit trigger must never exist.
+// 16-table audit-trigger wiring checklist (Deliverable 1b / §5.8 in the
+// origin design): assertions + edges + entities (exist on any migrate-01
+// target — effectively unconditional, but still run through the same
+// guarded gate as everything else, never special-cased) + the 13 §5.3 seam
+// tables, expected ABSENT today and wired automatically whenever this file
+// is re-applied after a later migration wave creates them. audit_log is
+// deliberately NOT in this list — see the SQL file's own comment
+// (ADVERSARY-PASS B-3): an audit_log_audit trigger must never exist.
+//
+// §8 M-4 amendment (memory-manager#18): 'entities' added — the canonical
+// wired set (this checklist + agent_exchange, checked separately via
+// agentExchangeTriggerOk below) grows 16 -> 17. edges was ALREADY in this
+// list; only entities was missing.
 const CHECKLIST_TABLES = [
-  'assertions', 'edges',
+  'assertions', 'edges', 'entities',
   'decisions', 'gotchas', 'findings', 'research', 'incidents',
   'code_index', 'tasks', 'checklist_items', 'corpus_files',
   'workflow_discovery', 'agent_rewrites', 'policy_sections', 'session_chunks',

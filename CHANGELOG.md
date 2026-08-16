@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **§8 generalized MCP tool surface** — `scripts/handoff-mcp.mjs` grows from
+  5 tools to 30: `memory_search` (hybrid vector+FTS across a closed
+  15-table enum — `assertions`/`agent_exchange` plus 4 of the 13 seam
+  tables carrying `fts_vec`, the other 9 seam tables scored on cosine
+  alone; `memory_entry_chunks` deliberately excluded, its `embedding`
+  column is `vector(1024)`, a different pgvector type/dimension than every
+  other table's `halfvec(4000)`), `memory_upsert`/`memory_get` (typed
+  per-table writes/lookups — `decisions` gains the ONE named ON-CONFLICT
+  carve-out in the schema, `(project_id, topic)`, backed by
+  `decisions_audit`; every seam-table write is embedded inline at write
+  time, fail-soft to NULL + a warning when the provider is down),
+  `memory_lint`, `memory_view_set`/`memory_view_run` (saved, versioned
+  query sets on `retrieval_contract.kind='view'`, interpreting only the
+  structured entity/assertion/recency/vector query-type JSON, never raw
+  SQL), 4-tool CRUD each for entities/assertions/edges (entity creation
+  runs exact + trigram-fuzzy near-match surfacing and revives a suppressed
+  exact match instead of inserting a duplicate; assertion updates supersede
+  — suppress-old + insert-new in one transaction with an optimistic guard,
+  requiring an explicit target row id for any non-1:1 predicate),
+  `exchange_append`/`exchange_read` (a millisecond-truncated, compound
+  `(created_at, id)` watermark — closes a same-row re-delivery bug found
+  during authoring: a caller's own JSON-round-tripped watermark otherwise
+  undercuts a full-microsecond-precision comparison), `route_resolve`
+  (replaying with a different `override_model` returns the recorded
+  decision plus `override_ignored: true`, never silently and never an
+  error) plus `routing_profile_set`/`get` (a new versioned row per set,
+  concurrency-safe via a transaction-scoped advisory lock — not the literal
+  `SELECT MAX(version) ... FOR UPDATE` sketch, which Postgres rejects
+  outright on any query containing an aggregate), and `usage_record`/
+  `usage_query`. `persist_decisions` is repointed from the old
+  `claude_policy_framework` child-process flow onto the same project-scoped
+  `decisions` table `memory_upsert` writes — a declared, backward-
+  incompatible response-shape change, and a new required `projectRoot`
+  parameter.
+
+  Schema addenda: `scripts/migrations/sql/migrate-15-mcp-addenda.sql`
+  (applied by `scripts/migrations/migrate-15-mcp-addenda.js`) adds
+  `retrieval_contract.kind`, `entities.suppressed`/`edges.suppressed`, a
+  `pg_trgm` index on `entities.name`, and
+  `decisions_project_topic_unique`. `entities` joins the audit-trigger
+  wired set (`migrate-13-agent-exchange.sql`/`.js`), growing it 16 -> 17.
+  `scripts/lib/project-identity.js`'s `PROJECT_ID_TABLES` grows to include
+  the 13 seam tables plus `agent_exchange`/`routing_profiles`/
+  `turn_usage`/`session_usage`. `scripts/lib/normalize-text.js` NFC-
+  normalizes before case-folding, closing an NFC/NFD visually-identical-
+  pair escape. New smoke test `scripts/migrations/verify-20-mcp-surface.js`
+  (27 checks + a real stdio MCP round-trip proving all 30 tools register
+  and one is independently callable end-to-end) and its regression harness
+  `test/migrations/test-verify-20.js`.
+
 - **§5.3 absorbed-seam tables + §5.9 fat-card view + §7 write/render/lint
   libraries** — new schema-setup-only migration
   `scripts/migrations/sql/migrate-14-seam-tables.sql` (applied by

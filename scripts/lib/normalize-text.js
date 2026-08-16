@@ -16,18 +16,31 @@
  *   whitespace, strip trailing sentence punctuation .!?;), then compare by
  *   PLAIN STRING INEQUALITY. Exact-normalized-equality is NOT a
  *   contradiction. No fuzzy/similarity matching.
+ *
+ * Amendment (M-11, §8 spec-adversary pass 2026-08-15, memory-manager#18):
+ * `.normalize('NFC')` is applied as the FIRST step, before case-folding —
+ * closes the NFC/NFD visually-identical-pair escape (e.g. "café" typed as a
+ * single precomposed U+00E9 vs. "e" + combining acute U+0301 both render
+ * identically but compare as different code-point sequences without this
+ * step). The JS-vs-SQL engine divergence (this helper runs NFC-normalized
+ * comparisons in JS; SQL-side LOWER(TRIM())-only matchers elsewhere in this
+ * codebase do NOT run NFC first) remains tracked as claude-memory#161 and
+ * widens until the SQL side aligns — flagged here, not silently left
+ * implicit.
  */
 
 /**
- * normalizeForCompare — case-fold, trim, collapse internal whitespace,
- * strip trailing sentence punctuation (.!?;). Pure, total (never throws —
- * non-string input is coerced via String()).
+ * normalizeForCompare — Unicode NFC-normalize (FIRST step, M-11), case-fold,
+ * trim, collapse internal whitespace, strip trailing sentence punctuation
+ * (.!?;). Pure, total (never throws — non-string input is coerced via
+ * String()).
  *
  * @param {*} value
  * @returns {string}
  */
 function normalizeForCompare(value) {
   let s = String(value == null ? '' : value);
+  s = s.normalize('NFC');
   s = s.trim();
   s = s.toLowerCase();
   s = s.replace(/\s+/g, ' ');

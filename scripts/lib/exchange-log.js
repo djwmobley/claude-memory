@@ -190,6 +190,98 @@ async function appendExchange(client, params) {
 }
 
 /**
+ * exchangeRead — §8's exchange_read tool. Polls the append-only
+ * agent_exchange log:
+ * `WHERE project_id=$1 AND (to_agent=$2 OR to_agent IS NULL) AND
+ * created_at > $3` — a WATERMARK, not a status flag (§5.8's append-only
+ * design has no `status` column to filter on).
+ *
+ * (M-8) null/omitted watermark = an EXPLICIT no-floor branch — never a bare
+ * `created_at > NULL` bind (which would silently match ZERO rows in SQL's
+ * three-valued logic, a correctness bug this function refuses to reproduce
+ * by construction: the floor clause is structurally OMITTED from the SQL
+ * text entirely when no watermark is given, not passed as a NULL parameter
+ * that happens to evaluate false against everything).
+ *
+ * (M-9) watermark is COMPOUND `(created_at, id)` with `ORDER BY created_at,
+ * id` — equal-timestamp rows are never lost. A watermark of
+ * `(afterCreatedAt, afterId)` selects rows where
+ * `(created_at, id) > (afterCreatedAt, afterId)` (row-wise comparison,
+ * lexicographic on the tuple) — the next poll's watermark is simply the
+ * last row returned this poll, so re-polling with that exact watermark
+ * never re-returns it and never skips a same-timestamp sibling.
+ *
+ * MILLISECOND TRUNCATION (correctness fix found during authoring): a real
+ * MCP caller can only round-trip `created_at` through JSON, which has no
+ * native Date type and represents timestamps as millisecond-precision
+ * ISO-8601 strings — Postgres TIMESTAMPTZ carries microsecond precision.
+ * Comparing a caller's millisecond-truncated watermark directly against
+ * the full-precision `created_at` column means a row's OWN timestamp
+ * (untruncated) is ALWAYS >= its own truncated watermark, and strictly >
+ * whenever it has a nonzero microsecond remainder — causing that SAME row
+ * to be spuriously re-returned on the very next poll (empirically
+ * reproduced while authoring this file: a poll immediately re-using the
+ * just-inserted row's own `created_at`/`id` as the watermark returned that
+ * row again). Both the WHERE comparison and the ORDER BY below therefore
+ * operate on `date_trunc('milliseconds', created_at)` — matching the
+ * precision any real caller can actually supply — with `id` as the
+ * tie-breaker for same-millisecond rows (M-9's own "equal-timestamp rows
+ * are never lost" guarantee, now anchored to millisecond granularity
+ * instead of an unreachable microsecond one).
+ *
+ * @param {object} client
+ * @param {object} args
+ * @param {string} args.projectId
+ * @param {string} [args.toAgent] — omitted/null = poll the broadcast-or-any
+ *   inbox (to_agent = toAgent OR to_agent IS NULL); note toAgent itself is
+ *   ALWAYS included in the OR (an agent polling its own inbox sees both
+ *   messages addressed to it and broadcasts)
+ * @param {string|Date} [args.afterCreatedAt] — watermark timestamp;
+ *   omitted/null = no floor (M-8)
+ * @param {number} [args.afterId] — watermark id (M-9); REQUIRED whenever
+ *   afterCreatedAt is given (a timestamp-only watermark cannot express the
+ *   compound-tuple comparison) — omitted while afterCreatedAt is present is
+ *   a validation error, never a silent single-column fallback.
+ * @param {number} [args.limit] — default 50
+ * @returns {Promise<Array<object>>} rows ordered by (created_at, id) ASC
+ */
+async function exchangeRead(client, args) {
+  const { projectId, toAgent = null, afterCreatedAt = null, afterId = null } = args || {};
+  if (typeof projectId !== 'string' || !projectId.trim()) {
+    throw new ExchangeLogError('validation', 'exchange-log: exchangeRead requires a non-empty projectId');
+  }
+  if (afterCreatedAt !== null && afterId === null) {
+    throw new ExchangeLogError(
+      'validation',
+      'exchange-log: exchangeRead requires afterId whenever afterCreatedAt is given (M-9: compound watermark, never a timestamp-only comparison).'
+    );
+  }
+  const limit = Number.isInteger(args.limit) && args.limit > 0 ? args.limit : 50;
+
+  // M-8: the floor clause is structurally present or absent from the SQL
+  // text itself — never a bare `> $n` bound to a NULL parameter. Both sides
+  // of the tuple comparison are millisecond-truncated (see header comment).
+  const watermarkClause = afterCreatedAt !== null
+    ? "AND (date_trunc('milliseconds', created_at), id) > (date_trunc('milliseconds', $3::timestamptz), $4)"
+    : '';
+  const params = afterCreatedAt !== null
+    ? [projectId, toAgent, afterCreatedAt, afterId, limit]
+    : [projectId, toAgent, limit];
+  const limitPlaceholder = afterCreatedAt !== null ? '$5' : '$3';
+
+  const { rows } = await client.query(
+    `SELECT id, project_id, docket_id, parent_id, agent_id, source_model, to_agent, kind, body_caveman, created_at
+       FROM agent_exchange
+      WHERE project_id = $1 AND (to_agent = $2 OR to_agent IS NULL)
+        ${watermarkClause}
+      ORDER BY date_trunc('milliseconds', created_at) ASC, id ASC
+      LIMIT ${limitPlaceholder}`,
+    params
+  );
+  return rows;
+}
+
+/**
  * Tool-description text (§3.4/§7.7): the "model reasons, tool ships it"
  * split, stated for any MCP client wiring this up as `exchange_append`
  * (renamed per L15).
@@ -211,5 +303,6 @@ module.exports = {
   ExchangeLogError,
   resolveDefaultEmbedder,
   appendExchange,
+  exchangeRead,
   EXCHANGE_APPEND_TOOL_DESCRIPTION,
 };

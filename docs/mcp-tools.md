@@ -1,0 +1,194 @@
+# MCP tool surface
+
+`scripts/handoff-mcp.mjs` is the one MCP server this repo ships (stdio
+transport, registered via `claude mcp add`). It started with 5 tools
+(session-lifecycle + a decisions-persistence tool) and now exposes 30: the
+original 5 plus 25 new direct-Postgres tools that generalize the store's
+write/read surface outside the checkpoint/close batch-payload flow.
+
+Every table and tool named on this page exists on `main` as of this
+writing; if you find a mismatch, the code is authoritative — start at
+`scripts/handoff-mcp.mjs`'s `buildServer()` function, where every tool is
+`server.registerTool(...)`'d with its zod input schema and description.
+
+## Two transport shapes
+
+The original 5 tools spawn `node scripts/handoff.js <subcommand>` as a
+child process per call — the engine needs host filesystem paths, real git
+checkouts, and localhost Postgres, all of which a host-run child process
+gets for free by inheriting the parent's cwd/env.
+
+The 25 new tools open a Postgres connection **in-process** instead
+(`scripts/lib/mcp-db-connect.js`), because several of them need to run a
+multi-statement transaction within one tool call (a supersede, a versioned
+routing-profile write, a guarded state transition) — a round trip through a
+child process per statement would not let the call own its own transaction
+boundary. Every one of them resolves its target database the same way
+`handoff.js` itself does (`HANDOFF_DB` env override, else
+`.claude/pipeline.yml`'s `knowledge.database`, else a built-in default) —
+`mcp-db-connect.js` re-derives that resolution parameterized by an explicit
+`projectRoot`, since the server is a single long-lived process that may
+serve tool calls for different projects across its lifetime and cannot
+safely mutate `process.env.PROJECT_ROOT` per call the way a short-lived CLI
+invocation can.
+
+**One project-identity path.** Every new tool resolves `project_id` via
+the SAME `ensureProjectIdentity()` function `handoff.js` itself calls
+(`scripts/lib/project-identity.js`) — never a second implementation. This
+function is migration-capable, not a pure lookup: a `projectRoot` that
+still has legacy-encoded rows and no project marker yet will have the
+one-shot identity migration run inline, on first use, exactly as it would
+under `handoff.js status`.
+
+## `memory_search` — hybrid vector+FTS, project-scoped
+
+Runs the same `ts_rank * 0.3 + cosine * 0.7` scoring formula the engine's
+`v_memory_hits`-style views use, generalized across a closed set of 15
+tables: `assertions`, `agent_exchange`, and 13 of the absorbed seam tables
+(`decisions`, `gotchas`, `findings`, `research`, `incidents`, `code_index`,
+`tasks`, `checklist_items`, `corpus_files`, `workflow_discovery`,
+`agent_rewrites`, `policy_sections`, `session_chunks`).
+
+Only 4 of those 15 tables (`decisions`, `gotchas`, `findings`,
+`code_index`) carry a full-text-search column — the rest (including
+`assertions` and `agent_exchange`) contribute a structurally-zero FTS term
+and are ranked on cosine similarity alone; this mirrors the shape, not a
+compromise on scoring, since a table with no `fts_vec` column has no text
+index to rank against in the first place.
+
+`memory_entry_chunks` is deliberately **excluded** from the enum: its
+embedding column is a different pgvector type and dimension
+(`vector(1024)`, a legacy pre-Qwen3 provider) than every other table's
+`embedding halfvec(4000)` column, and there is no valid way to compare a
+query vector against both in one search without either a type error or a
+meaningless similarity score.
+
+The table enum is closed — an unrecognized table name is a tool error, not
+a silent skip.
+
+## `memory_upsert` / `memory_get` — typed writes and lookups
+
+`memory_upsert` writes one row to any of the 9 seam tables that carry a
+live write surface (`decisions`, `gotchas`, `findings`, `research`,
+`incidents`, `code_index`, `tasks`, `checklist_items`, `corpus_files`).
+Every table is INSERT-ONLY — a primary-key or unique collision is a loud
+error — **except `decisions`**, which upserts by `(project_id, topic)`:
+this is the one, explicitly named carve-out in the whole schema, backed by
+`decisions_audit` (an `AFTER UPDATE` trigger) so the update is
+non-destructive in the append-only audit ledger even though the row itself
+changes in place.
+
+Every row written through `memory_upsert` (and through `persist_decisions`,
+below) is embedded inline at write time, using the same default-provider
+lookup `exchange_append` uses. This is fail-soft, not fail-loud: if the
+embedding provider is unreachable, the row is still written with
+`embedding = NULL` and the tool response carries a warning — a caveman-
+authored fact is never lost because a model server happened to be down.
+
+`memory_get` looks up rows by an explicit natural key
+(`{decisions: {topic}}`, `{findings: {id}}`, and so on) — every table also
+accepts `{id: <n>}` even where the column is a server-generated `SERIAL`,
+not part of the caller-writable column set.
+
+## `memory_lint` — read-only store health sweep
+
+Wraps the four checks already documented for the underlying engine
+(`orphan_entities`, `contradicting_assertions`, `stale_unreconciled`,
+`unlinked_mentions`) as a single MCP tool, project-scoped, read-only.
+
+## `memory_view_set` / `memory_view_run` — saved retrieval views
+
+A view is a named, versioned set of structured query objects saved onto
+the same `retrieval_contract` table next-session contracts use, tagged
+`kind = 'view'` — so a saved view can never be silently confused with, or
+overwrite, a project's next-session contract, and vice versa.
+
+`memory_view_run` interprets **only** the structured query-type JSON
+(`entity`, `assertion`, `recency`, `vector`) already used elsewhere in this
+engine's contract shape — it never executes caller-supplied SQL. Any future
+raw-SQL capability is a separate, explicitly-authorized design, not an
+implicit extension of this tool.
+
+## Entity / assertion / edge CRUD
+
+Four tools each (`_create`, `_read`, `_update`, `_suppress`) for entities,
+assertions, and edges — a granular write surface for callers (an A2A
+message handler, a small script) that want to write one fact without
+staging a full checkpoint/close payload.
+
+**Entity creation runs near-match surfacing.** Before inserting, it checks
+for an existing entity with the same name after normalization (case-fold,
+whitespace-collapse, Unicode NFC-normalize) — always exact-first, plus a
+trigram-similarity fuzzy pass for names of 4 or more normalized characters.
+Matches are returned as warnings; they are **never** auto-merged — a false
+merge is worse than a visible duplicate. If the exact match is a
+*suppressed* row, creation instead revives it (un-suppresses and updates
+it) rather than inserting a second row under the same name.
+
+**Assertion updates are a supersede**, not an in-place edit: the old row is
+suppressed and time-invalidated, a new row is inserted with the corrected
+object, and both happen in one transaction guarded by an optimistic
+row-count check — a stale or already-superseded target rolls the whole
+call back rather than silently double-superseding. For a predicate whose
+registry cardinality is not 1:1, the target row's id must be given
+explicitly; there is no cardinality under which this tool will guess which
+row you meant.
+
+Entities and edges have no such bi-temporal design — their `_update` tools
+are plain in-place updates, forensically visible via their own audit
+triggers.
+
+## `exchange_append` / `exchange_read` — the A2A bus
+
+Wraps the append-only `agent_exchange` log described in
+`docs/agent-interop.md`. `exchange_append` keeps the "model reasons, tool
+ships it" split: the caller authors the full caveman body plus a short,
+distinct summary, and the tool embeds the summary (not the full body) and
+performs the insert, optionally alongside one guarded state transition in
+the same transaction.
+
+`exchange_read` polls via a compound watermark —
+`(created_at, id) > (afterCreatedAt, afterId)` — never a status flag, since
+this table has none. An omitted watermark means "everything," not "nothing"
+(a bare `> NULL` comparison would silently match zero rows in SQL's
+three-valued logic, which this tool refuses to reproduce). The watermark
+comparison is truncated to millisecond precision on both sides, matching
+what a caller can actually round-trip through JSON (which has no native
+timestamp type) — a raw microsecond-precision comparison would otherwise
+cause a poller's own just-read row to reappear on its very next poll.
+
+## `route_resolve` / `routing_profile_set` / `routing_profile_get`
+
+`route_resolve` is idempotent per `(project_id, session_id, turn_idx,
+role)` — replaying the same call returns the recorded decision unchanged.
+Replaying with a *different* `overrideModel` than what was recorded does
+not silently ignore the new value nor error: the response carries
+`override_ignored: true` and the ignored value, so a caller can tell its
+new intent was seen but not applied.
+
+`routing_profile_set` writes a new versioned, active row and deactivates
+the previous one — never an in-place edit of an existing pin's tier or
+model. Concurrent calls for the same `(project_id, role)` serialize on a
+transaction-scoped advisory lock (not a row-level `FOR UPDATE`, which
+cannot lock a row that does not exist yet for a brand-new role).
+
+## `usage_record` / `usage_query`
+
+Records token/cost figures for a turn, matched on the same
+`(project_id, session_id, turn_idx, agent_role)` key `route_resolve` uses —
+the common case is resolve-first, measure-after, but usage can be recorded
+for a turn that never went through `route_resolve` at all. Cost, when not
+supplied, is computed server-side from the model registry's per-token
+rates and fails soft to `NULL` (never a guessed price) when the model or
+its rates are unregistered.
+
+## `persist_decisions` — repointed
+
+This tool predates the rest of this page: it used to write a completely
+separate, single-tenant `claude_policy_framework` database via two child
+processes. It now writes the SAME project-scoped `decisions` table
+`memory_upsert` writes — same ON-CONFLICT-by-topic carve-out, same
+inline-embed-at-write-time, same fail-soft posture. It gained a required
+`projectRoot` parameter (the old flow had no notion of project scoping) and
+its response shape changed accordingly; the topic-format contract (kebab
+case, at least one hyphen) is unchanged.

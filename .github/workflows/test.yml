@@ -318,7 +318,8 @@ jobs:
         # (agent_exchange) missing -> refusal naming migrate-13-agent-
         # exchange.js; re-applying migrate-13-agent-exchange.js after this
         # migration auto-wires all 13 seam tables AND now exits 0 cleanly
-        # (16 total *_audit triggers, zero deferred, zero wrong-type
+        # (17 total *_audit triggers post-§8/M-4 -- entities added -- zero
+        # deferred, zero wrong-type
         # columns); the two deviations' proof-of-firing (code_index trigger
         # actually captures UPDATE+DELETE; findings' TEXT id survives the
         # widened column, and reverting the widening is shown to reproduce
@@ -376,6 +377,42 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run MCP tool surface migration + verify-20 smoke tests (§8, issue #18)
+        # Tests scripts/migrations/migrate-15-mcp-addenda.js (retrieval_contract.
+        # kind, entities.suppressed/edges.suppressed, an entities.name pg_trgm
+        # index, decisions_project_topic_unique — the exact same statement/name a
+        # concurrent migrate-02 PR bundles, kept in its own file/runner precisely
+        # to avoid a merge collision on migrate-schema-addenda.js's shared
+        # SQL_FILES list) and scripts/migrations/verify-20-mcp-surface.js (27
+        # checks covering every new §8 direct-pg tool's underlying library
+        # function, plus a real stdio MCP round-trip proving all 30
+        # handoff-mcp.mjs tools register and one is independently callable
+        # end-to-end through mcp-db-connect.js + ensureProjectIdentity against a
+        # disposable scratch project root). EMBED_SKIP=1 (vLLM is not available in
+        # CI, same as every other embedding-touching step above): verify-20
+        # injects a deterministic mock embedder into every write-time-embed.js/
+        # memory-search.js call site under this env var, mirroring
+        # verify-19-seams-smoke.js's own mockEmbedder() precedent for
+        # exchange-log.js — this PR's author validated the same checks against
+        # live vLLM (Qwen3-Embedding-8B) locally before authoring this fallback.
+        # Covers: fresh full-stack apply (migrate-01 -> addenda -> migrate-13 ->
+        # migrate-14 -> migrate-13 re-apply -> migrate-15) -> verify-20 exit 0 +
+        # SMOKE20_RESULT: PASS with all 27 numbered checks + the MCP-registration
+        # check green, clean residue scan; migrate-15 not yet applied -> verify-20
+        # refusal naming migrate-15-mcp-addenda.js; migrate-15 idempotent
+        # re-apply; plus 6 DB-free pure-unit Group B checks (memory_search's
+        # M-14 closed 15-table enum with memory_entry_chunks excluded,
+        # memory_view's M-16 4-query-type enum + unsupported-type hard error,
+        # memory_upsert's per-table M-2 embed-text builders, routing-profile's
+        # VALID_TIERS, normalize-text's M-11 NFC-first normalization).
+        # Creates/drops its own _staging-suffixed scratch DBs; never touches
+        # claude_memory_eval_test/memory_manager_staging.
+        run: node test/migrations/test-verify-20.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          EMBED_SKIP: '1'
       - name: Run smoketest (all sections)
         # Runs the full smoketest suite — all 13 sections including collision (OQ-5
         # supersession invariant) and registry (SQL-1:1-index-vs-registry-JSON drift).
