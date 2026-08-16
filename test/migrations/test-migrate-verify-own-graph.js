@@ -28,6 +28,25 @@
  *   - retrieval_event_assertions FK remap survives a delete-then-reinsert
  *     re-run (event_id/assertion_id point at the NEW target ids, not stale
  *     source ids).
+ * Plus (history-collapse fix, 2026-08-16, found in the first real staging
+ * run -- T2 FAILed: assertions expected 623 found 504, edges expected 118
+ * found 104, both caused by supersession-chain rows silently collapsing to
+ * one via a LOGICAL natural-key check that has since been removed for the
+ * six tables where it was never DB-enforced):
+ *   - H1/H2: a 3-row bi-temporal supersession chain (1 live + 2 suppressed
+ *     ancestors, IDENTICAL project_id/subject/predicate/object) lands as 3
+ *     DISTINCT target rows on first migrate AND survives an idempotent
+ *     re-run as exactly 3 (never collapsed, never duplicated).
+ *   - H3: MIGRATION_RESULT's STRICT reconciliation (migrated === source_
+ *     real, not "<=") with the chain present -- the T2-shaped proof.
+ *   - H4: [CONTENT-DIVERGENCE] is now reserved for the GENUINE case (this
+ *     exact source id migrated before, content changed since) -- logged
+ *     informationally and RE-SYNCED, never skipped, distinguishing it from
+ *     D1's FOREIGN-row case below (which correctly IS skipped and now
+ *     correctly FAILs the strict gate -- see D1's updated exit-code
+ *     expectation).
+ *   - U2: redactRowForLog() strips *embedding*-named fields from log lines
+ *     (review finding: unredacted logs were ~1.4MB of vector noise/run).
  *
  * Usage: node test/migrations/test-migrate-verify-own-graph.js
  * Exit 0 = all pass; nonzero = any failure.
@@ -154,6 +173,11 @@ const REAL_PROJECT_ID = 'real-proj-11111111-1111-1111-1111-111111111111';
 const JUNK_PROJECT_ID = 'eval-junk-uuid-22222222-2222-2222-2222-222222222222';
 const KNOWN_IDS_PATH = writeKnownIds(TMP_DIR, [REAL_PROJECT_ID]);
 
+// History-collapse regression fixture (2026-08-16) -- see seedSource().
+const CHAIN_SUBJECT = 'claude-memory';
+const CHAIN_PREDICATE = 'has_unpackaged_state';
+const CHAIN_OBJECT = 'dirty — dirty working tree';
+
 async function seedSource() {
   const client = await pgConnect(DB_SOURCE);
   try {
@@ -178,6 +202,30 @@ async function seedSource() {
     await client.query(
       `INSERT INTO edges (project_id, from_entity, edge_type, to_entity) VALUES ($1,'widget','depends_on','gadget')`,
       [REAL_PROJECT_ID]
+    );
+    // Bi-temporal supersession chain (history-collapse regression fixture,
+    // 2026-08-16): 3 rows sharing the EXACT SAME (project_id, subject,
+    // predicate, object) -- 1 live (suppressed=false) + 2 suppressed
+    // ancestors (suppression_kind='superseded'), each with a distinct id
+    // and its own valid_at/invalid_at window. Mirrors the real staging
+    // repro exactly (source id=22 / target-existing id=948, s/p/o
+    // "claude-memory / has_unpackaged_state / dirty — dirty working tree").
+    // All 3 MUST migrate -- this is legitimate history, never a
+    // [CONTENT-DIVERGENCE] collision.
+    await client.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed, valid_at)
+       VALUES ($1,$2,$3,$4,6.0,'model_extracted',false,'2026-08-16T12:00:00Z')`,
+      [REAL_PROJECT_ID, CHAIN_SUBJECT, CHAIN_PREDICATE, CHAIN_OBJECT]
+    );
+    await client.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed, suppression_kind, valid_at, invalid_at)
+       VALUES ($1,$2,$3,$4,6.0,'model_extracted',true,'superseded','2026-08-15T09:00:00Z','2026-08-16T12:00:00Z')`,
+      [REAL_PROJECT_ID, CHAIN_SUBJECT, CHAIN_PREDICATE, CHAIN_OBJECT]
+    );
+    await client.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed, suppression_kind, valid_at, invalid_at)
+       VALUES ($1,$2,$3,$4,6.0,'model_extracted',true,'superseded','2026-08-14T09:00:00Z','2026-08-15T09:00:00Z')`,
+      [REAL_PROJECT_ID, CHAIN_SUBJECT, CHAIN_PREDICATE, CHAIN_OBJECT]
     );
     const { rows: ev1 } = await client.query(
       `INSERT INTO retrieval_events (project_id, query_text, session_id) VALUES ($1,'find widget deps','sess-1') RETURNING id`,
@@ -250,6 +298,17 @@ async function main() {
     assert(script.classifyProjectId('a', known) === 'REAL', 'a should be REAL');
     assert(script.classifyProjectId('unknown-uuid', known) === 'JUNK', 'unknown-uuid should be JUNK (default branch)');
     assert(script.classifyProjectId('', known) === 'JUNK', 'empty string should be JUNK, never a silent pass');
+  });
+
+  await run('U2', 'redactRowForLog: any *embedding*-named field is replaced with a short placeholder, everything else passes through unchanged (review finding: unredacted logs were ~1.4MB of vector noise per real run)', () => {
+    const bigVector = '[' + '0.123456,'.repeat(4000) + ']';
+    const row = { id: 5, subject: 'x', embedding: bigVector, query_embedding: bigVector, note: null };
+    const redacted = script.redactRowForLog(row);
+    assert(redacted.id === 5 && redacted.subject === 'x', 'non-embedding fields pass through unchanged');
+    assert(redacted.note === null, 'a null non-embedding field passes through unchanged');
+    assert(!redacted.embedding.includes('0.123456'), 'embedding field content is redacted');
+    assert(redacted.embedding.length < 100, `redacted embedding placeholder should be short, got ${redacted.embedding.length} chars (bigVector was ${bigVector.length})`);
+    assert(!redacted.query_embedding.includes('0.123456'), 'any *embedding*-named field is redacted, not just the literal "embedding" key');
   });
 
   let firstRunResult;
@@ -350,12 +409,29 @@ async function main() {
     const nEdges = await queryCount(DB_TARGET, `SELECT COUNT(*) AS n FROM edges WHERE project_id = $1`, [REAL_PROJECT_ID]);
     const nContract = await queryCount(DB_TARGET, `SELECT COUNT(*) AS n FROM retrieval_contract WHERE project_id = $1`, [REAL_PROJECT_ID]);
     const nSettings = await queryCount(DB_TARGET, `SELECT COUNT(*) AS n FROM project_settings WHERE project_id = $1`, [REAL_PROJECT_ID]);
+    // 2 original (1 live + 1 unrelated suppressed) + 3 chain rows (1 live + 2 suppressed ancestors) = 5 / 3.
     assert(nEntities === 1, `expected 1 entity, got ${nEntities}`);
-    assert(nAssertions === 2, `expected 2 assertions (incl. suppressed), got ${nAssertions}`);
-    assert(nSuppressed === 1, `expected 1 suppressed assertion migrated, got ${nSuppressed}`);
+    assert(nAssertions === 5, `expected 5 assertions (2 original + 3-row supersession chain), got ${nAssertions}`);
+    assert(nSuppressed === 3, `expected 3 suppressed assertions migrated (1 original + 2 chain ancestors), got ${nSuppressed}`);
     assert(nEdges === 1, `expected 1 edge, got ${nEdges}`);
     assert(nContract === 1, `expected 1 retrieval_contract row, got ${nContract}`);
     assert(nSettings === 1, `expected 1 project_settings row, got ${nSettings}`);
+  });
+
+  // ── History-collapse fix (2026-08-16): supersession chains migrate 1:1 ──
+  await run('H1', 'supersession-chain regression: 3-row chain (1 live + 2 suppressed, identical s/p/o) lands as 3 DISTINCT target rows -- lossless fidelity, never collapsed to 1', async () => {
+    const rows = await query(
+      DB_TARGET,
+      `SELECT id, suppressed, suppression_kind FROM assertions WHERE project_id=$1 AND subject=$2 AND predicate=$3 AND object=$4 ORDER BY id`,
+      [REAL_PROJECT_ID, CHAIN_SUBJECT, CHAIN_PREDICATE, CHAIN_OBJECT]
+    );
+    assert(rows.length === 3, `expected exactly 3 target rows for the supersession chain, got ${rows.length}: ${JSON.stringify(rows)}`);
+    const ids = new Set(rows.map((r) => r.id));
+    assert(ids.size === 3, `expected 3 DISTINCT target ids (never collapsed), got ${ids.size} distinct among ${JSON.stringify(rows.map((r) => r.id))}`);
+    const nLive = rows.filter((r) => r.suppressed === false).length;
+    const nSuperseded = rows.filter((r) => r.suppressed === true && r.suppression_kind === 'superseded').length;
+    assert(nLive === 1, `expected exactly 1 live (suppressed=false) row in the chain, got ${nLive}`);
+    assert(nSuperseded === 2, `expected exactly 2 suppressed/superseded ancestor rows, got ${nSuperseded}`);
   });
 
   await run('R2', 'retrieval_event_assertions FK remap: event_id/assertion_id point at the NEW target ids, not stale source ids', async () => {
@@ -396,10 +472,26 @@ async function main() {
       [REAL_PROJECT_ID]
     );
     assert(nEntities === 1, `entities duplicated on re-run: ${nEntities}`);
-    assert(nAssertions === 2, `assertions duplicated on re-run: ${nAssertions}`);
-    assert(nSuppressed === 1, `suppressed=true assertions duplicated on re-run (C-6): ${nSuppressed}`);
+    assert(nAssertions === 5, `assertions duplicated/lost on re-run: ${nAssertions}`);
+    assert(nSuppressed === 3, `suppressed=true assertions duplicated/lost on re-run (C-6): ${nSuppressed}`);
     assert(nEdges === 1, `edges duplicated on re-run: ${nEdges}`);
     assert(nRea === 1, `retrieval_event_assertions duplicated on re-run: ${nRea}`);
+  });
+  await run('H2', 'supersession-chain regression: idempotent re-run of the same 3-row chain still lands as exactly 3 rows (never duplicated, never collapsed to 1)', async () => {
+    const rows = await query(
+      DB_TARGET,
+      `SELECT id, suppressed, suppression_kind FROM assertions WHERE project_id=$1 AND subject=$2 AND predicate=$3 AND object=$4 ORDER BY id`,
+      [REAL_PROJECT_ID, CHAIN_SUBJECT, CHAIN_PREDICATE, CHAIN_OBJECT]
+    );
+    assert(rows.length === 3, `expected exactly 3 target rows after idempotent re-run, got ${rows.length}: ${JSON.stringify(rows)}`);
+    const nLive = rows.filter((r) => r.suppressed === false).length;
+    const nSuperseded = rows.filter((r) => r.suppressed === true && r.suppression_kind === 'superseded').length;
+    assert(nLive === 1 && nSuperseded === 2, `expected 1 live + 2 superseded after re-run, got live=${nLive} superseded=${nSuperseded}`);
+  });
+  await run('H3', 'supersession-chain regression: MIGRATION_RESULT strictly reconciles (migrated === source_real) with the chain present -- T2-shaped proof', async () => {
+    assert(/MIGRATION_RESULT: PASS \(source_real=\d+, migrated=\d+\)/.test(secondRunResult.stdout), `expected a PASS line with matching counts: ${secondRunResult.stdout}`);
+    const m = secondRunResult.stdout.match(/MIGRATION_RESULT: PASS \(source_real=(\d+), migrated=(\d+)\)/);
+    assert(m && m[1] === m[2], `expected source_real === migrated (strict reconciliation), got source_real=${m && m[1]} migrated=${m && m[2]}`);
   });
   await run('I3', 'second run: manifest slice rows replaced in place, not duplicated (still exactly 1 row per table/project pair)', async () => {
     const rows = await query(
@@ -410,6 +502,27 @@ async function main() {
     for (const r of rows) {
       assert(Number(r.n) === 1, `expected exactly 1 manifest row for ${r.source_table}/${REAL_PROJECT_ID}, got ${r.n}`);
     }
+  });
+
+  // ── Genuine same-source-id divergence (history-collapse fix companion) ──
+  await run('H4', 'genuine same-source-id divergence: editing an already-migrated row at the SOURCE is logged [CONTENT-DIVERGENCE] as informational and RE-SYNCED (never skipped, never a foreign-row false-positive)', async () => {
+    const srcClient = await pgConnect(DB_SOURCE);
+    try {
+      await srcClient.query(`UPDATE assertions SET confidence = 9.5 WHERE id = $1`, [seeded.assertionId1]);
+    } finally {
+      await srcClient.end();
+    }
+    const r = runScript(['--db', DB_TARGET, '--source-db', DB_SOURCE, '--known-ids', KNOWN_IDS_PATH]);
+    assert(r.status === 0, `expected exit 0 (a same-source-id re-sync is NEVER a foreign collision), got ${r.status}. stdout=${r.stdout} stderr=${r.stderr}`);
+    assert(/MIGRATION_RESULT: PASS/.test(r.stdout), `expected PASS: ${r.stdout}`);
+    assert(/\[CONTENT-DIVERGENCE\].*re-syncing/.test(r.stdout), `expected the informational genuine-divergence log line naming THIS as a re-sync: ${r.stdout}`);
+    const rows = await query(
+      DB_TARGET,
+      `SELECT confidence FROM assertions WHERE project_id=$1 AND subject='widget' AND predicate='depends_on' AND object='gadget'`,
+      [REAL_PROJECT_ID]
+    );
+    assert(rows.length === 1, `expected exactly 1 row (never duplicated by the re-sync), got ${rows.length}`);
+    assert(Number(rows[0].confidence) === 9.5, `expected the target row to reflect the NEW source content (re-synced, never skipped), got ${rows[0].confidence}`);
   });
 
   // ── Content-divergence detection ────────────────────────────────────────
@@ -437,11 +550,29 @@ async function main() {
       await srcClient.end();
     }
     const r = runScript(['--db', DB_TARGET, '--source-db', DB_SOURCE, '--known-ids', KNOWN_IDS_PATH]);
-    assert(r.status === 0, `expected exit 0, got ${r.status}. stdout=${r.stdout} stderr=${r.stderr}`);
+    // History-collapse fix (2026-08-16): MIGRATION_RESULT is now STRICT
+    // (migrated === source_real) -- a genuine foreign-row skip on a REAL
+    // DB-enforced natural key (entities) correctly makes this run's own
+    // entities slice fall 1 short, so the script correctly reports FAIL
+    // (exit 1) rather than silently passing over the collision. This is a
+    // desired behavior change from the pre-fix "<=" gate, not a bug: an
+    // unresolvable foreign-row collision IS an actionable problem an
+    // operator needs surfaced, exactly like a real T2 shortfall would be.
+    assert(r.status === 1, `expected exit 1 (a genuine foreign-row divergence must FAIL the strict reconciliation gate), got ${r.status}. stdout=${r.stdout} stderr=${r.stderr}`);
+    assert(/MIGRATION_RESULT: FAIL/.test(r.stdout), `expected MIGRATION_RESULT: FAIL: ${r.stdout}`);
     assert(/\[CONTENT-DIVERGENCE\]/.test(r.stdout), `expected [CONTENT-DIVERGENCE] logged: stdout=${r.stdout}`);
     const rows = await query(DB_TARGET, `SELECT description FROM entities WHERE project_id=$1 AND name='gizmo'`, [REAL_PROJECT_ID]);
     assert(rows.length === 1, `expected the foreign row to remain exactly once (never overwritten, never duplicated), got ${rows.length}`);
     assert(rows[0].description === 'LIVE foreign description', `expected the FOREIGN row's content preserved untouched, got "${rows[0].description}"`);
+    // Everything ELSE in this run still migrated correctly despite the one
+    // FAIL-worthy collision -- the strict gate flags the problem, it does
+    // not abort the whole run or roll back unrelated slices.
+    const chainRows = await query(
+      DB_TARGET,
+      `SELECT id FROM assertions WHERE project_id=$1 AND subject=$2 AND predicate=$3 AND object=$4`,
+      [REAL_PROJECT_ID, CHAIN_SUBJECT, CHAIN_PREDICATE, CHAIN_OBJECT]
+    );
+    assert(chainRows.length === 3, `expected the unrelated 3-row supersession chain to remain intact despite the entities collision, got ${chainRows.length}`);
   });
 
   // ── Rollback mode (manual, manifest-guided) ─────────────────────────────

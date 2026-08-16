@@ -104,24 +104,46 @@
  *      migration_manifest + migration_manifest_row_hashes for the slice,
  *      mirroring migrate-02-decisions.js's upsertSlice shape exactly.
  *
- *   6. CONTENT-DIVERGENCE (C-3): before inserting a row, this script checks
- *      for an existing FOREIGN row (one this script did NOT itself write —
- *      step 5(b) already deleted anything it did write, so anything left
- *      matching the row's LOGICAL natural key is by construction foreign)
- *      sharing that table's natural key (see NATURAL_KEYS below — DB-
- *      enforced for entities/retrieval_contract/project_settings, DB-
- *      UNENFORCED-but-logically-meaningful for the rest, per-table; NONE
- *      for extraction_queue, a genuine design choice documented at
- *      NATURAL_KEYS.extraction_queue = null — queue rows may legitimately
- *      repeat identical content, "divergence" has no meaning there). A
- *      match with IDENTICAL non-key content is a silent no-op (already
- *      correct). A match with DIFFERENT content is logged loud as
- *      `[CONTENT-DIVERGENCE]` with BOTH versions shown, and the source row
- *      is SKIPPED — this script never overwrites a foreign row. A real
- *      Postgres unique_violation (assertions' two partial indexes are the
- *      only DB-enforced case beyond the three natural-key tables above) is
- *      caught via a per-row SAVEPOINT and treated identically: logged,
- *      skipped, slice transaction continues.
+ *   6. IDENTITY IS SOURCE ID, NOT A NATURAL KEY (history-collapse fix,
+ *      2026-08-16, found in the first real staging run): entities/
+ *      retrieval_contract/project_settings are the ONLY tables with a REAL,
+ *      DB-enforced natural key (see NATURAL_KEYS below) -- for those three,
+ *      before inserting a row this script checks for an existing FOREIGN row
+ *      (one this script did NOT itself write — step 5(b) already deleted
+ *      anything it did write, so anything left matching the natural key is
+ *      by construction foreign) at that key. A match with IDENTICAL content
+ *      is a silent no-op; a match with DIFFERENT content is logged loud as
+ *      `[CONTENT-DIVERGENCE]` and the source row is SKIPPED — this script
+ *      never overwrites a foreign row.
+ *
+ *      EVERY OTHER table (assertions/edges/retrieval_contract_history/
+ *      entity_communities/extraction_queue/retrieval_events) carries NO
+ *      natural-key check at all -- identity for these is SOURCE ID alone.
+ *      The original design used a LOGICAL (DB-unenforced) natural key for
+ *      these too, which silently collapsed bi-temporal supersession chains:
+ *      multiple rows legitimately sharing (project_id, subject, predicate,
+ *      object) with distinct ids, one live (suppressed=false) + N ancestors
+ *      (suppressed=true, suppression_kind='superseded') -- assertions' two
+ *      partial unique indexes are WHERE suppressed=false, so N suppressed
+ *      rows sharing identical content are explicitly legal. The bug logged
+ *      every ancestor as a false [CONTENT-DIVERGENCE] skip; T2 caught it on
+ *      the real graph (assertions expected 623 found 504, edges expected 118
+ *      found 104). Lossless fidelity is this store's first tenet (§0.1) —
+ *      every source row migrates exactly once, full stop, regardless of any
+ *      content-key collision with a DIFFERENT source row.
+ *
+ *      [CONTENT-DIVERGENCE] is now reserved for exactly ONE genuine case,
+ *      logged by logGenuineSourceIdDivergence(): THIS EXACT source id was
+ *      migrated by a PRIOR run and its content has changed at the source
+ *      since — informational only (this is provably OUR OWN row, per
+ *      lineage, so the upcoming delete-then-reinsert re-syncing it is
+ *      correct, never a skip). A real Postgres unique_violation on insert
+ *      (assertions' two partial indexes, or a race on one of the three
+ *      natural-key tables) is a DIFFERENT scenario — two DISTINCT source
+ *      rows colliding on a DB constraint — logged as `[CONSTRAINT-CONFLICT]`
+ *      instead, via a per-row SAVEPOINT, and DOES reduce the migrated count
+ *      (T2 will FAIL on the shortfall, by design — this is a genuine data
+ *      question worth investigating, never silently tolerated as history).
  *
  *   7. PRE-INSERT PHASE ORDERING (C-3's closing line): "this script writes
  *      assertions before (e) does" — TABLE_ORDER below fixes assertions
@@ -138,9 +160,13 @@
  *   9. REPORT: per-slice REAL/JUNK counts, live-derived (no stale
  *      documentary baseline exists for this phase — nothing in §16
  *      inventories claude-memory's own graph the way §16.2 inventoried
- *      decisions topics). MIGRATION_RESULT: PASS iff every REAL slice's
- *      migrated row count equals its live source count AND zero unresolved
- *      SAVEPOINT-caught errors remain outside the divergence-log path.
+ *      decisions topics). MIGRATION_RESULT: PASS iff migratedTotal STRICTLY
+ *      EQUALS sourceRealTotal, summed across every REAL slice (history-
+ *      collapse fix, 2026-08-16) — not "<=". A shortfall means a genuine
+ *      [CONSTRAINT-CONFLICT] occurred and must be investigated; migrated
+ *      can never legitimately exceed source either (would mean a
+ *      double-count bug). This is what makes T2's row-count reconciliation
+ *      match on the real graph.
  *
  * ROLLBACK MODE (--rollback, C-8: "manifest-guided... documented as
  * manual"): for every (table, project_id) REAL slice recorded in
@@ -206,19 +232,48 @@ const TABLE_ORDER = [
   'extraction_queue', 'retrieval_events', RETRIEVAL_EVENT_ASSERTIONS,
 ];
 
-// Logical natural key per table (project_id is always implicit, prepended).
-// `null` = deliberately NO natural key (see extraction_queue note in header
-// comment) -- divergence detection for that table is N/A, not a gap.
+// Natural key per table (project_id is always implicit, prepended) -- used
+// ONLY for pre-insert FOREIGN-row divergence detection, and ONLY where the
+// table has a REAL, DB-enforced natural key (a genuine UNIQUE/PRIMARY KEY
+// constraint, so at most one row can ever legally exist at that key).
+// `null` = NO natural-key check for this table.
+//
+// HISTORY-COLLAPSE BUG (found in the first real staging run, post-#171
+// merge, 2026-08-16): assertions/edges/retrieval_contract_history/
+// entity_communities/retrieval_events previously carried a LOGICAL
+// (DB-unenforced) natural key here. That collapsed bi-temporal supersession
+// chains -- multiple rows legitimately sharing (project_id, subject,
+// predicate, object) with DISTINCT ids, one live (suppressed=false) + N
+// ancestors (suppressed=true, suppression_kind='superseded', each with its
+// own valid_at/invalid_at window; assertions' two partial unique indexes are
+// WHERE suppressed=false, so N suppressed rows sharing identical content are
+// explicitly legal) -- into one row, logging every ancestor as a false
+// [CONTENT-DIVERGENCE] skip. T2 reconciliation on the real graph caught it:
+// assertions expected 623 found 504 (119 short), edges expected 118 found
+// 104 (14 short). Lossless fidelity is this store's first tenet (§0.1) --
+// every source row must migrate exactly once, full stop. FIX: these five
+// tables carry NO natural key at all now; per-row identity for them is
+// SOURCE ID alone, via own_graph_migration_ids lineage (see
+// migrateProjectScopedTableSlice's logGenuineSourceIdDivergence, the ONLY
+// remaining use of [CONTENT-DIVERGENCE] for these tables -- reserved for
+// "this exact source id was migrated before and its content changed since,"
+// informational only, never a skip). entities/retrieval_contract/
+// project_settings keep their natural-key check unchanged -- those DO carry
+// a real UNIQUE/PRIMARY KEY constraint, so a natural-key collision there is
+// structurally guaranteed to be either our own already-deleted prior row
+// (never reached, since the delete runs first) or genuinely foreign data --
+// no supersession-chain scenario is possible at a column set the database
+// itself enforces as unique.
 const NATURAL_KEYS = {
   entities: ['name'],                                    // DB-enforced UNIQUE
-  assertions: ['subject', 'predicate', 'object'],         // DB-partial-enforced (suppressed=false only)
-  edges: ['from_entity', 'edge_type', 'to_entity'],       // logical only
+  assertions: null,                                       // supersession chains legitimate -- source-id-keyed only
+  edges: null,                                            // history repeats legitimate -- source-id-keyed only
   retrieval_contract: ['name'],                           // DB-enforced UNIQUE
-  retrieval_contract_history: ['name', 'version'],        // logical only
+  retrieval_contract_history: null,                       // append-only log -- repeats legitimate by design
   project_settings: ['key'],                              // DB-enforced PRIMARY KEY
-  entity_communities: ['entity_name', 'community_id', 'level', 'run_id'], // logical only
+  entity_communities: null,                                // repeated community assignments across runs legitimate
   extraction_queue: null,                                 // N/A — queue rows may legitimately repeat
-  retrieval_events: ['query_text', 'session_id', 'retrieved_at'],         // logical only
+  retrieval_events: null,                                  // repeated identical queries over time legitimate
 };
 
 // ─── OWN-GRAPH LINEAGE TABLE ────────────────────────────────────────────────
@@ -499,6 +554,66 @@ async function recordLineage(tgtClient, sourceDb, sourceTable, sourceRowId, proj
   );
 }
 
+// ─── LOG REDACTION (embedding columns are 1.4MB+ of noise per run) ────────
+
+/**
+ * Any column whose name matches /embedding/i is replaced with a short
+ * placeholder before a row is ever JSON.stringify'd into a log line --
+ * halfvec(4000) values are large numeric-array text and add nothing
+ * diagnostically useful to a divergence/conflict log line (review finding,
+ * 2026-08-16: unredacted logs were ~1.4MB of embedding-vector noise per
+ * real run). Never mutates the input row -- returns a shallow copy.
+ */
+function redactRowForLog(row) {
+  if (!row || typeof row !== 'object') return row;
+  const out = {};
+  for (const [k, v] of Object.entries(row)) {
+    out[k] = /embedding/i.test(k) && v != null ? `[embedding omitted from log, ${String(v).length} chars]` : v;
+  }
+  return out;
+}
+
+// ─── GENUINE SOURCE-ID DIVERGENCE (informational; never blocks re-sync) ───
+
+/**
+ * The ONLY remaining legitimate use of [CONTENT-DIVERGENCE] for a
+ * no-natural-key table (see NATURAL_KEYS above): THIS EXACT source id was
+ * migrated by THIS script in a prior run (per own_graph_migration_ids
+ * lineage), and its content has changed at the source since then. This is
+ * NEVER foreign data -- lineage proves this script wrote it -- so it is
+ * purely informational: the upcoming delete-then-reinsert (C-6) re-syncs it
+ * correctly regardless, exactly as it would for any other row. Runs BEFORE
+ * the slice's delete step (needs the target row's CURRENT content, which
+ * the delete is about to remove).
+ */
+async function logGenuineSourceIdDivergence(tgtClient, table, priorLineageRows, sourceRows, idCol, contentCols, log) {
+  if (priorLineageRows.length === 0) return;
+  const sourceById = new Map(sourceRows.map((r) => [String(r[idCol]), r]));
+  const relevant = priorLineageRows.filter((p) => sourceById.has(p.source_row_id));
+  if (relevant.length === 0) return;
+
+  let existingByKey;
+  if (table === 'project_settings') {
+    const keys = relevant.map((p) => p.source_row_id);
+    const { rows } = await tgtClient.query(`SELECT * FROM project_settings WHERE key = ANY($1::text[])`, [keys]);
+    existingByKey = new Map(rows.map((r) => [r.key, r]));
+  } else {
+    const ids = relevant.map((p) => p.target_row_id);
+    const { rows } = await tgtClient.query(`SELECT * FROM ${table} WHERE id = ANY($1::int[])`, [ids]);
+    existingByKey = new Map(rows.map((r) => [String(r.id), r]));
+  }
+
+  for (const p of relevant) {
+    const existing = table === 'project_settings' ? existingByKey.get(p.source_row_id) : existingByKey.get(String(p.target_row_id));
+    if (!existing) continue; // already gone (e.g. a prior partial failure) -- not this check's concern
+    const sourceRow = sourceById.get(p.source_row_id);
+    if (shared.rowHash(contentCols, existing) !== shared.rowHash(contentCols, sourceRow)) {
+      log(`  [CONTENT-DIVERGENCE] ${table} source_id=${p.source_row_id}: previously-migrated content differs from current source content -- re-syncing (this is THIS script's own lineage-tracked row, never foreign data, never skipped). ` +
+        `existing=${JSON.stringify(redactRowForLog(existing))} incoming=${JSON.stringify(redactRowForLog(sourceRow))}`);
+    }
+  }
+}
+
 // ─── PER-ROW DIVERGENCE-CHECKED INSERT ────────────────────────────────────
 
 /**
@@ -533,7 +648,7 @@ async function insertRowWithDivergenceCheck(tgtClient, table, cols, sourceRow, p
       const diverged = existing.filter((e) => shared.rowHash(contentCols, e) !== sourceHash);
       if (diverged.length > 0) {
         log(`  [CONTENT-DIVERGENCE] ${table} project_id="${projectId}" key=${JSON.stringify(naturalKeyCols.map((c) => sourceRow[c]))}: ` +
-          `existing row(s) differ from source row (${idColFor(table)}=${sourceRow[idColFor(table)]}). existing=${JSON.stringify(diverged[0])} incoming=${JSON.stringify(sourceRow)}`);
+          `existing row(s) differ from source row (${idColFor(table)}=${sourceRow[idColFor(table)]}). existing=${JSON.stringify(redactRowForLog(diverged[0]))} incoming=${JSON.stringify(redactRowForLog(sourceRow))}`);
       }
       return null; // already present (identical or diverged) -- never overwritten
     }
@@ -553,7 +668,14 @@ async function insertRowWithDivergenceCheck(tgtClient, table, cols, sourceRow, p
   } catch (err) {
     await tgtClient.query('ROLLBACK TO SAVEPOINT row_ins');
     if (err && err.code === '23505') {
-      log(`  [CONTENT-DIVERGENCE] ${table} project_id="${projectId}" source ${idColFor(table)}=${sourceRow[idColFor(table)]}: unique_violation on insert (${err.constraint || err.message}) -- a foreign row already occupies this DB-enforced key; source row skipped.`);
+      // [CONTENT-DIVERGENCE] is reserved for the genuine same-source-id case
+      // (logGenuineSourceIdDivergence) -- this is a DIFFERENT source row
+      // colliding with a DB-enforced constraint (either a genuine foreign
+      // row, for the three natural-key tables above, or two DISTINCT source
+      // rows that should never both be non-suppressed-live, for assertions'
+      // two partial unique indexes -- a genuine source-data integrity
+      // question, not "history," so it is never silently treated as one).
+      log(`  [CONSTRAINT-CONFLICT] ${table} project_id="${projectId}" source ${idColFor(table)}=${sourceRow[idColFor(table)]}: unique_violation on insert (${err.constraint || err.message}) -- source row skipped, NOT counted as migrated (T2 will FAIL on this shortfall by design).`);
       return null;
     }
     throw err;
@@ -572,9 +694,15 @@ async function migrateProjectScopedTableSlice(tgtClient, sourceDb, table, projec
   await tgtClient.query('BEGIN');
   const idMap = new Map(); // source identity (string) -> target identity
   try {
+    const prior = await getPriorTargetIds(tgtClient, sourceDb, table, projectId);
+
+    // Genuine same-source-id divergence (informational only) -- MUST run
+    // BEFORE the delete below, while the prior target rows' content still
+    // exists to compare against.
+    await logGenuineSourceIdDivergence(tgtClient, table, prior, sourceRows, idCol, contentCols, log);
+
     // C-6: manifest-scoped delete of THIS script's own prior rows for this
     // slice, by target id (never a blanket project_id delete).
-    const prior = await getPriorTargetIds(tgtClient, sourceDb, table, projectId);
     await deletePriorSliceRows(tgtClient, table, projectId, prior);
     await clearLineageSlice(tgtClient, sourceDb, table, projectId);
 
@@ -902,7 +1030,15 @@ async function main() {
     }
     console.log(`  TOTAL: source_real=${sourceRealTotal}, migrated=${migratedTotal}`);
 
-    const pass = migratedTotal <= sourceRealTotal; // skipped rows (idempotent no-op / logged divergence) are expected, not a failure
+    // STRICT equality (history-collapse fix, 2026-08-16): every REAL source
+    // row must migrate exactly once, full stop -- lossless fidelity is this
+    // store's first tenet. A shortfall (migratedTotal < sourceRealTotal) now
+    // means a genuine [CONSTRAINT-CONFLICT] (a real source-data integrity
+    // problem, or a real foreign-row collision) occurred somewhere and must
+    // be investigated, never silently tolerated as "expected." migratedTotal
+    // can never legitimately EXCEED sourceRealTotal either (would indicate a
+    // double-count bug) -- both directions are checked.
+    const pass = migratedTotal === sourceRealTotal;
     console.log(`MIGRATION_RESULT: ${pass ? 'PASS' : 'FAIL'} (source_real=${sourceRealTotal}, migrated=${migratedTotal})`);
     exitCode = pass ? 0 : 1;
   } finally {
@@ -937,6 +1073,8 @@ module.exports = {
   clearLineageSlice,
   recordLineage,
   insertRowWithDivergenceCheck,
+  redactRowForLog,
+  logGenuineSourceIdDivergence,
   migrateProjectScopedTableSlice,
   writeJunkSlice,
   migrateRetrievalEventAssertions,
