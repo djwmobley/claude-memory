@@ -39,6 +39,7 @@
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
+const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 const { Client } = require('pg');
 
@@ -599,7 +600,14 @@ async function main() {
       return;
     }
 
-    const prefix = `smoke-mm18-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    // crypto.randomUUID() (CSPRNG), not Math.random() (predictable, non-
+    // cryptographic PRNG) — this value only needs to be a collision-safe
+    // scratch-fixture namespace, not secret, but CodeQL's js/insecure-
+    // randomness query flags any Math.random() call regardless of the
+    // sink's actual sensitivity, so this repo's convention (see
+    // handoff-mcp.mjs's writeTempJson) is randomUUID() everywhere, even for
+    // non-secret uses like this one.
+    const prefix = `smoke-mm18-${Date.now().toString(36)}-${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}`;
     console.log(`  run prefix: ${prefix}`);
 
     const { allOk } = await harness.withTransactionRollback(db, [], async () => runChecks(db, prefix));

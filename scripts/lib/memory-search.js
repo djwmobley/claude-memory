@@ -269,15 +269,23 @@ async function memorySearch(client, args) {
   const queryVector = await embedFn(query);
   const vectorLiteral = `[${queryVector.join(',')}]`;
 
+  // Sequential, not Promise.all: a plain pg Client/PostgresAdapter serves
+  // one query at a time on a single connection — concurrent .query() calls
+  // on it queue internally rather than actually running in parallel (same
+  // constraint memory-lint.js's checkUnlinkedMentions already documents for
+  // its own sequential queries), and node-postgres additionally logs a
+  // deprecation warning for overlapping .query() calls on one Client,
+  // slated to become a hard error in pg@9. A loop is the correct shape here
+  // regardless of the (non-)concurrency question — result-merge logic
+  // (flatten + re-sort + slice) is unchanged.
   const valuesByKey = { vector: vectorLiteral, query, projectId, limit };
-  const perTableResults = await Promise.all(
-    tables.map(async (table) => {
-      const { sql, paramKeys } = buildTableQuery(table);
-      const values = paramKeys.map((k) => valuesByKey[k]);
-      const { rows } = await client.query(sql, values);
-      return rows;
-    })
-  );
+  const perTableResults = [];
+  for (const table of tables) {
+    const { sql, paramKeys } = buildTableQuery(table);
+    const values = paramKeys.map((k) => valuesByKey[k]);
+    const { rows } = await client.query(sql, values);
+    perTableResults.push(rows);
+  }
 
   const allHits = perTableResults.flat();
   allHits.sort((a, b) => Number(b.score) - Number(a.score));
