@@ -915,6 +915,139 @@ const REALITY_CHECKS = [
   },
 ];
 
+// ─── §7.4 dangling_entity_reference — DB-driven, project-scoped, annotate-
+// only (CONSOLIDATION-RUNBOOK.md §7.4, spec-adversary pass 2026-08-15,
+// S-7, memory-manager#17). ────────────────────────────────────────────────
+//
+// DESIGN NOTE (deviation from the REALITY_CHECKS array shape above): every
+// entry in REALITY_CHECKS is a SYNCHRONOUS, per-assertion probe keyed by
+// exact predicate name, dispatched by runVerifyDispatch over rows already
+// fetched from the DB — none of those probes take a DB client (they read
+// git/filesystem state only). dangling_entity_reference is fundamentally
+// different in kind: it needs a DB client to look up `entities` rows, and
+// it applies to EVERY live assertion regardless of predicate (S-7: "gets a
+// total classification over candidates TRIM(subject) and TRIM(object) of
+// each live assertion, per project"), not to one predicate's object value.
+// Forcing it into the synchronous (root, object, subject) => value|null
+// probe shape would either require a hidden module-level DB client (a
+// design smell this codebase does not otherwise have) or silently change
+// runVerifyDispatch's contract for every other probe. Instead this is
+// exported as its own standalone async function, callable the same way
+// memory-lint.js's checks are (DB-driven, read-only, returns a classified
+// result) — same "annotate-only, never suppresses" posture as every other
+// entry in this registry, same module, just not folded into the array.
+//
+// Total classification (S-7), five branches, every one visible in the
+// return value — no silent drop:
+//   (1) exact case-sensitive match to entities.name, same project -> linked
+//   (2) case-insensitive-only match, same project      -> flag 'case_mismatch'
+//   (3) case-insensitive match, a DIFFERENT project ONLY -> flag 'cross_project'
+//   (4) no match anywhere AND candidate is entity-shaped -> flag 'no_match'
+//   (5) everything else (blank, or not entity-shaped)    -> skipped, tallied
+
+/**
+ * isEntityShaped — S-7 branch (4)'s shape test: <=4 whitespace-delimited
+ * tokens, no sentence-terminal punctuation (.?!), not purely numeric.
+ * @param {string} candidate - already trimmed, non-empty
+ * @returns {boolean}
+ */
+function isEntityShaped(candidate) {
+  const tokens = candidate.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0 || tokens.length > 4) return false;
+  // "Sentence-terminal" punctuation means punctuation AT THE END of the
+  // string (signaling end-of-sentence) — NOT any occurrence anywhere. An
+  // "anywhere" check would wrongly disqualify entirely reasonable entity-
+  // shaped candidates such as file paths ("scripts/handoff.js") or decimal
+  // version numbers ("v1.2") purely because of an internal '.'.
+  if (/[.?!]$/.test(candidate)) return false;
+  if (/^-?\d+(\.\d+)?$/.test(candidate)) return false;
+  return true;
+}
+
+/**
+ * probeDanglingEntityReferences — S-7's total classification, run against
+ * every live (suppressed=false AND invalid_at IS NULL) assertion in a
+ * project. Annotate-only: read-only, never mutates, never suppresses.
+ *
+ * @param {object} client   - pg client/pool
+ * @param {string} projectId
+ * @returns {Promise<{
+ *   flags: Array<{assertionId:number, field:'subject'|'object', candidate:string, reason:'case_mismatch'|'cross_project'|'no_match'}>,
+ *   linkedCount: number,
+ *   skipTally: {blank: number, notEntityShaped: number},
+ *   annotateOnly: true
+ * }>}
+ */
+async function probeDanglingEntityReferences(client, projectId) {
+  const { rows: assertionRows } = await client.query(
+    `SELECT id, subject, object FROM assertions
+      WHERE project_id = $1 AND suppressed = false AND invalid_at IS NULL`,
+    [projectId]
+  );
+  const { rows: sameProjectEntities } = await client.query(
+    `SELECT name FROM entities WHERE project_id = $1`,
+    [projectId]
+  );
+  const { rows: otherProjectEntities } = await client.query(
+    `SELECT name FROM entities WHERE project_id <> $1`,
+    [projectId]
+  );
+
+  const sameExact = new Set(sameProjectEntities.map((r) => r.name));
+  const sameLower = new Set(sameProjectEntities.map((r) => r.name.toLowerCase()));
+  const otherLower = new Set(otherProjectEntities.map((r) => r.name.toLowerCase()));
+
+  const flags = [];
+  const skipTally = { blank: 0, notEntityShaped: 0 };
+  let linkedCount = 0;
+
+  function classify(rawCandidate, assertionId, field) {
+    const candidate = String(rawCandidate == null ? '' : rawCandidate).trim();
+    if (!candidate) { skipTally.blank++; return; }
+    if (sameExact.has(candidate)) { linkedCount++; return; }
+    if (sameLower.has(candidate.toLowerCase())) {
+      flags.push({ assertionId, field, candidate, reason: 'case_mismatch' });
+      return;
+    }
+    if (otherLower.has(candidate.toLowerCase())) {
+      flags.push({ assertionId, field, candidate, reason: 'cross_project' });
+      return;
+    }
+    if (isEntityShaped(candidate)) {
+      flags.push({ assertionId, field, candidate, reason: 'no_match' });
+      return;
+    }
+    skipTally.notEntityShaped++;
+  }
+
+  for (const row of assertionRows) {
+    classify(row.subject, row.id, 'subject');
+    classify(row.object, row.id, 'object');
+  }
+
+  return { flags, linkedCount, skipTally, annotateOnly: true };
+}
+
+// ─── §7.4 findings.status / gotchas.active extension — EXPLICITLY DEFERRED
+// (CONSOLIDATION-RUNBOOK.md §7.4 first paragraph: "this is an enhancement,
+// not a migration requirement; flag as a Phase-13-adjacent follow-up, not a
+// blocking gate for THIS runbook's completion"). This is the spec's OWN
+// non-blocking classification, not a scope cut made while authoring this
+// file. Reasoning for why it is not implemented as a REALITY_CHECKS entry
+// today: every entry above dispatches over ASSERTION rows fetched by
+// runVerifyDispatch; findings/gotchas are separate tables with their own
+// row shape (findings.status/commit_sha, gotchas.active), so wiring them in
+// requires a NEW dispatch loop parallel to runVerifyDispatch, not just a
+// new registry entry — a real, non-trivial addition the spec itself scopes
+// out of Phase 7. What IS shipped here, so the follow-up has a documented
+// starting point rather than a blank slate: the exact probe findings.status
+// = 'fixed' would use is IDENTICAL to the existing commit_merged probe
+// (probeCommitMerged, exported above) — a findings row whose commit_sha is
+// no longer an ancestor of the tracked ref is exactly as stale as an
+// assertion whose commit_merged object no longer holds. No new probe
+// function is needed when the Phase-13-adjacent dispatch loop is built;
+// probeCommitMerged is reused, not reimplemented.
+
 module.exports = {
   REALITY_CHECKS,
   runVerifyDispatch,
@@ -926,4 +1059,6 @@ module.exports = {
   getMergedPrSet,
   probeOpenThread,
   OPEN_THREAD_TOKEN_RE,
+  isEntityShaped,
+  probeDanglingEntityReferences,
 };
