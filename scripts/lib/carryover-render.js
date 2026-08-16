@@ -228,7 +228,14 @@ function renderCarryoverTable(rows) {
   if (!rows || rows.length === 0) {
     return '_(no open carry-overs)_';
   }
-  const escape = (s) => String(s == null ? '' : s).replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+  // Backslash MUST be escaped first (else a literal backslash introduced by
+  // the pipe-escaping step below would itself go unescaped, corrupting the
+  // markdown table's column structure — CodeQL "incomplete string escaping"
+  // finding, fixed).
+  const escape = (s) => String(s == null ? '' : s)
+    .replace(/\\/g, '\\\\')
+    .replace(/\|/g, '\\|')
+    .replace(/\r?\n/g, ' ');
   const header = '| Subject | Detail |\n|---|---|';
   const body = rows
     .map((r) => `| ${escape(r.subject)} | ${escape(r.object)} |`)

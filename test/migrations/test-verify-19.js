@@ -188,6 +188,16 @@ function testCarryoverRenderMarkdownPure() {
   assert(md.includes('S \\| pipe'), 'pipe characters escaped');
   assert(!md.includes('\n\n'), 'embedded newline collapsed to a single line');
   assertEq(carryoverRender.renderCarryoverTable(null), '_(no open carry-overs)_', 'null input renders the explicit sentinel');
+
+  // Regression guard: backslash must be escaped FIRST, before pipe-escaping
+  // introduces its own backslashes — otherwise a literal (unescaped)
+  // backslash immediately preceding the escaped pipe would make the pipe
+  // read as UN-escaped to a markdown renderer (a backslash "eats" the
+  // escape marker meant for the pipe), corrupting the table's column
+  // structure (CodeQL "incomplete string escaping" finding, fixed).
+  const md2 = carryoverRender.renderCarryoverTable([{ subject: 'C:\\path | tail', object: 'x' }]);
+  assert(md2.includes('C:\\\\path'), 'literal backslashes are themselves escaped (doubled)');
+  assert(md2.includes('\\\\path \\| tail'), 'the pipe escape marker is NOT preceded by an unescaped backslash — renders as \\\\path \\| tail, not \\\\| (which a markdown renderer would read as an un-escaped pipe)');
 }
 
 // ── Group C: §7.5 promotion-path confirmation ───────────────────────────
