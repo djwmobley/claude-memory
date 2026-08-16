@@ -36,10 +36,26 @@
  *      phase (d)/(f)/(g) property, covered by a later migration script, not
  *      this one. This script never reads or writes either table.
  *
+ *      REAL-ROSTER MANUAL STEP (2026-08-16 review finding, mirrors the
+ *      known-own-graph-project-ids.json pattern above): the §15.2 T0
+ *      roster-totality check (verify-15-t0-roster.js) requires a
+ *      scripts/migrations/source-table-roster.json entry for every
+ *      (source_db, source_table) pair this script writes migration_manifest
+ *      rows for. source-table-roster.example.json's committed synthetic
+ *      shape documents the 9 project_id-bearing tables' entries (source_db
+ *      = the real, already-public "claude_memory_eval_test" default — not
+ *      private instance data, unlike the known-ids config); the operator
+ *      copies the matching 9 rows into the REAL, gitignored roster before a
+ *      run whose target T0 must PASS against. See --help.
+ *
  *   2. retrieval_event_assertions HAS NO project_id COLUMN OF ITS OWN (it is
- *      a bare join table: event_id -> retrieval_events(id), assertion_id ->
- *      assertions(id), no FK declared in the schema, no unique index at
- *      all). It is excluded from Step 0's UNION (structurally cannot
+ *      a join table: event_id INTEGER NOT NULL REFERENCES retrieval_events(id)
+ *      ON DELETE CASCADE -- a REAL declared FK, verified against
+ *      app-retrieval-events-schema.sql -- but assertion_id INTEGER NOT NULL
+ *      carries NO declared FK to assertions(id) at all (a schema fact, not
+ *      an oversight in this comment: the earlier draft of this comment
+ *      wrongly claimed neither column had one). No unique index on either
+ *      column. It is excluded from Step 0's UNION (structurally cannot
  *      contribute a project_id) and its own migration is scoped
  *      TRANSITIVELY through whichever retrieval_events rows classified REAL
  *      — see migrateRetrievalEventAssertions() below.
@@ -200,27 +216,20 @@ const NATURAL_KEYS = {
   retrieval_events: ['query_text', 'session_id', 'retrieved_at'],         // logical only
 };
 
-// ─── OWN-GRAPH LINEAGE DDL (this script's own idempotent infra table) ─────
-
-const OWN_GRAPH_DDL = `
-CREATE TABLE IF NOT EXISTS own_graph_migration_ids (
-  id            SERIAL PRIMARY KEY,
-  source_db     TEXT NOT NULL,
-  source_table  TEXT NOT NULL,
-  source_row_id TEXT NOT NULL,
-  project_id    TEXT,
-  target_table  TEXT NOT NULL,
-  target_row_id INTEGER NOT NULL,
-  migrated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  UNIQUE (source_db, source_table, source_row_id)
-);
-CREATE INDEX IF NOT EXISTS own_graph_migration_ids_slice_idx
-  ON own_graph_migration_ids (source_db, source_table, project_id);
-`.trim();
-
-async function applyOwnGraphDdl(client) {
-  await client.query(OWN_GRAPH_DDL);
-}
+// ─── OWN-GRAPH LINEAGE TABLE ────────────────────────────────────────────────
+//
+// own_graph_migration_ids's DDL is NOT defined here. It is registered in
+// scripts/migrations/lib/verify15-shared.js's shared DDL_SQL (applied by the
+// shared.applyDdl(tgtClient) call in main() below, same as
+// migration_manifest/migration_manifest_row_hashes) -- a review finding
+// (2026-08-16): a private per-script DDL block here made this table
+// invisible to verify-15-t0-roster.js's live-table total classification
+// (category (b), "battery-infra", derived from verify15-shared.js's OWN
+// DDL_SQL text via getBatteryInfraTables()), so T0 FAILed naming it as an
+// unclassified table present in the target. Registering it in the shared
+// DDL_SQL is the SAME pattern every other battery-infra table
+// (migration_manifest, containment_evidence, promotion_conflict_log, …)
+// already uses -- never a table-specific exception.
 
 // ─── CLI ARGS ─────────────────────────────────────────────────────────────
 
@@ -263,6 +272,20 @@ function printUsage() {
     '                       + manifest rows for every REAL slice. Never triggered automatically.',
     '  --known-ids <path>   Path to known-own-graph-project-ids.json (default: alongside this script).',
     '  --backup-dir <path>  Directory for the timestamped source backup (default: scripts/migrations/backups).',
+    '',
+    'REAL-ROSTER MANUAL STEP (mirrors known-own-graph-project-ids.json -- see that section above):',
+    '  This script writes migration_manifest rows for 9 of its 10 in-scope, project_id-bearing',
+    '  tables (retrieval_event_assertions is scoped transitively -- see header comment) whose',
+    '  (source_db, source_table) pairs are NOT pre-registered in the committed',
+    '  source-table-roster.example.json by default -- only its SYNTHETIC entries are. Before a',
+    '  real run whose output verify-15-t0-roster.js (T0) must PASS against, the operator adds the',
+    '  9 matching entries to the REAL, gitignored scripts/migrations/source-table-roster.json --',
+    '  a one-time manual edit, same convention as known-own-graph-project-ids.json: the committed',
+    '  file documents the required SHAPE (see source-table-roster.example.json\'s own',
+    '  migrate-verify-own-graph.js-tagged entries), the real file carries the real source_db value',
+    '  and is never committed. Omitting this step does not affect THIS script\'s own',
+    '  MIGRATION_RESULT gate -- it only affects whether the separate §15.2 T0 roster-totality',
+    '  check later passes against the same target.',
   ].join('\n'));
 }
 
@@ -793,8 +816,7 @@ async function main() {
       }
     }
 
-    await shared.applyDdl(tgtClient); // migration_manifest + migration_manifest_row_hashes + siblings
-    await applyOwnGraphDdl(tgtClient); // this script's own lineage table
+    await shared.applyDdl(tgtClient); // migration_manifest + migration_manifest_row_hashes + own_graph_migration_ids + siblings
 
     if (parsed.rollback) {
       await runRollback(tgtClient, parsed.sourceDb, console.log);
@@ -914,8 +936,6 @@ module.exports = {
   writeJunkSlice,
   migrateRetrievalEventAssertions,
   runRollback,
-  applyOwnGraphDdl,
-  OWN_GRAPH_DDL,
   KNOWN_IDS_PATH,
   BACKUP_DIR,
   DEFAULT_SOURCE_DB,

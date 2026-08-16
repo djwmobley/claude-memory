@@ -41,6 +41,7 @@ const { createRequire } = require('module');
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
 const MIGRATE_ONE_PATH = path.join(PROJECT_ROOT, 'scripts', 'migrations', 'migrate-01-canonical-db.js');
 const SCRIPT_PATH = path.join(PROJECT_ROOT, 'scripts', 'migrations', 'migrate-verify-own-graph.js');
+const T0_ROSTER_SCRIPT_PATH = path.join(PROJECT_ROOT, 'scripts', 'migrations', 'verify-15-t0-roster.js');
 
 const migrateOne = require(MIGRATE_ONE_PATH);
 const script = require(SCRIPT_PATH);
@@ -120,6 +121,10 @@ function writeKnownIds(dirPath, ids) {
 
 function runScript(args, timeoutMs = 30000) {
   return require('child_process').spawnSync(process.execPath, [SCRIPT_PATH, ...args], { cwd: PROJECT_ROOT, env: process.env, encoding: 'utf8', timeout: timeoutMs });
+}
+
+function runT0Roster(args, extraEnv, timeoutMs = 20000) {
+  return require('child_process').spawnSync(process.execPath, [T0_ROSTER_SCRIPT_PATH, ...args], { cwd: PROJECT_ROOT, env: { ...process.env, ...extraEnv }, encoding: 'utf8', timeout: timeoutMs });
 }
 
 async function queryCount(dbName, sql, params) {
@@ -234,6 +239,55 @@ async function main() {
     firstRunResult = runScript(['--db', DB_TARGET, '--source-db', DB_SOURCE, '--known-ids', KNOWN_IDS_PATH]);
     assert(firstRunResult.status === 0, `expected exit 0, got ${firstRunResult.status}. stdout=${firstRunResult.stdout} stderr=${firstRunResult.stderr}`);
     assert(/MIGRATION_RESULT: PASS/.test(firstRunResult.stdout), `expected PASS in stdout: ${firstRunResult.stdout}`);
+  });
+
+  // ── T0 regression (review finding, 2026-08-16): own_graph_migration_ids
+  // was previously created via a PRIVATE per-script DDL block, invisible to
+  // verify-15-t0-roster.js's live-table total classification (category (b),
+  // "battery-infra", derived from verify15-shared.js's OWN DDL_SQL text) --
+  // T0 FAILed naming it as an unclassified table present in the target
+  // (reproduced twice by the independent reviewer). Fixed by registering
+  // the table's DDL in verify15-shared.js's shared DDL_SQL instead of a
+  // private constant in this script. Reproduces the reviewer's exact
+  // scenario against DB_TARGET (a disposable, persistent scratch DB, schema
+  // applied via migrate-01, already carrying real migrate-verify-own-graph.js
+  // output from M1 above): run this script, THEN run verify-15-t0-roster.js
+  // against the SAME target and confirm PASS with own_graph_migration_ids
+  // never appearing in the "unclassified" bucket. Placed here (before B1's
+  // --rollback, which later deletes the real-slice migration_manifest rows
+  // T0's roster-totality forward-check below depends on).
+  await run('T0-REG', 'C-DDL-registration: after a real migrate-verify-own-graph.js run, verify-15-t0-roster.js PASSes and classifies own_graph_migration_ids as battery-infra (never unclassified)', async () => {
+    // Roster covering exactly the (source_db=DB_SOURCE, source_table) pairs
+    // seedSource() actually populates (7 of the 9 §6.1(c) in-scope,
+    // project_id-bearing tables -- entity_communities/extraction_queue were
+    // never seeded, so they correctly carry zero migration_manifest rows
+    // and need no roster entry here; T0's roster-inverse direction only
+    // requires an entry for a NON-EXCLUDED manifest row that exists).
+    const t0Roster = [
+      { source_db: DB_SOURCE, source_table: 'entities', targetTable: 'entities',
+        loadBearingCols: ['name', 'entity_type', 'description'], hasContentBearingText: true, requires_project_id_scope: true },
+      { source_db: DB_SOURCE, source_table: 'assertions', targetTable: 'assertions',
+        loadBearingCols: ['subject', 'predicate', 'object'], hasContentBearingText: true, requires_project_id_scope: true },
+      { source_db: DB_SOURCE, source_table: 'edges', targetTable: 'edges',
+        loadBearingCols: ['from_entity', 'edge_type', 'to_entity'], hasContentBearingText: false, requires_project_id_scope: true },
+      { source_db: DB_SOURCE, source_table: 'retrieval_contract', targetTable: 'retrieval_contract',
+        loadBearingCols: ['name', 'queries'], hasContentBearingText: false, requires_project_id_scope: true },
+      { source_db: DB_SOURCE, source_table: 'project_settings', targetTable: 'project_settings',
+        loadBearingCols: ['key', 'value'], hasContentBearingText: false, requires_project_id_scope: true },
+      { source_db: DB_SOURCE, source_table: 'retrieval_events', targetTable: 'retrieval_events',
+        loadBearingCols: ['query_text', 'session_id'], hasContentBearingText: true, requires_project_id_scope: true },
+      { source_db: DB_SOURCE, source_table: 'retrieval_event_assertions', targetTable: 'retrieval_event_assertions',
+        loadBearingCols: ['event_id', 'assertion_id'], hasContentBearingText: false, requires_project_id_scope: false },
+    ];
+    const t0RosterPath = path.join(TMP_DIR, `t0-reg-roster-${TS}.json`);
+    fs.writeFileSync(t0RosterPath, JSON.stringify(t0Roster, null, 2));
+
+    const r = runT0Roster(['--db', DB_TARGET], { SOURCE_TABLE_ROSTER: t0RosterPath });
+    const out = r.stdout + r.stderr;
+    assert(r.status === 0, `expected verify-15-t0-roster.js to exit 0 after a real migrate-verify-own-graph.js run, got ${r.status}. stdout=${r.stdout} stderr=${r.stderr}`);
+    assert(!/unclassified.*own_graph_migration_ids|own_graph_migration_ids.*unclassified/.test(out), `own_graph_migration_ids must never appear in the unclassified bucket: ${out}`);
+    assert(/unclassified=0/.test(out), `expected unclassified=0 (own_graph_migration_ids classified as battery-infra), got: ${out}`);
+    assert(/battery-infra=[1-9]/.test(out), `expected battery-infra count >= 1, got: ${out}`);
   });
 
   // ── Junk exclusion ─────────────────────────────────────────────────────

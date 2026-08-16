@@ -43,5 +43,78 @@
     "loadBearingCols": ["role", "preferred_model"],
     "hasContentBearingText": false,
     "requires_project_id_scope": true
+  },
+  {
+    "_comment": "migrate-verify-own-graph.js (§6.1(c), memory-manager#11(c)) roster entries, 9 of its 10 in-scope tables ('assertions' already engine-core-classified and intentionally not re-listed here). source_db is the REAL, already-public default source database name this repo's own scripts hard-code (migrate-verify-own-graph.js's DEFAULT_SOURCE_DB, migrate-01-canonical-db.js's classifyTarget refusal list) — not private per-instance data, so it is safe to commit verbatim here, unlike known-own-graph-project-ids.json's project ids. source_table equals targetTable throughout: this migration copies within the SAME schema shape (source and target are both handoff-core-schema.sql / app-retrieval-events-schema.sql tables), never a renamed or transformed source. retrieval_event_assertions carries requires_project_id_scope=false deliberately -- it has no project_id column at all (a bare join table, event_id/assertion_id only), a documented design fact (see migrate-verify-own-graph.js's header comment), not a gap T6 should flag.",
+    "source_db": "claude_memory_eval_test",
+    "source_table": "entities",
+    "targetTable": "entities",
+    "loadBearingCols": ["name", "entity_type", "description"],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "claude_memory_eval_test",
+    "source_table": "edges",
+    "targetTable": "edges",
+    "loadBearingCols": ["from_entity", "edge_type", "to_entity"],
+    "hasContentBearingText": false,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "claude_memory_eval_test",
+    "source_table": "retrieval_contract",
+    "targetTable": "retrieval_contract",
+    "loadBearingCols": ["name", "queries"],
+    "hasContentBearingText": false,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "claude_memory_eval_test",
+    "source_table": "retrieval_contract_history",
+    "targetTable": "retrieval_contract_history",
+    "loadBearingCols": ["name", "version", "queries", "change_note"],
+    "hasContentBearingText": false,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "claude_memory_eval_test",
+    "source_table": "project_settings",
+    "targetTable": "project_settings",
+    "loadBearingCols": ["key", "value"],
+    "hasContentBearingText": false,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "claude_memory_eval_test",
+    "source_table": "entity_communities",
+    "targetTable": "entity_communities",
+    "loadBearingCols": ["entity_name", "community_id", "level", "run_id"],
+    "hasContentBearingText": false,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "claude_memory_eval_test",
+    "source_table": "extraction_queue",
+    "targetTable": "extraction_queue",
+    "loadBearingCols": ["payload", "source_ref", "status"],
+    "hasContentBearingText": false,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "claude_memory_eval_test",
+    "source_table": "retrieval_events",
+    "targetTable": "retrieval_events",
+    "loadBearingCols": ["query_text", "session_id"],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "claude_memory_eval_test",
+    "source_table": "retrieval_event_assertions",
+    "targetTable": "retrieval_event_assertions",
+    "loadBearingCols": ["event_id", "assertion_id"],
+    "hasContentBearingText": false,
+    "requires_project_id_scope": false
   }
 ]
