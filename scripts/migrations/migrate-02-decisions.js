@@ -62,6 +62,17 @@
  *      zero-match falls to `unmatched-<first-dash-token>`, D-1/D-10), and
  *      groups rows into per-derived-project-id slices.
  *   9. Per slice, in ONE transaction (D-5/D-11):
+ *        - RECONCILIATION (review-round-1 fix, post-D-12): deletes any
+ *          `decisions` row whose `topic` is in this slice but whose
+ *          `project_id` is NOT this slice's project_id -- a topic
+ *          re-classified to a different project_id since a prior run
+ *          (the documented D-2 owner-review workflow: fix an `unmatched-*`
+ *          bucket's rule, re-run -- or the inverse, a rule removal
+ *          dropping a topic back to `unmatched-*`). Topics are globally
+ *          unique (D-4), so this is a safe, precise identity key. Each
+ *          removed row is logged (`[RECLASSIFY]`) -- the `decisions_audit`
+ *          trigger, once wired, preserves it in `audit_log`; never a
+ *          silent drop.
  *        - upserts every row into `decisions` via
  *          `ON CONFLICT (project_id, topic) DO UPDATE` (idempotent re-run
  *          key, mirrors the source table's own upsert-by-topic semantics).
@@ -76,25 +87,48 @@
  *          migration_manifest_row_hashes rows, in the SAME transaction as
  *          the decisions upsert batch (D-5/D-11) -- re-run idempotent on
  *          both tables together, never one without the other.
- *  10. Prints a per-slice report: live count next to §16.2's documentary
- *      (stale) baseline where the runbook table gives a clean single
- *      figure for that hint, "n/a (undocumented in §16.2)" otherwise
+ *  10. ORPHANED-SLICE RECONCILIATION (review-round-1 fix), its own
+ *      transaction, after every per-slice transaction has committed:
+ *      deletes any `migration_manifest` (+ `migration_manifest_row_hashes`)
+ *      slice for this `(source_db, source_table)` whose `project_id_or_null`
+ *      is NOT in the CURRENT classification's slice set -- a project_id
+ *      that zero source topics route to this run (the case step 9's
+ *      per-topic delete can't reach, because no current slice ever visits
+ *      it: e.g. `unmatched-cache-warmup` disappearing entirely once its
+ *      one topic gets a real rule). Logged (`[RECONCILE]`).
+ *  11. RECONCILIATION GATE (review-round-1 fix): after all of the above,
+ *      asserts (a) no current source topic maps to more than one live
+ *      `decisions` row, and (b) the live `migration_manifest` slice set for
+ *      this source equals the current classification's slice set exactly.
+ *      Either failing is a loud `Refused (reconciliation gate)` and demotes
+ *      `MIGRATION_RESULT` to FAIL even if step 12's row-count gate passed --
+ *      this is the check that makes re-classification drift visible instead
+ *      of silently passing (the bug an independent reviewer found: both
+ *      runs of the reproduction printed `MIGRATION_RESULT: PASS` with a
+ *      duplicated, orphaned row left behind).
+ *  12. Prints a per-slice report: live count next to an OPTIONAL
+ *      documentary (stale) baseline carried on the routing map itself
  *      (D-9 -- diagnostic display only, NEVER read by any pass/fail
  *      branch in this script); flags every "unmatched-*" bucket by name.
- *      MIGRATION_RESULT: PASS iff migrated-row total == live source total.
+ *      MIGRATION_RESULT: PASS iff migrated-row total == live source total
+ *      AND step 11's reconciliation gate is clean.
  *
- * ROLLBACK MODE (--rollback, D-7/D-8): re-classifies the CURRENT source
- * content (not a saved list from the original run -- this makes rollback
- * a standalone, replayable invocation) to recover the exact set of
- * source_project_hint values this migration ever writes for this source,
- * then in ONE transaction: deletes every `decisions` row tagged
- * source_model='unknown-pre-migration' AND source_project_hint IN that set,
- * plus this source_db/source_table's migration_manifest and
- * migration_manifest_row_hashes rows. Prints the expected audit_log
- * append-note (D-8): the decisions_audit trigger, once wired, fires once
- * per deleted row -- that is EXPECTED, CORRECT, and never itself reverted
- * (the append-only ledger IS the record a migration-then-rollback
- * occurred).
+ * ROLLBACK MODE (--rollback, D-7/D-8, topic-scoped as of review round 1):
+ * reads the CURRENT source content's topic set (not a saved list from the
+ * original run, and NOT a re-derived hint set -- see below -- this makes
+ * rollback a standalone, replayable invocation), then in ONE transaction:
+ * deletes every `decisions` row tagged source_model='unknown-pre-migration'
+ * AND topic IN that set, plus this source_db/source_table's
+ * migration_manifest and migration_manifest_row_hashes rows. Prints the
+ * expected audit_log append-note (D-8): the decisions_audit trigger, once
+ * wired, fires once per deleted row -- that is EXPECTED, CORRECT, and never
+ * itself reverted (the append-only ledger IS the record a migration-then-
+ * rollback occurred). Topic identity (not source_project_hint re-derived by
+ * re-classifying through whatever routing map happens to be loaded right
+ * now) is the scoping key as of review round 1: hint-based scoping was
+ * drift-vulnerable to the exact same routing-map-edited-since-the-original-
+ * run scenario the reconciliation fix addresses -- see REQUIRED BLIND SPOTS
+ * for the residual limit once a second source shares this table.
  *
  * WHAT THIS SCRIPT DELIBERATELY DOES NOT DO (out of scope):
  *   - No embedding backfill (phase (g)/D-6).
@@ -373,6 +407,26 @@ function computeContentFingerprint(sliceRowsOrderedById) {
 async function upsertSlice(tgtClient, sourceDb, projectId, sliceRows) {
   await tgtClient.query('BEGIN');
   try {
+    // Review-round-1 fix: a topic in THIS slice may already exist in
+    // `decisions` under a DIFFERENT project_id from a prior run whose
+    // routing map classified it differently (D-2's documented owner-review
+    // workflow, either direction: unmatched-* -> real rule, or a rule
+    // removed -> unmatched-*). Topics are globally unique (D-4), so
+    // deleting by (topic, project_id <> this slice's target) is a safe,
+    // precise identity key -- never touches a topic this slice doesn't
+    // own. Logged, never silent; decisions_audit (once wired) preserves
+    // the removed row in audit_log.
+    const sliceTopics = sliceRows.map((r) => r.topic);
+    if (sliceTopics.length > 0) {
+      const { rows: reclassified } = await tgtClient.query(
+        `DELETE FROM decisions WHERE topic = ANY($1::text[]) AND project_id <> $2 RETURNING topic, project_id`,
+        [sliceTopics, projectId]
+      );
+      for (const r of reclassified) {
+        console.log(`  [RECLASSIFY] topic="${r.topic}": removed stale row under project_id="${r.project_id}" (now project_id="${projectId}")`);
+      }
+    }
+
     for (const row of sliceRows) {
       await tgtClient.query(
         `INSERT INTO decisions
@@ -421,6 +475,89 @@ async function upsertSlice(tgtClient, sourceDb, projectId, sliceRows) {
   }
 }
 
+// ─── ORPHANED-SLICE RECONCILIATION (review-round-1 fix) ───────────────────
+
+/**
+ * A migration_manifest slice (+ its row_hashes) for this (source_db,
+ * source_table) whose project_id_or_null is NOT in the CURRENT
+ * classification's slice set means zero source topics route there THIS
+ * run -- the per-slice upsertSlice() loop never visits it (there is no
+ * slice to iterate), so its own topic-scoped delete inside upsertSlice()
+ * can never reach it either. Example: `unmatched-cache-warmup` had exactly
+ * one topic, which just got a real routing rule -- the OLD slice is now
+ * fully vacated, not merely shrunk. This runs in its OWN transaction,
+ * deliberately separate from any per-slice transaction (D-5/D-11's
+ * atomicity guarantee is scoped to "this slice's decisions upsert + this
+ * slice's manifest row together" -- a vacated slice has no decisions
+ * upsert to pair with). Idempotent: re-running with an unchanged
+ * currentProjectIds set deletes nothing.
+ */
+async function reconcileOrphanedManifestSlices(tgtClient, sourceDb, currentProjectIds) {
+  await tgtClient.query('BEGIN');
+  let deletedManifestSlices = 0;
+  let deletedHashRows = 0;
+  let orphanedProjectIds = [];
+  try {
+    const delHashes = await tgtClient.query(
+      `DELETE FROM migration_manifest_row_hashes WHERE source_db=$1 AND source_table=$2 AND project_id_or_null <> ALL($3::text[])`,
+      [sourceDb, SOURCE_TABLE, currentProjectIds]
+    );
+    deletedHashRows = delHashes.rowCount;
+    const delManifest = await tgtClient.query(
+      `DELETE FROM migration_manifest WHERE source_db=$1 AND source_table=$2 AND project_id_or_null <> ALL($3::text[]) RETURNING project_id_or_null`,
+      [sourceDb, SOURCE_TABLE, currentProjectIds]
+    );
+    deletedManifestSlices = delManifest.rowCount;
+    orphanedProjectIds = [...new Set(delManifest.rows.map((r) => r.project_id_or_null))];
+    await tgtClient.query('COMMIT');
+  } catch (err) {
+    await tgtClient.query('ROLLBACK');
+    throw err;
+  }
+  for (const pid of orphanedProjectIds) {
+    console.log(`  [RECONCILE] removed orphaned migration_manifest slice project_id="${pid}" (no source topic currently classifies to it)`);
+  }
+  return { deletedManifestSlices, deletedHashRows, orphanedProjectIds };
+}
+
+// ─── RECONCILIATION GATE (review-round-1 fix) ─────────────────────────────
+
+/**
+ * Post-run self-check, independent of the per-slice/orphan-cleanup logic
+ * above: proves the end state is actually consistent rather than trusting
+ * that the operations above did their job. (a) no current source topic
+ * maps to more than one live decisions row; (b) the live manifest slice
+ * set for this source equals the current classification's slice set
+ * exactly (no missing, no extra/orphaned). Returns an array of human-
+ * readable problem strings; empty = clean. This is the check that makes
+ * re-classification drift VISIBLE -- the independent-reviewer-found bug
+ * was that MIGRATION_RESULT: PASS could not see a stale duplicate/orphaned
+ * slice left behind by a prior run.
+ */
+async function verifyReconciliation(tgtClient, sourceDb, sourceTopics, currentProjectIds) {
+  const problems = [];
+  if (sourceTopics.length > 0) {
+    const { rows: dupTopics } = await tgtClient.query(
+      `SELECT topic, COUNT(*) AS n FROM decisions WHERE topic = ANY($1::text[]) GROUP BY topic HAVING COUNT(*) > 1`,
+      [sourceTopics]
+    );
+    for (const r of dupTopics) {
+      problems.push(`topic=${JSON.stringify(r.topic)} maps to ${r.n} live decisions row(s) (expected exactly 1)`);
+    }
+  }
+  const { rows: manifestRows } = await tgtClient.query(
+    `SELECT project_id_or_null FROM migration_manifest WHERE source_db=$1 AND source_table=$2`,
+    [sourceDb, SOURCE_TABLE]
+  );
+  const liveSliceSet = new Set(manifestRows.map((r) => r.project_id_or_null));
+  const expectedSliceSet = new Set(currentProjectIds);
+  const missing = [...expectedSliceSet].filter((p) => !liveSliceSet.has(p));
+  const extra = [...liveSliceSet].filter((p) => !expectedSliceSet.has(p));
+  if (missing.length) problems.push(`migration_manifest is missing slice(s) for: ${missing.join(', ')}`);
+  if (extra.length) problems.push(`migration_manifest carries orphaned/unexpected slice(s) for: ${extra.join(', ')}`);
+  return problems;
+}
+
 // ─── REPORT (D-9) ──────────────────────────────────────────────────────────
 
 function printReport(slices, sourceTotal, routingMap) {
@@ -456,23 +593,24 @@ function printReport(slices, sourceTotal, routingMap) {
 
 // ─── ROLLBACK MODE (D-7/D-8) ───────────────────────────────────────────────
 
-async function runRollback(srcClient, tgtClient, sourceDb, routingMap) {
-  // Re-classify the CURRENT source content (not a saved list from the
-  // original run) to recover the exact set of source_project_hint values
-  // this migration ever writes for this source -- a standalone, replayable
-  // scoping key. source_model='unknown-pre-migration' ALONE is not
-  // source-specific (a future pipeline_pipeline-sourced migration into the
-  // SAME decisions table would tag its rows identically) -- see this
-  // script's blind-spot note in the PR body for the residual limit once
-  // that migration exists.
+async function runRollback(srcClient, tgtClient, sourceDb) {
+  // Review-round-1 fix: scope the decisions deletion by the CURRENT
+  // source's TOPIC set, not by re-deriving source_project_hint through
+  // whatever routing map happens to be loaded right now. Topics are
+  // globally unique (D-4) and require no map at all to identify -- hint-
+  // based scoping was drift-vulnerable to the exact scenario the
+  // reconciliation fix (upsertSlice/reconcileOrphanedManifestSlices)
+  // addresses: if the routing map has been edited since the original run
+  // (D-2's documented owner-review workflow), the recomputed hint set
+  // would not match the source_project_hint values actually persisted on
+  // rows classified under the OLD map, and rollback could miss them.
+  // source_model='unknown-pre-migration' ALONE is not source-specific (a
+  // future pipeline_pipeline-sourced migration into the SAME decisions
+  // table would tag its rows identically) -- see this script's blind-spot
+  // note in the PR body for the residual limit once that migration exists.
   const { rows: sourceRows } = await sourceSelect(srcClient, `SELECT topic FROM ${SOURCE_TABLE}`);
-  const hints = new Set();
-  for (const row of sourceRows) {
-    const { sourceProjectHint } = classifyTopic(row.topic, routingMap);
-    hints.add(sourceProjectHint);
-  }
-  const hintList = [...hints];
-  console.log(`  [ROLLBACK] scoping by source_model='${SOURCE_MODEL_TAG}' AND source_project_hint IN (${hintList.length} hint(s) derived from current source content)`);
+  const topics = sourceRows.map((r) => r.topic);
+  console.log(`  [ROLLBACK] scoping decisions deletion by source_model='${SOURCE_MODEL_TAG}' AND topic IN (${topics.length} topic(s) from current source content)`);
 
   await tgtClient.query('BEGIN');
   let deletedDecisions = 0;
@@ -480,8 +618,8 @@ async function runRollback(srcClient, tgtClient, sourceDb, routingMap) {
   let deletedHashes = 0;
   try {
     const delRes = await tgtClient.query(
-      `DELETE FROM decisions WHERE source_model = $1 AND source_project_hint = ANY($2::text[])`,
-      [SOURCE_MODEL_TAG, hintList]
+      `DELETE FROM decisions WHERE source_model = $1 AND topic = ANY($2::text[])`,
+      [SOURCE_MODEL_TAG, topics]
     );
     deletedDecisions = delRes.rowCount;
     const delManifest = await tgtClient.query(
@@ -581,7 +719,7 @@ async function main() {
     await shared.applyDdl(tgtClient); // migration_manifest + migration_manifest_row_hashes + siblings, idempotent
 
     if (parsed.rollback) {
-      await runRollback(srcClient, tgtClient, parsed.sourceDb, routingMap);
+      await runRollback(srcClient, tgtClient, parsed.sourceDb);
       exitCode = 0;
       return;
     }
@@ -629,15 +767,44 @@ async function main() {
     }
 
     // ── Upsert + manifest, one transaction PER SLICE (D-5/D-11) ─────────
+    // Each slice's own transaction also reconciles any stale row for this
+    // slice's topics left behind under a DIFFERENT project_id by a prior
+    // run's classification (review-round-1 fix, see upsertSlice()).
     for (const [projectId, rows] of slices) {
       await upsertSlice(tgtClient, parsed.sourceDb, projectId, rows);
       console.log(`  [OK] project_id="${projectId}": upserted ${rows.length} row(s) + manifest slice`);
     }
 
-    // ── Report + gate ────────────────────────────────────────────────
+    // ── Orphaned-slice reconciliation (review-round-1 fix) ───────────────
+    // A project_id that ZERO current topics route to (e.g. an
+    // unmatched-* bucket fully vacated by a new rule) has no slice in
+    // `slices` for the loop above to ever visit -- clean it up separately.
+    const currentProjectIds = [...slices.keys()];
+    const orphanCleanup = await reconcileOrphanedManifestSlices(tgtClient, parsed.sourceDb, currentProjectIds);
+    if (orphanCleanup.deletedManifestSlices > 0) {
+      console.log(`  [OK] reconciliation: removed ${orphanCleanup.deletedManifestSlices} orphaned migration_manifest slice(s), ${orphanCleanup.deletedHashRows} row_hashes row(s)`);
+    }
+
+    // ── Report ────────────────────────────────────────────────────────
     const migratedTotal = printReport(slices, sourceRows.length, routingMap);
-    const pass = migratedTotal === sourceRows.length;
-    console.log(`MIGRATION_RESULT: ${pass ? 'PASS' : 'FAIL'} (source=${sourceRows.length}, migrated=${migratedTotal})`);
+    const rowCountPass = migratedTotal === sourceRows.length;
+
+    // ── Reconciliation gate (review-round-1 fix) ─────────────────────────
+    // Independent self-check: proves the end state is actually consistent
+    // rather than trusting the operations above did their job. This is
+    // the check that makes re-classification drift VISIBLE -- previously
+    // MIGRATION_RESULT: PASS could not see a stale duplicate/orphaned
+    // slice left behind by a prior run (both runs of the independent
+    // reviewer's reproduction printed PASS).
+    const sourceTopics = sourceRows.map((r) => r.topic);
+    const reconciliationProblems = await verifyReconciliation(tgtClient, parsed.sourceDb, sourceTopics, currentProjectIds);
+    if (reconciliationProblems.length) {
+      console.error(`Refused (reconciliation gate): the post-run state is inconsistent (${reconciliationProblems.length} problem(s)):`);
+      for (const p of reconciliationProblems) console.error(`  - ${p}`);
+    }
+
+    const pass = rowCountPass && reconciliationProblems.length === 0;
+    console.log(`MIGRATION_RESULT: ${pass ? 'PASS' : 'FAIL'} (source=${sourceRows.length}, migrated=${migratedTotal}, reconciliation_problems=${reconciliationProblems.length})`);
     exitCode = pass ? 0 : 1;
   } finally {
     await srcClient.end();
@@ -666,6 +833,8 @@ module.exports = {
   checkDuplicateTopics,
   computeContentFingerprint,
   upsertSlice,
+  reconcileOrphanedManifestSlices,
+  verifyReconciliation,
   printReport,
   runRollback,
   ROUTING_MAP_PATH,

@@ -174,7 +174,9 @@ const DB_SOURCE_BADTOPIC = `verify02_src_badtopic_${TS}`;
 const DB_SOURCE_DUPE = `verify02_src_dupe_${TS}`;
 const DB_SOURCE_TXN = `verify02_src_txn_${TS}`;
 const DB_SOURCE_ROLLBACK = `verify02_src_rollback_${TS}`;
-const CREATED_DBS = [DB_TARGET, DB_SOURCE_HAPPY, DB_SOURCE_BADTOPIC, DB_SOURCE_DUPE, DB_SOURCE_TXN, DB_SOURCE_ROLLBACK];
+const DB_SOURCE_DRIFT_ADDED = `verify02_src_drift_added_${TS}`;   // rule-added: unmatched -> routed
+const DB_SOURCE_DRIFT_REMOVED = `verify02_src_drift_removed_${TS}`; // rule-removed: routed -> unmatched
+const CREATED_DBS = [DB_TARGET, DB_SOURCE_HAPPY, DB_SOURCE_BADTOPIC, DB_SOURCE_DUPE, DB_SOURCE_TXN, DB_SOURCE_ROLLBACK, DB_SOURCE_DRIFT_ADDED, DB_SOURCE_DRIFT_REMOVED];
 
 const HAPPY_ROWS = [
   { topic: 'proj-alpha-foo-bar', decision: 'use approach A', reason: 'perf' },
@@ -300,6 +302,17 @@ async function main() {
     ]);
     await setupSourceDb(DB_SOURCE_ROLLBACK);
     await insertSourceRows(DB_SOURCE_ROLLBACK, [{ topic: 'proj-alpha-rollback-me', decision: 'temp', reason: null }]);
+    // Distinct topic literals per drift test -- the (project_id, topic)
+    // upsert key means two DIFFERENT sources landing the SAME topic under
+    // the SAME project_id (as R2 and R3 both eventually route "proj-real")
+    // would collide and conflate into one row, corrupting each test's
+    // assertions about its own source's slice. Globally-unique topics
+    // sidestep that (an orthogonal, pre-existing multi-source-collision
+    // limitation of this schema, not something this fix needs to solve).
+    await setupSourceDb(DB_SOURCE_DRIFT_ADDED);
+    await insertSourceRows(DB_SOURCE_DRIFT_ADDED, [{ topic: 'cache-warmup-fix-added', decision: 'x', reason: null }]);
+    await setupSourceDb(DB_SOURCE_DRIFT_REMOVED);
+    await insertSourceRows(DB_SOURCE_DRIFT_REMOVED, [{ topic: 'cache-warmup-fix-removed', decision: 'x', reason: null }]);
   });
 
   // ── Group 3: preconditions (D-3/D-4) — loud FAIL, nothing inserted ──────
@@ -471,6 +484,112 @@ async function main() {
       await client.end();
     }
   });
+
+  // ── Group 7: reconciliation (review-round-1 fix) — re-classification drift ──
+  // Reproduces the independent reviewer's finding in BOTH directions: a
+  // topic's derived project_id changing between two runs (the documented
+  // D-2 owner-review workflow: fix an unmatched-* bucket's rule and
+  // re-run, or the inverse — a rule removed drops a topic back to
+  // unmatched-*). Asserts single-row-per-topic, the old slice's full
+  // removal (manifest + row_hashes), and slice-set equality — the three
+  // things the old code silently got wrong while still printing
+  // MIGRATION_RESULT: PASS on both runs.
+  const driftTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'migrate02-drift-'));
+  const MAP_UNMATCHED_PATH = path.join(driftTmpDir, 'map-unmatched.json');
+  const MAP_ROUTED_PATH = path.join(driftTmpDir, 'map-routed.json');
+  fs.writeFileSync(MAP_UNMATCHED_PATH, JSON.stringify({
+    known_project_ids: ['placeholder-project'],
+    rules: [{ type: 'LITERAL', prefix: 'cache-warmup', target: 'unmatched-cache-warmup' }],
+  }));
+  fs.writeFileSync(MAP_ROUTED_PATH, JSON.stringify({
+    known_project_ids: ['proj-real'],
+    rules: [{ type: 'LITERAL', prefix: 'cache-warmup', target: 'proj-real' }],
+  }));
+
+  await run('R2', 'reconciliation: rule ADDED (unmatched-* -> routed) — old slice fully removed, single row under the new project_id', async () => {
+    const firstRun = runMigrate02(['--db', DB_TARGET, '--source-db', DB_SOURCE_DRIFT_ADDED, '--routing-map', MAP_UNMATCHED_PATH]);
+    assert(firstRun.status === 0, `expected exit 0 on first run, got ${firstRun.status}. stdout=${firstRun.stdout} stderr=${firstRun.stderr}`);
+    assert(/MIGRATION_RESULT: PASS/.test(firstRun.stdout), `expected PASS on first run. stdout=${firstRun.stdout}`);
+
+    const secondRun = runMigrate02(['--db', DB_TARGET, '--source-db', DB_SOURCE_DRIFT_ADDED, '--routing-map', MAP_ROUTED_PATH]);
+    assert(secondRun.status === 0, `expected exit 0 on second (re-classified) run, got ${secondRun.status}. stdout=${secondRun.stdout} stderr=${secondRun.stderr}`);
+    assert(/MIGRATION_RESULT: PASS/.test(secondRun.stdout), `expected PASS on second run. stdout=${secondRun.stdout}`);
+    assert(/\[RECLASSIFY\] topic="cache-warmup-fix-added"/.test(secondRun.stdout), `expected a [RECLASSIFY] log line on the second run. stdout=${secondRun.stdout}`);
+    assert(/\[RECONCILE\] removed orphaned migration_manifest slice project_id="unmatched-cache-warmup"/.test(secondRun.stdout), `expected a [RECONCILE] log line removing the vacated unmatched-cache-warmup slice. stdout=${secondRun.stdout}`);
+
+    const client = await pgConnect(DB_TARGET);
+    try {
+      const { rows: decRows } = await client.query(`SELECT project_id FROM decisions WHERE topic = 'cache-warmup-fix-added'`);
+      assert(decRows.length === 1, `expected exactly 1 decisions row for topic, found ${decRows.length}`);
+      assert(decRows[0].project_id === 'proj-real', `expected project_id=proj-real, got ${decRows[0].project_id}`);
+
+      const { rows: manRows } = await client.query(
+        `SELECT project_id_or_null FROM migration_manifest WHERE source_db = $1 AND source_table = 'decisions'`,
+        [DB_SOURCE_DRIFT_ADDED]
+      );
+      assert(manRows.length === 1, `expected exactly 1 manifest slice, found ${manRows.length}: ${JSON.stringify(manRows)}`);
+      assert(manRows[0].project_id_or_null === 'proj-real', `expected the sole manifest slice to be proj-real, got ${manRows[0].project_id_or_null}`);
+
+      const { rows: staleManRows } = await client.query(
+        `SELECT 1 FROM migration_manifest WHERE source_db = $1 AND source_table = 'decisions' AND project_id_or_null = 'unmatched-cache-warmup'`,
+        [DB_SOURCE_DRIFT_ADDED]
+      );
+      assert(staleManRows.length === 0, 'expected the old unmatched-cache-warmup manifest slice to be gone');
+      const { rows: staleHashRows } = await client.query(
+        `SELECT 1 FROM migration_manifest_row_hashes WHERE source_db = $1 AND source_table = 'decisions' AND project_id_or_null = 'unmatched-cache-warmup'`,
+        [DB_SOURCE_DRIFT_ADDED]
+      );
+      assert(staleHashRows.length === 0, 'expected the old unmatched-cache-warmup row_hashes to be gone');
+
+      // An unrelated source's slices must be untouched by the orphan cleanup
+      // (proves the DELETE is scoped by source_db, not global).
+      const { rows: happyRows } = await client.query(`SELECT COUNT(*) AS n FROM decisions WHERE topic = 'gamma-judge'`);
+      assert(Number(happyRows[0].n) === 1, `expected the unrelated happy-path source's row to survive, found ${happyRows[0].n}`);
+      const { rows: happyManRows } = await client.query(
+        `SELECT COUNT(*) AS n FROM migration_manifest WHERE source_db = $1 AND source_table = 'decisions'`,
+        [DB_SOURCE_HAPPY]
+      );
+      assert(Number(happyManRows[0].n) > 0, 'expected the unrelated happy-path source to still have its manifest slices');
+    } finally {
+      await client.end();
+    }
+  });
+
+  await run('R3', 'reconciliation: rule REMOVED (routed -> unmatched-*) — inverse direction, same three guarantees', async () => {
+    const firstRun = runMigrate02(['--db', DB_TARGET, '--source-db', DB_SOURCE_DRIFT_REMOVED, '--routing-map', MAP_ROUTED_PATH]);
+    assert(firstRun.status === 0, `expected exit 0 on first run, got ${firstRun.status}. stdout=${firstRun.stdout} stderr=${firstRun.stderr}`);
+    assert(/MIGRATION_RESULT: PASS/.test(firstRun.stdout), `expected PASS on first run. stdout=${firstRun.stdout}`);
+
+    const secondRun = runMigrate02(['--db', DB_TARGET, '--source-db', DB_SOURCE_DRIFT_REMOVED, '--routing-map', MAP_UNMATCHED_PATH]);
+    assert(secondRun.status === 0, `expected exit 0 on second (re-classified) run, got ${secondRun.status}. stdout=${secondRun.stdout} stderr=${secondRun.stderr}`);
+    assert(/MIGRATION_RESULT: PASS/.test(secondRun.stdout), `expected PASS on second run. stdout=${secondRun.stdout}`);
+    assert(/\[RECLASSIFY\] topic="cache-warmup-fix-removed"/.test(secondRun.stdout), `expected a [RECLASSIFY] log line on the second run. stdout=${secondRun.stdout}`);
+    assert(/\[RECONCILE\] removed orphaned migration_manifest slice project_id="proj-real"/.test(secondRun.stdout), `expected a [RECONCILE] log line removing the vacated proj-real slice. stdout=${secondRun.stdout}`);
+
+    const client = await pgConnect(DB_TARGET);
+    try {
+      const { rows: decRows } = await client.query(`SELECT project_id FROM decisions WHERE topic = 'cache-warmup-fix-removed'`);
+      assert(decRows.length === 1, `expected exactly 1 decisions row for topic, found ${decRows.length}`);
+      assert(decRows[0].project_id === 'unmatched-cache-warmup', `expected project_id=unmatched-cache-warmup, got ${decRows[0].project_id}`);
+
+      const { rows: manRows } = await client.query(
+        `SELECT project_id_or_null FROM migration_manifest WHERE source_db = $1 AND source_table = 'decisions'`,
+        [DB_SOURCE_DRIFT_REMOVED]
+      );
+      assert(manRows.length === 1, `expected exactly 1 manifest slice, found ${manRows.length}: ${JSON.stringify(manRows)}`);
+      assert(manRows[0].project_id_or_null === 'unmatched-cache-warmup', `expected the sole manifest slice to be unmatched-cache-warmup, got ${manRows[0].project_id_or_null}`);
+
+      const { rows: staleManRows } = await client.query(
+        `SELECT 1 FROM migration_manifest WHERE source_db = $1 AND source_table = 'decisions' AND project_id_or_null = 'proj-real'`,
+        [DB_SOURCE_DRIFT_REMOVED]
+      );
+      assert(staleManRows.length === 0, 'expected the old proj-real manifest slice to be gone');
+    } finally {
+      await client.end();
+    }
+  });
+
+  fs.rmSync(driftTmpDir, { recursive: true, force: true });
 
   // ── Cleanup ──────────────────────────────────────────────────────────
   for (const db of CREATED_DBS) {
