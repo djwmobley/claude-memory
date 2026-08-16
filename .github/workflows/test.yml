@@ -365,17 +365,13 @@ jobs:
           PGPASSWORD: postgres
       - name: Run source-file-normalize unit tests (§6.1(d) D3-2/D3-10, memory-manager#11(d))
         # Tests scripts/lib/source-file-normalize.js -- the ONE shared normalization
-        # module used identically by migrate-03-corpus-project-id.js's filesystem
-        # map-builder and its SQL-side matching (separators, optional memory/
-        # prefix, case-fold, Unicode NFC). Includes a live-Postgres cross-check
-        # that sqlExpr() produces the byte-identical result to normalize() for
-        # every fixture, including the verified backslash-vs-forward-slash
-        # regression that previously matched zero rows.
+        # function used identically by migrate-03-corpus-project-id.js's filesystem
+        # map-builder and its per-database backfill matching step (both call the
+        # SAME JS normalize(), never a hand-ported SQL twin -- separators, optional
+        # memory/ prefix, case-fold, Unicode NFC), including the verified
+        # backslash-vs-forward-slash regression that previously matched zero rows.
+        # Pure unit test -- no Postgres required.
         run: node scripts/test-source-file-normalize.js
-        env:
-          PGHOST: localhost
-          PGUSER: postgres
-          PGPASSWORD: postgres
       - name: Run corpus project_id migration tests (§6.1(d), memory-manager#11(d))
         # Tests scripts/migrations/migrate-03-corpus-project-id.js -- adds +
         # backfills project_id on memory_entries/memory_entry_chunks IN PLACE on

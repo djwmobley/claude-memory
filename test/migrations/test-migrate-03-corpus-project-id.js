@@ -269,6 +269,55 @@ async function main() {
     assert(r.reason === null, 'expected null reason on success');
   });
 
+  await run('two-transcripts-two-cwds', 'findCwdFromTranscripts: two transcripts disagreeing on cwd -> unmapped with divergent-transcript-cwds reason, NEVER the first one scanned (post-review fix)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-divergent-'));
+    // Filename-sorted so "a.jsonl" is scanned before "b.jsonl" -- proves
+    // the fix does not silently resolve to whichever transcript sorts
+    // first (the exact bug an independent reviewer reproduced).
+    fs.writeFileSync(path.join(dir, 'a.jsonl'), JSON.stringify({ type: 'system', cwd: '/path/one' }) + '\n', 'utf8');
+    fs.writeFileSync(path.join(dir, 'b.jsonl'), JSON.stringify({ type: 'system', cwd: '/path/two' }) + '\n', 'utf8');
+    const r = migrate03.findCwdFromTranscripts(dir);
+    assert(r.cwd === null, `expected null cwd on divergence, got ${r.cwd}`);
+    assert(/divergent-transcript-cwds: 2 distinct values/.test(r.reason), `expected the divergent-transcript-cwds reason with a count, got: ${r.reason}`);
+  });
+
+  await run('two-transcripts-same-cwd', 'findCwdFromTranscripts: two transcripts agreeing on cwd -> resolves cleanly (identical values across many transcripts remain a clean resolve)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-agree-'));
+    fs.writeFileSync(path.join(dir, 'a.jsonl'), JSON.stringify({ type: 'system', cwd: '/path/same' }) + '\n', 'utf8');
+    fs.writeFileSync(path.join(dir, 'b.jsonl'), JSON.stringify({ type: 'system', cwd: '/path/same' }) + '\n', 'utf8');
+    const r = migrate03.findCwdFromTranscripts(dir);
+    assert(r.cwd === '/path/same', `expected /path/same, got ${r.cwd}`);
+    assert(r.reason === null, 'expected null reason on a clean agreeing resolve');
+  });
+
+  await run('U3c', 'findCwdFromTranscripts: a trailing-slash-only difference between two transcripts is NOT treated as divergence (light canonicalization, cwdCompareKey)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-trailing-slash-'));
+    fs.writeFileSync(path.join(dir, 'a.jsonl'), JSON.stringify({ type: 'system', cwd: '/path/same' }) + '\n', 'utf8');
+    fs.writeFileSync(path.join(dir, 'b.jsonl'), JSON.stringify({ type: 'system', cwd: '/path/same/' }) + '\n', 'utf8');
+    const r = migrate03.findCwdFromTranscripts(dir);
+    assert(r.cwd !== null, `expected a clean resolve despite the trailing-slash difference, got reason: ${r.reason}`);
+    assert(r.reason === null, 'expected null reason');
+  });
+
+  await run('U3d', 'findCwdFromTranscripts: three transcripts with two distinct values reports the correct distinct count', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-three-'));
+    fs.writeFileSync(path.join(dir, 'a.jsonl'), JSON.stringify({ type: 'system', cwd: '/path/one' }) + '\n', 'utf8');
+    fs.writeFileSync(path.join(dir, 'b.jsonl'), JSON.stringify({ type: 'system', cwd: '/path/one' }) + '\n', 'utf8');
+    fs.writeFileSync(path.join(dir, 'c.jsonl'), JSON.stringify({ type: 'system', cwd: '/path/two' }) + '\n', 'utf8');
+    const r = migrate03.findCwdFromTranscripts(dir);
+    assert(r.cwd === null, 'expected unmapped');
+    assert(/divergent-transcript-cwds: 2 distinct values/.test(r.reason), `expected 2 distinct values (not 3), got: ${r.reason}`);
+  });
+
+  await run('U3e', 'resolveProjectIdForDir: divergent transcripts route to the unmapped bucket, never a guessed marker resolution', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-divergent-dir-'));
+    fs.writeFileSync(path.join(dir, 'a.jsonl'), JSON.stringify({ cwd: '/path/one' }) + '\n', 'utf8');
+    fs.writeFileSync(path.join(dir, 'b.jsonl'), JSON.stringify({ cwd: '/path/two' }) + '\n', 'utf8');
+    const r = migrate03.resolveProjectIdForDir(dir);
+    assert(r.projectId === null, 'expected null project id on divergent transcripts');
+    assert(/divergent-transcript-cwds/.test(r.unmappedReason), `expected the divergent reason propagated, got: ${r.unmappedReason}`);
+  });
+
   await run('U4', 'resolveProjectIdForDir: real marker resolved via cwd walk-up (project-marker.js, never decoded)', async () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-u4-'));
     const checkoutRoot = path.join(base, 'checkout');

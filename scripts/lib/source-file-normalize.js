@@ -11,19 +11,25 @@
  *   - the map-builder (scripts/migrations/migrate-03-corpus-project-id.js's
  *     filesystem walk over ~/.claude/projects/<encoded-cwd>/memory/*.md,
  *     turning each listed filename into a normalized key), and
- *   - the SQL-side matching (the same script's per-database backfill,
- *     which reads each corpus database's own LIVE `source_file` column
- *     values and must fold them onto the SAME normalized key space before
- *     looking them up in the map).
+ *   - the per-database backfill's matching step (the same script reads
+ *     each corpus database's own LIVE, raw `source_file` column values via
+ *     a plain SELECT, then calls THIS SAME normalize() function on each one
+ *     — in JS, not a hand-ported SQL twin — before looking the result up
+ *     in the map).
  *
- * D3-2 is explicit about why this has to be a SINGLE shared function
- * rather than two independently-hand-written implementations (one JS, one
- * SQL): "Verified live: stored source_file values use backslash; an
- * un-normalized join matches ZERO rows." A drift between two
- * hand-maintained normalizers (one in JS, one restated in SQL) is exactly
- * the kind of silent-divergence bug that produced that zero-row join in
- * the first place. This module is imported directly by both call sites —
- * never re-implemented inline at either one.
+ * Both call sites invoke this ONE function. There is deliberately no
+ * separate SQL-expression form of this transform: an earlier revision
+ * carried a `sqlExpr()` companion for a SQL-predicate-based matching path,
+ * but the shipped migration never matches via a SQL predicate — it always
+ * pulls raw values into JS first and normalizes there on both sides. A
+ * function that renders "the same transform in SQL" with nothing in the
+ * shipped code ever calling it would imply a dual-path parity that does
+ * not exist and cannot drift-guard anything real; it was removed rather
+ * than kept as unexercised, misleading surface area. D3-2's underlying
+ * concern — "verified live: stored source_file values use backslash; an
+ * un-normalized join matches ZERO rows" — is closed by there being exactly
+ * ONE normalization implementation that both sides import, not by having
+ * two implementations (JS and SQL) that could silently drift apart.
  *
  * normalize() is a total function over any input: separators normalized
  * to posix ('/'), Unicode NFC-normalized, an optional leading "memory/"
@@ -33,16 +39,6 @@
  * total case — never an exception). Any other non-string input is a
  * TypeError: a caller passing a number/object/etc. has a bug worth
  * surfacing loudly, not silently coercing.
- *
- * sqlExpr() renders the SAME transform as a Postgres SQL expression
- * string over an arbitrary column/parameter reference, for callers that
- * need to express the identical normalization inside a SQL predicate
- * (rather than pulling rows into JS first). It is verified against
- * normalize() by test/lib/test-source-file-normalize.js's cross-check
- * suite (round-tripping backslash/forward-slash/prefixed/unprefixed/
- * mixed-case fixtures through a live Postgres connection and asserting
- * byte-for-byte equality with the JS output) — this is what makes "used
- * identically" a verified property rather than an assertion.
  */
 
 const MEMORY_PREFIX = 'memory/';
@@ -90,47 +86,7 @@ function normalize(sourceFile) {
   return s;
 }
 
-/**
- * Render the SAME normalization as a Postgres SQL expression over an
- * arbitrary SQL text fragment (a quoted column reference, a parameter
- * placeholder like "$1", or a literal). The caller is responsible for
- * ensuring `colExpr` is safe to splice into SQL text (a column reference
- * or a parameter placeholder — never untrusted user input).
- *
- * Mirrors normalize()'s seven steps in SQL:
- *   1. normalize(<expr>, NFC)               -- Unicode NFC (Postgres 13+)
- *   2. replace(..., '\', '/')                -- backslash -> forward slash
- *   3. trim(...)                             -- leading/trailing whitespace
- *   4. regexp_replace(..., '^/+', '')        -- strip leading slash(es)
- *   5. regexp_replace(..., '/+', '/', 'g')   -- collapse duplicate slashes
- *   6. lower(...)                            -- case-fold
- *   7. regexp_replace(..., '^memory/', '')   -- strip optional prefix
- *      (safe post-lower(): the literal is already lower-case, so this is
- *      a plain, non-'i'-flagged match — kept deliberately simple rather
- *      than matching case-insensitively on already-lower-cased text.)
- *
- * @param {string} colExpr - SQL text for the column/parameter to normalize.
- * @returns {string} A SQL expression string producing the normalized value.
- */
-function sqlExpr(colExpr) {
-  if (typeof colExpr !== 'string' || !colExpr.trim()) {
-    throw new TypeError('source-file-normalize.sqlExpr: colExpr must be a non-empty SQL text fragment');
-  }
-  return (
-    `regexp_replace(` +
-      `lower(` +
-        `regexp_replace(` +
-          `regexp_replace(` +
-            `trim(replace(normalize(${colExpr}, NFC), '\\', '/'))` +
-          `, '^/+', '')` +
-        `, '/+', '/', 'g')` +
-      `)` +
-    `, '^memory/', '')`
-  );
-}
-
 module.exports = {
   normalize,
-  sqlExpr,
   MEMORY_PREFIX,
 };

@@ -38,20 +38,28 @@
  *   2. MAP-BUILDING (D3-1, filesystem walk, done ONCE, shared across every
  *      corpus DB found in step 1): for every directory directly under
  *      `<HANDOFF_BASE_DIR or ~/.claude>/projects/` that has a `memory/`
- *      subdirectory, resolves the REAL project id by (a) scanning that
- *      directory's own `*.jsonl` session transcripts for the first line
- *      carrying a string `cwd` field, then (b) walking up from that path
- *      via `project-marker.js`'s `findProjectRootByMarker` (imported, NEVER
- *      re-implemented) to the nearest `.memory-engine` (or legacy
- *      `.claude-memory`) marker and reading its UUID. The encoded-cwd
- *      DIRECTORY NAME ITSELF IS NEVER DECODED (D3-1: `encodeCwd` is lossy/
- *      non-invertible — "my.project", "my-project", and "my project" all
- *      encode identically). A directory with zero transcript files, zero
- *      transcript lines carrying a `cwd` field, no marker found by walking
- *      up from that `cwd`, or a marker read that throws (project-marker's
- *      documented dual-marker HARD ERROR) is UNMAPPED — its `memory/*.md`
- *      filenames are simply not offered as candidates to any DB, logged
- *      with the specific reason, never guessed.
+ *      subdirectory, resolves the REAL project id by (a) scanning EVERY
+ *      line of EVERY one of that directory's own `*.jsonl` session
+ *      transcripts for a string `cwd` field — never stopping at the first
+ *      hit, and refusing (never guessing) if more than one DISTINCT `cwd`
+ *      value is found across those transcripts (post-review fix: a
+ *      directory whose transcripts genuinely disagree, e.g. a moved/
+ *      renamed checkout later reused under the same encoded-cwd directory
+ *      name, must never resolve confidently to whichever transcript
+ *      happened to sort first) — then (b) walking up from the single
+ *      agreed-upon `cwd` via `project-marker.js`'s
+ *      `findProjectRootByMarker` (imported, NEVER re-implemented) to the
+ *      nearest `.memory-engine` (or legacy `.claude-memory`) marker and
+ *      reading its UUID. The encoded-cwd DIRECTORY NAME ITSELF IS NEVER
+ *      DECODED (D3-1: `encodeCwd` is lossy/non-invertible — "my.project",
+ *      "my-project", and "my project" all encode identically). A directory
+ *      with zero transcript files, zero transcript lines carrying a `cwd`
+ *      field, divergent `cwd` values across its transcripts, no marker
+ *      found by walking up from the agreed `cwd`, or a marker read that
+ *      throws (project-marker's documented dual-marker HARD ERROR) is
+ *      UNMAPPED — its `memory/*.md` filenames are simply not offered as
+ *      candidates to any DB, logged with the specific reason, never
+ *      guessed.
  *
  *   3. PER-DATABASE BACKFILL (one independent unit of work per corpus DB —
  *      a failure in one DB never blocks another):
@@ -292,11 +300,39 @@ function printClassification(classifications, dbPrefix) {
 // ─── MAP-BUILDING (D3-1/D3-2) ───────────────────────────────────────────────
 
 /**
- * Scan a directory's own *.jsonl session transcripts for the first line
- * carrying a string `cwd` field. Total classification of the result:
- *   - zero transcript files                          -> reason, cwd=null
- *   - N transcript files, none carry a `cwd` field    -> reason, cwd=null
- *   - a `cwd` field found                             -> cwd, reason=null
+ * Light canonicalization used ONLY to compare two `cwd` values for
+ * agreement (never used to derive a project id — the resolved `cwd`
+ * returned by findCwdFromTranscripts is always the raw, as-recorded
+ * string). Deliberately NOT full separator normalization (backslash <->
+ * forward-slash) and NOT case-folding — either would risk masking a REAL
+ * divergence (e.g. a genuinely different drive-letter-cased mount, or a
+ * case-sensitive POSIX path). Trims whitespace and strips exactly one
+ * trailing path separator, so a purely representational difference
+ * (trailing slash) does not manufacture a false "divergent" verdict, while
+ * any other difference still counts as one. Friction (routing an
+ * ambiguous case to the unmapped bucket) is always the safer default than
+ * silently treating two representations as equal when they might not be.
+ */
+function cwdCompareKey(cwd) {
+  return cwd.trim().replace(/[\\/]+$/, '');
+}
+
+/**
+ * Scan EVERY line of EVERY one of a directory's own *.jsonl session
+ * transcripts for a string `cwd` field — never stop at the first hit
+ * (post-review fix: an independent reviewer reproduced a silent confident
+ * misattribution from two divergent transcripts in the same directory,
+ * e.g. a moved/renamed checkout later reused under the same encoded-cwd
+ * directory name — resolving from whichever transcript happened to sort
+ * first is exactly the silent-misattribution failure mode D3-1's totality
+ * posture forbids). Total classification of the result:
+ *   - zero transcript files                              -> reason, cwd=null
+ *   - N transcript files, none carry a `cwd` field        -> reason, cwd=null
+ *   - every `cwd` field found agrees (via cwdCompareKey)   -> cwd, reason=null
+ *   - two or more DISTINCT cwdCompareKey values found      -> reason
+ *     ("divergent-transcript-cwds: N distinct values"), cwd=null — routed
+ *     to the unmapped bucket exactly like the zero-transcript and
+ *     dual-marker branches, never a guessed pick among the candidates.
  * Never guesses, never decodes the directory name itself.
  */
 function findCwdFromTranscripts(dirAbsPath) {
@@ -309,6 +345,7 @@ function findCwdFromTranscripts(dirAbsPath) {
   if (jsonlFiles.length === 0) {
     return { cwd: null, reason: 'zero transcript files (*.jsonl) in this directory' };
   }
+  const distinctByKey = new Map(); // cwdCompareKey -> first-seen raw cwd value
   for (const fname of jsonlFiles) {
     const fpath = path.join(dirAbsPath, fname);
     let raw;
@@ -327,11 +364,18 @@ function findCwdFromTranscripts(dirAbsPath) {
         continue;
       }
       if (obj && typeof obj.cwd === 'string' && obj.cwd.trim()) {
-        return { cwd: obj.cwd, reason: null };
+        const key = cwdCompareKey(obj.cwd);
+        if (!distinctByKey.has(key)) distinctByKey.set(key, obj.cwd);
       }
     }
   }
-  return { cwd: null, reason: `${jsonlFiles.length} transcript file(s) scanned, none carried a "cwd" field` };
+  if (distinctByKey.size === 0) {
+    return { cwd: null, reason: `${jsonlFiles.length} transcript file(s) scanned, none carried a "cwd" field` };
+  }
+  if (distinctByKey.size > 1) {
+    return { cwd: null, reason: `divergent-transcript-cwds: ${distinctByKey.size} distinct values` };
+  }
+  return { cwd: distinctByKey.values().next().value, reason: null };
 }
 
 /**
@@ -903,6 +947,7 @@ module.exports = {
   classifyDatabase,
   discoverAndClassify,
   printClassification,
+  cwdCompareKey,
   findCwdFromTranscripts,
   resolveProjectIdForDir,
   buildProjectDirIndex,
