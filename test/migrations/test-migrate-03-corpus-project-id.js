@@ -22,14 +22,21 @@
  *     classification, never a name-shape check), resolveDbMapping
  *     (winner-directory heuristic, deterministic tie-break, unique-fallback,
  *     ambiguous -> unmapped), classifyDatabase's unreachable branch.
- *   - FIELD-FINDING REGRESSIONS (second round): "worktree-cwd-resolves-
- *     same-project" — transcripts carrying a repo root cwd AND a
+ *   - FIELD-FINDING REGRESSIONS: "worktree-cwd-resolves-same-project"
+ *     (second round) — transcripts carrying a repo root cwd AND a
  *     `<repo>/.claude/worktrees/agent-x` cwd (the real-world norm for
  *     worktree agent sessions) resolve cleanly to the ONE project both
- *     paths' marker walk-up converges on, raw-cwd variety irrelevant; and
- *     "two-distinct-marker-roots-unmapped" — transcripts whose cwds
- *     resolve to two GENUINELY different marker roots are (correctly)
- *     unmapped with the divergence reason.
+ *     paths' marker walk-up converges on, raw-cwd variety irrelevant;
+ *     "two-distinct-marker-roots-unmapped" (second round) — transcripts
+ *     whose cwds resolve to two GENUINELY different marker roots are
+ *     (correctly) unmapped with the divergence reason; and
+ *     "mixed-resolvable-cwds-unmapped" (third round, the reviewer's exact
+ *     repro) — [rootX-no-marker, rootY-with-marker] is unmapped, NEVER
+ *     silently attributed to Y alone, because findProjectRootByMarker
+ *     never checks the start path for existence (only each candidate
+ *     ancestor's marker file), so an unresolvable cwd can never be a
+ *     benign deleted-worktree artifact — it always means no marker exists
+ *     anywhere in that ancestry.
  *   - Discovery: holds-corpus / no-corpus classification against real
  *     scratch databases; --discover-only mutates nothing.
  *   - Happy path: a single corpus DB backfilled from a matching fixture
@@ -360,6 +367,27 @@ async function main() {
     const r = migrate03.resolveProjectIdForDir(dirPath);
     assert(r.projectId === null, 'expected null project id on genuine root divergence');
     assert(/divergent-transcript-cwds: 2 distinct resolved project root/.test(r.unmappedReason), `expected the resolved-root divergence reason, got: ${r.unmappedReason}`);
+  });
+
+  await run('mixed-resolvable-cwds-unmapped', 'resolveProjectIdForDir: [rootX-no-marker, rootY-with-marker] -> unmapped with mixed-resolvable-cwds (reviewer\'s exact repro, third round): an unresolvable cwd is NEVER a benign deleted-worktree artifact (findProjectRootByMarker never checks the start path for existence), so it must never be silently absorbed into whichever side happened to resolve', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-mixed-'));
+    // Project Y: real, has a live marker.
+    const rootY = path.join(base, 'project-y');
+    fs.mkdirSync(rootY, { recursive: true });
+    const { uuid: uuidY } = projectMarker.writeMarker(rootY);
+    // Project X: simulates a checkout whose marker was deleted/never
+    // restored, or an alien path -- deliberately NO marker written here.
+    const rootX = path.join(base, 'project-x-no-marker');
+    fs.mkdirSync(rootX, { recursive: true });
+
+    const dirPath = path.join(base, 'encoded-cwd-dir');
+    fs.mkdirSync(dirPath, { recursive: true });
+    fs.writeFileSync(path.join(dirPath, 'a.jsonl'), JSON.stringify({ cwd: rootX }) + '\n', 'utf8');
+    fs.writeFileSync(path.join(dirPath, 'b.jsonl'), JSON.stringify({ cwd: rootY }) + '\n', 'utf8');
+
+    const r = migrate03.resolveProjectIdForDir(dirPath);
+    assert(r.projectId === null, `expected null project id (NEVER silently attributed to Y=${uuidY}), got ${r.projectId}`);
+    assert(/mixed-resolvable-cwds: 1 resolved to 1 root\(s\), 1 unresolvable/.test(r.unmappedReason), `expected the mixed-resolvable-cwds reason, got: ${r.unmappedReason}`);
   });
 
   await run('U4', 'resolveProjectIdForDir: real marker resolved via cwd walk-up (project-marker.js, never decoded)', async () => {

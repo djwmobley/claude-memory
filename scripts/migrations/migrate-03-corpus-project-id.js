@@ -56,15 +56,26 @@
  *      unmapped ("divergent-transcript-cwds: N distinct resolved project
  *      root(s)") — a directory whose transcripts genuinely point at two or
  *      more DIFFERENT projects, as opposed to one project's checkout plus
- *      its own worktrees. The encoded-cwd DIRECTORY NAME ITSELF IS NEVER
+ *      its own worktrees. A MIX of at least one resolving cwd and at least
+ *      one NON-resolving cwd is ALSO unmapped ("mixed-resolvable-cwds: N
+ *      resolved to <root-count> root(s), M unresolvable") — field-finding
+ *      fix, third round: `findProjectRootByMarker` never checks the START
+ *      path for existence (only each candidate ancestor's marker file), so
+ *      a deleted-worktree cwd still resolves fine; an UNRESOLVABLE cwd
+ *      therefore can never be explained away as a benign deleted-worktree
+ *      artifact — it always means no marker exists anywhere in that path's
+ *      ancestry (an alien path, or a genuinely lost second project), and
+ *      silently attributing the directory to whichever cwd happened to
+ *      resolve is unsafe. The encoded-cwd DIRECTORY NAME ITSELF IS NEVER
  *      DECODED (D3-1: `encodeCwd` is lossy/non-invertible — "my.project",
  *      "my-project", and "my project" all encode identically). A directory
  *      with zero transcript files, zero transcript lines carrying a `cwd`
- *      field, every resolved cwd resolving to no marker root, divergent
- *      resolved roots, or a marker read that throws (project-marker's
- *      documented dual-marker HARD ERROR) is UNMAPPED — its `memory/*.md`
- *      filenames are simply not offered as candidates to any DB, logged
- *      with the specific reason, never guessed.
+ *      field, every resolved cwd resolving to no marker root, a mix of
+ *      resolving and non-resolving cwds, divergent resolved roots, or a
+ *      marker read that throws (project-marker's documented dual-marker
+ *      HARD ERROR) is UNMAPPED — its `memory/*.md` filenames are simply
+ *      not offered as candidates to any DB, logged with the specific
+ *      reason, never guessed.
  *
  *   3. PER-DATABASE BACKFILL (one independent unit of work per corpus DB —
  *      a failure in one DB never blocks another):
@@ -434,14 +445,32 @@ function findCwdsFromTranscripts(dirAbsPath) {
  *       -> unmapped, that error surfaced immediately — never silently
  *          proceed past a HARD ERROR just because another cwd in the set
  *          happened to resolve cleanly
- *   - every distinct cwd that resolves at all resolves to NO marker root
- *     (all null)
+ *   - the distinct cwd set is a MIX of at least one that resolves to a
+ *     root AND at least one that resolves to NOTHING (checked BEFORE the
+ *     two branches below, third-round field finding)
+ *       -> unmapped ("mixed-resolvable-cwds: N resolved to <root-count>
+ *          root(s), M unresolvable") — findProjectRootByMarker is a pure
+ *          string/parent walk that NEVER checks the START path for
+ *          existence (only each candidate ancestor's marker FILE is
+ *          checked), so "a deleted worktree subdirectory under a real
+ *          root" is NOT a case that fails to resolve — it still resolves
+ *          fine, because the walk never needed the start path itself to
+ *          exist. An unresolvable cwd therefore ALWAYS means no marker
+ *          exists anywhere in that path's ancestry: an alien path, or a
+ *          genuinely lost/never-minted second project. Silently
+ *          attributing the whole directory to whichever side happened to
+ *          resolve (the second-round fix's behavior) could absorb the
+ *          unresolvable side's content into the wrong project — never
+ *          done; friction (unmapped) is the only safe default here.
+ *   - every distinct cwd resolves to NO marker root (all null, none
+ *     resolving — the "mixed" case above requires at least one to
+ *     resolve, so this is the ALL-unresolvable case)
  *       -> unmapped ("no project marker found walking up from any of N
  *          distinct cwd(s)")
- *   - every distinct cwd that DOES resolve agrees on exactly ONE root
+ *   - every distinct cwd resolves, and all agree on exactly ONE root
  *       -> RESOLVED — raw-cwd variety among the inputs is irrelevant once
- *          they converge on one root
- *   - two or more DISTINCT resolved roots
+ *          they converge on one root (the worktree case)
+ *   - every distinct cwd resolves, but to two or more DISTINCT roots
  *       -> unmapped ("divergent-transcript-cwds: N distinct resolved
  *          project root(s)"), the roots listed — a directory whose
  *          transcripts genuinely point at TWO OR MORE DIFFERENT projects
@@ -455,6 +484,7 @@ function resolveProjectIdForDir(dirAbsPath) {
     return { projectId: null, unmappedReason: cwdsReason };
   }
   const resolvedRoots = new Set();
+  let unresolvedCount = 0;
   for (const cwd of cwds) {
     let root;
     try {
@@ -463,6 +493,28 @@ function resolveProjectIdForDir(dirAbsPath) {
       return { projectId: null, unmappedReason: `findProjectRootByMarker threw for cwd="${cwd}": ${err.message}` };
     }
     if (root) resolvedRoots.add(root);
+    else unresolvedCount++;
+  }
+  // Third-round field finding: findProjectRootByMarker is a pure string/
+  // parent walk that never checks the START path for existence (only each
+  // candidate ancestor directory's MARKER FILE is checked) -- so an
+  // unresolvable cwd is never explainable as "a deleted worktree
+  // subdirectory under a real root" (that case still resolves fine, since
+  // the walk never needed the start path to exist). An unresolvable cwd
+  // therefore means NO marker exists anywhere in that path's ancestry: an
+  // alien path, or a genuinely lost/never-minted second project. A
+  // directory whose distinct cwds are a MIX of at least one that resolves
+  // and at least one that does NOT must never be confidently attributed to
+  // whichever side happened to resolve -- that would silently absorb the
+  // unresolvable side's (possibly real, possibly foreign) content. This
+  // check runs BEFORE the all-resolved-agree/all-resolved-diverge checks
+  // below, so it also fires correctly when the resolving side itself
+  // disagrees on more than one root.
+  if (resolvedRoots.size > 0 && unresolvedCount > 0) {
+    return {
+      projectId: null,
+      unmappedReason: `mixed-resolvable-cwds: ${cwds.length - unresolvedCount} resolved to ${resolvedRoots.size} root(s), ${unresolvedCount} unresolvable`,
+    };
   }
   if (resolvedRoots.size === 0) {
     return { projectId: null, unmappedReason: `no project marker found walking up from any of ${cwds.length} distinct cwd(s): ${cwds.join(', ')}` };
