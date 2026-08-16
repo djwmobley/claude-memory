@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **§6.1(h) handoff-markdown migration** — `scripts/migrations/migrate-08-handoff-markdown.js` parses a project's `HANDOFF.md` (active fat card) and `.claude/HANDOFF-HISTORY.md` (archive) into `assertions` rows, PEER to the SQL-source migrations. New `scripts/lib/handoff-markdown-parse.js` (fenced-code/blockquote/HTML-comment-aware heading classifier + markdown-table cell parser, the exact inverse of `carryover-render.js`'s escaping) and `scripts/lib/fs-path-normalize.js` (shared `filesystem:<path>` manifest-key normalizer, reusable by future filesystem-sourced migrations). Archived session summaries land under the new `session_tldr_archived` predicate (1:N; registry-added) — deliberately never the live 1:1 `session_tldr` predicate, so migration-origin rows can never corrupt the "most recent session" picker. Carry-over rows always land `carryover_status='open'`; durable sections (`run_commands`/`critical_operational_notes`/`key_paths`) land pinned; NEXT SESSION items get a freshly-assigned `seq`. Re-run semantics: whole-project delete-and-reinsert of this migration's own `source_model='markdown-migration-h'` rows in one transaction. New `scripts/migrations/handoff-section-headings.json` config (extensible per-project durable-heading list).
 - **§8 generalized MCP tool surface** — `scripts/handoff-mcp.mjs` grows from
   5 tools to 30: `memory_search` (hybrid vector+FTS across a closed
   15-table enum — `assertions`/`agent_exchange` plus 4 of the 13 seam

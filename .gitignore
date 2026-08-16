@@ -80,3 +80,9 @@ scripts/decisions_backup*.csv
 # scripts/migrations/memory-entry-project-map.example.json documents the
 # shape. See migrate-03-corpus-project-id.js's writeMapArtifact().
 /scripts/migrations/memory-entry-project-map.json
+
+# migrate-08-handoff-markdown.js's per-project fail-soft parse reports —
+# may embed real HANDOFF.md/HANDOFF-HISTORY.md content (subjects, session
+# summaries), never committed. See migrate-08-handoff-markdown.js's
+# writeReport().
+/scripts/migrations/reports/
