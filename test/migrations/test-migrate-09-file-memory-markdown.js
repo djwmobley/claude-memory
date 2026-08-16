@@ -32,8 +32,19 @@
  *   - Happy-path migrate: entities/edges/manifest rows land correctly,
  *     entity_type NULL for the unmatched-type case (proves the
  *     DROP NOT NULL addendum applied).
- *   - Idempotent re-run: no duplicate edges (proves
- *     edges_project_from_type_to_unique applied + upsert, not insert).
+ *   - Idempotent re-run: no duplicate edges (I-10 supersession, field
+ *     finding 2026-08-16 — the write path is now an existence-guarded
+ *     insert scoped to this script's own source_model tag, NOT an
+ *     `ON CONFLICT` upsert against a UNIQUE index; the plain
+ *     edges_project_from_type_to_idx lookup index applied by
+ *     sql/migrate-09-file-memory-schema.sql is non-unique by design so it
+ *     can coexist with the real table's legitimate historical duplicate
+ *     4-tuples).
+ *   - I-10 regressions: this script's own write is invisible to other
+ *     writers' pre-existing duplicate tuples (never blocked by them) and
+ *     unaffected by their presence on re-run; a target carrying duplicate
+ *     tuples proves the plain index applies cleanly where the old UNIQUE
+ *     index would have failed to even create.
  *   - I-12 precedence: a pre-existing entities row tagged a DIFFERENT
  *     source_model keeps its description untouched by this migration.
  *   - I-13 rollback: reference-count-gated entity cleanup — an entity
@@ -490,7 +501,7 @@ async function main() {
     }
   });
 
-  await run('T10', 'DB: idempotent re-run — no duplicate edges (proves unique index + upsert)', async () => {
+  await run('T10', 'DB: idempotent re-run — no duplicate edges (I-10: existence-guarded insert scoped to this script\'s own tag, not a UNIQUE-index upsert)', async () => {
     const r1 = runMigrate09(['--db', dbName, '--projects-root', fixtureRoot, '--enrollment-config', enrollmentConfigPath]);
     assert(r1.status === 0, `re-run 1 expected exit 0, got ${r1.status}; stderr=${r1.stderr}`);
     const r2 = runMigrate09(['--db', dbName, '--projects-root', fixtureRoot, '--enrollment-config', enrollmentConfigPath]);
@@ -504,6 +515,190 @@ async function main() {
       assert(Number(entRows[0].n) === 4, `expected entity count to stay at 4 after re-run, got ${entRows[0].n}`);
     } finally {
       await client.end();
+    }
+  });
+
+  await run('T10b', 'I-10 regression: target pre-seeded with 3 identical-tuple edges from ANOTHER writer (source_model NULL) — this run adds its own row, never blocked by them; a re-run adds nothing further; their 3 rows are untouched', async () => {
+    const cfgPath = path.join(fixtureRoot, 'enrollment-config-i10.json');
+    writeFixtureEnrollmentConfig(cfgPath, fixture.enrolledDirName);
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    cfg.enrolled_dirs[0].project_id = 'proj-i10-test';
+    fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), 'utf8');
+
+    // Pre-seed 3 identical-tuple edges under ANOTHER writer's tag, on the
+    // SAME (from_entity, edge_type, to_entity) migrate-09 will itself
+    // derive from this fixture (user_alpha_topic -[references]->
+    // project_beta_topic, per T6's own fixture-tree wiki-link assertions).
+    const client0 = await pgConnect(dbName);
+    try {
+      for (let i = 0; i < 3; i++) {
+        await client0.query(
+          `INSERT INTO edges (project_id, from_entity, edge_type, to_entity, source_model)
+           VALUES ('proj-i10-test', 'user_alpha_topic', 'references', 'project_beta_topic', NULL)`
+        );
+      }
+    } finally {
+      await client0.end();
+    }
+
+    const r1 = runMigrate09(['--db', dbName, '--projects-root', fixtureRoot, '--enrollment-config', cfgPath]);
+    assert(r1.status === 0, `expected exit 0 (never blocked by another writer's pre-existing duplicates), got ${r1.status}; stdout=${r1.stdout}\nstderr=${r1.stderr}`);
+    assert(/MIGRATION_RESULT: PASS/.test(r1.stdout), `expected MIGRATION_RESULT: PASS, got: ${r1.stdout}`);
+
+    const r2 = runMigrate09(['--db', dbName, '--projects-root', fixtureRoot, '--enrollment-config', cfgPath]);
+    assert(r2.status === 0, `re-run expected exit 0, got ${r2.status}; stderr=${r2.stderr}`);
+
+    const client = await pgConnect(dbName);
+    try {
+      const { rows: taggedRows } = await client.query(
+        `SELECT source_model FROM edges WHERE project_id='proj-i10-test' AND from_entity='user_alpha_topic' AND edge_type='references' AND to_entity='project_beta_topic' AND source_model='markdown-migration-i'`
+      );
+      assert(taggedRows.length === 1, `expected exactly 1 row tagged this script's own source_model after run + re-run, got ${taggedRows.length}`);
+
+      const { rows: otherRows } = await client.query(
+        `SELECT source_model FROM edges WHERE project_id='proj-i10-test' AND from_entity='user_alpha_topic' AND edge_type='references' AND to_entity='project_beta_topic' AND source_model IS NULL`
+      );
+      assert(otherRows.length === 3, `expected the other writer's 3 pre-seeded rows untouched, got ${otherRows.length}`);
+
+      const { rows: totalRows } = await client.query(
+        `SELECT COUNT(*) AS n FROM edges WHERE project_id='proj-i10-test' AND from_entity='user_alpha_topic' AND edge_type='references' AND to_entity='project_beta_topic'`
+      );
+      assert(Number(totalRows[0].n) === 4, `expected 4 total rows for this tuple (3 other-writer + 1 ours), got ${totalRows[0].n}`);
+
+      // The second, non-pre-seeded edge this fixture also derives
+      // (feedback_gamma_topic -> project_beta_topic) must land normally,
+      // proving the guard's scoping doesn't suppress unrelated writes.
+      const { rows: secondEdge } = await client.query(
+        `SELECT 1 FROM edges WHERE project_id='proj-i10-test' AND from_entity='feedback_gamma_topic' AND edge_type='references' AND to_entity='project_beta_topic' AND source_model='markdown-migration-i'`
+      );
+      assert(secondEdge.length === 1, `expected the second, non-pre-seeded edge to land normally, got ${JSON.stringify(secondEdge)}`);
+    } finally {
+      await client.end();
+    }
+  });
+
+  await run('T10c', 'I-10 regression: plain edges_project_from_type_to_idx applies cleanly over pre-existing duplicated data where the old UNIQUE index would fail to even create', async () => {
+    const dupDbName = `mm09_i10_dup_${TS}_staging`;
+    const sys = await pgConnect('postgres');
+    try { await sys.query(`CREATE DATABASE "${dupDbName}"`); } finally { await sys.end(); }
+    try {
+      await setupTargetSchema(dupDbName); // migrate-01 + migrate-schema-addenda -- NOT migrate-09's own schema step yet
+
+      const client0 = await pgConnect(dupDbName);
+      try {
+        // Simulate staging's real finding: 2+ identical 4-tuples already
+        // present in `edges`, faithfully migrated from a source graph that
+        // predates any uniqueness constraint on this tuple.
+        for (let i = 0; i < 2; i++) {
+          await client0.query(
+            `INSERT INTO edges (project_id, from_entity, edge_type, to_entity, source_model)
+             VALUES ('proj-dup-test', 'entity_a', 'references', 'entity_b', NULL)`
+          );
+        }
+
+        // Ground the regression: prove a UNIQUE index over this exact
+        // duplicated data genuinely fails (this is not a hypothetical --
+        // it is the mechanism the field finding actually hit).
+        let uniqueIndexThrew = false;
+        try {
+          await client0.query(
+            `CREATE UNIQUE INDEX test_i10_would_fail_unique ON edges (project_id, from_entity, edge_type, to_entity)`
+          );
+          await client0.query(`DROP INDEX test_i10_would_fail_unique`); // cleanup if it somehow succeeded
+        } catch (err) {
+          uniqueIndexThrew = true;
+          assert(/duplicate key|could not create unique index/i.test(err.message), `expected a duplicate-key failure, got: ${err.message}`);
+        }
+        assert(uniqueIndexThrew, 'expected CREATE UNIQUE INDEX over pre-existing duplicate tuples to fail -- if it did not, the regression this fix addresses is not actually reproduced by this fixture');
+      } finally {
+        await client0.end();
+      }
+
+      // Now run migrate-09 itself (zero enrolled dirs -- this test is only
+      // about the SCHEMA STEP succeeding against the duplicated table, not
+      // file processing) and confirm the plain index applies cleanly.
+      const emptyCfgPath = path.join(fixtureRoot, 'enrollment-config-empty.json');
+      fs.writeFileSync(emptyCfgPath, JSON.stringify({ enrolled_dirs: [], test_artifact_patterns: [] }, null, 2), 'utf8');
+      const emptyProjectsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'mm09-empty-root-'));
+      try {
+        const r = runMigrate09(['--db', dupDbName, '--projects-root', emptyProjectsRoot, '--enrollment-config', emptyCfgPath]);
+        assert(r.status === 0, `expected exit 0 (schema step must succeed despite pre-existing duplicates), got ${r.status}; stdout=${r.stdout}\nstderr=${r.stderr}`);
+        assert(/MIGRATION_RESULT: PASS/.test(r.stdout), `expected MIGRATION_RESULT: PASS, got: ${r.stdout}`);
+      } finally {
+        fs.rmSync(emptyProjectsRoot, { recursive: true, force: true });
+      }
+
+      const client = await pgConnect(dupDbName);
+      try {
+        const { rows: idxRows } = await client.query(
+          `SELECT indexname, indexdef FROM pg_indexes WHERE tablename='edges' AND indexname='edges_project_from_type_to_idx'`
+        );
+        assert(idxRows.length === 1, `expected edges_project_from_type_to_idx to exist, got ${JSON.stringify(idxRows)}`);
+        assert(!/UNIQUE/i.test(idxRows[0].indexdef), `expected a NON-unique index, got: ${idxRows[0].indexdef}`);
+
+        const { rows: oldIdxRows } = await client.query(
+          `SELECT 1 FROM pg_indexes WHERE tablename='edges' AND indexname='edges_project_from_type_to_unique'`
+        );
+        assert(oldIdxRows.length === 0, 'expected the old UNIQUE index name to be absent (never created on this target, and DROP INDEX IF EXISTS is a no-op)');
+
+        const { rows: dupRows } = await client.query(
+          `SELECT COUNT(*) AS n FROM edges WHERE project_id='proj-dup-test' AND from_entity='entity_a' AND edge_type='references' AND to_entity='entity_b'`
+        );
+        assert(Number(dupRows[0].n) === 2, `expected the 2 pre-existing duplicate rows to survive untouched, got ${dupRows[0].n}`);
+      } finally {
+        await client.end();
+      }
+    } finally {
+      await dropDb(dupDbName);
+    }
+  });
+
+  await run('T10d', 'I-10 upgrade path: a target where the OLD UNIQUE index previously succeeded (dupe-free) has it DROPPED and REPLACED with the plain index — deterministic convergence', async () => {
+    const upgDbName = `mm09_i10_upg_${TS}_staging`;
+    const sys = await pgConnect('postgres');
+    try { await sys.query(`CREATE DATABASE "${upgDbName}"`); } finally { await sys.end(); }
+    try {
+      await setupTargetSchema(upgDbName);
+
+      const client0 = await pgConnect(upgDbName);
+      try {
+        // Simulate a target where the ORIGINAL I-10 SQL ran successfully
+        // (a dupe-free table, e.g. a fresh dev/CI database) before this
+        // fix existed.
+        await client0.query(
+          `CREATE UNIQUE INDEX edges_project_from_type_to_unique ON edges (project_id, from_entity, edge_type, to_entity)`
+        );
+      } finally {
+        await client0.end();
+      }
+
+      const emptyCfgPath = path.join(fixtureRoot, 'enrollment-config-empty-upg.json');
+      fs.writeFileSync(emptyCfgPath, JSON.stringify({ enrolled_dirs: [], test_artifact_patterns: [] }, null, 2), 'utf8');
+      const emptyProjectsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'mm09-empty-root-upg-'));
+      try {
+        const r = runMigrate09(['--db', upgDbName, '--projects-root', emptyProjectsRoot, '--enrollment-config', emptyCfgPath]);
+        assert(r.status === 0, `expected exit 0, got ${r.status}; stdout=${r.stdout}\nstderr=${r.stderr}`);
+      } finally {
+        fs.rmSync(emptyProjectsRoot, { recursive: true, force: true });
+      }
+
+      const client = await pgConnect(upgDbName);
+      try {
+        const { rows: oldIdx } = await client.query(
+          `SELECT 1 FROM pg_indexes WHERE tablename='edges' AND indexname='edges_project_from_type_to_unique'`
+        );
+        assert(oldIdx.length === 0, 'expected the old UNIQUE index to have been DROPPED');
+
+        const { rows: newIdx } = await client.query(
+          `SELECT indexdef FROM pg_indexes WHERE tablename='edges' AND indexname='edges_project_from_type_to_idx'`
+        );
+        assert(newIdx.length === 1, 'expected the new plain index to exist after the upgrade');
+        assert(!/UNIQUE/i.test(newIdx[0].indexdef), `expected the replacement index to be non-unique, got: ${newIdx[0].indexdef}`);
+      } finally {
+        await client.end();
+      }
+    } finally {
+      await dropDb(upgDbName);
     }
   });
 
