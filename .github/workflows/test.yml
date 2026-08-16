@@ -363,6 +363,41 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run own-graph verify/migrate tests (§6.1(c), memory-manager#11(c))
+        # Tests scripts/migrations/migrate-verify-own-graph.js — verifies
+        # whether claude-memory's own graph data (entities/assertions/edges/
+        # retrieval_contract/retrieval_contract_history/project_settings/
+        # entity_communities/extraction_queue/retrieval_events/
+        # retrieval_event_assertions) lives in the old claude_memory_eval_test
+        # fallback DB and migrates the REAL (non-eval-junk) rows into the
+        # memory_manager_staging consolidation target. memory_entries/
+        # memory_entry_chunks are explicitly out of scope (phase (d)/(f)/(g)).
+        # Covers: C-1 total classification (REAL vs JUNK project_id, junk the
+        # default branch) against known-own-graph-project-ids.json; C-6
+        # idempotent per-(table,project_id)-slice delete-then-reinsert via the
+        # own_graph_migration_ids lineage table (registered as battery-infra
+        # DDL in verify15-shared.js, NOT a private per-script constant — T0-REG
+        # is a regression guard for exactly that registration, reproducing the
+        # scenario end-to-end: real migrate run against a disposable target,
+        # then verify-15-t0-roster.js against the SAME target using the
+        # SHIPPED source-table-roster.example.json's own 10
+        # migrate-verify-own-graph.js-tagged entries, asserting
+        # own_graph_migration_ids never lands in T0's unclassified bucket and
+        # both the forward and inverse roster-totality directions PASS); C-3
+        # content-divergence detection (a foreign row sharing a natural key
+        # with different content is logged and never overwritten); the
+        # retrieval_event_assertions source-id -> target-id FK remap surviving
+        # a delete-then-reinsert re-run; and --rollback (manifest-guided,
+        # deletes exactly this source's migrated rows via lineage, never a
+        # blanket project_id delete).
+        # Creates/drops its own scratch databases (target "_staging"-suffixed
+        # to satisfy migrate-01's classifyTarget); never touches
+        # claude_memory_eval_test/memory_manager_staging.
+        run: node test/migrations/test-migrate-verify-own-graph.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run source-file-normalize unit tests (§6.1(d) D3-2/D3-10, memory-manager#11(d))
         # Tests scripts/lib/source-file-normalize.js -- the ONE shared normalization
         # function used identically by migrate-03-corpus-project-id.js's filesystem

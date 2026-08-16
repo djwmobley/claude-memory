@@ -73,6 +73,14 @@ scripts/decisions_backup*.csv
 # never committed. See migrate-02-decisions.js's backupSourceTable().
 /scripts/migrations/backups/
 
+# migrate-verify-own-graph.js's real/junk project_id classification set —
+# the real marker UUID + real encoded-cwd project id observed live in
+# claude_memory_eval_test (CONSOLIDATION-RUNBOOK.md §6.1(c)'s C-1
+# amendment), never committed. scripts/migrations/known-own-graph-project-
+# ids.example.json documents the required shape. See
+# migrate-verify-own-graph.js's loadKnownOwnGraphProjectIds().
+/scripts/migrations/known-own-graph-project-ids.json
+
 # migrate-03-corpus-project-id.js's built project-attribution map — an
 # AUDIT ARTIFACT of each run (never read back as input, D3-7), carrying
 # real ~/.claude/projects directory names, real database names, and real

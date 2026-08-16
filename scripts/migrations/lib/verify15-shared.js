@@ -16,9 +16,14 @@
  *     no .trim(), JSON.stringify of the value array, md5) — reused by T1
  *     (source snapshot), T3/T3b (live comparison), and test fixtures
  *   - DDL: CREATE TABLE IF NOT EXISTS for every shared table this battery
- *     reads/writes (migration_manifest, migration_manifest_row_hashes,
- *     memory_manager_staging_row_hashes, dual_write_shim_window,
- *     old_store_row_hashes, containment_evidence, promotion_conflict_log)
+ *     (or a migrate-NN-*.js script) reads/writes (migration_manifest,
+ *     migration_manifest_row_hashes, memory_manager_staging_row_hashes,
+ *     dual_write_shim_window, old_store_row_hashes, containment_evidence,
+ *     promotion_conflict_log, own_graph_migration_ids) — registered here,
+ *     never as a private DDL block inside an individual script, so T0's
+ *     live-table classification (verify-15-t0-roster.js) recognizes every
+ *     one of them as battery/engine infrastructure via
+ *     getBatteryInfraTables() below
  *   - containment_evidence row writer (T4/F1-F4 evidence, §15.2.1)
  *
  * NEVER connects to claude_memory_eval_test, claude_policy_framework, any
@@ -543,6 +548,33 @@ CREATE TABLE IF NOT EXISTS promotion_conflict_log (
   reviewed_by          TEXT,
   logged_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- own_graph_migration_ids: migrate-verify-own-graph.js's (§6.1(c)) own
+-- source-id -> target-id lineage table. Registered HERE (not as a private
+-- DDL constant inside that script) so T0's live-table total classification
+-- (verify-15-t0-roster.js, category (b) "battery-infra", derived from THIS
+-- FILE's own DDL_SQL text via getBatteryInfraTables() below) recognizes it
+-- as battery/engine infrastructure rather than FAILing it as an
+-- unclassified table present in the target -- mirrors how migration_manifest
+-- itself is registered (a script-agnostic, shared infra table, never a
+-- per-script private DDL block). Every in-scope table but project_settings
+-- has a real SERIAL id; project_settings' PK is (project_id, key), so its
+-- lineage rows carry the key as source_row_id and a dummy sentinel (1) in
+-- target_row_id (INTEGER NOT NULL, cannot hold text) -- see that script's
+-- header comment.
+CREATE TABLE IF NOT EXISTS own_graph_migration_ids (
+  id            SERIAL PRIMARY KEY,
+  source_db     TEXT NOT NULL,
+  source_table  TEXT NOT NULL,
+  source_row_id TEXT NOT NULL,
+  project_id    TEXT,
+  target_table  TEXT NOT NULL,
+  target_row_id INTEGER NOT NULL,
+  migrated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (source_db, source_table, source_row_id)
+);
+CREATE INDEX IF NOT EXISTS own_graph_migration_ids_slice_idx
+  ON own_graph_migration_ids (source_db, source_table, project_id);
 `.trim();
 
 async function applyDdl(client) {
