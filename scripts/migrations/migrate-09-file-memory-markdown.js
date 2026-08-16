@@ -69,12 +69,22 @@
  *      case-insensitive (I-7).
  *   6. Per remaining topic file: `entities.name` = the filename stem
  *      ALWAYS (I-4, never the frontmatter title). Entity type resolution
- *      (I-3/I-8) checks `frontmatter.type`, THEN
- *      `frontmatter.metadata?.type`; if both are absent, falls back to
- *      filename-prefix inference (`feedback_`/`project_`/`reference_`/
- *      `user_`, in that fixed order) — a LOGGED fallback, never silent;
- *      if that also fails, entity_type is written as NULL ("unmatched-
- *      type", also logged) — the row is still written, never dropped.
+ *      (I-3/I-8) checks `frontmatter.type`, THEN `frontmatter.metadata?.
+ *      type` ONLY if `frontmatter.type` contributed no candidate at all;
+ *      whichever field contributes the first non-empty candidate is
+ *      validated against the exact 4-value enum (`user|feedback|project|
+ *      reference`) — a non-empty value outside that enum (e.g. `banana`)
+ *      is a TERMINAL "invalid-enum-value" result: entity_type is written
+ *      NULL and a loud unmatched-type report line is logged, and
+ *      resolution NEVER falls through to filename-prefix inference (an
+ *      explicit-but-wrong author claim must not be silently "corrected"
+ *      by a heuristic guess) nor to the other frontmatter field. Only
+ *      when NEITHER field contributes any candidate does resolution fall
+ *      back to filename-prefix inference (`feedback_`/`project_`/
+ *      `reference_`/`user_`, in that fixed order) — a LOGGED fallback,
+ *      never silent; if that also fails, entity_type is written as NULL
+ *      ("unmatched-type", also logged) — the row is still written, never
+ *      dropped.
  *      Description is primarily sourced from MEMORY.md's own hand-curated
  *      index line (`- [Title](stem.md) — description`) for that stem, per
  *      §6.1(i) point 3; frontmatter/title text is never used to derive it.
@@ -156,7 +166,6 @@
  */
 
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { Client } = require('pg');
@@ -164,6 +173,12 @@ const { Client } = require('pg');
 const migrateOne = require('./migrate-01-canonical-db'); // reused by reference, never forked
 const shared = require('./lib/verify15-shared');          // reused by reference: rowHash, applyDdl
 const { fsSourceDb } = require('../lib/fs-source-path');   // reused by reference (H-14 convention)
+const { resolveBaseDir } = require('../lib/handoff-paths'); // reused by reference — single source of
+                                                             // truth for the .claude base dir; honors
+                                                             // HANDOFF_BASE_DIR. Never hand-roll
+                                                             // os.homedir()+'.claude' locally (enforced
+                                                             // repo-wide by test-host-agnostic-naming.js's
+                                                             // S1 sweep).
 
 // ─── PATHS / CONSTANTS ────────────────────────────────────────────────────
 
@@ -173,7 +188,12 @@ const SQL_FILE = path.join(SQL_DIR, 'migrate-09-file-memory-schema.sql');
 const SQL_FILES = [SQL_FILE];
 
 const ENROLLMENT_CONFIG_PATH = path.join(MIGRATIONS_DIR, 'file-memory-project-enrollment.json');
-const DEFAULT_PROJECTS_ROOT = path.join(os.homedir(), '.claude', 'projects');
+// Routed through handoff-paths.js's resolveBaseDir() (single source of truth
+// for the .claude base dir; honors the HANDOFF_BASE_DIR override with its
+// own MSYS-trap + '..'-traversal validation) — NEVER a hand-rolled
+// os.homedir()+'.claude' duplicate, which would silently ignore that
+// override for this script alone.
+const DEFAULT_PROJECTS_ROOT = path.join(resolveBaseDir(), 'projects');
 
 const PREREQUISITE_TABLES = ['entities', 'edges'];
 // entities.source_model/agent_id + edges.source_model/agent_id are added by
@@ -195,6 +215,11 @@ const EDGE_TYPE = 'references';
 
 // I-3/I-8: fixed check order. Also drives the I-3 filename-prefix fallback.
 const FILENAME_PREFIX_TYPES = ['feedback', 'project', 'reference', 'user'];
+// I-3: the exact 4-value enum a resolved frontmatter.type/metadata.type
+// string must belong to. A non-empty value that does NOT match this set
+// (e.g. "banana") is an explicit-but-invalid author claim, not an absent
+// one -- see resolveEntityType's "invalid-enum-value" branch below.
+const VALID_ENTITY_TYPES = new Set(FILENAME_PREFIX_TYPES);
 
 // I-2: documentary ~116 baseline (§6.1(f)'s own known count). Diagnostic
 // display only — NEVER read by any pass/fail branch in this script.
@@ -385,15 +410,44 @@ function stripQuotes(v) {
 }
 
 /**
- * I-3/I-8: entity_type resolution, total classification over four branches.
+ * I-3/I-8: entity_type resolution, total classification over five branches.
+ *
+ * Order: frontmatter.type is checked first; frontmatter.metadata.type is
+ * checked ONLY when frontmatter.type contributes no candidate at all
+ * (absent, non-string, or blank after trim) — NOT as a retry when
+ * frontmatter.type contributed a candidate that failed enum validation.
+ * Whichever field contributes the first non-empty candidate is validated
+ * against the exact 4-value enum (VALID_ENTITY_TYPES):
+ *   - valid            -> that value, method names the winning field.
+ *   - invalid           -> 'invalid-enum-value': entity_type NULL, logged.
+ *     An explicit-but-wrong author claim is a TERMINAL result — it never
+ *     falls through to filename-prefix inference (a heuristic guess must
+ *     never silently "correct" a stated-but-wrong value) and never falls
+ *     through to checking the other frontmatter field either (that would
+ *     let a lucky valid value elsewhere mask the fact that the field the
+ *     author actually set was wrong).
+ *   - no candidate from either field -> filename-prefix inference (logged
+ *     fallback) -> 'unmatched-type' (entity_type NULL, logged) if that
+ *     also fails to match.
  */
 function resolveEntityType(frontmatter, stem) {
+  let candidate = null;
+  let candidateMethod = null;
   if (typeof frontmatter.type === 'string' && frontmatter.type.trim()) {
-    return { entityType: frontmatter.type.trim(), method: 'frontmatter.type' };
+    candidate = frontmatter.type.trim();
+    candidateMethod = 'frontmatter.type';
+  } else if (frontmatter.metadata && typeof frontmatter.metadata.type === 'string' && frontmatter.metadata.type.trim()) {
+    candidate = frontmatter.metadata.type.trim();
+    candidateMethod = 'frontmatter.metadata.type';
   }
-  if (frontmatter.metadata && typeof frontmatter.metadata.type === 'string' && frontmatter.metadata.type.trim()) {
-    return { entityType: frontmatter.metadata.type.trim(), method: 'frontmatter.metadata.type' };
+
+  if (candidate !== null) {
+    if (VALID_ENTITY_TYPES.has(candidate)) {
+      return { entityType: candidate, method: candidateMethod };
+    }
+    return { entityType: null, method: 'invalid-enum-value', invalidValue: candidate, invalidSource: candidateMethod };
   }
+
   for (const prefix of FILENAME_PREFIX_TYPES) {
     if (stem.startsWith(`${prefix}_`)) {
       return { entityType: prefix, method: 'filename-prefix-fallback' };
@@ -517,11 +571,18 @@ function parseProjectMemoryDir(memoryDirPath) {
     const text = fs.readFileSync(filePath, 'utf8');
     const { frontmatter, body } = parseFrontmatterAndBody(text);
 
-    const { entityType, method } = resolveEntityType(frontmatter, stem);
+    const resolved = resolveEntityType(frontmatter, stem);
+    const { entityType, method } = resolved;
     if (method === 'filename-prefix-fallback') {
       events.push({ kind: 'filename-prefix-fallback', stem, entityType });
+    } else if (method === 'invalid-enum-value') {
+      // I-3: frontmatter present-but-invalid -- reported as its own named
+      // reason under the SAME 'unmatched-type' report kind (loud
+      // unmatched-type report line), never silently accepted verbatim and
+      // never masked by falling through to prefix inference.
+      events.push({ kind: 'unmatched-type', stem, reason: 'invalid-enum-value', invalidValue: resolved.invalidValue, invalidSource: resolved.invalidSource });
     } else if (method === 'unmatched-type') {
-      events.push({ kind: 'unmatched-type', stem });
+      events.push({ kind: 'unmatched-type', stem, reason: 'no-frontmatter-type-no-prefix-match' });
     }
 
     let description = null;
@@ -741,6 +802,8 @@ function printEvents(projectId, events) {
   for (const ev of events) {
     if (ev.kind === 'filename-prefix-fallback') {
       console.log(`  [FALLBACK] project_id="${projectId}" stem="${ev.stem}": no frontmatter type; filename-prefix inference -> entity_type="${ev.entityType}"`);
+    } else if (ev.kind === 'unmatched-type' && ev.reason === 'invalid-enum-value') {
+      console.log(`  [UNMATCHED-TYPE] project_id="${projectId}" stem="${ev.stem}": ${ev.invalidSource}="${ev.invalidValue}" is not one of the 4 valid entity types (user|feedback|project|reference); entity_type written NULL (never falls through to filename-prefix inference)`);
     } else if (ev.kind === 'unmatched-type') {
       console.log(`  [UNMATCHED-TYPE] project_id="${projectId}" stem="${ev.stem}": no frontmatter type and no recognized filename prefix; entity_type written NULL`);
     } else if (ev.kind === 'no-memory-index-entry') {
@@ -923,6 +986,7 @@ module.exports = {
   SOURCE_MODEL_TAG,
   EDGE_TYPE,
   FILENAME_PREFIX_TYPES,
+  VALID_ENTITY_TYPES,
   DOCUMENTARY_BASELINE_TOTAL,
   MEMORY_INDEX_FILENAME,
   ENROLLMENT_CONFIG_PATH,

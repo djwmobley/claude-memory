@@ -274,6 +274,33 @@ async function main() {
     assert(r.entityType === null && r.method === 'unmatched-type', JSON.stringify(r));
   });
 
+  await run('T2e', 'I-3 regression: invalid enum value ("banana") on frontmatter.type NEVER falls through to filename-prefix inference', async () => {
+    // stem starts with "feedback_" -- WOULD prefix-match if resolution
+    // fell through, which it must not.
+    const r = migrate09.resolveEntityType({ type: 'banana' }, 'feedback_something');
+    assert(r.entityType === null, `entity_type must be NULL for an invalid enum value, got ${JSON.stringify(r)}`);
+    assert(r.method === 'invalid-enum-value', `expected method 'invalid-enum-value', got ${JSON.stringify(r)}`);
+    assert(r.invalidValue === 'banana' && r.invalidSource === 'frontmatter.type', JSON.stringify(r));
+  });
+
+  await run('T2f', 'I-3 regression: invalid enum value on frontmatter.metadata.type ALSO never falls through to filename-prefix inference', async () => {
+    const r = migrate09.resolveEntityType({ metadata: { type: 'banana' } }, 'project_something');
+    assert(r.entityType === null, `entity_type must be NULL for an invalid enum value, got ${JSON.stringify(r)}`);
+    assert(r.method === 'invalid-enum-value', `expected method 'invalid-enum-value', got ${JSON.stringify(r)}`);
+    assert(r.invalidValue === 'banana' && r.invalidSource === 'frontmatter.metadata.type', JSON.stringify(r));
+  });
+
+  await run('T2g', 'I-3 regression: an invalid frontmatter.type is terminal — never probes frontmatter.metadata.type either, even when metadata.type is itself valid', async () => {
+    const r = migrate09.resolveEntityType({ type: 'banana', metadata: { type: 'user' } }, 'user_something');
+    assert(r.entityType === null && r.method === 'invalid-enum-value' && r.invalidSource === 'frontmatter.type',
+      `an invalid top-level type must not be rescued by a valid metadata.type, got ${JSON.stringify(r)}`);
+  });
+
+  await run('T2h', 'VALID_ENTITY_TYPES is the exact 4-value enum', async () => {
+    const vals = [...migrate09.VALID_ENTITY_TYPES].sort();
+    assert(JSON.stringify(vals) === JSON.stringify(['feedback', 'project', 'reference', 'user']), JSON.stringify(vals));
+  });
+
   await run('T3', 'listTopicFiles: MEMORY.md excluded case-insensitively + .md.bak-<ts> excluded by extname boundary (I-9)', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mm09-listfiles-'));
     try {
@@ -349,6 +376,35 @@ async function main() {
 
     const unmatchedTypeEvents = parsed.events.filter((e) => e.kind === 'unmatched-type');
     assert(unmatchedTypeEvents.length === 1 && unmatchedTypeEvents[0].stem === 'unrecognized_delta_topic', JSON.stringify(unmatchedTypeEvents));
+  });
+
+  await run('T6b', 'I-3 regression (parseProjectMemoryDir, isolated fixture): frontmatter.type="banana" -> unmatched-type/invalid-enum-value, NULL entity_type, never prefix-inferred', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mm09-invalid-enum-'));
+    try {
+      // Stem starts with "feedback_" -- WOULD prefix-match to "feedback"
+      // if resolution incorrectly fell through past the invalid value.
+      fs.writeFileSync(path.join(tmp, 'feedback_hostile_one.md'), [
+        '---',
+        'type: banana',
+        '---',
+        '',
+        'Body text, no links.',
+      ].join('\n'), 'utf8');
+      const parsed = migrate09.parseProjectMemoryDir(tmp);
+
+      assert(parsed.entities.length === 1, JSON.stringify(parsed.entities));
+      assert(parsed.entities[0].entityType === null, `expected entity_type NULL, got ${JSON.stringify(parsed.entities[0])}`);
+
+      const unmatchedTypeEvents = parsed.events.filter((e) => e.kind === 'unmatched-type');
+      assert(unmatchedTypeEvents.length === 1, JSON.stringify(parsed.events));
+      assert(unmatchedTypeEvents[0].reason === 'invalid-enum-value', JSON.stringify(unmatchedTypeEvents));
+      assert(unmatchedTypeEvents[0].invalidValue === 'banana' && unmatchedTypeEvents[0].invalidSource === 'frontmatter.type', JSON.stringify(unmatchedTypeEvents));
+
+      const prefixFallbackEvents = parsed.events.filter((e) => e.kind === 'filename-prefix-fallback');
+      assert(prefixFallbackEvents.length === 0, `invalid enum value must NEVER fall through to filename-prefix inference, got ${JSON.stringify(prefixFallbackEvents)}`);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
   // ── DB tests ─────────────────────────────────────────────────────────────
