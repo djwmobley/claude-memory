@@ -60,3 +60,15 @@ scripts/decisions_backup*.csv
 # stay local only. See scripts/migrations/lib/verify15-shared.js loadRoster().
 /scripts/migrations/source-table-roster.json
 /scripts/migrations/recall-equivalence-queries.json
+
+# migrate-02-decisions.js's routing map — real project identifiers +
+# private per-project routing rules (CONSOLIDATION-RUNBOOK.md §16.1/§16.2),
+# never committed. scripts/migrations/topic-prefix-to-project.example.json
+# documents the required shape. See migrate-02-decisions.js's
+# loadRoutingMap().
+/scripts/migrations/topic-prefix-to-project.json
+
+# migrate-02-decisions.js's pre-migration source backup dumps — real
+# claude_policy_framework.decisions content (private, cross-project prose),
+# never committed. See migrate-02-decisions.js's backupSourceTable().
+/scripts/migrations/backups/
