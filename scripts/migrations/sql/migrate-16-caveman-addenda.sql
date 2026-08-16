@@ -1,0 +1,41 @@
+-- migrate-16-caveman-addenda.sql
+--
+-- §3.5 schema addendum for the store-wide caveman-economy gate (K-9
+-- owner-delegate decision, memory-manager#12/T7, 2026-08-16). Schema-only,
+-- idempotent, re-runnable, no DROP anywhere in this file.
+--
+-- Ships as its OWN file/runner (migrate-16-caveman-addenda.js), following the
+-- same precedent migrate-15-mcp-addenda.js set (see that file's own header
+-- comment): NOT folded into migrate-schema-addenda.js's shared SQL_FILES
+-- array, so a concurrent sibling PR adding its own addendum cannot collide
+-- on that shared file. A same-named-file collision with another PR that also
+-- picks "migrate-16-..." is a visible git conflict, resolved at merge time —
+-- not a silent one, unlike editing a shared array.
+--
+-- (K-9) assertions.authoring_mode — assertions.object is the invariant's
+-- birthplace (§3.1) but the assertions table has never carried an
+-- authoring_mode column; every other §5.3 seam table got one at CREATE TIME
+-- (§5.3's DDL: `authoring_mode TEXT NOT NULL DEFAULT 'caveman' CHECK (...)`).
+-- assertions is NOT a fresh CREATE TABLE — it has lived, real rows written
+-- BEFORE this invariant existed. Backfilling every existing row to
+-- 'caveman' via a NOT-NULL-DEFAULT ADD COLUMN (the seam-table shape) would
+-- MISCLASSIFY every pre-existing row as caveman-compliant when it was never
+-- authored under this discipline at all — a false-positive-prone lie the
+-- store-wide gate would then have to specially exempt anyway.
+--
+-- Instead this column follows the SAME grandfather pattern this table
+-- already uses for `tier` and `reality_check` (handoff-core-schema.sql:
+-- "tier IS NULL means the row predates this migration and MUST be treated
+-- as 'consolidated'... NEVER issue an UPDATE that sets tier on pre-existing
+-- rows"): nullable, CHECK-constrained, NO DEFAULT. Existing rows get NULL
+-- (grandfathered — the store-wide gate treats NULL identically to
+-- 'verbose': fidelity-checked, economy-exempt, never retroactively
+-- rewritten). New assertion rows are expected to be written with
+-- authoring_mode='caveman' explicitly by the write path (§3.4, forward-only
+-- enforcement) — wiring handoff.js's assertion-insert call sites to set it
+-- is a SEPARATE, write-path-enforcement piece of work, out of scope for
+-- this schema-only addendum (same division of labor as `tier`'s own
+-- history: the column landed before every insert call site was updated to
+-- set it).
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS authoring_mode TEXT
+  CHECK (authoring_mode IN ('caveman', 'verbose'));

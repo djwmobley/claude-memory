@@ -1053,11 +1053,44 @@ async function testT6ReferentialIntegrity() {
 }
 
 async function testT7CavemanEconomy() {
+  // The store-wide gate (test/north-star/test-caveman-economy-store-wide.js)
+  // now EXISTS (memory-manager#12, T7's former blocker) — this test's
+  // original assertion ("prerequisite not built") is stale and can never
+  // match again. Updated to reflect current reality rather than deleted,
+  // because the underlying INTENT this test encodes — "T7 never silently
+  // passes" — still holds, just via a different, now-accurate mechanism.
+  //
+  // TARGET_DB here is the SAME narrow 7-table fixture setupTargetSchema()
+  // builds for every other T0-T8 test in this file (decisions/tasks/
+  // entities/edges/memory_entries/memory_entry_chunks/routing_profiles) —
+  // nowhere near the full 29-table §5 schema scripts/migrations/
+  // caveman-columns.json is built against. Running the now-real gate
+  // against this deliberately narrow fixture is EXPECTED to fail its own
+  // K-8 completeness backstop — not because the gate is missing, but
+  // because this fixture's schema doesn't match §5. That is a correct, loud
+  // failure (never a silent pass), reproduced independently (drop one
+  // manifest column from a disposable DB -> named in "stale manifest
+  // entries"; add one unlisted live column -> named in
+  // "unclassified-LOUD-FAIL") before this assertion was written.
+  //
+  // The gate's POSITIVE path (PASS against a fully §5-provisioned schema) is
+  // already covered by its own test suite (test/migrations/
+  // test-caveman-gate-store-wide.js's T5c/T6a, and
+  // test/north-star/test-caveman-economy-store-wide.js's own CLI smoke run,
+  // both of which also run against the REAL memory_manager_staging) —
+  // building a second full §5 schema fixture inside THIS shared-fixture file
+  // would duplicate that coverage and risk destabilizing the ~15 other tests
+  // that depend on TARGET_DB's narrow, fast-to-provision shape.
   const r = runScript('verify-15-t7-caveman-economy.js', ['--db', TARGET_DB]);
-  if (r.status !== 0 && /prerequisite .* not built/.test(r.stdout + r.stderr)) {
-    pass('T7', 'store-wide caveman gate prerequisite not built -> FAIL, loud, non-zero exit (never silently passes)');
+  const combined = r.stdout + r.stderr;
+  const loudFail =
+    r.status !== 0 &&
+    /completeness \(K-8\): FAIL/.test(combined) &&
+    (/unclassified-LOUD-FAIL/.test(combined) || /stale manifest entries/.test(combined));
+  if (loudFail) {
+    pass('T7', 'store-wide gate: narrow 7-table TARGET_DB fixture fails loud via the K-8 completeness backstop (never silently passes)');
   } else {
-    fail('T7', 'store-wide caveman gate prerequisite not built -> FAIL, loud, non-zero exit (never silently passes)', `status=${r.status} stdout=${r.stdout} stderr=${r.stderr}`);
+    fail('T7', 'store-wide gate: narrow 7-table TARGET_DB fixture fails loud via the K-8 completeness backstop (never silently passes)', `status=${r.status} stdout=${r.stdout} stderr=${r.stderr}`);
   }
 }
 
@@ -1209,6 +1242,51 @@ async function testT9Negative() {
       pass('T9-e', 'provenance check unit: confirms PASS when manifest row present, FAIL when absent (proves the check actually fires)');
     } else {
       fail('T9-e', 'provenance check unit: confirms PASS when manifest row present, FAIL when absent (proves the check actually fires)', `brokenResult=${JSON.stringify(brokenResult)} brokenResult2=${JSON.stringify(brokenResult2)}`);
+    }
+
+    // C-7 regression (§6.1(c), memory-manager#11(c), 2026-08-16): TWO
+    // different source_dbs both excluding a same-named source_table
+    // ("decisions") at NULL scope under the SAME excluded_reason used to
+    // collapse under the pre-fix unscoped provenance query -- confirming
+    // source A's manifest row could wrongly "prove" source B's exclusion
+    // was accounted for even with B's own confirming row absent. With
+    // sourceDb supplied, each source is checked independently.
+    await truncateAll(target, ['migration_manifest']);
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint, excluded_reason)
+       VALUES ('ephemeral_source_a','decisions',NULL,1,'fp-a','ephemeral-db-triage-drop')`
+    );
+    // Deliberately NO confirming row for 'ephemeral_source_b' at all.
+    const t9SourceDbMod = require(scriptPath('verify-15-t9-negative.js'));
+    const scopedA = await t9SourceDbMod.checkExclusion(
+      target, roster,
+      { excluded_reason: 'ephemeral-db-triage-drop', source_table: 'decisions', project_id_or_null: null },
+      'ephemeral_source_a'
+    );
+    const scopedB = await t9SourceDbMod.checkExclusion(
+      target, roster,
+      { excluded_reason: 'ephemeral-db-triage-drop', source_table: 'decisions', project_id_or_null: null },
+      'ephemeral_source_b'
+    );
+    if (scopedA.ok === true && scopedB.ok === false) {
+      pass('T9-f-source-db-scoping', 'C-7: source_db-scoped provenance distinguishes two sources sharing a source_table+excluded_reason -- A confirmed, B (no confirming row) FAILs, never silently borrows A\'s manifest row');
+    } else {
+      fail('T9-f-source-db-scoping', 'C-7: source_db-scoped provenance distinguishes two sources sharing a source_table+excluded_reason -- A confirmed, B (no confirming row) FAILs, never silently borrows A\'s manifest row', `scopedA=${JSON.stringify(scopedA)} scopedB=${JSON.stringify(scopedB)}`);
+    }
+    // Unscoped call (sourceDb omitted) is UNCHANGED behavior -- proves the
+    // fix is additive, not a breaking change for pre-existing callers: the
+    // unscoped query still finds source A's row regardless of which source
+    // is actually being asked about (this is the EXACT pre-fix ambiguity,
+    // preserved on purpose for the omitted-argument code path per C-7's
+    // "behavior-preserving for existing callers" requirement).
+    const unscoped = await t9SourceDbMod.checkExclusion(
+      target, roster,
+      { excluded_reason: 'ephemeral-db-triage-drop', source_table: 'decisions', project_id_or_null: null }
+    );
+    if (unscoped.ok === true) {
+      pass('T9-g-unscoped-unchanged', 'C-7: omitting sourceDb keeps the ORIGINAL unscoped provenance behavior (backward-compatible for existing unit-test callers)');
+    } else {
+      fail('T9-g-unscoped-unchanged', 'C-7: omitting sourceDb keeps the ORIGINAL unscoped provenance behavior (backward-compatible for existing unit-test callers)', `unscoped=${JSON.stringify(unscoped)}`);
     }
   } finally {
     await target.end();

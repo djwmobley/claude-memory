@@ -396,6 +396,78 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run own-graph verify/migrate tests (§6.1(c), memory-manager#11(c))
+        # Tests scripts/migrations/migrate-verify-own-graph.js — verifies
+        # whether claude-memory's own graph data (entities/assertions/edges/
+        # retrieval_contract/retrieval_contract_history/project_settings/
+        # entity_communities/extraction_queue/retrieval_events/
+        # retrieval_event_assertions) lives in the old claude_memory_eval_test
+        # fallback DB and migrates the REAL (non-eval-junk) rows into the
+        # memory_manager_staging consolidation target. memory_entries/
+        # memory_entry_chunks are explicitly out of scope (phase (d)/(f)/(g)).
+        # Covers: C-1 total classification (REAL vs JUNK project_id, junk the
+        # default branch) against known-own-graph-project-ids.json; C-6
+        # idempotent per-(table,project_id)-slice delete-then-reinsert via the
+        # own_graph_migration_ids lineage table (registered as battery-infra
+        # DDL in verify15-shared.js, NOT a private per-script constant — T0-REG
+        # is a regression guard for exactly that registration, reproducing the
+        # scenario end-to-end: real migrate run against a disposable target,
+        # then verify-15-t0-roster.js against the SAME target using the
+        # SHIPPED source-table-roster.example.json's own 10
+        # migrate-verify-own-graph.js-tagged entries, asserting
+        # own_graph_migration_ids never lands in T0's unclassified bucket and
+        # both the forward and inverse roster-totality directions PASS); C-3
+        # content-divergence detection (a foreign row sharing a natural key
+        # with different content is logged and never overwritten); the
+        # retrieval_event_assertions source-id -> target-id FK remap surviving
+        # a delete-then-reinsert re-run; and --rollback (manifest-guided,
+        # deletes exactly this source's migrated rows via lineage, never a
+        # blanket project_id delete).
+        # Creates/drops its own scratch databases (target "_staging"-suffixed
+        # to satisfy migrate-01's classifyTarget); never touches
+        # claude_memory_eval_test/memory_manager_staging.
+        run: node test/migrations/test-migrate-verify-own-graph.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: Run source-file-normalize unit tests (§6.1(d) D3-2/D3-10, memory-manager#11(d))
+        # Tests scripts/lib/source-file-normalize.js -- the ONE shared normalization
+        # function used identically by migrate-03-corpus-project-id.js's filesystem
+        # map-builder and its per-database backfill matching step (both call the
+        # SAME JS normalize(), never a hand-ported SQL twin -- separators, optional
+        # memory/ prefix, case-fold, Unicode NFC), including the verified
+        # backslash-vs-forward-slash regression that previously matched zero rows.
+        # Pure unit test -- no Postgres required.
+        run: node scripts/test-source-file-normalize.js
+      - name: Run corpus project_id migration tests (§6.1(d), memory-manager#11(d))
+        # Tests scripts/migrations/migrate-03-corpus-project-id.js -- adds +
+        # backfills project_id on memory_entries/memory_entry_chunks IN PLACE on
+        # every database that holds them (never a data-copy migration).
+        # Covers: total-classification discovery (holds-corpus/no-corpus/
+        # unreachable) scoped by --db-prefix (this script's own explicit test-
+        # isolation boundary); --discover-only mutates nothing; the filesystem
+        # map-builder (transcript cwd resolution via project-marker.js, zero-
+        # transcript and no-marker-found unmapped branches, memory/-subdir
+        # presence as the total classification rather than a directory-name-
+        # shape check); the winner-directory-by-overlap mapping heuristic
+        # (deterministic winner, unique-fallback for files outside the winner,
+        # ambiguous-across-non-winner-directories -> unmapped, never guessed);
+        # a happy-path backfill including the D3-2 backslash-source_file
+        # regression; the unmapped-orphan-memory-entry placeholder (migrates
+        # normally, never blocks SET NOT NULL); cross-DB same-filename
+        # disambiguation (two databases, two project directories, an identical
+        # MEMORY.md basename in both, each resolved to its OWN project via
+        # full-set overlap); idempotent re-run (stable manifest slices, zero
+        # duplication); and --rollback (drops project_id + clears manifest
+        # slices). Creates/drops its own DB-prefix-scoped scratch databases and
+        # an isolated HANDOFF_BASE_DIR fixture tree; never touches a real
+        # ~/.claude/projects tree or any non-scratch database.
+        run: node test/migrations/test-migrate-03-corpus-project-id.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run seam-libraries smoke tests (§7.1-§7.8, issue #17)
         # Tests scripts/migrations/verify-19-seams-smoke.js (30-check operator
         # smoke test) and its regression harness test/migrations/test-verify-19.js
@@ -949,6 +1021,25 @@ jobs:
           PGPASSWORD: postgres
       - name: "North-star: caveman economy (GREEN gate — caveman tokens < verbose, no fidelity loss)"
         run: node test/north-star/test-caveman-economy.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: "North-star: caveman economy, store-wide (§3.5 K-1..K-11, GREEN gate — T7 prerequisite)"
+        # Generalizes the above to the ENTIRE §5 schema (scripts/migrations/
+        # caveman-columns.json's K-9 manifest), not one close-payload fixture.
+        # With no --db, provisions + drops its OWN throwaway `_staging`-
+        # suffixed scratch DB (migrate-01 -> addenda -> migrate-13 ->
+        # migrate-14 -> migrate-15 -> migrate-16), mirroring every other
+        # migrate-*.js test step's convention — never touches
+        # claude_memory_eval_test/memory_manager_staging.
+        run: node test/north-star/test-caveman-economy-store-wide.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: "Run caveman-economy store-wide gate's own tests (disposable scratch DB)"
+        run: node test/migrations/test-caveman-gate-store-wide.js
         env:
           PGHOST: localhost
           PGUSER: postgres

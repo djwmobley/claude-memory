@@ -1,0 +1,32 @@
+{
+  "_comment": "SYNTHETIC EXAMPLE ONLY — obviously-fake directory names, database names, and UUIDs throughout. The real memory-entry-project-map.json is an AUDIT ARTIFACT written BY migrate-03-corpus-project-id.js at the end of a run (D3-7: it is never read back as input — map-build and map-apply happen in one atomic pass over live data, so there is nothing for a caller to hand-edit or supply in advance). It carries real instance data (real ~/.claude/projects directory names, real database names, real project marker UUIDs) and is gitignored, never committed. This file documents the SHAPE the script writes, for readers of the public repo who cannot see the real one.",
+  "generated_at": "2026-08-16T00:00:00.000Z",
+  "projects_root": "/home/example-user/.claude/projects",
+  "resolved_dirs": [
+    { "dirName": "C--home-example-user-dev-proj-alpha", "projectId": "11111111-1111-4111-8111-111111111111", "fileCount": 12 },
+    { "dirName": "C--home-example-user-dev-proj-alpha--worktrees-agent-a1", "projectId": "11111111-1111-4111-8111-111111111111", "fileCount": 3 },
+    { "dirName": "C--home-example-user-dev-proj-beta", "projectId": "22222222-2222-4222-8222-222222222222", "fileCount": 8 }
+  ],
+  "unmapped_dirs": [
+    { "dirName": "C--home-example-user-tmp-scratch-run-1", "reason": "zero transcript files (*.jsonl) in this directory" },
+    { "dirName": "C--home-example-user-old-experiment", "reason": "2 transcript file(s) scanned, none carried a \"cwd\" field" }
+  ],
+  "per_db": {
+    "example_project_alpha_db": {
+      "winner": { "dirName": "C--home-example-user-dev-proj-alpha", "projectId": "11111111-1111-4111-8111-111111111111", "overlapCount": 10 },
+      "tied": null,
+      "mapping": {
+        "memory/feedback_example.md": { "projectId": "11111111-1111-4111-8111-111111111111", "method": "winner-dir", "dirName": "C--home-example-user-dev-proj-alpha", "reason": null },
+        "memory/MEMORY.md": { "projectId": "11111111-1111-4111-8111-111111111111", "method": "winner-dir", "dirName": "C--home-example-user-dev-proj-alpha", "reason": null },
+        "memory/deleted-file-no-longer-on-disk.md": { "projectId": null, "method": "unmapped", "dirName": null, "reason": "no project directory memory/ listing contains this source_file" }
+      }
+    },
+    "example_project_beta_db": {
+      "winner": { "dirName": "C--home-example-user-dev-proj-beta", "projectId": "22222222-2222-4222-8222-222222222222", "overlapCount": 8 },
+      "tied": null,
+      "mapping": {
+        "memory/MEMORY.md": { "projectId": "22222222-2222-4222-8222-222222222222", "method": "winner-dir", "dirName": "C--home-example-user-dev-proj-beta", "reason": null }
+      }
+    }
+  }
+}

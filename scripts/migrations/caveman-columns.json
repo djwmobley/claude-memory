@@ -1,0 +1,958 @@
+{
+  "_doc": "Column manifest for the §3.5 store-wide caveman-economy gate (K-9 total classification). Derived from CONSOLIDATION-RUNBOOK.md §5 DDL + live memory_manager_staging INFORMATION_SCHEMA (2026-08-16). Scope: every TEXT/VARCHAR column on every §5 graph/corpus/seam table. Classes: checked-caveman (model-authored, economy+fidelity checked per row unless that row is tagged authoring_mode=verbose via the table authoring_mode_column, in which case economy is skipped but fidelity still applies) / checked-verbose-exempt (table default authoring_mode=verbose; economy exempt by design, fidelity still applies) / mandatory-caveman-no-column (no authoring_mode escape exists or ever will; economy+fidelity always enforced, 100% of rows) / exempt-not-model-authored (skipped entirely; reason field mandatory). `out_of_scope_tables` total-classifies every OTHER table/view in the live schema that is not part of §5 at all (§15/§17/§18 infrastructure, views) — together `tables` + `out_of_scope_tables` cover the ENTIRE live public schema, so the K-8 runtime completeness backstop can diff against the whole schema, not a pre-filtered §5 subset. Any (table,column) pair absent from BOTH is unclassified-LOUD-FAIL, never silently skipped.",
+  "generated_at": "2026-08-16",
+  "tables": {
+    "entities": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column, not narrative prose"
+        },
+        "name": {
+          "class": "exempt-not-model-authored",
+          "reason": "entity name/identifier, not narrative prose"
+        },
+        "entity_type": {
+          "class": "exempt-not-model-authored",
+          "reason": "enum-like type tag"
+        },
+        "description": {
+          "class": "checked-caveman",
+          "reason": "model-authored entity description; no authoring_mode column on this table (always-caveman, same bucket as tasks.title)"
+        },
+        "session_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "source_model": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "agent_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        }
+      }
+    },
+    "assertions": {
+      "authoring_mode_column": "authoring_mode",
+      "default_authoring_mode": null,
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "subject": {
+          "class": "exempt-not-model-authored",
+          "reason": "entity name or topic string (DDL comment) — identifier, not narrative"
+        },
+        "predicate": {
+          "class": "exempt-not-model-authored",
+          "reason": "enum-like relation vocabulary (e.g. 'depends_on','prefers')"
+        },
+        "object": {
+          "class": "checked-caveman",
+          "reason": "K-9 spec exemplar — the invariant's birthplace; asserted value/prose, per this PR's authoring_mode addendum (nullable/grandfathered — see default_authoring_mode)"
+        },
+        "source": {
+          "class": "exempt-not-model-authored",
+          "reason": "CHECK-constrained enum"
+        },
+        "session_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "suppression_kind": {
+          "class": "exempt-not-model-authored",
+          "reason": "CHECK-constrained enum"
+        },
+        "tier": {
+          "class": "exempt-not-model-authored",
+          "reason": "CHECK-constrained enum (probationary|consolidated)"
+        },
+        "reality_check": {
+          "class": "exempt-not-model-authored",
+          "reason": "CHECK-constrained enum (verified|mismatch|unverifiable)"
+        },
+        "source_model": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "agent_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "carryover_status": {
+          "class": "exempt-not-model-authored",
+          "reason": "status flag, not narrative prose"
+        },
+        "authoring_mode": {
+          "class": "exempt-not-model-authored",
+          "reason": "the authoring_mode flag column itself (this PR's migrate-16 addendum), not narrative prose"
+        }
+      }
+    },
+    "edges": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "from_entity": {
+          "class": "exempt-not-model-authored",
+          "reason": "entities.name reference"
+        },
+        "edge_type": {
+          "class": "exempt-not-model-authored",
+          "reason": "enum-like relation vocabulary"
+        },
+        "to_entity": {
+          "class": "exempt-not-model-authored",
+          "reason": "entities.name reference"
+        },
+        "session_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "source_model": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "agent_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        }
+      }
+    },
+    "retrieval_contract": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "name": {
+          "class": "exempt-not-model-authored",
+          "reason": "contract identifier (e.g. 'default','deep_load')"
+        },
+        "kind": {
+          "class": "exempt-not-model-authored",
+          "reason": "enum-like retrieval-kind tag"
+        }
+      }
+    },
+    "retrieval_contract_history": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "name": {
+          "class": "exempt-not-model-authored",
+          "reason": "contract identifier"
+        },
+        "change_note": {
+          "class": "exempt-not-model-authored",
+          "reason": "operator/config change-log annotation outside the §3.4 write-path surface (contract updates are not memory_upsert/decisions/gotchas/etc.)"
+        }
+      }
+    },
+    "project_settings": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "key": {
+          "class": "exempt-not-model-authored",
+          "reason": "config key, not narrative prose"
+        },
+        "value": {
+          "class": "exempt-not-model-authored",
+          "reason": "config value, not narrative prose"
+        }
+      }
+    },
+    "entity_communities": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "entity_name": {
+          "class": "exempt-not-model-authored",
+          "reason": "entities.name reference"
+        },
+        "run_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "algorithmic run identifier"
+        }
+      }
+    },
+    "extraction_queue": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "source_ref": {
+          "class": "exempt-not-model-authored",
+          "reason": "source reference identifier"
+        },
+        "status": {
+          "class": "exempt-not-model-authored",
+          "reason": "CHECK-constrained enum"
+        },
+        "error_detail": {
+          "class": "exempt-not-model-authored",
+          "reason": "system-generated error text, not model-authored narrative"
+        }
+      }
+    },
+    "retrieval_events": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "query_text": {
+          "class": "exempt-not-model-authored",
+          "reason": "telemetry field (logged query string), not authored seam/memory content"
+        },
+        "outcome": {
+          "class": "exempt-not-model-authored",
+          "reason": "CHECK-constrained enum"
+        },
+        "outcome_signal": {
+          "class": "exempt-not-model-authored",
+          "reason": "enum-like signal tag (e.g. 'user_explicit')"
+        },
+        "session_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "notes": {
+          "class": "exempt-not-model-authored",
+          "reason": "telemetry annotation field, not within §3.4 write-path surface"
+        }
+      }
+    },
+    "retrieval_event_assertions": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {}
+    },
+    "memory_entries": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "name": {
+          "class": "exempt-not-model-authored",
+          "reason": "corpus entry title/identifier"
+        },
+        "description": {
+          "class": "exempt-not-model-authored",
+          "reason": "corpus-ingested markdown content (§5.2), migrated verbatim — not authored via the live memory_upsert write path"
+        },
+        "mem_type": {
+          "class": "exempt-not-model-authored",
+          "reason": "frontmatter type tag (user|feedback|project|reference)"
+        },
+        "body": {
+          "class": "exempt-not-model-authored",
+          "reason": "corpus-ingested markdown content (§5.2), same reasoning as description"
+        },
+        "source_file": {
+          "class": "exempt-not-model-authored",
+          "reason": "source path identifier"
+        },
+        "content_hash": {
+          "class": "exempt-not-model-authored",
+          "reason": "content hash, not narrative prose"
+        }
+      }
+    },
+    "memory_entry_chunks": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "content": {
+          "class": "exempt-not-model-authored",
+          "reason": "corpus-ingested markdown chunk content (§5.2), migrated verbatim"
+        },
+        "content_hash": {
+          "class": "exempt-not-model-authored",
+          "reason": "content hash, not narrative prose"
+        }
+      }
+    },
+    "decisions": {
+      "authoring_mode_column": "authoring_mode",
+      "default_authoring_mode": "caveman",
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "topic": {
+          "class": "checked-caveman",
+          "reason": "model-authored decision topic; table default authoring_mode=caveman"
+        },
+        "decision": {
+          "class": "checked-caveman",
+          "reason": "model-authored decision text; table default authoring_mode=caveman"
+        },
+        "reason": {
+          "class": "checked-caveman",
+          "reason": "model-authored decision rationale; table default authoring_mode=caveman"
+        },
+        "source_project_hint": {
+          "class": "exempt-not-model-authored",
+          "reason": "pre-migration topic-prefix audit trail, not model-authored narrative"
+        },
+        "source_model": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "agent_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "authoring_mode": {
+          "class": "exempt-not-model-authored",
+          "reason": "the authoring_mode flag column itself, not narrative prose"
+        }
+      }
+    },
+    "gotchas": {
+      "authoring_mode_column": "authoring_mode",
+      "default_authoring_mode": "caveman",
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "issue": {
+          "class": "checked-caveman",
+          "reason": "model-authored gotcha description; table default authoring_mode=caveman"
+        },
+        "rule": {
+          "class": "checked-caveman",
+          "reason": "model-authored rule text; table default authoring_mode=caveman"
+        },
+        "source_model": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "agent_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "authoring_mode": {
+          "class": "exempt-not-model-authored",
+          "reason": "the authoring_mode flag column itself, not narrative prose"
+        }
+      }
+    },
+    "findings": {
+      "authoring_mode_column": "authoring_mode",
+      "default_authoring_mode": "caveman",
+      "columns": {
+        "id": {
+          "class": "exempt-not-model-authored",
+          "reason": "source-prefixed finding id (e.g. RT-INJ-001), identifier not narrative"
+        },
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "source": {
+          "class": "exempt-not-model-authored",
+          "reason": "finding-source tag, not narrative"
+        },
+        "severity": {
+          "class": "exempt-not-model-authored",
+          "reason": "categorical rating (enum-like)"
+        },
+        "confidence": {
+          "class": "exempt-not-model-authored",
+          "reason": "categorical rating (enum-like)"
+        },
+        "location": {
+          "class": "exempt-not-model-authored",
+          "reason": "file/path pointer, identifier not narrative"
+        },
+        "category": {
+          "class": "exempt-not-model-authored",
+          "reason": "categorical tag"
+        },
+        "description": {
+          "class": "checked-caveman",
+          "reason": "model-authored finding description; table default authoring_mode=caveman"
+        },
+        "impact": {
+          "class": "checked-caveman",
+          "reason": "model-authored impact narrative; table default authoring_mode=caveman"
+        },
+        "remediation": {
+          "class": "checked-caveman",
+          "reason": "model-authored remediation narrative; table default authoring_mode=caveman"
+        },
+        "effort": {
+          "class": "exempt-not-model-authored",
+          "reason": "categorical rating (S/M/L-style)"
+        },
+        "verification_domain": {
+          "class": "exempt-not-model-authored",
+          "reason": "categorical tag"
+        },
+        "status": {
+          "class": "exempt-not-model-authored",
+          "reason": "status flag"
+        },
+        "commit_sha": {
+          "class": "exempt-not-model-authored",
+          "reason": "SHA identifier"
+        },
+        "report_path": {
+          "class": "exempt-not-model-authored",
+          "reason": "file path identifier"
+        },
+        "source_model": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "agent_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "authoring_mode": {
+          "class": "exempt-not-model-authored",
+          "reason": "the authoring_mode flag column itself, not narrative prose"
+        }
+      }
+    },
+    "tasks": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "title": {
+          "class": "checked-caveman",
+          "reason": "K-9 spec exemplar; model-authored, no authoring_mode column on this table (always-caveman)"
+        },
+        "status": {
+          "class": "exempt-not-model-authored",
+          "reason": "status flag"
+        },
+        "phase": {
+          "class": "exempt-not-model-authored",
+          "reason": "categorical tag"
+        },
+        "priority": {
+          "class": "exempt-not-model-authored",
+          "reason": "categorical tag"
+        },
+        "readme_label": {
+          "class": "exempt-not-model-authored",
+          "reason": "label identifier"
+        },
+        "category": {
+          "class": "exempt-not-model-authored",
+          "reason": "categorical tag"
+        },
+        "source_model": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "agent_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        }
+      }
+    },
+    "research": {
+      "authoring_mode_column": "authoring_mode",
+      "default_authoring_mode": "verbose",
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "title": {
+          "class": "checked-verbose-exempt",
+          "reason": "model-authored, but table default authoring_mode=verbose (§3.3: research is long-form by nature) — row-level economy exemption follows the row's authoring_mode"
+        },
+        "body": {
+          "class": "checked-verbose-exempt",
+          "reason": "model-authored design rationale; table default authoring_mode=verbose (§3.3 named exemplar)"
+        },
+        "source_model": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "agent_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "authoring_mode": {
+          "class": "exempt-not-model-authored",
+          "reason": "the authoring_mode flag column itself, not narrative prose"
+        }
+      }
+    },
+    "incidents": {
+      "authoring_mode_column": "authoring_mode",
+      "default_authoring_mode": "caveman",
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "incident_code": {
+          "class": "exempt-not-model-authored",
+          "reason": "short code identifier"
+        },
+        "title": {
+          "class": "checked-caveman",
+          "reason": "model-authored; table default authoring_mode=caveman"
+        },
+        "what_happened": {
+          "class": "checked-caveman",
+          "reason": "model-authored incident narrative; table default authoring_mode=caveman"
+        },
+        "what_we_did": {
+          "class": "checked-caveman",
+          "reason": "model-authored remediation narrative; table default authoring_mode=caveman"
+        },
+        "watch_for": {
+          "class": "checked-caveman",
+          "reason": "model-authored follow-up narrative; table default authoring_mode=caveman"
+        },
+        "source_model": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "agent_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "authoring_mode": {
+          "class": "exempt-not-model-authored",
+          "reason": "the authoring_mode flag column itself, not narrative prose"
+        }
+      }
+    },
+    "code_index": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "path": {
+          "class": "exempt-not-model-authored",
+          "reason": "file path identifier"
+        },
+        "description": {
+          "class": "checked-caveman",
+          "reason": "K-9 spec exemplar; model-authored, no authoring_mode column on this table (always-caveman)"
+        },
+        "source_model": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "agent_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        }
+      }
+    },
+    "checklist_items": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "checklist_name": {
+          "class": "exempt-not-model-authored",
+          "reason": "checklist identifier"
+        },
+        "cadence": {
+          "class": "exempt-not-model-authored",
+          "reason": "categorical tag (e.g. 'daily','per-PR'), not narrative prose"
+        },
+        "title": {
+          "class": "checked-caveman",
+          "reason": "K-9 spec exemplar (checklist_items.*, narrative subset); no authoring_mode column (always-caveman)"
+        },
+        "description": {
+          "class": "checked-caveman",
+          "reason": "K-9 spec exemplar (checklist_items.*, narrative subset)"
+        },
+        "verification_step": {
+          "class": "checked-caveman",
+          "reason": "K-9 spec exemplar (checklist_items.*, narrative subset)"
+        },
+        "source_model": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "agent_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        }
+      }
+    },
+    "corpus_files": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "path": {
+          "class": "exempt-not-model-authored",
+          "reason": "file path identifier"
+        },
+        "file_type": {
+          "class": "exempt-not-model-authored",
+          "reason": "categorical tag"
+        },
+        "source_domain": {
+          "class": "exempt-not-model-authored",
+          "reason": "categorical tag"
+        },
+        "summary": {
+          "class": "exempt-not-model-authored",
+          "reason": "K-9 spec exemplar — ingested source text, not model-authored"
+        },
+        "source_model": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "agent_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        }
+      }
+    },
+    "workflow_discovery": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "step": {
+          "class": "exempt-not-model-authored",
+          "reason": "categorical/workflow-step tag"
+        },
+        "item_type": {
+          "class": "exempt-not-model-authored",
+          "reason": "categorical tag"
+        },
+        "title": {
+          "class": "checked-caveman",
+          "reason": "K-9 spec exemplar (workflow_discovery.*, narrative subset); no authoring_mode column (always-caveman)"
+        },
+        "detail": {
+          "class": "checked-caveman",
+          "reason": "K-9 spec exemplar (workflow_discovery.*, narrative subset)"
+        },
+        "status": {
+          "class": "exempt-not-model-authored",
+          "reason": "status flag"
+        },
+        "persona": {
+          "class": "exempt-not-model-authored",
+          "reason": "categorical tag"
+        },
+        "source_model": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "agent_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        }
+      }
+    },
+    "agent_rewrites": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "agent_name": {
+          "class": "exempt-not-model-authored",
+          "reason": "identifier"
+        },
+        "skill_path": {
+          "class": "exempt-not-model-authored",
+          "reason": "file path identifier"
+        },
+        "as_is": {
+          "class": "checked-caveman",
+          "reason": "K-9 spec exemplar (agent_rewrites.*, narrative subset); no authoring_mode column (always-caveman)"
+        },
+        "to_be": {
+          "class": "checked-caveman",
+          "reason": "K-9 spec exemplar (agent_rewrites.*, narrative subset)"
+        },
+        "gap": {
+          "class": "checked-caveman",
+          "reason": "K-9 spec exemplar (agent_rewrites.*, narrative subset)"
+        },
+        "effort": {
+          "class": "exempt-not-model-authored",
+          "reason": "categorical rating"
+        },
+        "depends_on": {
+          "class": "exempt-not-model-authored",
+          "reason": "identifier list, not narrative prose"
+        },
+        "status": {
+          "class": "exempt-not-model-authored",
+          "reason": "status flag"
+        },
+        "source_model": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "agent_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        }
+      }
+    },
+    "policy_sections": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "doc_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "document identifier"
+        },
+        "section_num": {
+          "class": "exempt-not-model-authored",
+          "reason": "section-number identifier"
+        },
+        "section_title": {
+          "class": "exempt-not-model-authored",
+          "reason": "ingested policy-document section title, not model-authored"
+        },
+        "content": {
+          "class": "exempt-not-model-authored",
+          "reason": "K-9 spec exemplar — ingested policy source text, not model-authored"
+        },
+        "source_path": {
+          "class": "exempt-not-model-authored",
+          "reason": "file path identifier"
+        },
+        "content_hash": {
+          "class": "exempt-not-model-authored",
+          "reason": "content hash, not narrative prose"
+        },
+        "source_model": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "agent_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        }
+      }
+    },
+    "session_chunks": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "session_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "chunk_kind": {
+          "class": "exempt-not-model-authored",
+          "reason": "categorical tag"
+        },
+        "content": {
+          "class": "exempt-not-model-authored",
+          "reason": "K-9 spec exemplar — ingested session JSONL source text, not model-authored"
+        },
+        "source_jsonl": {
+          "class": "exempt-not-model-authored",
+          "reason": "source path identifier"
+        },
+        "source_model": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "agent_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        }
+      }
+    },
+    "model_registry": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "label": {
+          "class": "exempt-not-model-authored",
+          "reason": "free-text self-identifying model label, but a registry identifier, not narrative prose"
+        },
+        "kind": {
+          "class": "exempt-not-model-authored",
+          "reason": "categorical hint (e.g. 'mcp-client')"
+        },
+        "notes": {
+          "class": "exempt-not-model-authored",
+          "reason": "operator-configured registry note, outside §3.4 write-path surface"
+        },
+        "configured_by": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "provider": {
+          "class": "exempt-not-model-authored",
+          "reason": "categorical tag"
+        },
+        "model_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "identifier"
+        },
+        "capability_tier": {
+          "class": "exempt-not-model-authored",
+          "reason": "categorical tag"
+        },
+        "headless_cli_cmd": {
+          "class": "exempt-not-model-authored",
+          "reason": "command-string config value, not narrative prose"
+        }
+      }
+    },
+    "embedding_providers": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "name": {
+          "class": "exempt-not-model-authored",
+          "reason": "provider identifier"
+        },
+        "model_label": {
+          "class": "exempt-not-model-authored",
+          "reason": "model identifier label"
+        },
+        "endpoint": {
+          "class": "exempt-not-model-authored",
+          "reason": "connection-string config value"
+        },
+        "data_egress_approved_by": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        }
+      }
+    },
+    "agent_exchange": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "agent_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "source_model": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "to_agent": {
+          "class": "exempt-not-model-authored",
+          "reason": "addressing identifier, not narrative prose"
+        },
+        "kind": {
+          "class": "exempt-not-model-authored",
+          "reason": "speech-act taxonomy tag (e.g. 'proposal','ruling')"
+        },
+        "body_caveman": {
+          "class": "mandatory-caveman-no-column",
+          "reason": "K-9 spec exemplar — NOT NULL, no authoring_mode column, no verbose exemption possible ever; A2A traffic is always caveman by design"
+        }
+      }
+    },
+    "audit_log": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "table_name": {
+          "class": "exempt-not-model-authored",
+          "reason": "forensic capture field, system-generated"
+        },
+        "operation": {
+          "class": "exempt-not-model-authored",
+          "reason": "system-generated enum ('UPDATE'|'DELETE')"
+        },
+        "row_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "forensic capture identifier, system-generated"
+        },
+        "db_user": {
+          "class": "exempt-not-model-authored",
+          "reason": "forensic capture identifier, system-generated"
+        }
+      }
+    }
+  },
+  "out_of_scope_tables": {
+    "containment_evidence": "§15.2.1 migration-acceptance-battery infrastructure (containment evidence), not part of §5's target schema",
+    "dual_write_shim_window": "§15 migration dual-write-shim infrastructure, not part of §5",
+    "memory_manager_staging_row_hashes": "§15 T1/T3 content-hash reconciliation infrastructure, not part of §5",
+    "migration_manifest": "§15 T0 roster/migration-manifest infrastructure, not part of §5",
+    "migration_manifest_row_hashes": "§15 T3 content-hash reconciliation infrastructure, not part of §5",
+    "old_store_row_hashes": "§15 T3b reverse-containment infrastructure, not part of §5",
+    "promotion_conflict_log": "§15 promotion-conflict infrastructure, not part of §5",
+    "routing_profiles": "§17 model-routing harness table, not part of §5's graph/corpus/seam schema",
+    "routing_session_overrides": "§17 model-routing harness table, not part of §5",
+    "session_usage": "§18 usage/cost telemetry table, not part of §5",
+    "turn_usage": "§18 usage/cost telemetry table, not part of §5",
+    "v_handoff_card_inputs": "database VIEW (§5.9 fat-card render view) derived from already-classified base tables (assertions), not itself a base table with independently-authored content",
+    "v_memory_hits": "database VIEW (corpus retrieval view) derived from already-classified base tables (memory_entries/memory_entry_chunks/decisions/etc.), not itself a base table"
+  }
+}
