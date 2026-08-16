@@ -1,0 +1,237 @@
+'use strict';
+
+/**
+ * memory-lint.js — §7.8 memory_lint, periodic store-wide health sweep
+ * (CONSOLIDATION-RUNBOOK.md §7.8, Karpathy-derived — gist.github.com/
+ * karpathy/442a6bf555914893e9891c11519de94f — spec-adversary pass
+ * 2026-08-15, S-9..S-11, memory-manager#17).
+ *
+ * READ-ONLY. Never mutates (§3.4's no-server-rewrite discipline applies
+ * here too). Four checks, `checks?` optionally narrows to a subset. Every
+ * check is a TOTAL classification over its input set — every excluded/
+ * skipped candidate is tallied, never silently dropped.
+ *
+ * Complements, does not replace, §7.4's per-assertion reality-check probes:
+ * §7.4 is a targeted single-fact verify; memory_lint is a scheduled
+ * store-wide sweep across all four failure modes at once.
+ */
+
+const { materiallyDifferent } = require('./normalize-text.js');
+const { cardinalityOf } = require('./predicate-registry.js');
+const { REALITY_CHECKS } = require('./reality-checks.js');
+
+const ALL_CHECKS = Object.freeze([
+  'orphan_entities',
+  'contradicting_assertions',
+  'stale_unreconciled',
+  'unlinked_mentions',
+]);
+
+/** Predicates flagged annotateOnly in the reality-checks registry (S-10:
+ * these stay at reality_check='mismatch' indefinitely BY DESIGN and are
+ * excluded from stale_unreconciled). Derived from REALITY_CHECKS, never a
+ * hardcoded duplicate list. */
+function getAnnotateOnlyPredicates() {
+  return new Set(REALITY_CHECKS.filter((c) => c.annotateOnly === true).map((c) => c.predicate));
+}
+
+// ── orphan_entities ─────────────────────────────────────────────────────
+
+async function checkOrphanEntities(client, projectId) {
+  const { rows } = await client.query(
+    `SELECT e.id, e.name, e.entity_type
+       FROM entities e
+      WHERE e.project_id = $1
+        AND NOT EXISTS (SELECT 1 FROM edges g WHERE g.project_id = e.project_id AND g.from_entity = e.name)
+        AND NOT EXISTS (SELECT 1 FROM edges g WHERE g.project_id = e.project_id AND g.to_entity = e.name)
+      ORDER BY e.id`,
+    [projectId]
+  );
+  return { orphans: rows, count: rows.length };
+}
+
+// ── contradicting_assertions (S-9) ──────────────────────────────────────
+
+async function checkContradictingAssertions(client, projectId) {
+  const { rows } = await client.query(
+    `SELECT id, subject, predicate, object FROM assertions
+      WHERE project_id = $1 AND suppressed = false AND invalid_at IS NULL
+      ORDER BY subject, predicate, id`,
+    [projectId]
+  );
+
+  // Group by (subject, predicate) -- subject matched via LOWER(TRIM())
+  // (post-review fix, G1), NOT raw string equality. This aligns with every
+  // other subject-matching call site introduced by this PR
+  // (carryover-render.js's findLiveOpenThreadRows, mirroring
+  // scripts/handoff.js's own resolved_threads auto-retire matcher) and
+  // with the write path's assertions_1to1_unique-adjacent expectation that
+  // "same subject" is case/whitespace-insensitive. Without this, live rows
+  // with subjects "Foo" vs "foo" on a 1:1 predicate with contradictory
+  // objects would be invisible to this check (two separate groups of size
+  // 1, never paired).
+  const groups = new Map();
+  for (const row of rows) {
+    const normalizedSubject = String(row.subject == null ? '' : row.subject).trim().toLowerCase();
+    const key = `${normalizedSubject}\x1f${row.predicate}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+
+  const contradictions = [];
+  const excludedTally = { notOneToOne: 0, unregistered: 0 };
+
+  for (const [, groupRows] of groups) {
+    if (groupRows.length < 2) continue;
+    const predicate = groupRows[0].predicate;
+    const cardinality = cardinalityOf(predicate);
+
+    if (cardinality === null) {
+      excludedTally.unregistered += groupRows.length;
+      continue;
+    }
+    if (cardinality !== '1:1') {
+      excludedTally.notOneToOne += groupRows.length;
+      continue;
+    }
+
+    // 1:1-registered pairing: any two rows with a materially different
+    // object (S-6 shared normalization) is a contradiction.
+    for (let i = 0; i < groupRows.length; i++) {
+      for (let j = i + 1; j < groupRows.length; j++) {
+        if (materiallyDifferent(groupRows[i].object, groupRows[j].object)) {
+          contradictions.push({
+            subject: groupRows[i].subject,
+            predicate,
+            rowA: { id: groupRows[i].id, object: groupRows[i].object },
+            rowB: { id: groupRows[j].id, object: groupRows[j].object },
+          });
+        }
+      }
+    }
+  }
+
+  return { contradictions, count: contradictions.length, excludedTally };
+}
+
+// ── stale_unreconciled (S-10) ───────────────────────────────────────────
+
+async function checkStaleUnreconciled(client, projectId) {
+  const annotateOnlyPredicates = getAnnotateOnlyPredicates();
+  const { rows } = await client.query(
+    `SELECT id, subject, predicate, object FROM assertions
+      WHERE project_id = $1 AND suppressed = false AND invalid_at IS NULL
+        AND reality_check = 'mismatch'
+      ORDER BY id`,
+    [projectId]
+  );
+  const stale = rows.filter((r) => !annotateOnlyPredicates.has(r.predicate));
+  const excludedAnnotateOnlyCount = rows.length - stale.length;
+  return { stale, count: stale.length, excludedAnnotateOnlyCount };
+}
+
+// ── unlinked_mentions (S-11) ────────────────────────────────────────────
+
+const MIN_MENTION_NAME_LEN = 4;
+
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function checkUnlinkedMentions(client, projectId) {
+  // Sequential (not Promise.all) — a plain pg Client does not support
+  // overlapping concurrent queries on one connection.
+  const { rows: assertionRows } = await client.query(
+    `SELECT id, subject, object FROM assertions
+      WHERE project_id = $1 AND suppressed = false AND invalid_at IS NULL`,
+    [projectId]
+  );
+  const { rows: entityRows } = await client.query(`SELECT name FROM entities WHERE project_id = $1`, [projectId]);
+  const { rows: edgeRows } = await client.query(`SELECT from_entity, to_entity FROM edges WHERE project_id = $1`, [projectId]);
+
+  const entityNames = entityRows.map((r) => r.name);
+  const entityNameSet = new Set(entityNames);
+  const edgePairs = new Set();
+  for (const e of edgeRows) {
+    edgePairs.add(`${e.from_entity}\x1f${e.to_entity}`);
+    edgePairs.add(`${e.to_entity}\x1f${e.from_entity}`); // either direction
+  }
+  function hasEdge(a, b) {
+    return edgePairs.has(`${a}\x1f${b}`);
+  }
+
+  const flags = [];
+  const skipTally = { subjectNotEntity: 0, mentionTooShort: 0 };
+
+  for (const row of assertionRows) {
+    const subject = String(row.subject || '').trim();
+    if (!entityNameSet.has(subject)) {
+      skipTally.subjectNotEntity++;
+      continue;
+    }
+    const objectText = String(row.object || '');
+    for (const candidateName of entityNames) {
+      if (candidateName === subject) continue; // self-mention is not a "mention of another entity"
+      if (candidateName.length < MIN_MENTION_NAME_LEN) {
+        skipTally.mentionTooShort++;
+        continue;
+      }
+      const re = new RegExp(`\\b${escapeRegExp(candidateName)}\\b`, 'i');
+      if (!re.test(objectText)) continue;
+      if (hasEdge(subject, candidateName)) continue; // linked — no flag
+      flags.push({
+        assertionId: row.id,
+        subjectEntity: subject,
+        mentionedEntity: candidateName,
+      });
+    }
+  }
+
+  return { flags, count: flags.length, skipTally };
+}
+
+// ── memoryLint dispatcher ───────────────────────────────────────────────
+
+/**
+ * memoryLint — read-only, never mutates.
+ *
+ * @param {object} client
+ * @param {string} projectId
+ * @param {string[]} [checks] - subset of ALL_CHECKS; defaults to all four.
+ *   An unrecognized check name is a hard error (total classification, not
+ *   a silently-ignored typo).
+ * @returns {Promise<object>} keyed by check name, only for requested checks
+ */
+async function memoryLint(client, projectId, checks) {
+  const requested = checks && checks.length ? checks : ALL_CHECKS.slice();
+  for (const c of requested) {
+    if (!ALL_CHECKS.includes(c)) {
+      throw new Error(`memory_lint: unknown check "${c}" (allowed: ${ALL_CHECKS.join(', ')})`);
+    }
+  }
+
+  const report = {};
+  if (requested.includes('orphan_entities')) {
+    report.orphan_entities = await checkOrphanEntities(client, projectId);
+  }
+  if (requested.includes('contradicting_assertions')) {
+    report.contradicting_assertions = await checkContradictingAssertions(client, projectId);
+  }
+  if (requested.includes('stale_unreconciled')) {
+    report.stale_unreconciled = await checkStaleUnreconciled(client, projectId);
+  }
+  if (requested.includes('unlinked_mentions')) {
+    report.unlinked_mentions = await checkUnlinkedMentions(client, projectId);
+  }
+  return report;
+}
+
+module.exports = {
+  ALL_CHECKS,
+  getAnnotateOnlyPredicates,
+  checkOrphanEntities,
+  checkContradictingAssertions,
+  checkStaleUnreconciled,
+  checkUnlinkedMentions,
+  memoryLint,
+};

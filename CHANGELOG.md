@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **§5.3 absorbed-seam tables + §5.9 fat-card view + §7 write/render/lint
+  libraries** — new schema-setup-only migration
+  `scripts/migrations/sql/migrate-14-seam-tables.sql` (applied by
+  `scripts/migrations/migrate-14-seam-tables.js`) adds the 13 §5.3 seam
+  tables (`decisions`, `gotchas`, `findings`, `research`, `incidents`,
+  `code_index`, `tasks`, `checklist_items`, `corpus_files`,
+  `workflow_discovery`, `agent_rewrites`, `policy_sections`,
+  `session_chunks`) and `v_handoff_card_inputs` (the §5.9 fat-card render
+  view). `code_index` gains a plain, non-primary-key `id SERIAL` column not
+  present in the source schema so the shared `log_guarded_change()` audit
+  trigger can wire onto it; `audit_log.row_id` is widened `BIGINT -> TEXT`
+  (in both `migrate-13-agent-exchange.sql` and, redundantly,
+  `migrate-14-seam-tables.sql`) so `findings`' caller-supplied TEXT id
+  (e.g. `RT-INJ-001`) survives an `UPDATE`/`DELETE` through that same
+  trigger. Re-applying `migrate-13-agent-exchange.js` after this migration
+  auto-wires all 13 tables' audit triggers, landing at exactly 16 total
+  (13 seam + `assertions` + `edges` + `agent_exchange`).
+
+  On top of the schema, seven new library modules under `scripts/lib/`
+  implement the write/render/lint seams: `carryover-render.js` (open-thread
+  carry-over delta merge, reusing `handoff.js`'s `deriveIntentSubject` +
+  pinned-row exclusion by reference), `memory-upsert.js` (a typed,
+  INSERT-ONLY write path for the 9 seam tables with a live MCP surface —
+  closed table enum, app-level per-column validation, PK/unique collision
+  as a loud error, never a silent overwrite), `normalize-text.js` (the one
+  shared case/whitespace/punctuation normalization helper used by the
+  ingest-time contradiction check, the new `dangling_entity_reference`
+  reality-check probe, and `memory_lint`'s checks), `render-handoff-card.js`
+  (assembles the NEXT SESSION / Session N / Done / Ceiling / Open
+  carry-overs card shape), `exchange-log.js` (the `agent_exchange`
+  body/summary write split with an injectable embedder seam — unreachable
+  default provider is a loud error, never a silent fallback — and one
+  guarded, atomic optimistic-row-count state transition per write), and
+  `memory-lint.js` (four read-only store-wide checks: `orphan_entities`,
+  `contradicting_assertions` scoped to 1:1-registered predicates,
+  `stale_unreconciled` excluding annotate-only reality-check predicates,
+  and `unlinked_mentions`). `scripts/lib/reality-checks.js` gains a new
+  standalone `probeDanglingEntityReferences` export. `next_step`
+  (cardinality 1:N) is added to `predicate-registry.json`.
+
 - **Agent-to-agent exchange schema + tamper-evidence infrastructure +
   interop contracts** — new schema-setup-only migration
   `scripts/migrations/sql/migrate-13-agent-exchange.sql` (applied by

@@ -389,6 +389,12 @@
       "directive": true
     },
     {
+      "predicate": "next_step",
+      "cardinality": "1:N",
+      "description": "A queued next-session action item (§5.9/§7.6 fat-card NEXT SESSION list); multiple next steps may be live simultaneously, rendered in created_at ASC order",
+      "added_version": "1.1"
+    },
+    {
       "predicate": "no_longer_includes",
       "cardinality": "1:N",
       "description": "Items that a set or scope no longer includes; multiple removed items may apply",

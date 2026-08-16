@@ -3962,6 +3962,14 @@ function deriveIntentSubject(threadText) {
   return text.slice(0, 80);
 }
 
+// Shared SQL fragment: excludes pinned rows from a match (pinned=false OR
+// pinned IS NULL passes; pinned=true is excluded). Used by the auto-retire
+// query below AND by scripts/lib/carryover-render.js's applyCarryoverDeltas
+// (§7.1/S-12c) -- reused BY REFERENCE, never reimplemented, so both call
+// sites can never drift out of sync on what "pinned" means for matching
+// purposes. Pure string constant: exporting it changes no behavior here.
+const PINNED_EXCLUSION_SQL = '(pinned = false OR pinned IS NULL)';
+
 /**
  * Persist session-driving intent (open_threads, tldr, quick_references) as
  * queryable assertion rows in the `assertions` table.
@@ -4196,7 +4204,7 @@ async function writeExtraction(db, projectId, payload, opts) {
          WHERE project_id = $1 AND predicate = 'open_thread'
            AND LOWER(TRIM(subject)) = LOWER(TRIM($2))
            AND suppressed = false AND invalid_at IS NULL
-           AND (pinned = false OR pinned IS NULL)`,
+           AND ${PINNED_EXCLUSION_SQL}`,
         [projectId, subject]
       );
       const n = rowCount != null ? Number(rowCount) : 0;
@@ -7047,6 +7055,11 @@ if (require.main === module) {
     queriesEqual,
     recordContractChange,
     pruneDegradedClose,
+    // §7.1/S-12c shared exports (reused by reference, never reimplemented,
+    // by scripts/lib/carryover-render.js). Pure additions -- no existing
+    // export changed, no behavior change to any existing call site.
+    deriveIntentSubject,
+    PINNED_EXCLUSION_SQL,
     // Pointer-staleness gate internals (exposed for test-pointer-gate.js)
     _extractPointers,
     _deriveAnchor,

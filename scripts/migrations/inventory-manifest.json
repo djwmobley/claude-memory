@@ -16,6 +16,7 @@
     { "targetTable": "session_chunks",      "section": "5.3" },
     { "targetTable": "agent_exchange",      "section": "5.8" },
     { "targetTable": "audit_log",           "section": "5.8" },
+    { "targetTable": "v_handoff_card_inputs", "section": "5.9" },
     { "targetTable": "model_registry",      "section": "5.6" },
     { "targetTable": "embedding_providers", "section": "5.7" },
     { "targetTable": "routing_profiles",            "section": "17.1" },

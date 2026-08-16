@@ -285,6 +285,97 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run seam-tables migration tests (§5.3/§5.9, issue #17)
+        # Tests scripts/migrations/migrate-14-seam-tables.js — the 13 §5.3
+        # absorbed-seam tables (decisions/gotchas/findings/research/incidents/
+        # code_index/tasks/checklist_items/corpus_files/workflow_discovery/
+        # agent_rewrites/policy_sections/session_chunks) + §5.9's
+        # v_handoff_card_inputs view + a narrow audit_log.row_id BIGINT->TEXT
+        # widening. Two documented deviations from §5.3's verbatim DDL text
+        # (both additive, both proof-of-fired here): (1) code_index gains a
+        # plain `id SERIAL` column (not the PK) so the shared
+        # log_guarded_change() trigger function can wire onto it; (2)
+        # audit_log.row_id is widened so findings' TEXT-shaped id (e.g.
+        # "RT-INJ-001") survives an UPDATE/DELETE through that same trigger
+        # without a bigint type-cast error. migrate-13-agent-exchange.sql now
+        # ALSO declares row_id TEXT directly and carries the same idempotent
+        # widening ALTER itself (post-review fix) — so its own generic self-
+        # check converges to PASS on re-apply instead of permanently
+        # reporting a wrong-type-column FAIL that would mask real future
+        # drift; migrate-14's copy of the ALTER is harmless redundancy.
+        # v_handoff_card_inputs (§5.9) is verified BEHAVIORALLY (post-review
+        # fix, not a pg_get_viewdef text/substring match, which an AND->OR
+        # edit keeping the same tokens would defeat): probe rows are
+        # inserted/queried/rolled-back inside a transaction, proving exactly
+        # the valid row is visible through the view's filters. Reuses
+        # migrate-schema-addenda.js's verifyAddenda for generic derived
+        # verification (against the dollar-quote-free migrate-14-seam-
+        # tables.sql ONLY, per §7.9/S-16 — the embedding/HNSW DO-blocks live
+        # in a separate sidecar file never passed to that derivation layer)
+        # and migrate-13-agent-exchange.js's own trigger-wiring DO block
+        # (unmodified in its wiring logic) for audit-trigger wiring.
+        # Covers: fresh apply -> PASS; idempotent re-run; prerequisite
+        # (agent_exchange) missing -> refusal naming migrate-13-agent-
+        # exchange.js; re-applying migrate-13-agent-exchange.js after this
+        # migration auto-wires all 13 seam tables AND now exits 0 cleanly
+        # (16 total *_audit triggers, zero deferred, zero wrong-type
+        # columns); the two deviations' proof-of-firing (code_index trigger
+        # actually captures UPDATE+DELETE; findings' TEXT id survives the
+        # widened column, and reverting the widening is shown to reproduce
+        # the original bigint cast failure); and an adversarial regression
+        # proving the behavioral view-probe catches an AND->OR-broken view
+        # definition that the old substring check would have missed.
+        # Creates/drops its own _staging-suffixed scratch DBs; never touches
+        # claude_memory_eval_test/memory_manager_staging.
+        run: node test/migrations/test-migrate-14-seam-tables.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: Run seam-libraries smoke tests (§7.1-§7.8, issue #17)
+        # Tests scripts/migrations/verify-19-seams-smoke.js (30-check operator
+        # smoke test) and its regression harness test/migrations/test-verify-19.js
+        # against the §5.3/§5.9 seam-table stack: scripts/lib/carryover-render.js
+        # (§7.1 delta-merge — legacy-NULL open rows, 0-match/2+-match delta
+        # branches, added/updated/resolved supersession, markdown render),
+        # scripts/lib/memory-upsert.js (§7.2/§7.3 typed INSERT-ONLY write path —
+        # closed 9-table enum, unknown table/key rejection, required-field +
+        # integer-coercion validation, PK/unique collision as a loud error,
+        # empty-string enum values rejected app-level not as a raw Postgres
+        # 23514), scripts/lib/normalize-text.js (§7.3/S-6/S-8's ONE shared
+        # case/whitespace/punctuation normalization helper), scripts/lib/
+        # reality-checks.js's new probeDanglingEntityReferences (§7.4/S-7's
+        # 5-branch total classification: linked/case_mismatch/cross_project/
+        # no_match/skipped), scripts/lib/render-handoff-card.js (§7.6 fat-card
+        # renderer — NEXT SESSION/Session/Done/Ceiling/Open-carry-overs
+        # sections, next_step re-sorted created_at ASC per S-15, NULL
+        # gotchas.active/findings.status included via IS DISTINCT FROM, not
+        # silently three-valued-logic-dropped), scripts/lib/exchange-log.js
+        # (§7.7 A2A write split — injectable embedder seam, embed-before-
+        # transaction, the guarded optimistic row-count transition, no-
+        # default-provider loud-error path), and scripts/lib/memory-lint.js
+        # (§7.8's four read-only checks — orphan_entities, contradicting_
+        # assertions scoped to 1:1-registered predicates only per S-9 and
+        # matched via LOWER(TRIM(subject)) so case-variant subjects are never
+        # invisible to pairing, stale_unreconciled excluding annotateOnly
+        # predicates per S-10, unlinked_mentions' exact 4-character boundary
+        # per S-11). Also a static §7.5 confirmation that cmdPromote
+        # (scripts/handoff.js) never references any of the 13 seam tables.
+        # The smoke script's 27 of 30 checks run inside one transaction that
+        # is always rolled back; the 3 exchange-log checks run against a
+        # SEPARATE dedicated connection (appendExchange owns its own
+        # BEGIN/COMMIT/ROLLBACK per §7.7) with explicit manual cleanup —
+        # both halves prove zero residue in every scanned data table; the
+        # script separately reports audit_log's own row-count delta HONESTLY
+        # (expected, non-zero, tamper-evidence-by-design — never silently
+        # omitted, never counted as residue).
+        # Creates/drops its own _staging-suffixed scratch DBs; never touches
+        # claude_memory_eval_test/memory_manager_staging.
+        run: node test/migrations/test-verify-19.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run smoketest (all sections)
         # Runs the full smoketest suite — all 13 sections including collision (OQ-5
         # supersession invariant) and registry (SQL-1:1-index-vs-registry-JSON drift).
