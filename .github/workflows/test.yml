@@ -396,6 +396,50 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run handoff-markdown parse unit tests (§6.1(h) H-1..H-14 amendment)
+        # Tests scripts/lib/handoff-markdown-parse.js directly -- pure unit tests,
+        # no DB, no fixture files on disk (every fixture is an inline SYNTHETIC
+        # string literal per H-13's public-repo sanitization rule).
+        # Covers every adversary construction named in the authoring brief:
+        # H-5/H-6 dash variants + 4-way-split titles + duplicate session N
+        # (both rows survive, flagged as a named collision event); H-8 fake
+        # headings inside fenced code/blockquotes/HTML comments (single- and
+        # multi-line); H-9 pipes-in-cells/backslash escaping/hand-typed
+        # variable-cell-count tables (flagged, never index-shifted); H-10 BOM
+        # strip, CRLF->LF, trailing-whitespace trim; H-11 nested/multi-line/
+        # checkbox NEXT SESSION items; H-12 merged-block detection via the
+        # body-length-delta heuristic.
+        # Pure unit test -- no Postgres or Ollama required.
+        run: node test/migrations/test-handoff-markdown-parse.js
+      - name: Run handoff-markdown migration tests (§6.1(h), memory-manager#11(h))
+        # Tests scripts/migrations/migrate-08-handoff-markdown.js -- parses a
+        # project's HANDOFF.md (active fat card) and .claude/HANDOFF-HISTORY.md
+        # (archive) into assertions rows, the markdown-source PEER of the
+        # SQL-source migrations (migrate-02 etc.). Mirrors
+        # test-migrate-02-decisions.js's/test-migrate-09-file-memory-markdown.js's
+        # conventions: self-contained scratch database ("_staging"-suffixed to
+        # satisfy migrate-01's own classifyTarget, reused by reference);
+        # fixture HANDOFF.md/HANDOFF-HISTORY.md files are SYNTHETIC content
+        # written to a scratch temp directory per run, never a real file (H-13).
+        # Covers: happy path (both files migrate, DDL preamble columns land,
+        # report written); H-1 session_tldr_archived created_at backdated to
+        # the parsed session date (never live session_tldr); migration_manifest
+        # rows with correct row_count and H-14-normalized filesystem: source_db;
+        # idempotent re-run (identical content -> identical row count, no
+        # duplication); content-shrink re-run (a removed next_step item is
+        # actually gone -- delete-and-reinsert, not accretion); fail-soft when
+        # one of --file/--history-file is missing; H-6 loud named collision
+        # event when an identical session heading appears in both files (both
+        # rows survive); --project-id/--file-or-history-file/--authoring-mode
+        # usage validation; and --rollback (deletes exactly this project's
+        # tagged rows).
+        # Creates/drops its own "_staging"-suffixed scratch database; never
+        # touches claude_memory_eval_test/memory_manager_staging.
+        run: node test/migrations/test-migrate-08-handoff-markdown.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run own-graph verify/migrate tests (§6.1(c), memory-manager#11(c))
         # Tests scripts/migrations/migrate-verify-own-graph.js — verifies
         # whether claude-memory's own graph data (entities/assertions/edges/
