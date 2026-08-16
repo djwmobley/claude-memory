@@ -363,6 +363,47 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run source-file-normalize unit tests (§6.1(d) D3-2/D3-10, memory-manager#11(d))
+        # Tests scripts/lib/source-file-normalize.js -- the ONE shared normalization
+        # module used identically by migrate-03-corpus-project-id.js's filesystem
+        # map-builder and its SQL-side matching (separators, optional memory/
+        # prefix, case-fold, Unicode NFC). Includes a live-Postgres cross-check
+        # that sqlExpr() produces the byte-identical result to normalize() for
+        # every fixture, including the verified backslash-vs-forward-slash
+        # regression that previously matched zero rows.
+        run: node scripts/test-source-file-normalize.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: Run corpus project_id migration tests (§6.1(d), memory-manager#11(d))
+        # Tests scripts/migrations/migrate-03-corpus-project-id.js -- adds +
+        # backfills project_id on memory_entries/memory_entry_chunks IN PLACE on
+        # every database that holds them (never a data-copy migration).
+        # Covers: total-classification discovery (holds-corpus/no-corpus/
+        # unreachable) scoped by --db-prefix (this script's own explicit test-
+        # isolation boundary); --discover-only mutates nothing; the filesystem
+        # map-builder (transcript cwd resolution via project-marker.js, zero-
+        # transcript and no-marker-found unmapped branches, memory/-subdir
+        # presence as the total classification rather than a directory-name-
+        # shape check); the winner-directory-by-overlap mapping heuristic
+        # (deterministic winner, unique-fallback for files outside the winner,
+        # ambiguous-across-non-winner-directories -> unmapped, never guessed);
+        # a happy-path backfill including the D3-2 backslash-source_file
+        # regression; the unmapped-orphan-memory-entry placeholder (migrates
+        # normally, never blocks SET NOT NULL); cross-DB same-filename
+        # disambiguation (two databases, two project directories, an identical
+        # MEMORY.md basename in both, each resolved to its OWN project via
+        # full-set overlap); idempotent re-run (stable manifest slices, zero
+        # duplication); and --rollback (drops project_id + clears manifest
+        # slices). Creates/drops its own DB-prefix-scoped scratch databases and
+        # an isolated HANDOFF_BASE_DIR fixture tree; never touches a real
+        # ~/.claude/projects tree or any non-scratch database.
+        run: node test/migrations/test-migrate-03-corpus-project-id.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run seam-libraries smoke tests (§7.1-§7.8, issue #17)
         # Tests scripts/migrations/verify-19-seams-smoke.js (30-check operator
         # smoke test) and its regression harness test/migrations/test-verify-19.js
