@@ -336,6 +336,50 @@ async function main() {
     }
   });
 
+  // ── T6b: H-6 cross-file collision reporting (independent-review fix,
+  // PR #172 blocker 2) — same session heading present in BOTH --file and
+  // --history-file must produce a loud, named cross-file collision event
+  // (console line + report entry), never silently write both rows with
+  // an empty collision array. ──────────────────────────────────────────
+  await run('T6b', 'H-6: an identical session heading in both files produces a reported cross-file collision, and BOTH rows survive', async () => {
+    const dupHeading = '## Session 9 — 2026-02-10 — Duplicated across files';
+    const activeDupPath = writeFixture(
+      'HANDOFF-dup-active.md',
+      [dupHeading, '', '### Done', '- did an example thing in the active file', ''].join('\n')
+    );
+    const historyDupPath = writeFixture(
+      'HANDOFF-HISTORY-dup.md',
+      [dupHeading, '', '### Done', '- did an example thing in the archive', ''].join('\n')
+    );
+    const reportScratchDir = path.join(SCRATCH_DIR, 'reports-t6b');
+    const projectC = `example-project-gamma-${TS}`;
+    const r = runMigrate08(['--db', DB_TARGET, '--project-id', projectC, '--file', activeDupPath, '--history-file', historyDupPath, '--report-dir', reportScratchDir]);
+    if (r.status !== 0) throw new Error(`cross-file collision run failed: status=${r.status}\nstdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert(/\[CROSS-FILE-SUBJECT-COLLISION\]/.test(r.stdout), 'expected a loud [CROSS-FILE-SUBJECT-COLLISION] console line');
+    assert(r.stdout.includes('category="session_tldr_archived"'), 'expected the collision to be reported under the session_tldr_archived category');
+
+    const client = await pgConnect(DB_TARGET);
+    try {
+      const { rows } = await client.query(
+        `SELECT subject, object FROM assertions WHERE project_id=$1 AND predicate='session_tldr_archived'`,
+        [projectC]
+      );
+      assertEq(rows.length, 2, 'both the active-file and history-file rows for the duplicated heading must survive (1:N-safe by design)');
+      assert(rows.every((r2) => r2.subject === rows[0].subject), 'both rows should share the identical subject (same heading text in both files)');
+    } finally {
+      await client.end();
+    }
+
+    const reportFiles = fs.readdirSync(reportScratchDir).filter((f) => f.includes(projectC));
+    assertEq(reportFiles.length, 1, 'expected exactly one report file for this run');
+    const report = JSON.parse(fs.readFileSync(path.join(reportScratchDir, reportFiles[0]), 'utf8'));
+    assert(report.cross_file_collisions, 'report is missing cross_file_collisions entirely');
+    const sessionCollisions = report.cross_file_collisions.session_tldr_archived;
+    assertEq(sessionCollisions.length, 1, 'expected exactly one session_tldr_archived cross-file collision entry in the report');
+    assertEq(sessionCollisions[0].activeCount, 1, 'wrong activeCount in the cross-file collision report entry');
+    assertEq(sessionCollisions[0].historyCount, 1, 'wrong historyCount in the cross-file collision report entry');
+  });
+
   // ── T7: usage errors ──────────────────────────────────────────────────
   await run('T7', 'usage: --project-id is required', async () => {
     const r = runMigrate08(['--db', DB_TARGET, '--file', activeFilePath]);

@@ -46,10 +46,17 @@
  *          (durable-section headings, pinned=true)
  *        - next_step               ("## NEXT SESSION" section's list
  *          items, seq reassigned this run, H-11)
- *   5. Subject collisions within any one category (H-6) are loud named
- *      report events (`[SUBJECT-COLLISION]`) — never silently
- *      overwritten; both/all colliding rows are still written (categories
- *      other than the live 1:1 predicates are 1:N-safe by construction).
+ *   5. Subject collisions (H-6) are loud named report events, printed to
+ *      stdout AND carried in the fail-soft report (point 8) — never
+ *      silently overwritten; both/all colliding rows are still written
+ *      (every category here is 1:N-safe by construction). Two DISTINCT
+ *      collision checks run: WITHIN one file (`[SUBJECT-COLLISION]`,
+ *      computed per-file by parseFileIntoRows/findCollisions) and ACROSS
+ *      the active file and the archive file (`[CROSS-FILE-SUBJECT-
+ *      COLLISION]`, computed once both files are parsed by
+ *      computeCrossFileCollisions/findCrossFileCollisions — e.g. an
+ *      identical `## Session N — date — title` heading present in BOTH
+ *      HANDOFF.md's active preamble and HANDOFF-HISTORY.md's archive).
  *   6. Re-run semantics (H-6): per-project DELETE of this script's own
  *      `source_model='markdown-migration-h'` rows, then bulk INSERT of
  *      every freshly-parsed row, in ONE transaction — idempotent by
@@ -69,8 +76,9 @@
  *      scripts/migrations/reports/, gitignored) covering: sections found/
  *      unmatched, raw-line vs parsed-row tallies, H-12's per-block
  *      body-length-delta flags, H-10's unrecognized-dash flags, H-6's
- *      subject-collision events, H-9's flagged (wrong-cell-count) table
- *      rows, and H-11's dropped stray-list-line notes.
+ *      within-file AND cross-file subject-collision events, H-9's
+ *      flagged (wrong-cell-count / header-only) table rows, and H-11's
+ *      dropped stray-list-line notes.
  *
  * ROLLBACK MODE (--rollback): deletes every `assertions` row tagged
  * `source_model='markdown-migration-h' AND project_id=$1` (point 7 of the
@@ -349,6 +357,77 @@ function findCollisions(rows, keyFn) {
     if (n > 1) collisions.push({ key: k, count: n });
   }
   return collisions;
+}
+
+/**
+ * findCrossFileCollisions — H-6 cross-file collision detection
+ * (independent-review fix, PR #172 blocker 2). findCollisions() above
+ * only sees duplicates WITHIN one already-parsed file's row list; it has
+ * no way to notice that the SAME subject/predicate key was ALSO produced
+ * by the OTHER file (e.g. an identical `## Session N — date — title`
+ * heading rotated into both HANDOFF.md's active preamble AND
+ * HANDOFF-HISTORY.md's archive). This function is that cross-file check,
+ * run by the caller AFTER both files are parsed.
+ *
+ * Write-semantics decision (this file's own, since neither the base spec
+ * nor the H amendment states it explicitly): under the whole-project
+ * delete-and-reinsert design (writeProjectMigration), BOTH contributing
+ * rows are written and BOTH survive — every category this function is
+ * called for is 1:N-safe by construction (session_tldr_archived/
+ * open_thread/next_step are registry-declared 1:N; a durable-section
+ * subject is the fixed canonical heading name, so a cross-file collision
+ * there is the EXPECTED shape whenever a project's durable sections are
+ * mirrored into both files). This function's job is only to make that
+ * outcome an EXPLICITLY REPORTED one — never a silent accident the
+ * operator has to notice by re-deriving it themselves.
+ *
+ * @param {Array} activeRows
+ * @param {Array} historyRows
+ * @param {(row: object) => string} keyFn
+ * @returns {Array<{key:string, activeCount:number, historyCount:number}>}
+ */
+function findCrossFileCollisions(activeRows, historyRows, keyFn) {
+  const activeCounts = new Map();
+  for (const r of activeRows || []) {
+    const k = keyFn(r);
+    activeCounts.set(k, (activeCounts.get(k) || 0) + 1);
+  }
+  const historyCounts = new Map();
+  for (const r of historyRows || []) {
+    const k = keyFn(r);
+    historyCounts.set(k, (historyCounts.get(k) || 0) + 1);
+  }
+  const collisions = [];
+  for (const [k, activeCount] of activeCounts) {
+    if (historyCounts.has(k)) {
+      collisions.push({ key: k, activeCount, historyCount: historyCounts.get(k) });
+    }
+  }
+  return collisions;
+}
+
+const COLLISION_KEY_FNS = {
+  session_tldr_archived: (r) => r.subject,
+  open_thread: (r) => r.subject,
+  durable: (r) => `${r.predicate}::${r.subject}`,
+  next_step: (r) => r.subject,
+};
+
+/**
+ * computeCrossFileCollisions — runs findCrossFileCollisions() over all
+ * four categories between the active-file and history-file parse
+ * results. Returns null when either file was absent (nothing to compare
+ * across — a single-file run cannot have a CROSS-file collision, only the
+ * WITHIN-file kind findCollisions() already covers).
+ */
+function computeCrossFileCollisions(activeParsed, historyParsed) {
+  if (!activeParsed || !historyParsed) return null;
+  return {
+    session_tldr_archived: findCrossFileCollisions(activeParsed.sessionTldrRows, historyParsed.sessionTldrRows, COLLISION_KEY_FNS.session_tldr_archived),
+    open_thread: findCrossFileCollisions(activeParsed.openThreadRows, historyParsed.openThreadRows, COLLISION_KEY_FNS.open_thread),
+    durable: findCrossFileCollisions(activeParsed.durableRows, historyParsed.durableRows, COLLISION_KEY_FNS.durable),
+    next_step: findCrossFileCollisions(activeParsed.nextStepRows, historyParsed.nextStepRows, COLLISION_KEY_FNS.next_step),
+  };
 }
 
 // ─── CONTENT FINGERPRINT (T1 convention, mirrors migrate-02) ─────────────
@@ -631,7 +710,30 @@ async function main() {
       console.log(`  [OK] slice source_db="${slice.sourceDb}" source_table="${slice.sourceTable}": ${slice.rows.length} row(s)`);
     }
 
-    const report = buildReport({ parsed, activeParsed, historyParsed, totalWritten });
+    // H-6: loud named collision events — WITHIN one file (findCollisions,
+    // computed per-file in parseFileIntoRows) and ACROSS the two files
+    // (findCrossFileCollisions, computed here once both files are
+    // parsed). Both kinds are printed to stdout (not just carried in the
+    // JSON report) so "loud" in the header comment's own framing is true
+    // in practice, not just in the report file.
+    for (const [fileLabel, filesParsed] of [['active', activeParsed], ['history', historyParsed]]) {
+      if (!filesParsed) continue;
+      for (const [category, list] of Object.entries(filesParsed.report.collisions)) {
+        for (const c of list) {
+          console.log(`  [SUBJECT-COLLISION] file=${fileLabel} category="${category}" key=${JSON.stringify(c.key)}: ${c.count} row(s) share this subject within one file`);
+        }
+      }
+    }
+    const crossFileCollisions = computeCrossFileCollisions(activeParsed, historyParsed);
+    if (crossFileCollisions) {
+      for (const [category, list] of Object.entries(crossFileCollisions)) {
+        for (const c of list) {
+          console.log(`  [CROSS-FILE-SUBJECT-COLLISION] category="${category}" key=${JSON.stringify(c.key)}: ${c.activeCount} row(s) in --file + ${c.historyCount} row(s) in --history-file — both survive as separate rows under this one subject key (documented H-6 outcome, not an accident)`);
+        }
+      }
+    }
+
+    const report = buildReport({ parsed, activeParsed, historyParsed, totalWritten, crossFileCollisions });
     const reportPath = writeReport(parsed.reportDir, parsed.projectId, report);
     console.log(`  [REPORT] ${reportPath}`);
 
@@ -693,7 +795,7 @@ function loadHeadingsConfig(configPath) {
 
 // ─── REPORT (base spec point 5, fail-soft) ────────────────────────────────
 
-function buildReport({ parsed, activeParsed, historyParsed, totalWritten }) {
+function buildReport({ parsed, activeParsed, historyParsed, totalWritten, crossFileCollisions }) {
   return {
     project_id: parsed.projectId,
     generated_at: new Date().toISOString(),
@@ -703,6 +805,13 @@ function buildReport({ parsed, activeParsed, historyParsed, totalWritten }) {
     total_assertions_written: totalWritten,
     active: activeParsed ? activeParsed.report : null,
     history: historyParsed ? historyParsed.report : null,
+    // H-6 cross-file collision events (independent-review fix, PR #172
+    // blocker 2) — null when either file was absent (nothing to compare
+    // across); otherwise one entry per category, each an array of
+    // {key, activeCount, historyCount}. See findCrossFileCollisions()'s
+    // header comment for the write-semantics decision this documents:
+    // both contributing rows are written and survive, by design.
+    cross_file_collisions: crossFileCollisions,
   };
 }
 
@@ -729,6 +838,8 @@ module.exports = {
   loadAndNormalizeFile,
   parseFileIntoRows,
   findCollisions,
+  findCrossFileCollisions,
+  computeCrossFileCollisions,
   computeContentFingerprint,
   writeProjectMigration,
   runRollback,

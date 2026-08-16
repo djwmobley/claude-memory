@@ -377,6 +377,25 @@ function isTableSeparatorRow(line) {
  * `_(no open carry-overs)_` empty-state placeholder as zero rows, never a
  * parse error.
  *
+ * HEADER DETECTION IS STRUCTURAL, NEVER POSITIONAL (independent-review
+ * fix, PR #172 blocker 1): the first content line after the heading is a
+ * HEADER only if the line immediately following it matches
+ * `isTableSeparatorRow` (a `|---|---|`-shaped divider). If it does not,
+ * the first content line is DATA — a hand-typed table with no
+ * header/separator row is still parsed in full, never silently losing its
+ * first row to a positional "line 1 is always the header" assumption.
+ *
+ * TOTALITY (H-9): every content line under the heading is placed into
+ * exactly one of three buckets — a well-formed row (`rows`), a malformed
+ * row (`flaggedRows`, e.g. wrong cell count, or a line with no `|` at
+ * all), or a boundary (blank line / next heading / EOF, which ends the
+ * table). No line is ever silently skipped. A header+separator pair
+ * followed by ZERO data/flagged rows (a "header-only" table) is itself
+ * flagged — distinct from the renderer's own explicit `_(none)_`
+ * empty-state placeholder, and therefore a suspicious, hand-edited shape
+ * that should never be silently indistinguishable from a genuinely empty
+ * section.
+ *
  * @param {string} bodyText
  * @param {number} bodyStartLineNo - 1-based line number bodyText's line 0 corresponds to, for report accuracy
  * @returns {Array<{
@@ -403,30 +422,59 @@ function findOpenCarryoverTables(bodyText, bodyStartLineNo) {
     let j = i + 1;
     while (j < lines.length && lines[j].trim() === '') j++;
 
-    if (j < lines.length && /^_\(.*\)_$/.test(lines[j].trim())) {
+    const isBoundary = (idx) => idx >= lines.length || lines[idx].trim() === '' || /^#{2,3}(?!#)\s+/.test(lines[idx].trim());
+
+    if (isBoundary(j)) {
+      // Nothing at all under this heading before the next boundary —
+      // legitimately empty (the renderer's own convention is to always
+      // emit the `_(none)_` placeholder for a truly empty table, so an
+      // outright-blank section is not itself suspicious the way a
+      // header-only table is).
+      results.push({ headingLineNo, rows, flaggedRows });
+      continue;
+    }
+
+    if (/^_\(.*\)_$/.test(lines[j].trim())) {
       // Empty-state placeholder — zero rows, not an error.
       results.push({ headingLineNo, rows, flaggedRows });
       continue;
     }
 
-    // Expect: header row, separator row, then body rows until a blank
-    // line, the next `##`/`###` heading, or EOF.
-    if (j < lines.length && lines[j].trim().startsWith('|')) {
-      let k = j + 1;
-      if (k < lines.length && isTableSeparatorRow(lines[k])) k++;
-      for (; k < lines.length; k++) {
-        const rowTrimmed = lines[k].trim();
-        if (rowTrimmed === '') break;
-        if (/^#{2,3}(?!#)\s+/.test(rowTrimmed)) break;
-        if (!rowTrimmed.includes('|')) break;
-        const parsed = parseTableRow(rowTrimmed, 2);
-        const lineNo = bodyStartLineNo + k;
-        if (parsed.ok) {
-          rows.push({ subjectRaw: parsed.cells[0], objectRaw: parsed.cells[1], lineNo });
-        } else {
-          flaggedRows.push({ raw: lines[k], reason: parsed.reason, lineNo });
-        }
+    // STRUCTURAL header detection: line j is a header iff line j+1 is a
+    // separator row. Otherwise line j is DATA (headerless table).
+    let k = j;
+    const headerPresent = (j + 1 < lines.length) && isTableSeparatorRow(lines[j + 1]);
+    if (headerPresent) {
+      k = j + 2; // skip header row + separator row
+    }
+
+    for (; k < lines.length; k++) {
+      const rowTrimmed = lines[k].trim();
+      if (rowTrimmed === '') break;
+      if (/^#{2,3}(?!#)\s+/.test(rowTrimmed)) break;
+      const lineNo = bodyStartLineNo + k;
+      if (!rowTrimmed.includes('|')) {
+        // A non-blank, non-heading line under this heading that cannot be
+        // placed as a table row at all (no pipe delimiter whatsoever) —
+        // H-9 totality: flagged, never silently skipped or treated as an
+        // implicit end-of-table boundary.
+        flaggedRows.push({ raw: lines[k], reason: 'expected a pipe-delimited table row, blank line, or heading — found neither', lineNo });
+        continue;
       }
+      const parsed = parseTableRow(rowTrimmed, 2);
+      if (parsed.ok) {
+        rows.push({ subjectRaw: parsed.cells[0], objectRaw: parsed.cells[1], lineNo });
+      } else {
+        flaggedRows.push({ raw: lines[k], reason: parsed.reason, lineNo });
+      }
+    }
+
+    if (headerPresent && rows.length === 0 && flaggedRows.length === 0) {
+      flaggedRows.push({
+        raw: lines[j],
+        reason: 'header-only table: a header + separator row was present but zero data rows followed (use the renderer\'s "_(no open carry-overs)_" placeholder for a genuinely empty table, not a bare header)',
+        lineNo: bodyStartLineNo + j,
+      });
     }
 
     results.push({ headingLineNo, rows, flaggedRows });

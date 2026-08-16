@@ -251,6 +251,61 @@ run('H9-9', 'fake "### Open carry-overs" heading inside a fence is not extracted
   assertEq(tables.length, 0, 'fenced fake Open carry-overs heading was incorrectly extracted');
 });
 
+// ── Independent-review fix (PR #172 blocker 1): header detection must be
+// structural (line-1-followed-by-a-separator), never positional
+// ("line 1 is always the header"). Reviewer-reproduced regression: a
+// headerless 2-row table previously lost its first row silently.
+
+run('H9-10', 'headerless 2-row table: BOTH rows parsed, none silently lost', () => {
+  const body = [
+    '',
+    '### Open carry-overs',
+    '',
+    '| EXAMPLE-THREAD-ALPHA: something | do the alpha thing |',
+    '| EXAMPLE-THREAD-BETA: other | do the beta thing |',
+    '',
+  ].join('\n');
+  const tables = mdParse.findOpenCarryoverTables(body, 1);
+  assertEq(tables.length, 1, 'expected exactly one Open carry-overs table');
+  assertEq(tables[0].rows.length, 2, 'headerless table must parse BOTH data rows, not lose the first to an assumed header');
+  assertEq(tables[0].rows[0].subjectRaw, 'EXAMPLE-THREAD-ALPHA: something', 'first row was incorrectly consumed as a header');
+  assertEq(tables[0].rows[1].subjectRaw, 'EXAMPLE-THREAD-BETA: other', 'second row mismatch');
+  assertEq(tables[0].flaggedRows.length, 0, 'no rows should be flagged for a well-formed headerless table');
+});
+
+run('H9-11', 'headered table (header + separator present): header row itself is skipped, only data rows parsed', () => {
+  const body = [
+    '',
+    '### Open carry-overs',
+    '',
+    '| Subject | Detail |',
+    '|---|---|',
+    '| EXAMPLE-THREAD-ALPHA: something | do the alpha thing |',
+    '',
+  ].join('\n');
+  const tables = mdParse.findOpenCarryoverTables(body, 1);
+  assertEq(tables.length, 1, 'expected exactly one Open carry-overs table');
+  assertEq(tables[0].rows.length, 1, 'expected exactly one data row (header row must not be parsed as data)');
+  assertEq(tables[0].rows[0].subjectRaw, 'EXAMPLE-THREAD-ALPHA: something', 'data row mismatch');
+  assert(!tables[0].rows.some((r) => r.subjectRaw === 'Subject'), 'the literal header row leaked through as a data row');
+});
+
+run('H9-12', 'header-only table (header + separator, zero data rows): zero rows, but flagged — never silently indistinguishable from a genuinely empty table', () => {
+  const body = [
+    '',
+    '### Open carry-overs',
+    '',
+    '| Subject | Detail |',
+    '|---|---|',
+    '',
+  ].join('\n');
+  const tables = mdParse.findOpenCarryoverTables(body, 1);
+  assertEq(tables.length, 1, 'expected exactly one Open carry-overs table');
+  assertEq(tables[0].rows.length, 0, 'header-only table should yield zero data rows');
+  assertEq(tables[0].flaggedRows.length, 1, 'header-only table must be flagged, not silently treated as a clean empty table');
+  assert(/header-only/i.test(tables[0].flaggedRows[0].reason), 'flag reason should identify the header-only condition');
+});
+
 // ─── H-11: NEXT SESSION list-item parsing ────────────────────────────────
 
 run('H11-1', 'numbered items with checkbox decoration stripped', () => {
