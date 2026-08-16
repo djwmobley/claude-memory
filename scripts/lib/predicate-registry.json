@@ -1,6 +1,6 @@
 {
   "_meta": {
-    "registry_version": "1.1",
+    "registry_version": "1.4",
     "description": "Authoritative predicate-vocabulary registry. Each entry declares the canonical predicate string, its cardinality, a human-readable description, and the registry version when the entry was added. Shape: { _meta: {...}, entries: [ { predicate, cardinality, description, added_version } ] }."
   },
   "entries": [
@@ -502,6 +502,12 @@
       "cardinality": "1:1",
       "description": "The session TL;DR persisted as a queryable row; latest supersedes prior",
       "added_version": "1.1"
+    },
+    {
+      "predicate": "session_tldr_archived",
+      "cardinality": "1:N",
+      "description": "A historical session summary parsed from HANDOFF.md / HANDOFF-HISTORY.md by the markdown migration (§6.1(h)/H-1); subject = the session's own heading text (date+title), object = the block body, created_at backdated to the session's parsed date. Deliberately DISTINCT from the live 1:1 session_tldr predicate written by handoff:close — a migration-origin archived row must never be eligible for session_tldr's \"most recent live row\" pick (v_handoff_card_inputs/fetchHandoffCardInputs has no subject filter on session_tldr), so archived history accumulates as 1:N rows under this separate predicate instead of colliding with or corrupting the live picker.",
+      "added_version": "1.4"
     },
     {
       "predicate": "shipped_at",
