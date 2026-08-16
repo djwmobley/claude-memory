@@ -380,6 +380,67 @@ async function main() {
     assertEq(sessionCollisions[0].historyCount, 1, 'wrong historyCount in the cross-file collision report entry');
   });
 
+  // ── T6c: H-6 WITHIN-file durable-heading collision (independent-review
+  // fix, PR #176) — a duplicated durable-section heading (e.g. two
+  // '## Run commands' sections in the SAME file) is the exact regression
+  // PR #176's author found empirically: registering run_commands/
+  // critical_operational_notes/key_paths as cardinality 1:1 (and widening
+  // assertions_1to1_unique to match) converts this documented, log-and-
+  // continue collision path into a hard Postgres "duplicate key value
+  // violates unique constraint" error that aborts the whole-project
+  // transaction (zero rows written). This fixture pins the CORRECT (1:N)
+  // behavior permanently so a future re-introduction of 1:1 for any
+  // durable-section predicate fails this test immediately, not just the
+  // reviewer's one-off manual repro. Distinct from T6b: T6b is a CROSS-file
+  // (--file vs --history-file) collision on session_tldr_archived; this is
+  // a WITHIN-file collision on a durable-section predicate. ─────────────
+  await run('T6c', 'H-6: a duplicated durable-section heading ("## Run commands" twice) within one file produces a reported within-file collision, exits 0, and BOTH rows survive', async () => {
+    const dupDurablePath = writeFixture(
+      'HANDOFF-dup-durable.md',
+      [
+        '## Run commands',
+        '',
+        'npm run example-test-one',
+        '',
+        '## Run commands',
+        '',
+        'npm run example-test-two',
+        '',
+      ].join('\n')
+    );
+    const reportScratchDir = path.join(SCRATCH_DIR, 'reports-t6c');
+    const projectD = `example-project-delta-${TS}`;
+    const r = runMigrate08(['--db', DB_TARGET, '--project-id', projectD, '--file', dupDurablePath, '--report-dir', reportScratchDir]);
+    if (r.status !== 0) throw new Error(`within-file durable-heading collision run failed (should exit 0, not crash): status=${r.status}\nstdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert(/MIGRATION_RESULT: PASS/.test(r.stdout), 'expected MIGRATION_RESULT: PASS in stdout');
+    assert(/\[SUBJECT-COLLISION\]/.test(r.stdout), 'expected a loud [SUBJECT-COLLISION] console line');
+    assert(r.stdout.includes('category="durable"'), 'expected the collision to be reported under the durable category');
+    assert(r.stdout.includes('key="run_commands::Run commands"'), 'expected the collision key to name the run_commands predicate and Run commands subject');
+
+    const client = await pgConnect(DB_TARGET);
+    try {
+      const { rows } = await client.query(
+        `SELECT subject, object, predicate, pinned FROM assertions WHERE project_id=$1 AND predicate='run_commands' ORDER BY object`,
+        [projectD]
+      );
+      assertEq(rows.length, 2, 'both durable-section rows for the duplicated "## Run commands" heading must survive (1:N-safe by design, never constraint-blocked)');
+      assert(rows.every((r2) => r2.subject === 'Run commands'), 'both rows should share the identical canonical subject');
+      assert(rows.every((r2) => r2.pinned === true), 'durable-section rows must be written pinned=true');
+      assert(rows[0].object !== rows[1].object, 'the two colliding rows should retain their distinct body content, not be merged or deduplicated');
+    } finally {
+      await client.end();
+    }
+
+    const reportFiles = fs.readdirSync(reportScratchDir).filter((f) => f.includes(projectD));
+    assertEq(reportFiles.length, 1, 'expected exactly one report file for this run');
+    const report = JSON.parse(fs.readFileSync(path.join(reportScratchDir, reportFiles[0]), 'utf8'));
+    assert(report.active && report.active.collisions && report.active.collisions.durable, 'report is missing active.collisions.durable entirely');
+    const durableCollisions = report.active.collisions.durable;
+    assertEq(durableCollisions.length, 1, 'expected exactly one durable within-file collision entry in the report');
+    assertEq(durableCollisions[0].key, 'run_commands::Run commands', 'wrong key in the within-file durable collision report entry');
+    assertEq(durableCollisions[0].count, 2, 'wrong count in the within-file durable collision report entry');
+  });
+
   // ── T7: usage errors ──────────────────────────────────────────────────
   await run('T7', 'usage: --project-id is required', async () => {
     const r = runMigrate08(['--db', DB_TARGET, '--file', activeFilePath]);
