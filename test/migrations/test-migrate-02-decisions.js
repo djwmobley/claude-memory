@@ -176,7 +176,8 @@ const DB_SOURCE_TXN = `verify02_src_txn_${TS}`;
 const DB_SOURCE_ROLLBACK = `verify02_src_rollback_${TS}`;
 const DB_SOURCE_DRIFT_ADDED = `verify02_src_drift_added_${TS}`;   // rule-added: unmatched -> routed
 const DB_SOURCE_DRIFT_REMOVED = `verify02_src_drift_removed_${TS}`; // rule-removed: routed -> unmatched
-const CREATED_DBS = [DB_TARGET, DB_SOURCE_HAPPY, DB_SOURCE_BADTOPIC, DB_SOURCE_DUPE, DB_SOURCE_TXN, DB_SOURCE_ROLLBACK, DB_SOURCE_DRIFT_ADDED, DB_SOURCE_DRIFT_REMOVED];
+const DB_SOURCE_LIVE_COLLISION = `verify02_src_live_collision_${TS}`; // review-round-2: cross-source topic collision
+const CREATED_DBS = [DB_TARGET, DB_SOURCE_HAPPY, DB_SOURCE_BADTOPIC, DB_SOURCE_DUPE, DB_SOURCE_TXN, DB_SOURCE_ROLLBACK, DB_SOURCE_DRIFT_ADDED, DB_SOURCE_DRIFT_REMOVED, DB_SOURCE_LIVE_COLLISION];
 
 const HAPPY_ROWS = [
   { topic: 'proj-alpha-foo-bar', decision: 'use approach A', reason: 'perf' },
@@ -313,6 +314,8 @@ async function main() {
     await insertSourceRows(DB_SOURCE_DRIFT_ADDED, [{ topic: 'cache-warmup-fix-added', decision: 'x', reason: null }]);
     await setupSourceDb(DB_SOURCE_DRIFT_REMOVED);
     await insertSourceRows(DB_SOURCE_DRIFT_REMOVED, [{ topic: 'cache-warmup-fix-removed', decision: 'x', reason: null }]);
+    await setupSourceDb(DB_SOURCE_LIVE_COLLISION);
+    await insertSourceRows(DB_SOURCE_LIVE_COLLISION, [{ topic: 'proj-alpha-shared-topic', decision: 'migrated decision', reason: null }]);
   });
 
   // ── Group 3: preconditions (D-3/D-4) — loud FAIL, nothing inserted ──────
@@ -586,6 +589,67 @@ async function main() {
       assert(staleManRows.length === 0, 'expected the old proj-real manifest slice to be gone');
     } finally {
       await client.end();
+    }
+  });
+
+  // ── Group 8: review-round-2 — cross-source topic collision must NOT be touched ──
+  // Reproduces the round-2 independent reviewer's exact finding: a
+  // legitimate, non-migration row (e.g. a live memory_upsert/
+  // persist_decisions write) sharing a topic string with a currently-
+  // migrating row under a DIFFERENT project_id must survive the
+  // reconciliation DELETE untouched -- the table's own (project_id,
+  // topic) unique constraint explicitly supports two rows sharing a
+  // topic under different project_ids; the reconciliation logic must
+  // never conflate "topic re-classified by a PRIOR RUN OF THIS SCRIPT"
+  // with "topic happens to collide with someone else's unrelated row."
+  const LIVE_SOURCE_MODEL = 'claude-sonnet-5-live-session';
+  await run('R4', 'review-round-2: a legitimate non-migration row sharing a topic under a different project_id survives untouched, un-reclassified, and the migration still PASSes', async () => {
+    const client = await pgConnect(DB_TARGET);
+    let liveRowId;
+    try {
+      const { rows } = await client.query(
+        `INSERT INTO decisions (project_id, topic, decision, source_model) VALUES ($1,$2,$3,$4) RETURNING id`,
+        ['totally-unrelated-live-project', 'proj-alpha-shared-topic', 'live legitimate decision, not migration debris', LIVE_SOURCE_MODEL]
+      );
+      liveRowId = rows[0].id;
+    } finally {
+      await client.end();
+    }
+
+    const migrateResult = runMigrate02(['--db', DB_TARGET, '--source-db', DB_SOURCE_LIVE_COLLISION]);
+    assert(migrateResult.status === 0, `expected exit 0, got ${migrateResult.status}. stdout=${migrateResult.stdout} stderr=${migrateResult.stderr}`);
+    assert(/MIGRATION_RESULT: PASS/.test(migrateResult.stdout), `expected PASS. stdout=${migrateResult.stdout}`);
+    assert(!/\[RECLASSIFY\] topic="proj-alpha-shared-topic"/.test(migrateResult.stdout), `expected NO [RECLASSIFY] line referencing the shared topic (the live row must never be treated as reclassification debris). stdout=${migrateResult.stdout}`);
+
+    const client2 = await pgConnect(DB_TARGET);
+    try {
+      // The live, non-migration row must survive completely unchanged.
+      const { rows: liveRows } = await client2.query(
+        `SELECT id, project_id, decision, source_model FROM decisions WHERE id = $1`,
+        [liveRowId]
+      );
+      assert(liveRows.length === 1, `expected the live row to survive untouched by id, found ${liveRows.length}`);
+      assert(liveRows[0].project_id === 'totally-unrelated-live-project', `expected the live row's project_id unchanged, got ${liveRows[0].project_id}`);
+      assert(liveRows[0].source_model === LIVE_SOURCE_MODEL, `expected the live row's source_model unchanged, got ${liveRows[0].source_model}`);
+      assert(liveRows[0].decision === 'live legitimate decision, not migration debris', `expected the live row's decision text unchanged, got ${JSON.stringify(liveRows[0].decision)}`);
+
+      // The migration's own row must ALSO exist, coexisting under the
+      // SAME topic but a DIFFERENT project_id (proves no overwrite/
+      // conflation happened at the (project_id, topic) key level either).
+      const { rows: migratedRows } = await client2.query(
+        `SELECT project_id, source_model FROM decisions WHERE topic = 'proj-alpha-shared-topic' AND project_id = 'proj-alpha'`
+      );
+      assert(migratedRows.length === 1, `expected exactly 1 migrated row under proj-alpha, found ${migratedRows.length}`);
+      assert(migratedRows[0].source_model === migrate02.SOURCE_MODEL_TAG, `expected the migrated row's source_model to be ${migrate02.SOURCE_MODEL_TAG}, got ${migratedRows[0].source_model}`);
+
+      // Exactly two rows total share this topic string -- one live, one
+      // migrated -- neither clobbered the other.
+      const { rows: allSharedTopic } = await client2.query(
+        `SELECT COUNT(*) AS n FROM decisions WHERE topic = 'proj-alpha-shared-topic'`
+      );
+      assert(Number(allSharedTopic[0].n) === 2, `expected exactly 2 rows sharing the topic (1 live + 1 migrated), found ${allSharedTopic[0].n}`);
+    } finally {
+      await client2.end();
     }
   });
 

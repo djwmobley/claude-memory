@@ -62,17 +62,29 @@
  *      zero-match falls to `unmatched-<first-dash-token>`, D-1/D-10), and
  *      groups rows into per-derived-project-id slices.
  *   9. Per slice, in ONE transaction (D-5/D-11):
- *        - RECONCILIATION (review-round-1 fix, post-D-12): deletes any
- *          `decisions` row whose `topic` is in this slice but whose
- *          `project_id` is NOT this slice's project_id -- a topic
- *          re-classified to a different project_id since a prior run
- *          (the documented D-2 owner-review workflow: fix an `unmatched-*`
- *          bucket's rule, re-run -- or the inverse, a rule removal
- *          dropping a topic back to `unmatched-*`). Topics are globally
- *          unique (D-4), so this is a safe, precise identity key. Each
- *          removed row is logged (`[RECLASSIFY]`) -- the `decisions_audit`
- *          trigger, once wired, preserves it in `audit_log`; never a
- *          silent drop.
+ *        - RECONCILIATION (review-round-1 fix, post-D-12; review-round-2
+ *          fix: source_model-guarded): deletes any `decisions` row whose
+ *          `topic` is in this slice, whose `project_id` is NOT this
+ *          slice's project_id, AND whose `source_model` is this script's
+ *          own SOURCE_MODEL_TAG -- a topic re-classified to a different
+ *          project_id since a prior run of THIS script (the documented
+ *          D-2 owner-review workflow: fix an `unmatched-*` bucket's rule,
+ *          re-run -- or the inverse, a rule removal dropping a topic back
+ *          to `unmatched-*`). Topics are globally unique WITHIN this
+ *          migration's own source (D-4), but NOT across the whole
+ *          `decisions` table -- other writers (a live memory_upsert/
+ *          persist_decisions path, hand-run SQL, a future second
+ *          migration) can legitimately share a topic string under a
+ *          DIFFERENT project_id, which the table's own (project_id,
+ *          topic) unique constraint explicitly supports. The
+ *          source_model guard (round 2 -- an independent reviewer
+ *          reproduced the unscoped version silently deleting live,
+ *          non-migration data) is what makes this DELETE precise; without
+ *          it, "topic re-classified by a prior run of this script" and
+ *          "topic happens to collide with someone else's unrelated row"
+ *          are indistinguishable. Each removed row is logged
+ *          (`[RECLASSIFY]`) -- the `decisions_audit` trigger, once wired,
+ *          preserves it in `audit_log`; never a silent drop.
  *        - upserts every row into `decisions` via
  *          `ON CONFLICT (project_id, topic) DO UPDATE` (idempotent re-run
  *          key, mirrors the source table's own upsert-by-topic semantics).
@@ -96,16 +108,25 @@
  *      per-topic delete can't reach, because no current slice ever visits
  *      it: e.g. `unmatched-cache-warmup` disappearing entirely once its
  *      one topic gets a real rule). Logged (`[RECONCILE]`).
- *  11. RECONCILIATION GATE (review-round-1 fix): after all of the above,
+ *  11. RECONCILIATION GATE (review-round-1 fix; review-round-2 fix:
+ *      source_model-guarded duplicate check): after all of the above,
  *      asserts (a) no current source topic maps to more than one live
- *      `decisions` row, and (b) the live `migration_manifest` slice set for
- *      this source equals the current classification's slice set exactly.
- *      Either failing is a loud `Refused (reconciliation gate)` and demotes
- *      `MIGRATION_RESULT` to FAIL even if step 12's row-count gate passed --
- *      this is the check that makes re-classification drift visible instead
- *      of silently passing (the bug an independent reviewer found: both
- *      runs of the reproduction printed `MIGRATION_RESULT: PASS` with a
- *      duplicated, orphaned row left behind).
+ *      `decisions` row tagged this script's own `source_model` (NOT a
+ *      claim that the topic is unique across the whole table -- a
+ *      legitimate unrelated row sharing that topic under a different
+ *      project_id must not fail this gate), and (b) the live
+ *      `migration_manifest` slice set for this source equals the current
+ *      classification's slice set exactly. Either failing is a loud
+ *      `Refused (reconciliation gate)` and demotes `MIGRATION_RESULT` to
+ *      FAIL even if step 12's row-count gate passed -- this is the check
+ *      that makes re-classification drift visible instead of silently
+ *      passing (the round-1 bug: both runs of that reproduction printed
+ *      `MIGRATION_RESULT: PASS` with a duplicated, orphaned row left
+ *      behind). NOTE: this gate runs AFTER step 9's DELETE has already
+ *      committed, so it can only catch inconsistency that SURVIVES the
+ *      delete -- it is not a substitute for that DELETE's own
+ *      source_model guard (round 2), which is what prevents an
+ *      over-broad delete from happening in the first place.
  *  12. Prints a per-slice report: live count next to an OPTIONAL
  *      documentary (stale) baseline carried on the routing map itself
  *      (D-9 -- diagnostic display only, NEVER read by any pass/fail
@@ -411,16 +432,27 @@ async function upsertSlice(tgtClient, sourceDb, projectId, sliceRows) {
     // `decisions` under a DIFFERENT project_id from a prior run whose
     // routing map classified it differently (D-2's documented owner-review
     // workflow, either direction: unmatched-* -> real rule, or a rule
-    // removed -> unmatched-*). Topics are globally unique (D-4), so
-    // deleting by (topic, project_id <> this slice's target) is a safe,
-    // precise identity key -- never touches a topic this slice doesn't
-    // own. Logged, never silent; decisions_audit (once wired) preserves
-    // the removed row in audit_log.
+    // removed -> unmatched-*). Topics are globally unique WITHIN this
+    // migration's own source (D-4) -- they are NOT globally unique across
+    // the whole `decisions` table, which other writers (a live
+    // memory_upsert/persist_decisions path, hand-run SQL, a future second
+    // migration) can and do also populate. Review-round-2 fix: this DELETE
+    // MUST be scoped by `source_model = SOURCE_MODEL_TAG` -- the same
+    // pattern runRollback() already used correctly -- so it can only ever
+    // touch a row THIS SCRIPT wrote under a prior classification, never a
+    // legitimate, unrelated row that merely happens to share a topic
+    // string with a currently-migrating one under a different project_id
+    // (an explicitly supported case per the table's own (project_id,
+    // topic) unique constraint, not a degenerate one). An independent
+    // reviewer reproduced the unscoped version silently deleting live,
+    // non-migration data -- this guard is the fix, not an enhancement.
+    // Logged, never silent; decisions_audit (once wired) preserves the
+    // removed row in audit_log.
     const sliceTopics = sliceRows.map((r) => r.topic);
     if (sliceTopics.length > 0) {
       const { rows: reclassified } = await tgtClient.query(
-        `DELETE FROM decisions WHERE topic = ANY($1::text[]) AND project_id <> $2 RETURNING topic, project_id`,
-        [sliceTopics, projectId]
+        `DELETE FROM decisions WHERE topic = ANY($1::text[]) AND project_id <> $2 AND source_model = $3 RETURNING topic, project_id`,
+        [sliceTopics, projectId, SOURCE_MODEL_TAG]
       );
       for (const r of reclassified) {
         console.log(`  [RECLASSIFY] topic="${r.topic}": removed stale row under project_id="${r.project_id}" (now project_id="${projectId}")`);
@@ -526,23 +558,44 @@ async function reconcileOrphanedManifestSlices(tgtClient, sourceDb, currentProje
  * Post-run self-check, independent of the per-slice/orphan-cleanup logic
  * above: proves the end state is actually consistent rather than trusting
  * that the operations above did their job. (a) no current source topic
- * maps to more than one live decisions row; (b) the live manifest slice
- * set for this source equals the current classification's slice set
- * exactly (no missing, no extra/orphaned). Returns an array of human-
- * readable problem strings; empty = clean. This is the check that makes
- * re-classification drift VISIBLE -- the independent-reviewer-found bug
- * was that MIGRATION_RESULT: PASS could not see a stale duplicate/orphaned
- * slice left behind by a prior run.
+ * maps to more than one live decisions row THIS MIGRATION OWNS (source_
+ * model = SOURCE_MODEL_TAG, review-round-2 fix -- see the scoping note in
+ * the function body for what this claims and deliberately does NOT
+ * claim); (b) the live manifest slice set for this source equals the
+ * current classification's slice set exactly (no missing, no extra/
+ * orphaned). Returns an array of human-readable problem strings; empty =
+ * clean. This is the check that makes re-classification drift VISIBLE --
+ * the round-1 independent-reviewer-found bug was that MIGRATION_RESULT:
+ * PASS could not see a stale duplicate/orphaned slice left behind by a
+ * prior run. NOTE (round 2): this gate runs AFTER upsertSlice()'s
+ * reconciliation DELETE has already committed -- it can only detect
+ * inconsistency that SURVIVES the delete, not an over-broad delete that
+ * already ran. The DELETE's own source_model guard (upsertSlice()) is
+ * what prevents the over-broad delete in the first place; this gate is a
+ * second, independent check, not a substitute for that guard.
  */
 async function verifyReconciliation(tgtClient, sourceDb, sourceTopics, currentProjectIds) {
   const problems = [];
+  // Review-round-2 fix: this duplicate-topic check MUST be scoped to
+  // source_model = SOURCE_MODEL_TAG, matching the DELETE guard in
+  // upsertSlice() above. What this gate claims: "no topic this migration
+  // classified has more than one row THIS MIGRATION OWNS." What it
+  // deliberately does NOT claim, and cannot: that a source topic is
+  // unique across the WHOLE decisions table -- a legitimate, unrelated
+  // row (a live memory_upsert/persist_decisions write, hand-run SQL, or a
+  // future second migration's own tag) sharing that topic string under a
+  // different project_id is an explicitly supported case (the table's
+  // unique constraint is (project_id, topic), not (topic) alone) and must
+  // neither fail this gate nor be touched by it. Unscoped, this check
+  // would false-positive the very first time a live writer's topic
+  // happened to collide with a currently-migrating one.
   if (sourceTopics.length > 0) {
     const { rows: dupTopics } = await tgtClient.query(
-      `SELECT topic, COUNT(*) AS n FROM decisions WHERE topic = ANY($1::text[]) GROUP BY topic HAVING COUNT(*) > 1`,
-      [sourceTopics]
+      `SELECT topic, COUNT(*) AS n FROM decisions WHERE topic = ANY($1::text[]) AND source_model = $2 GROUP BY topic HAVING COUNT(*) > 1`,
+      [sourceTopics, SOURCE_MODEL_TAG]
     );
     for (const r of dupTopics) {
-      problems.push(`topic=${JSON.stringify(r.topic)} maps to ${r.n} live decisions row(s) (expected exactly 1)`);
+      problems.push(`topic=${JSON.stringify(r.topic)} maps to ${r.n} live decisions row(s) tagged source_model='${SOURCE_MODEL_TAG}' (expected exactly 1)`);
     }
   }
   const { rows: manifestRows } = await tgtClient.query(
