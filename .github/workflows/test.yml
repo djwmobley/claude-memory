@@ -920,6 +920,25 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: "North-star: caveman economy, store-wide (§3.5 K-1..K-11, GREEN gate — T7 prerequisite)"
+        # Generalizes the above to the ENTIRE §5 schema (scripts/migrations/
+        # caveman-columns.json's K-9 manifest), not one close-payload fixture.
+        # With no --db, provisions + drops its OWN throwaway `_staging`-
+        # suffixed scratch DB (migrate-01 -> addenda -> migrate-13 ->
+        # migrate-14 -> migrate-15 -> migrate-16), mirroring every other
+        # migrate-*.js test step's convention — never touches
+        # claude_memory_eval_test/memory_manager_staging.
+        run: node test/north-star/test-caveman-economy-store-wide.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: "Run caveman-economy store-wide gate's own tests (disposable scratch DB)"
+        run: node test/migrations/test-caveman-gate-store-wide.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       # ── North-star suite (TDD spec — RED BY DESIGN, hard gate) ───────────────
       # These four files encode the system's north star: load-bearing session
       # intent (open-threads / next-actions / tldr) MUST live in Postgres as
