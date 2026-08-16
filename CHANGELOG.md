@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **§3.5 store-wide caveman-economy gate (T7 prerequisite, K-1..K-11 amendment,
+  memory-manager#12)** — `test/north-star/test-caveman-economy-store-wide.js`
+  generalizes the single-session `test-caveman-economy.js` gate to the ENTIRE
+  target database: `scripts/lib/caveman-lint.js` (new shared lib) holds the
+  single `estimateTokens`/`assertSurfaced` definitions (moved by reference out
+  of `test/north-star/lib/ns-harness.js`, which now imports them), a generic
+  K-3 load-bearing-token extractor (SHA/hex, file paths, `file:line`, PR/issue
+  refs, ISO dates, URLs, quoted strings, numbers, and K-6 negation markers
+  carved OUT of the strippable set into MUST-PRESERVE), a no-baseline K-7
+  truncation heuristic (`detectTruncation` — tightened after running against
+  real migrated `decisions` rows in `memory_manager_staging` surfaced false
+  positives on ordinary apostrophes/possessives and benign slash-separated
+  word pairs; now requires corroborating path context and excludes
+  terminal-punctuation-complete sentences), and an ARM3-style function-word
+  density ceiling for the K-5 no-synthetic-baseline economy check.
+  `scripts/migrations/caveman-columns.json` is the K-9 total-classification
+  manifest — every TEXT/VARCHAR column across all 29 §5 graph/corpus/seam/
+  registry tables (checked-caveman / checked-verbose-exempt /
+  mandatory-caveman-no-column / exempt-not-model-authored-with-reason), PLUS
+  an `out_of_scope_tables` bucket total-classifying every other table/view in
+  the live schema (§15/§17/§18 infrastructure, views) — together they cover
+  the database's entire public schema, so the runtime K-8 completeness
+  backstop (`checkCompleteness`) diffs the WHOLE live schema against the
+  manifest, never a pre-filtered allow-list. `assertions.authoring_mode`
+  ships as its own schema addendum (`migrate-16-caveman-addenda.js`/`.sql`),
+  nullable with no DEFAULT (grandfather pattern, same as `tier`/
+  `reality_check` — never silently backfills pre-existing rows to
+  'caveman'). `test/migrations/test-caveman-gate-store-wide.js` covers the
+  gate itself on a disposable scratch DB: passing caveman rows, grandfathered
+  verbose/NULL rows (economy-exempt, fidelity still enforced), a truncated
+  row (must fail), manifest drift in both directions (must fail loud), and a
+  direct K-6 negation-regression proof via `assertFullFidelity`.
+  `scripts/migrations/verify-15-t7-caveman-economy.js`'s previously-unmet
+  prerequisite is now satisfied end to end.
+
+- **§6.1(h) handoff-markdown migration** — `scripts/migrations/migrate-08-handoff-markdown.js` parses a project's `HANDOFF.md` (active fat card) and `.claude/HANDOFF-HISTORY.md` (archive) into `assertions` rows, PEER to the SQL-source migrations. New `scripts/lib/handoff-markdown-parse.js` (fenced-code/blockquote/HTML-comment-aware heading classifier + markdown-table cell parser, the exact inverse of `carryover-render.js`'s escaping) and `scripts/lib/fs-path-normalize.js` (shared `filesystem:<path>` manifest-key normalizer, reusable by future filesystem-sourced migrations). Archived session summaries land under the new `session_tldr_archived` predicate (1:N; registry-added) — deliberately never the live 1:1 `session_tldr` predicate, so migration-origin rows can never corrupt the "most recent session" picker. Carry-over rows always land `carryover_status='open'`; durable sections (`run_commands`/`critical_operational_notes`/`key_paths`) land pinned; NEXT SESSION items get a freshly-assigned `seq`. Re-run semantics: whole-project delete-and-reinsert of this migration's own `source_model='markdown-migration-h'` rows in one transaction. New `scripts/migrations/handoff-section-headings.json` config (extensible per-project durable-heading list).
 - **§8 generalized MCP tool surface** — `scripts/handoff-mcp.mjs` grows from
   5 tools to 30: `memory_search` (hybrid vector+FTS across a closed
   15-table enum — `assertions`/`agent_exchange` plus 4 of the 13 seam

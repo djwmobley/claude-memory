@@ -1,0 +1,19 @@
+{
+  "_meta": {
+    "description": "Extensible per-project list of durable/pinned HANDOFF.md `##`-level section headings (CONSOLIDATION-RUNBOOK.md §6.1(h), base spec point 3 + H-5's total-classification rule). scripts/lib/handoff-markdown-parse.js matches every real `##` heading against this list CASE-INSENSITIVELY (trimmed, dash/whitespace-collapsed) to decide the durable-section branch of its total classification. Each entry's `predicate` is the assertions.predicate string §5.9's v_handoff_card_inputs view already expects to read for that section (pinned=true rows). SYNTHETIC-SAFE: this is engine config, not project instance data — every project's real HANDOFF.md is expected to use these exact three canonical headings unless it extends the list locally (never committed with real per-project additions; extend via a local, gitignored override if a project's shape diverges)."
+  },
+  "headings": [
+    {
+      "canonical": "Run commands",
+      "predicate": "run_commands"
+    },
+    {
+      "canonical": "Critical operational notes",
+      "predicate": "critical_operational_notes"
+    },
+    {
+      "canonical": "Key paths",
+      "predicate": "key_paths"
+    }
+  ]
+}
