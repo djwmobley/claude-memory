@@ -10,9 +10,18 @@
  * scripts/lib/exchange-log.js, and scripts/lib/memory-lint.js against a
  * live target. Reuses scripts/migrations/lib/smoke-harness.js's
  * withTransactionRollback/runCheck/withSavepoint (verify-17/18's own
- * pattern) — the entire run happens inside one transaction that is ALWAYS
- * rolled back, so this is safe to run against a live staging database with
- * zero residue by construction.
+ * pattern) — 27 of 30 checks run inside one transaction that is ALWAYS
+ * rolled back; the 3 exchange-log checks run against a separate dedicated
+ * connection with explicit manual DELETE cleanup (appendExchange owns its
+ * own transaction, per §7.7 — see runExchangeLogChecks()'s own comment).
+ * Both halves are proven residue-free in scripts/lib data tables (see
+ * main()'s scanForResidue call). HONEST CAVEAT (post-review, N1): this run
+ * is NOT byte-identical-to-before in audit_log — the manual cleanup DELETEs
+ * in the second half are audit-triggered by design (tamper-evidence rows
+ * are never scrubbed, on this table or any other guarded table), so
+ * audit_log grows by a small, reported, expected amount every run. main()
+ * reports that delta explicitly rather than omitting it; it is never
+ * counted as residue/failure.
  *
  * Prerequisite: migrate-14-seam-tables.js AND migrate-13-agent-exchange.js
  * (re-applied after it) must already be PASSing against the target.
@@ -489,6 +498,84 @@ async function runChecks(client, prefix) {
     }
   });
 
+  // ── N3 regression: NULL active/status rows are NOT silently dropped ────
+  await check(27, 'render-handoff-card: NULL gotchas.active / findings.status are INCLUDED, not silently three-valued-logic-dropped (N3)', async () => {
+    await client.query(
+      `INSERT INTO gotchas (project_id, issue, rule, active) VALUES ($1, 'null-active issue', 'null-active rule', NULL)`,
+      [projectA]
+    );
+    await client.query(
+      `INSERT INTO gotchas (project_id, issue, rule, active) VALUES ($1, 'false-active issue', 'false-active rule', false)`,
+      [projectA]
+    );
+    await client.query(
+      `INSERT INTO findings (id, project_id, source, severity, confidence, location, category, description, impact, remediation, effort, status)
+       VALUES ($1, $2, 's', 'low', 'low', 'x', 'x', 'null-status desc', 'i', 'r', 'low', NULL)`,
+      [`${prefix}-F-nullstatus`, projectA]
+    );
+    await client.query(
+      `INSERT INTO findings (id, project_id, source, severity, confidence, location, category, description, impact, remediation, effort, status)
+       VALUES ($1, $2, 's', 'low', 'low', 'x', 'x', 'fixed-status desc', 'i', 'r', 'low', 'fixed')`,
+      [`${prefix}-F-fixedstatus`, projectA]
+    );
+    const facts = await renderHandoffCard.fetchDurablePlatformFacts(client, projectA, 20);
+    const gotchaIssues = facts.gotchas.map((g) => g.issue);
+    assert(gotchaIssues.includes('null-active issue'), 'NULL active gotcha included (three-valued-logic fix)');
+    assert(!gotchaIssues.includes('false-active issue'), 'explicit active=false gotcha still excluded');
+    const findingDescs = facts.findings.map((f) => f.description);
+    assert(findingDescs.includes('null-status desc'), 'NULL status finding included (three-valued-logic fix)');
+    assert(!findingDescs.includes('fixed-status desc'), 'explicit status=fixed finding still excluded');
+  });
+
+  // ── N4 regression: empty-string authoring_mode fails APP-LEVEL, not as a
+  // raw Postgres 23514 CHECK-constraint violation ──────────────────────────
+  await check(28, 'memory-upsert: empty-string authoring_mode rejected app-level (N4/S-3)', async () => {
+    try {
+      await memoryUpsert.writeMemoryRow(client, 'decisions', {
+        project_id: projectA, topic: 'x', decision: 'y', authoring_mode: '',
+      });
+      throw new Error('expected a MemoryUpsertError');
+    } catch (err) {
+      assert(err instanceof memoryUpsert.MemoryUpsertError, `expected a MemoryUpsertError (clean app-level rejection), got: ${err.name || typeof err}: ${err.message}`);
+      assertEq(err.code, 'validation', 'error code (S-3: clean tool error, never a raw Postgres 23514)');
+    }
+  });
+
+  // ── G1 regression: case-variant subjects on a 1:1 predicate with
+  // contradictory objects are caught by BOTH contradiction checks ─────────
+  await check(29, 'memory-lint: contradicting_assertions catches case-variant subjects "Foo"/"foo" via LOWER(TRIM()) matching (G1)', async () => {
+    await client.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
+       VALUES ($1, $2, 'are_safe_outside_this_project', 'yes', 8, 'user_stated')`,
+      [projectA, `${prefix}-CaseSubj`]
+    );
+    await client.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
+       VALUES ($1, $2, 'are_safe_outside_this_project', 'no', 8, 'user_stated')`,
+      [projectA, `${prefix}-casesubj`] // same subject, different case
+    );
+    const result = await memoryLint.checkContradictingAssertions(client, projectA);
+    const hit = result.contradictions.some(
+      (c) => c.subject.toLowerCase() === `${prefix}-casesubj`.toLowerCase()
+    );
+    assert(hit, 'case-variant subject pair ("Foo"-shape vs "foo"-shape) IS caught — would have been invisible to raw-string grouping');
+  });
+
+  await check(30, 'memory-upsert: findContradictingAssertion catches case-variant subjects via LOWER(TRIM()) matching (G1)', async () => {
+    const subjectUpper = `${prefix}-CaseSubj2`;
+    const subjectLower = `${prefix}-casesubj2`;
+    await client.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
+       VALUES ($1, $2, 'are_safe_outside_this_project', 'existing-value', 8, 'user_stated')`,
+      [projectA, subjectUpper]
+    );
+    const conflict = await memoryUpsert.findContradictingAssertion(
+      client, projectA, subjectLower, 'are_safe_outside_this_project', 'different-value'
+    );
+    assert(conflict !== null, 'case-variant subject lookup finds the existing row (would have been invisible to exact `subject = $2` matching)');
+    assertEq(conflict.object, 'existing-value', 'conflicting row object returned correctly');
+  });
+
   return { allOk, results };
 }
 
@@ -614,6 +701,20 @@ async function main() {
     const prefix = harness.makeRunPrefix(LABEL);
     console.log(`  run prefix: ${prefix}`);
 
+    // audit_log BASELINE (N1/honest-residue reporting): audit_log rows are
+    // NOT residue -- they are the tamper-evidence trail's own inherent
+    // behavior. Checks 18-20's manual DELETE cleanup (agent_exchange/tasks,
+    // both audit-triggered) UNAVOIDABLY appends real audit_log rows -- that
+    // is exactly what the trigger is FOR, per migrate-13-agent-exchange.sql's
+    // own design note ("legitimate engine writes... generate audit_log rows
+    // by design"). Silently omitting this growth from the residue report
+    // would misrepresent "zero residue" as "the DB is byte-identical to
+    // before," which it is not and structurally cannot be for any run that
+    // exercises a guarded table's DELETE/UPDATE path. Reported explicitly
+    // below instead.
+    const { rows: auditBeforeRows } = await db.query('SELECT count(*)::int AS n FROM audit_log');
+    const auditLogCountBefore = auditBeforeRows[0].n;
+
     const { allOk } = await harness.withTransactionRollback(db, [], async () => {
       return runChecks(db, prefix);
     });
@@ -643,8 +744,16 @@ async function main() {
     if (residue.length) {
       console.error(`  RESIDUE DETECTED: ${residue.join('; ')}`);
     } else {
-      console.log('  residue scan: clean (0 rows)');
+      console.log('  residue scan: clean (0 rows) across assertions/entities/edges/decisions/findings/tasks/agent_exchange');
     }
+
+    // audit_log HONEST REPORT (N1) -- never silently omitted. A non-zero
+    // delta here is EXPECTED (checks 18-20's cleanup DELETEs are captured
+    // by design) and is NOT counted as residue/failure.
+    const { rows: auditAfterRows } = await db.query('SELECT count(*)::int AS n FROM audit_log');
+    const auditLogCountAfter = auditAfterRows[0].n;
+    const auditLogDelta = auditLogCountAfter - auditLogCountBefore;
+    console.log(`  audit_log tamper-evidence rows this run: +${auditLogDelta} (by design -- checks 18-20's manual cleanup DELETEs on agent_exchange/tasks are audit-triggered and captured, never scrubbed; this is NOT residue)`);
 
     const finalOk = allOk && exchangeOk && residue.length === 0;
     harness.printSummary(LABEL, finalOk);

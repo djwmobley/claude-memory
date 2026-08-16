@@ -40,7 +40,7 @@
 --      touching the declared composite PRIMARY KEY or any other §5.3 column
 --      -- every column §5.3 names is still present, unchanged, verbatim.
 --
---   2. audit_log.row_id (BIGINT, unwidened from PR #158) is widened to TEXT
+--   2. audit_log.row_id (originally BIGINT, PR #158) is widened to TEXT
 --      here ("ROW_ID WIDENING" below). findings.id is TEXT by design (§5.3:
 --      source-prefixed ids like "RT-INJ-001", composite PK (project_id,
 --      id)) -- log_guarded_change()'s `VALUES (..., OLD.id, ...)` would
@@ -55,13 +55,25 @@
 --      audit_log consumer is known to depend on row_id's SQL type rather
 --      than its textual value.
 --
+--      POST-REVIEW UPDATE (memory-manager#17): migrate-13-agent-exchange.sql
+--      now declares row_id TEXT directly AND carries this exact same
+--      idempotent ALTER itself (so its own generic self-verification
+--      converges instead of permanently reporting a wrong-type-column FAIL
+--      on every re-apply -- a genuine future drift on this column now
+--      surfaces as a real FAIL again, as intended). This file's own copy of
+--      the ALTER below is therefore harmless, redundant belt-and-suspenders
+--      -- kept so this file's prerequisite ordering never silently depends
+--      on migrate-13 having already run the widening.
+--
 -- PREREQUISITE: migrate-schema-addenda.js's addendum AND
 -- migrate-13-agent-exchange.js's audit_log/log_guarded_change() must already
 -- be applied to the target (migrate-14-seam-tables.js checks this before
 -- applying anything -- see its header comment).
 
 -- ============================================================================
--- ROW_ID WIDENING -- see deviation (2) above.
+-- ROW_ID WIDENING -- see deviation (2) above. Redundant with migrate-13-
+-- agent-exchange.sql's own copy of this statement (post-review update) --
+-- kept here too; a repeated idempotent ALTER is a proven no-op either way.
 -- ============================================================================
 ALTER TABLE audit_log ALTER COLUMN row_id TYPE TEXT USING row_id::text;
 

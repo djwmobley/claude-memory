@@ -51,9 +51,17 @@
  *            13 seam tables (mirrors migrate-13-agent-exchange.js's D-3/D-4
  *            checkEmbeddingColumn/checkHnswIndex, generalized into a loop),
  *            and the audit_log.row_id widening (data_type = 'text').
- *        (c) v_handoff_card_inputs view: existence (pg_views) + its
- *            defense-in-depth WHERE clause substring check (S-14) via
- *            pg_get_viewdef.
+ *        (c) v_handoff_card_inputs view: existence (pg_views) + a
+ *            BEHAVIORAL probe (post-review fix, G2 -- NOT a pg_get_viewdef
+ *            text/substring match, which is defeatable by an AND->OR edit
+ *            that keeps the same tokens): 4 probe assertion rows are
+ *            inserted inside a transaction (one that should be visible,
+ *            three that each individually trip one of the view's filter
+ *            predicates -- suppressed / invalid_at / carryover_status='
+ *            resolved', the S-14 defense predicate specifically), the view
+ *            is queried, exactly the one valid row must be visible, then
+ *            the transaction is unconditionally ROLLED BACK (zero residue
+ *            -- INSERT never fires the assertions_audit trigger).
  *
  * Usage:
  *   node scripts/migrations/migrate-14-seam-tables.js [--db <name>]
@@ -200,19 +208,74 @@ async function checkRowIdWidened(client) {
 
 /** v_handoff_card_inputs (§5.9): existence + the S-14 defense-in-depth
  * predicate present in its definition. */
+/**
+ * checkHandoffCardView — v_handoff_card_inputs (§5.9): BEHAVIORAL check
+ * (post-review fix, G2), not text-matching.
+ *
+ * The prior implementation substring-matched pg_get_viewdef()'s SQL text
+ * for the S-14 defense-in-depth predicate. That is defeatable: an
+ * AND -> OR edit (or any other semantically-destructive rewrite that keeps
+ * the same tokens) passes a substring check while disabling every filter
+ * the view is supposed to apply. This version instead inserts 4 probe
+ * assertion rows inside a transaction -- one that SHOULD be visible
+ * through the view, and three that each individually trip exactly ONE of
+ * the view's filter predicates (suppressed=true / invalid_at set /
+ * carryover_status='resolved') -- queries the view, asserts EXACTLY the
+ * one valid probe row is visible, then ROLLS BACK unconditionally. Zero
+ * residue: assertions_audit only fires on UPDATE/DELETE (never INSERT), so
+ * this leaves no audit_log rows behind either, and the ROLLBACK discards
+ * the probe rows themselves.
+ */
 async function checkHandoffCardView(client) {
-  const { rows } = await client.query(
-    `SELECT pg_get_viewdef('v_handoff_card_inputs'::regclass, true) AS def
-       FROM pg_views WHERE schemaname = current_schema() AND viewname = 'v_handoff_card_inputs'`
+  const { rows: viewRows } = await client.query(
+    `SELECT 1 FROM pg_views WHERE schemaname = current_schema() AND viewname = 'v_handoff_card_inputs'`
   );
-  if (rows.length === 0) return { status: 'FAIL', reason: 'v_handoff_card_inputs view not found' };
-  const def = rows[0].def;
-  const hasDefensePredicate = /carryover_status\s+IS\s+NULL/i.test(def) && /carryover_status\s*<>\s*'resolved'/i.test(def);
-  return {
-    status: hasDefensePredicate ? 'PASS' : 'FAIL',
-    reason: hasDefensePredicate ? null : 'S-14 defense-in-depth predicate (carryover_status IS NULL OR <> resolved) not found in view definition',
-    def,
-  };
+  if (viewRows.length === 0) return { status: 'FAIL', reason: 'v_handoff_card_inputs view not found' };
+
+  const probeProjectId = `t14-viewcheck-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  let status = 'FAIL';
+  let reason = null;
+  let observedSubjects = null;
+
+  await client.query('BEGIN');
+  try {
+    const probes = [
+      // { subject, carryover_status, suppressed, invalidAt, expectVisible }
+      { subject: 'probe-valid',       carryover_status: 'open',     suppressed: false, invalidAt: false, expectVisible: true },
+      { subject: 'probe-suppressed',  carryover_status: 'open',     suppressed: true,  invalidAt: false, expectVisible: false },
+      { subject: 'probe-invalidated', carryover_status: 'open',     suppressed: false, invalidAt: true,  expectVisible: false },
+      { subject: 'probe-resolved',    carryover_status: 'resolved', suppressed: false, invalidAt: false, expectVisible: false },
+    ];
+    for (const p of probes) {
+      await client.query(
+        `INSERT INTO assertions
+           (project_id, subject, predicate, object, confidence, source, carryover_status, suppressed, invalid_at)
+         VALUES ($1, $2, 'open_thread', $3, 8, 'user_stated', $4, $5, ${p.invalidAt ? 'now()' : 'NULL'})`,
+        [probeProjectId, p.subject, `${p.subject} object text`, p.carryover_status, p.suppressed]
+      );
+    }
+
+    const { rows: viewResults } = await client.query(
+      `SELECT subject FROM v_handoff_card_inputs WHERE project_id = $1 ORDER BY subject`,
+      [probeProjectId]
+    );
+    observedSubjects = viewResults.map((r) => r.subject);
+    const expectedVisible = probes.filter((p) => p.expectVisible).map((p) => p.subject).sort();
+
+    if (JSON.stringify(observedSubjects) === JSON.stringify(expectedVisible)) {
+      status = 'PASS';
+    } else {
+      status = 'FAIL';
+      reason = `expected exactly ${JSON.stringify(expectedVisible)} visible through the view, got ${JSON.stringify(observedSubjects)}`;
+    }
+  } catch (err) {
+    status = 'FAIL';
+    reason = `probe insert/query error: ${err.message}`;
+  } finally {
+    await client.query('ROLLBACK'); // unconditional -- zero residue regardless of outcome above
+  }
+
+  return { status, reason, observedSubjects };
 }
 
 // ─── FULL VERIFICATION PASS ────────────────────────────────────────────────
@@ -356,7 +419,7 @@ async function main() {
     for (const r of v.hnswResults) console.log(`    - ${r.table}_embedding_idx: ${r.status}${r.reason ? ` -- ${r.reason}` : ''}`);
 
     console.log(`  audit_log.row_id widening (deviation 2): ${v.rowIdWidened.status} (data_type=${v.rowIdWidened.dataType || 'n/a'})`);
-    console.log(`  v_handoff_card_inputs (§5.9, S-14 defense predicate): ${v.handoffCardView.status}${v.handoffCardView.reason ? ` -- ${v.handoffCardView.reason}` : ''}`);
+    console.log(`  v_handoff_card_inputs (§5.9, S-14 defense predicate, BEHAVIORAL probe): ${v.handoffCardView.status}${v.handoffCardView.reason ? ` -- ${v.handoffCardView.reason}` : ''}`);
 
     console.log('');
     console.log('  NEXT STEP: re-run `node scripts/migrations/migrate-13-agent-exchange.js` (unmodified) so its trigger-wiring DO block finds these 13 newly-created tables and auto-wires audit triggers onto them.');

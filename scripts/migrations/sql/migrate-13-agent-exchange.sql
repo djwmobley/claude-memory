@@ -85,19 +85,42 @@ END $$;
 -- AUDIT_LOG + log_guarded_change() -- generic tamper-evidence infrastructure.
 -- ============================================================================
 
--- ADVERSARY-PASS A-2: row_id is BIGINT, not INTEGER -- a deliberate deviation
--- from the source design, strictly safer against any future wide-ID guarded
--- table (audit_log.row_id must never itself become the overflow point).
+-- ADVERSARY-PASS A-2 (superseded -- see ROW_ID TEXT WIDENING below): row_id
+-- was originally BIGINT, not INTEGER, as a deliberate deviation from the
+-- source design, strictly safer against any future wide-ID guarded table.
+-- That numeric-safety property is now carried by row_id being TEXT instead
+-- (a TEXT column has no width ceiling at all, a strict superset of what
+-- BIGINT guarded against).
+--
+-- ROW_ID TEXT WIDENING (memory-manager#17 follow-up, post-review): row_id
+-- is TEXT, not BIGINT/INTEGER. §5.3's `findings` table gives it a
+-- caller-supplied TEXT primary-key id (source-prefixed, e.g.
+-- "RT-INJ-001") -- inserting that value into a BIGINT row_id column throws
+-- a type-cast error the first time findings is UPDATEd or DELETEd once its
+-- audit trigger is wired (empirically confirmed against a live Postgres
+-- instance). TEXT is a strict widening: every OTHER guarded table's id is
+-- SERIAL/INTEGER, and an integer value inserts into a TEXT column cleanly
+-- via ordinary assignment coercion, no cast needed on the trigger-function
+-- side (also empirically confirmed) -- so this widening is safe for every
+-- currently- and future-guarded table, not just findings.
 CREATE TABLE IF NOT EXISTS audit_log (
   id          SERIAL PRIMARY KEY,
   table_name  TEXT NOT NULL,
   operation   TEXT NOT NULL,       -- 'UPDATE' | 'DELETE'
-  row_id      BIGINT,
+  row_id      TEXT,
   db_user     TEXT,
   old_row     JSONB,
   new_row     JSONB,
   created_at  TIMESTAMPTZ DEFAULT NOW()
 );
+-- Idempotent convergence ALTER for any target that already ran an EARLIER
+-- version of this file (row_id BIGINT, PR #158) or was widened only via
+-- migrate-14-seam-tables.sql's own copy of this same statement (that
+-- file's copy is now harmless, redundant, intentionally left in place --
+-- re-running this ALTER against an already-TEXT column is a proven no-op).
+-- A fresh target (CREATE TABLE above just ran) already has row_id TEXT, so
+-- this ALTER is a no-op there too -- unconditionally safe either way.
+ALTER TABLE audit_log ALTER COLUMN row_id TYPE TEXT USING row_id::text;
 CREATE INDEX IF NOT EXISTS audit_log_table_op_idx ON audit_log (table_name, operation);
 CREATE INDEX IF NOT EXISTS audit_log_created_idx  ON audit_log (created_at DESC);
 

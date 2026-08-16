@@ -91,13 +91,21 @@ async function fetchDurablePlatformFacts(client, projectId, limitPerTable = 5) {
     [projectId, limitPerTable]
   );
   const gotchas = await client.query(
+    // active is nullable (§5.3: BOOLEAN DEFAULT TRUE, no NOT NULL) -- plain
+    // `= true` is three-valued-logic-broken (NULL = true evaluates to NULL,
+    // silently EXCLUDING NULL rows). IS DISTINCT FROM makes this total:
+    // NULL and TRUE are both included, only an EXPLICIT false excludes.
     `SELECT id, issue, rule, created_at FROM gotchas
-      WHERE project_id = $1 AND active = true ORDER BY created_at DESC LIMIT $2`,
+      WHERE project_id = $1 AND active IS DISTINCT FROM false ORDER BY created_at DESC LIMIT $2`,
     [projectId, limitPerTable]
   );
   const findings = await client.query(
+    // status is nullable (§5.3: TEXT DEFAULT 'triaged', no NOT NULL) --
+    // plain `<> 'fixed'` silently EXCLUDES NULL rows for the same reason.
+    // IS DISTINCT FROM makes this total: NULL and any non-'fixed' value are
+    // both included, only an EXPLICIT 'fixed' excludes.
     `SELECT id, description, status, created_at FROM findings
-      WHERE project_id = $1 AND status <> 'fixed' ORDER BY created_at DESC LIMIT $2`,
+      WHERE project_id = $1 AND status IS DISTINCT FROM 'fixed' ORDER BY created_at DESC LIMIT $2`,
     [projectId, limitPerTable]
   );
   return {

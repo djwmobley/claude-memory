@@ -260,7 +260,17 @@ function validateRow(table, columnMap, row) {
           { table, column: col }
         );
       }
-      if (spec.authoringModeColumn && value.trim().length > 0 && !AUTHORING_MODE_VALUES.has(value)) {
+      // NOTE: no `value.trim().length > 0` guard here (post-review fix,
+      // S-3) -- authoring_mode is OPTIONAL (the `present` check above
+      // already lets an absent/null value skip straight through), but once
+      // a caller explicitly PROVIDES a value -- including an empty string
+      // -- it must be validated against the enum. An empty-string guard
+      // let `authoring_mode: ''` bypass this app-level check entirely and
+      // reach Postgres as a raw 23514 CHECK-constraint violation instead of
+      // a clean MemoryUpsertError, which is exactly what S-3 requires this
+      // function to prevent ("a clean tool error raised BEFORE any SQL is
+      // issued").
+      if (spec.authoringModeColumn && !AUTHORING_MODE_VALUES.has(value)) {
         throw new MemoryUpsertError(
           'validation',
           `memory_upsert: table "${table}" column "${col}" must be one of 'caveman'/'verbose' (got ${JSON.stringify(value)})`,
@@ -358,6 +368,14 @@ const { materiallyDifferent } = require(path.join(__dirname, 'normalize-text.js'
  * predicate) whose object is MATERIALLY DIFFERENT (S-6 normalization) from
  * the candidate object? Read-only — never writes, never blocks.
  *
+ * Subject matching is LOWER(TRIM()) (post-review fix, G1) — an exact
+ * `subject = $2` match would make live rows with subjects "Foo" vs "foo"
+ * invisible to each other, exactly the same gap memory-lint.js's
+ * contradicting_assertions check had before its own G1 fix. This aligns
+ * with every other subject-matching call site this PR introduces
+ * (carryover-render.js's findLiveOpenThreadRows, mirroring
+ * scripts/handoff.js's own resolved_threads auto-retire matcher).
+ *
  * @returns {Promise<{id:number, object:string}|null>} the first
  *   conflicting row (id + object), or null if none / no material
  *   difference.
@@ -365,7 +383,7 @@ const { materiallyDifferent } = require(path.join(__dirname, 'normalize-text.js'
 async function findContradictingAssertion(client, projectId, subject, predicate, candidateObject) {
   const { rows } = await client.query(
     `SELECT id, object FROM assertions
-      WHERE project_id = $1 AND subject = $2 AND predicate = $3
+      WHERE project_id = $1 AND LOWER(TRIM(subject)) = LOWER(TRIM($2)) AND predicate = $3
         AND suppressed = false AND invalid_at IS NULL
       ORDER BY id ASC`,
     [projectId, subject, predicate]

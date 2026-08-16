@@ -7,7 +7,7 @@
  * RUNBOOK.md §7.1-§7.8, memory-manager#17).
  *
  * Group A: subprocess tests of verify-19-seams-smoke.js itself (fresh
- * full-stack apply -> exit 0 + SMOKE19_RESULT: PASS with all 26 checks
+ * full-stack apply -> exit 0 + SMOKE19_RESULT: PASS with all 30 checks
  * green; prerequisite-missing FAIL naming migrate-14-seam-tables.js).
  *
  * Group B: direct, DB-free unit tests for the pure/static pieces of
@@ -15,7 +15,7 @@
  * scripts/lib/reality-checks.js's isEntityShaped, and
  * scripts/lib/carryover-render.js's renderCarryoverTable — the
  * DB-dependent behavior of all of these is already exercised end-to-end by
- * verify-19-seams-smoke.js's 26 checks (Group A proves that script itself
+ * verify-19-seams-smoke.js's 30 checks (Group A proves that script itself
  * passes); Group B adds fast, standalone regression coverage for the
  * adversarial fixtures that do NOT need a live database.
  *
@@ -109,7 +109,7 @@ async function testFreshApplyAllGreen() {
   const failLines = (r.stdout.match(/\[SMOKE-19\]\[\d+\] FAIL.*/g) || []);
   assert(failLines.length === 0, `expected zero FAIL lines, got: ${failLines.join(' | ')}`);
   const passCount = (r.stdout.match(/\[SMOKE-19\]\[\d+\] PASS/g) || []).length;
-  assert(passCount === 26, `expected all 26 checks to PASS, got ${passCount}`);
+  assert(passCount === 30, `expected all 30 checks to PASS, got ${passCount}`);
   assert(/residue scan: clean \(0 rows\)/.test(r.stdout), `expected a clean residue scan. stdout=${r.stdout}`);
 }
 
@@ -237,7 +237,7 @@ function testPromotionPathConfinedToAssertions() {
 }
 
 async function main() {
-  await run('A1', 'Fresh full-stack apply -> exit 0, SMOKE19_RESULT: PASS, all 26 checks green, clean residue scan', testFreshApplyAllGreen);
+  await run('A1', 'Fresh full-stack apply -> exit 0, SMOKE19_RESULT: PASS, all 30 checks green, clean residue scan', testFreshApplyAllGreen);
   await run('A2', 'decisions table missing -> refusal naming migrate-14-seam-tables.js', testPrereqMissing);
 
   await run('B1', 'normalize-text: case/whitespace/punctuation normalization + materiallyDifferent', () => testNormalizeTextCaseWhitespacePunctuation());

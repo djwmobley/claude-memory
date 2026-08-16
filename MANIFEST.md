@@ -15,7 +15,7 @@ This index covers documentation that ships in the repository. Local-only plannin
 | `MANIFEST.md` | This file — tracked index of all documentation | updated (agent-interop doc row added) |
 | `QUICKSTART.md` | Step-by-step setup guide for new users | updated (added /handoff:resurrect) |
 | `PREREQS.md` | System prerequisites (Node, Postgres, pgvector, vLLM) | current |
-| `CHANGELOG.md` | Version history and release notes | updated (Unreleased: agent-exchange schema + tamper-evidence infrastructure + AgentProvider/EmbeddingProvider interop contracts added; usage-telemetry record/query library + verify-18 smoke test added, plus the shared smoke-harness extraction; least-cost routing resolver + verify-17 smoke test; schema-setup-only addenda migration; serve-time open_thread staleness gate; prior refactor entries retained) |
+| `CHANGELOG.md` | Version history and release notes | updated (Unreleased: §5.3 absorbed-seam tables + §5.9 fat-card view + §7 write/render/lint libraries added; agent-exchange schema + tamper-evidence infrastructure + AgentProvider/EmbeddingProvider interop contracts added; usage-telemetry record/query library + verify-18 smoke test added, plus the shared smoke-harness extraction; least-cost routing resolver + verify-17 smoke test; schema-setup-only addenda migration; serve-time open_thread staleness gate; prior refactor entries retained) |
 | `CONTRIBUTING.md` | Contribution guidelines and workflow | current |
 | `CODE_OF_CONDUCT.md` | Community standards | current |
 | `SECURITY.md` | Security policy and disclosure process | current |

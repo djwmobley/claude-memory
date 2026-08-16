@@ -155,20 +155,18 @@ async function testTriggerReapplyWires16() {
   assert(r14.status === 0, `migrate-14 apply failed: status=${r14.status} stdout=${r14.stdout} stderr=${r14.stderr}`);
 
   const r13 = runMigrate13(['--db', dbName]);
-  // migrate-13-agent-exchange.js is reused UNMODIFIED (never forked/patched
-  // to accommodate migrate-14's deviations). Its OWN generic wrong-type-
-  // column self-check compares audit_log.row_id against ITS OWN file's
-  // original declaration (BIGINT) — migrate-14's deviation (2) widens that
-  // column to TEXT (see migrate-14-seam-tables.sql's header comment), so
-  // this self-check now reports a wrong-type-column FAIL on EVERY re-apply,
-  // forever. This is an EXPECTED, documented, one-time consequence of
-  // deviation 2 — NOT a regression and NOT proof the trigger wiring itself
-  // is broken. The check that actually matters for §5.8.1's requirement
-  // (classifyTriggerWiring's 16-table wiring classification) is asserted
-  // separately below and PASSES cleanly.
-  assert(r13.status === 1, `expected migrate-13 CLI exit 1 (see comment above) — status=${r13.status} stdout=${r13.stdout} stderr=${r13.stderr}`);
-  assert(/wrong-type columns: audit_log\.row_id \(expected bigint, found text\)/.test(r13.stdout), `expected the documented row_id wrong-type line. stdout=${r13.stdout}`);
-  assert(/MIGRATION_RESULT: FAIL/.test(r13.stdout), `expected the documented FAIL summary (row_id widening side effect only). stdout=${r13.stdout}`);
+  // migrate-13-agent-exchange.sql now DECLARES row_id TEXT directly (post-
+  // review fix, memory-manager#17) and carries its own idempotent
+  // convergence ALTER — so its generic self-check compares against its OWN
+  // file's CURRENT declaration (TEXT), which matches the live column
+  // (already TEXT, widened by migrate-14 above) exactly. Re-applying
+  // migrate-13-agent-exchange.js after migrate-14 now converges cleanly to
+  // PASS, not a permanent, tolerated FAIL — a genuine future drift on this
+  // column will surface as a real FAIL again, exactly as §5.8.1's canonical
+  // verifier is supposed to guarantee.
+  assert(r13.status === 0, `expected migrate-13 CLI exit 0 (row_id TEXT convergence — see migrate-13-agent-exchange.sql's header comment), got status=${r13.status} stdout=${r13.stdout} stderr=${r13.stderr}`);
+  assert(/wrong-type columns: \(none\)/.test(r13.stdout), `expected zero wrong-type columns (row_id converged to TEXT). stdout=${r13.stdout}`);
+  assert(/MIGRATION_RESULT: PASS/.test(r13.stdout), `expected migrate-13 re-apply to PASS cleanly. stdout=${r13.stdout}`);
   for (const t of migrate14.SEAM_TABLES) {
     assert(new RegExp(`- ${t}: wired`).test(r13.stdout), `expected ${t} wired in the trigger checklist. stdout=${r13.stdout}`);
   }
@@ -249,6 +247,60 @@ async function testFindingsRowIdWideningFiresAndReverts() {
   }
 }
 
+/** G2 adversarial regression: the OLD checkHandoffCardView substring-
+ * matched pg_get_viewdef() text, which an AND->OR edit (same tokens,
+ * opposite meaning -- every filter becomes a no-op) would have passed. The
+ * NEW behavioral-probe check (migrate-14-seam-tables.js's
+ * checkHandoffCardView) must catch this. Swaps the live view to a
+ * deliberately-broken (AND->OR) definition via CREATE OR REPLACE VIEW
+ * (each statement auto-commits -- no explicit transaction wrapping here,
+ * since checkHandoffCardView manages its OWN internal transaction and
+ * nesting an outer BEGIN around it would make its internal ROLLBACK
+ * discard the outer transaction too), asserts the check reports FAIL, then
+ * restores the correct view definition and re-confirms PASS. */
+async function testViewCheckCatchesBrokenFilter() {
+  const dbName = `verify14_wiring_${TS}_staging`;
+  const client = await pgConnect(dbName);
+  try {
+    const brokenSql = `
+      CREATE OR REPLACE VIEW v_handoff_card_inputs AS
+        SELECT project_id, predicate, subject, object, carryover_status, pinned, created_at, confidence
+        FROM assertions
+        WHERE suppressed = false
+           OR invalid_at IS NULL
+           OR predicate IN ('open_thread','next_step','session_tldr','quick_reference',
+                             'run_commands','critical_operational_notes','key_paths')
+           OR (carryover_status IS NULL OR carryover_status <> 'resolved')
+        ORDER BY project_id, predicate, created_at DESC;
+    `;
+    const correctSql = `
+      CREATE OR REPLACE VIEW v_handoff_card_inputs AS
+        SELECT project_id, predicate, subject, object, carryover_status, pinned, created_at, confidence
+        FROM assertions
+        WHERE suppressed = false
+          AND invalid_at IS NULL
+          AND predicate IN ('open_thread','next_step','session_tldr','quick_reference',
+                             'run_commands','critical_operational_notes','key_paths')
+          AND (carryover_status IS NULL OR carryover_status <> 'resolved')
+        ORDER BY project_id, predicate, created_at DESC;
+    `;
+
+    await client.query(brokenSql);
+    try {
+      const brokenResult = await migrate14.checkHandoffCardView(client);
+      assert(brokenResult.status === 'FAIL', `expected the behavioral probe to catch the AND->OR-broken view as FAIL, got: ${JSON.stringify(brokenResult)}`);
+      assert(/expected exactly/.test(brokenResult.reason || ''), `expected a descriptive mismatch reason. got: ${brokenResult.reason}`);
+    } finally {
+      await client.query(correctSql); // restore, unconditionally
+    }
+
+    const restoredResult = await migrate14.checkHandoffCardView(client);
+    assert(restoredResult.status === 'PASS', `expected the check to PASS again after restoring the correct view, got: ${JSON.stringify(restoredResult)}`);
+  } finally {
+    await client.end();
+  }
+}
+
 async function main() {
   await run('A1', 'Fresh apply -> exit 0, MIGRATION_RESULT: PASS (13 tables + view + widening + embeddings)', testFreshApply);
   await run('A2', 'Idempotent re-run -> PASS', testIdempotentReapply);
@@ -256,6 +308,7 @@ async function main() {
   await run('A4', 'Re-apply migrate-13-agent-exchange.js wires all 13 seam tables; 16 total *_audit triggers', testTriggerReapplyWires16);
   await run('A5', 'Deviation (1) proof-of-firing: code_index audit trigger actually fires (UPDATE+DELETE)', testCodeIndexTriggerFires);
   await run('A6', 'Deviation (2) proof-of-firing: findings TEXT-id UPDATE survives widened row_id; reverting reproduces the original bigint cast failure', testFindingsRowIdWideningFiresAndReverts);
+  await run('A7', 'G2 adversarial: behavioral view-probe catches an AND->OR-broken v_handoff_card_inputs that a substring match would have missed', testViewCheckCatchesBrokenFilter);
 
   console.log(`\n${passed} passed, ${failed} failed`);
 
