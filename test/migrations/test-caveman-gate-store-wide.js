@@ -114,7 +114,7 @@ async function createEmptyDb(dbName) {
 
 async function main() {
   console.log(`test-caveman-gate-store-wide: provisioning "${DB_NAME}"`);
-  gate.provisionSchema(DB_NAME);
+  await gate.provisionSchema(DB_NAME);
 
   // DB_PREREQ: created EMPTY (no migrate-01 ever run against it) so
   // `assertions` genuinely does not exist — fixture for M16b below.

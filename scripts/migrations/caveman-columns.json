@@ -1,6 +1,7 @@
 {
-  "_doc": "Column manifest for the §3.5 store-wide caveman-economy gate (K-9 total classification). Derived from CONSOLIDATION-RUNBOOK.md §5 DDL + live memory_manager_staging INFORMATION_SCHEMA (2026-08-16). Scope: every TEXT/VARCHAR column on every §5 graph/corpus/seam table. Classes: checked-caveman (model-authored, economy+fidelity checked per row unless that row is tagged authoring_mode=verbose via the table authoring_mode_column, in which case economy is skipped but fidelity still applies) / checked-verbose-exempt (table default authoring_mode=verbose; economy exempt by design, fidelity still applies) / mandatory-caveman-no-column (no authoring_mode escape exists or ever will; economy+fidelity always enforced, 100% of rows) / exempt-not-model-authored (skipped entirely; reason field mandatory). `out_of_scope_tables` total-classifies every OTHER table/view in the live schema that is not part of §5 at all (§15/§17/§18 infrastructure, views) — together `tables` + `out_of_scope_tables` cover the ENTIRE live public schema, so the K-8 runtime completeness backstop can diff against the whole schema, not a pre-filtered §5 subset. Any (table,column) pair absent from BOTH is unclassified-LOUD-FAIL, never silently skipped.",
+  "_doc": "Column manifest for the §3.5 store-wide caveman-economy gate (K-9 total classification). Derived from CONSOLIDATION-RUNBOOK.md §5 DDL + live memory_manager_staging INFORMATION_SCHEMA (2026-08-16). Scope: every TEXT/VARCHAR column on every §5 graph/corpus/seam table. Classes: checked-caveman (model-authored, economy+fidelity checked per row unless that row is tagged authoring_mode=verbose via the table authoring_mode_column, in which case economy is skipped but fidelity still applies) / checked-verbose-exempt (table default authoring_mode=verbose; economy exempt by design, fidelity still applies) / mandatory-caveman-no-column (no authoring_mode escape exists or ever will; economy+fidelity always enforced, 100% of rows) / exempt-not-model-authored (skipped entirely; reason field mandatory). `out_of_scope_tables` total-classifies every OTHER table/view in the live schema that is not part of §5 at all (§15/§17/§18 infrastructure, views) — together `tables` + `out_of_scope_tables` cover the ENTIRE live public schema, so the K-8 runtime completeness backstop can diff against the whole schema, not a pre-filtered §5 subset. Any (table,column) pair absent from BOTH is unclassified-LOUD-FAIL, never silently skipped. SAME-CHANGE RULE: any migration/PR that adds a text-bearing column to a §5 table (or a new table with text-bearing columns) MUST classify it in this manifest, in the SAME PR — this is not optional cleanup for later, because T7's K-8 completeness backstop fails the whole §15 acceptance battery on the very next run against real staging otherwise (this exact miss happened 2026-08-16: three sibling PRs — migrate-03's memory_entries.project_id/memory_entry_chunks.project_id backfill columns, and the phase-c own_graph_migration_ids lineage table from PRs #171/#174 — each landed without a manifest update, and the first post-merge T7 run against real memory_manager_staging correctly failed loud on all 7 unclassified columns).",
   "generated_at": "2026-08-16",
+  "last_updated": "2026-08-16 (own_graph_migration_ids + memory_entries.project_id/memory_entry_chunks.project_id added — PRs #169-179 same-change gap closed)",
   "tables": {
     "entities": {
       "authoring_mode_column": null,
@@ -284,6 +285,10 @@
         "content_hash": {
           "class": "exempt-not-model-authored",
           "reason": "content hash, not narrative prose"
+        },
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column — migrate-03-corpus-project-id.js's backfill (§6.1(d), mm#11(d), PR #170/#175), landed after this manifest was first derived; added same-change per the manifest's own rule below"
         }
       }
     },
@@ -298,6 +303,36 @@
         "content_hash": {
           "class": "exempt-not-model-authored",
           "reason": "content hash, not narrative prose"
+        },
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column — migrate-03-corpus-project-id.js's backfill (§6.1(d), mm#11(d), PR #170/#175), landed after this manifest was first derived; added same-change per the manifest's own rule below"
+        }
+      }
+    },
+    "own_graph_migration_ids": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "source_db": {
+          "class": "exempt-not-model-authored",
+          "reason": "phase-c own-graph migration provenance/lineage key (§6.1(c), mm#11(c), PR #171/#174) — source database identifier, not narrative prose"
+        },
+        "source_table": {
+          "class": "exempt-not-model-authored",
+          "reason": "phase-c own-graph migration provenance/lineage key — source table identifier, not narrative prose"
+        },
+        "source_row_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "phase-c own-graph migration provenance/lineage key — source row identifier, not narrative prose"
+        },
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "target_table": {
+          "class": "exempt-not-model-authored",
+          "reason": "phase-c own-graph migration provenance/lineage key — target table identifier, not narrative prose"
         }
       }
     },
