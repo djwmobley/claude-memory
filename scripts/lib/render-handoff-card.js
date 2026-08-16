@@ -9,9 +9,9 @@
  * `AND (carryover_status IS NULL OR carryover_status <> 'resolved')`
  * directly in the view, so this file does not need to re-filter for it) +
  * `decisions`/`gotchas`/`findings` for the "Durable platform facts"
- * section, and assembles the section shape pwa-etl's own HANDOFF.md
- * verified: NEXT SESSION / Session N — date — title / Done / Ceiling /
- * Open carry-overs table.
+ * section, and assembles the section shape the reference fat-card
+ * HANDOFF.md format uses: NEXT SESSION / Session N — date — title / Done /
+ * Ceiling / Open carry-overs table.
  *
  * This is the render HALF of Owner-Veto V3 (§7.6's own framing) — built
  * regardless of which way V3 resolves, since even an "authored-in-repo"
