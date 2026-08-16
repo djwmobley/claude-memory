@@ -73,6 +73,12 @@ scripts/decisions_backup*.csv
 # never committed. See migrate-02-decisions.js's backupSourceTable().
 /scripts/migrations/backups/
 
+# migrate-08-handoff-markdown.js's per-project fail-soft parse reports —
+# may embed real HANDOFF.md/HANDOFF-HISTORY.md content (subjects, session
+# summaries), never committed. See migrate-08-handoff-markdown.js's
+# writeReport().
+/scripts/migrations/reports/
+
 # migrate-09-file-memory-markdown.js's project enrollment config — real
 # ~/.claude/projects directory names + real project identifiers (private
 # instance data), never committed.
