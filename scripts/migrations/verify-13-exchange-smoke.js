@@ -303,9 +303,10 @@ async function checkTamperEvidenceDelete(client, PREFIX) {
   assert(a.new_row === null, 'new_row must be NULL for a DELETE');
 }
 
-// CHECK 6: TRIGGER COVERAGE REPORT -- every PRESENT table in the 15-table
-// checklist + agent_exchange must be wired (else FAIL); absent tables are
-// printed as deferred, never a failure.
+// CHECK 6: TRIGGER COVERAGE REPORT -- every PRESENT table in the 16-table
+// checklist (§8 M-4: grew from 15 -- entities added) + agent_exchange must
+// be wired (else FAIL); absent tables are printed as deferred, never a
+// failure.
 async function checkTriggerCoverageReport(client) {
   const { rows: trigRows } = await client.query(
     `SELECT tgname FROM pg_trigger WHERE tgname LIKE '%\\_audit' ESCAPE '\\' AND NOT tgisinternal`

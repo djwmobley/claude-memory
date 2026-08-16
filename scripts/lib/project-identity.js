@@ -83,6 +83,20 @@ function _findLegacyRoot(startDir) {
 
 // Ordered list of ALL tables with a project_id column (derived from schema audit).
 // IMPORTANT: any new table with a project_id column must be added here.
+//
+// §8 M-7 (CONSOLIDATION-RUNBOOK.md, memory-manager#18): grows to include the
+// 13 §5.3 seam/interop/routing/telemetry tables (decisions, gotchas,
+// findings, research, incidents, code_index, tasks, checklist_items,
+// corpus_files, workflow_discovery, agent_rewrites, policy_sections,
+// session_chunks) plus agent_exchange, routing_profiles, turn_usage,
+// session_usage — so the I1/I3/I4 snapshot/conservation/collision loops
+// (dumpRecoverySnapshot, runOneShot's I4 collision-check + I3 conservation
+// check, both driven off this SAME array) cover every project-scoped table
+// this PR's new MCP tools write to, not just the original 9 engine-core
+// tables. A table added here with zero rows for a given legacy/new id is a
+// no-op in every loop below (querySafe tolerates a missing/empty table) —
+// this is purely additive coverage, never a behavior change for existing
+// tables.
 const PROJECT_ID_TABLES = [
   'assertions',
   'entities',
@@ -93,6 +107,23 @@ const PROJECT_ID_TABLES = [
   'extraction_queue',
   'retrieval_events',
   'entity_communities',
+  'decisions',
+  'gotchas',
+  'findings',
+  'research',
+  'incidents',
+  'code_index',
+  'tasks',
+  'checklist_items',
+  'corpus_files',
+  'workflow_discovery',
+  'agent_rewrites',
+  'policy_sections',
+  'session_chunks',
+  'agent_exchange',
+  'routing_profiles',
+  'turn_usage',
+  'session_usage',
 ];
 
 // Staging dir for recovery snapshots (I1). Under OS temp, NEVER inside the repo.

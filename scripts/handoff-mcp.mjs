@@ -20,6 +20,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -27,20 +28,28 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// ── §8 direct-pg tool libraries (CommonJS — loaded via createRequire since
+// this server is ESM). Every new §8 tool below shares ONE connection-
+// resolution path (mcp-db-connect.js) and ONE project-identity-resolution
+// path (project-identity.js's ensureProjectIdentity, M-19) — no tool below
+// implements its own DB connection or project_id lookup. ──────────────────
+const require = createRequire(import.meta.url);
+const { connectForRoot } = require('./lib/mcp-db-connect.js');
+const { ensureProjectIdentity } = require('./lib/project-identity.js');
+const memoryUpsertLib = require('./lib/memory-upsert.js');
+const memorySearchLib = require('./lib/memory-search.js');
+const entityCrudLib = require('./lib/entity-graph-crud.js');
+const memoryViewLib = require('./lib/memory-view.js');
+const memoryLintLib = require('./lib/memory-lint.js');
+const exchangeLogLib = require('./lib/exchange-log.js');
+const routeResolveLib = require('./lib/route-resolve.js');
+const routingProfileLib = require('./lib/routing-profile.js');
+const usageTelemetryLib = require('./lib/usage-telemetry.js');
+const { embedForWrite } = require('./lib/write-time-embed.js');
+
 // ── Ground-truth paths (verified 2026-07-11; overridable via env for other hosts) ──
 
 const ENGINE_PATH = process.env.HANDOFF_MCP_ENGINE_PATH || path.join(__dirname, 'handoff.js');
-
-const PIPELINE_SCRIPTS_DIR =
-  process.env.HANDOFF_MCP_PIPELINE_SCRIPTS_DIR || 'C:/Users/djwmo/dev/pipeline/scripts';
-const UPSERT_DECISIONS_PATH = path.join(PIPELINE_SCRIPTS_DIR, 'upsert-decisions.js');
-const PIPELINE_EMBED_PATH = path.join(PIPELINE_SCRIPTS_DIR, 'pipeline-embed.js');
-
-// The decisions pipeline resolves its target DB (claude_policy_framework) from
-// <PROJECT_ROOT>/.claude/pipeline.yml — this is NOT the caller's projectRoot,
-// it is always the policy-framework repo itself. See ground truth in ADO #4566.
-const DECISIONS_PROJECT_ROOT =
-  process.env.HANDOFF_MCP_DECISIONS_PROJECT_ROOT || 'C:/claudecode/policy-framework';
 
 // ── Child-process runner ─────────────────────────────────────────────────────
 
@@ -103,6 +112,47 @@ function stripAnsi(str) {
   return str.replace(/\x1b\[[0-9;]*m/g, '');
 }
 
+// ── §8 direct-pg tool plumbing ───────────────────────────────────────────
+//
+// withProjectDb: the ONE call site every new §8 tool below uses to (a)
+// connect (mcp-db-connect.js:connectForRoot, root-parameterized — safe for
+// a long-lived server handling different projectRoots across calls, unlike
+// mutating process.env.PROJECT_ROOT) and (b) resolve project_id via
+// ensureProjectIdentity (M-19 — "the SAME ensureProjectIdentity library
+// path handoff.js uses ... no duplicate resolution implementation").
+// ensureProjectIdentity is migration-capable (not a pure read) — a
+// projectRoot with legacy-encoded rows and no marker yet will run the
+// one-shot identity migration inline, exactly as handoff.js's own
+// cmdLoaderLoad/cmdClose do. Always closes the connection in `finally`.
+async function withProjectDb(projectRoot, fn) {
+  if (typeof projectRoot !== 'string' || !projectRoot.trim()) {
+    throw new Error('projectRoot is required and must be a non-empty string');
+  }
+  const db = await connectForRoot(projectRoot);
+  try {
+    const identity = await ensureProjectIdentity(db, { cwd: projectRoot, silent: true });
+    return await fn(db, identity.projectId);
+  } finally {
+    await db.end();
+  }
+}
+
+/** Maps every §8 lib error class's `.code` to a stable MCP-tool error
+ * response. Named library errors (MemoryUpsertError, MemorySearchError,
+ * EntityGraphCrudError, MemoryViewError, ExchangeLogError,
+ * RoutingProfileError) are reported with their code + message; anything
+ * else falls through to errorResult's generic stack-trace formatting. */
+function libToolError(err) {
+  const namedCodes = new Set([
+    'MemoryUpsertError', 'MemorySearchError', 'EntityGraphCrudError',
+    'MemoryViewError', 'ExchangeLogError', 'RoutingProfileError',
+  ]);
+  if (err && namedCodes.has(err.name)) {
+    return toolError(`${err.name} [${err.code}]: ${err.message}`);
+  }
+  return errorResult(err);
+}
+
 // ── MCP result helpers ───────────────────────────────────────────────────────
 
 function textResult(obj) {
@@ -155,60 +205,6 @@ function parseInitReport(stdout) {
   const report = lines.filter((l) => l.startsWith('[OK]') || l.startsWith('[NOTE]') || l.startsWith('Done:'));
   const done = /Done:\s*handoff:init\s*—\s*(.+)/.exec(stdout);
   return { report, summary: done ? done[1].trim() : null };
-}
-
-/** Parses per-row "INSERT topic="..." (new id=N)" / "UPDATE topic="..." (id=N, ...)"
- * lines from upsert-decisions.js stdout. */
-function parseUpsertOutput(stdout) {
-  const rows = [];
-  const re = /^(INSERT|UPDATE)\s+topic="([^"]+)"\s*\((?:new id=(\d+)|id=(\d+)[^)]*)\)/gm;
-  let m;
-  while ((m = re.exec(stdout)) !== null) {
-    rows.push({ op: m[1], topic: m[2], id: Number(m[3] ?? m[4]) });
-  }
-  return rows;
-}
-
-/** Parses the per-table "Done. <table>: N embedded, M truncated, K failed."
- * lines plus the "Total: N entries embedded across all tables." line from
- * pipeline-embed.js index output (ANSI-stripped first). */
-function parseEmbedIndexOutput(stdout) {
-  const clean = stripAnsi(stdout);
-  const perTable = [];
-  const tableRe = /Done\.\s*(\S+):\s*(\d+)\s*embedded,\s*(\d+)\s*truncated[^,]*,\s*(\d+)\s*failed\./g;
-  let m;
-  while ((m = tableRe.exec(clean)) !== null) {
-    perTable.push({ table: m[1], embedded: Number(m[2]), truncated: Number(m[3]), failed: Number(m[4]) });
-  }
-  const totalMatch = /Total:\s*(\d+)\s*entries embedded/.exec(clean);
-  return { perTable, totalEmbedded: totalMatch ? Number(totalMatch[1]) : null };
-}
-
-/** Parses the numbered "N. label (XX.X%)" hit lines from pipeline-embed.js
- * hybrid output (ANSI-stripped first), scoped to the "── decisions ──" table
- * section specifically. pipeline-embed.js prints a global numbering across
- * a "memory (chunked: memory + sessions + policy)" section FIRST, followed by
- * one "── <table> ──" section per table with data — a naive global top-N would
- * almost always be dominated by the much larger chunked-memory corpus and
- * never surface the decisions row a caller just wrote. Scoping to the
- * decisions section is what makes this a meaningful round-trip verification. */
-function parseHybridOutput(stdout) {
-  const clean = stripAnsi(stdout);
-  const lines = clean.split(/\r?\n/);
-  const sectionRe = /^──\s*(.+?)\s*──$/;
-  const startIdx = lines.findIndex((l) => sectionRe.test(l.trim()) && /^decisions$/.test(l.trim().replace(/^──\s*/, '').replace(/\s*──$/, '')));
-  if (startIdx === -1) return [];
-  let endIdx = lines.findIndex((l, i) => i > startIdx && sectionRe.test(l.trim()));
-  if (endIdx === -1) endIdx = lines.length;
-  const section = lines.slice(startIdx + 1, endIdx).join('\n');
-
-  const hits = [];
-  const hitRe = /^\s*(\d+)\.\s+(.+?)\s+\((\d+\.\d+)%\)\s*$/gm;
-  let m;
-  while ((m = hitRe.exec(section)) !== null) {
-    hits.push({ rank: Number(m[1]), label: m[2].trim(), scorePct: Number(m[3]) });
-  }
-  return hits;
 }
 
 // ── Tool implementations ────────────────────────────────────────────────────
@@ -306,59 +302,365 @@ function validateDecisionRows(rows) {
   return errors;
 }
 
-async function toolPersistDecisions({ rows, verifyQuery }) {
+// §7.2/§8 M-1/M-2/M-3 repoint (declared response-shape break — see the PR
+// body): persist_decisions no longer writes claude_policy_framework via
+// upsert-decisions.js/pipeline-embed.js child processes. It now writes the
+// SAME structured, project-scoped `decisions` table memory_upsert's
+// decisions path uses — ON CONFLICT (project_id, topic) DO UPDATE (M-1's
+// named carve-out), inline-embedded at write time (M-2, fail-soft). The
+// TOPIC_RE kebab-case contract is UNCHANGED (M-3) — retained at the tool
+// layer via validateDecisionRows below, unmodified. NEW REQUIRED PARAMETER:
+// `projectRoot` — the old flow had no notion of project scoping (it always
+// targeted the single policy-framework repo's DB); the new `decisions`
+// table is project-scoped like every other table in this schema, so a
+// caller must now say which project's decisions it is writing.
+async function toolPersistDecisions({ projectRoot, rows, verifyQuery }) {
   const validationErrors = validateDecisionRows(rows);
   if (validationErrors.length > 0) {
     return toolError(`persist_decisions: row validation failed — no database writes were made.\n${validationErrors.join('\n')}`);
   }
-  if (typeof verifyQuery !== 'string' || verifyQuery.trim() === '') {
-    return toolError('persist_decisions: verifyQuery is required (non-empty string).');
-  }
-
-  const decisionsEnv = { PROJECT_ROOT: DECISIONS_PROJECT_ROOT };
-  const tempFile = writeTempJson('handoff-mcp-decisions', rows);
 
   try {
-    // Step 1 — upsert
-    const upsert = await runNode({
-      scriptPath: UPSERT_DECISIONS_PATH,
-      args: [tempFile],
-      env: decisionsEnv,
-    });
-    if (upsert.code !== 0) {
-      return toolError('persist_decisions: upsert-decisions.js failed', upsert);
-    }
-    const upsertRows = parseUpsertOutput(upsert.stdout);
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const written = [];
+      const warnings = [];
+      for (const row of rows) {
+        const embedText = memoryUpsertLib.buildEmbedText('decisions', {
+          topic: row.topic, decision: row.decision, reason: row.reason,
+        });
+        const embed = await embedForWrite(db, embedText);
+        if (embed.warning) warnings.push({ topic: row.topic, warning: embed.warning });
+        const written_row = await memoryUpsertLib.upsertDecisionRow(db, {
+          project_id: projectId,
+          topic: row.topic,
+          decision: row.decision,
+          reason: row.reason,
+          session_num: row.session_num ?? null,
+        }, { embeddingVectorLiteral: embed.vectorLiteral });
+        written.push({ id: written_row.id, topic: written_row.topic, inserted: written_row.inserted });
+      }
 
-    // Step 2 — embed index
-    const embed = await runNode({
-      scriptPath: PIPELINE_EMBED_PATH,
-      args: ['index'],
-      env: decisionsEnv,
-    });
-    if (embed.code !== 0) {
-      return toolError('persist_decisions: pipeline-embed.js index failed', embed);
-    }
-    const embedResult = parseEmbedIndexOutput(embed.stdout);
+      let topHits = null;
+      if (typeof verifyQuery === 'string' && verifyQuery.trim()) {
+        const search = await memorySearchLib.memorySearch(db, { projectId, query: verifyQuery, tables: ['decisions'], limit: 3 });
+        topHits = search.hits;
+      }
 
-    // Step 3 — hybrid verify
-    const verify = await runNode({
-      scriptPath: PIPELINE_EMBED_PATH,
-      args: ['hybrid', verifyQuery],
-      env: decisionsEnv,
+      return textResult({ projectId, written, embedWarnings: warnings, verify: verifyQuery ? { query: verifyQuery, topHits } : null });
     });
-    if (verify.code !== 0) {
-      return toolError('persist_decisions: pipeline-embed.js hybrid failed', verify);
-    }
-    const hits = parseHybridOutput(verify.stdout).slice(0, 3);
+  } catch (err) {
+    return libToolError(err);
+  }
+}
 
-    return textResult({
-      upsert: upsertRows,
-      embed: embedResult,
-      verify: { query: verifyQuery, topHits: hits },
+// ── §8 direct-pg tool implementations ────────────────────────────────────
+
+async function toolMemorySearch({ projectRoot, query, tables, limit }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const result = await memorySearchLib.memorySearch(db, { projectId, query, tables, limit });
+      return textResult(result);
     });
-  } finally {
-    cleanupTemp(tempFile);
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolMemoryUpsert({ projectRoot, table, row }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const rowWithProject = { ...row, project_id: projectId };
+      const embedText = memoryUpsertLib.buildEmbedText(table, rowWithProject);
+      const embed = await embedForWrite(db, embedText);
+
+      let written;
+      if (table === 'decisions') {
+        written = await memoryUpsertLib.upsertDecisionRow(db, rowWithProject, { embeddingVectorLiteral: embed.vectorLiteral });
+      } else {
+        written = await memoryUpsertLib.writeMemoryRow(db, table, rowWithProject, { embeddingVectorLiteral: embed.vectorLiteral });
+      }
+      return textResult({ row: written, embedWarning: embed.warning });
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolMemoryGet({ projectRoot, table, key }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const rows = await memoryUpsertLib.memoryGet(db, table, projectId, key);
+      return textResult({ rows });
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolMemoryLint({ projectRoot, checks }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const report = await memoryLintLib.memoryLint(db, projectId, checks);
+      return textResult(report);
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolMemoryViewSet({ projectRoot, name, queries }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const row = await memoryViewLib.memoryViewSet(db, { projectId, name, queries });
+      return textResult(row);
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolMemoryViewRun({ projectRoot, name }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const result = await memoryViewLib.memoryViewRun(db, { projectId, name });
+      return textResult(result);
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolEntityCreate({ projectRoot, name, entityType, description, sourceModel, agentId }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const result = await entityCrudLib.entityCreate(db, { projectId, name, entityType, description, sourceModel, agentId });
+      return textResult(result);
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolEntityRead({ projectRoot, id, name }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const rows = await entityCrudLib.entityRead(db, { projectId, id, name });
+      return textResult({ rows });
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolEntityUpdate({ projectRoot, id, entityType, description }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const row = await entityCrudLib.entityUpdate(db, { projectId, id, entityType, description });
+      return textResult(row);
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolEntitySuppress({ projectRoot, id }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const row = await entityCrudLib.entitySuppress(db, { projectId, id });
+      return textResult(row);
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolAssertionCreate({ projectRoot, subject, predicate, object, confidence, source, sourceModel, agentId }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const result = await entityCrudLib.assertionCreate(db, { projectId, subject, predicate, object, confidence, source, sourceModel, agentId });
+      return textResult(result);
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolAssertionRead({ projectRoot, id, subject, predicate }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const rows = await entityCrudLib.assertionRead(db, { projectId, id, subject, predicate });
+      return textResult({ rows });
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolAssertionUpdate({ projectRoot, id, subject, predicate, newObject, confidence, source, sourceModel, agentId }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const result = await entityCrudLib.assertionUpdate(db, { projectId, id, subject, predicate, newObject, confidence, source, sourceModel, agentId });
+      return textResult(result);
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolAssertionSuppress({ projectRoot, id }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const row = await entityCrudLib.assertionSuppress(db, { projectId, id });
+      return textResult(row);
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolEdgeCreate({ projectRoot, fromEntity, edgeType, toEntity, weight, sourceModel, agentId }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const row = await entityCrudLib.edgeCreate(db, { projectId, fromEntity, edgeType, toEntity, weight, sourceModel, agentId });
+      return textResult(row);
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolEdgeRead({ projectRoot, id, fromEntity, toEntity }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const rows = await entityCrudLib.edgeRead(db, { projectId, id, fromEntity, toEntity });
+      return textResult({ rows });
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolEdgeUpdate({ projectRoot, id, edgeType, weight }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const row = await entityCrudLib.edgeUpdate(db, { projectId, id, edgeType, weight });
+      return textResult(row);
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolEdgeSuppress({ projectRoot, id }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const row = await entityCrudLib.edgeSuppress(db, { projectId, id });
+      return textResult(row);
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolExchangeAppend({ projectRoot, agentId, kind, body, summary, sourceModel, toAgent, docketId, parentId, transition }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const result = await exchangeLogLib.appendExchange(db, {
+        projectId, agentId, kind, body, summary, sourceModel, toAgent, docketId, parentId, transition,
+      });
+      return textResult(result);
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolExchangeRead({ projectRoot, toAgent, afterCreatedAt, afterId, limit }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const rows = await exchangeLogLib.exchangeRead(db, { projectId, toAgent, afterCreatedAt, afterId, limit });
+      return textResult({ rows });
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+// §8 M-10: route_resolve replay on an existing (project_id, session_id,
+// turn_idx, role) key with a DIFFERENT override_model than recorded returns
+// the recorded row UNCHANGED plus override_ignored:true + the ignored
+// value — never silently, never an error. Implemented at the tool layer
+// (not inside route-resolve.js itself): routeResolve's own replay branch
+// already returns `replayed:true` + the RECORDED model regardless of what
+// overrideModel this call passed — this wrapper simply compares the two and
+// annotates the response, without touching route-resolve.js's proven
+// idempotency/race-handling logic.
+async function toolRouteResolve({ projectRoot, sessionId, turnIdx, role, capabilityTier, overrideModel }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const result = await routeResolveLib.routeResolve(db, {
+        projectId, sessionId, turnIdx, role, capabilityTier, overrideModel,
+      });
+      const overrideIgnored = Boolean(
+        result.replayed && overrideModel !== undefined && overrideModel !== null && result.model !== overrideModel
+      );
+      return textResult({
+        ...result,
+        ...(overrideIgnored ? { override_ignored: true, ignored_override_model: overrideModel } : {}),
+      });
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolRoutingProfileSet({ projectRoot, role, capabilityTier, preferredModel, preferredProvider, sourceModel, agentId, notes }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const result = await routingProfileLib.routingProfileSet(db, {
+        projectId, role, capabilityTier, preferredModel, preferredProvider, sourceModel, agentId, notes,
+      });
+      return textResult(result);
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolRoutingProfileGet({ projectRoot, role }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const rows = await routingProfileLib.routingProfileGet(db, { projectId, role });
+      return textResult({ rows });
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolUsageRecord(args) {
+  const { projectRoot, sessionId, turnIdx, agentRole, tokensIn, tokensOut, cacheReadTokens, cacheWriteTokens, costUsd, modelId, provider, outcome, sourceModel, agentId } = args;
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const result = await usageTelemetryLib.usageRecord(db, {
+        projectId, sessionId, turnIdx, agentRole, tokensIn, tokensOut, cacheReadTokens, cacheWriteTokens,
+        costUsd, modelId, provider, outcome, sourceModel, agentId,
+      });
+      return textResult(result);
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolUsageQuery({ projectRoot, sessionId, groupBy }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const rows = await usageTelemetryLib.usageQuery(db, { projectId, sessionId, groupBy });
+      return textResult({ rows });
+    });
+  } catch (err) {
+    return libToolError(err);
   }
 }
 
@@ -518,17 +820,25 @@ function buildServer() {
   server.registerTool(
     'persist_decisions',
     {
-      title: 'Persist and embed roadmap decisions to the policy-framework decisions table',
+      title: 'Persist and embed roadmap decisions to the project-scoped decisions table (§8 M-1/M-2/M-3 repoint)',
       description:
-        'Upserts rows into the `decisions` table in the claude_policy_framework database (by topic), then runs ' +
-        'the embedding index pass, then runs a hybrid (FTS + vector) search with verifyQuery to confirm the rows ' +
-        'are retrievable. This is a SEPARATE store from the handoff engine — used for durable cross-session ' +
-        'roadmap/architecture decisions (topics like "ppm-monolith-*"). Each row requires: topic (lowercase ' +
-        'kebab-case with at least one hyphen, e.g. "ppm-monolith-handoff-mcp-decision"), decision (non-empty ' +
-        'string), reason (non-empty string), and optional session_num. Rows are validated BEFORE any database ' +
-        'writes — if any row fails validation, the whole call is rejected with no writes made. Returns per-row ' +
-        'INSERT/UPDATE ids, embed counts per table, and the top-3 hybrid-search hits with scores for verifyQuery.',
+        'DECLARED BREAK (M-3): this tool now writes the SAME project-scoped, structured `decisions` table ' +
+        '`memory_upsert` writes (in memory_manager, NOT claude_policy_framework — the prior single-tenant ' +
+        'policy-framework store this tool used before the §8 repoint). NEW REQUIRED PARAMETER: `projectRoot` — ' +
+        'the old flow had no project scoping; this one does. Response shape CHANGED: returns ' +
+        '{ projectId, written: [{id, topic, inserted}], embedWarnings: [...], verify: {query, topHits}|null } — ' +
+        'no longer the old { upsert, embed, verify } shape keyed on child-process stdout parsing. ' +
+        'Upserts rows by (project_id, topic): ON CONFLICT DO UPDATE (M-1 — the ONLY table with this carve-out, ' +
+        'backed by decisions_audit so the update is non-destructive in the append-only audit_log ledger). Each ' +
+        'row is embedded INLINE at write time via the default embedding_providers row (M-2) — fail-soft: a down ' +
+        'provider leaves embedding NULL and adds an entry to embedWarnings, the row is still written. Each row ' +
+        'requires: topic (UNCHANGED kebab-case contract, M-3: lowercase, at least one hyphen), decision ' +
+        '(non-empty string), reason (non-empty string), optional session_num. Rows are validated BEFORE any ' +
+        'database writes. CAVEMAN MANDATE (§3.4): decision/reason should be authored in caveman/telegraphic ' +
+        'English — strip articles/copulas/prepositions, keep every load-bearing token (identifiers, paths, PR ' +
+        'numbers, SHAs, names, decisions) verbatim.',
       inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root whose decisions table this writes.'),
         rows: z
           .array(
             z.object({
@@ -538,8 +848,8 @@ function buildServer() {
               session_num: z.number().nullable().optional(),
             })
           )
-          .describe('Rows to upsert into the decisions table, keyed by topic.'),
-        verifyQuery: z.string().describe('Query text to run through hybrid search after embedding, to confirm the rows are retrievable.'),
+          .describe('Rows to upsert into the decisions table, keyed by (project_id, topic).'),
+        verifyQuery: z.string().optional().describe('Optional query text to run through memory_search (decisions table only) after writing, to confirm the rows are retrievable.'),
       },
     },
     async (args) => {
@@ -549,6 +859,483 @@ function buildServer() {
         return errorResult(err);
       }
     }
+  );
+
+  // ── §8: memory_search / memory_upsert / memory_get ──────────────────────
+
+  server.registerTool(
+    'memory_search',
+    {
+      title: 'Hybrid vector+FTS search across the generalized memory store, project-scoped',
+      description:
+        'Runs the §10.3 hybrid scoring formula (ts_rank * 0.3 + cosine * 0.7, per-table — a table with no ' +
+        'fts_vec column contributes a structurally-zero FTS term, never a NULL) against a project-scoped CLOSED ' +
+        'enum of tables: assertions, agent_exchange, decisions, gotchas, findings, research, incidents, ' +
+        'code_index, tasks, checklist_items, corpus_files, workflow_discovery, agent_rewrites, policy_sections, ' +
+        'session_chunks (M-14). memory_entry_chunks is DELIBERATELY EXCLUDED — its embedding column is a ' +
+        'different pgvector type/dimension (vector(1024), a legacy provider) incompatible with every other ' +
+        'table\'s halfvec(4000) column. An unknown table name is a hard tool error. `tables` omitted searches ' +
+        'ALL 15 allowed tables. Returns the top `limit` hits (default 10) merged and re-sorted across every ' +
+        'searched table.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        query: z.string().describe('Free-text query.'),
+        tables: z.array(z.enum(memorySearchLib.ALLOWED_TABLES)).optional().describe('Subset of the closed table enum to search; omitted = search all.'),
+        limit: z.number().int().positive().optional().describe('Max hits to return (default 10).'),
+      },
+    },
+    async (args) => toolMemorySearch(args)
+  );
+
+  server.registerTool(
+    'memory_upsert',
+    {
+      title: 'Typed, project-scoped write to one §5.3 seam table (including decisions\' M-1 ON CONFLICT carve-out)',
+      description:
+        memoryUpsertLib.MEMORY_UPSERT_TOOL_DESCRIPTION +
+        '\n\nWrite semantics: INSERT-ONLY for every table EXCEPT `decisions`, which uses ON CONFLICT ' +
+        '(project_id, topic) DO UPDATE (M-1 — the ONLY table with this carve-out; every other table\'s PK/unique ' +
+        'collision is a loud tool error, never a silent overwrite). Every row is embedded INLINE at write time ' +
+        '(M-2, fail-soft — a down provider leaves embedding NULL + a returned warning, the row is still written).',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        table: z.enum(memoryUpsertLib.ALLOWED_TABLES).describe('Closed table enum — see description.'),
+        row: z.record(z.string(), z.any()).describe('Column values for the row (project_id is filled in automatically from projectRoot — do not pass it).'),
+      },
+    },
+    async (args) => toolMemoryUpsert(args)
+  );
+
+  server.registerTool(
+    'memory_get',
+    {
+      title: 'Direct lookup by table + natural key',
+      description:
+        'Looks up rows in one §5.3 seam table by an explicit {column: value} key (e.g. `decisions` by ' +
+        '{topic: "..."}, `findings` by {id: "..."}). Every table also accepts {id: <n>} as an implicit lookup ' +
+        'key even where `id` is server-generated (absent from memory_upsert\'s writable column set). Unknown ' +
+        'table or unknown lookup column is a hard tool error.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        table: z.enum(memoryUpsertLib.ALLOWED_TABLES).describe('Closed table enum.'),
+        key: z.record(z.string(), z.any()).describe('Natural-key {column: value} pairs to look up by.'),
+      },
+    },
+    async (args) => toolMemoryGet(args)
+  );
+
+  server.registerTool(
+    'memory_lint',
+    {
+      title: 'Read-only, periodic store-wide health sweep (§7.8)',
+      description:
+        'Runs one or more of the four §7.8 checks (orphan_entities, contradicting_assertions, ' +
+        'stale_unreconciled, unlinked_mentions) against the project. Read-only — never mutates. `checks` ' +
+        'omitted runs all four; an unrecognized check name is a hard error.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        checks: z.array(z.enum(memoryLintLib.ALL_CHECKS)).optional().describe('Subset of checks to run; omitted = all four.'),
+      },
+    },
+    async (args) => toolMemoryLint(args)
+  );
+
+  // ── §8: memory_view_set / memory_view_run (M-15/M-16) ──────────────────
+
+  server.registerTool(
+    'memory_view_set',
+    {
+      title: 'Create or update a saved retrieval view (retrieval_contract kind=\'view\')',
+      description:
+        'Saves a named, reusable set of structured §4 query-type queries (entity/assertion/recency/vector) for ' +
+        'later execution via memory_view_run. Guards against a cross-kind name collision — refuses to silently ' +
+        'convert an existing kind=\'contract\' row (a next-session retrieval contract) into a view, or vice ' +
+        'versa. Versioned: an update to an existing view increments its version, never mutates queries in place ' +
+        'without a version bump.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        name: z.string().describe('View name, unique within the project.'),
+        queries: z.array(z.record(z.string(), z.any())).describe('Array of structured §4 query objects (type: entity|assertion|recency|vector).'),
+      },
+    },
+    async (args) => toolMemoryViewSet(args)
+  );
+
+  server.registerTool(
+    'memory_view_run',
+    {
+      title: 'Execute a saved retrieval view',
+      description:
+        'Executes a saved view\'s queries and returns structured JSON results, one entry per saved query. M-16: ' +
+        'interprets ONLY the structured §4 query-type JSON (entity/assertion/recency/vector) — NEVER raw SQL. ' +
+        'An unsupported query type saved in a view (should not happen — memoryViewSet validates at save time) ' +
+        'or a missing/wrong-kind view name is a hard tool error.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        name: z.string().describe('View name to execute.'),
+      },
+    },
+    async (args) => toolMemoryViewRun(args)
+  );
+
+  // ── §8: entity/assertion/edge CRUD ──────────────────────────────────────
+
+  server.registerTool(
+    'entity_create',
+    {
+      title: 'Create an entity, with near-match surfacing and suppressed-row revival',
+      description:
+        'M-12/M-13: ALWAYS runs an exact normalizeForCompare-equal check first, PLUS a trigram fuzzy pass ' +
+        '(similarity >= 0.4) — candidates shorter than 4 characters after normalization get the exact check ' +
+        'ONLY (flood guard). Every query is explicitly project-scoped. Near-matches are returned as WARNINGS, ' +
+        'NEVER auto-merged. M-4: if an exact-normalized match exists among SUPPRESSED rows, this un-suppresses ' +
+        'and updates that row (revival) instead of inserting a second row.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        name: z.string().describe('Entity name.'),
+        entityType: z.string().describe('Entity type (free text, e.g. "system", "concept", "file").'),
+        description: z.string().optional(),
+        sourceModel: z.string().optional(),
+        agentId: z.string().optional(),
+      },
+    },
+    async (args) => toolEntityCreate(args)
+  );
+
+  server.registerTool(
+    'entity_read',
+    {
+      title: 'Read entities by id or name',
+      description: 'Looks up entity rows by id and/or name, project-scoped. Either id or name is required.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        id: z.number().int().optional(),
+        name: z.string().optional(),
+      },
+    },
+    async (args) => toolEntityRead(args)
+  );
+
+  server.registerTool(
+    'entity_update',
+    {
+      title: 'Update an entity in place',
+      description: 'Plain in-place UPDATE of entity_type/description (entities have no bi-temporal design — see scripts/lib/entity-graph-crud.js\'s header comment). Forensically visible via the entities_audit trigger.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        id: z.number().int().describe('Target entity id.'),
+        entityType: z.string().optional(),
+        description: z.string().optional(),
+      },
+    },
+    async (args) => toolEntityUpdate(args)
+  );
+
+  server.registerTool(
+    'entity_suppress',
+    {
+      title: 'Suppress (retract) an entity',
+      description: 'Sets suppressed=true. Non-destructive — a later entity_create with the same normalized name revives it (M-4).',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        id: z.number().int().describe('Target entity id.'),
+      },
+    },
+    async (args) => toolEntitySuppress(args)
+  );
+
+  server.registerTool(
+    'assertion_create',
+    {
+      title: 'Create one assertion, outside the checkpoint/close batch flow',
+      description:
+        'Runs the §7.3 ingest-time contradiction check (same (project_id, subject, predicate) with a ' +
+        'materially different object) before writing — still writes either way (append-only), but the result ' +
+        'carries a contradictionWarning when a conflict is found. predicate MUST be a value from ' +
+        'scripts/lib/predicate-registry.json.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        subject: z.string(),
+        predicate: z.string(),
+        object: z.string(),
+        confidence: z.number().int().min(1).max(10),
+        source: z.enum(['user_stated', 'model_extracted', 'doc_quoted', 'retrieved_from_prior']),
+        sourceModel: z.string().optional(),
+        agentId: z.string().optional(),
+      },
+    },
+    async (args) => toolAssertionCreate(args)
+  );
+
+  server.registerTool(
+    'assertion_read',
+    {
+      title: 'Read live assertions by id, subject, and/or predicate',
+      description: 'Returns live (suppressed=false, invalid_at IS NULL) assertion rows matching the given filters, project-scoped.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        id: z.number().int().optional(),
+        subject: z.string().optional(),
+        predicate: z.string().optional(),
+      },
+    },
+    async (args) => toolAssertionRead(args)
+  );
+
+  server.registerTool(
+    'assertion_update',
+    {
+      title: 'Supersede an assertion (suppress-old + insert-new, one transaction, optimistic guard)',
+      description:
+        'M-5/M-6: supersede = suppress the old row (suppressed=true, invalid_at=now()) THEN insert a new row ' +
+        'with the corrected object, inside ONE transaction with an optimistic row-count guard (a stale/already-' +
+        'superseded target rolls the whole call back, never a partial write). `id` is the explicit target row ' +
+        '— REQUIRED for any predicate whose registry cardinality is NOT 1:1 (an omitted id on a 1:N or ' +
+        'unregistered predicate is a hard error, never a guess). For a 1:1 predicate, `id` may be omitted and ' +
+        'is inferred from (subject, predicate).',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        id: z.number().int().optional().describe('Explicit target row id — required for non-1:1 predicates.'),
+        subject: z.string().optional().describe('Used to infer the target id for a 1:1 predicate when id is omitted.'),
+        predicate: z.string(),
+        newObject: z.string(),
+        confidence: z.number().int().min(1).max(10).optional(),
+        source: z.enum(['user_stated', 'model_extracted', 'doc_quoted', 'retrieved_from_prior']).optional(),
+        sourceModel: z.string().optional(),
+        agentId: z.string().optional(),
+      },
+    },
+    async (args) => toolAssertionUpdate(args)
+  );
+
+  server.registerTool(
+    'assertion_suppress',
+    {
+      title: 'Suppress an assertion (retract, no supersession)',
+      description: 'Sets suppressed=true without inserting a replacement — use assertion_update to supersede-with-a-correction instead.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        id: z.number().int().describe('Target assertion id.'),
+      },
+    },
+    async (args) => toolAssertionSuppress(args)
+  );
+
+  server.registerTool(
+    'edge_create',
+    {
+      title: 'Create an edge between two entities',
+      description: 'Plain INSERT (edges have no dedup/near-match surfacing — that is an entity-only concept, §5.1).',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        fromEntity: z.string(),
+        edgeType: z.string(),
+        toEntity: z.string(),
+        weight: z.number().optional(),
+        sourceModel: z.string().optional(),
+        agentId: z.string().optional(),
+      },
+    },
+    async (args) => toolEdgeCreate(args)
+  );
+
+  server.registerTool(
+    'edge_read',
+    {
+      title: 'Read live edges by id, from_entity, and/or to_entity',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        id: z.number().int().optional(),
+        fromEntity: z.string().optional(),
+        toEntity: z.string().optional(),
+      },
+    },
+    async (args) => toolEdgeRead(args)
+  );
+
+  server.registerTool(
+    'edge_update',
+    {
+      title: 'Update an edge in place',
+      description: 'Plain in-place UPDATE of edge_type/weight (no bi-temporal design — same posture as entity_update). Forensically visible via the edges_audit trigger.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        id: z.number().int().describe('Target edge id.'),
+        edgeType: z.string().optional(),
+        weight: z.number().optional(),
+      },
+    },
+    async (args) => toolEdgeUpdate(args)
+  );
+
+  server.registerTool(
+    'edge_suppress',
+    {
+      title: 'Suppress (retract) an edge',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        id: z.number().int().describe('Target edge id.'),
+      },
+    },
+    async (args) => toolEdgeSuppress(args)
+  );
+
+  // ── §8: exchange_append / exchange_read (A2A bus) ───────────────────────
+
+  server.registerTool(
+    'exchange_append',
+    {
+      title: 'Append one row to the append-only agent_exchange A2A log',
+      description: exchangeLogLib.EXCHANGE_APPEND_TOOL_DESCRIPTION,
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        agentId: z.string().describe('Author identity — the SAME free-text string stamped as source_model/agent_id elsewhere.'),
+        kind: z.string().describe('Speech-act hint (e.g. proposal|response|opinion|ruling|observation|research|handoff) — OPEN vocabulary, extend by convention, never a closed enum.'),
+        body: z.string().describe('Full caveman-English reasoning text.'),
+        summary: z.string().describe('Short digest, DISTINCT from body — this is what gets embedded, not the full body.'),
+        sourceModel: z.string().optional(),
+        toAgent: z.string().optional().describe('Omitted/null = broadcast.'),
+        docketId: z.number().int().optional(),
+        parentId: z.number().int().optional().describe('Thread linkage — id of the message being replied to/acked.'),
+        transition: z.object({
+          table: z.literal('tasks'),
+          id: z.number().int(),
+          fromStatus: z.string(),
+          toStatus: z.string(),
+        }).optional().describe('Optional ONE guarded atomic state transition in the SAME transaction as the append.'),
+      },
+    },
+    async (args) => toolExchangeAppend(args)
+  );
+
+  server.registerTool(
+    'exchange_read',
+    {
+      title: 'Poll the append-only agent_exchange A2A log via a compound watermark',
+      description:
+        'WHERE project_id=$1 AND (to_agent=$2 OR to_agent IS NULL) AND (created_at, id) > (afterCreatedAt, ' +
+        'afterId) — a WATERMARK, not a status flag (append-only design has no status column). M-8: ' +
+        'afterCreatedAt omitted = explicit no-floor branch (returns everything, not zero rows). M-9: the ' +
+        'watermark is COMPOUND (created_at, id) so same-millisecond rows are never lost; afterId is REQUIRED ' +
+        'whenever afterCreatedAt is given.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        toAgent: z.string().optional().describe('Poll this agent\'s inbox (messages addressed to it, plus broadcasts). Omitted = broadcasts only.'),
+        afterCreatedAt: z.string().optional().describe('Watermark timestamp (ISO-8601). Omitted = no floor (M-8).'),
+        afterId: z.number().int().optional().describe('Watermark id — REQUIRED when afterCreatedAt is given (M-9).'),
+        limit: z.number().int().positive().optional().describe('Default 50.'),
+      },
+    },
+    async (args) => toolExchangeRead(args)
+  );
+
+  // ── §8/§17: route_resolve / routing_profile_set / routing_profile_get ───
+
+  server.registerTool(
+    'route_resolve',
+    {
+      title: 'Resolve a model-routing decision (idempotent per turn)',
+      description:
+        'Resolves per §17\'s precedence ladder: explicit directive > session override > routing_profiles pin > ' +
+        'cost-aware recommendation. Idempotent: a second call for the SAME (project_id, session_id, turn_idx, ' +
+        'role) key returns the recorded row unchanged, never re-resolving. M-10: a replay called with a ' +
+        'DIFFERENT override_model than what was recorded returns the recorded row PLUS ' +
+        'override_ignored:true and ignored_override_model — never silently, never an error.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        sessionId: z.string(),
+        turnIdx: z.number().int().min(0),
+        role: z.string(),
+        capabilityTier: z.enum(routeResolveLib.VALID_TIERS).optional(),
+        overrideModel: z.string().optional(),
+      },
+    },
+    async (args) => toolRouteResolve(args)
+  );
+
+  server.registerTool(
+    'routing_profile_set',
+    {
+      title: 'Set a versioned routing profile pin for (project_id, role)',
+      description:
+        'M-18: ONE transaction — a transaction-scoped advisory lock keyed on (project_id, role) serializes ' +
+        'concurrent calls (see scripts/lib/routing-profile.js\'s header comment for why this deviates from the ' +
+        'runbook\'s literal "SELECT MAX(version) ... FOR UPDATE" pseudocode, which is not valid Postgres SQL) ' +
+        '-> deactivate the current active row -> insert a NEW versioned active row. Never mutates an existing ' +
+        'row\'s tier/model in place.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        role: z.string(),
+        capabilityTier: z.enum(routingProfileLib.VALID_TIERS),
+        preferredModel: z.string().optional(),
+        preferredProvider: z.string().optional(),
+        sourceModel: z.string().optional(),
+        agentId: z.string().optional(),
+        notes: z.string().optional(),
+      },
+    },
+    async (args) => toolRoutingProfileSet(args)
+  );
+
+  server.registerTool(
+    'routing_profile_get',
+    {
+      title: 'Get active routing profile(s) for a project',
+      description: '`role` omitted returns every active profile for the project.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        role: z.string().optional(),
+      },
+    },
+    async (args) => toolRoutingProfileGet(args)
+  );
+
+  // ── §18: usage_record / usage_query ──────────────────────────────────────
+
+  server.registerTool(
+    'usage_record',
+    {
+      title: 'Record token/cost usage for one turn',
+      description:
+        'Matched on (project_id, session_id, turn_idx, agent_role) — UPDATEs the row route_resolve already ' +
+        'created (the common resolve-first-measure-after case), or upserts a fresh row if usage is recorded ' +
+        'without route_resolve having run first. costUsd omitted computes server-side from model_registry rates ' +
+        '(fails soft to NULL, never a guessed price, when the model or its rates are unregistered).',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        sessionId: z.string(),
+        turnIdx: z.number().int().min(0),
+        agentRole: z.string(),
+        tokensIn: z.number().int().min(0).optional(),
+        tokensOut: z.number().int().min(0).optional(),
+        cacheReadTokens: z.number().int().min(0).optional(),
+        cacheWriteTokens: z.number().int().min(0).optional(),
+        costUsd: z.number().min(0).nullable().optional(),
+        modelId: z.string().optional(),
+        provider: z.string().optional(),
+        outcome: z.enum(usageTelemetryLib.VALID_OUTCOMES).optional(),
+        sourceModel: z.string().optional(),
+        agentId: z.string().optional(),
+      },
+    },
+    async (args) => toolUsageRecord(args)
+  );
+
+  server.registerTool(
+    'usage_query',
+    {
+      title: 'Roll up token/cost usage by model, role, provider, or day',
+      description:
+        'sessionId given: aggregates turn_usage directly, any groupBy. sessionId omitted: aggregates ' +
+        'session_usage ROLLUPS only (staleness-by-design — a session whose rollup has not been recomputed is ' +
+        'invisible), groupBy must be "model".',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        sessionId: z.string().optional(),
+        groupBy: z.enum(usageTelemetryLib.VALID_GROUP_BY).optional().describe('Default "model".'),
+      },
+    },
+    async (args) => toolUsageQuery(args)
   );
 
   return server;

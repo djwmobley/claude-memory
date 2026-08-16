@@ -194,12 +194,20 @@ FOR EACH ROW EXECUTE FUNCTION log_guarded_change();
 -- (every listed table wired + row-count verification) belongs to the
 -- migration-phase issue, not this file -- this file wires what exists today
 -- and reports the deferred set loudly (see migrate-13-agent-exchange.js).
+--
+-- §8 M-4 amendment (CONSOLIDATION-RUNBOOK.md §5.8.1, memory-manager#18):
+-- 'entities' added to the FOREACH array below -- the canonical wired set
+-- grows 16 -> 17 (13 seam tables + assertions + edges + agent_exchange +
+-- entities). entities exists unconditionally on any migrate-01 target, same
+-- as assertions/edges -- no special-casing needed, it just joins the same
+-- guarded gate. edges was ALREADY wired in the 16-table set; only entities
+-- was missing.
 DO $$
 DECLARE
   t TEXT;
 BEGIN
   FOREACH t IN ARRAY ARRAY[
-    'assertions', 'edges',
+    'assertions', 'edges', 'entities',
     'decisions', 'gotchas', 'findings', 'research', 'incidents',
     'code_index', 'tasks', 'checklist_items', 'corpus_files',
     'workflow_discovery', 'agent_rewrites', 'policy_sections', 'session_chunks'

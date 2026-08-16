@@ -176,6 +176,31 @@ const ALLOWED_TABLES = Object.freeze(Object.keys(TABLE_COLUMN_MAP));
 const AUTHORING_MODE_VALUES = new Set(['caveman', 'verbose']);
 
 /**
+ * §8 M-2: per-table embed-text builder — the concatenation of text columns
+ * fed to the embedding provider at write time (mirrors §10.2's
+ * v_memory_hits_unified "content" column definitions, so the same text a
+ * row would surface under in hybrid recall is the same text it was embedded
+ * from). Pure; never touches the DB. Returns '' when the row carries none of
+ * the listed columns (caller treats '' as "nothing to embed").
+ */
+const EMBED_TEXT_BUILDERS = {
+  decisions: (row) => [row.topic, row.decision, row.reason].filter(Boolean).join(' '),
+  gotchas: (row) => [row.issue, row.rule].filter(Boolean).join(' '),
+  findings: (row) => [row.description, row.impact, row.remediation].filter(Boolean).join(' '),
+  research: (row) => [row.title, row.body].filter(Boolean).join(' '),
+  incidents: (row) => [row.title, row.what_happened, row.what_we_did].filter(Boolean).join(' '),
+  code_index: (row) => row.description || '',
+  tasks: (row) => row.title || '',
+  checklist_items: (row) => [row.title, row.description].filter(Boolean).join(' '),
+  corpus_files: (row) => row.summary || row.path || '',
+};
+
+function buildEmbedText(table, row) {
+  const builder = EMBED_TEXT_BUILDERS[table];
+  return builder ? builder(row || {}) : '';
+}
+
+/**
  * Tool-description text (§3.4/S-5): stated here so any MCP client wiring
  * this function up to a tool definition can surface the caveman mandate at
  * call time, mirroring EXTRACTION_PAYLOAD_FIELD_CONTRACT's proven pattern
@@ -304,13 +329,23 @@ function validateRow(table, columnMap, row) {
  * @param {object} client - pg client/pool
  * @param {string} table  - MUST be one of ALLOWED_TABLES (S-1)
  * @param {object} row    - column values; unknown keys are rejected (S-4)
+ * @param {object} [opts]
+ * @param {string|null} [opts.embeddingVectorLiteral] - §8 M-2: a
+ *   server-computed halfvec literal string (e.g. "[0.1,0.2,...]"), added to
+ *   the INSERT alongside the validated columns AFTER validateRow succeeds —
+ *   this is NEVER caller-supplied via `row` (the embedding column is
+ *   deliberately absent from every table's TABLE_COLUMN_MAP, so a raw
+ *   client-side embedding can never be smuggled through `row`; only the MCP
+ *   tool-orchestration layer populates this opt, from its own
+ *   server-computed vector, mirroring exchange_append's "tool ships it"
+ *   posture). null/omitted = embedding left NULL (fail-soft path, M-2).
  * @returns {Promise<{id: *}>} the inserted row's primary-key value(s) —
  *   `id` for every table except `findings`, where it echoes back the
  *   caller-supplied (project_id, id) pair as `{id, project_id}`.
  * @throws {MemoryUpsertError} 'unknownTable' | 'unknownKey' | 'validation'
  *   | 'collision'
  */
-async function writeMemoryRow(client, table, row) {
+async function writeMemoryRow(client, table, row, opts) {
   if (!Object.prototype.hasOwnProperty.call(TABLE_COLUMN_MAP, table)) {
     throw new MemoryUpsertError(
       'unknownTable',
@@ -325,12 +360,18 @@ async function writeMemoryRow(client, table, row) {
   const cols = Object.keys(columnMap).filter((c) =>
     Object.prototype.hasOwnProperty.call(row, c) && row[c] !== undefined && row[c] !== null
   );
-  const placeholders = cols.map((_, i) => `$${i + 1}`);
   const values = cols.map((c) => row[c]);
 
+  const embeddingVectorLiteral = opts && opts.embeddingVectorLiteral ? opts.embeddingVectorLiteral : null;
+  if (embeddingVectorLiteral !== null) {
+    cols.push('embedding');
+    values.push(embeddingVectorLiteral);
+  }
+  const placeholders = values.map((_, i) => `$${i + 1}`);
+
   // Identifiers (table, cols) come ONLY from TABLE_COLUMN_MAP's own key set
-  // above — never from caller input directly (S-1). Every value is
-  // parameterized.
+  // above, plus the single hardcoded literal "embedding" — never from caller
+  // input directly (S-1). Every value is parameterized.
   const quotedCols = cols.map((c) => `"${c}"`).join(', ');
   const sql = `INSERT INTO "${table}" (${quotedCols}) VALUES (${placeholders.join(', ')}) RETURNING *`;
 
@@ -349,6 +390,78 @@ async function writeMemoryRow(client, table, row) {
     }
     throw err;
   }
+}
+
+/**
+ * upsertDecisionRow — §8 M-1's EXPLICIT, NAMED carve-out from S-2's
+ * INSERT-ONLY rule: "ON CONFLICT (project_id, topic) DO UPDATE ... No other
+ * table gets this carve-out." Backed by decisions_audit (AFTER UPDATE),
+ * which preserves the prior value in the append-only audit_log ledger, so
+ * the UPDATE is non-destructive in the ledger sense (M-1's own
+ * justification). Requires the decisions_project_topic_unique index
+ * (scripts/migrations/sql/migrate-15-mcp-addenda.sql) to exist on the
+ * target — without it, ON CONFLICT (project_id, topic) has no matching
+ * arbiter index and Postgres raises 42P10, surfaced here as a named error
+ * rather than a raw driver error.
+ *
+ * @param {object} client
+ * @param {object} row - same shape/validation as TABLE_COLUMN_MAP.decisions
+ * @param {object} [opts]
+ * @param {string|null} [opts.embeddingVectorLiteral] - §8 M-2, same
+ *   contract as writeMemoryRow's opt.
+ * @returns {Promise<object>} the post-write row (RETURNING *) plus
+ *   `{ inserted: boolean }` (xmax = 0 idiom, same as usage-telemetry.js's
+ *   usageRecord — true iff this call's own upsert performed the physical
+ *   INSERT rather than the UPDATE branch).
+ * @throws {MemoryUpsertError} 'unknownKey' | 'validation'
+ */
+async function upsertDecisionRow(client, row, opts) {
+  const columnMap = TABLE_COLUMN_MAP.decisions.columns;
+  validateRow('decisions', columnMap, row || {});
+
+  const cols = Object.keys(columnMap).filter((c) =>
+    Object.prototype.hasOwnProperty.call(row, c) && row[c] !== undefined && row[c] !== null
+  );
+  const values = cols.map((c) => row[c]);
+
+  const embeddingVectorLiteral = opts && opts.embeddingVectorLiteral ? opts.embeddingVectorLiteral : null;
+  if (embeddingVectorLiteral !== null) {
+    cols.push('embedding');
+    values.push(embeddingVectorLiteral);
+  }
+  const placeholders = values.map((_, i) => `$${i + 1}`);
+  const quotedCols = cols.map((c) => `"${c}"`).join(', ');
+
+  // UPDATE SET list: every column this call actually supplied, EXCEPT the
+  // conflict-key columns (project_id, topic) themselves — those never
+  // change on an update-by-key. embedding (when supplied) IS re-set on
+  // conflict, so a topic edit's new embedding replaces the stale one.
+  const setCols = cols.filter((c) => c !== 'project_id' && c !== 'topic');
+  const setClause = setCols.length
+    ? setCols.map((c) => `"${c}" = EXCLUDED."${c}"`).join(', ')
+    : null;
+
+  const sql = setClause
+    ? `INSERT INTO "decisions" (${quotedCols}) VALUES (${placeholders.join(', ')})
+       ON CONFLICT (project_id, topic) DO UPDATE SET ${setClause}
+       RETURNING *, (xmax = 0) AS inserted`
+    : `INSERT INTO "decisions" (${quotedCols}) VALUES (${placeholders.join(', ')})
+       ON CONFLICT (project_id, topic) DO NOTHING
+       RETURNING *, (xmax = 0) AS inserted`;
+
+  const { rows } = await client.query(sql, values);
+  if (rows.length === 0) {
+    // Only reachable via the DO NOTHING branch (no non-key column supplied
+    // on a conflicting row) — the existing row is unchanged; re-select it so
+    // the caller always gets a row back, never an empty result on a benign
+    // no-op conflict.
+    const { rows: existing } = await client.query(
+      `SELECT *, false AS inserted FROM decisions WHERE project_id = $1 AND topic = $2`,
+      [row.project_id, row.topic]
+    );
+    return existing[0];
+  }
+  return rows[0];
 }
 
 // ─── Ingest-time contradiction flagging — ASSERTION writes ONLY (§7.3/S-6
@@ -396,6 +509,59 @@ async function findContradictingAssertion(client, projectId, subject, predicate,
   return null;
 }
 
+// ─── memory_get — §8's direct lookup-by-natural-key tool ───────────────────
+//
+// "direct lookup by table + natural key (e.g. `decisions` by
+// `(project_id, topic)`, `findings` by `(project_id, id)`)."
+//
+// `key` is a plain {column: value} object. Column names are validated
+// against TABLE_COLUMN_MAP[table]'s own key set PLUS the literal 'id' (an
+// implicit lookup key on every table, even the tables whose SERIAL id is
+// server-generated and therefore absent from TABLE_COLUMN_MAP's
+// caller-writable column set) — never caller-supplied SQL identifiers
+// (S-1's identifier-safety rule, reused here).
+
+async function memoryGet(client, table, projectId, key) {
+  if (!Object.prototype.hasOwnProperty.call(TABLE_COLUMN_MAP, table)) {
+    throw new MemoryUpsertError(
+      'unknownTable',
+      `memory_get: unknown table "${table}" (allowed: ${ALLOWED_TABLES.join(', ')})`,
+      { table }
+    );
+  }
+  if (typeof projectId !== 'string' || !projectId.trim()) {
+    throw new MemoryUpsertError('validation', 'memory_get: projectId is required and must be a non-empty string');
+  }
+  if (typeof key !== 'object' || key === null || Array.isArray(key) || Object.keys(key).length === 0) {
+    throw new MemoryUpsertError('validation', 'memory_get: key must be a non-empty plain object of {column: value}');
+  }
+
+  const allowedKeys = new Set([...Object.keys(TABLE_COLUMN_MAP[table].columns), 'id']);
+  const keyCols = Object.keys(key);
+  for (const k of keyCols) {
+    if (!allowedKeys.has(k)) {
+      throw new MemoryUpsertError(
+        'unknownKey',
+        `memory_get: table "${table}" has no lookup column "${k}" (allowed: ${[...allowedKeys].join(', ')})`,
+        { table, key: k }
+      );
+    }
+  }
+
+  const conditions = ['project_id = $1'];
+  const values = [projectId];
+  for (const k of keyCols) {
+    values.push(key[k]);
+    conditions.push(`"${k}" = $${values.length}`);
+  }
+
+  const { rows } = await client.query(
+    `SELECT * FROM "${table}" WHERE ${conditions.join(' AND ')}`,
+    values
+  );
+  return rows;
+}
+
 module.exports = {
   TABLE_COLUMN_MAP,
   ALLOWED_TABLES,
@@ -404,5 +570,9 @@ module.exports = {
   MemoryUpsertError,
   validateRow,
   writeMemoryRow,
+  upsertDecisionRow,
   findContradictingAssertion,
+  EMBED_TEXT_BUILDERS,
+  buildEmbedText,
+  memoryGet,
 };

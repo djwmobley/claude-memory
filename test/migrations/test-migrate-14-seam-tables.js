@@ -26,7 +26,9 @@
  * Also covers the trigger-wiring re-apply sequence this migration itself
  * documents: after migrate-14 lands the seam tables, re-running
  * migrate-13-agent-exchange.js (unmodified) auto-wires all 13 onto its own
- * CHECKLIST_TABLES, landing at exactly 16 total *_audit triggers.
+ * CHECKLIST_TABLES, landing at exactly 17 total *_audit triggers (§8 M-4:
+ * migrate-13-agent-exchange.js's CHECKLIST_TABLES grew 16 -> 17 with
+ * 'entities' added, memory-manager#18).
  *
  * Usage: node test/migrations/test-migrate-14-seam-tables.js
  * Exit 0 = all pass; nonzero = any failure.
@@ -175,7 +177,7 @@ async function testTriggerReapplyWires16() {
   const client = await pgConnect(dbName);
   try {
     const { rows } = await client.query(`SELECT tgname FROM pg_trigger WHERE tgname LIKE '%_audit' ORDER BY tgname`);
-    assert(rows.length === 16, `expected exactly 16 *_audit triggers, got ${rows.length}: ${rows.map((r) => r.tgname).join(', ')}`);
+    assert(rows.length === 17, `expected exactly 17 *_audit triggers (§8 M-4: entities added), got ${rows.length}: ${rows.map((r) => r.tgname).join(', ')}`);
   } finally {
     await client.end();
   }
@@ -305,7 +307,7 @@ async function main() {
   await run('A1', 'Fresh apply -> exit 0, MIGRATION_RESULT: PASS (13 tables + view + widening + embeddings)', testFreshApply);
   await run('A2', 'Idempotent re-run -> PASS', testIdempotentReapply);
   await run('A3', 'Prerequisite (agent_exchange) missing -> refusal naming migrate-13-agent-exchange.js', testPrereqMissing);
-  await run('A4', 'Re-apply migrate-13-agent-exchange.js wires all 13 seam tables; 16 total *_audit triggers', testTriggerReapplyWires16);
+  await run('A4', 'Re-apply migrate-13-agent-exchange.js wires all 13 seam tables; 17 total *_audit triggers (§8 M-4)', testTriggerReapplyWires16);
   await run('A5', 'Deviation (1) proof-of-firing: code_index audit trigger actually fires (UPDATE+DELETE)', testCodeIndexTriggerFires);
   await run('A6', 'Deviation (2) proof-of-firing: findings TEXT-id UPDATE survives widened row_id; reverting reproduces the original bigint cast failure', testFindingsRowIdWideningFiresAndReverts);
   await run('A7', 'G2 adversarial: behavioral view-probe catches an AND->OR-broken v_handoff_card_inputs that a substring match would have missed', testViewCheckCatchesBrokenFilter);
