@@ -1,6 +1,6 @@
 {
   "_meta": {
-    "registry_version": "1.4",
+    "registry_version": "1.5",
     "description": "Authoritative predicate-vocabulary registry. Each entry declares the canonical predicate string, its cardinality, a human-readable description, and the registry version when the entry was added. Shape: { _meta: {...}, entries: [ { predicate, cardinality, description, added_version } ] }."
   },
   "entries": [
@@ -118,6 +118,12 @@
       "cardinality": "1:1",
       "description": "Author or mechanism that created a subject",
       "added_version": "1.1"
+    },
+    {
+      "predicate": "critical_operational_notes",
+      "cardinality": "1:1",
+      "description": "The 'Critical operational notes' durable-section content parsed from HANDOFF.md (§6.1(h) markdown migration) and read by the §7.6 fat-card renderer; subject is the fixed canonical heading text, one live value per project, latest supersedes prior. Written pinned (excluded from decay/eviction).",
+      "added_version": "1.5"
     },
     {
       "predicate": "currently_at",
@@ -339,6 +345,12 @@
       "added_version": "1.1"
     },
     {
+      "predicate": "key_paths",
+      "cardinality": "1:1",
+      "description": "The 'Key paths' durable-section content parsed from HANDOFF.md (§6.1(h) markdown migration) and read by the §7.6 fat-card renderer; subject is the fixed canonical heading text, one live value per project, latest supersedes prior. Written pinned (excluded from decay/eviction).",
+      "added_version": "1.5"
+    },
+    {
       "predicate": "listens_on",
       "cardinality": "1:N",
       "description": "Port or interface on which a service listens; a service may listen on multiple ports or interfaces simultaneously",
@@ -484,6 +496,12 @@
       "cardinality": "1:N",
       "description": "Values or types returned by a function or query; multiple return types may apply",
       "added_version": "1.1"
+    },
+    {
+      "predicate": "run_commands",
+      "cardinality": "1:1",
+      "description": "The 'Run commands' durable-section content parsed from HANDOFF.md (§6.1(h) markdown migration) and read by the §7.6 fat-card renderer; subject is the fixed canonical heading text, one live value per project, latest supersedes prior. Written pinned (excluded from decay/eviction).",
+      "added_version": "1.5"
     },
     {
       "predicate": "schema_migration_is",
