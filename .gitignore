@@ -73,6 +73,14 @@ scripts/decisions_backup*.csv
 # never committed. See migrate-02-decisions.js's backupSourceTable().
 /scripts/migrations/backups/
 
+# migrate-03-corpus-project-id.js's built project-attribution map — an
+# AUDIT ARTIFACT of each run (never read back as input, D3-7), carrying
+# real ~/.claude/projects directory names, real database names, and real
+# project marker UUIDs. Never committed.
+# scripts/migrations/memory-entry-project-map.example.json documents the
+# shape. See migrate-03-corpus-project-id.js's writeMapArtifact().
+/scripts/migrations/memory-entry-project-map.json
+
 # migrate-08-handoff-markdown.js's per-project fail-soft parse reports —
 # may embed real HANDOFF.md/HANDOFF-HISTORY.md content (subjects, session
 # summaries), never committed. See migrate-08-handoff-markdown.js's
