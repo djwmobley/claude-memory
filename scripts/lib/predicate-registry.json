@@ -121,8 +121,8 @@
     },
     {
       "predicate": "critical_operational_notes",
-      "cardinality": "1:1",
-      "description": "The 'Critical operational notes' durable-section content parsed from HANDOFF.md (§6.1(h) markdown migration) and read by the §7.6 fat-card renderer; subject is the fixed canonical heading text, one live value per project, latest supersedes prior. Written pinned (excluded from decay/eviction).",
+      "cardinality": "1:N",
+      "description": "The 'Critical operational notes' durable-section content parsed from HANDOFF.md (§6.1(h) markdown migration) and read by the §7.6 fat-card renderer; subject is the fixed canonical heading text. Registered 1:N (not 1:1) deliberately: the migration's own H-6 collision handling treats a duplicate durable heading (within one file, or across --file/--history-file) as a loud-but-survives event — both rows are written, never silently overwritten or constraint-blocked (migrate-08-handoff-markdown.js's own header comment: 'every category here is 1:N-safe by construction'). Written pinned (excluded from decay/eviction).",
       "added_version": "1.5"
     },
     {
@@ -346,8 +346,8 @@
     },
     {
       "predicate": "key_paths",
-      "cardinality": "1:1",
-      "description": "The 'Key paths' durable-section content parsed from HANDOFF.md (§6.1(h) markdown migration) and read by the §7.6 fat-card renderer; subject is the fixed canonical heading text, one live value per project, latest supersedes prior. Written pinned (excluded from decay/eviction).",
+      "cardinality": "1:N",
+      "description": "The 'Key paths' durable-section content parsed from HANDOFF.md (§6.1(h) markdown migration) and read by the §7.6 fat-card renderer; subject is the fixed canonical heading text. Registered 1:N (not 1:1) deliberately: the migration's own H-6 collision handling treats a duplicate durable heading (within one file, or across --file/--history-file) as a loud-but-survives event — both rows are written, never silently overwritten or constraint-blocked (migrate-08-handoff-markdown.js's own header comment: 'every category here is 1:N-safe by construction'). Written pinned (excluded from decay/eviction).",
       "added_version": "1.5"
     },
     {
@@ -499,8 +499,8 @@
     },
     {
       "predicate": "run_commands",
-      "cardinality": "1:1",
-      "description": "The 'Run commands' durable-section content parsed from HANDOFF.md (§6.1(h) markdown migration) and read by the §7.6 fat-card renderer; subject is the fixed canonical heading text, one live value per project, latest supersedes prior. Written pinned (excluded from decay/eviction).",
+      "cardinality": "1:N",
+      "description": "The 'Run commands' durable-section content parsed from HANDOFF.md (§6.1(h) markdown migration) and read by the §7.6 fat-card renderer; subject is the fixed canonical heading text. Registered 1:N (not 1:1) deliberately: the migration's own H-6 collision handling treats a duplicate durable heading (within one file, or across --file/--history-file) as a loud-but-survives event — both rows are written, never silently overwritten or constraint-blocked (migrate-08-handoff-markdown.js's own header comment: 'every category here is 1:N-safe by construction'). Written pinned (excluded from decay/eviction).",
       "added_version": "1.5"
     },
     {
