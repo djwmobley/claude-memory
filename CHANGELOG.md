@@ -378,6 +378,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`scripts/handoff-mcp-selftest.mjs`: instance data out of public defaults**
+  — `SERVER_PATH` was a hardcoded owner-machine absolute path; now resolved
+  relative to the script's own location via `import.meta.url`. `PROJECT_ROOT`
+  hardcoded a real private-repo path and name; now required from
+  `HANDOFF_SELFTEST_PROJECT_ROOT`, with a loud FATAL + usage instructions and
+  a non-zero exit when unset (no silent fallback). The `persist_decisions`
+  fixture topic/decision text also carried a real project name and an
+  internal ticket number; genericized to synthetic kebab-case values that
+  still satisfy `TOPIC_RE`. Behavior otherwise unchanged.
+
 - **`open_thread` serve-time staleness gate: qualified cross-repo refs no
   longer false-positive against local PR numbers (#150)** — `probeOpenThread`
   in `scripts/lib/reality-checks.js` extracted every `#N` token from an
