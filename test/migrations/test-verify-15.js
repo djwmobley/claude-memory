@@ -1053,11 +1053,44 @@ async function testT6ReferentialIntegrity() {
 }
 
 async function testT7CavemanEconomy() {
+  // The store-wide gate (test/north-star/test-caveman-economy-store-wide.js)
+  // now EXISTS (memory-manager#12, T7's former blocker) — this test's
+  // original assertion ("prerequisite not built") is stale and can never
+  // match again. Updated to reflect current reality rather than deleted,
+  // because the underlying INTENT this test encodes — "T7 never silently
+  // passes" — still holds, just via a different, now-accurate mechanism.
+  //
+  // TARGET_DB here is the SAME narrow 7-table fixture setupTargetSchema()
+  // builds for every other T0-T8 test in this file (decisions/tasks/
+  // entities/edges/memory_entries/memory_entry_chunks/routing_profiles) —
+  // nowhere near the full 29-table §5 schema scripts/migrations/
+  // caveman-columns.json is built against. Running the now-real gate
+  // against this deliberately narrow fixture is EXPECTED to fail its own
+  // K-8 completeness backstop — not because the gate is missing, but
+  // because this fixture's schema doesn't match §5. That is a correct, loud
+  // failure (never a silent pass), reproduced independently (drop one
+  // manifest column from a disposable DB -> named in "stale manifest
+  // entries"; add one unlisted live column -> named in
+  // "unclassified-LOUD-FAIL") before this assertion was written.
+  //
+  // The gate's POSITIVE path (PASS against a fully §5-provisioned schema) is
+  // already covered by its own test suite (test/migrations/
+  // test-caveman-gate-store-wide.js's T5c/T6a, and
+  // test/north-star/test-caveman-economy-store-wide.js's own CLI smoke run,
+  // both of which also run against the REAL memory_manager_staging) —
+  // building a second full §5 schema fixture inside THIS shared-fixture file
+  // would duplicate that coverage and risk destabilizing the ~15 other tests
+  // that depend on TARGET_DB's narrow, fast-to-provision shape.
   const r = runScript('verify-15-t7-caveman-economy.js', ['--db', TARGET_DB]);
-  if (r.status !== 0 && /prerequisite .* not built/.test(r.stdout + r.stderr)) {
-    pass('T7', 'store-wide caveman gate prerequisite not built -> FAIL, loud, non-zero exit (never silently passes)');
+  const combined = r.stdout + r.stderr;
+  const loudFail =
+    r.status !== 0 &&
+    /completeness \(K-8\): FAIL/.test(combined) &&
+    (/unclassified-LOUD-FAIL/.test(combined) || /stale manifest entries/.test(combined));
+  if (loudFail) {
+    pass('T7', 'store-wide gate: narrow 7-table TARGET_DB fixture fails loud via the K-8 completeness backstop (never silently passes)');
   } else {
-    fail('T7', 'store-wide caveman gate prerequisite not built -> FAIL, loud, non-zero exit (never silently passes)', `status=${r.status} stdout=${r.stdout} stderr=${r.stderr}`);
+    fail('T7', 'store-wide gate: narrow 7-table TARGET_DB fixture fails loud via the K-8 completeness backstop (never silently passes)', `status=${r.status} stdout=${r.stdout} stderr=${r.stderr}`);
   }
 }
 

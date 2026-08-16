@@ -43,6 +43,12 @@ const { loadConfig } = require('../../../scripts/lib/shared');
 // (verified: project-marker.js:152-159).
 const { writeMarker } = require('../../../scripts/lib/project-marker');
 const { resolveHandoffMdPath } = require('../../../scripts/lib/handoff-paths');
+// estimateTokens/assertSurfaced now have ONE definition, in the shared caveman
+// lint lib (§3.5 K-10/K-11) — this file re-exports them by reference instead of
+// defining its own copies, so test-caveman-economy.js (which consumes them via
+// H.estimateTokens/H.assertSurfaced) and the new store-wide gate both resolve to
+// the same implementation.
+const { estimateTokens, assertSurfaced } = require('../../../scripts/lib/caveman-lint');
 
 // pg lives in scripts/node_modules — use createRequire anchored to
 // scripts/package.json so the import is portable across any pnpm/npm/yarn
@@ -595,18 +601,10 @@ async function queryEdges(db, projectId, filter = {}) {
 }
 
 // ─── TOKEN HELPERS ──────────────────────────────────────────────────────────────
-
-/**
- * Token estimate convention used throughout handoff.js: Math.ceil(text.length/4)
- * (e.g. handoff.js:2711). Provided so sibling files use the SAME convention as
- * the engine when reasoning about budgets.
- *
- * @param {string} text
- * @returns {number}
- */
-function estimateTokens(text) {
-  return Math.ceil(String(text || '').length / 4);
-}
+//
+// estimateTokens now lives in scripts/lib/caveman-lint.js (single definition,
+// K-10/K-11) and is imported at the top of this file; re-exported below by
+// reference for backward compatibility with sibling files using H.estimateTokens.
 
 /**
  * Parse the "tokens used: ~N / M" line out of resume/loader stdout. Returns the
@@ -637,23 +635,11 @@ function asItemList(items) {
     .filter((s) => s.length > 0);
 }
 
-/**
- * Assert that every item in `items` appears (substring) in servedText.
- *
- * @param {string} servedText - e.g. runResume() output.
- * @param {string|string[]} items - strings that must all surface.
- * @param {string} [msg] - context prefix for the failure message.
- */
-function assertSurfaced(servedText, items, msg) {
-  const text = String(servedText || '');
-  const missing = asItemList(items).filter((it) => !text.includes(it));
-  assert.strictEqual(
-    missing.length, 0,
-    `${msg || 'assertSurfaced'}: expected to surface in served context but did NOT: ` +
-    `${JSON.stringify(missing)} — north-star (1) lossless fidelity: session-driving ` +
-    `intent must survive into the next session's served context.`
-  );
-}
+// assertSurfaced now lives in scripts/lib/caveman-lint.js (single definition,
+// K-10/K-11) and is imported at the top of this file; re-exported below by
+// reference. asItemList (above) is kept locally — assertNotSurfaced still uses
+// it and moving it would split one tiny private helper across two files for no
+// benefit.
 
 /**
  * Assert that NONE of `items` appear in servedText.
