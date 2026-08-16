@@ -466,7 +466,7 @@ async function main() {
     console.log(`  log_guarded_change(): exists=${v.guardFn.exists} bodyOk=${v.guardFn.bodyOk}${v.guardFn.reason ? ` -- ${v.guardFn.reason}` : ''}`);
     console.log(`  agent_exchange_audit trigger events: [${v.agentExchangeEvents.join(', ')}] (ok=${v.agentExchangeTriggerOk})`);
 
-    console.log('  trigger-wiring checklist (15 tables):');
+    console.log(`  trigger-wiring checklist (${v.triggerWiring.length} tables):`);
     for (const r of v.triggerWiring) {
       console.log(`    - ${r.table}: ${r.state}${r.reason ? ` -- ${r.reason}` : ''}`);
     }
