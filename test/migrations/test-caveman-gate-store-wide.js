@@ -50,7 +50,10 @@ const AUTHORED_BY = 'sonnet-t7-store-wide-gate-author-2026-08-16';
  */
 
 const path = require('path');
+const fs = require('fs');
+const os = require('os');
 const assert = require('assert');
+const { spawnSync } = require('child_process');
 
 const gate = require('../north-star/test-caveman-economy-store-wide');
 const lint = require('../../scripts/lib/caveman-lint');
@@ -62,6 +65,27 @@ const { Client } = scriptsRequire('pg');
 
 const TS = Date.now();
 const DB_NAME = `caveman_gate_test_${TS}_staging`;
+const DB_PREREQ = `caveman_gate_prereq_${TS}_staging`;
+
+// migrate-16's own idempotency/prerequisite-refusal coverage — mirrors the
+// house pattern test-migrate-14-seam-tables.js's testIdempotentReapply/
+// testPrereqMissing set for migrate-14, and test-verify-20.js's A2/A3 set for
+// migrate-15 — dedicated coverage for migrate-16 lives here (not a separate
+// test-migrate-16-*.js file) because this is the one file that already owns
+// migrate-16 provisioning (via gate.provisionSchema), same locality argument
+// migrate-15's own tests use for living alongside verify-20's.
+const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
+const MIGRATE01_PATH = path.join(PROJECT_ROOT, 'scripts', 'migrations', 'migrate-01-canonical-db.js');
+const MIGRATE16_PATH = path.join(PROJECT_ROOT, 'scripts', 'migrations', 'migrate-16-caveman-addenda.js');
+
+function spawnScript(scriptPath, args, timeoutMs = 20000) {
+  return spawnSync(process.execPath, [scriptPath, ...args], {
+    cwd: PROJECT_ROOT,
+    env: process.env,
+    encoding: 'utf8',
+    timeout: timeoutMs,
+  });
+}
 
 let passed = 0;
 let failed = 0;
@@ -78,9 +102,24 @@ async function connect() {
   return client;
 }
 
+async function createEmptyDb(dbName) {
+  const sys = new Client(shared.pgConfig('postgres'));
+  await sys.connect();
+  try {
+    await sys.query(`CREATE DATABASE "${dbName}"`);
+  } finally {
+    await sys.end();
+  }
+}
+
 async function main() {
   console.log(`test-caveman-gate-store-wide: provisioning "${DB_NAME}"`);
   gate.provisionSchema(DB_NAME);
+
+  // DB_PREREQ: created EMPTY (no migrate-01 ever run against it) so
+  // `assertions` genuinely does not exist — fixture for M16b below.
+  console.log(`test-caveman-gate-store-wide: provisioning empty "${DB_PREREQ}" (no schema — M16b prerequisite-missing fixture)`);
+  await createEmptyDb(DB_PREREQ);
 
   const client = await connect();
   let cavemanId, verboseId, nullModeAssertionId, truncatedTaskId;
@@ -200,6 +239,46 @@ async function main() {
       assert.strictEqual(result.pass, true, `shipped manifest must have zero drift, got onlyLive=${JSON.stringify(result.onlyLive)} onlyManifest=${JSON.stringify(result.onlyManifest)}`);
     });
 
+    // ── T5d: K-9 class-enum validation — a corrupted manifest COPY, never
+    // the real committed file, must fail loud naming the file/entry/value ──
+    await runCase('T5d', 'K-9: an unrecognized "class" value (typo/drift) in the manifest is a LOUD FAIL naming the file, entry, and bad value — never a silent pass', () => {
+      const real = JSON.parse(fs.readFileSync(gate.MANIFEST_PATH, 'utf8'));
+      // Corrupt exactly one, known-real entry — mirrors the shape an
+      // independent reviewer reproduced by hand (entities.description ->
+      // a typo'd class string outside the K-9 enum).
+      assert.ok(real.tables.entities && real.tables.entities.columns.description, 'fixture sanity: entities.description must exist in the real manifest');
+      real.tables.entities.columns.description = { class: 'checked-cavmenn-TYPO-OUTSIDE-ENUM', reason: 'corrupted fixture' };
+
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'caveman-manifest-corrupt-'));
+      const corruptedPath = path.join(tmpDir, 'caveman-columns.json');
+      fs.writeFileSync(corruptedPath, JSON.stringify(real, null, 2), 'utf8');
+      try {
+        assert.throws(
+          () => gate.loadManifest(corruptedPath),
+          (err) => {
+            assert.ok(err instanceof Error, 'expected an Error to be thrown');
+            assert.ok(err.message.includes(corruptedPath), `expected the file path named in the error: ${err.message}`);
+            assert.ok(err.message.includes('entities.description'), `expected the bad entry named in the error: ${err.message}`);
+            assert.ok(err.message.includes('checked-cavmenn-TYPO-OUTSIDE-ENUM'), `expected the bad value named in the error: ${err.message}`);
+            return true;
+          },
+          'loadManifest() must throw loud on an out-of-enum class value, never silently pass'
+        );
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+
+      // Sanity: the REAL committed manifest was never touched — corruption
+      // happened only on an in-memory clone written to a disposable temp file.
+      const realFileText = fs.readFileSync(gate.MANIFEST_PATH, 'utf8');
+      assert.ok(!realFileText.includes('checked-cavmenn-TYPO-OUTSIDE-ENUM'), 'the real committed caveman-columns.json must be byte-identical (unmodified) after this test');
+
+      // Cross-check: the real, uncorrupted manifest loads clean (every class
+      // value IS in the enum) — proves T5d exercises the validator's FAIL
+      // path specifically, not a validator that always throws.
+      assert.doesNotThrow(() => gate.loadManifest(), 'the real, uncorrupted manifest must load without throwing');
+    });
+
     // ── T6: aggregate runGate() — legitimate traffic passes, real defects fail ──
     await runCase('T6a', 'runGate(): legitimate mixed traffic (caveman + grandfathered-verbose) is an overall PASS', async () => {
       // At this point the DB has: cavemanId (clean), verboseId (verbose,
@@ -224,9 +303,36 @@ async function main() {
       const decisionsResult = result.tableResults.find((t) => t.table === 'decisions');
       assert.strictEqual(decisionsResult.failed, 0, `decisions table should report zero failures even though tasks failed, got ${JSON.stringify(decisionsResult)}`);
     });
+    // ── M16: migrate-16-caveman-addenda.js's own idempotency + prerequisite-
+    // refusal coverage (mirrors test-migrate-14-seam-tables.js's
+    // testIdempotentReapply/testPrereqMissing, and test-verify-20.js's A2/A3
+    // for migrate-15) ───────────────────────────────────────────────────────
+    await runCase('M16a', 'migrate-16-caveman-addenda.js is idempotent on re-apply', () => {
+      // DB_NAME already had migrate-16 applied once, inside
+      // gate.provisionSchema() at the top of this file — a second direct
+      // apply must still exit 0 / PASS cleanly.
+      const r = spawnScript(MIGRATE16_PATH, ['--db', DB_NAME]);
+      assert.strictEqual(r.status, 0, `expected idempotent re-apply to exit 0, got ${r.status}. stdout=${r.stdout} stderr=${r.stderr}`);
+      assert.ok(/MIGRATION_RESULT: PASS/.test(r.stdout), `expected PASS on re-apply. stdout=${r.stdout}`);
+      assert.ok(/authoring_mode grandfather \(no default\): PASS/.test(r.stdout), `expected the grandfather check to still PASS on re-apply. stdout=${r.stdout}`);
+    });
+
+    await runCase('M16b', 'migrate-16-caveman-addenda.js refuses when its prerequisite (assertions table) is missing, naming migrate-01-canonical-db.js as the fix', () => {
+      // DB_PREREQ is created empty (no migrate-01 ever run against it) — the
+      // `assertions` table genuinely does not exist, exercising
+      // checkPrerequisiteTables()'s refusal branch directly, same shape as
+      // migrate-14's own testPrereqMissing (missing prerequisite table(s),
+      // the missing table named, the fix script named).
+      const r = spawnScript(MIGRATE16_PATH, ['--db', DB_PREREQ]);
+      assert.strictEqual(r.status, 1, `expected exit 1, got ${r.status}. stdout=${r.stdout} stderr=${r.stderr}`);
+      assert.ok(/missing prerequisite table\(s\)/.test(r.stderr), `expected a prerequisite refusal. stderr=${r.stderr}`);
+      assert.ok(/assertions/.test(r.stderr), `expected the missing table named. stderr=${r.stderr}`);
+      assert.ok(/migrate-01-canonical-db\.js/.test(r.stderr), `expected migrate-01 named as the fix. stderr=${r.stderr}`);
+    });
   } finally {
     await client.end();
     await gate.dropScratchDb(DB_NAME);
+    await gate.dropScratchDb(DB_PREREQ);
   }
 
   console.log('');

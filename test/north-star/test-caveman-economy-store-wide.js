@@ -72,16 +72,56 @@ const lint = require('../../scripts/lib/caveman-lint');
 
 const MANIFEST_PATH = path.resolve(__dirname, '..', '..', 'scripts', 'migrations', 'caveman-columns.json');
 
-/** Load + parse the K-9 manifest. Throws loudly if missing/malformed — never
- * silently treated as "no columns to check" (that would defeat K-8/K-9). */
-function loadManifest() {
-  if (!fs.existsSync(MANIFEST_PATH)) {
-    throw new Error(`caveman-columns.json manifest not found at ${MANIFEST_PATH} — the store-wide gate has nothing to check against.`);
+// K-9's total classification is EXACTLY these four values — nothing else is
+// ever a valid `class`. A hand-edited, 190+-entry JSON manifest is exactly
+// where a typo eventually happens (independent review reproduced this: a
+// corrupted class value silently fell through scanTable()'s `!== 'exempt-
+// not-model-authored'` branch and checkCell()'s generic authoring-mode-
+// column logic, producing a silent RESULT: PASS). Validated once here, in
+// loadManifest(), so every caller — run(), checkCompleteness(), scanTable(),
+// the CLI, and every test — gets the same loud refusal for free; never a
+// second place this enum could drift out of sync.
+const VALID_CLASSES = new Set([
+  'checked-caveman',
+  'checked-verbose-exempt',
+  'mandatory-caveman-no-column',
+  'exempt-not-model-authored',
+]);
+
+/** Load + parse the K-9 manifest. Throws loudly if missing/malformed, OR if
+ * any column entry's `class` is outside the K-9 enum — never silently
+ * treated as "no columns to check" or silently downgraded to generic
+ * checked-caveman-ish handling (that would defeat K-8/K-9's total-
+ * classification guarantee).
+ *
+ * @param {string} [manifestPath] - override for tests only (a corrupted
+ *   temp-file copy); production callers always use the default MANIFEST_PATH.
+ */
+function loadManifest(manifestPath = MANIFEST_PATH) {
+  if (!fs.existsSync(manifestPath)) {
+    throw new Error(`caveman-columns.json manifest not found at ${manifestPath} — the store-wide gate has nothing to check against.`);
   }
-  const manifest = JSON.parse(fs.readFileSync(MANIFEST_PATH, 'utf8'));
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   if (!manifest || typeof manifest !== 'object' || !manifest.tables) {
-    throw new Error(`caveman-columns.json at ${MANIFEST_PATH} is malformed (missing top-level "tables" key).`);
+    throw new Error(`caveman-columns.json at ${manifestPath} is malformed (missing top-level "tables" key).`);
   }
+
+  const badEntries = [];
+  for (const [table, def] of Object.entries(manifest.tables)) {
+    for (const [col, colDef] of Object.entries((def && def.columns) || {})) {
+      const cls = colDef && colDef.class;
+      if (!VALID_CLASSES.has(cls)) {
+        badEntries.push(`${table}.${col} (class=${JSON.stringify(cls)})`);
+      }
+    }
+  }
+  if (badEntries.length > 0) {
+    throw new Error(
+      `${manifestPath}: ${badEntries.length} column entr${badEntries.length === 1 ? 'y has' : 'ies have'} a "class" value ` +
+      `outside the K-9 total-classification enum (valid: ${[...VALID_CLASSES].join(' | ')}): ${badEntries.join(', ')}`
+    );
+  }
+
   return manifest;
 }
 
@@ -405,4 +445,5 @@ module.exports = {
   provisionSchema,
   dropScratchDb,
   MANIFEST_PATH,
+  VALID_CLASSES,
 };
