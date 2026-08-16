@@ -14,18 +14,35 @@
  * root (never a real ~/.claude/projects tree), unconditional cleanup.
  *
  * Covers:
- *   - Pure unit tests (no DB): findCwdFromTranscripts (zero-transcript /
- *     no-cwd-field / cwd-found), resolveProjectIdForDir (real marker via
- *     project-marker.js, unmapped reasons), buildProjectDirIndex
- *     (memory/-subdir-presence as the total classification, never a
- *     name-shape check), resolveDbMapping (winner-directory heuristic,
- *     deterministic tie-break, unique-fallback, ambiguous -> unmapped),
- *     classifyDatabase's unreachable branch.
+ *   - Pure unit tests (no DB): findCwdsFromTranscripts (zero-transcript /
+ *     no-cwd-field / cwd(s)-found / trailing-slash dedup), resolveProjectIdForDir
+ *     (real marker via project-marker.js, unmapped reasons, root-based
+ *     divergence classification — see the two field-finding regressions
+ *     below), buildProjectDirIndex (memory/-subdir-presence as the total
+ *     classification, never a name-shape check), resolveDbMapping
+ *     (winner-directory heuristic, deterministic tie-break, unique-fallback,
+ *     ambiguous -> unmapped), classifyDatabase's unreachable branch.
+ *   - FIELD-FINDING REGRESSIONS: "worktree-cwd-resolves-same-project"
+ *     (second round) — transcripts carrying a repo root cwd AND a
+ *     `<repo>/.claude/worktrees/agent-x` cwd (the real-world norm for
+ *     worktree agent sessions) resolve cleanly to the ONE project both
+ *     paths' marker walk-up converges on, raw-cwd variety irrelevant;
+ *     "two-distinct-marker-roots-unmapped" (second round) — transcripts
+ *     whose cwds resolve to two GENUINELY different marker roots are
+ *     (correctly) unmapped with the divergence reason; and
+ *     "mixed-resolvable-cwds-unmapped" (third round, the reviewer's exact
+ *     repro) — [rootX-no-marker, rootY-with-marker] is unmapped, NEVER
+ *     silently attributed to Y alone, because findProjectRootByMarker
+ *     never checks the start path for existence (only each candidate
+ *     ancestor's marker file), so an unresolvable cwd can never be a
+ *     benign deleted-worktree artifact — it always means no marker exists
+ *     anywhere in that ancestry.
  *   - Discovery: holds-corpus / no-corpus classification against real
  *     scratch databases; --discover-only mutates nothing.
  *   - Happy path: a single corpus DB backfilled from a matching fixture
  *     project directory — real project id applied, NOT NULL applied,
- *     manifest slice written to the bookkeeping target.
+ *     manifest slice written to the bookkeeping target, and a pre-mutation
+ *     backup dump written for every corpus table before any ALTER/backfill.
  *   - Cross-DB same-filename disambiguation: two corpus DBs, two fixture
  *     project directories that BOTH contain a file with the identical
  *     basename — each DB's winner-directory heuristic resolves it to its
@@ -34,6 +51,12 @@
  *   - Orphan bucket: a source_file with no filesystem match anywhere ->
  *     'unmapped-orphan-memory-entry', migrates normally, never blocks the
  *     NOT NULL step for the rest of the table.
+ *   - Orphan RE-ATTRIBUTION (field finding, second round): once the
+ *     source project's directory later appears on disk, a re-run
+ *     re-attributes a row this script itself previously orphaned (the
+ *     placeholder is this script's own sentinel, safely distinguishable
+ *     from a manual correction) and the manifest's orphan slice shrinks
+ *     accordingly.
  *   - Idempotent re-run: second invocation touches zero additional rows,
  *     manifest slices stable (no duplication, no orphaned leftover slice).
  *   - Rollback: drops project_id from the corpus DB + clears this DB's
@@ -167,8 +190,15 @@ async function setupTargetSchema(dbName) {
   if (r1.status !== 0) throw new Error(`migrate-01 fixture setup failed: status=${r1.status} stderr=${r1.stderr}`);
 }
 
+// Every invocation is pointed at a scratch --backup-dir (never the real,
+// gitignored scripts/migrations/backups/ this repo's own runs write to) --
+// a caller needing a DIFFERENT backup dir simply passes its own
+// --backup-dir later in argv, which migrate-03's own parseArgs takes
+// last-flag-wins on (mirrors test-migrate-02-decisions.js's
+// EXAMPLE_ROUTING_MAP_PATH convention).
+let BACKUP_DIR;
 function runMigrate03(args, extraEnv = {}, timeoutMs = 30000) {
-  return spawnSync(process.execPath, [MIGRATE03_PATH, '--db-prefix', DB_PREFIX, ...args], {
+  return spawnSync(process.execPath, [MIGRATE03_PATH, '--db-prefix', DB_PREFIX, '--backup-dir', BACKUP_DIR, ...args], {
     cwd: PROJECT_ROOT,
     env: { ...process.env, ...extraEnv },
     encoding: 'utf8',
@@ -241,81 +271,123 @@ const CREATED_DBS = [DB_TARGET, DB_CORPUS_HAPPY, DB_CORPUS_ORPHAN, DB_CORPUS_A, 
 let fixtureBase;
 
 async function main() {
+  BACKUP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-backups-'));
+
   // ── Group 1: pure unit tests (no DB) ────────────────────────────────
 
-  await run('U1', 'findCwdFromTranscripts: zero transcript files -> null + reason', async () => {
+  await run('U1', 'findCwdsFromTranscripts: zero transcript files -> [] + reason', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-u1-'));
-    const r = migrate03.findCwdFromTranscripts(dir);
-    assert(r.cwd === null, 'expected null cwd');
+    const r = migrate03.findCwdsFromTranscripts(dir);
+    assert(Array.isArray(r.cwds) && r.cwds.length === 0, 'expected empty cwds array');
     assert(/zero transcript files/.test(r.reason), `expected zero-transcript reason, got: ${r.reason}`);
   });
 
-  await run('U2', 'findCwdFromTranscripts: transcripts present but none carry a cwd field -> null + reason', async () => {
+  await run('U2', 'findCwdsFromTranscripts: transcripts present but none carry a cwd field -> [] + reason', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-u2-'));
     fs.writeFileSync(path.join(dir, 'a.jsonl'), JSON.stringify({ type: 'mode', mode: 'normal' }) + '\n', 'utf8');
-    const r = migrate03.findCwdFromTranscripts(dir);
-    assert(r.cwd === null, 'expected null cwd');
+    const r = migrate03.findCwdsFromTranscripts(dir);
+    assert(r.cwds.length === 0, 'expected empty cwds array');
     assert(/none carried a "cwd" field/.test(r.reason), `unexpected reason: ${r.reason}`);
   });
 
-  await run('U3', 'findCwdFromTranscripts: a line carrying a string cwd field is found', async () => {
+  await run('U3', 'findCwdsFromTranscripts: a line carrying a string cwd field is found', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-u3-'));
     fs.writeFileSync(path.join(dir, 'a.jsonl'), [
       JSON.stringify({ type: 'mode' }),
       JSON.stringify({ type: 'system', cwd: '/some/real/path' }),
     ].join('\n') + '\n', 'utf8');
-    const r = migrate03.findCwdFromTranscripts(dir);
-    assert(r.cwd === '/some/real/path', `expected /some/real/path, got ${r.cwd}`);
+    const r = migrate03.findCwdsFromTranscripts(dir);
+    assert(r.cwds.length === 1 && r.cwds[0] === '/some/real/path', `expected ["/some/real/path"], got ${JSON.stringify(r.cwds)}`);
     assert(r.reason === null, 'expected null reason on success');
   });
 
-  await run('two-transcripts-two-cwds', 'findCwdFromTranscripts: two transcripts disagreeing on cwd -> unmapped with divergent-transcript-cwds reason, NEVER the first one scanned (post-review fix)', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-divergent-'));
-    // Filename-sorted so "a.jsonl" is scanned before "b.jsonl" -- proves
-    // the fix does not silently resolve to whichever transcript sorts
-    // first (the exact bug an independent reviewer reproduced).
+  await run('two-distinct-raw-cwds-collected', 'findCwdsFromTranscripts: two transcripts with different raw cwd values are BOTH collected -- multiple distinct raw cwds is the norm, never itself an unmapped verdict at this layer (post-review, second round)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-two-raw-'));
     fs.writeFileSync(path.join(dir, 'a.jsonl'), JSON.stringify({ type: 'system', cwd: '/path/one' }) + '\n', 'utf8');
     fs.writeFileSync(path.join(dir, 'b.jsonl'), JSON.stringify({ type: 'system', cwd: '/path/two' }) + '\n', 'utf8');
-    const r = migrate03.findCwdFromTranscripts(dir);
-    assert(r.cwd === null, `expected null cwd on divergence, got ${r.cwd}`);
-    assert(/divergent-transcript-cwds: 2 distinct values/.test(r.reason), `expected the divergent-transcript-cwds reason with a count, got: ${r.reason}`);
+    const r = migrate03.findCwdsFromTranscripts(dir);
+    assert(r.reason === null, `expected no reason (collection never itself judges divergence), got: ${r.reason}`);
+    assert(r.cwds.length === 2 && r.cwds.includes('/path/one') && r.cwds.includes('/path/two'), `expected both raw values collected, got ${JSON.stringify(r.cwds)}`);
   });
 
-  await run('two-transcripts-same-cwd', 'findCwdFromTranscripts: two transcripts agreeing on cwd -> resolves cleanly (identical values across many transcripts remain a clean resolve)', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-agree-'));
-    fs.writeFileSync(path.join(dir, 'a.jsonl'), JSON.stringify({ type: 'system', cwd: '/path/same' }) + '\n', 'utf8');
-    fs.writeFileSync(path.join(dir, 'b.jsonl'), JSON.stringify({ type: 'system', cwd: '/path/same' }) + '\n', 'utf8');
-    const r = migrate03.findCwdFromTranscripts(dir);
-    assert(r.cwd === '/path/same', `expected /path/same, got ${r.cwd}`);
-    assert(r.reason === null, 'expected null reason on a clean agreeing resolve');
-  });
-
-  await run('U3c', 'findCwdFromTranscripts: a trailing-slash-only difference between two transcripts is NOT treated as divergence (light canonicalization, cwdCompareKey)', async () => {
+  await run('U3c', 'findCwdsFromTranscripts: a trailing-slash-only difference between two transcripts dedupes to ONE raw value (light canonicalization, cwdCompareKey)', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-trailing-slash-'));
     fs.writeFileSync(path.join(dir, 'a.jsonl'), JSON.stringify({ type: 'system', cwd: '/path/same' }) + '\n', 'utf8');
     fs.writeFileSync(path.join(dir, 'b.jsonl'), JSON.stringify({ type: 'system', cwd: '/path/same/' }) + '\n', 'utf8');
-    const r = migrate03.findCwdFromTranscripts(dir);
-    assert(r.cwd !== null, `expected a clean resolve despite the trailing-slash difference, got reason: ${r.reason}`);
-    assert(r.reason === null, 'expected null reason');
+    const r = migrate03.findCwdsFromTranscripts(dir);
+    assert(r.cwds.length === 1, `expected trailing-slash dedup to 1 distinct raw value, got ${JSON.stringify(r.cwds)}`);
   });
 
-  await run('U3d', 'findCwdFromTranscripts: three transcripts with two distinct values reports the correct distinct count', async () => {
+  await run('U3d', 'findCwdsFromTranscripts: three transcripts (two agreeing, one different) collects exactly two distinct raw values', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-three-'));
     fs.writeFileSync(path.join(dir, 'a.jsonl'), JSON.stringify({ type: 'system', cwd: '/path/one' }) + '\n', 'utf8');
     fs.writeFileSync(path.join(dir, 'b.jsonl'), JSON.stringify({ type: 'system', cwd: '/path/one' }) + '\n', 'utf8');
     fs.writeFileSync(path.join(dir, 'c.jsonl'), JSON.stringify({ type: 'system', cwd: '/path/two' }) + '\n', 'utf8');
-    const r = migrate03.findCwdFromTranscripts(dir);
-    assert(r.cwd === null, 'expected unmapped');
-    assert(/divergent-transcript-cwds: 2 distinct values/.test(r.reason), `expected 2 distinct values (not 3), got: ${r.reason}`);
+    const r = migrate03.findCwdsFromTranscripts(dir);
+    assert(r.cwds.length === 2, `expected 2 distinct raw values (not 3), got ${JSON.stringify(r.cwds)}`);
   });
 
-  await run('U3e', 'resolveProjectIdForDir: divergent transcripts route to the unmapped bucket, never a guessed marker resolution', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-divergent-dir-'));
-    fs.writeFileSync(path.join(dir, 'a.jsonl'), JSON.stringify({ cwd: '/path/one' }) + '\n', 'utf8');
-    fs.writeFileSync(path.join(dir, 'b.jsonl'), JSON.stringify({ cwd: '/path/two' }) + '\n', 'utf8');
+  await run('U3e', 'resolveProjectIdForDir: multiple distinct raw cwds, NONE of which resolve to any marker root -> unmapped ("no project marker found"), never a guess', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-no-marker-multi-'));
+    fs.writeFileSync(path.join(dir, 'a.jsonl'), JSON.stringify({ cwd: '/path/one/nowhere' }) + '\n', 'utf8');
+    fs.writeFileSync(path.join(dir, 'b.jsonl'), JSON.stringify({ cwd: '/path/two/nowhere' }) + '\n', 'utf8');
     const r = migrate03.resolveProjectIdForDir(dir);
-    assert(r.projectId === null, 'expected null project id on divergent transcripts');
-    assert(/divergent-transcript-cwds/.test(r.unmappedReason), `expected the divergent reason propagated, got: ${r.unmappedReason}`);
+    assert(r.projectId === null, 'expected null project id when nothing resolves to a marker');
+    assert(/no project marker found/.test(r.unmappedReason), `expected the no-marker reason, got: ${r.unmappedReason}`);
+  });
+
+  await run('worktree-cwd-resolves-same-project', 'resolveProjectIdForDir: transcripts carrying [repo-root, repo-root/.claude/worktrees/agent-x] resolve cleanly to the ONE project both converge on -- field finding, second round (previously over-orphaned nearly the entire real estate)', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-worktree-'));
+    const repoRoot = path.join(base, 'repo');
+    fs.mkdirSync(repoRoot, { recursive: true });
+    const { uuid } = projectMarker.writeMarker(repoRoot);
+    const worktreeCwd = path.join(repoRoot, '.claude', 'worktrees', 'agent-x');
+    fs.mkdirSync(worktreeCwd, { recursive: true }); // no marker of its own -- walk-up finds repoRoot's
+    const dirPath = path.join(base, 'encoded-cwd-dir');
+    fs.mkdirSync(dirPath, { recursive: true });
+    fs.writeFileSync(path.join(dirPath, 'a.jsonl'), JSON.stringify({ cwd: repoRoot }) + '\n', 'utf8');
+    fs.writeFileSync(path.join(dirPath, 'b.jsonl'), JSON.stringify({ cwd: worktreeCwd }) + '\n', 'utf8');
+    const r = migrate03.resolveProjectIdForDir(dirPath);
+    assert(r.projectId === uuid, `expected ${uuid} (raw-cwd variety irrelevant once both converge on one root), got ${r.projectId} (reason: ${r.unmappedReason})`);
+    assert(r.unmappedReason === null, `expected a clean resolve, got reason: ${r.unmappedReason}`);
+  });
+
+  await run('two-distinct-marker-roots-unmapped', 'resolveProjectIdForDir: transcripts resolving to TWO genuinely different marker roots are unmapped with the divergence reason', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-two-roots-'));
+    const rootOne = path.join(base, 'project-one');
+    const rootTwo = path.join(base, 'project-two');
+    fs.mkdirSync(rootOne, { recursive: true });
+    fs.mkdirSync(rootTwo, { recursive: true });
+    projectMarker.writeMarker(rootOne);
+    projectMarker.writeMarker(rootTwo);
+    const dirPath = path.join(base, 'encoded-cwd-dir');
+    fs.mkdirSync(dirPath, { recursive: true });
+    fs.writeFileSync(path.join(dirPath, 'a.jsonl'), JSON.stringify({ cwd: rootOne }) + '\n', 'utf8');
+    fs.writeFileSync(path.join(dirPath, 'b.jsonl'), JSON.stringify({ cwd: rootTwo }) + '\n', 'utf8');
+    const r = migrate03.resolveProjectIdForDir(dirPath);
+    assert(r.projectId === null, 'expected null project id on genuine root divergence');
+    assert(/divergent-transcript-cwds: 2 distinct resolved project root/.test(r.unmappedReason), `expected the resolved-root divergence reason, got: ${r.unmappedReason}`);
+  });
+
+  await run('mixed-resolvable-cwds-unmapped', 'resolveProjectIdForDir: [rootX-no-marker, rootY-with-marker] -> unmapped with mixed-resolvable-cwds (reviewer\'s exact repro, third round): an unresolvable cwd is NEVER a benign deleted-worktree artifact (findProjectRootByMarker never checks the start path for existence), so it must never be silently absorbed into whichever side happened to resolve', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-mixed-'));
+    // Project Y: real, has a live marker.
+    const rootY = path.join(base, 'project-y');
+    fs.mkdirSync(rootY, { recursive: true });
+    const { uuid: uuidY } = projectMarker.writeMarker(rootY);
+    // Project X: simulates a checkout whose marker was deleted/never
+    // restored, or an alien path -- deliberately NO marker written here.
+    const rootX = path.join(base, 'project-x-no-marker');
+    fs.mkdirSync(rootX, { recursive: true });
+
+    const dirPath = path.join(base, 'encoded-cwd-dir');
+    fs.mkdirSync(dirPath, { recursive: true });
+    fs.writeFileSync(path.join(dirPath, 'a.jsonl'), JSON.stringify({ cwd: rootX }) + '\n', 'utf8');
+    fs.writeFileSync(path.join(dirPath, 'b.jsonl'), JSON.stringify({ cwd: rootY }) + '\n', 'utf8');
+
+    const r = migrate03.resolveProjectIdForDir(dirPath);
+    assert(r.projectId === null, `expected null project id (NEVER silently attributed to Y=${uuidY}), got ${r.projectId}`);
+    assert(/mixed-resolvable-cwds: 1 resolved to 1 root\(s\), 1 unresolvable/.test(r.unmappedReason), `expected the mixed-resolvable-cwds reason, got: ${r.unmappedReason}`);
   });
 
   await run('U4', 'resolveProjectIdForDir: real marker resolved via cwd walk-up (project-marker.js, never decoded)', async () => {
@@ -508,6 +580,18 @@ async function main() {
     } finally { await client.end(); }
   });
 
+  await run('I5b', 'backup: a timestamped pre-mutation JSON dump was written for every corpus table before any ALTER/backfill (§6.1(d) step 1, field finding, second round)', async () => {
+    const files = fs.readdirSync(BACKUP_DIR);
+    const entriesBackup = files.find((f) => f.startsWith(`${DB_CORPUS_HAPPY}-memory_entries-backup-`) && f.endsWith('.json'));
+    const chunksBackup = files.find((f) => f.startsWith(`${DB_CORPUS_HAPPY}-memory_entry_chunks-backup-`) && f.endsWith('.json'));
+    assert(entriesBackup, `expected a memory_entries backup file for ${DB_CORPUS_HAPPY}, found: ${JSON.stringify(files)}`);
+    assert(chunksBackup, `expected a memory_entry_chunks backup file for ${DB_CORPUS_HAPPY} (hasChunks=true), found: ${JSON.stringify(files)}`);
+    const payload = JSON.parse(fs.readFileSync(path.join(BACKUP_DIR, entriesBackup), 'utf8'));
+    assert(payload.source_db === DB_CORPUS_HAPPY, `expected source_db=${DB_CORPUS_HAPPY}, got ${payload.source_db}`);
+    assert(payload.source_table === 'memory_entries', `expected source_table=memory_entries, got ${payload.source_table}`);
+    assert(Array.isArray(payload.rows) && payload.rows.length === payload.row_count, 'expected row_count to match the dumped rows array length');
+  });
+
   await run('I6', 'orphan bucket: a source_file absent from every candidate directory migrates as unmapped-orphan-memory-entry, never blocks NOT NULL', async () => {
     const r = runMigrate03(['--db', DB_TARGET], { HANDOFF_BASE_DIR: fixtureBase });
     assert(r.status === 0, `expected exit 0, got ${r.status}: ${r.stderr}`);
@@ -520,6 +604,35 @@ async function main() {
       );
       assert(notNullCheck[0].is_nullable === 'NO', 'an all-orphan table must still reach SET NOT NULL — the orphan placeholder is a real value, not a NULL');
     } finally { await client.end(); }
+  });
+
+  await run('I6b', 'orphan RE-ATTRIBUTION: once the source project directory appears on disk, a re-run reclassifies the row this script itself orphaned, and the manifest orphan slice shrinks to zero (field finding, second round)', async () => {
+    // The source project for DB_CORPUS_ORPHAN's row ("memory/long-deleted-file.md")
+    // did not exist anywhere in the fixture tree during I6 -- it "recovers"
+    // here, simulating either the directory reappearing or a resolver fix.
+    const ckRecovered = mintCheckout(fixtureBase, 'ck-recovered');
+    writeProjectDir(fixtureBase, 'dir-recovered', {
+      checkoutRoot: ckRecovered.root,
+      memoryFiles: { 'long-deleted-file.md': 'recovered content' },
+    });
+
+    const r = runMigrate03(['--db', DB_TARGET], { HANDOFF_BASE_DIR: fixtureBase });
+    assert(r.status === 0, `expected exit 0, got ${r.status}\nstdout:${r.stdout}\nstderr:${r.stderr}`);
+
+    const client = await pgConnect(DB_CORPUS_ORPHAN);
+    try {
+      const { rows } = await client.query(`SELECT project_id FROM memory_entries WHERE source_file='memory/long-deleted-file.md'`);
+      assert(rows.length === 1 && rows[0].project_id === ckRecovered.uuid, `expected re-attribution to ${ckRecovered.uuid}, got ${JSON.stringify(rows)}`);
+    } finally { await client.end(); }
+
+    const tgtClient = await pgConnect(DB_TARGET);
+    try {
+      const slices = await getManifestSlices(tgtClient, DB_CORPUS_ORPHAN, 'memory_entries');
+      const orphanSlice = slices.find((s) => s.project_id_or_null === migrate03.ORPHAN_PROJECT_ID);
+      assert(!orphanSlice, `expected the orphan slice to have shrunk away entirely (0 rows -> deleted by orphan reconciliation), still present: ${JSON.stringify(orphanSlice)}`);
+      const recoveredSlice = slices.find((s) => s.project_id_or_null === ckRecovered.uuid);
+      assert(recoveredSlice && Number(recoveredSlice.row_count) === 1, `expected a new slice for ${ckRecovered.uuid} with row_count=1, got ${JSON.stringify(slices)}`);
+    } finally { await tgtClient.end(); }
   });
 
   await run('I7', 'idempotent re-run: zero additional rows touched, manifest slice unchanged, no orphaned leftover slice', async () => {
@@ -608,6 +721,7 @@ async function main() {
 async function cleanup() {
   for (const db of CREATED_DBS) await dropDb(db);
   if (fixtureBase) { try { fs.rmSync(fixtureBase, { recursive: true, force: true }); } catch (_) {} }
+  if (BACKUP_DIR) { try { fs.rmSync(BACKUP_DIR, { recursive: true, force: true }); } catch (_) {} }
 }
 
 main()

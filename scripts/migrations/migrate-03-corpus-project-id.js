@@ -41,28 +41,52 @@
  *      subdirectory, resolves the REAL project id by (a) scanning EVERY
  *      line of EVERY one of that directory's own `*.jsonl` session
  *      transcripts for a string `cwd` field — never stopping at the first
- *      hit, and refusing (never guessing) if more than one DISTINCT `cwd`
- *      value is found across those transcripts (post-review fix: a
- *      directory whose transcripts genuinely disagree, e.g. a moved/
- *      renamed checkout later reused under the same encoded-cwd directory
- *      name, must never resolve confidently to whichever transcript
- *      happened to sort first) — then (b) walking up from the single
- *      agreed-upon `cwd` via `project-marker.js`'s
- *      `findProjectRootByMarker` (imported, NEVER re-implemented) to the
- *      nearest `.memory-engine` (or legacy `.claude-memory`) marker and
- *      reading its UUID. The encoded-cwd DIRECTORY NAME ITSELF IS NEVER
+ *      hit, collecting every DISTINCT raw value found (multiple distinct
+ *      raw cwds are the NORM, not an anomaly: a worktree agent session's
+ *      cwd and its parent checkout's cwd both legitimately appear in the
+ *      same project's transcripts) — then (b) resolving EACH distinct raw
+ *      cwd through `project-marker.js`'s `findProjectRootByMarker`
+ *      (imported, NEVER re-implemented) FIRST, and classifying on the SET
+ *      OF RESOLVED PROJECT ROOTS, never on raw cwd string equality
+ *      (field-finding fix, second round: judging on raw strings treated
+ *      the ordinary worktree case as a hard failure and over-orphaned
+ *      nearly an entire real estate on first production use). Exactly one
+ *      distinct resolved root across every distinct raw cwd -> resolved,
+ *      raw-cwd variety irrelevant; two or more distinct resolved roots ->
+ *      unmapped ("divergent-transcript-cwds: N distinct resolved project
+ *      root(s)") — a directory whose transcripts genuinely point at two or
+ *      more DIFFERENT projects, as opposed to one project's checkout plus
+ *      its own worktrees. A MIX of at least one resolving cwd and at least
+ *      one NON-resolving cwd is ALSO unmapped ("mixed-resolvable-cwds: N
+ *      resolved to <root-count> root(s), M unresolvable") — field-finding
+ *      fix, third round: `findProjectRootByMarker` never checks the START
+ *      path for existence (only each candidate ancestor's marker file), so
+ *      a deleted-worktree cwd still resolves fine; an UNRESOLVABLE cwd
+ *      therefore can never be explained away as a benign deleted-worktree
+ *      artifact — it always means no marker exists anywhere in that path's
+ *      ancestry (an alien path, or a genuinely lost second project), and
+ *      silently attributing the directory to whichever cwd happened to
+ *      resolve is unsafe. The encoded-cwd DIRECTORY NAME ITSELF IS NEVER
  *      DECODED (D3-1: `encodeCwd` is lossy/non-invertible — "my.project",
  *      "my-project", and "my project" all encode identically). A directory
  *      with zero transcript files, zero transcript lines carrying a `cwd`
- *      field, divergent `cwd` values across its transcripts, no marker
- *      found by walking up from the agreed `cwd`, or a marker read that
- *      throws (project-marker's documented dual-marker HARD ERROR) is
- *      UNMAPPED — its `memory/*.md` filenames are simply not offered as
- *      candidates to any DB, logged with the specific reason, never
- *      guessed.
+ *      field, every resolved cwd resolving to no marker root, a mix of
+ *      resolving and non-resolving cwds, divergent resolved roots, or a
+ *      marker read that throws (project-marker's documented dual-marker
+ *      HARD ERROR) is UNMAPPED — its `memory/*.md` filenames are simply
+ *      not offered as candidates to any DB, logged with the specific
+ *      reason, never guessed.
  *
  *   3. PER-DATABASE BACKFILL (one independent unit of work per corpus DB —
  *      a failure in one DB never blocks another):
+ *        0. BACKUP (read-only, before ANY mutation — field finding: the
+ *           §6.1(d) step 1 house backup pattern, mirroring
+ *           migrate-02-decisions.js's backupSourceTable(), was missing
+ *           from the first authored version): dumps every row of this
+ *           DB's `memory_entries` (and `memory_entry_chunks`, if present)
+ *           to a timestamped JSON file under `--backup-dir` (default
+ *           `scripts/migrations/backups/`, gitignored — real corpus
+ *           content), unconditionally, every run.
  *        a. Bundle the additive, idempotent §5.2 SQL: nullable
  *           `project_id TEXT` on both corpus tables (chunks only if that
  *           table exists in this DB) + both `_project_idx` indexes.
@@ -73,11 +97,19 @@
  *           `resolveDbMapping` below for the winner-directory heuristic —
  *           this is what makes the persisted map genuinely keyed by
  *           (source_db, source_file), not source_file alone).
- *        d. Backfill every `memory_entries` row `WHERE project_id IS
- *           NULL` in batches of `--batch-size` (D3-8) — a row whose
- *           `source_file` has no mapped project becomes
- *           `unmapped-orphan-memory-entry` (D3-11: migrates normally,
- *           never dropped, never blocks the rest of the table).
+ *        d. Backfill every `memory_entries` row `WHERE project_id IS NULL
+ *           OR project_id = 'unmapped-orphan-memory-entry'` in batches of
+ *           `--batch-size` (D3-8) — a row whose `source_file` has no
+ *           mapped project becomes `unmapped-orphan-memory-entry` (D3-11:
+ *           migrates normally, never dropped, never blocks the rest of the
+ *           table). The `OR project_id = '...orphan...'` half (field
+ *           finding, second round) is what makes a re-run able to
+ *           re-attribute a row this script itself previously orphaned —
+ *           the orphan placeholder is this script's OWN sentinel value,
+ *           by construction never a value a manual correction would ever
+ *           write, so widening the re-run-eligible set to include it can
+ *           never clobber a manual correction (D3-8's protection is
+ *           preserved for every OTHER non-NULL value).
  *        e. Backfill `memory_entry_chunks.project_id` from its parent
  *           `memory_entries` row via `entry_id` (D3-6: intra-DB only, a
  *           plain FK join, never an id-remap candidate) `WHERE
@@ -88,7 +120,11 @@
  *           gate loudly and this DB's `SET NOT NULL` step is skipped
  *           (documented quiescence precondition) — its nullable backfill
  *           already committed and is safe to leave in place; re-run once
- *           quiescent.
+ *           quiescent. (This gate only ever cares about literal NULLs —
+ *           an orphan-placeholder row already satisfies NOT NULL and is
+ *           never itself a gate blocker; re-attribution is a separate,
+ *           always-attempted reclassification pass, not a precondition of
+ *           SET NOT NULL.)
  *        g. `ALTER COLUMN project_id SET NOT NULL` on each corpus table
  *           that passed its own gate.
  *        h. Manifest bookkeeping (D3-11): one `migration_manifest` (+
@@ -101,7 +137,9 @@
  *           anything migrate-01's `classifyTarget` refuses). Recomputed
  *           from the table's FULL current state every run (not just rows
  *           touched this run), so a re-run against an already-migrated DB
- *           still produces an accurate, idempotent manifest.
+ *           still produces an accurate, idempotent manifest — including
+ *           the orphan slice correctly SHRINKING (or disappearing) as
+ *           step (d)'s re-attribution moves rows out of it on a later run.
  *
  *   4. The built map is ALSO written to `--map-out` (default:
  *      `scripts/migrations/memory-entry-project-map.json`, gitignored —
@@ -151,6 +189,7 @@ const { findProjectRootByMarker, readMarker } = require('../lib/project-marker')
 
 const MIGRATIONS_DIR = __dirname;
 const DEFAULT_MAP_OUT_PATH = path.join(MIGRATIONS_DIR, 'memory-entry-project-map.json');
+const DEFAULT_BACKUP_DIR = path.join(MIGRATIONS_DIR, 'backups'); // already gitignored -- shared with migrate-02's backups
 const ORPHAN_PROJECT_ID = 'unmapped-orphan-memory-entry';
 const DEFAULT_BATCH_SIZE = 500;
 
@@ -169,7 +208,8 @@ class UsageError extends Error {}
 function parseArgs(argv) {
   const parsed = {
     db: null, dbPrefix: null, batchSize: DEFAULT_BATCH_SIZE,
-    mapOut: DEFAULT_MAP_OUT_PATH, discoverOnly: false, rollback: false, help: false,
+    mapOut: DEFAULT_MAP_OUT_PATH, backupDir: DEFAULT_BACKUP_DIR,
+    discoverOnly: false, rollback: false, help: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -181,6 +221,8 @@ function parseArgs(argv) {
     else if (a.startsWith('--batch-size=')) parsed.batchSize = parseInt(a.slice('--batch-size='.length), 10);
     else if (a === '--map-out') parsed.mapOut = argv[++i];
     else if (a.startsWith('--map-out=')) parsed.mapOut = a.slice('--map-out='.length);
+    else if (a === '--backup-dir') parsed.backupDir = argv[++i];
+    else if (a.startsWith('--backup-dir=')) parsed.backupDir = a.slice('--backup-dir='.length);
     else if (a === '--discover-only') parsed.discoverOnly = true;
     else if (a === '--rollback') parsed.rollback = true;
     else if (a === '--help' || a === '-h') parsed.help = true;
@@ -196,7 +238,7 @@ function printUsage() {
   console.log([
     'Usage: node scripts/migrations/migrate-03-corpus-project-id.js [--db <target>]',
     '         [--db-prefix <prefix>] [--batch-size <n>] [--map-out <path>]',
-    '         [--discover-only] [--rollback]',
+    '         [--backup-dir <path>] [--discover-only] [--rollback]',
     '',
     '  --db <name>          Bookkeeping target for migration_manifest rows (else',
     '                       MIGRATE_TARGET_DB env, else memory_manager_staging).',
@@ -211,6 +253,10 @@ function printUsage() {
     '  --map-out <path>     Where to write the built map audit artifact (default:',
     '                       scripts/migrations/memory-entry-project-map.json,',
     '                       gitignored -- never read back as input).',
+    '  --backup-dir <path>  Directory for the timestamped per-(DB, table) backup',
+    '                       dumps written before any mutation (default:',
+    '                       scripts/migrations/backups/, gitignored, shared with',
+    '                       migrate-02-decisions.js\'s backups).',
     '  --discover-only      Print the discovery classification and exit -- no',
     '                       database is altered.',
     '  --rollback           Drop project_id from every corpus DB found in',
@@ -300,18 +346,16 @@ function printClassification(classifications, dbPrefix) {
 // ─── MAP-BUILDING (D3-1/D3-2) ───────────────────────────────────────────────
 
 /**
- * Light canonicalization used ONLY to compare two `cwd` values for
- * agreement (never used to derive a project id — the resolved `cwd`
- * returned by findCwdFromTranscripts is always the raw, as-recorded
- * string). Deliberately NOT full separator normalization (backslash <->
- * forward-slash) and NOT case-folding — either would risk masking a REAL
- * divergence (e.g. a genuinely different drive-letter-cased mount, or a
- * case-sensitive POSIX path). Trims whitespace and strips exactly one
- * trailing path separator, so a purely representational difference
- * (trailing slash) does not manufacture a false "divergent" verdict, while
- * any other difference still counts as one. Friction (routing an
- * ambiguous case to the unmapped bucket) is always the safer default than
- * silently treating two representations as equal when they might not be.
+ * Light canonicalization used ONLY to DEDUPE raw `cwd` strings before
+ * resolving each one through findProjectRootByMarker (an efficiency/
+ * clarity aid, never a correctness dependency — path.resolve() inside
+ * findProjectRootByMarker already collapses a trailing-slash variant onto
+ * the identical resolved root regardless). Deliberately NOT full separator
+ * normalization (backslash <-> forward-slash) and NOT case-folding —
+ * either would risk masking a REAL difference (e.g. a genuinely different
+ * drive-letter-cased mount, or a case-sensitive POSIX path) before
+ * resolution ever gets a chance to prove the paths are (or are not) the
+ * same project root.
  */
 function cwdCompareKey(cwd) {
   return cwd.trim().replace(/[\\/]+$/, '');
@@ -319,31 +363,35 @@ function cwdCompareKey(cwd) {
 
 /**
  * Scan EVERY line of EVERY one of a directory's own *.jsonl session
- * transcripts for a string `cwd` field — never stop at the first hit
- * (post-review fix: an independent reviewer reproduced a silent confident
- * misattribution from two divergent transcripts in the same directory,
- * e.g. a moved/renamed checkout later reused under the same encoded-cwd
- * directory name — resolving from whichever transcript happened to sort
- * first is exactly the silent-misattribution failure mode D3-1's totality
- * posture forbids). Total classification of the result:
- *   - zero transcript files                              -> reason, cwd=null
- *   - N transcript files, none carry a `cwd` field        -> reason, cwd=null
- *   - every `cwd` field found agrees (via cwdCompareKey)   -> cwd, reason=null
- *   - two or more DISTINCT cwdCompareKey values found      -> reason
- *     ("divergent-transcript-cwds: N distinct values"), cwd=null — routed
- *     to the unmapped bucket exactly like the zero-transcript and
- *     dual-marker branches, never a guessed pick among the candidates.
+ * transcripts for a string `cwd` field, returning every DISTINCT raw cwd
+ * value found (deduped via cwdCompareKey) — never stops at the first hit.
+ *
+ * Deliberately does NOT judge divergence itself: multiple distinct raw cwd
+ * values in one directory's transcripts are the NORM, not an anomaly —
+ * worktree agent sessions legitimately log a worktree-specific cwd (e.g.
+ * `<repo>/.claude/worktrees/agent-x`) into the SAME project's transcripts
+ * alongside the main checkout's own cwd. Judging divergence on raw string
+ * equality (an earlier revision's fix) treated this ordinary case as a
+ * hard failure and over-orphaned an entire real estate on first
+ * production use. Divergence is judged one level up, in
+ * resolveProjectIdForDir, AFTER each distinct raw cwd has been resolved
+ * through findProjectRootByMarker — see that function's header comment.
+ *
+ * Total classification of the result:
+ *   - zero transcript files                          -> reason, cwds=[]
+ *   - N transcript files, none carry a `cwd` field    -> reason, cwds=[]
+ *   - one or more distinct cwd values found            -> cwds (1+), reason=null
  * Never guesses, never decodes the directory name itself.
  */
-function findCwdFromTranscripts(dirAbsPath) {
+function findCwdsFromTranscripts(dirAbsPath) {
   let jsonlFiles;
   try {
     jsonlFiles = fs.readdirSync(dirAbsPath).filter((f) => f.endsWith('.jsonl')).sort();
   } catch (err) {
-    return { cwd: null, reason: `could not list directory: ${err.message}` };
+    return { cwds: [], reason: `could not list directory: ${err.message}` };
   }
   if (jsonlFiles.length === 0) {
-    return { cwd: null, reason: 'zero transcript files (*.jsonl) in this directory' };
+    return { cwds: [], reason: 'zero transcript files (*.jsonl) in this directory' };
   }
   const distinctByKey = new Map(); // cwdCompareKey -> first-seen raw cwd value
   for (const fname of jsonlFiles) {
@@ -370,36 +418,111 @@ function findCwdFromTranscripts(dirAbsPath) {
     }
   }
   if (distinctByKey.size === 0) {
-    return { cwd: null, reason: `${jsonlFiles.length} transcript file(s) scanned, none carried a "cwd" field` };
+    return { cwds: [], reason: `${jsonlFiles.length} transcript file(s) scanned, none carried a "cwd" field` };
   }
-  if (distinctByKey.size > 1) {
-    return { cwd: null, reason: `divergent-transcript-cwds: ${distinctByKey.size} distinct values` };
-  }
-  return { cwd: distinctByKey.values().next().value, reason: null };
+  return { cwds: [...distinctByKey.values()], reason: null };
 }
 
 /**
- * D3-1: resolve the real project id for one ~/.claude/projects/<dir>
- * entry via its own transcripts' `cwd` field, then
- * findProjectRootByMarker(cwd) (imported, never re-implemented). A
- * dual-marker HARD ERROR thrown by findProjectRootByMarker/readMarker is
- * CAUGHT here and routed to the unmapped bucket with the error text --
- * never left to propagate and abort the whole run over one directory.
+ * D3-1 (post-review, second round — field finding from the first real
+ * production run): resolve the real project id for one
+ * ~/.claude/projects/<dir> entry by resolving EVERY distinct raw `cwd`
+ * value found in its own transcripts through findProjectRootByMarker
+ * FIRST (imported, never re-implemented), then classifying on the SET OF
+ * RESOLVED PROJECT ROOTS — never on raw cwd string equality. Divergent raw
+ * cwds are the norm (a worktree agent session's cwd and its parent
+ * checkout's cwd both appear in the same project's transcripts, and both
+ * legitimately resolve to the identical marker root by walking up) — the
+ * first-round fix judged divergence on the raw strings and over-orphaned
+ * ~24 of ~25 real memory-bearing directories, including this repo's own,
+ * on first production use.
+ *
+ * Classification, after resolving every distinct raw cwd:
+ *   - zero transcripts / no cwd field found in any of them
+ *       -> unmapped (existing reason from findCwdsFromTranscripts)
+ *   - findProjectRootByMarker/readMarker THROWS for ANY of the distinct
+ *     cwds (the documented dual-marker HARD ERROR)
+ *       -> unmapped, that error surfaced immediately — never silently
+ *          proceed past a HARD ERROR just because another cwd in the set
+ *          happened to resolve cleanly
+ *   - the distinct cwd set is a MIX of at least one that resolves to a
+ *     root AND at least one that resolves to NOTHING (checked BEFORE the
+ *     two branches below, third-round field finding)
+ *       -> unmapped ("mixed-resolvable-cwds: N resolved to <root-count>
+ *          root(s), M unresolvable") — findProjectRootByMarker is a pure
+ *          string/parent walk that NEVER checks the START path for
+ *          existence (only each candidate ancestor's marker FILE is
+ *          checked), so "a deleted worktree subdirectory under a real
+ *          root" is NOT a case that fails to resolve — it still resolves
+ *          fine, because the walk never needed the start path itself to
+ *          exist. An unresolvable cwd therefore ALWAYS means no marker
+ *          exists anywhere in that path's ancestry: an alien path, or a
+ *          genuinely lost/never-minted second project. Silently
+ *          attributing the whole directory to whichever side happened to
+ *          resolve (the second-round fix's behavior) could absorb the
+ *          unresolvable side's content into the wrong project — never
+ *          done; friction (unmapped) is the only safe default here.
+ *   - every distinct cwd resolves to NO marker root (all null, none
+ *     resolving — the "mixed" case above requires at least one to
+ *     resolve, so this is the ALL-unresolvable case)
+ *       -> unmapped ("no project marker found walking up from any of N
+ *          distinct cwd(s)")
+ *   - every distinct cwd resolves, and all agree on exactly ONE root
+ *       -> RESOLVED — raw-cwd variety among the inputs is irrelevant once
+ *          they converge on one root (the worktree case)
+ *   - every distinct cwd resolves, but to two or more DISTINCT roots
+ *       -> unmapped ("divergent-transcript-cwds: N distinct resolved
+ *          project root(s)"), the roots listed — a directory whose
+ *          transcripts genuinely point at TWO OR MORE DIFFERENT projects
+ *          (as opposed to one project's main checkout + its own
+ *          worktrees) is a real, if rare, case this script must never
+ *          guess through.
  */
 function resolveProjectIdForDir(dirAbsPath) {
-  const { cwd, reason: cwdReason } = findCwdFromTranscripts(dirAbsPath);
-  if (!cwd) {
-    return { projectId: null, unmappedReason: cwdReason };
+  const { cwds, reason: cwdsReason } = findCwdsFromTranscripts(dirAbsPath);
+  if (cwds.length === 0) {
+    return { projectId: null, unmappedReason: cwdsReason };
   }
-  let root;
-  try {
-    root = findProjectRootByMarker(cwd);
-  } catch (err) {
-    return { projectId: null, unmappedReason: `findProjectRootByMarker threw for cwd="${cwd}": ${err.message}` };
+  const resolvedRoots = new Set();
+  let unresolvedCount = 0;
+  for (const cwd of cwds) {
+    let root;
+    try {
+      root = findProjectRootByMarker(cwd);
+    } catch (err) {
+      return { projectId: null, unmappedReason: `findProjectRootByMarker threw for cwd="${cwd}": ${err.message}` };
+    }
+    if (root) resolvedRoots.add(root);
+    else unresolvedCount++;
   }
-  if (!root) {
-    return { projectId: null, unmappedReason: `no project marker found walking up from cwd="${cwd}"` };
+  // Third-round field finding: findProjectRootByMarker is a pure string/
+  // parent walk that never checks the START path for existence (only each
+  // candidate ancestor directory's MARKER FILE is checked) -- so an
+  // unresolvable cwd is never explainable as "a deleted worktree
+  // subdirectory under a real root" (that case still resolves fine, since
+  // the walk never needed the start path to exist). An unresolvable cwd
+  // therefore means NO marker exists anywhere in that path's ancestry: an
+  // alien path, or a genuinely lost/never-minted second project. A
+  // directory whose distinct cwds are a MIX of at least one that resolves
+  // and at least one that does NOT must never be confidently attributed to
+  // whichever side happened to resolve -- that would silently absorb the
+  // unresolvable side's (possibly real, possibly foreign) content. This
+  // check runs BEFORE the all-resolved-agree/all-resolved-diverge checks
+  // below, so it also fires correctly when the resolving side itself
+  // disagrees on more than one root.
+  if (resolvedRoots.size > 0 && unresolvedCount > 0) {
+    return {
+      projectId: null,
+      unmappedReason: `mixed-resolvable-cwds: ${cwds.length - unresolvedCount} resolved to ${resolvedRoots.size} root(s), ${unresolvedCount} unresolvable`,
+    };
   }
+  if (resolvedRoots.size === 0) {
+    return { projectId: null, unmappedReason: `no project marker found walking up from any of ${cwds.length} distinct cwd(s): ${cwds.join(', ')}` };
+  }
+  if (resolvedRoots.size > 1) {
+    return { projectId: null, unmappedReason: `divergent-transcript-cwds: ${resolvedRoots.size} distinct resolved project root(s): ${[...resolvedRoots].join(', ')}` };
+  }
+  const root = [...resolvedRoots][0];
   let marker;
   try {
     marker = readMarker(root);
@@ -519,6 +642,43 @@ function resolveDbMapping(distinctSourceFilesRaw, candidateDirs) {
   return { mapping, winner, tied: tied.length > 1 ? tied : null, scores };
 }
 
+// ─── BACKUP (read-only, before any mutation, §6.1(d) step 1) ──────────────
+
+/**
+ * ISO timestamp with `:`/`.` replaced so the result is a safe filename
+ * fragment on every OS (mirrors migrate-02-decisions.js's
+ * timestampForFilename() exactly).
+ */
+function timestampForFilename(d = new Date()) {
+  return d.toISOString().replace(/[:.]/g, '-');
+}
+
+/**
+ * §6.1(d) step 1's house backup pattern (field finding: missing from the
+ * first authored version -- migrate-02-decisions.js's backupSourceTable()
+ * is the house precedent this mirrors). Dumps EVERY row of `table` in
+ * `dbName`, unconditionally, BEFORE any ALTER/backfill touches it --
+ * called for every corpus table (memory_entries always; memory_entry_chunks
+ * when present) as the very first action inside the per-database loop, on
+ * every run (not just the first), to a timestamped JSON file under
+ * `backupDir` (gitignored -- real corpus content, cross-project prose).
+ */
+async function backupCorpusTable(client, dbName, table, backupDir) {
+  const { rows } = await client.query(`SELECT * FROM ${table} ORDER BY id`);
+  fs.mkdirSync(backupDir, { recursive: true });
+  const fileName = `${dbName}-${table}-backup-${timestampForFilename()}.json`;
+  const filePath = path.join(backupDir, fileName);
+  const payload = {
+    source_db: dbName,
+    source_table: table,
+    captured_at: new Date().toISOString(),
+    row_count: rows.length,
+    rows,
+  };
+  fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf8');
+  return { filePath, rowCount: rows.length };
+}
+
 // ─── SCHEMA / BACKFILL ──────────────────────────────────────────────────────
 
 async function columnExists(client, table, column) {
@@ -543,9 +703,29 @@ async function ensureNullableProjectIdColumn(client, table) {
   await client.query(`CREATE INDEX IF NOT EXISTS ${table}_project_idx ON ${table} (project_id)`);
 }
 
-/** D3-8: batched backfill of memory_entries.project_id via a VALUES join. */
+/**
+ * D3-8: batched backfill of memory_entries.project_id via a VALUES join.
+ *
+ * Re-run-eligible predicate (field finding, second round): `project_id IS
+ * NULL OR project_id = ORPHAN_PROJECT_ID` -- widened from a bare `IS NULL`
+ * so that a re-run (e.g. after a resolver fix, or after the source
+ * project's directory reappears/gets remapped) can re-attribute a row
+ * THIS SCRIPT itself previously orphaned. This is safe by construction:
+ * ORPHAN_PROJECT_ID is this script's OWN sentinel string, never a value a
+ * manual correction or any other writer would independently choose to
+ * write, so it is unambiguously distinguishable from "someone deliberately
+ * set this row's project_id" -- D3-8's protection (never clobber a
+ * non-orphan, non-NULL value) is preserved for every OTHER value. The
+ * SELECT and the UPDATE below MUST use the IDENTICAL predicate -- a
+ * mismatch here (e.g. widening the SELECT but leaving the UPDATE's WHERE
+ * as a bare IS NULL) would silently no-op the UPDATE for every
+ * previously-orphaned row while still reporting it as "touched".
+ */
 async function backfillEntries(client, mapping, batchSize) {
-  const { rows } = await client.query(`SELECT id, source_file FROM ${ENTRIES_TABLE} WHERE project_id IS NULL ORDER BY id`);
+  const { rows } = await client.query(
+    `SELECT id, source_file FROM ${ENTRIES_TABLE} WHERE project_id IS NULL OR project_id = $1 ORDER BY id`,
+    [ORPHAN_PROJECT_ID]
+  );
   const updates = rows.map((row) => {
     const m = row.source_file !== null ? mapping.get(row.source_file) : null;
     const projectId = m && m.projectId ? m.projectId : ORPHAN_PROJECT_ID;
@@ -557,10 +737,12 @@ async function backfillEntries(client, mapping, batchSize) {
     const valuesSql = batch.map((_, idx) => `($${idx * 2 + 1}::int, $${idx * 2 + 2}::text)`).join(',');
     const params = [];
     for (const b of batch) params.push(b.id, b.projectId);
+    const orphanParamIdx = params.length + 1;
+    params.push(ORPHAN_PROJECT_ID);
     await client.query(
       `UPDATE ${ENTRIES_TABLE} AS m SET project_id = v.project_id
        FROM (VALUES ${valuesSql}) AS v(id, project_id)
-       WHERE m.id = v.id AND m.project_id IS NULL`,
+       WHERE m.id = v.id AND (m.project_id IS NULL OR m.project_id = $${orphanParamIdx})`,
       params
     );
   }
@@ -854,6 +1036,16 @@ async function main() {
       const client = new Client(migrateOne.pgConfig(db.dbName));
       await client.connect();
       try {
+        // (0) BACKUP -- read-only, unconditional, before ANY mutation
+        // (§6.1(d) step 1; field finding, second round: missing from the
+        // first authored version).
+        const entriesBackup = await backupCorpusTable(client, db.dbName, ENTRIES_TABLE, parsed.backupDir);
+        console.log(`  [BACKUP] ${ENTRIES_TABLE}: ${entriesBackup.rowCount} row(s) -> ${entriesBackup.filePath}`);
+        if (db.hasChunks) {
+          const chunksBackup = await backupCorpusTable(client, db.dbName, CHUNKS_TABLE, parsed.backupDir);
+          console.log(`  [BACKUP] ${CHUNKS_TABLE}: ${chunksBackup.rowCount} row(s) -> ${chunksBackup.filePath}`);
+        }
+
         // (a) additive schema
         await ensureNullableProjectIdColumn(client, ENTRIES_TABLE);
         if (db.hasChunks) await ensureNullableProjectIdColumn(client, CHUNKS_TABLE);
@@ -948,10 +1140,12 @@ module.exports = {
   discoverAndClassify,
   printClassification,
   cwdCompareKey,
-  findCwdFromTranscripts,
+  findCwdsFromTranscripts,
   resolveProjectIdForDir,
   buildProjectDirIndex,
   resolveDbMapping,
+  timestampForFilename,
+  backupCorpusTable,
   columnExists,
   tableExists,
   ensureNullableProjectIdColumn,
@@ -965,6 +1159,7 @@ module.exports = {
   ORPHAN_PROJECT_ID,
   DEFAULT_BATCH_SIZE,
   DEFAULT_MAP_OUT_PATH,
+  DEFAULT_BACKUP_DIR,
   ENTRIES_TABLE,
   CHUNKS_TABLE,
   ENTRIES_LOAD_BEARING_COLS,

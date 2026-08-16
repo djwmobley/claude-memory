@@ -68,9 +68,11 @@ scripts/decisions_backup*.csv
 # loadRoutingMap().
 /scripts/migrations/topic-prefix-to-project.json
 
-# migrate-02-decisions.js's pre-migration source backup dumps — real
-# claude_policy_framework.decisions content (private, cross-project prose),
-# never committed. See migrate-02-decisions.js's backupSourceTable().
+# Pre-mutation source backup dumps — real corpus/source content (private,
+# cross-project prose), never committed. Shared by migrate-02-decisions.js's
+# backupSourceTable() (claude_policy_framework.decisions) and
+# migrate-03-corpus-project-id.js's backupCorpusTable() (per-(DB, table)
+# memory_entries/memory_entry_chunks dumps).
 /scripts/migrations/backups/
 
 # migrate-verify-own-graph.js's real/junk project_id classification set —
