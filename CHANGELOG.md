@@ -59,6 +59,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and one is independently callable end-to-end) and its regression harness
   `test/migrations/test-verify-20.js`.
 
+- **§6.1(b) decisions data migration** — new
+  `scripts/migrations/migrate-02-decisions.js` migrates
+  `claude_policy_framework.decisions` into the structured (not prose-blob)
+  `decisions` seam table on a memory-manager consolidation target, keyed by
+  a topic-prefix routing classifier
+  (`scripts/migrations/topic-prefix-to-project.json`): an ordered
+  LITERAL/WILDCARD rule list, first-match-wins, with a
+  `unmatched-<first-dash-token>` fallback bucket for anything the routing
+  table doesn't recognize (never guessed, never silently dropped). Loud
+  preconditions before any write (every topic already
+  `= lower(trim(topic))`; zero duplicate topics); bundles
+  `CREATE UNIQUE INDEX IF NOT EXISTS decisions_project_topic_unique ON
+  decisions(project_id, topic)`; writes one `migration_manifest` row (+ row
+  hashes) per derived-project slice, in the same transaction as that
+  slice's `decisions` upsert batch; supports `--rollback` (re-classifies
+  the live source to recover exactly which rows it owns, deletes them plus
+  their manifest rows in one transaction). Pre-migration rows are tagged
+  `source_model='unknown-pre-migration'` / `authoring_mode='verbose'`
+  (grandfather, insert-time only) with `source_project_hint` recording the
+  matched prefix as an audit trail; `embedding`/`agent_id` are left `NULL`
+  (backfill is a later phase). Takes a read-only source backup (timestamped
+  JSON dump, gitignored) before touching anything. Two rounds of
+  independent-review fixes landed on top before merge: round 1 closed a
+  re-classification-drift bug (a topic's derived `project_id` changing
+  between runs left a duplicate row + an orphaned `migration_manifest`
+  slice behind, undetected); round 2 scoped the round-1 fix's
+  reconciliation `DELETE` by `source_model` after an unscoped version was
+  shown to be able to silently delete unrelated, non-migration `decisions`
+  rows sharing a topic string.
+
 - **§5.3 absorbed-seam tables + §5.9 fat-card view + §7 write/render/lint
   libraries** — new schema-setup-only migration
   `scripts/migrations/sql/migrate-14-seam-tables.sql` (applied by

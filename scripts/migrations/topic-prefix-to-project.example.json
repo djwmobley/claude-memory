@@ -1,0 +1,44 @@
+{
+  "_comment": "SYNTHETIC EXAMPLE ONLY — obviously-fake project names and topic prefixes throughout. The real topic-prefix-to-project.json carries private instance routing data (real project identifiers, real per-project topic-prefix conventions) and is gitignored, never committed. This file documents the required SHAPE and every rule-matching behavior migrate-02-decisions.js's loadRoutingMap()/classifyTopic() implement, and is also what test/migrations/test-migrate-02-decisions.js loads (via --routing-map) so the suite runs green with no private data present, in CI or anywhere else. Ordered rule list, first-match-wins. Each rule is typed LITERAL (exact match on the topic's first TWO dash-tokens) or WILDCARD (match on the topic's first dash-token only). A topic matching zero rules routes to project_id = 'unmatched-<first-dash-token>' at migration time (never guessed, never silently dropped — see the fallback proven by 'never-seen-before-topic' in the test suite). known_project_ids must contain EXACTLY every rule target used below, EXCEPT the 'unmatched-*' bucket targets and the dynamic 'unmatched-<first-dash-token>' fallback, which are deliberately never real project_ids — loadRoutingMap() FAILs loud at load time (D-12) otherwise. documentary_baseline_by_hint/documentary_total are OPTIONAL — a diagnostic-only, never-a-gate stale-count comparison (D-9); omitted here since there is no real history behind a synthetic map, but present on the real, private file.",
+  "known_project_ids": [
+    "proj-alpha",
+    "proj-beta-monolith",
+    "proj-gamma",
+    "org.DeltaWidgetSupport",
+    "tool-epsilon",
+    "svc-zeta"
+  ],
+  "rules": [
+    { "type": "LITERAL",  "prefix": "proj-alpha",        "target": "proj-alpha",
+      "note": "example row 1 — main literal prefix for proj-alpha" },
+    { "type": "LITERAL",  "prefix": "proj-scan",         "target": "proj-alpha",
+      "note": "example row 2 -- scan-tooling, same tool family as proj-alpha, different literal prefix folding into the same target" },
+    { "type": "LITERAL",  "prefix": "proj-qa",           "target": "proj-alpha",
+      "note": "example row 3 -- QA-target singleton, same tool family as proj-alpha" },
+    { "type": "LITERAL",  "prefix": "proj-web",          "target": "proj-alpha",
+      "note": "example row 4 -- same tool family as proj-alpha" },
+    { "type": "LITERAL",  "prefix": "beta-svc",          "target": "proj-beta-monolith",
+      "note": "example row 5 -- literal prefix need not textually resemble its target" },
+    { "type": "WILDCARD", "prefix": "gamma",             "target": "proj-gamma",
+      "note": "example row 6 -- wildcard on prefix, not literal-string match; every gamma-* topic routes here regardless of the second token (e.g. gamma-judge routes to proj-gamma, NOT a separate 'judge' project)" },
+    { "type": "WILDCARD", "prefix": "delta",             "target": "org.DeltaWidgetSupport",
+      "note": "example row 7 -- wildcard on prefix" },
+    { "type": "LITERAL",  "prefix": "epsilon-tool",      "target": "tool-epsilon",
+      "note": "example row 8 -- out-of-root project, filesystem:/path/to/tool-epsilon" },
+    { "type": "LITERAL",  "prefix": "zeta-embed",        "target": "svc-zeta",
+      "note": "example row 9 -- literal prefix need not textually resemble its target" },
+
+    { "type": "LITERAL",  "prefix": "cache-warmup",      "target": "unmatched-cache-warmup",
+      "note": "unmatched-by-wildcard singleton example, owner-review — NEVER auto-routed to any low-confidence inferred project; D-2" },
+    { "type": "LITERAL",  "prefix": "readme-audit",      "target": "unmatched-readme-audit",
+      "note": "unmatched-by-wildcard singleton example, owner-review; D-2" },
+    { "type": "LITERAL",  "prefix": "first-pass",        "target": "unmatched-first-pass",
+      "note": "unmatched-by-wildcard singleton example, owner-review; D-2" },
+    { "type": "LITERAL",  "prefix": "legacy-tooling",    "target": "unmatched-legacy-tooling",
+      "note": "unmatched-by-wildcard singleton example, owner-review; D-2" },
+    { "type": "LITERAL",  "prefix": "draft-semantic",    "target": "unmatched-draft-semantic",
+      "note": "unmatched-by-wildcard singleton example, owner-review; D-2" },
+    { "type": "LITERAL",  "prefix": "wiring-script",     "target": "unmatched-wiring-script",
+      "note": "unmatched-by-wildcard singleton example, owner-review; D-2" }
+  ]
+}

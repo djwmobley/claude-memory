@@ -333,6 +333,36 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run decisions data migration tests (§6.1(b), memory-manager#11(b))
+        # Tests scripts/migrations/migrate-02-decisions.js — migrates
+        # claude_policy_framework.decisions into the structured decisions seam
+        # table via the ordered LITERAL/WILDCARD topic-prefix routing
+        # classifier in scripts/migrations/topic-prefix-to-project.json.
+        # Covers: classifyTopic (LITERAL vs WILDCARD precedence, first-match-
+        # wins, unmatched-<first-dash-token> fallback, single-token topics,
+        # every real §16.2 rule shape); routing-map D-12 validation (a rule
+        # target absent from known_project_ids and not an "unmatched-*"
+        # bucket refuses loud, before any DB connection is opened);
+        # preconditions D-3 (non-normalized topic) and D-4/M-1 (duplicate
+        # topics) refusing loud with nothing inserted; a fresh migrate against
+        # a synthetic source table covering every rule shape, verified
+        # per-slice against migration_manifest + the decisions rows' project_
+        # id/source_project_hint/source_model/authoring_mode; the required
+        # decisions_project_topic_unique index; an idempotent re-run (no
+        # duplication); manifest transactionality against a FRESH database —
+        # a deliberately constraint-violating row mid-slice proves the
+        # decisions upserts and the migration_manifest writes roll back
+        # together, atomically; and --rollback mode (deletes exactly one
+        # source's migrated rows + manifest + row_hashes, leaving an
+        # unrelated source's rows untouched).
+        # Creates/drops its own scratch databases (target "_staging"-suffixed
+        # to satisfy migrate-01's classifyTarget); never touches
+        # claude_policy_framework/memory_manager_staging.
+        run: node test/migrations/test-migrate-02-decisions.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run seam-libraries smoke tests (§7.1-§7.8, issue #17)
         # Tests scripts/migrations/verify-19-seams-smoke.js (30-check operator
         # smoke test) and its regression harness test/migrations/test-verify-19.js
