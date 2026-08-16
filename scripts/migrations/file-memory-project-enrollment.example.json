@@ -1,0 +1,12 @@
+{
+  "_comment": "SYNTHETIC EXAMPLE ONLY — obviously-fake directory names and project ids throughout. The real file-memory-project-enrollment.json carries private instance routing data (real ~/.claude/projects directory names, real project identifiers) and is gitignored, never committed. This file documents the required SHAPE and every rule migrate-09-file-memory-markdown.js's loadEnrollmentConfig()/classifyProjectDir() implement, and is also what test/migrations/test-migrate-09-file-memory-markdown.js loads (via --enrollment-config) so the suite runs green with no private data present, in CI or anywhere else. classifyProjectDir() is a TOTAL classification over every directory directly under --projects-root that itself contains a `memory` subdirectory (a 'memory/-bearing dir') — never a blind glob-all over *.md files: (1) ENROLLED — dir_name exactly matches an entry in enrolled_dirs, routed to that entry's project_id; (2) TEST-ARTIFACT-EXCLUDED — dir_name matches one of test_artifact_patterns (regex, tested against the bare directory name) — the eval-harness/scratch-fixture temp naming convention (e.g. a path segment produced under a system temp directory, optionally followed by a random suffix); logged with a loud, named report line, never silently dropped and never enrolled; (3) UNMATCHED-FLAGGED — the default branch for every memory/-bearing dir that is neither enrolled nor a recognized test artifact — ALSO logged with its own named report line (owner-review line-item; a project deliberately withheld from enrollment, e.g. private tooling, is expected to show up here every run until an owner either adds it to enrolled_dirs or to a documented exclusion — it is never silently enrolled and never silently skipped). enrolled_dirs' project_id values need not appear in any other roster file — file-memory project ids are this config's own namespace.",
+  "enrolled_dirs": [
+    { "dir_name": "C--Users-example-dev-proj-alpha", "project_id": "proj-alpha" },
+    { "dir_name": "C--Users-example-dev-proj-beta-monolith", "project_id": "proj-beta-monolith" }
+  ],
+  "test_artifact_patterns": [
+    "AppData-Local-Temp-[A-Za-z0-9_-]*-eval-[A-Za-z0-9]+$",
+    "AppData-Local-Temp-[a-zA-Z]+-[a-zA-Z0-9]+-\\d{10,}$",
+    "AppData-Local-Temp-handoff-(debug|test|w\\d+)"
+  ]
+}

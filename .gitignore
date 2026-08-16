@@ -72,3 +72,11 @@ scripts/decisions_backup*.csv
 # claude_policy_framework.decisions content (private, cross-project prose),
 # never committed. See migrate-02-decisions.js's backupSourceTable().
 /scripts/migrations/backups/
+
+# migrate-09-file-memory-markdown.js's project enrollment config — real
+# ~/.claude/projects directory names + real project identifiers (private
+# instance data), never committed.
+# scripts/migrations/file-memory-project-enrollment.example.json documents
+# the required shape. See migrate-09-file-memory-markdown.js's
+# loadEnrollmentConfig().
+/scripts/migrations/file-memory-project-enrollment.json
