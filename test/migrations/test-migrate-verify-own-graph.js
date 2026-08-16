@@ -195,6 +195,24 @@ async function seedSource() {
       `INSERT INTO project_settings (project_id, key, value) VALUES ($1,'staleness_days','7')`,
       [REAL_PROJECT_ID]
     );
+    // The remaining 3 of the 10 §6.1(c) in-scope tables (needed so T0-REG's
+    // full-10-entry shipped-roster check below finds a migration_manifest
+    // row for every entry it loads, not just the 7 tables seeded above).
+    await client.query(
+      `INSERT INTO retrieval_contract_history (project_id, name, version, queries, change_note)
+       VALUES ($1,'default',1,'[]'::jsonb,'seed')`,
+      [REAL_PROJECT_ID]
+    );
+    await client.query(
+      `INSERT INTO entity_communities (project_id, entity_name, community_id, level, run_id)
+       VALUES ($1,'widget',1,0,'run-1')`,
+      [REAL_PROJECT_ID]
+    );
+    await client.query(
+      `INSERT INTO extraction_queue (project_id, payload, source_ref, status)
+       VALUES ($1,'{}'::jsonb,'sess-1','pending')`,
+      [REAL_PROJECT_ID]
+    );
 
     // JUNK slice: same shapes, different (unlisted) project_id.
     await client.query(
@@ -256,38 +274,52 @@ async function main() {
   // never appearing in the "unclassified" bucket. Placed here (before B1's
   // --rollback, which later deletes the real-slice migration_manifest rows
   // T0's roster-totality forward-check below depends on).
-  await run('T0-REG', 'C-DDL-registration: after a real migrate-verify-own-graph.js run, verify-15-t0-roster.js PASSes and classifies own_graph_migration_ids as battery-infra (never unclassified)', async () => {
-    // Roster covering exactly the (source_db=DB_SOURCE, source_table) pairs
-    // seedSource() actually populates (7 of the 9 §6.1(c) in-scope,
-    // project_id-bearing tables -- entity_communities/extraction_queue were
-    // never seeded, so they correctly carry zero migration_manifest rows
-    // and need no roster entry here; T0's roster-inverse direction only
-    // requires an entry for a NON-EXCLUDED manifest row that exists).
-    const t0Roster = [
-      { source_db: DB_SOURCE, source_table: 'entities', targetTable: 'entities',
-        loadBearingCols: ['name', 'entity_type', 'description'], hasContentBearingText: true, requires_project_id_scope: true },
-      { source_db: DB_SOURCE, source_table: 'assertions', targetTable: 'assertions',
-        loadBearingCols: ['subject', 'predicate', 'object'], hasContentBearingText: true, requires_project_id_scope: true },
-      { source_db: DB_SOURCE, source_table: 'edges', targetTable: 'edges',
-        loadBearingCols: ['from_entity', 'edge_type', 'to_entity'], hasContentBearingText: false, requires_project_id_scope: true },
-      { source_db: DB_SOURCE, source_table: 'retrieval_contract', targetTable: 'retrieval_contract',
-        loadBearingCols: ['name', 'queries'], hasContentBearingText: false, requires_project_id_scope: true },
-      { source_db: DB_SOURCE, source_table: 'project_settings', targetTable: 'project_settings',
-        loadBearingCols: ['key', 'value'], hasContentBearingText: false, requires_project_id_scope: true },
-      { source_db: DB_SOURCE, source_table: 'retrieval_events', targetTable: 'retrieval_events',
-        loadBearingCols: ['query_text', 'session_id'], hasContentBearingText: true, requires_project_id_scope: true },
-      { source_db: DB_SOURCE, source_table: 'retrieval_event_assertions', targetTable: 'retrieval_event_assertions',
-        loadBearingCols: ['event_id', 'assertion_id'], hasContentBearingText: false, requires_project_id_scope: false },
-    ];
+  await run('T0-REG', 'C-DDL-registration + roster-completeness: after a real migrate-verify-own-graph.js run, verify-15-t0-roster.js PASSes against the SHIPPED committed example roster (all 10 entries, never a bespoke hand-typed subset) and classifies own_graph_migration_ids as battery-infra (never unclassified)', async () => {
+    // Loads the REAL, committed scripts/migrations/source-table-roster.
+    // example.json -- the same file an operator copies from -- rather than
+    // a hand-typed roster in this test file. This is deliberate: a second
+    // reviewer finding (2026-08-16) caught that the committed example was
+    // MISSING the 'assertions' entry (9 of 10, not 10 of 10), a drift a
+    // bespoke test roster could never detect because it would just be
+    // hand-typed to match whatever the test author remembered to include.
+    // Loading the shipped file directly means any future regression of the
+    // SAME shape (an entry silently dropped from the example) fails this
+    // test immediately, not just a live operator's real run.
+    const exampleRosterPath = path.join(PROJECT_ROOT, 'scripts', 'migrations', 'source-table-roster.example.json');
+    const exampleRoster = JSON.parse(fs.readFileSync(exampleRosterPath, 'utf8'));
+    // Filter to this script's own tagged entries (source_db ===
+    // script.DEFAULT_SOURCE_DB, i.e. 'claude_memory_eval_test' -- the OTHER
+    // example entries in the file belong to migrate-02-decisions.js /
+    // routing_profiles / memory_entries and are irrelevant here), then
+    // remap source_db -> DB_SOURCE (this test's actual scratch source) so
+    // the entries match what migrate-verify-own-graph.js's real
+    // migration_manifest rows carry -- every OTHER field (targetTable,
+    // loadBearingCols, hasContentBearingText, requires_project_id_scope,
+    // embeddingCol) is used VERBATIM from the shipped file, unmodified.
+    const ownGraphEntries = exampleRoster
+      .filter((e) => e.source_db === script.DEFAULT_SOURCE_DB)
+      .map((e) => ({ ...e, source_db: DB_SOURCE }));
+    // Self-check: fails loud (not silently passing with fewer entries) if
+    // the shipped file ever regresses below the full 10-table set this
+    // script's in-scope roster requires -- the exact class of drift caught
+    // above.
+    assert(ownGraphEntries.length === 10, `expected exactly 10 migrate-verify-own-graph.js-tagged entries in the shipped source-table-roster.example.json, got ${ownGraphEntries.length}: ${JSON.stringify(ownGraphEntries.map((e) => e.targetTable))}`);
+    const expectedTables = ['entities', 'assertions', 'edges', 'retrieval_contract', 'retrieval_contract_history', 'project_settings', 'entity_communities', 'extraction_queue', 'retrieval_events', 'retrieval_event_assertions'];
+    for (const t of expectedTables) {
+      assert(ownGraphEntries.some((e) => e.targetTable === t), `shipped example roster is missing a migrate-verify-own-graph.js entry for targetTable="${t}"`);
+    }
+
     const t0RosterPath = path.join(TMP_DIR, `t0-reg-roster-${TS}.json`);
-    fs.writeFileSync(t0RosterPath, JSON.stringify(t0Roster, null, 2));
+    fs.writeFileSync(t0RosterPath, JSON.stringify(ownGraphEntries, null, 2));
 
     const r = runT0Roster(['--db', DB_TARGET], { SOURCE_TABLE_ROSTER: t0RosterPath });
     const out = r.stdout + r.stderr;
-    assert(r.status === 0, `expected verify-15-t0-roster.js to exit 0 after a real migrate-verify-own-graph.js run, got ${r.status}. stdout=${r.stdout} stderr=${r.stderr}`);
+    assert(r.status === 0, `expected verify-15-t0-roster.js to exit 0 after a real migrate-verify-own-graph.js run using the SHIPPED example roster, got ${r.status}. stdout=${r.stdout} stderr=${r.stderr}`);
     assert(!/unclassified.*own_graph_migration_ids|own_graph_migration_ids.*unclassified/.test(out), `own_graph_migration_ids must never appear in the unclassified bucket: ${out}`);
     assert(/unclassified=0/.test(out), `expected unclassified=0 (own_graph_migration_ids classified as battery-infra), got: ${out}`);
     assert(/battery-infra=[1-9]/.test(out), `expected battery-infra count >= 1, got: ${out}`);
+    assert(/OK \(forward\)/.test(out), `expected T0 forward direction to pass against the full 10-entry shipped roster: ${out}`);
+    assert(/OK \(inverse\)/.test(out), `expected T0 inverse direction to pass (every non-excluded manifest pair has a roster entry, including assertions): ${out}`);
   });
 
   // ── Junk exclusion ─────────────────────────────────────────────────────

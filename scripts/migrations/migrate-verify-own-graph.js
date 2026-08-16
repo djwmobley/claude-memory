@@ -38,15 +38,20 @@
  *
  *      REAL-ROSTER MANUAL STEP (2026-08-16 review finding, mirrors the
  *      known-own-graph-project-ids.json pattern above): the §15.2 T0
- *      roster-totality check (verify-15-t0-roster.js) requires a
- *      scripts/migrations/source-table-roster.json entry for every
- *      (source_db, source_table) pair this script writes migration_manifest
- *      rows for. source-table-roster.example.json's committed synthetic
- *      shape documents the 9 project_id-bearing tables' entries (source_db
- *      = the real, already-public "claude_memory_eval_test" default — not
- *      private instance data, unlike the known-ids config); the operator
- *      copies the matching 9 rows into the REAL, gitignored roster before a
- *      run whose target T0 must PASS against. See --help.
+ *      roster-INVERSE check and T2's row-count reconciliation (both keyed
+ *      off migration_manifest, NOT off whether the underlying table is
+ *      engine-core — a distinction an earlier cut of this comment
+ *      conflated) require a scripts/migrations/source-table-roster.json
+ *      entry for EVERY (source_db, source_table) pair this script writes a
+ *      migration_manifest row for — all 10 in-scope tables, including
+ *      retrieval_event_assertions (it lacks project_id, not a
+ *      migration_manifest row -- see migrateRetrievalEventAssertions()).
+ *      source-table-roster.example.json's committed synthetic shape
+ *      documents all 10 entries (source_db = the real, already-public
+ *      "claude_memory_eval_test" default — not private instance data,
+ *      unlike the known-ids config); the operator copies the matching 10
+ *      rows into the REAL, gitignored roster before a run whose target T0
+ *      must PASS against. See --help.
  *
  *   2. retrieval_event_assertions HAS NO project_id COLUMN OF ITS OWN (it is
  *      a join table: event_id INTEGER NOT NULL REFERENCES retrieval_events(id)
@@ -274,18 +279,18 @@ function printUsage() {
     '  --backup-dir <path>  Directory for the timestamped source backup (default: scripts/migrations/backups).',
     '',
     'REAL-ROSTER MANUAL STEP (mirrors known-own-graph-project-ids.json -- see that section above):',
-    '  This script writes migration_manifest rows for 9 of its 10 in-scope, project_id-bearing',
-    '  tables (retrieval_event_assertions is scoped transitively -- see header comment) whose',
-    '  (source_db, source_table) pairs are NOT pre-registered in the committed',
+    '  This script writes migration_manifest rows for ALL 10 of its in-scope tables, including',
+    '  retrieval_event_assertions (it lacks project_id, not a manifest row -- see header comment)',
+    '  -- whose (source_db, source_table) pairs are NOT pre-registered in the committed',
     '  source-table-roster.example.json by default -- only its SYNTHETIC entries are. Before a',
     '  real run whose output verify-15-t0-roster.js (T0) must PASS against, the operator adds the',
-    '  9 matching entries to the REAL, gitignored scripts/migrations/source-table-roster.json --',
+    '  10 matching entries to the REAL, gitignored scripts/migrations/source-table-roster.json --',
     '  a one-time manual edit, same convention as known-own-graph-project-ids.json: the committed',
     '  file documents the required SHAPE (see source-table-roster.example.json\'s own',
     '  migrate-verify-own-graph.js-tagged entries), the real file carries the real source_db value',
     '  and is never committed. Omitting this step does not affect THIS script\'s own',
-    '  MIGRATION_RESULT gate -- it only affects whether the separate §15.2 T0 roster-totality',
-    '  check later passes against the same target.',
+    '  MIGRATION_RESULT gate -- it only affects whether the separate §15.2 T0 roster-INVERSE check',
+    '  and T2 row-count reconciliation later pass against the same target.',
   ].join('\n'));
 }
 
