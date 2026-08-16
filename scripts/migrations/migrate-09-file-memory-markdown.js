@@ -31,10 +31,10 @@
  *      hard, up-front refusal naming that script if missing, nothing
  *      applied.
  *   3. Applies this script's OWN additive schema file,
- *      sql/migrate-09-file-memory-schema.sql (I-1): the
- *      edges_project_from_type_to_unique index (confirmed absent live —
- *      §1.1's ground-truth read of handoff-core-schema.sql did not find
- *      one) plus `entities.entity_type DROP NOT NULL` (required so I-8's
+ *      sql/migrate-09-file-memory-schema.sql: a plain (non-unique) lookup
+ *      index `edges_project_from_type_to_idx` on
+ *      `edges(project_id, from_entity, edge_type, to_entity)`, plus
+ *      `entities.entity_type DROP NOT NULL` (required so I-8's
  *      "unmatched-type" branch can write entity_type=NULL instead of
  *      either failing or fabricating a type). Applied via migrate-01's own
  *      applySqlFile — registered the SAME way migrate-13/migrate-14
@@ -42,6 +42,26 @@
  *      apply step, never appended to migrate-schema-addenda.js's shared
  *      SQL_FILES array (avoids any collision with a concurrent sibling PR
  *      also touching that array).
+ *
+ *      SUPERSESSION (I-10, field finding 2026-08-16, first real staging
+ *      run): I-10 originally specified a UNIQUE index on this same 4-tuple
+ *      so the edges write could be a plain `ON CONFLICT ... DO UPDATE`
+ *      upsert. That UNIQUE index cannot coexist with this runbook's
+ *      lossless-migration guarantee — staging's real `edges` table (phase
+ *      (c)'s migrate-verify-own-graph.js output) holds 12 duplicate
+ *      4-tuples faithfully migrated with their full multiplicity intact
+ *      from a source graph that predates any uniqueness constraint on this
+ *      tuple; deduping them to satisfy a UNIQUE index would break T3's
+ *      content-hash MULTISET reconciliation against the source (which
+ *      counts occurrences, not distinct values). The plain index keeps
+ *      I-10's lookup-performance goal; idempotency for THIS script's own
+ *      writes is now enforced in application code instead of the database
+ *      schema — see `edgeAlreadyWrittenByThisScript()`/`upsertEdge()`
+ *      below and the SQL file's own header comment for the full
+ *      supersession writeup and the deterministic upgrade path (a target
+ *      where the old UNIQUE index previously succeeded has it dropped and
+ *      replaced with the plain one, so every environment converges to the
+ *      same constraint shape).
  *   4. Loads scripts/migrations/file-memory-project-enrollment.json (I-1;
  *      gitignored, private instance data — see .example.json for shape),
  *      then enumerates every directory directly under --projects-root
@@ -107,9 +127,16 @@
  *      may fill `entity_type` if currently NULL, but never touches
  *      `description`/`source_model`/`agent_id` (a live writer, e.g.
  *      `/handoff:close`, owns that row's prose; this migration never
- *      clobbers it). `edges` upsert key is `(project_id, from_entity,
- *      edge_type, to_entity)` (now enforced by the index applied in step
- *      3).
+ *      clobbers it). `edges` writes are existence-guarded, NOT an
+ *      `ON CONFLICT` upsert (I-10 supersession, see step 3 above): insert
+ *      a `(project_id, from_entity, edge_type, to_entity)` row only if no
+ *      row with that exact 4-tuple AND `source_model='markdown-migration-
+ *      i'` already exists. The guard is scoped to THIS SCRIPT'S OWN tag —
+ *      a pre-existing duplicate from another writer (a live write path,
+ *      or the source graph's own historical duplicates migrated by phase
+ *      (c)) never blocks this script's write, and this script's own
+ *      re-runs stay exactly-once regardless of how many un-tagged
+ *      duplicates already share that tuple.
  *   9. Manifest rows (T1/T3-style, scoped to the DERIVED structure, not the
  *      raw text which (f) already covers): one `migration_manifest` +
  *      `migration_manifest_row_hashes` slice per (project, source_table)
@@ -654,14 +681,51 @@ async function upsertEntity(client, projectId, entity) {
   );
 }
 
-async function upsertEdge(client, projectId, edge) {
-  await client.query(
-    `INSERT INTO edges (project_id, from_entity, edge_type, to_entity, source_model, agent_id)
-     VALUES ($1,$2,$3,$4,$5,NULL)
-     ON CONFLICT (project_id, from_entity, edge_type, to_entity) DO UPDATE SET
-       source_model = EXCLUDED.source_model`,
+/**
+ * I-10 supersession (field finding 2026-08-16): the original mechanism was
+ * a UNIQUE index on (project_id, from_entity, edge_type, to_entity) plus a
+ * plain `ON CONFLICT ... DO UPDATE` upsert. That UNIQUE index cannot
+ * coexist with this runbook's lossless-migration guarantee — the real
+ * `edges` table can legitimately carry duplicate 4-tuples migrated with
+ * their full multiplicity from a source graph that predates any
+ * uniqueness constraint (see sql/migrate-09-file-memory-schema.sql's
+ * header comment for the full writeup). Returns true if a row with this
+ * exact 4-tuple, tagged THIS SCRIPT'S OWN source_model, already exists —
+ * scoped to the tag specifically so a pre-existing duplicate written by
+ * ANY OTHER writer (a live write path, or the source graph's own
+ * historical duplicates) is invisible to this check and never blocks this
+ * script's write.
+ */
+async function edgeAlreadyWrittenByThisScript(client, projectId, edge) {
+  const { rows } = await client.query(
+    `SELECT 1 FROM edges
+     WHERE project_id=$1 AND from_entity=$2 AND edge_type=$3 AND to_entity=$4 AND source_model=$5
+     LIMIT 1`,
     [projectId, edge.fromEntity, edge.edgeType, edge.toEntity, SOURCE_MODEL_TAG]
   );
+  return rows.length > 0;
+}
+
+/**
+ * Existence-guarded insert, NOT an `ON CONFLICT` upsert (I-10 supersession
+ * — see edgeAlreadyWrittenByThisScript() above). Within a single run this
+ * is race-free: processProject() wraps one project's whole file/edge batch
+ * in ONE transaction on ONE client, so the guard SELECT and the INSERT
+ * below execute sequentially against the same session with no interleaved
+ * writer. This does NOT protect against two SEPARATE, concurrently-running
+ * invocations of this script racing the SAME (project, edge) tuple — that
+ * is out of scope for an operator-run migration script (same posture as
+ * every other migrate-*.js in this repo; see PR body's blind-spot note).
+ */
+async function upsertEdge(client, projectId, edge) {
+  const alreadyWritten = await edgeAlreadyWrittenByThisScript(client, projectId, edge);
+  if (alreadyWritten) return { inserted: false };
+  await client.query(
+    `INSERT INTO edges (project_id, from_entity, edge_type, to_entity, source_model, agent_id)
+     VALUES ($1,$2,$3,$4,$5,NULL)`,
+    [projectId, edge.fromEntity, edge.edgeType, edge.toEntity, SOURCE_MODEL_TAG]
+  );
+  return { inserted: true };
 }
 
 /** Delete-and-reinsert one (source_table, project) manifest slice, in the caller's transaction. */
@@ -796,11 +860,17 @@ async function verifyProject(client, projectId, parsed) {
     if (rows.length !== 1) problems.push(`entity name=${JSON.stringify(entity.name)} project_id=${JSON.stringify(projectId)}: expected 1 live row, found ${rows.length}`);
   }
   for (const edge of parsed.edges) {
+    // I-10 supersession: scoped to THIS SCRIPT'S OWN tag, exactly like the
+    // write-path guard (edgeAlreadyWrittenByThisScript). The real `edges`
+    // table can legitimately carry OTHER writers' rows sharing this exact
+    // 4-tuple (a live write path, or the source graph's own pre-existing
+    // duplicates) -- an un-scoped count would false-positive on those,
+    // exactly the failure mode this fix exists to avoid.
     const { rows } = await client.query(
-      `SELECT 1 FROM edges WHERE project_id=$1 AND from_entity=$2 AND edge_type=$3 AND to_entity=$4`,
-      [projectId, edge.fromEntity, edge.edgeType, edge.toEntity]
+      `SELECT 1 FROM edges WHERE project_id=$1 AND from_entity=$2 AND edge_type=$3 AND to_entity=$4 AND source_model=$5`,
+      [projectId, edge.fromEntity, edge.edgeType, edge.toEntity, SOURCE_MODEL_TAG]
     );
-    if (rows.length !== 1) problems.push(`edge ${edge.fromEntity}->${edge.toEntity} (${edge.edgeType}) project_id=${JSON.stringify(projectId)}: expected 1 live row, found ${rows.length}`);
+    if (rows.length !== 1) problems.push(`edge ${edge.fromEntity}->${edge.toEntity} (${edge.edgeType}) project_id=${JSON.stringify(projectId)}: expected exactly 1 live row tagged source_model='${SOURCE_MODEL_TAG}', found ${rows.length}`);
   }
   return problems;
 }
@@ -983,6 +1053,7 @@ module.exports = {
   parseProjectMemoryDir,
   upsertEntity,
   upsertEdge,
+  edgeAlreadyWrittenByThisScript,
   writeManifestSlice,
   processProject,
   rollbackProject,

@@ -4,15 +4,9 @@
 -- migrate-09-file-memory-markdown.js (CONSOLIDATION-RUNBOOK.md §6.1(i)).
 -- Two additive, idempotent pieces:
 --
---   1. edges_project_from_type_to_unique -- confirmed ABSENT on the live
---      engine-core `edges` table (§6.1(i) point 4 / the runbook's §1.1
---      ground-truth note: "Whether `edges` carries a UNIQUE (project_id,
---      from_entity, edge_type, to_entity) constraint was not confirmed").
---      Without it, migrate-09-file-memory-markdown.js's edges upsert keyed
---      on (project_id, from_entity, edge_type, to_entity) would silently
---      duplicate rows on every re-run instead of upserting -- this index is
---      what makes that upsert actually safe rather than merely intended to
---      be.
+--   1. edges_project_from_type_to_idx (I-10, SUPERSEDED 2026-08-16 --
+--      see below) -- a plain, non-unique lookup index on
+--      edges(project_id, from_entity, edge_type, to_entity).
 --
 --   2. entities.entity_type DROP NOT NULL -- handoff-core-schema.sql
 --      declares `entity_type TEXT NOT NULL`. migrate-09-file-memory-
@@ -24,6 +18,49 @@
 --      type), so the column must accept NULL. `DROP NOT NULL` is
 --      idempotent: re-running it against an already-nullable column is a
 --      no-op, not an error.
+--
+-- SUPERSESSION (field finding, 2026-08-16, first real staging run):
+-- I-10's original mechanism was a UNIQUE index,
+-- `edges_project_from_type_to_unique`, on the same four columns, intended
+-- to make migrate-09's edges write an idempotent upsert
+-- (`ON CONFLICT ... DO UPDATE`). That UNIQUE index CANNOT coexist with
+-- this runbook's lossless-migration guarantee: staging's real `edges`
+-- table (populated by phase (c), migrate-verify-own-graph.js, from a
+-- source graph that predates any uniqueness constraint on this tuple)
+-- holds 12 duplicate 4-tuples that are informationally identical
+-- (same weight, source_model NULL, unsuppressed) but were faithfully
+-- migrated with their full multiplicity intact -- deduping them to satisfy
+-- a UNIQUE index would break T3's content-hash MULTISET reconciliation
+-- against the source, which counts occurrences, not distinct values. The
+-- source's historical duplicates are migrated by design, not a defect to
+-- clean up here.
+--
+-- The FIX keeps I-10's GOAL (a safe, idempotent per-run write path for
+-- migrate-09's own edges, plus fast lookup on this 4-tuple) while dropping
+-- its MECHANISM: a plain, non-unique index for lookup performance, paired
+-- with migrate-09-file-memory-markdown.js's own existence-guarded insert
+-- (scoped to this script's own `source_model` tag,
+-- `'markdown-migration-i'`) for idempotency, rather than a database-level
+-- UNIQUE constraint that has no way to distinguish "this script re-running"
+-- from "the source graph's own legitimate historical duplicates."
+--
+-- UPGRADE PATH (deterministic, both directions):
+--   - A target where `edges_project_from_type_to_unique` was never applied
+--     (e.g. staging, where CREATE UNIQUE INDEX failed against the 12
+--     existing duplicate tuples and nothing was left behind): the
+--     `DROP INDEX IF EXISTS` below is a no-op, and the plain index is
+--     created fresh.
+--   - A target where `edges_project_from_type_to_unique` DID succeed
+--     (e.g. a fresh dev/CI database with no pre-existing duplicates, where
+--     the original I-10 SQL had nothing to conflict with): the unique
+--     index is explicitly DROPPED and REPLACED with the plain index below
+--     -- deterministic convergence to ONE end state across every
+--     environment, rather than leaving some databases uniquely-constrained
+--     and others not. A database-level uniqueness guarantee that only
+--     holds on databases lucky enough to have started duplicate-free is
+--     not a guarantee at all, and every writer to `edges` (migrate-09
+--     re-runs, migrate-verify-own-graph.js, a future live write path)
+--     should observe the SAME constraint shape everywhere.
 --
 -- REGISTRATION: applied the SAME way every other migration script's OWN
 -- sql/*.sql file is (migrate-13-agent-exchange.js, migrate-14-seam-
@@ -40,7 +77,9 @@
 -- addendum) is the better fit of the two house patterns already in this
 -- repo).
 
-CREATE UNIQUE INDEX IF NOT EXISTS edges_project_from_type_to_unique
+DROP INDEX IF EXISTS edges_project_from_type_to_unique;
+
+CREATE INDEX IF NOT EXISTS edges_project_from_type_to_idx
   ON edges (project_id, from_entity, edge_type, to_entity);
 
 ALTER TABLE entities ALTER COLUMN entity_type DROP NOT NULL;
