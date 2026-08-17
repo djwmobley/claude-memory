@@ -1,7 +1,7 @@
 {
   "_doc": "Column manifest for the §3.5 store-wide caveman-economy gate (K-9 total classification). Derived from CONSOLIDATION-RUNBOOK.md §5 DDL + live memory_manager_staging INFORMATION_SCHEMA (2026-08-16). Scope: every TEXT/VARCHAR column on every §5 graph/corpus/seam table. Classes: checked-caveman (model-authored, economy+fidelity checked per row unless that row is tagged authoring_mode=verbose via the table authoring_mode_column, in which case economy is skipped but fidelity still applies) / checked-verbose-exempt (table default authoring_mode=verbose; economy exempt by design, fidelity still applies) / mandatory-caveman-no-column (no authoring_mode escape exists or ever will; economy+fidelity always enforced, 100% of rows) / exempt-not-model-authored (skipped entirely; reason field mandatory). `out_of_scope_tables` total-classifies every OTHER table/view in the live schema that is not part of §5 at all (§15/§17/§18 infrastructure, views) — together `tables` + `out_of_scope_tables` cover the ENTIRE live public schema, so the K-8 runtime completeness backstop can diff against the whole schema, not a pre-filtered §5 subset. Any (table,column) pair absent from BOTH is unclassified-LOUD-FAIL, never silently skipped. SAME-CHANGE RULE: any migration/PR that adds a text-bearing column to a §5 table (or a new table with text-bearing columns) MUST classify it in this manifest, in the SAME PR — this is not optional cleanup for later, because T7's K-8 completeness backstop fails the whole §15 acceptance battery on the very next run against real staging otherwise (this exact miss happened 2026-08-16: three sibling PRs — migrate-03's memory_entries.project_id/memory_entry_chunks.project_id backfill columns, and the phase-c own_graph_migration_ids lineage table from PRs #171/#174 — each landed without a manifest update, and the first post-merge T7 run against real memory_manager_staging correctly failed loud on all 7 unclassified columns).",
   "generated_at": "2026-08-16",
-  "last_updated": "2026-08-16 (own_graph_migration_ids + memory_entries.project_id/memory_entry_chunks.project_id added — PRs #169-179 same-change gap closed)",
+  "last_updated": "2026-08-16 (migrate-04-absorb-pipeline-tables.js, mm#11(e): sessions 14th seam table + pipeline_migration_row_ids lineage table added; migrated_legacy/memory_refs/playbook_refs/last_modified/section_idx correctly OMITTED -- non-TEXT types, out of K-8 completeness scope; lossless-fidelity TEXT columns on tasks/incidents/checklist_items/corpus_files/session_chunks classified)",
   "tables": {
     "entities": {
       "authoring_mode_column": null,
@@ -521,6 +521,14 @@
         "agent_id": {
           "class": "exempt-not-model-authored",
           "reason": "attribution column"
+        },
+        "notes": {
+          "class": "checked-caveman",
+          "reason": "migrate-04-absorb-pipeline-tables.js additive column (claude_context.tasks.notes, live schema-diff finding) -- model-authored task note text; no authoring_mode column on this table (always-caveman unless migrated_legacy=true)"
+        },
+        "blocker": {
+          "class": "checked-caveman",
+          "reason": "migrate-04-absorb-pipeline-tables.js additive column (claude_context.tasks.blocker, live schema-diff finding) -- model-authored blocker description; no authoring_mode column on this table (always-caveman unless migrated_legacy=true)"
         }
       }
     },
@@ -593,6 +601,10 @@
         "authoring_mode": {
           "class": "exempt-not-model-authored",
           "reason": "the authoring_mode flag column itself, not narrative prose"
+        },
+        "status": {
+          "class": "exempt-not-model-authored",
+          "reason": "migrate-04-absorb-pipeline-tables.js additive column (claude_policy_framework.incidents.status, live schema-diff finding) -- status flag, not narrative prose"
         }
       }
     },
@@ -657,6 +669,22 @@
         "agent_id": {
           "class": "exempt-not-model-authored",
           "reason": "attribution column"
+        },
+        "item_num": {
+          "class": "exempt-not-model-authored",
+          "reason": "migrate-04-absorb-pipeline-tables.js additive column (claude_policy_framework.checklist_items.item_num, live schema-diff finding) -- identifier, not narrative prose"
+        },
+        "owner_name": {
+          "class": "exempt-not-model-authored",
+          "reason": "migrate-04-absorb-pipeline-tables.js additive column (claude_policy_framework.checklist_items.owner, live schema-diff finding) -- identifier/attribution, not narrative prose"
+        },
+        "source_file": {
+          "class": "exempt-not-model-authored",
+          "reason": "migrate-04-absorb-pipeline-tables.js additive column (claude_policy_framework.checklist_items.source_file, live schema-diff finding) -- file path identifier"
+        },
+        "content_hash": {
+          "class": "exempt-not-model-authored",
+          "reason": "migrate-04-absorb-pipeline-tables.js additive column (claude_policy_framework.checklist_items.content_hash, live schema-diff finding) -- content hash, not narrative prose"
         }
       }
     },
@@ -691,6 +719,10 @@
         "agent_id": {
           "class": "exempt-not-model-authored",
           "reason": "attribution column"
+        },
+        "sha256": {
+          "class": "exempt-not-model-authored",
+          "reason": "migrate-04-absorb-pipeline-tables.js additive column (claude_policy_framework.corpus_files.sha256, live schema-diff finding) -- content hash, not narrative prose"
         }
       }
     },
@@ -859,6 +891,10 @@
         "agent_id": {
           "class": "exempt-not-model-authored",
           "reason": "attribution column"
+        },
+        "content_hash": {
+          "class": "exempt-not-model-authored",
+          "reason": "migrate-04-absorb-pipeline-tables.js additive column (both source dbs carry session_chunks.content_hash, live schema-diff finding) -- content hash, not narrative prose"
         }
       }
     },
@@ -971,6 +1007,62 @@
         "db_user": {
           "class": "exempt-not-model-authored",
           "reason": "forensic capture identifier, system-generated"
+        }
+      }
+    },
+    "sessions": {
+      "authoring_mode_column": "authoring_mode",
+      "default_authoring_mode": "verbose",
+      "columns": {
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "source_project_hint": {
+          "class": "exempt-not-model-authored",
+          "reason": "pre-migration DB-native project-hint audit trail, not model-authored narrative"
+        },
+        "summary": {
+          "class": "checked-verbose-exempt",
+          "reason": "model-authored session summary; table default authoring_mode=verbose (long-form session narrative, same §3.3 reasoning as research)"
+        },
+        "source_model": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "agent_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution column"
+        },
+        "authoring_mode": {
+          "class": "exempt-not-model-authored",
+          "reason": "the authoring_mode flag column itself, not narrative prose"
+        }
+      }
+    },
+    "pipeline_migration_row_ids": {
+      "authoring_mode_column": null,
+      "default_authoring_mode": null,
+      "columns": {
+        "source_db": {
+          "class": "exempt-not-model-authored",
+          "reason": "phase-e pipeline-tables migration provenance/lineage key (§6.1(e) E-6, mm#11(e)) -- source database identifier, not narrative prose"
+        },
+        "source_table": {
+          "class": "exempt-not-model-authored",
+          "reason": "phase-e migration provenance/lineage key -- source table identifier, not narrative prose"
+        },
+        "source_row_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "phase-e migration provenance/lineage key -- source row identifier, not narrative prose"
+        },
+        "project_id": {
+          "class": "exempt-not-model-authored",
+          "reason": "attribution/identifier column"
+        },
+        "target_table": {
+          "class": "exempt-not-model-authored",
+          "reason": "phase-e migration provenance/lineage key -- target table identifier, not narrative prose"
         }
       }
     }

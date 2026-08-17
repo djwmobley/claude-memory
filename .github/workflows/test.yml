@@ -512,6 +512,41 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run pipeline-tables absorption migration tests (§6.1(e), memory-manager#11(e))
+        # Tests scripts/migrations/migrate-04-absorb-pipeline-tables.js --
+        # absorbs pipeline's/claude_policy_framework's/claude_context's 14
+        # in-scope memory-nature tables (the 13 §5.3 seam tables + `sessions`,
+        # the 14th, added by this PR per E-2) into the structured target
+        # tables. Covers: db-triage.json total classification (E-1/E-8,
+        # REAL-MIGRATE/EPHEMERAL-DROP/OWNER-REVIEW/ENGINE-INFRA, UNCLASSIFIED
+        # default-refuse branch); claude-context-topic-rules.json's ordered
+        # CONTAINS classifier (E-11, first-match-wins, excluded-bucket
+        # routing, unmatched-<word> fallback); pipeline-db-project-map.json's
+        # DB-level derivation + never-guessed unmapped-pipeline-db-<name>
+        # fallback; task_id total classification (E-10: null/valid-
+        # remappable/dangling-pre-existing); the column-shape precondition
+        # (a live column with no COLUMN_MAPS entry refuses loud rather than
+        # silently dropping data -- a real live-schema-drift finding this
+        # PR's own authoring made, beyond E-1..E-15); lineage idempotency via
+        # pipeline_migration_row_ids (E-6 -- a second insert attempt for the
+        # SAME source row is a no-op, never natural-key/content matched);
+        # decisions' topic-disambiguation path (E-3/E-12 -- a genuinely
+        # distinct row sharing a (project_id,topic) key with an existing row
+        # is disambiguated and preserved, never silently dropped -- the
+        # design this PR's own real staging run corrected after an initial
+        # cut collapsed 13 real pipeline_pipeline.decisions "branch-
+        # completion" rows to 1); and rollback scoping (a real bug found
+        # authoring this script -- an unscoped rollback query previously
+        # reached into a DIFFERENT migration script's manifest bookkeeping
+        # for the same source_db). Self-contained: creates/drops its own
+        # `_staging`-suffixed scratch target + scratch source databases;
+        # never touches claude_policy_framework/pipeline_pipeline/
+        # claude_context/memory_manager_staging.
+        run: node test/migrations/test-migrate-04-absorb-pipeline-tables.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run seam-libraries smoke tests (§7.1-§7.8, issue #17)
         # Tests scripts/migrations/verify-19-seams-smoke.js (30-check operator
         # smoke test) and its regression harness test/migrations/test-verify-19.js

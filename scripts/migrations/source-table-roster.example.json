@@ -4,7 +4,11 @@
     "source_db": "example_source_db",
     "source_table": "example_decisions",
     "targetTable": "decisions",
-    "loadBearingCols": ["topic", "decision", "reason"],
+    "loadBearingCols": [
+      "topic",
+      "decision",
+      "reason"
+    ],
     "hasContentBearingText": true,
     "requires_project_id_scope": true
   },
@@ -12,7 +16,9 @@
     "source_db": "example_source_db",
     "source_table": "example_session_chunks",
     "targetTable": "session_chunks",
-    "loadBearingCols": ["chunk_text"],
+    "loadBearingCols": [
+      "chunk_text"
+    ],
     "hasContentBearingText": true,
     "requires_project_id_scope": true,
     "embeddingCol": "embedding",
@@ -22,7 +28,9 @@
     "source_db": "filesystem:/path/to/HANDOFF.md",
     "source_table": "handoff_session_blocks",
     "targetTable": "memory_entries",
-    "loadBearingCols": ["body"],
+    "loadBearingCols": [
+      "body"
+    ],
     "hasContentBearingText": true,
     "requires_project_id_scope": true,
     "contentCol": "body"
@@ -31,7 +39,10 @@
     "source_db": "example_source_db",
     "source_table": "example_tasks",
     "targetTable": "tasks",
-    "loadBearingCols": ["title", "status"],
+    "loadBearingCols": [
+      "title",
+      "status"
+    ],
     "hasContentBearingText": false,
     "requires_project_id_scope": true
   },
@@ -40,7 +51,10 @@
     "source_db": "filesystem:C:/example/project/HANDOFF.md",
     "source_table": "handoff_next_session_items",
     "targetTable": "assertions",
-    "loadBearingCols": ["subject", "object"],
+    "loadBearingCols": [
+      "subject",
+      "object"
+    ],
     "hasContentBearingText": true,
     "requires_project_id_scope": true
   },
@@ -49,7 +63,10 @@
     "source_db": "filesystem:C:/example/project/HANDOFF.md",
     "source_table": "handoff_active_session_summary",
     "targetTable": "assertions",
-    "loadBearingCols": ["subject", "object"],
+    "loadBearingCols": [
+      "subject",
+      "object"
+    ],
     "hasContentBearingText": true,
     "requires_project_id_scope": true
   },
@@ -58,7 +75,10 @@
     "source_db": "net-new:memory_manager",
     "source_table": "routing_profiles",
     "targetTable": "routing_profiles",
-    "loadBearingCols": ["role", "preferred_model"],
+    "loadBearingCols": [
+      "role",
+      "preferred_model"
+    ],
     "hasContentBearingText": false,
     "requires_project_id_scope": true
   },
@@ -67,7 +87,11 @@
     "source_db": "claude_memory_eval_test",
     "source_table": "assertions",
     "targetTable": "assertions",
-    "loadBearingCols": ["subject", "predicate", "object"],
+    "loadBearingCols": [
+      "subject",
+      "predicate",
+      "object"
+    ],
     "hasContentBearingText": true,
     "requires_project_id_scope": true,
     "embeddingCol": "embedding"
@@ -76,7 +100,11 @@
     "source_db": "claude_memory_eval_test",
     "source_table": "entities",
     "targetTable": "entities",
-    "loadBearingCols": ["name", "entity_type", "description"],
+    "loadBearingCols": [
+      "name",
+      "entity_type",
+      "description"
+    ],
     "hasContentBearingText": true,
     "requires_project_id_scope": true
   },
@@ -84,7 +112,11 @@
     "source_db": "claude_memory_eval_test",
     "source_table": "edges",
     "targetTable": "edges",
-    "loadBearingCols": ["from_entity", "edge_type", "to_entity"],
+    "loadBearingCols": [
+      "from_entity",
+      "edge_type",
+      "to_entity"
+    ],
     "hasContentBearingText": false,
     "requires_project_id_scope": true
   },
@@ -92,7 +124,10 @@
     "source_db": "claude_memory_eval_test",
     "source_table": "retrieval_contract",
     "targetTable": "retrieval_contract",
-    "loadBearingCols": ["name", "queries"],
+    "loadBearingCols": [
+      "name",
+      "queries"
+    ],
     "hasContentBearingText": false,
     "requires_project_id_scope": true
   },
@@ -100,7 +135,12 @@
     "source_db": "claude_memory_eval_test",
     "source_table": "retrieval_contract_history",
     "targetTable": "retrieval_contract_history",
-    "loadBearingCols": ["name", "version", "queries", "change_note"],
+    "loadBearingCols": [
+      "name",
+      "version",
+      "queries",
+      "change_note"
+    ],
     "hasContentBearingText": false,
     "requires_project_id_scope": true
   },
@@ -108,7 +148,10 @@
     "source_db": "claude_memory_eval_test",
     "source_table": "project_settings",
     "targetTable": "project_settings",
-    "loadBearingCols": ["key", "value"],
+    "loadBearingCols": [
+      "key",
+      "value"
+    ],
     "hasContentBearingText": false,
     "requires_project_id_scope": true
   },
@@ -116,7 +159,12 @@
     "source_db": "claude_memory_eval_test",
     "source_table": "entity_communities",
     "targetTable": "entity_communities",
-    "loadBearingCols": ["entity_name", "community_id", "level", "run_id"],
+    "loadBearingCols": [
+      "entity_name",
+      "community_id",
+      "level",
+      "run_id"
+    ],
     "hasContentBearingText": false,
     "requires_project_id_scope": true
   },
@@ -124,7 +172,11 @@
     "source_db": "claude_memory_eval_test",
     "source_table": "extraction_queue",
     "targetTable": "extraction_queue",
-    "loadBearingCols": ["payload", "source_ref", "status"],
+    "loadBearingCols": [
+      "payload",
+      "source_ref",
+      "status"
+    ],
     "hasContentBearingText": false,
     "requires_project_id_scope": true
   },
@@ -132,7 +184,10 @@
     "source_db": "claude_memory_eval_test",
     "source_table": "retrieval_events",
     "targetTable": "retrieval_events",
-    "loadBearingCols": ["query_text", "session_id"],
+    "loadBearingCols": [
+      "query_text",
+      "session_id"
+    ],
     "hasContentBearingText": true,
     "requires_project_id_scope": true
   },
@@ -140,8 +195,262 @@
     "source_db": "claude_memory_eval_test",
     "source_table": "retrieval_event_assertions",
     "targetTable": "retrieval_event_assertions",
-    "loadBearingCols": ["event_id", "assertion_id"],
+    "loadBearingCols": [
+      "event_id",
+      "assertion_id"
+    ],
     "hasContentBearingText": false,
     "requires_project_id_scope": false
+  },
+  {
+    "_comment": "migrate-04-absorb-pipeline-tables.js (§6.1(e), mm#11(e)) roster entries. claude_policy_framework is already-public (migrate-02-decisions.js's own hardcoded DEFAULT_SOURCE_DB), kept literal; pipeline_pipeline/claude_context are NOT hardcoded anywhere in migrate-04's own committed source (only in its gitignored db-triage.json/pipeline-db-project-map.json config), so they are SYNTHETIC placeholders here."
+  },
+  {
+    "source_db": "claude_policy_framework",
+    "source_table": "gotchas",
+    "targetTable": "gotchas",
+    "loadBearingCols": [
+      "issue",
+      "rule"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "claude_policy_framework",
+    "source_table": "checklist_items",
+    "targetTable": "checklist_items",
+    "loadBearingCols": [
+      "title",
+      "description",
+      "verification_step"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "claude_policy_framework",
+    "source_table": "corpus_files",
+    "targetTable": "corpus_files",
+    "loadBearingCols": [
+      "summary"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "claude_policy_framework",
+    "source_table": "policy_sections",
+    "targetTable": "policy_sections",
+    "loadBearingCols": [
+      "content"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "claude_policy_framework",
+    "source_table": "session_chunks",
+    "targetTable": "session_chunks",
+    "loadBearingCols": [
+      "content"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "claude_policy_framework",
+    "source_table": "sessions",
+    "targetTable": "sessions",
+    "loadBearingCols": [
+      "summary"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "example_pipeline_main_db",
+    "source_table": "decisions",
+    "targetTable": "decisions",
+    "loadBearingCols": [
+      "topic",
+      "decision",
+      "reason"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "example_pipeline_main_db",
+    "source_table": "gotchas",
+    "targetTable": "gotchas",
+    "loadBearingCols": [
+      "issue",
+      "rule"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "example_pipeline_main_db",
+    "source_table": "findings",
+    "targetTable": "findings",
+    "loadBearingCols": [
+      "description",
+      "impact",
+      "remediation"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "example_pipeline_main_db",
+    "source_table": "code_index",
+    "targetTable": "code_index",
+    "loadBearingCols": [
+      "description"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "example_pipeline_main_db",
+    "source_table": "tasks",
+    "targetTable": "tasks",
+    "loadBearingCols": [
+      "title"
+    ],
+    "hasContentBearingText": false,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "example_pipeline_main_db",
+    "source_table": "workflow_discovery",
+    "targetTable": "workflow_discovery",
+    "loadBearingCols": [
+      "title",
+      "detail"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "example_pipeline_main_db",
+    "source_table": "agent_rewrites",
+    "targetTable": "agent_rewrites",
+    "loadBearingCols": [
+      "as_is",
+      "to_be",
+      "gap"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "example_pipeline_main_db",
+    "source_table": "policy_sections",
+    "targetTable": "policy_sections",
+    "loadBearingCols": [
+      "content"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "example_pipeline_main_db",
+    "source_table": "session_chunks",
+    "targetTable": "session_chunks",
+    "loadBearingCols": [
+      "content"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "example_pipeline_main_db",
+    "source_table": "sessions",
+    "targetTable": "sessions",
+    "loadBearingCols": [
+      "summary"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "example_shared_context_db",
+    "source_table": "decisions",
+    "targetTable": "decisions",
+    "loadBearingCols": [
+      "topic",
+      "decision",
+      "reason"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "example_shared_context_db",
+    "source_table": "gotchas",
+    "targetTable": "gotchas",
+    "loadBearingCols": [
+      "issue",
+      "rule"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "example_shared_context_db",
+    "source_table": "research",
+    "targetTable": "research",
+    "loadBearingCols": [
+      "title",
+      "body"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "example_shared_context_db",
+    "source_table": "code_index",
+    "targetTable": "code_index",
+    "loadBearingCols": [
+      "description"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "example_shared_context_db",
+    "source_table": "tasks",
+    "targetTable": "tasks",
+    "loadBearingCols": [
+      "title"
+    ],
+    "hasContentBearingText": false,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "example_shared_context_db",
+    "source_table": "sessions",
+    "targetTable": "sessions",
+    "loadBearingCols": [
+      "summary"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
+  },
+  {
+    "source_db": "example_pipeline_main_db",
+    "source_table": "incidents",
+    "targetTable": "incidents",
+    "loadBearingCols": [
+      "title",
+      "what_happened",
+      "what_we_did",
+      "watch_for"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true
   }
 ]
