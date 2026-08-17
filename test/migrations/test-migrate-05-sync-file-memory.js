@@ -525,6 +525,89 @@ async function main() {
         );
         assert(rows[0].n === 0, `expected zero exclusion manifest rows after rollback, got ${rows[0].n}`);
       });
+
+      // ── run(targetDbName) IN-PROCESS safety (independent review, PR #190) ──
+      // T8's own header comment (and this script's own header comment on
+      // run()) states run() is require()'d and called IN-PROCESS, no
+      // child_process. A process.exit() anywhere reachable via run() would
+      // kill the ENTIRE calling harness process instead of surfacing a
+      // catchable failure. These tests wrap process.exit itself with a
+      // guard that THROWS instead of exiting -- if the regression this
+      // review found ever reappears, these tests fail loud with the exact
+      // "process.exit(N) was called" message, rather than silently
+      // terminating the whole test runner the way the original bug would.
+      {
+        const DB_TRIAGE_REAL_PATH = migrate05.DB_TRIAGE_PATH;
+        const originalDbTriageContent = fs.existsSync(DB_TRIAGE_REAL_PATH) ? fs.readFileSync(DB_TRIAGE_REAL_PATH, 'utf8') : null;
+
+        function installExitGuard() {
+          const originalExit = process.exit;
+          process.exit = (code) => {
+            throw new Error(`process.exit(${code}) was called -- run() must never terminate the host process (T8's own before/after diff, T6 re-run, and DB-client cleanup would all be skipped)`);
+          };
+          return () => { process.exit = originalExit; };
+        }
+        function restoreDbTriage() {
+          if (originalDbTriageContent !== null) fs.writeFileSync(DB_TRIAGE_REAL_PATH, originalDbTriageContent, 'utf8');
+          else { try { fs.rmSync(DB_TRIAGE_REAL_PATH, { force: true }); } catch (_) { /* best-effort */ } }
+        }
+
+        await run('RUN-1', 'run(): a db-triage classification refusal is a catchable false, never process.exit() (the reviewer\'s adversarial construction)', async () => {
+          fs.writeFileSync(DB_TRIAGE_REAL_PATH, JSON.stringify({ databases: {} }), 'utf8'); // neither absorb source classified -- Step A must refuse
+          const restoreExit = installExitGuard();
+          try {
+            const result = await migrate05.run(TARGET_DB);
+            assert(result === false, `expected run() to resolve false on a classification refusal, got ${JSON.stringify(result)}`);
+          } finally {
+            restoreExit();
+            restoreDbTriage();
+          }
+        });
+
+        await run('RUN-2', 'run(): a genuine success path resolves true, never process.exit()', async () => {
+          // ABSORB_SOURCE_DBS/EXCLUDED_SOURCE_DBS are plain exported arrays/
+          // objects -- run(targetDbName)'s single-argument contract has no
+          // slot for overriding them (unlike runStepA/runStepB's own test-only
+          // params), so an in-place mutation of the SAME array/object
+          // reference runStepA/runStepB's default parameters resolve at call
+          // time is the only way to redirect Step A/B away from the real,
+          // hardcoded claude_policy_framework/pipeline_pipeline/eval-fixture
+          // names without ever touching them -- restored in the finally below
+          // regardless of outcome. Step C's filesystem scan has no such
+          // override (enumerateMemoryBearingDirs/DEFAULT_PROJECTS_ROOT are
+          // captured by value at module load, not overridable via run()),
+          // so this ONE test deliberately reads this machine's real
+          // ~/.claude/projects content into the disposable scratch TARGET_DB
+          // -- a narrow, explicit exception to this suite's otherwise-
+          // synthetic-only fixtures, required because run()'s own contract
+          // (not a parameter this script controls) is what's under test.
+          const HAPPY_A = `migrate05_happy_a_${stamp}`;
+          const HAPPY_B = `migrate05_happy_b_${stamp}`;
+          await createDb(HAPPY_A);
+          await createDb(HAPPY_B);
+          const savedAbsorbDbs = migrate05.ABSORB_SOURCE_DBS.slice();
+          migrate05.ABSORB_SOURCE_DBS.length = 0;
+          migrate05.ABSORB_SOURCE_DBS.push(HAPPY_A, HAPPY_B);
+          const savedExcludedDbs = { ...migrate05.EXCLUDED_SOURCE_DBS };
+          for (const k of Object.keys(migrate05.EXCLUDED_SOURCE_DBS)) delete migrate05.EXCLUDED_SOURCE_DBS[k];
+
+          fs.writeFileSync(DB_TRIAGE_REAL_PATH, JSON.stringify({ databases: { [HAPPY_A]: 'REAL-MIGRATE', [HAPPY_B]: 'REAL-MIGRATE' } }), 'utf8');
+          const restoreExit = installExitGuard();
+          try {
+            const result = await migrate05.run(TARGET_DB);
+            assert(result === true, `expected run() to resolve true on the happy path, got ${JSON.stringify(result)}`);
+          } finally {
+            restoreExit();
+            migrate05.ABSORB_SOURCE_DBS.length = 0;
+            migrate05.ABSORB_SOURCE_DBS.push(...savedAbsorbDbs);
+            for (const k of Object.keys(migrate05.EXCLUDED_SOURCE_DBS)) delete migrate05.EXCLUDED_SOURCE_DBS[k];
+            Object.assign(migrate05.EXCLUDED_SOURCE_DBS, savedExcludedDbs);
+            restoreDbTriage();
+            await dropDb(HAPPY_A);
+            await dropDb(HAPPY_B);
+          }
+        });
+      }
     } finally {
       await tgt.end();
     }

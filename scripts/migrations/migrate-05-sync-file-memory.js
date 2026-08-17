@@ -134,6 +134,7 @@ const { Client } = require('pg');
 
 const migrateOne = require('./migrate-01-canonical-db');                 // reused by reference
 const shared = require('./lib/verify15-shared');                          // reused by reference
+const migrate03 = require('./migrate-03-corpus-project-id');              // reused by reference: ORPHAN_PROJECT_ID, the ONE canonical orphan-project-id sentinel
 const migrate04 = require('./migrate-04-absorb-pipeline-tables');         // reused by reference: lineage helpers, db-triage, manifest writer
 const migrate09 = require('./migrate-09-file-memory-markdown');           // reused by reference: enrollment config, classifier, file walk, frontmatter/type parsing
 const { chunkText } = require('../pipeline-chunker');                     // reused by reference
@@ -178,7 +179,18 @@ const ABSORB_MANIFEST_LABELS = {
   memory_entries: 'memory_entries_db_absorb',
   memory_entry_chunks: 'memory_entry_chunks_db_absorb',
 };
-const ORPHAN_NULL_PROJECT_BUCKET = 'orphan-null-project-id-memory-entries';
+// NON-BLOCKING REVIEW NOTE ADDRESSED (PR #190, independent review,
+// 2026-08-17): this NULL-project_id defensive fallback is unreachable
+// under the declared a -> d -> f run order -- phase (d) backfills every
+// row's project_id to a non-NULL value, INCLUDING minting this exact
+// sentinel string for its own unmapped rows, before (f) ever runs. If this
+// branch ever does fire (a mis-sequenced run), it now lands under the SAME
+// canonical orphan bucket migrate-03 already uses (migrate03.
+// ORPHAN_PROJECT_ID), not a second, distinct sentinel literal -- closing
+// the "two different orphan-sentinel strings for the same condition" risk
+// the review flagged, by reusing the exported constant instead of
+// duplicating its value.
+const ORPHAN_NULL_PROJECT_BUCKET = migrate03.ORPHAN_PROJECT_ID;
 
 // ── Step B: exclusions (F5-11) ──────────────────────────────────────────
 const EXCLUDED_SOURCE_DBS = {
@@ -360,6 +372,20 @@ async function absorbTable(tgtClient, srcClient, sourceDb, table, entryIdMap, dr
   return { perSlice };
 }
 
+/**
+ * FIELD-FOUND FIX (independent review, PR #190, 2026-08-17): this function
+ * is reachable from `run(targetDbName)`, which `verify-15-t8-idempotency.js`
+ * calls IN-PROCESS (no child_process, per that script's own documented
+ * contract). A `process.exit(1)` here previously killed the ENTIRE T8
+ * harness process on a classification refusal -- skipping T8's own before/
+ * after diff, its T6 re-run, and its `finally { await client.end(); }`
+ * cleanup -- instead of surfacing as a normal, catchable T8 FAIL. Refusal
+ * is now a returned `{ refused: true, ... }` result; the CLI-only caller
+ * (main(), itself only ever process.exit()-ing from the `require.main ===
+ * module` guard at the bottom of this file) is the one place that turns a
+ * refusal into an exit code. runStepA itself never touches process exit
+ * state, exactly like every other exported helper in this file.
+ */
 async function runStepA(tgtClient, dbTriage, dryRun, log, absorbSourceDbs = ABSORB_SOURCE_DBS) {
   const misclassified = absorbSourceDbs
     .map((db) => ({ db, cls: migrate04.classifyDb(db, dbTriage) }))
@@ -368,7 +394,7 @@ async function runStepA(tgtClient, dbTriage, dryRun, log, absorbSourceDbs = ABSO
     console.error(`Refused (Step A total classification): ${misclassified.length} absorb-source DB(s) are not classified REAL-MIGRATE in db-triage.json:`);
     for (const m of misclassified) console.error(`  - "${m.db}": classified "${m.cls}"`);
     console.error('Step A never connects to a source it has not confirmed REAL-MIGRATE. Nothing was touched.');
-    process.exit(1);
+    return { refused: true, misclassified, perSlice: [], precheckFailures: [] };
   }
 
   const perSliceAll = [];
@@ -397,7 +423,7 @@ async function runStepA(tgtClient, dbTriage, dryRun, log, absorbSourceDbs = ABSO
       await srcClient.end();
     }
   }
-  return { perSlice: perSliceAll, precheckFailures };
+  return { refused: false, perSlice: perSliceAll, precheckFailures };
 }
 
 // ─── STEP B: EXCLUSIONS (F5-11) ─────────────────────────────────────────────
@@ -753,6 +779,24 @@ async function rollbackExclusions(tgtClient, log, excludedSourceDbs = EXCLUDED_S
 
 // ─── MAIN ───────────────────────────────────────────────────────────────────
 
+/**
+ * FIELD-FOUND FIX (independent review, PR #190, 2026-08-17): main() is
+ * reachable IN-PROCESS via run(targetDbName) (verify-15-t8-idempotency.js's
+ * documented --rerun-module contract, no child_process). Every refusal path
+ * that IS reachable via run() now RETURNS `true`/`false` (pass/fail)
+ * instead of calling `process.exit()` -- a `process.exit()` here would kill
+ * the entire calling harness process (e.g. T8's own diff/T6-recheck/
+ * cleanup), not just this script's own run. Only `process.exit(2)` (bad
+ * CLI usage) and `process.exit(0)` (--help) remain, because run() always
+ * constructs a well-formed `--db <name>` argv itself and can never reach
+ * either of those two branches -- they are exclusively reachable from the
+ * `require.main === module` CLI entry point at the bottom of this file,
+ * which is the ONE place in this script allowed to touch process exit
+ * state at all (mirrors the "CLI path keeps its exit-code behavior, run()
+ * never touches process exit state" shape used elsewhere in this repo).
+ *
+ * @returns {Promise<boolean>} true = PASS, false = refused/FAIL.
+ */
 async function main() {
   let parsed;
   try {
@@ -773,13 +817,13 @@ async function main() {
   const { name: target, source: targetSource } = migrateOne.resolveTargetDb({ db: parsed.db });
   if (!migrateOne.DB_NAME_RE.test(target)) {
     console.error(`Invalid database name "${target}" (from ${targetSource}) — must match /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/.`);
-    process.exit(1);
+    return false;
   }
   const classification = migrateOne.classifyTarget(target);
   if (!classification.allowed) {
     console.error(`Refused: ${classification.reason}`);
     console.error(`(resolved from ${targetSource} — no database connection was opened.)`);
-    process.exit(1);
+    return false;
   }
 
   const dbTriage = migrate04.loadDbTriage(parsed.dbTriagePath);
@@ -790,7 +834,6 @@ async function main() {
   const tgtClient = new Client(migrateOne.pgConfig(target));
   await tgtClient.connect();
 
-  let exitCode = 0;
   const report = { target, mode: parsed.rollback ? 'rollback' : parsed.dryRun ? 'dry-run' : 'migrate' };
 
   try {
@@ -802,16 +845,14 @@ async function main() {
     const missingTables = PREREQUISITE_TABLES.filter((t) => !found.has(t));
     if (missingTables.length) {
       console.error(`Refused: target "${target}" is missing table(s): ${missingTables.join(', ')}. Run migrate-01-canonical-db.js first.`);
-      process.exitCode = 1;
-      return;
+      return false;
     }
     const { rows: colRows } = await tgtClient.query(`SELECT table_name, column_name FROM information_schema.columns WHERE table_schema=current_schema()`);
     const colSet = new Set(colRows.map((r) => `${r.table_name}.${r.column_name}`));
     const missingCols = PREREQUISITE_COLUMNS.filter((c) => !colSet.has(`${c.table}.${c.column}`));
     if (missingCols.length) {
       console.error(`Refused: target "${target}" is missing column(s): ${missingCols.map((c) => `${c.table}.${c.column}`).join(', ')}. Run migrate-03-corpus-project-id.js first.`);
-      process.exitCode = 1;
-      return;
+      return false;
     }
 
     await shared.applyDdl(tgtClient); // migration_manifest + pipeline_migration_row_ids + siblings
@@ -846,12 +887,17 @@ async function main() {
       const absorbResult = await rollbackAbsorb(tgtClient, console.log);
       await rollbackExclusions(tgtClient, console.log);
       console.log(`ROLLBACK_RESULT: PASS (step_c_entries_deleted=${totalEntriesDeleted}, step_a_rows_deleted=${absorbResult.totalDeleted})`);
-      exitCode = 0;
-      return;
+      return true;
     }
 
     // ── STEP A ──────────────────────────────────────────────────────────
     const stepA = await runStepA(tgtClient, dbTriage, parsed.dryRun, console.log);
+    if (stepA.refused) {
+      report.stepA = { refused: true, misclassified: stepA.misclassified };
+      console.log(JSON.stringify(report, null, 2));
+      console.log('MIGRATION_RESULT: FAIL (Step A refused -- see db-triage classification errors above)');
+      return false;
+    }
     report.stepA = { perSlice: stepA.perSlice, precheckFailures: stepA.precheckFailures };
     console.log('Step A (DB-absorb) per-slice report:');
     let stepAReconciliationFailures = 0;
@@ -885,18 +931,19 @@ async function main() {
     report.result = pass ? 'PASS' : 'FAIL';
     console.log(JSON.stringify(report, null, 2));
     console.log(`MIGRATION_RESULT: ${pass ? 'PASS' : 'FAIL'} (step_a_precheck_failures=${stepA.precheckFailures.length}, step_a_reconciliation_failures=${stepAReconciliationFailures})`);
-    exitCode = pass ? 0 : 1;
+    return pass;
   } finally {
     await tgtClient.end();
   }
-  process.exitCode = exitCode;
 }
 
 if (require.main === module) {
-  main().catch((err) => {
-    console.error(err && err.stack ? err.stack : err);
-    process.exitCode = 1;
-  });
+  main()
+    .then((ok) => { process.exitCode = ok ? 0 : 1; })
+    .catch((err) => {
+      console.error(err && err.stack ? err.stack : err);
+      process.exitCode = 1;
+    });
 }
 
 /**
@@ -908,12 +955,21 @@ if (require.main === module) {
  * this shape -- verify-15-t8-idempotency.js's own header comment names the
  * absence of any pluggable script as a stated blind spot; this closes it
  * for phase (f) specifically.
+ *
+ * FIELD-FOUND FIX (independent review, PR #190, 2026-08-17): run() now
+ * returns main()'s own boolean result directly and never reads or writes
+ * `process.exitCode` -- the prior `process.exitCode === 0 || undefined`
+ * read was itself fragile (a global, process-wide flag that could already
+ * be non-zero for a reason unrelated to this call, or left stale by a
+ * concurrent caller), on top of the process.exit() crash this same review
+ * found. run() is now a pure in-process call: it can only resolve `true`/
+ * `false` or reject with whatever main() itself throws -- never terminate
+ * the host process.
  */
 async function run(targetDbName) {
   const argv = ['--db', targetDbName];
   process.argv = [process.argv[0], process.argv[1] || __filename, ...argv];
-  await main();
-  return process.exitCode === 0 || process.exitCode === undefined;
+  return main();
 }
 
 module.exports = {
