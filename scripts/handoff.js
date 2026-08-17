@@ -1495,9 +1495,16 @@ function _hashSchemaFileNormalized(filePath) {
  * @returns {string} "<SCHEMA_EPOCH>:<sha256 hex>"
  */
 function _computeSchemaFingerprint(units) {
-  const sorted = [...units].sort((a, b) => (
-    a.basename < b.basename ? -1 : a.basename > b.basename ? 1 : 0
-  ));
+  // cm#185 review N3: sort key is the LOWERCASED basename per R-3's identity
+  // rule (identity = basename.toLowerCase()), not the raw basename. Every
+  // current unit basename is already all-lowercase so this is a no-op today,
+  // but keeps the sort order stable once a mixed-case unit is ever added
+  // (case-fold collisions are already rejected earlier, in classifySchemaFiles).
+  const sorted = [...units].sort((a, b) => {
+    const al = a.basename.toLowerCase();
+    const bl = b.basename.toLowerCase();
+    return al < bl ? -1 : al > bl ? 1 : 0;
+  });
   const hash = crypto.createHash('sha256');
   for (const u of sorted) {
     hash.update(u.basename + '\0' + _hashSchemaFileNormalized(u.fullPath), 'utf8');
@@ -1715,6 +1722,21 @@ async function clearSchemaDegradation(db, projectId) {
  * @returns {Promise<{applied:boolean, reason:string, detail?:object}>}
  */
 async function ensureSchemaCurrent(db, projectId, { silent } = {}) {
+  // cm#185 review N5: classification (a non-recursive readdir, a `git
+  // ls-files` spawn, and reading+parsing all ~5 small scripts/sql/*.sql files
+  // for their header directives) now runs on EVERY call, including the
+  // common "schema is current" case — this is genuinely more work than the
+  // pre-cm#185 "one SELECT" hot path, and was necessary to make the total-
+  // classification safety guarantee (S-5: an untracked/unclassified file is
+  // always caught, not just at apply time) hold on every invocation, not only
+  // when something is about to change. Measured, not assumed: a
+  // bench-handoff.js `resume` A/B (n=15 each, this project's own
+  // claude_memory_eval_test-backed loop) against pre-cm#185 main (commit
+  // 2fdd52c) showed p50 wall 282.8ms / p50 internal 225.9ms on main vs. p50
+  // wall 276.2ms / p50 internal 227.2ms on this branch — within normal
+  // run-to-run noise (DB round-trips dominate this path; see the datapoint
+  // in the PR body). Left unoptimized; revisit if a future profile shows
+  // otherwise.
   let classification;
   try {
     classification = classifySchemaFiles({ engineRoot: _ENGINE_ROOT });
@@ -1741,7 +1763,9 @@ async function ensureSchemaCurrent(db, projectId, { silent } = {}) {
 
   const currentFingerprint = _computeSchemaFingerprint(units);
 
-  // Hot path: one SELECT.
+  // Fingerprint comparison: one SELECT (the DB round-trip is the dominant
+  // cost on the "schema is current" path — see the N5 note above the
+  // classification call for why this is no longer literally "the only work").
   const { rows } = await db.query(
     'SELECT value FROM project_settings WHERE project_id = $1 AND key = $2',
     [projectId, 'schema_fingerprint']
@@ -1769,7 +1793,16 @@ async function ensureSchemaCurrent(db, projectId, { silent } = {}) {
   }
 
   const lockKey = 'schema_apply:' + projectId;
-  await db.acquireSchemaApplyLock(lockKey);
+  try {
+    await db.acquireSchemaApplyLock(lockKey);
+  } catch (lockErr) {
+    // cm#185 review N1: bounded acquire (db-seam.js SET lock_timeout) means a
+    // wedged/long-lived concurrent holder throws here instead of hanging this
+    // process forever. Treat exactly like any other apply-time failure: loud,
+    // non-fatal, retried on the next invocation.
+    await recordSchemaDegradation(db, projectId, 'lock_acquire_failed', { message: lockErr.message }, { silent });
+    return { applied: false, reason: 'lock_acquire_failed', detail: { message: lockErr.message } };
+  }
   try {
     // Re-check immediately after acquiring the lock — a concurrent process
     // may have already applied and upserted while we were waiting; if so,
@@ -2013,6 +2046,23 @@ async function cmdInit(args) {
     process.exit(1);
   }
 
+  // cm#185 review N2: take the same session-scoped schema-apply advisory lock
+  // here that ensureSchemaCurrent takes on the drift-apply path — previously
+  // only the sentinel path was locked, leaving a window where a concurrent
+  // `init` and a concurrent drift-apply (or two concurrent inits) could
+  // interleave their per-file apply transactions. Bounded (N1): a wedged
+  // holder degrades init loud-and-non-destructively rather than hanging the
+  // CLI process forever.
+  const initLockKey = 'schema_apply:' + projectId;
+  try {
+    await db.acquireSchemaApplyLock(initLockKey);
+  } catch (lockErr) {
+    await db.end();
+    console.log(`  [FAIL]  Could not acquire schema-apply lock — ${lockErr.message}`);
+    unwindFsLedger();  // ledger is empty at this point — prints accurate status
+    process.exit(1);
+  }
+
   // Step 7: apply the classified unit set via the same engine used by the
   // drift sentinel (applyAdditiveSchema) — per-file transaction, fail-fast:
   // a failing unit stops the sequence; units already committed before it stay
@@ -2034,6 +2084,7 @@ async function cmdInit(args) {
   //       explicit operator authorization, not a routine command.
   const applyResult = await applyAdditiveSchema(db, units, { silent: false });
   if (!applyResult.ok) {
+    await db.releaseSchemaApplyLock(initLockKey);
     await db.end();
     console.log(`  [FAIL]  Schema apply failed on ${applyResult.failedUnit} — ${applyResult.errorMsg}`);
     console.log(`  [FAIL]  That unit's transaction rolled back; earlier unit(s) already applied remain committed: ${applyResult.appliedUnits.join(', ') || '(none)'}`);
@@ -2067,15 +2118,27 @@ async function cmdInit(args) {
   // extension absence (the expected-objects lists in schema-manifest.json
   // deliberately exclude the pgvector/pg_trgm-gated objects — see that
   // file's handoff-core-schema.sql "_note").
+  //
+  // Deliberately excludes any integrity index whose applyResult.integrityResults
+  // entry is ok:false (review B1 fix): a legacy-duplicate corpus that blocks
+  // assertions_1to1_unique/assertions_1ton_exact_unique creation is a WARN,
+  // non-fatal condition (see the loop above and the §7 SKIP decision) — it
+  // must not be re-promoted to a FAIL here. Only a genuinely-missing DDL
+  // object (one that was never attempted, or attempted and NOT reported as a
+  // non-fatal integrity-index failure) still fails init hard.
+  const failedIndexNames = new Set(
+    applyResult.integrityResults.filter((r) => !r.ok).map((r) => r.name)
+  );
   const expectedObjects = { tables: [], columns: [], indexes: [] };
   for (const u of units) {
     const eo = (classification.manifest.units[u.basename] || {}).expected_objects || {};
     expectedObjects.tables.push(...(eo.tables || []));
     expectedObjects.columns.push(...(eo.columns || []));
-    expectedObjects.indexes.push(...(eo.indexes || []));
+    expectedObjects.indexes.push(...(eo.indexes || []).filter((i) => !failedIndexNames.has(i)));
   }
   const verify = await db.schemaObjectsExist(expectedObjects);
   if (!verify.ok) {
+    await db.releaseSchemaApplyLock(initLockKey);
     await db.end();
     console.log(`  [FAIL]  Post-apply schema verification failed — missing objects:`);
     for (const m of verify.missing) console.log(`          - ${JSON.stringify(m)}`);
@@ -2086,6 +2149,7 @@ async function cmdInit(args) {
     `  [OK]    Post-apply schema verification passed ` +
     `(${expectedObjects.tables.length} tables, ${expectedObjects.columns.length} columns, ${expectedObjects.indexes.length} indexes checked)`
   );
+  await db.releaseSchemaApplyLock(initLockKey);
 
   // Step 8: Insert default project_settings rows (idempotent)
   const defaults = {

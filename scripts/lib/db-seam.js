@@ -1360,12 +1360,27 @@ class PostgresAdapter {
    * uniqueness constraint (legacy duplicate corpus), returns { ok: false, msg }.
    * On success (index created or already exists), returns { ok: true }.
    * Never throws — the caller decides how to surface the result.
+   *
+   * cm#185 review B2: wrapped in the same BEGIN / SET LOCAL lock_timeout+
+   * statement_timeout / COMMIT envelope as runIntegrityIndexPair (R-7) —
+   * this is the lone-CREATE path (no preceding DROP, e.g.
+   * assertions_1ton_exact_unique's `CREATE UNIQUE INDEX IF NOT EXISTS`), which
+   * previously issued a bare, un-timeouted statement. A non-CONCURRENTLY
+   * CREATE UNIQUE INDEX takes SHARE on the table (blocks writes); un-timeouted
+   * against a live DB this is the indefinite-stall wedge R-7 exists to close.
+   * CREATE INDEX (without CONCURRENTLY) is valid inside an explicit
+   * transaction block, so this wrapping is safe.
    */
   async runIntegrityIndex(sql) {
     try {
+      await this._client.query('BEGIN');
+      await this._client.query(`SET LOCAL lock_timeout = '5s'`);
+      await this._client.query(`SET LOCAL statement_timeout = '120s'`);
       await this._client.query(sql.trim());
+      await this._client.query('COMMIT');
       return { ok: true, msg: 'index created' };
     } catch (e) {
+      try { await this._client.query('ROLLBACK'); } catch (_) {}
       return { ok: false, msg: e.message };
     }
   }
@@ -1402,37 +1417,48 @@ class PostgresAdapter {
    * Returns { ok: boolean, missing: [{type, ...}] }. Never throws.
    */
   async schemaObjectsExist(expected) {
-    const missing = [];
-    const client = this._client;
-    if (expected.tables && expected.tables.length) {
-      const { rows } = await client.query(
-        `SELECT table_name FROM information_schema.tables
-          WHERE table_schema = current_schema() AND table_name = ANY($1::text[])`,
-        [expected.tables]
-      );
-      const found = new Set(rows.map((r) => r.table_name));
-      for (const t of expected.tables) if (!found.has(t)) missing.push({ type: 'table', table: t });
-    }
-    if (expected.columns && expected.columns.length) {
-      const { rows } = await client.query(
-        `SELECT table_name, column_name FROM information_schema.columns
-          WHERE table_schema = current_schema()`
-      );
-      const found = new Set(rows.map((r) => `${r.table_name}.${r.column_name}`));
-      for (const c of expected.columns) {
-        if (!found.has(`${c.table}.${c.column}`)) missing.push({ type: 'column', table: c.table, column: c.column });
+    // cm#185 review N4: wrapped in try/catch to actually honor the documented
+    // "Never throws" contract. A query failure here (e.g. a transient
+    // connection error) now fails CLOSED — reported as ok:false with a
+    // synthetic 'error' entry in missing[] — rather than throwing past
+    // ensureSchemaCurrent's verification-gate check without writing a
+    // schema_apply_degraded row (the lock's own `finally` release was never
+    // at risk, but the degradation row was).
+    try {
+      const missing = [];
+      const client = this._client;
+      if (expected.tables && expected.tables.length) {
+        const { rows } = await client.query(
+          `SELECT table_name FROM information_schema.tables
+            WHERE table_schema = current_schema() AND table_name = ANY($1::text[])`,
+          [expected.tables]
+        );
+        const found = new Set(rows.map((r) => r.table_name));
+        for (const t of expected.tables) if (!found.has(t)) missing.push({ type: 'table', table: t });
       }
+      if (expected.columns && expected.columns.length) {
+        const { rows } = await client.query(
+          `SELECT table_name, column_name FROM information_schema.columns
+            WHERE table_schema = current_schema()`
+        );
+        const found = new Set(rows.map((r) => `${r.table_name}.${r.column_name}`));
+        for (const c of expected.columns) {
+          if (!found.has(`${c.table}.${c.column}`)) missing.push({ type: 'column', table: c.table, column: c.column });
+        }
+      }
+      if (expected.indexes && expected.indexes.length) {
+        const { rows } = await client.query(
+          `SELECT indexname FROM pg_indexes
+            WHERE schemaname = current_schema() AND indexname = ANY($1::text[])`,
+          [expected.indexes]
+        );
+        const found = new Set(rows.map((r) => r.indexname));
+        for (const i of expected.indexes) if (!found.has(i)) missing.push({ type: 'index', index: i });
+      }
+      return { ok: missing.length === 0, missing };
+    } catch (e) {
+      return { ok: false, missing: [{ type: 'error', message: e.message }] };
     }
-    if (expected.indexes && expected.indexes.length) {
-      const { rows } = await client.query(
-        `SELECT indexname FROM pg_indexes
-          WHERE schemaname = current_schema() AND indexname = ANY($1::text[])`,
-        [expected.indexes]
-      );
-      const found = new Set(rows.map((r) => r.indexname));
-      for (const i of expected.indexes) if (!found.has(i)) missing.push({ type: 'index', index: i });
-    }
-    return { ok: missing.length === 0, missing };
   }
 
   /**
@@ -1457,8 +1483,26 @@ class PostgresAdapter {
    * space disjoint from the existing identity-resolution advisory lock usage
    * in this same file.
    */
+  /**
+   * cm#185 review N1: bounded acquire. Without a bound, a wedged/long-lived
+   * holder (e.g. a stuck concurrent process) blocks every subsequent close/
+   * load/init on this project indefinitely. lock_timeout applies to blocking
+   * advisory-lock acquisition the same as any other lock wait, so a 10s
+   * SET lock_timeout before the acquire caps the wait; on timeout the query
+   * throws and the caller (ensureSchemaCurrent / cmdInit) treats it as a
+   * non-fatal, retried-next-time degradation rather than a hang. The
+   * session-level SET is reset immediately after (success or failure) so the
+   * bounded acquire-only timeout never leaks into unrelated later queries on
+   * this same connection (e.g. the per-file apply transactions' own
+   * SET LOCAL timeouts, or ordinary write-path queries later in the process).
+   */
   async acquireSchemaApplyLock(lockKey) {
-    await this._client.query(`SELECT pg_advisory_lock(hashtext($1), 43)`, [lockKey]);
+    try {
+      await this._client.query(`SET lock_timeout = '10s'`);
+      await this._client.query(`SELECT pg_advisory_lock(hashtext($1), 43)`, [lockKey]);
+    } finally {
+      try { await this._client.query(`SET lock_timeout = 0`); } catch (_) { /* best-effort reset */ }
+    }
   }
 
   async releaseSchemaApplyLock(lockKey) {

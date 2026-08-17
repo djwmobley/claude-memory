@@ -37,6 +37,17 @@
  * T4  CRLF/BOM fingerprint stability (the S-8 regression gate): fingerprint
  *     computed from a CRLF+BOM copy of a schema file equals the fingerprint
  *     computed from the LF original.
+ * T5  cmdInit regression (independent review B1): the SAME aged-DB
+ *     construction as T1, but driving the real `handoff.js init -y` CLI (not
+ *     ensureSchemaCurrent directly) as a subprocess -- init's own fatal
+ *     post-apply verification previously re-promoted the non-fatal integrity-
+ *     index WARN into a hard `process.exit(1)`, contradicting the WARN
+ *     block's own "handoff init succeeds WITHOUT this index" text. Asserts
+ *     exit 0, the WARN block present, verification reports PASSED (not
+ *     FAILED), retrieval_events still created, the failed index remains
+ *     absent, and cmdInit never writes schema_fingerprint at all (so R-6's
+ *     "never upsert on integrity failure" invariant holds identically on
+ *     both the init path and the ensureSchemaCurrent sentinel path).
  *
  * Requires Postgres (PGHOST/PGUSER/PGPASSWORD, defaults localhost/postgres/postgres).
  * T4 is pure and runs with no DB. Exit 0 = all run tests passed.
@@ -45,6 +56,7 @@
 const fs   = require('fs');
 const path = require('path');
 const os   = require('os');
+const { spawnSync } = require('child_process');
 const { Client } = require('pg');
 
 const PROJECT_ROOT = path.resolve(__dirname, '..');
@@ -299,6 +311,111 @@ async function testT3() {
   }
 }
 
+// ── T5: cmdInit regression — legacy-duplicate corpus succeeds with warning ────
+
+async function testT5() {
+  const label = 'T5: `handoff.js init` against a legacy-duplicate corpus succeeds with warning (not exit 1); retrieval_events created; fingerprint never claimed';
+  if (!(await isPgAvailable())) { console.log(`SKIP  ${label} (Postgres unavailable)`); return; }
+
+  const dbName = `cm185_t5_${Date.now()}`;
+  const projDir = path.join(os.tmpdir(), `cm185-t5-init-${Date.now()}`);
+
+  try {
+    await createThrowawayDb(dbName);
+
+    // Seed the aged state BEFORE running init: core schema applied (so the
+    // table + index exist), then the 1:1 index dropped and a live-duplicate
+    // pair seeded -- identical construction to T1, but this time init itself
+    // (not ensureSchemaCurrent directly) is the thing under test, since B1
+    // was a cmdInit-only bug (the sentinel path was already correct — see T1).
+    const coreSchemaSql = fs.readFileSync(
+      path.join(PROJECT_ROOT, 'scripts', 'sql', 'handoff-core-schema.sql'), 'utf8'
+    );
+    const seedDb = await pgConnect(dbName);
+    await seedDb.query('BEGIN');
+    await seedDb.query(coreSchemaSql);
+    await seedDb.query('COMMIT');
+    await seedDb.query(`DROP INDEX IF EXISTS assertions_1to1_unique`);
+    await seedDb.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+       VALUES ('cm185-t5-seed', 'aged-subject', 'chose', 'option-A', 8, 'user_stated', false)`
+    );
+    await seedDb.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+       VALUES ('cm185-t5-seed', 'aged-subject', 'chose', 'option-B', 8, 'user_stated', false)`
+    );
+    await seedDb.end();
+
+    // Fresh throwaway project directory (git-initialized, no pre-existing
+    // marker) — init needs a real .git for findProjectRoot.
+    fs.mkdirSync(projDir, { recursive: true });
+    const gitInit = spawnSync('git', ['-C', projDir, 'init', '-q'], { encoding: 'utf8' });
+    if (gitInit.status !== 0) throw new Error(`git init failed: ${gitInit.stderr}`);
+
+    const result = spawnSync(
+      process.execPath,
+      [path.join(PROJECT_ROOT, 'scripts', 'handoff.js'), 'init', '-y'],
+      {
+        cwd: projDir,
+        encoding: 'utf8',
+        timeout: 30000,
+        env: { ...process.env, HANDOFF_DB: dbName, PROJECT_ROOT: projDir },
+      }
+    );
+
+    assertEqual(
+      result.status, 0,
+      `T5: init must exit 0 (succeed-with-warning), got ${result.status}. stdout:\n${result.stdout}\nstderr:\n${result.stderr}`
+    );
+    assertTrue(
+      result.stdout.includes('Integrity index NOT created: assertions_1to1_unique'),
+      'T5: init prints the WARN block for the failed integrity index'
+    );
+    assertTrue(
+      result.stdout.includes('handoff init succeeds WITHOUT'),
+      'T5: init prints the §7 SKIP "succeeds WITHOUT this index" message'
+    );
+    assertTrue(
+      result.stdout.includes('Post-apply schema verification passed'),
+      'T5: post-apply verification still reports PASSED (the failed index was excluded from the expected set, not the whole check skipped)'
+    );
+    assertTrue(
+      !result.stdout.includes('Post-apply schema verification failed'),
+      'T5: init must NOT report verification FAILED'
+    );
+
+    const verifyDb = await pgConnect(dbName);
+    try {
+      const { rows: rteRows } = await verifyDb.query(
+        `SELECT 1 FROM information_schema.tables WHERE table_name = 'retrieval_events'`
+      );
+      assertEqual(rteRows.length, 1, "T5: retrieval_events was still created by init despite the earlier unit's integrity-index failure");
+
+      const { rows: idxRows } = await verifyDb.query(
+        `SELECT 1 FROM pg_indexes WHERE indexname = 'assertions_1to1_unique'`
+      );
+      assertEqual(idxRows.length, 0, 'T5: the failed index remains absent (not falsely reported present)');
+
+      const { rows: fpRows } = await verifyDb.query(
+        `SELECT 1 FROM project_settings WHERE key = 'schema_fingerprint'`
+      );
+      assertEqual(
+        fpRows.length, 0,
+        'T5: cmdInit never writes schema_fingerprint at all (consistent with ensureSchemaCurrent, which also never upserts it when an integrity index fails — R-6 semantics hold on both paths)'
+      );
+    } finally {
+      await verifyDb.end();
+    }
+
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+    try { fs.rmSync(projDir, { recursive: true, force: true }); } catch (_) { /* best-effort */ }
+  }
+}
+
 // ── T4: CRLF/BOM fingerprint stability (pure, no DB) ──────────────────────────
 
 function testT4() {
@@ -340,6 +457,7 @@ async function main() {
   await testT1();
   await testT2();
   await testT3();
+  await testT5();
 
   console.log('');
   console.log(`Results: ${passed} passed, ${failed} failed`);

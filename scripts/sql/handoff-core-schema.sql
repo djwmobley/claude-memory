@@ -194,6 +194,19 @@ BEGIN
   -- under its canonical name with the exact canonical 5-value definition, skip
   -- the drop+recreate entirely -- the steady-state case (already-current DB)
   -- takes zero row locks and does not touch pg_constraint at all.
+  --
+  -- cm#185 review N6: this fast path checks ONLY the canonically-named
+  -- constraint (assertions_suppression_kind_check). If some OTHER, narrower
+  -- CHECK constraint on suppression_kind coexists under a different name
+  -- (e.g. hand-added out-of-band, or left over from a schema revision this
+  -- comment predates), the fast path returns without dropping that other
+  -- constraint, and a canonically-widened definition still applies alongside
+  -- it -- the narrower one would still reject a value it excludes even though
+  -- the canonical one accepts it. This is believed unreachable via any path
+  -- this engine itself takes (the DROP loop below is the only other writer
+  -- of a suppression_kind CHECK, and it always targets the canonical name),
+  -- but is flagged here given this exact constraint's history (#124,
+  -- test-schema-suppression-kind.js) of ordering/narrowing bugs.
   SELECT pg_get_constraintdef(con.oid) INTO current_def
   FROM   pg_constraint con
   JOIN   pg_class      rel ON rel.oid = con.conrelid
