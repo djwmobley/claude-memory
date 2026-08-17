@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **cm#185 schema bring-forward** — generalizes the handoff engine's schema
+  auto-apply from a hardcoded two-file set to a total classification of every
+  `scripts/sql/*.sql` file, driven by a tracked manifest
+  (`scripts/sql/schema-manifest.json`) cross-checked against each file's own
+  in-file header directive (`scripts/lib/schema-classify.js`). Fixes the
+  observed defect that `app-retrieval-events-schema.sql` (`retrieval_events` +
+  `retrieval_event_assertions`) was never applied by `/handoff:init` — it is
+  now applied automatically, ordered after `handoff-core-schema.sql`.
+  Excludes `phase3b-schema.sql` and `v_memory_hits.sql` (they target the
+  separate canonical/pipeline database and depend on tables no per-project
+  schema defines) with recorded reasons; deletes the stale, unparsable
+  `phase3.5-defaults.sql` (superseded by the in-code defaults map). The
+  fingerprint is now epoch-prefixed and EOL/BOM-normalized (fixes a real
+  cross-platform drift bug: the stored fingerprint differed between a Windows
+  CRLF checkout and Linux CI). Schema apply is now per-file-transaction,
+  fail-fast, and runs under a session-scoped Postgres advisory lock; a
+  post-apply catalog probe gates the fingerprint upsert so "the apply did not
+  throw" is never treated as proof "the object is present" (closes a silent
+  half-apply class of bug around the pgvector-gated DO blocks and the
+  duplicate-column swallow). A failed integrity-index re-create (legacy-
+  duplicate corpus) is now an atomic DROP+CREATE pair, so a previously-working
+  index can never be left destroyed by a failed re-create. Persistent
+  degradation is surfaced by `/handoff:status` and the resume banner.
 - **§3.5 store-wide caveman-economy gate (T7 prerequisite, K-1..K-11 amendment,
   memory-manager#12)** — `test/north-star/test-caveman-economy-store-wide.js`
   generalizes the single-session `test-caveman-economy.js` gate to the ENTIRE

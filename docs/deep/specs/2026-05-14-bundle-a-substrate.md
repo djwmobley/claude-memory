@@ -705,21 +705,32 @@ silently.
 
 ## 4. Schema Migrations and Deployment Configuration
 
-> **Phase 3.8 schema split.**
-> The schema is now split into two files with distinct portability guarantees:
+> **cm#185 schema bring-forward (supersedes the original Phase 3.8 schema-split framing below).**
+> `scripts/sql/*.sql` is now a totally-classified set (see `scripts/sql/schema-manifest.json`
+> and `docs/how-memory-works.md`'s "Schema files" section for the authoritative table). The two
+> corrections to the original Phase 3.8 claims below: (1) `app-retrieval-events-schema.sql` does
+> **not** require pgvector — its `query_embedding halfvec(4000)` column was removed (see that
+> file's own header); it is pure stock Postgres >= 13, same as `handoff-core-schema.sql`.
+> (2) `app-retrieval-events-schema.sql` is now applied automatically by `/handoff:init` and the
+> schema-drift auto-apply sentinel, ordered immediately after `handoff-core-schema.sql` — it is no
+> longer a manual `psql -f` step.
 >
 > | File | Applied by | Requires |
 > |---|---|---|
 > | `scripts/sql/handoff-core-schema.sql` | `/handoff:init` automatically | Stock Postgres >= 13, no extensions |
-> | `scripts/sql/app-retrieval-events-schema.sql` | Manual `psql -f` or pipeline setup | pgvector extension (`halfvec` type) |
-> | `scripts/sql/phase3b-schema.sql` | Manual `psql -f` or pipeline setup | `memory_entry_chunks` table from `setup.sql` |
+> | `scripts/sql/app-retrieval-events-schema.sql` | `/handoff:init` automatically (ordered after core) | Stock Postgres >= 13, no extensions |
+> | `scripts/sql/handoff-sqlite-schema.sql` | `/handoff:init` automatically (SQLite backend only) | node:sqlite (SQLite >= 3.37) |
+> | `scripts/sql/phase3b-schema.sql` | Manual `psql -f` (excluded from the handoff-engine roster) | `memory_entry_chunks` table from `setup.sql` |
+> | `scripts/sql/v_memory_hits.sql` | Manual, via `scripts/setup.sql`'s `\ir` (excluded from the handoff-engine roster) | `memory_entries`/`memory_entry_chunks` tables from `setup.sql` |
 >
-> `handoff-core-schema.sql` contains the five handoff-core tables (`entities`, `assertions`,
-> `edges`, `retrieval_contract`, `project_settings`) and is safe to apply on any Postgres instance
-> without pgvector. `app-retrieval-events-schema.sql` installs `retrieval_events` with its
-> `halfvec(4000)` embedding column and requires pgvector 0.8.1+. `phase3b-schema.sql` adds
-> `memory_entry_chunks.blurb` and is app-specific (requires the `memory_entry_chunks` table from
-> `scripts/setup.sql`).
+> `handoff-core-schema.sql` contains the handoff-core tables (`entities`, `assertions`,
+> `edges`, `retrieval_contract`, `retrieval_contract_history`, `project_settings`,
+> `entity_communities`, `extraction_queue`) and is safe to apply on any Postgres instance without
+> extensions. `app-retrieval-events-schema.sql` installs `retrieval_events` +
+> `retrieval_event_assertions`. `phase3b-schema.sql` and `v_memory_hits.sql` target the separate
+> canonical/pipeline database provisioned by `scripts/setup.sql` (they depend on
+> `memory_entries`/`memory_entry_chunks`, which no per-project handoff schema defines) and are
+> deliberately excluded from the `/handoff:init` roster.
 
 ### vLLM deployment — native WSL (active path)
 

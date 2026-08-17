@@ -1,3 +1,4 @@
+-- handoff:excluded targets the canonical/pipeline DB provisioned by scripts/setup.sql; depends on memory_entries/memory_entry_chunks which no per-project schema defines
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- v_memory_hits VIEW
 -- Unified retrieval surface for hybrid search (FTS + vector).

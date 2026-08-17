@@ -1,10 +1,15 @@
+-- handoff:dialect postgres
 -- ============================================================================
 -- app-retrieval-events-schema.sql
 --
 -- claude-memory-specific schema: retrieval_events and retrieval_event_assertions.
 --
--- NOT applied by `/handoff:init`. Apply manually:
---   psql -d claude_memory_eval_test -f scripts/sql/app-retrieval-events-schema.sql
+-- Applied automatically by `/handoff:init` and by the schema-drift auto-apply
+-- sentinel (ensureSchemaCurrent), ordered AFTER handoff-core-schema.sql (cm#185
+-- schema bring-forward). This file was previously "NOT applied by /handoff:init"
+-- -- that gap is what cm#185 fixes; every project DB (fresh init or an existing
+-- one drifting forward) now gets retrieval_events/retrieval_event_assertions
+-- without a separate manual `psql -f` step.
 --
 -- NOTE: The query_embedding halfvec(4000) column and CREATE EXTENSION vector
 -- have been removed. query_embedding was never written or read by the handoff

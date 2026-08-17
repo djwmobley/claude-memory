@@ -1,3 +1,4 @@
+-- handoff:dialect postgres
 -- ============================================================================
 -- handoff-core-schema.sql
 --
@@ -187,7 +188,43 @@ ALTER TABLE assertions ADD COLUMN IF NOT EXISTS corroboration_count INTEGER NOT 
 DO $$
 DECLARE
   r RECORD;
+  current_def TEXT;
 BEGIN
+  -- Fast no-op path (R-7 lock-budget guard): if the constraint already exists
+  -- under its canonical name with the exact canonical 5-value definition, skip
+  -- the drop+recreate entirely -- the steady-state case (already-current DB)
+  -- takes zero row locks and does not touch pg_constraint at all.
+  --
+  -- cm#185 review N6: this fast path checks ONLY the canonically-named
+  -- constraint (assertions_suppression_kind_check). If some OTHER, narrower
+  -- CHECK constraint on suppression_kind coexists under a different name
+  -- (e.g. hand-added out-of-band, or left over from a schema revision this
+  -- comment predates), the fast path returns without dropping that other
+  -- constraint, and a canonically-widened definition still applies alongside
+  -- it -- the narrower one would still reject a value it excludes even though
+  -- the canonical one accepts it. This is believed unreachable via any path
+  -- this engine itself takes (the DROP loop below is the only other writer
+  -- of a suppression_kind CHECK, and it always targets the canonical name),
+  -- but is flagged here given this exact constraint's history (#124,
+  -- test-schema-suppression-kind.js) of ordering/narrowing bugs.
+  SELECT pg_get_constraintdef(con.oid) INTO current_def
+  FROM   pg_constraint con
+  JOIN   pg_class      rel ON rel.oid = con.conrelid
+  JOIN   pg_namespace  ns  ON ns.oid  = rel.relnamespace
+  WHERE  con.contype   = 'c'
+    AND  rel.relname   = 'assertions'
+    AND  ns.nspname    = current_schema()
+    AND  con.conname   = 'assertions_suppression_kind_check';
+
+  IF current_def IS NOT NULL
+     AND current_def LIKE '%superseded%'
+     AND current_def LIKE '%downvoted_terminal%'
+     AND current_def LIKE '%downvoted_probation%'
+     AND current_def LIKE '%retired%'
+     AND current_def LIKE '%reality_reconciled%' THEN
+    RETURN;
+  END IF;
+
   -- Drop any existing CHECK constraint that references suppression_kind.
   FOR r IN
     SELECT con.conname
@@ -405,6 +442,13 @@ CREATE UNIQUE INDEX assertions_1to1_unique
 --      one, or abort the transaction if the widened index is already active).
 DO $$
 BEGIN
+  -- Fast no-op path (R-7 lock-budget guard): once every old-name row has been
+  -- migrated (the steady-state case on every DB after the first apply), skip
+  -- both UPDATEs entirely -- no table scan, no row locks.
+  IF NOT EXISTS (SELECT 1 FROM assertions WHERE predicate = 'are_safe_outside_claude-memory') THEN
+    RETURN;
+  END IF;
+
   UPDATE assertions
     SET suppressed = true, invalid_at = now(), suppression_kind = 'superseded'
     WHERE assertions.suppressed = false

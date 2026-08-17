@@ -186,18 +186,22 @@ knowledge:
     process.exit(2);
   }
 
-  // Apply schema if needed.
-  const sqlDir = path.resolve(__dirname, '..', '..', 'scripts', 'sql');
-  for (const schemaName of ['handoff-core-schema.sql', 'app-retrieval-events-schema.sql']) {
-    const schemaFile = path.join(sqlDir, schemaName);
-    if (!fs.existsSync(schemaFile)) continue;
-    let sql = fs.readFileSync(schemaFile, 'utf8');
+  // Apply every postgres-classified schema unit, in manifest order (cm#185:
+  // derived from the same total classification the engine uses, instead of a
+  // hand-maintained file list here).
+  const { classifySchemaFiles } = require('../../scripts/lib/schema-classify');
+  const classification = classifySchemaFiles({ engineRoot: path.resolve(__dirname, '..', '..') });
+  if (!classification.ok) {
+    throw new Error(`schema classification failed: ${classification.errors.join('; ')}`);
+  }
+  for (const unit of classification.unitsByDialect.postgres) {
+    let sql = fs.readFileSync(unit.fullPath, 'utf8');
     sql = sql.replace(/^\\[a-z].*$/gm, '');
     try {
       await db.query(sql);
     } catch (err) {
       if (!err.message.includes('already exists')) {
-        console.warn(`  Schema apply warning (${schemaName}): ${err.message}`);
+        console.warn(`  Schema apply warning (${unit.basename}): ${err.message}`);
       }
     }
   }

@@ -163,21 +163,19 @@ knowledge:
     process.exit(2);
   }
 
-  // Apply the canonical schemas in order:
-  //   1. handoff-core-schema.sql   — portable handoff-core tables (auto-applied
-  //                                  by /handoff:init in production).
-  //   2. app-retrieval-events-schema.sql — claude-memory-specific observability
-  //                                  tables (retrieval_events + retrieval_event_assertions).
-  //                                  NOT applied by /handoff:init; test must apply
-  //                                  it explicitly so the C2/C3 paths handoff.js
-  //                                  invokes during close/checkpoint don't emit
-  //                                  "relation retrieval_events does not exist"
-  //                                  warnings on every test run.
-  const sqlDir = path.resolve(__dirname, '..', '..', 'scripts', 'sql');
-  for (const schemaName of ['handoff-core-schema.sql', 'app-retrieval-events-schema.sql']) {
-    const schemaFile = path.join(sqlDir, schemaName);
-    if (!fs.existsSync(schemaFile)) continue;
-    let sql = fs.readFileSync(schemaFile, 'utf8');
+  // Apply every postgres-classified schema unit, in manifest order (cm#185:
+  // derived from the same total classification the engine itself uses —
+  // scripts/lib/schema-classify.js + scripts/sql/schema-manifest.json —
+  // rather than a hand-maintained file list here. Currently resolves to
+  // handoff-core-schema.sql then app-retrieval-events-schema.sql; both are
+  // now auto-applied by /handoff:init in production too (cm#185 bring-forward).
+  const { classifySchemaFiles } = require('../../scripts/lib/schema-classify');
+  const classification = classifySchemaFiles({ engineRoot: path.resolve(__dirname, '..', '..') });
+  if (!classification.ok) {
+    throw new Error(`test-handoff.js setup: schema classification failed: ${classification.errors.join('; ')}`);
+  }
+  for (const unit of classification.unitsByDialect.postgres) {
+    let sql = fs.readFileSync(unit.fullPath, 'utf8');
     // Strip psql meta-commands (e.g. \c, \echo) so we can run via the JS client.
     sql = sql.replace(/^\\[a-z].*$/gm, '');
     try {
@@ -185,7 +183,7 @@ knowledge:
     } catch (err) {
       // May already exist — non-fatal
       if (!err.message.includes('already exists')) {
-        console.warn(`  Schema apply warning (${schemaName}): ${err.message}`);
+        console.warn(`  Schema apply warning (${unit.basename}): ${err.message}`);
       }
     }
   }

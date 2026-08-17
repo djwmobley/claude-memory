@@ -72,6 +72,11 @@ const HANDOFF_JS    = path.resolve(__dirname, 'handoff.js');
 const DB_SEAM_JS    = path.resolve(__dirname, 'lib', 'db-seam.js');
 const PROJECT_ROOT  = path.resolve(__dirname, '..');
 
+// cm#185: the real exported schema bring-forward functions (S-18 — S12 tests
+// require() the engine's own functions rather than reimplementing them).
+const handoffModule = require(HANDOFF_JS);
+const { classifySchemaFiles } = require('./lib/schema-classify');
+
 // ── Hoisted: static source read ───────────────────────────────────────────────
 // Read once at module load; all static-analysis sections share this reference.
 const HANDOFF_SRC = fs.readFileSync(HANDOFF_JS, 'utf8');
@@ -2233,70 +2238,12 @@ function requireHandoffFunctions() {
 
 // ── S12: Deliverables A+B deterministic coverage ─────────────────────────────
 
-/**
- * Inline helper: mirrors applyAdditiveSchema from handoff.js for tests.
- * Applies the appropriate schema (dialect-aware) idempotently via db.runSchema() +
- * additive ALTER TABLE routed through runSchema so IF NOT EXISTS handling is correct
- * on both backends.
- *
- * @param {object} db         — connected StoragePort adapter
- * @param {string} [_ignored] — schemaFile param kept for compat; dialect is auto-detected
- */
-async function _testApplyAdditiveSchema(db, _ignored) {
-  // Pick the schema file appropriate for this adapter's dialect.
-  const schemaFile = db.dialect === 'sqlite' ? SCHEMA_SQLITE : SCHEMA_POSTGRES;
-  let sql0 = fs.readFileSync(schemaFile, 'utf8');
-  // Strip UTF-8 BOM if present (SQLite schema file has BOM on this machine).
-  if (sql0.charCodeAt(0) === 0xFEFF) sql0 = sql0.slice(1);
-  let sql = sql0.replace(/^\\[a-z].*$/gm, '');
-  const INTEGRITY_INDEX_NAMES = ['assertions_1to1_unique', 'assertions_1ton_exact_unique'];
-  const integrityIndexSqls = [];
-  let coreSchemaSQL = sql;
-  for (const idxName of INTEGRITY_INDEX_NAMES) {
-    const pattern = new RegExp(
-      `CREATE\\s+UNIQUE\\s+INDEX\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?${idxName}[\\s\\S]*?;`,
-      'i'
-    );
-    const m = coreSchemaSQL.match(pattern);
-    if (m) {
-      integrityIndexSqls.push({ name: idxName, sql: m[0] });
-      coreSchemaSQL = coreSchemaSQL.replace(m[0], '');
-    }
-  }
-  // Route ALTER TABLE through runSchema so IF NOT EXISTS handling is correct on SQLite.
-  const additiveAlter = [
-    'ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted    BOOLEAN     NOT NULL DEFAULT false',
-    'ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMPTZ',
-  ].join(';\n') + ';';
-  await db.query('BEGIN');
-  await db.runSchema(coreSchemaSQL);
-  await db.runSchema(additiveAlter);
-  await db.query('COMMIT');
-  for (const { sql: idxSql } of integrityIndexSqls) {
-    await db.runIntegrityIndex(idxSql);
-  }
-}
-
-/**
- * Inline helper: mirrors ensureSchemaCurrent from handoff.js for tests.
- * Uses the supplied fingerprint to check against project_settings.schema_fingerprint.
- */
-async function _testEnsureSchemaCurrent(db, projectId, schemaFile, fingerprint) {
-  const { rows } = await db.query(
-    'SELECT value FROM project_settings WHERE project_id = $1 AND key = $2',
-    [projectId, 'schema_fingerprint']
-  );
-  if (rows.length > 0 && rows[0].value === fingerprint) return false; // no-op
-  // Apply
-  await _testApplyAdditiveSchema(db, schemaFile);
-  // Upsert fingerprint
-  await db.query(
-    `INSERT INTO project_settings (project_id, key, value) VALUES ($1, $2, $3)
-     ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
-    [projectId, 'schema_fingerprint', fingerprint]
-  );
-  return true; // applied
-}
+// cm#185 / S-18: the former _testApplyAdditiveSchema / _testEnsureSchemaCurrent
+// inline mirrors are DELETED. S12.c/e now require() and exercise the real
+// handoff.js exports (handoffModule.applyAdditiveSchema / .ensureSchemaCurrent /
+// ._computeSchemaFingerprint) directly — proving the live engine behavior
+// instead of a test-side reimplementation that had already drifted from it
+// (BOM-stripping, promoted/promoted_at-only vs. the full additive column set).
 
 async function runS12() {
   console.log('\n=== S12: Deliverables A+B — schema auto-apply + deterministic packaging assertion ===');
@@ -2498,30 +2445,32 @@ async function runS12() {
   }
 
   // ── S12.c: Schema auto-apply sentinel — idempotent + non-fatal ───────────────
+  // Exercises the REAL handoffModule.ensureSchemaCurrent (S-18) — no injected
+  // fingerprint: the real function always computes its own from the live
+  // scripts/sql/ classification, so these tests manipulate the STORED value
+  // directly (absent / stale-legacy-hex / current) and assert against the
+  // { applied, reason } status object the real function returns.
 
   await bothBackends(
     'S12.c1: ensureSchemaCurrent applies schema on missing fingerprint and sets key',
     async (db) => {
       const PID = 's12-c1-schema';
-      const fp  = 'test-fingerprint-initial';
-      // Verify fingerprint is not yet set.
       const { rows: before } = await db.query(
         'SELECT value FROM project_settings WHERE project_id=$1 AND key=$2',
         [PID, 'schema_fingerprint']
       );
       assertEqual(before.length, 0, 'S12.c1: no fingerprint row initially');
 
-      // Run the sentinel — missing fingerprint → should apply and set.
-      const applied = await _testEnsureSchemaCurrent(db, PID, SCHEMA_SQLITE, fp);
-      assertTrue(applied, 'S12.c1: apply should return true (fingerprint was missing)');
+      const result = await handoffModule.ensureSchemaCurrent(db, PID, { silent: true });
+      assertTrue(result.applied, 'S12.c1: apply should report applied=true (fingerprint was missing)');
+      assertEqual(result.reason, 'applied', 'S12.c1: reason is "applied"');
 
-      // Verify fingerprint is now stored.
       const { rows: after } = await db.query(
         'SELECT value FROM project_settings WHERE project_id=$1 AND key=$2',
         [PID, 'schema_fingerprint']
       );
       assertEqual(after.length, 1, 'S12.c1: fingerprint row now exists');
-      assertEqual(after[0].value, fp, 'S12.c1: stored fingerprint matches');
+      assertTrue(/^\d+:[0-9a-f]{64}$/.test(after[0].value), 'S12.c1: stored fingerprint is epoch:hash formatted');
     }
   );
 
@@ -2529,41 +2478,86 @@ async function runS12() {
     'S12.c2: ensureSchemaCurrent is a no-op on second call with same fingerprint',
     async (db) => {
       const PID = 's12-c2-schema';
-      const fp  = 'test-fingerprint-v2';
 
       // First call: sets fingerprint.
-      await _testEnsureSchemaCurrent(db, PID, SCHEMA_SQLITE, fp);
+      const first = await handoffModule.ensureSchemaCurrent(db, PID, { silent: true });
+      assertTrue(first.applied, 'S12.c2: first call applies');
 
-      // Second call with SAME fingerprint → no-op (returns false).
-      const applied = await _testEnsureSchemaCurrent(db, PID, SCHEMA_SQLITE, fp);
-      assertFalse(applied, 'S12.c2: second call with same fingerprint is a no-op');
+      // Second call with the DB now current → no-op (applied:false, reason:'current').
+      const second = await handoffModule.ensureSchemaCurrent(db, PID, { silent: true });
+      assertFalse(second.applied, 'S12.c2: second call with same fingerprint is a no-op');
+      assertEqual(second.reason, 'current', 'S12.c2: reason is "current"');
     }
   );
 
   await bothBackends(
-    'S12.c3: ensureSchemaCurrent re-applies when fingerprint changes (drift simulation)',
+    'S12.c3: ensureSchemaCurrent re-applies when the stored fingerprint is a legacy bare-hex value (epoch 0, always behind)',
     async (db) => {
       const PID = 's12-c3-schema';
-      const fp1  = 'fingerprint-old';
-      const fp2  = 'fingerprint-new';
+      const legacyBareHex = 'a'.repeat(64); // pre-epoch format -> parses as epoch 0
 
-      // Set old fingerprint.
       await db.query(
         `INSERT INTO project_settings (project_id, key, value) VALUES ($1, 'schema_fingerprint', $2)
          ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
-        [PID, fp1]
+        [PID, legacyBareHex]
       );
 
-      // Run with new fingerprint → should re-apply.
-      const applied = await _testEnsureSchemaCurrent(db, PID, SCHEMA_SQLITE, fp2);
-      assertTrue(applied, 'S12.c3: re-apply triggered on fingerprint change');
+      const result = await handoffModule.ensureSchemaCurrent(db, PID, { silent: true });
+      assertTrue(result.applied, 'S12.c3: re-apply triggered on legacy bare-hex (epoch 0) fingerprint');
 
-      // Verify new fingerprint stored.
       const { rows } = await db.query(
         'SELECT value FROM project_settings WHERE project_id=$1 AND key=$2',
         [PID, 'schema_fingerprint']
       );
-      assertEqual(rows[0].value, fp2, 'S12.c3: fingerprint updated to new value');
+      assertTrue(/^\d+:[0-9a-f]{64}$/.test(rows[0].value), 'S12.c3: fingerprint upgraded to epoch:hash format');
+      assertTrue(rows[0].value !== legacyBareHex, 'S12.c3: fingerprint value changed from the legacy bare-hex');
+    }
+  );
+
+  await bothBackends(
+    'S12.c5: ensureSchemaCurrent refuses to apply on an "ahead" fingerprint (future epoch) — persistent degradation, no throw',
+    async (db) => {
+      const PID = 's12-c5-schema';
+      const aheadValue = '99999:' + 'b'.repeat(64);
+      await db.query(
+        `INSERT INTO project_settings (project_id, key, value) VALUES ($1, 'schema_fingerprint', $2)
+         ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
+        [PID, aheadValue]
+      );
+
+      const result = await handoffModule.ensureSchemaCurrent(db, PID, { silent: true });
+      assertFalse(result.applied, 'S12.c5: ahead fingerprint is never applied');
+      assertEqual(result.reason, 'ahead', 'S12.c5: reason is "ahead"');
+
+      const { rows } = await db.query(
+        'SELECT value FROM project_settings WHERE project_id=$1 AND key=$2',
+        [PID, 'schema_fingerprint']
+      );
+      assertEqual(rows[0].value, aheadValue, 'S12.c5: stored fingerprint left untouched (never overwritten)');
+
+      const { rows: degRows } = await db.query(
+        `SELECT value FROM project_settings WHERE project_id=$1 AND key='schema_apply_degraded'`,
+        [PID]
+      );
+      assertEqual(degRows.length, 1, 'S12.c5: persistent schema_apply_degraded row written');
+      const parsed = JSON.parse(degRows[0].value);
+      assertEqual(parsed.reason, 'fingerprint_ahead', 'S12.c5: degradation reason is fingerprint_ahead');
+    }
+  );
+
+  await bothBackends(
+    'S12.c6: ensureSchemaCurrent refuses to apply on an unparseable fingerprint — persistent degradation, no throw',
+    async (db) => {
+      const PID = 's12-c6-schema';
+      await db.query(
+        `INSERT INTO project_settings (project_id, key, value) VALUES ($1, 'schema_fingerprint', 'not-a-real-fingerprint')
+         ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
+        [PID]
+      );
+
+      const result = await handoffModule.ensureSchemaCurrent(db, PID, { silent: true });
+      assertFalse(result.applied, 'S12.c6: unparseable fingerprint is never applied');
+      assertEqual(result.reason, 'unknown', 'S12.c6: reason is "unknown"');
     }
   );
 
@@ -2675,7 +2669,6 @@ async function runS12() {
     'S12.e1: ensureSchemaCurrent persists schema_fingerprint on already-initialized DB (Defect-1 regression)',
     async (db) => {
       const PID = 's12-e1-defect1';
-      const fp  = 'fp-defect1-test';
 
       // Verify fingerprint is absent.
       const { rows: before } = await db.query(
@@ -2685,9 +2678,8 @@ async function runS12() {
       assertEqual(before.length, 0, 'S12.e1: no fingerprint row initially');
 
       // First call: fingerprint absent → must apply and upsert fingerprint.
-      const applied = await _testEnsureSchemaCurrent(db, PID,
-        db.dialect === 'sqlite' ? SCHEMA_SQLITE : SCHEMA_POSTGRES, fp);
-      assertTrue(applied, 'S12.e1: first call returns true (schema was applied)');
+      const result = await handoffModule.ensureSchemaCurrent(db, PID, { silent: true });
+      assertTrue(result.applied, 'S12.e1: first call reports applied=true (schema was applied)');
 
       // Verify fingerprint stored.
       const { rows: after } = await db.query(
@@ -2695,7 +2687,7 @@ async function runS12() {
         [PID, 'schema_fingerprint']
       );
       assertEqual(after.length, 1, 'S12.e1: fingerprint row now exists');
-      assertEqual(after[0].value, fp, 'S12.e1: stored fingerprint matches');
+      assertTrue(/^\d+:[0-9a-f]{64}$/.test(after[0].value), 'S12.e1: stored fingerprint is epoch:hash formatted');
     }
   );
 
@@ -2703,16 +2695,19 @@ async function runS12() {
     'S12.e2: second ensureSchemaCurrent call is a true no-op — no apply, no stderr on both backends (Defect-1 regression)',
     async (db) => {
       const PID = 's12-e2-defect1';
-      const fp  = 'fp-defect1-noop';
 
       // First call: sets fingerprint.
-      await _testEnsureSchemaCurrent(db, PID,
-        db.dialect === 'sqlite' ? SCHEMA_SQLITE : SCHEMA_POSTGRES, fp);
+      await handoffModule.ensureSchemaCurrent(db, PID, { silent: true });
+      const { rows: afterFirst } = await db.query(
+        'SELECT value FROM project_settings WHERE project_id=$1 AND key=$2',
+        [PID, 'schema_fingerprint']
+      );
+      const fpAfterFirst = afterFirst[0].value;
 
-      // Second call with same fingerprint: must be a no-op (returns false).
-      const applied = await _testEnsureSchemaCurrent(db, PID,
-        db.dialect === 'sqlite' ? SCHEMA_SQLITE : SCHEMA_POSTGRES, fp);
-      assertFalse(applied, 'S12.e2: second call is a no-op (returns false)');
+      // Second call with the DB now current: must be a true no-op.
+      const result = await handoffModule.ensureSchemaCurrent(db, PID, { silent: true });
+      assertFalse(result.applied, 'S12.e2: second call is a no-op (applied=false)');
+      assertEqual(result.reason, 'current', 'S12.e2: reason is "current"');
 
       // Fingerprint row must still exist unchanged.
       const { rows } = await db.query(
@@ -2720,7 +2715,7 @@ async function runS12() {
         [PID, 'schema_fingerprint']
       );
       assertEqual(rows.length, 1, 'S12.e2: exactly one fingerprint row');
-      assertEqual(rows[0].value, fp, 'S12.e2: fingerprint value unchanged');
+      assertEqual(rows[0].value, fpAfterFirst, 'S12.e2: fingerprint value unchanged by the no-op call');
     }
   );
 
@@ -2728,11 +2723,14 @@ async function runS12() {
     'S12.e3: drift triggers exactly one reapply that is idempotent — delete fingerprint → re-apply → fingerprint restored (Defect-1 regression)',
     async (db) => {
       const PID = 's12-e3-defect1';
-      const fp  = 'fp-defect1-drift';
 
       // Establish fingerprint.
-      await _testEnsureSchemaCurrent(db, PID,
-        db.dialect === 'sqlite' ? SCHEMA_SQLITE : SCHEMA_POSTGRES, fp);
+      await handoffModule.ensureSchemaCurrent(db, PID, { silent: true });
+      const { rows: established } = await db.query(
+        'SELECT value FROM project_settings WHERE project_id=$1 AND key=$2',
+        [PID, 'schema_fingerprint']
+      );
+      const originalFp = established[0].value;
 
       // Simulate drift: delete the fingerprint row.
       await db.query(
@@ -2740,23 +2738,22 @@ async function runS12() {
         [PID, 'schema_fingerprint']
       );
 
-      // Should re-apply (returns true).
-      const applied = await _testEnsureSchemaCurrent(db, PID,
-        db.dialect === 'sqlite' ? SCHEMA_SQLITE : SCHEMA_POSTGRES, fp);
-      assertTrue(applied, 'S12.e3: re-apply after drift returns true');
+      // Should re-apply.
+      const result = await handoffModule.ensureSchemaCurrent(db, PID, { silent: true });
+      assertTrue(result.applied, 'S12.e3: re-apply after drift reports applied=true');
 
-      // Fingerprint restored.
+      // Fingerprint restored — deterministic content hashing means the same
+      // scripts/sql/ tree re-produces the SAME fingerprint value.
       const { rows } = await db.query(
         'SELECT value FROM project_settings WHERE project_id=$1 AND key=$2',
         [PID, 'schema_fingerprint']
       );
       assertEqual(rows.length, 1, 'S12.e3: fingerprint row restored');
-      assertEqual(rows[0].value, fp, 'S12.e3: restored fingerprint matches');
+      assertEqual(rows[0].value, originalFp, 'S12.e3: restored fingerprint is byte-identical to the original (deterministic hashing)');
 
       // Third call (after restored) must be a no-op.
-      const applied2 = await _testEnsureSchemaCurrent(db, PID,
-        db.dialect === 'sqlite' ? SCHEMA_SQLITE : SCHEMA_POSTGRES, fp);
-      assertFalse(applied2, 'S12.e3: third call after restore is no-op');
+      const result2 = await handoffModule.ensureSchemaCurrent(db, PID, { silent: true });
+      assertFalse(result2.applied, 'S12.e3: third call after restore is no-op');
     }
   );
 
@@ -2894,6 +2891,101 @@ async function runS12() {
       assertEqual(allRows.length, 3, 'S12.f2: exactly 3 total rows (legacy suppressed + first canonical superseded + second canonical live)');
     }
   );
+
+  // ── S12.g: cm#185 schema bring-forward — classification + rowid-alias acceptance ──
+
+  {
+    const label = 'S12.g1: classifySchemaFiles against the real repo tree is clean (ok:true, zero errors)';
+    try {
+      const result = classifySchemaFiles({ engineRoot: PROJECT_ROOT });
+      assertTrue(result.ok, `classification errors: ${JSON.stringify(result.errors)}`);
+      assertEqual(result.errors.length, 0, 'S12.g1: zero classification errors');
+      assertTrue(
+        result.unitsByDialect.postgres.map((u) => u.basename).join(',') ===
+          'handoff-core-schema.sql,app-retrieval-events-schema.sql',
+        `S12.g1: postgres unit order is [core, app-retrieval-events], got: ${result.unitsByDialect.postgres.map((u) => u.basename)}`
+      );
+      assertEqual(result.unitsByDialect.sqlite.length, 1, 'S12.g1: exactly one sqlite unit');
+      assertEqual(result.unitsByDialect.sqlite[0].basename, 'handoff-sqlite-schema.sql', 'S12.g1: sqlite unit is handoff-sqlite-schema.sql');
+      pass(label);
+    } catch (err) { fail(label, err.message); }
+  }
+
+  {
+    const label = 'S12.g2: schema-manifest.json every "excluded" unit carries a non-empty reason (S-3)';
+    try {
+      const result = classifySchemaFiles({ engineRoot: PROJECT_ROOT });
+      const excluded = Object.entries(result.manifest.units).filter(([, v]) => v.classification === 'excluded');
+      assertTrue(excluded.length >= 2, 'S12.g2: at least the two known-excluded files (phase3b-schema.sql, v_memory_hits.sql) are present');
+      for (const [basename, entry] of excluded) {
+        assertTrue(
+          typeof entry.reason === 'string' && entry.reason.trim().length > 0,
+          `S12.g2: excluded unit ${basename} must carry a non-empty reason string`
+        );
+      }
+      pass(label);
+    } catch (err) { fail(label, err.message); }
+  }
+
+  {
+    const label = 'S12.g3: schema-manifest.json never declares "both" (or any value other than postgres|sqlite|excluded) as a classification (R-9)';
+    try {
+      const result = classifySchemaFiles({ engineRoot: PROJECT_ROOT });
+      for (const [basename, entry] of Object.entries(result.manifest.units)) {
+        assertTrue(
+          ['postgres', 'sqlite', 'excluded'].includes(entry.classification),
+          `S12.g3: unit ${basename} has illegal classification "${entry.classification}"`
+        );
+      }
+      pass(label);
+    } catch (err) { fail(label, err.message); }
+  }
+
+  if (SQLITE_AVAILABLE) {
+    const label = 'S12.g4: SQLite retrieval_events.id is a genuine rowid alias (R-9 acceptance test)';
+    try {
+      const dbPath = path.join(os.tmpdir(), `s12g4-rowid-${Date.now()}.sqlite`);
+      const adapter = new SQLiteAdapter(dbPath);
+      await adapter.connect();
+      try {
+        let sql = fs.readFileSync(SCHEMA_SQLITE, 'utf8');
+        if (sql.charCodeAt(0) === 0xFEFF) sql = sql.slice(1);
+        sql = sql.replace(/^\\[a-z].*$/gm, '');
+        await adapter.runSchema(sql);
+
+        // PRAGMA table_info: an INTEGER PRIMARY KEY column (and ONLY that shape)
+        // is a rowid alias in SQLite -- pk flag set, declared type exactly INTEGER.
+        const info = await adapter.query(`PRAGMA table_info(retrieval_events)`);
+        const idCol = info.rows.find((r) => r.name === 'id');
+        assertTrue(!!idCol, 'S12.g4: retrieval_events.id column exists');
+        assertTrue(/^integer$/i.test(idCol.type), `S12.g4: id column type is exactly INTEGER (rowid-alias requirement), got "${idCol.type}"`);
+        assertTrue(Number(idCol.pk) === 1, 'S12.g4: id column is the declared PRIMARY KEY');
+
+        // Behavioral proof: an INSERT omitting id gets last_insert_rowid(), and a
+        // second row gets the next sequential rowid -- the hallmark of a working
+        // rowid alias (a non-alias INTEGER PRIMARY KEY on a WITHOUT ROWID table,
+        // or any other shape, would not exhibit monotonic auto-assignment here).
+        const ins1 = await adapter.query(
+          `INSERT INTO retrieval_events (project_id, query_text) VALUES ($1, $2) RETURNING id`,
+          ['s12g4-proj', 'first']
+        );
+        const ins2 = await adapter.query(
+          `INSERT INTO retrieval_events (project_id, query_text) VALUES ($1, $2) RETURNING id`,
+          ['s12g4-proj', 'second']
+        );
+        const id1 = ins1.rows[0].id;
+        const id2 = ins2.rows[0].id;
+        assertTrue(Number.isInteger(id1) && id1 > 0, 'S12.g4: first insert got a positive integer id');
+        assertEqual(id2, id1 + 1, 'S12.g4: second insert got the next sequential rowid');
+      } finally {
+        await adapter.end();
+        try { fs.unlinkSync(dbPath); } catch (_) {}
+      }
+      pass(label);
+    } catch (err) { fail(label, err.message); }
+  } else {
+    console.log('SKIP  S12.g4: SQLite retrieval_events.id rowid-alias acceptance test (Node < 22)');
+  }
 }
 
 // ── S13: PR-3a — Marker-borne project identity + one-shot migration ───────────
