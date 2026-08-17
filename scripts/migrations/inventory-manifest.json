@@ -14,6 +14,7 @@
     { "targetTable": "agent_rewrites",      "section": "5.3" },
     { "targetTable": "policy_sections",     "section": "5.3" },
     { "targetTable": "session_chunks",      "section": "5.3" },
+    { "targetTable": "sessions",            "section": "5.3 (14th seam table, E-2, mm#11(e))" },
     { "targetTable": "agent_exchange",      "section": "5.8" },
     { "targetTable": "audit_log",           "section": "5.8" },
     { "targetTable": "v_handoff_card_inputs", "section": "5.9" },

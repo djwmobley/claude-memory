@@ -1,0 +1,13 @@
+{
+  "_comment": "SYNTHETIC EXAMPLE ONLY — obviously-fake database and project names throughout. The real pipeline-db-project-map.json carries private instance routing data (real database names, real project identifiers per CONSOLIDATION-RUNBOOK.md §16.1) and is gitignored, never committed. §6.1(e) step 3's first bullet: project_id for a `pipeline_<name>` DB is derived from the DB name itself (the name IS the project signal); for `claude_policy_framework`'s own NATIVE rows (every in-scope table this migration touches there EXCEPT decisions, which stays phase (b)'s job — gotchas/checklist_items/corpus_files/policy_sections/session_chunks/sessions), the project is policy-framework itself, the DB's own native host project per §16.1's own enrollment-matrix row. This flat map covers BOTH cases with one mechanism: db name -> project_id. A db present in db-triage.json as REAL-MIGRATE but ABSENT from this map is never guessed — its rows route to an explicit `unmapped-pipeline-db-<dbname>` bucket, flagged in the migration report, exactly D-1/D-10's `unmatched-<prefix>` pattern for decisions. `claude_context` is deliberately NOT mapped here in the real file (see that script's header comment on E-11's scope boundary): its DECISIONS table alone gets row-level classification via claude-context-topic-rules.json; every OTHER claude_context table (gotchas/research/tasks/code_index/sessions) has no per-row project hint at all and, absent owner confirmation of what single project it belongs to, correctly falls to the unmapped bucket rather than a guessed assignment.",
+  "known_project_ids": [
+    "example-project-alpha",
+    "example-policy-framework",
+    "example-pipeline"
+  ],
+  "map": {
+    "example_policy_framework_db": "example-policy-framework",
+    "example_pipeline_main_db": "example-pipeline",
+    "example_pipeline_ppm_monolith_db": "example-project-alpha"
+  }
+}

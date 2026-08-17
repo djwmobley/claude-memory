@@ -1,0 +1,19 @@
+{
+  "_comment": "SYNTHETIC EXAMPLE ONLY — obviously-fake database names throughout. The real db-triage.json carries private instance data (real Postgres database names on the owner's own instance) and is gitignored, never committed. This file documents the required SHAPE migrate-04-absorb-pipeline-tables.js's loadDbTriage()/classifyDb() implement, and is also what test/migrations/test-migrate-04-absorb-pipeline-tables.js loads (via --db-triage) so the suite runs green with no private data present, in CI or anywhere else. E-1/E-8 (CONSOLIDATION-RUNBOOK.md §6.1(e) amendment, memory-manager#11(e)): TOTAL classification over every non-template pg_database entry — a flat map of db name -> one of four classes. classifyDb()'s DEFAULT branch (a db name absent from this map) is 'UNCLASSIFIED', a loud, run-blocking refusal — never a silent skip and never a silent REAL-MIGRATE guess.",
+  "classes": {
+    "_comment": "The four real classes. REAL-MIGRATE: this script connects and migrates in-scope tables from it (an empty result for a REAL-MIGRATE db with zero in-scope tables is a normal, reported outcome, never an error). EPHEMERAL-DROP: loud-skipped, self-evidently disposable test/debug scratch data, mirrors CONSOLIDATION-RUNBOOK.md §16.3's own triage table. OWNER-REVIEW: loud-skipped, V6 'leave alone' — never migrated, never dropped, without explicit owner sign-off. ENGINE-INFRA: loud-skipped; this repo's OWN target/test-fixture databases (memory_manager_staging, claude_memory_eval_test, the Postgres maintenance db, etc.) — distinguished from EPHEMERAL-DROP only for clearer reporting: permanent infra this script structurally must never touch as a SOURCE, not disposable test debris a human might someday delete."
+  },
+  "databases": {
+    "example_policy_framework":        "REAL-MIGRATE",
+    "example_pipeline_main":           "REAL-MIGRATE",
+    "example_shared_context":          "REAL-MIGRATE",
+    "example_pipeline_empty_project":  "REAL-MIGRATE",
+    "example_pipeline_scratch_debug_1779064022571": "EPHEMERAL-DROP",
+    "example_pipeline_confirm_test_1783814138967":  "EPHEMERAL-DROP",
+    "example_pipeline_owner_pending":  "OWNER-REVIEW",
+    "example_consulting_side_db":      "OWNER-REVIEW",
+    "postgres":                        "ENGINE-INFRA",
+    "example_memory_manager_staging":  "ENGINE-INFRA",
+    "example_eval_test_fixture_db":    "ENGINE-INFRA"
+  }
+}

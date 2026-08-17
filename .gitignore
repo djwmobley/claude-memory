@@ -113,3 +113,13 @@ scripts/decisions_backup*.csv
 # the required shape. See migrate-09-file-memory-markdown.js's
 # loadEnrollmentConfig().
 /scripts/migrations/file-memory-project-enrollment.json
+
+# migrate-04-absorb-pipeline-tables.js's (§6.1(e), memory-manager#11(e))
+# three real config files — all carry private instance data (real database
+# names/classifications, real per-project routing decisions, real topic
+# vocabulary) and are never committed. Each has a committed synthetic
+# .example.json documenting the required shape. See that script's
+# loadDbTriage()/loadPipelineDbProjectMap()/loadClaudeContextTopicRules().
+/scripts/migrations/db-triage.json
+/scripts/migrations/pipeline-db-project-map.json
+/scripts/migrations/claude-context-topic-rules.json

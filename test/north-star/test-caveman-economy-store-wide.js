@@ -208,6 +208,21 @@ function checkCell(manifest, table, column, colDef, row) {
     requireEconomy = rowMode === 'caveman'; // NULL (grandfathered) or 'verbose' -> exempt (§3.6/§3.5 step 3).
   }
 
+  // E-9 grandfather escape (CONSOLIDATION-RUNBOOK.md §6.1(e) amendment,
+  // memory-manager#11(e), RESOLVED owner 2026-08-16): the 5 §5 tables with
+  // NO authoring_mode column at all (tasks, code_index, checklist_items,
+  // workflow_discovery, agent_rewrites) are otherwise permanently
+  // requireEconomy=true (the `!authCol` branch above) — a guaranteed FAIL
+  // against real migrated legacy pipeline prose that long predates the
+  // caveman invariant. migrate-04-absorb-pipeline-tables.js's own DDL
+  // addenda adds a `migrated_legacy BOOLEAN` column to exactly these 5
+  // tables and sets it true on every row it inserts. A migrated_legacy=true
+  // row is exempt from ECONOMY only — FIDELITY (K-7, byte-preservation/T3)
+  // is untouched and still checked below, unconditionally, for every row.
+  if (row.migrated_legacy === true) {
+    requireEconomy = false;
+  }
+
   const failures = [];
 
   // FIDELITY (K-7) — always, every classified column, every row.
@@ -358,6 +373,12 @@ const MIGRATE13 = path.join(MIGRATIONS_DIR, 'migrate-13-agent-exchange.js');
 const MIGRATE14 = path.join(MIGRATIONS_DIR, 'migrate-14-seam-tables.js');
 const MIGRATE15 = path.join(MIGRATIONS_DIR, 'migrate-15-mcp-addenda.js');
 const MIGRATE16 = path.join(MIGRATIONS_DIR, 'migrate-16-caveman-addenda.js');
+// migrate-04-absorb-pipeline-tables.js's bundled DDL preamble -- applied
+// directly via migrateOne.applySqlFile (reused by reference, never forked)
+// rather than a CLI step, same reasoning as the own_graph_migration_ids/
+// memory_entries.project_id block below (see provisionSchema()).
+const migrateOne = require(path.join(MIGRATIONS_DIR, 'migrate-01-canonical-db.js'));
+const MIGRATE04_SEAM_DDL_ADDENDA = path.join(MIGRATIONS_DIR, 'sql', 'migrate-04-seam-ddl-addenda.sql');
 
 function runScript(scriptPath, args, timeoutMs = 30000) {
   return spawnSync(process.execPath, [scriptPath, ...args], {
@@ -414,6 +435,21 @@ async function provisionSchema(dbName) {
     await shared.applyDdl(client);
     await client.query('ALTER TABLE memory_entries ADD COLUMN IF NOT EXISTS project_id TEXT');
     await client.query('ALTER TABLE memory_entry_chunks ADD COLUMN IF NOT EXISTS project_id TEXT');
+    // migrate-04-absorb-pipeline-tables.js's bundled DDL preamble (§6.1(e)
+    // amendment, mm#11(e)): creates `sessions` (the 14th seam table, E-2),
+    // the `migrated_legacy` escape column on 5 tables (E-9), the UNIQUE/PK
+    // supersessions (E-4/E-7), and the lossless-fidelity additive columns
+    // (tasks.notes/blocker, incidents.status, checklist_items.item_num/
+    // owner_name/source_file/content_hash, corpus_files.sha256,
+    // session_chunks.content_hash — see that SQL file's own header comment)
+    // — landed in caveman-columns.json after this provisioning stack was
+    // first written, same same-change-gap shape as own_graph_migration_ids/
+    // memory_entries.project_id above. Applied directly here (never via
+    // migrate-04's own full data-migration CLI, which requires real
+    // db-triage.json/pipeline-db-project-map.json/claude-context-topic-
+    // rules.json config and performs a real multi-source-db migration —
+    // wildly inappropriate for one throwaway schema-shape scratch DB).
+    await migrateOne.applySqlFile(client, MIGRATE04_SEAM_DDL_ADDENDA);
   } finally {
     await client.end();
   }

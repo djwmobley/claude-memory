@@ -575,6 +575,36 @@ CREATE TABLE IF NOT EXISTS own_graph_migration_ids (
 );
 CREATE INDEX IF NOT EXISTS own_graph_migration_ids_slice_idx
   ON own_graph_migration_ids (source_db, source_table, project_id);
+
+-- pipeline_migration_row_ids: migrate-04-absorb-pipeline-tables.js's (§6.1(e)
+-- amendment E-6, mm#11(e)) own source-id -> target-id lineage table, mirroring
+-- own_graph_migration_ids above verbatim in shape and in the reason for being
+-- registered HERE rather than as a private DDL block inside that script (same
+-- T0 live-table-classification argument). source_row_id is TEXT so one column
+-- serves every in-scope table regardless of source PK shape (findings.id is
+-- already TEXT; every other in-scope table's source PK is an integer SERIAL,
+-- cast to TEXT at write time). target_row_id is INTEGER for every table with
+-- a real target SERIAL id; findings' target identity is its composite PK
+-- (project_id, id) — a TEXT id it verbatim-preserves from the source, not a
+-- SERIAL — so findings' lineage rows carry that id string in source_row_id
+-- and a dummy sentinel (1) in target_row_id (INTEGER NOT NULL, cannot hold
+-- text), exactly mirroring own_graph_migration_ids' project_settings
+-- precedent: deletes/lookups for findings are scoped by (project_id, id)
+-- directly, never by target_row_id (see migrate-04-absorb-pipeline-tables.js
+-- header comment, E-6 resolution).
+CREATE TABLE IF NOT EXISTS pipeline_migration_row_ids (
+  id            SERIAL PRIMARY KEY,
+  source_db     TEXT NOT NULL,
+  source_table  TEXT NOT NULL,
+  source_row_id TEXT NOT NULL,
+  project_id    TEXT NOT NULL,
+  target_table  TEXT NOT NULL,
+  target_row_id INTEGER NOT NULL,
+  migrated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (source_db, source_table, source_row_id)
+);
+CREATE INDEX IF NOT EXISTS pipeline_migration_row_ids_slice_idx
+  ON pipeline_migration_row_ids (source_db, source_table, project_id);
 `.trim();
 
 async function applyDdl(client) {
