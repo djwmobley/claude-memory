@@ -178,6 +178,28 @@ The journal has three parts, and they serve different purposes.
 - **`HANDOFF_BASE_DIR`** — overrides the base directory for `handoff.md` (default: `~/.claude`, i.e. `os.homedir()/.claude`). Must be an absolute path in the current platform's native form — a drive-letter-rooted path on Windows (`C:\Users\you\.claude`), not an MSYS/Git-Bash-style `/c/Users/you/.claude` (that form passes a naive "is this absolute" check but resolves drive-relative to Windows APIs, which is rejected with an explanatory error).
 - **`HANDOFF_PROMOTION_FILE`** — overrides the durable-facts promotion filename (default: `CLAUDE.md`). Must be a bare filename relative to the project root (no path separators, no `..` segment, not absolute) and cannot collide with the marker filename or `handoff.md`.
 
+### Schema files
+
+Everything Postgres-side is defined by `.sql` files under `scripts/sql/`. Each file carries a
+first-line directive (`-- handoff:dialect postgres`, `-- handoff:dialect sqlite`, or
+`-- handoff:excluded <reason>`) that is cross-checked against a tracked manifest
+(`scripts/sql/schema-manifest.json`); any file the engine finds but can't classify this way is a
+loud, visible error rather than a silent skip. The current classification:
+
+| File | Applied by | Notes |
+|---|---|---|
+| `handoff-core-schema.sql` | `/handoff:init` and the schema-drift auto-apply sentinel (Postgres backend) | `entities`, `assertions`, `edges`, `retrieval_contract`, `retrieval_contract_history`, `project_settings`, `entity_communities`, `extraction_queue` |
+| `app-retrieval-events-schema.sql` | Same, ordered immediately after `handoff-core-schema.sql` | `retrieval_events`, `retrieval_event_assertions` |
+| `handoff-sqlite-schema.sql` | Same (SQLite backend only — `STORAGE_BACKEND=sqlite`) | Self-contained equivalent of both files above, dialect-adapted |
+| `phase3b-schema.sql` | Not applied by the handoff engine (excluded) | App-specific; targets `memory_entry_chunks` in the separate canonical/pipeline database provisioned by `scripts/setup.sql` |
+| `v_memory_hits.sql` | Not applied by the handoff engine (excluded) | Same canonical/pipeline database; sourced by `scripts/setup.sql`'s own `\ir` |
+
+`/handoff:init` applies the Postgres-classified files (or the single SQLite-classified file) in
+order and verifies every expected table/column/index actually landed before recording the schema
+as current. On every `/handoff:close` and `/handoff:resume` after that, a drift sentinel compares
+a content hash of the applicable files against what's recorded for your project and re-applies
+additively if anything changed — you never run a manual migration step.
+
 ---
 
 ## A word on what the hooks are doing

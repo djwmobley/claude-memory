@@ -967,6 +967,32 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run schema bring-forward aged-DB fixture tests (cm#185)
+        # Fresh-DB CI cannot exercise any prior-state-dependent schema-apply
+        # failure mode (S-11/S-13/S-17/S-19) -- every test-both-backends.js
+        # test starts from a schema the harness itself just applied. This
+        # suite constructs genuinely aged database states by hand instead:
+        #   T1  core-only provision -> drop the 1:1 integrity index -> seed a
+        #       live-duplicate pair that would violate it -> run the REAL
+        #       ensureSchemaCurrent -- asserts retrieval_events still gets
+        #       applied (a later unit), the fingerprint is NEVER upserted on
+        #       integrity-index failure, a persistent schema_apply_degraded
+        #       row is written, and a retry never falsely marks success.
+        #   T2  atomic DROP+CREATE pair regression proof: a previously-WORKING
+        #       integrity index survives a failed re-create attempt (the
+        #       sharpest form of the S-11 claim) -- db.runIntegrityIndexPair
+        #       rolls the DROP back together with the failed CREATE.
+        #   T3  run-twice zero-DDL idempotency: a second ensureSchemaCurrent
+        #       call after a successful apply is a pure no-op.
+        #   T4  fingerprint(CRLF+BOM) === fingerprint(LF) -- the S-8
+        #       cross-platform stability gate (pure, no DB).
+        # Creates/drops its own throwaway scratch databases; never touches
+        # claude_memory_eval_test/memory_manager_staging.
+        run: node scripts/test-schema-bring-forward.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run host-agnostic naming tests
         # Regression guard for #135 (host-agnostic naming generalization):
         #   M1-M7  Dual-marker same-directory classification (new .memory-engine

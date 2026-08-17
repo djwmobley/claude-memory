@@ -1,0 +1,143 @@
+{
+  "_doc": "cm#185 schema bring-forward manifest. Cross-checked against each file's own in-file header directive (first non-blank lines: '-- handoff:dialect postgres' | '-- handoff:dialect sqlite' | '-- handoff:excluded <reason>') by scripts/lib/schema-classify.js. This file provides CLASSIFICATION + EXPECTED-OBJECTS metadata only -- it is never the source of enumeration. Enumeration always reads the filesystem (scripts/sql/*.sql, non-recursive) and cross-checks git-tracked status; any enumerated file absent from this manifest, or any manifest entry whose classification disagrees with the file's own header directive, is a loud classification error (persistent project_settings 'schema_apply_degraded' row + stderr), never a silent skip. schema_epoch is a monotonically-bumped integer bumped whenever the applicable-unit set or any unit's DDL changes in a way that must force a re-apply on already-current databases; it is embedded as the '<epoch>:<hash>' prefix of the stored project_settings.schema_fingerprint value (see _computeSchemaFingerprint in scripts/handoff.js).",
+  "schema_epoch": 1,
+  "required_roster": [
+    "handoff-core-schema.sql",
+    "handoff-sqlite-schema.sql",
+    "app-retrieval-events-schema.sql"
+  ],
+  "units": {
+    "handoff-core-schema.sql": {
+      "classification": "postgres",
+      "order": 10,
+      "expected_objects": {
+        "tables": [
+          "entities",
+          "assertions",
+          "edges",
+          "retrieval_contract",
+          "retrieval_contract_history",
+          "project_settings",
+          "entity_communities",
+          "extraction_queue"
+        ],
+        "columns": [
+          { "table": "assertions", "column": "suppressed" },
+          { "table": "assertions", "column": "outcome_bias" },
+          { "table": "assertions", "column": "promoted" },
+          { "table": "assertions", "column": "promoted_at" },
+          { "table": "assertions", "column": "valid_at" },
+          { "table": "assertions", "column": "invalid_at" },
+          { "table": "assertions", "column": "suppression_kind" },
+          { "table": "assertions", "column": "pinned" },
+          { "table": "assertions", "column": "tier" },
+          { "table": "assertions", "column": "consolidated_at" },
+          { "table": "assertions", "column": "corroboration_count" },
+          { "table": "assertions", "column": "reality_check" },
+          { "table": "assertions", "column": "anchor" },
+          { "table": "retrieval_contract", "column": "version" }
+        ],
+        "indexes": [
+          "entities_project_idx",
+          "entities_name_idx",
+          "assertions_project_idx",
+          "assertions_subject_idx",
+          "assertions_confidence_idx",
+          "assertions_1to1_unique",
+          "assertions_1ton_exact_unique",
+          "edges_project_idx",
+          "edges_from_idx",
+          "edges_to_idx",
+          "retrieval_contract_project_idx",
+          "retrieval_contract_history_idx",
+          "entity_communities_lookup_idx",
+          "entity_communities_run_idx",
+          "extraction_queue_project_status_idx"
+        ],
+        "_note": "The pgvector-gated assertions.embedding column, assertions_embedding_hnsw_idx, and the pg_trgm-gated assertions_trgm_text_idx are deliberately EXCLUDED from this expected-objects list. Both DO $$ blocks that create them are designed to degrade gracefully (EXCEPTION WHEN OTHERS) when the extension is absent -- the file's own header states 'no extensions, no halfvec, no pgvector dependency'. Including them here would convert an intentional optional degrade into a permanent stuck-degraded state on every stock Postgres instance without pgvector/pg_trgm installed. See PR body for the full rationale (S-13 scope interpretation)."
+      }
+    },
+    "handoff-sqlite-schema.sql": {
+      "classification": "sqlite",
+      "order": 10,
+      "expected_objects": {
+        "tables": [
+          "entities",
+          "assertions",
+          "edges",
+          "retrieval_contract",
+          "retrieval_contract_history",
+          "project_settings",
+          "entity_communities",
+          "extraction_queue",
+          "retrieval_events",
+          "retrieval_event_assertions"
+        ],
+        "columns": [
+          { "table": "assertions", "column": "suppressed" },
+          { "table": "assertions", "column": "outcome_bias" },
+          { "table": "assertions", "column": "promoted" },
+          { "table": "assertions", "column": "promoted_at" },
+          { "table": "assertions", "column": "valid_at" },
+          { "table": "assertions", "column": "invalid_at" },
+          { "table": "assertions", "column": "suppression_kind" },
+          { "table": "assertions", "column": "pinned" },
+          { "table": "assertions", "column": "tier" },
+          { "table": "assertions", "column": "consolidated_at" },
+          { "table": "assertions", "column": "corroboration_count" },
+          { "table": "assertions", "column": "reality_check" },
+          { "table": "assertions", "column": "anchor" },
+          { "table": "retrieval_contract", "column": "version" }
+        ],
+        "indexes": [
+          "entities_project_idx",
+          "entities_name_idx",
+          "assertions_project_idx",
+          "assertions_subject_idx",
+          "assertions_confidence_idx",
+          "assertions_1to1_unique",
+          "assertions_1ton_exact_unique",
+          "edges_project_idx",
+          "edges_from_idx",
+          "edges_to_idx",
+          "retrieval_contract_project_idx",
+          "retrieval_contract_history_idx",
+          "entity_communities_lookup_idx",
+          "entity_communities_run_idx",
+          "extraction_queue_project_status_idx",
+          "retrieval_events_project_idx",
+          "retrieval_events_outcome_idx",
+          "retrieval_events_time_idx",
+          "rea_event_idx",
+          "rea_assertion_idx"
+        ]
+      }
+    },
+    "app-retrieval-events-schema.sql": {
+      "classification": "postgres",
+      "order": 20,
+      "expected_objects": {
+        "tables": [
+          "retrieval_events",
+          "retrieval_event_assertions"
+        ],
+        "columns": [],
+        "indexes": [
+          "retrieval_events_project_idx",
+          "retrieval_events_outcome_idx",
+          "retrieval_events_time_idx",
+          "rea_event_idx",
+          "rea_assertion_idx"
+        ]
+      }
+    },
+    "phase3b-schema.sql": {
+      "classification": "excluded",
+      "reason": "targets the canonical/pipeline DB provisioned by scripts/setup.sql; depends on memory_entry_chunks which no per-project schema defines"
+    },
+    "v_memory_hits.sql": {
+      "classification": "excluded",
+      "reason": "targets the canonical/pipeline DB provisioned by scripts/setup.sql; depends on memory_entries/memory_entry_chunks which no per-project schema defines"
+    }
+  }
+}

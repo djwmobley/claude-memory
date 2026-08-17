@@ -82,16 +82,32 @@ node scripts/handoff.js init
 **You should see:**
 
 ```
-init complete:
-OK    schema migration: phase2-schema.sql
-OK    schema migration: phase3b-schema.sql
-OK    project_settings defaults inserted (5 keys, idempotent)
-OK    created handoff.md: ~/.claude/projects/<your-path>/handoff.md
-OK    created CLAUDE.md: <project-root>/CLAUDE.md
-OK    retrieval_contract 'default' row ensured
+Running: handoff:init
 
-Done: handoff:init — project <your-path> provisioned
+  [OK]    project marker minted (deferred): uuid=<uuid>
+  Resolved target DB: <your-db>  (source: pipeline.yml)
+  [OK]    Node version >= 18: Node <version>
+  [OK]    pg package installed: pg package present
+  [OK]    Postgres reachable at localhost:5432: Postgres reachable at localhost:5432
+  [OK]    Database '<your-db>' present: Database '<your-db>' exists
+  [OK]    Postgres version >= 13: Postgres <version>
+  [OK]    Schema units resolved (2): handoff-core-schema.sql, app-retrieval-events-schema.sql
+  [OK]    Schema applied: handoff-core-schema.sql, app-retrieval-events-schema.sql
+  [OK]    Post-apply schema verification passed (<N> tables, <N> columns, <N> indexes checked)
+  [OK]    project_settings defaults ensured (<N> keys, idempotent)
+  [OK]    retrieval_contract 'default' row ensured
+  [OK]    retrieval_contract_history baseline ensured (idempotent)
+  [OK]    handoff.md created: ~/.claude/projects/<your-path>/handoff.md
+  [OK]    CLAUDE.md created: <project-root>/CLAUDE.md
+  [OK]    project marker written: uuid=<uuid>
+
+Done: handoff:init — project <uuid> provisioned
 ```
+
+The two schema units applied — `handoff-core-schema.sql` and `app-retrieval-events-schema.sql` —
+are both stock Postgres >= 13, no extensions required. (SQLite-backend projects apply the single
+`handoff-sqlite-schema.sql` unit instead.) See `docs/how-memory-works.md`'s "Schema files" section
+for the full classification of every file under `scripts/sql/`.
 
 **What just happened:** The script created the database tables and a `handoff.md` in a private folder outside the repo where session notes will live. If your project didn't already have a `CLAUDE.md` at the repo root, it created one too (Claude reads this at startup — commit it to git). If you already had a `CLAUDE.md`, the script left it alone. The output line will say `OK    created CLAUDE.md: <path>` or `OK    CLAUDE.md already exists — skipped: <path>` accordingly.
 

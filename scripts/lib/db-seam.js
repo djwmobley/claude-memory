@@ -84,6 +84,22 @@
 //                                  — Connect to the target database for the init command.
 //                                    Handles dialect-specific connection setup.
 //
+//   cm#185 schema bring-forward port methods (both adapters implement all four):
+//   runIntegrityIndexPair(dropSql, createSql)
+//                                  — Atomic DROP INDEX IF EXISTS + CREATE [UNIQUE] INDEX
+//                                    pair (own transaction). CREATE failure rolls back
+//                                    the DROP too. Never throws; returns { ok, msg }.
+//   schemaObjectsExist({tables?, columns?, indexes?})
+//                                  — Post-apply structural verification probe (PG:
+//                                    information_schema/pg_indexes; SQLite: sqlite_master/
+//                                    PRAGMA table_info). Returns { ok, missing }.
+//   setApplyTimeouts()             — SET LOCAL lock_timeout/statement_timeout for the
+//                                    current apply transaction (PG only; SQLite no-op).
+//   acquireSchemaApplyLock(lockKey) / releaseSchemaApplyLock(lockKey)
+//                                  — Session-scoped advisory lock guarding the whole
+//                                    detect+apply+verify+upsert sequence (PG: pg_advisory_
+//                                    lock/unlock, namespace 43; SQLite: no-op, seam-test-only).
+//
 // Dialect differences handled internally by SQLiteAdapter:
 //   1. Param placeholders:  $N -> ?
 //   2. JSONB vs TEXT:       serialize/deserialize queries + payload columns
@@ -776,6 +792,86 @@ class SQLiteAdapter {
   }
 
   /**
+   * cm#185: run a DROP INDEX IF EXISTS + CREATE [UNIQUE] INDEX pair as a single
+   * atomic unit (its own transaction). If CREATE fails (legacy-duplicate corpus),
+   * the DROP is rolled back too -- the index is never left in a "dropped but not
+   * recreated" state (closes S-11: a failed re-create must not silently destroy
+   * a previously-working integrity index).
+   * Never throws -- returns { ok, msg }.
+   */
+  async runIntegrityIndexPair(dropSql, createSql) {
+    const db = this._db;
+    if (!db) throw new Error('SQLiteAdapter: not connected');
+    try {
+      db.prepare('BEGIN').run();
+      if (dropSql) db.prepare(rewriteForSQLite(dropSql.trim())).run();
+      db.prepare(rewriteForSQLite(createSql.trim())).run();
+      db.prepare('COMMIT').run();
+      return { ok: true, msg: 'index recreated' };
+    } catch (e) {
+      try { db.prepare('ROLLBACK').run(); } catch (_) {}
+      return { ok: false, msg: e.message };
+    }
+  }
+
+  /**
+   * cm#185: probe whether the given tables/columns/indexes exist. Used as the
+   * post-apply structural verification gate before the schema_fingerprint is
+   * upserted (closes S-13: "did not throw" is not proof of "is present").
+   * expected: { tables?: string[], columns?: {table,column}[], indexes?: string[] }
+   * Returns { ok: boolean, missing: [{type, ...}] }. Never throws.
+   */
+  async schemaObjectsExist(expected) {
+    const db = this._db;
+    if (!db) throw new Error('SQLiteAdapter: not connected');
+    const missing = [];
+    const safeIdent = /^[A-Za-z_][A-Za-z0-9_]*$/;
+    for (const t of (expected.tables || [])) {
+      let row = null;
+      try { row = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name = ?`).get(t); } catch (_) {}
+      if (!row) missing.push({ type: 'table', table: t });
+    }
+    const byTable = {};
+    for (const c of (expected.columns || [])) {
+      (byTable[c.table] = byTable[c.table] || []).push(c.column);
+    }
+    for (const [table, cols] of Object.entries(byTable)) {
+      let info = [];
+      if (safeIdent.test(table)) {
+        try { info = db.prepare(`PRAGMA table_info(${table})`).all(); } catch (_) {}
+      }
+      const found = new Set(info.map((r) => r.name));
+      for (const col of cols) {
+        if (!found.has(col)) missing.push({ type: 'column', table, column: col });
+      }
+    }
+    for (const idx of (expected.indexes || [])) {
+      let row = null;
+      try { row = db.prepare(`SELECT name FROM sqlite_master WHERE type='index' AND name = ?`).get(idx); } catch (_) {}
+      if (!row) missing.push({ type: 'index', index: idx });
+    }
+    return { ok: missing.length === 0, missing };
+  }
+
+  /**
+   * cm#185: set the per-apply lock/statement timeout budget (R-7). No-op for
+   * SQLite -- busy_timeout is already set at connect() time and there is no
+   * per-transaction lock_timeout/statement_timeout concept to mirror.
+   */
+  async setApplyTimeouts() { /* no-op: SQLite has no SET LOCAL lock_timeout concept */ }
+
+  /**
+   * cm#185: acquire/release the schema-apply advisory lock (R-8). No-op for
+   * SQLite -- this adapter is seam-test-only (single embedded db file, single
+   * test process); true write-serialization for SQLite comes from
+   * acquireMigrationLock's BEGIN IMMEDIATE elsewhere, not from a session-level
+   * advisory lock (SQLite has no such primitive). Documented as a blind spot:
+   * no cross-process schema-apply mutual exclusion exists on the SQLite path.
+   */
+  async acquireSchemaApplyLock(_lockKey) { /* no-op: see method doc */ }
+  async releaseSchemaApplyLock(_lockKey) { /* no-op: see method doc */ }
+
+  /**
    * Execute a SELECT query that may fail (e.g., table might not exist) without
    * aborting the surrounding transaction.
    *
@@ -1272,6 +1368,101 @@ class PostgresAdapter {
     } catch (e) {
       return { ok: false, msg: e.message };
     }
+  }
+
+  /**
+   * cm#185: run a DROP INDEX IF EXISTS + CREATE [UNIQUE] INDEX pair as a single
+   * atomic unit (its own transaction, with the R-7 lock/statement timeout
+   * budget applied). If CREATE fails (legacy-duplicate corpus), the DROP is
+   * rolled back too -- the index is never left in a "dropped but not
+   * recreated" state (closes S-11).
+   * Never throws -- returns { ok, msg }.
+   */
+  async runIntegrityIndexPair(dropSql, createSql) {
+    try {
+      await this._client.query('BEGIN');
+      await this._client.query(`SET LOCAL lock_timeout = '5s'`);
+      await this._client.query(`SET LOCAL statement_timeout = '120s'`);
+      if (dropSql) await this._client.query(dropSql.trim());
+      await this._client.query(createSql.trim());
+      await this._client.query('COMMIT');
+      return { ok: true, msg: 'index recreated' };
+    } catch (e) {
+      try { await this._client.query('ROLLBACK'); } catch (_) {}
+      return { ok: false, msg: e.message };
+    }
+  }
+
+  /**
+   * cm#185: probe whether the given tables/columns/indexes exist via
+   * information_schema / pg_indexes. Used as the post-apply structural
+   * verification gate before the schema_fingerprint is upserted (closes
+   * S-13: "did not throw" is not proof of "is present").
+   * expected: { tables?: string[], columns?: {table,column}[], indexes?: string[] }
+   * Returns { ok: boolean, missing: [{type, ...}] }. Never throws.
+   */
+  async schemaObjectsExist(expected) {
+    const missing = [];
+    const client = this._client;
+    if (expected.tables && expected.tables.length) {
+      const { rows } = await client.query(
+        `SELECT table_name FROM information_schema.tables
+          WHERE table_schema = current_schema() AND table_name = ANY($1::text[])`,
+        [expected.tables]
+      );
+      const found = new Set(rows.map((r) => r.table_name));
+      for (const t of expected.tables) if (!found.has(t)) missing.push({ type: 'table', table: t });
+    }
+    if (expected.columns && expected.columns.length) {
+      const { rows } = await client.query(
+        `SELECT table_name, column_name FROM information_schema.columns
+          WHERE table_schema = current_schema()`
+      );
+      const found = new Set(rows.map((r) => `${r.table_name}.${r.column_name}`));
+      for (const c of expected.columns) {
+        if (!found.has(`${c.table}.${c.column}`)) missing.push({ type: 'column', table: c.table, column: c.column });
+      }
+    }
+    if (expected.indexes && expected.indexes.length) {
+      const { rows } = await client.query(
+        `SELECT indexname FROM pg_indexes
+          WHERE schemaname = current_schema() AND indexname = ANY($1::text[])`,
+        [expected.indexes]
+      );
+      const found = new Set(rows.map((r) => r.indexname));
+      for (const i of expected.indexes) if (!found.has(i)) missing.push({ type: 'index', index: i });
+    }
+    return { ok: missing.length === 0, missing };
+  }
+
+  /**
+   * cm#185 (R-7): set the per-apply-transaction lock/statement timeout budget.
+   * MUST be called after BEGIN (SET LOCAL is only valid inside a transaction
+   * block). A blocked DDL statement now fails fast (non-fatal, retried on the
+   * next invocation) rather than potentially wedging the live session behind a
+   * queued ACCESS EXCLUSIVE lock indefinitely.
+   */
+  async setApplyTimeouts() {
+    await this._client.query(`SET LOCAL lock_timeout = '5s'`);
+    await this._client.query(`SET LOCAL statement_timeout = '120s'`);
+  }
+
+  /**
+   * cm#185 (R-8): session-level advisory lock for the schema-apply sequence
+   * (detect+apply+verify+upsert). Deliberately pg_advisory_lock (session-scoped),
+   * NOT pg_advisory_xact_lock -- the apply phase runs multiple independently
+   * committing per-file transactions (R-6 fail-fast), so a lock tied to a
+   * single outer transaction (as acquireMigrationLock provides) cannot span
+   * them. Namespace 43 (vs. acquireMigrationLock's 42) keeps this lock key
+   * space disjoint from the existing identity-resolution advisory lock usage
+   * in this same file.
+   */
+  async acquireSchemaApplyLock(lockKey) {
+    await this._client.query(`SELECT pg_advisory_lock(hashtext($1), 43)`, [lockKey]);
+  }
+
+  async releaseSchemaApplyLock(lockKey) {
+    try { await this._client.query(`SELECT pg_advisory_unlock(hashtext($1), 43)`, [lockKey]); } catch (_) {}
   }
 
   get dialect() { return 'postgres'; }

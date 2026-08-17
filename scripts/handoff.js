@@ -1418,159 +1418,414 @@ function detectUnpackagedState(root) {
   }
 }
 
-// ─── SCHEMA AUTO-APPLY (Deliverable A) ───────────────────────────────────────
+// ─── SCHEMA AUTO-APPLY (cm#185 generalized schema bring-forward) ─────────────
+//
+// Generalizes the former hardcoded two-file (core+sqlite) apply into a total
+// classification of scripts/sql/*.sql (see scripts/lib/schema-classify.js and
+// scripts/sql/schema-manifest.json). Design summary (full rationale in the
+// cm#185 PR body / issue #185):
+//   - Enumeration + a required-minimum roster + an in-file header directive
+//     cross-checked against the tracked manifest together drive a TOTAL
+//     classification of every file in scripts/sql/ into postgres | sqlite |
+//     excluded. Any disagreement/absence/unknown is a loud, non-fatal error
+//     (persistent project_settings 'schema_apply_degraded' row + stderr),
+//     surfaced by /handoff:status and the resume banner — never a silent skip.
+//   - The fingerprint is epoch-prefixed ("<epoch>:<hash>") so an older engine
+//     talking to a DB stamped by a newer engine build detects "ahead" and
+//     refuses to apply, rather than looping.
+//   - Apply is per-file-transaction, fail-fast: a failing unit stops the
+//     sequence immediately: later units are not attempted and the fingerprint
+//     is not upserted.
+//   - The whole detect+apply+verify+upsert sequence runs under a session-scoped
+//     Postgres advisory lock (db.acquireSchemaApplyLock), with a fingerprint
+//     re-check immediately after acquiring — a losing concurrent process is a
+//     clean no-op.
+//   - The fingerprint is upserted ONLY after a post-apply catalog probe
+//     (db.schemaObjectsExist) confirms every expected table/column/index from
+//     the applied units' manifest entries is actually present — "did not
+//     throw" is never treated as proof of "is present" (closes the pgvector-
+//     DO-block / duplicate-column-swallow silent-degrade class of bug).
 
-// Module-level cache: maps schemaFilePath → { mtime, hash } so repeated calls in one
-// process don't re-read or re-hash the SQL files.  Reset implicitly on process restart.
+const { classifySchemaFiles, normalizeContent } = require('./lib/schema-classify');
+
+// Must match scripts/sql/schema-manifest.json's top-level "schema_epoch".
+// Bump BOTH together whenever the applicable-unit set or any unit's DDL
+// changes in a way that must force a re-apply on already-current databases.
+const SCHEMA_EPOCH = 1;
+
+// Module-level cache: maps schemaFilePath → { mtimeMs, size, hash } so repeated
+// calls in one process don't re-read or re-hash the SQL files. Keyed on
+// (mtimeMs, size) rather than mtimeMs alone (S-21) — a same-millisecond
+// content-changing write with an unchanged size is vanishingly rare in this
+// engine's own usage pattern (hand-edited SQL files between process runs),
+// but the extra guard is free. Reset implicitly on process restart; never
+// persisted.
 const _schemaHashCache = new Map();
 
 /**
- * Return a stable SHA-256 hex digest of a schema file's content.
- * Caches by (filePath + mtime) so file I/O is amortized within a process run.
+ * Return a stable SHA-256 hex digest of a schema file's EOL/BOM-normalized
+ * content (strip leading BOM; CRLF/CR → LF before hashing). Normalizing before
+ * hashing is what makes the fingerprint identical across a Windows CRLF
+ * working-tree checkout and a Linux CI LF checkout of the same commit (S-8).
  */
-function _hashSchemaFile(filePath) {
-  let mtime;
-  try {
-    mtime = fs.statSync(filePath).mtimeMs;
-  } catch (_) {
-    mtime = 0;
-  }
-  const cached = _schemaHashCache.get(filePath);
-  if (cached && cached.mtime === mtime) return cached.hash;
-  const content = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
-  const hash = crypto.createHash('sha256').update(content).digest('hex');
-  _schemaHashCache.set(filePath, { mtime, hash });
+function _hashSchemaFileNormalized(filePath) {
+  let stat = null;
+  try { stat = fs.statSync(filePath); } catch (_) { /* file absent */ }
+  const mtimeMs = stat ? stat.mtimeMs : 0;
+  const size    = stat ? stat.size    : 0;
+  const cached  = _schemaHashCache.get(filePath);
+  if (cached && cached.mtimeMs === mtimeMs && cached.size === size) return cached.hash;
+  const raw        = stat ? fs.readFileSync(filePath, 'utf8') : '';
+  const normalized = normalizeContent(raw);
+  const hash        = crypto.createHash('sha256').update(normalized, 'utf8').digest('hex');
+  _schemaHashCache.set(filePath, { mtimeMs, size, hash });
   return hash;
 }
 
 /**
- * Compute a single fingerprint covering BOTH schema files.
- * Even if only one backend is active, hashing both files means any schema change
- * to either file triggers a re-apply on the active backend.
+ * Compute the epoch-prefixed fingerprint for an ordered set of classified
+ * schema units (the active dialect's applicable set — see
+ * classifySchemaFiles().unitsByDialect). Entries are re-sorted here by
+ * UTF-16 code-unit order on the (already-lowercase, since these are the
+ * engine's own real basenames) basename — NOT filesystem/readdir order,
+ * which is platform-dependent (S-7) — before hashing, so a rename with
+ * identical content changes the fingerprint and a removal changes it too.
+ *
+ * @param {Array<{basename:string, fullPath:string}>} units
+ * @returns {string} "<SCHEMA_EPOCH>:<sha256 hex>"
  */
-function _computeSchemaFingerprint() {
-  const pgFile     = path.join(_ENGINE_ROOT, 'scripts', 'sql', 'handoff-core-schema.sql');
-  const sqliteFile = path.join(_ENGINE_ROOT, 'scripts', 'sql', 'handoff-sqlite-schema.sql');
-  return crypto.createHash('sha256')
-    .update(_hashSchemaFile(pgFile))
-    .update(_hashSchemaFile(sqliteFile))
-    .digest('hex');
+function _computeSchemaFingerprint(units) {
+  const sorted = [...units].sort((a, b) => (
+    a.basename < b.basename ? -1 : a.basename > b.basename ? 1 : 0
+  ));
+  const hash = crypto.createHash('sha256');
+  for (const u of sorted) {
+    hash.update(u.basename + '\0' + _hashSchemaFileNormalized(u.fullPath), 'utf8');
+  }
+  return `${SCHEMA_EPOCH}:${hash.digest('hex')}`;
 }
 
 /**
- * Apply the additive DDL for the active dialect's schema file.
- *
- * Mirrors the Phase A logic in cmdInit but factored out for reuse:
- *   - Reads the schema file, strips psql meta-commands.
- *   - Extracts and removes the two integrity index CREATE UNIQUE INDEX statements.
- *   - Runs core DDL inside BEGIN/COMMIT (idempotent IF NOT EXISTS DDL).
- *   - Runs each integrity index via db.runIntegrityIndex() (non-fatal on failure).
- *
- * Always uses db.query() for the additive ALTER TABLE statements so the seam
- * handles dialect rewriting (IF NOT EXISTS → stripped + caught for SQLite).
- *
- * @param {object}  db         — connected StoragePort adapter
- * @param {string}  schemaFile — absolute path to the active SQL schema file
- * @param {object}  [opts]
- * @param {boolean} [opts.silent=false] — suppress informational stderr output
+ * Parse a stored/current fingerprint string into { epoch, hash }.
+ * Bare 64-hex-char legacy values (pre-epoch format, written by the engine
+ * before cm#185) parse as epoch 0 — always "behind" the current epoch, so a
+ * legacy-fingerprinted DB re-applies exactly once and then carries the new
+ * epoch-prefixed format from then on.
+ * Anything else unparseable → { epoch: null, hash: null }.
  */
-async function applyAdditiveSchema(db, schemaFile, { silent } = {}) {
-  if (!fs.existsSync(schemaFile)) {
-    if (!silent) process.stderr.write(`[handoff] applyAdditiveSchema: schema file not found: ${schemaFile}\n`);
-    return;
-  }
+function _parseSchemaFingerprint(value) {
+  if (typeof value !== 'string' || value.length === 0) return { epoch: null, hash: null };
+  const epochMatch = value.match(/^(\d+):([0-9a-f]{64})$/);
+  if (epochMatch) return { epoch: parseInt(epochMatch[1], 10), hash: epochMatch[2] };
+  if (/^[0-9a-f]{64}$/.test(value)) return { epoch: 0, hash: value };
+  return { epoch: null, hash: null };
+}
 
-  let sql = fs.readFileSync(schemaFile, 'utf8');
-  // Strip psql meta-commands (\ir, \d, etc.) — not supported by pg client.
-  sql = sql.replace(/^\\[a-z].*$/gm, '');
+/**
+ * Compare a stored fingerprint against the current one.
+ * Returns 'absent' | 'current' | 'behind' | 'ahead' | 'unknown'.
+ */
+function _compareSchemaFingerprint(stored, current) {
+  if (stored == null) return 'absent';
+  const s = _parseSchemaFingerprint(stored);
+  const c = _parseSchemaFingerprint(current);
+  if (s.epoch === null) return 'unknown';
+  if (s.epoch > c.epoch) return 'ahead';
+  if (s.epoch < c.epoch) return 'behind';
+  return s.hash === c.hash ? 'current' : 'behind';
+}
 
-  // Extract integrity index statements (same logic as cmdInit Phase B).
-  const INTEGRITY_INDEX_NAMES = ['assertions_1to1_unique', 'assertions_1ton_exact_unique'];
-  const integrityIndexSqls = [];
-  let coreSchemaSQL = sql;
+// The two integrity (partial unique) indexes whose CREATE can legitimately
+// fail on a legacy-duplicate corpus and must therefore run in the non-fatal
+// phase, separate from the fatal per-file DDL transaction.
+const INTEGRITY_INDEX_NAMES = ['assertions_1to1_unique', 'assertions_1ton_exact_unique'];
+
+/**
+ * Extract the integrity-index operations from a unit's SQL text.
+ *
+ * For each name in INTEGRITY_INDEX_NAMES, if a CREATE [UNIQUE] INDEX
+ * statement for that name is present, extract it — and, if a matching
+ * `DROP INDEX IF EXISTS <name>;` statement precedes it in the same file,
+ * extract that too and pair them (S-11: the DROP must run in the SAME
+ * non-fatal phase as the CREATE, atomically, so a failing re-create can never
+ * leave the index permanently destroyed). A lone CREATE (no preceding DROP)
+ * runs via db.runIntegrityIndex() unchanged from prior behavior.
+ *
+ * @param {string} sql
+ * @returns {{ coreSQL: string, ops: Array<{name, dropSql: string|null, createSql: string}> }}
+ */
+function _extractIntegrityIndexOps(sql) {
+  let coreSQL = sql;
+  const ops = [];
   for (const idxName of INTEGRITY_INDEX_NAMES) {
-    const pattern = new RegExp(
+    const createPattern = new RegExp(
       `CREATE\\s+UNIQUE\\s+INDEX\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?${idxName}[\\s\\S]*?;`,
       'i'
     );
-    const m = coreSchemaSQL.match(pattern);
-    if (m) {
-      integrityIndexSqls.push({ name: idxName, sql: m[0] });
-      coreSchemaSQL = coreSchemaSQL.replace(m[0], '');
-    }
-  }
+    const createMatch = coreSQL.match(createPattern);
+    if (!createMatch) continue;
 
-  // Phase A: core DDL inside a transaction.
-  await db.query('BEGIN');
-  try {
-    await db.runSchema(coreSchemaSQL);
-    // Idempotent migration: add promoted / promoted_at columns (Bundle A).
-    // MUST use db.runSchema() (not db.query()) so the SQLiteAdapter's IF NOT EXISTS
-    // strip-and-catch path is applied — node:sqlite does not support ADD COLUMN IF NOT EXISTS.
-    await db.runSchema(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted    BOOLEAN     NOT NULL DEFAULT false`);
-    await db.runSchema(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMPTZ`);
-    // L3 reality-check tag (additive, NULL-tolerant).
-    // 'verified' | 'mismatch' | 'unverifiable' | NULL (pre-L3 rows).
-    // On mismatch, conf/source/tier are NEVER modified — only this column.
-    await db.runSchema(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS reality_check TEXT`);
-    await db.query('COMMIT');
-  } catch (err) {
-    try { await db.query('ROLLBACK'); } catch (_) { /* ignore */ }
-    throw err;
-  }
-
-  // Phase B: integrity indexes (non-fatal on legacy-dupe corpus).
-  for (const { name, sql: idxSql } of integrityIndexSqls) {
-    const result = await db.runIntegrityIndex(idxSql);
-    if (!result.ok && !silent) {
-      process.stderr.write(`[handoff] applyAdditiveSchema: integrity index ${name} skipped (non-fatal): ${result.msg}\n`);
+    const dropPattern = new RegExp(`DROP\\s+INDEX\\s+IF\\s+EXISTS\\s+${idxName}\\s*;`, 'i');
+    const dropMatch = coreSQL.match(dropPattern);
+    let dropSql = null;
+    if (dropMatch) {
+      dropSql = dropMatch[0];
+      coreSQL = coreSQL.replace(dropSql, '');
     }
+    const createSql = createMatch[0];
+    coreSQL = coreSQL.replace(createSql, '');
+    ops.push({ name: idxName, dropSql, createSql });
   }
+  return { coreSQL, ops };
 }
 
 /**
- * Cheap drift sentinel: compare the stored schema_fingerprint in project_settings
- * against the current file hash.  If they differ (or the key is absent), apply the
- * additive schema and upsert the fingerprint.  If they match, return immediately
- * (hot path = one SELECT + one cached hash computation).
+ * Apply an ordered set of classified schema units. Per-file transaction,
+ * fail-fast: the first unit whose DDL throws stops the sequence — later
+ * units are NOT attempted. Does NOT touch project_settings.schema_fingerprint;
+ * callers decide whether/when to upsert (only after post-apply verification).
  *
- * Non-fatal: all errors are caught and logged to stderr; callers must wrap in try/catch
- * and continue regardless.
+ * splitStatements() (db-seam.js) is intentionally NEVER used here — the two
+ * DO $$ ... $$ dollar-quoted blocks in handoff-core-schema.sql would be
+ * shredded by its non-dollar-quote-aware statement splitter. Each unit's SQL
+ * is sent to db.runSchema() as a single multi-statement string (Postgres
+ * treats it as one implicit transaction segment inside our explicit BEGIN;
+ * node:sqlite splits it internally via its own dollar-quote-free splitter,
+ * which the two DO blocks never reach on the SQLite path since SQLite units
+ * carry no DO blocks).
+ *
+ * @param {object} db — connected StoragePort adapter
+ * @param {Array<{basename, fullPath}>} units — ordered, active-dialect classified units
+ * @param {object} [opts]
+ * @param {boolean} [opts.silent=false]
+ * @returns {Promise<{ok, appliedUnits, failedUnit, errorMsg, integrityResults}>}
+ */
+async function applyAdditiveSchema(db, units, { silent } = {}) {
+  const appliedUnits = [];
+  const integrityResults = [];
+
+  for (const unit of units) {
+    if (!fs.existsSync(unit.fullPath)) {
+      return {
+        ok: false, appliedUnits, failedUnit: unit.basename,
+        errorMsg: `schema file not found: ${unit.fullPath}`, integrityResults,
+      };
+    }
+
+    let sql = normalizeContent(fs.readFileSync(unit.fullPath, 'utf8'));
+    // Strip psql meta-commands (\ir, \d, etc.) — not supported by the pg client.
+    sql = sql.replace(/^\\[a-z].*$/gm, '');
+
+    const { coreSQL, ops } = _extractIntegrityIndexOps(sql);
+
+    // Phase A (this unit): fatal, transactional, timeout-budgeted DDL.
+    await db.query('BEGIN');
+    try {
+      await db.setApplyTimeouts();
+      await db.runSchema(coreSQL);
+      await db.query('COMMIT');
+    } catch (err) {
+      try { await db.query('ROLLBACK'); } catch (_) { /* ignore */ }
+      return {
+        ok: false, appliedUnits, failedUnit: unit.basename,
+        errorMsg: err.message, integrityResults,
+      };
+    }
+    appliedUnits.push(unit.basename);
+
+    // Phase B (this unit): non-fatal integrity-index ops, atomic pair when a
+    // DROP precedes the CREATE (S-11).
+    for (const op of ops) {
+      const result = op.dropSql
+        ? await db.runIntegrityIndexPair(op.dropSql, op.createSql)
+        : await db.runIntegrityIndex(op.createSql);
+      integrityResults.push({ unit: unit.basename, name: op.name, ok: result.ok, msg: result.msg });
+      if (!result.ok && !silent) {
+        process.stderr.write(
+          `[handoff] applyAdditiveSchema: integrity index ${op.name} (${unit.basename}) skipped (non-fatal): ${result.msg}\n`
+        );
+      }
+    }
+  }
+
+  return { ok: true, appliedUnits, failedUnit: null, errorMsg: null, integrityResults };
+}
+
+/**
+ * L4-style persistent degradation signal for the schema-apply path (R-5).
+ * Upserts a SINGLE project_settings row keyed 'schema_apply_degraded' (unlike
+ * degraded_close:*, which accumulates one row per event — this key reflects
+ * CURRENT state, so it is overwritten on each new degradation and deleted by
+ * clearSchemaDegradation() once a fully-verified apply succeeds). Surfaced by
+ * cmdStatus and the cmdLoaderLoad resume banner. Always also writes to
+ * stderr (unless silent). Never throws.
+ */
+async function recordSchemaDegradation(db, projectId, reason, detail, { silent } = {}) {
+  const val = JSON.stringify({ reason, detail: detail || null, stamp: new Date().toISOString() });
+  try {
+    await db.query(
+      `INSERT INTO project_settings (project_id, key, value) VALUES ($1, 'schema_apply_degraded', $2)
+       ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
+      [projectId, val]
+    );
+  } catch (writeErr) {
+    if (!silent) process.stderr.write(`[handoff] recordSchemaDegradation write failed (non-fatal): ${writeErr.message}\n`);
+  }
+  if (!silent) {
+    process.stderr.write(`[handoff] schema apply degraded (${reason}): ${JSON.stringify(detail)}\n`);
+  }
+}
+
+/** Clear the schema_apply_degraded row (a later fully-verified apply succeeded). */
+async function clearSchemaDegradation(db, projectId) {
+  try {
+    await db.query(
+      `DELETE FROM project_settings WHERE project_id = $1 AND key = 'schema_apply_degraded'`,
+      [projectId]
+    );
+  } catch (_) { /* best-effort */ }
+}
+
+/**
+ * Schema-apply drift sentinel — the sole entry point used by cmdInit,
+ * cmdLoaderLoad, and cmdClose.
+ *
+ * Flow: classify scripts/sql/* (loud degradation + return on any
+ * classification error) → resolve the active dialect's ordered unit set →
+ * compute the epoch-prefixed fingerprint → compare against the stored value
+ * (current/absent/behind/ahead/unknown) → hot-path no-op on 'current' →
+ * acquire the session-scoped schema-apply advisory lock → re-check (loser
+ * no-ops) → per-file apply (fail-fast) → integrity-index gate → post-apply
+ * catalog verification → upsert fingerprint + clear any prior degradation.
+ *
+ * Non-fatal end-to-end: every error path records a persistent
+ * schema_apply_degraded row (+ stderr) and returns without throwing; callers
+ * must still wrap in try/catch as a belt-and-suspenders guard for unexpected
+ * throws (matches the existing call-site convention).
+ *
+ * Returns a status object so callers/tests can observe what happened without
+ * re-deriving it: { applied: boolean, reason: string, detail?: object }.
+ * Production call sites (cmdLoaderLoad, cmdClose) ignore the return value —
+ * adding it is a non-breaking testability improvement (R-10).
  *
  * @param {object}  db        — connected StoragePort adapter
- * @param {string}  projectId — encoded_cwd
+ * @param {string}  projectId — encoded_cwd / project UUID
  * @param {object}  [opts]
  * @param {boolean} [opts.silent=false] — suppress informational stderr output
+ * @returns {Promise<{applied:boolean, reason:string, detail?:object}>}
  */
 async function ensureSchemaCurrent(db, projectId, { silent } = {}) {
-  const fingerprint = _computeSchemaFingerprint();
+  let classification;
+  try {
+    classification = classifySchemaFiles({ engineRoot: _ENGINE_ROOT });
+  } catch (err) {
+    await recordSchemaDegradation(db, projectId, 'manifest_error', { message: err.message }, { silent });
+    return { applied: false, reason: 'manifest_error', detail: { message: err.message } };
+  }
+  if (!classification.ok) {
+    await recordSchemaDegradation(db, projectId, 'classification_error', { errors: classification.errors }, { silent });
+    return { applied: false, reason: 'classification_error', detail: { errors: classification.errors } };
+  }
+
+  // Resolve the active dialect purely via the adapter's existing schemaFileName
+  // property, never a live-client dialect getter check — the engine's zero-
+  // dialect-conditional invariant (enforced by test-both-backends.js S8)
+  // forbids any such check outside connectHandoff().
+  const rosterEntry = classification.manifest.units[db.schemaFileName];
+  const units = rosterEntry ? classification.unitsByDialect[rosterEntry.classification] : null;
+  if (!units || units.length === 0) {
+    const errors = [`no applicable schema units resolved for active dialect (roster file: ${db.schemaFileName})`];
+    await recordSchemaDegradation(db, projectId, 'classification_error', { errors }, { silent });
+    return { applied: false, reason: 'classification_error', detail: { errors } };
+  }
+
+  const currentFingerprint = _computeSchemaFingerprint(units);
 
   // Hot path: one SELECT.
   const { rows } = await db.query(
     'SELECT value FROM project_settings WHERE project_id = $1 AND key = $2',
     [projectId, 'schema_fingerprint']
   );
-  if (rows.length > 0 && rows[0].value === fingerprint) {
-    // Schema is current — no-op.
-    return;
+  const stored = rows.length > 0 ? rows[0].value : null;
+  const cmp = _compareSchemaFingerprint(stored, currentFingerprint);
+
+  if (cmp === 'current') return { applied: false, reason: 'current' }; // no-op — the common case.
+
+  if (cmp === 'ahead') {
+    // Stored epoch is newer than this engine build knows about — refuse to
+    // apply (would be a downgrade), warn persistently, continue non-fatally.
+    const detail = { stored, current: currentFingerprint, note: 'stored schema_fingerprint epoch is newer than this engine build — refusing to apply; upgrade the engine' };
+    await recordSchemaDegradation(db, projectId, 'fingerprint_ahead', detail, { silent });
+    return { applied: false, reason: 'ahead', detail };
+  }
+  if (cmp === 'unknown') {
+    await recordSchemaDegradation(db, projectId, 'fingerprint_unparseable', { stored }, { silent });
+    return { applied: false, reason: 'unknown', detail: { stored } };
   }
 
-  // Fingerprint missing or stale: apply the active dialect's schema file.
+  // cmp is 'absent' or 'behind' — apply.
   if (!silent) {
     process.stderr.write('[handoff] schema drift detected — running additive schema apply\n');
   }
 
-  // Resolve the schema file for the active dialect.
-  const schemaFileName = db.schemaFileName;
-  const schemaFile = path.join(_ENGINE_ROOT, 'scripts', 'sql', schemaFileName);
-  await applyAdditiveSchema(db, schemaFile, { silent });
+  const lockKey = 'schema_apply:' + projectId;
+  await db.acquireSchemaApplyLock(lockKey);
+  try {
+    // Re-check immediately after acquiring the lock — a concurrent process
+    // may have already applied and upserted while we were waiting; if so,
+    // this invocation is a clean no-op (R-8).
+    const { rows: rows2 } = await db.query(
+      'SELECT value FROM project_settings WHERE project_id = $1 AND key = $2',
+      [projectId, 'schema_fingerprint']
+    );
+    const stored2 = rows2.length > 0 ? rows2[0].value : null;
+    if (_compareSchemaFingerprint(stored2, currentFingerprint) === 'current') {
+      return { applied: false, reason: 'current' };
+    }
 
-  // Upsert the new fingerprint into project_settings.
-  await db.query(
-    `INSERT INTO project_settings (project_id, key, value) VALUES ($1, $2, $3)
-     ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
-    [projectId, 'schema_fingerprint', fingerprint]
-  );
+    const applyResult = await applyAdditiveSchema(db, units, { silent });
+    if (!applyResult.ok) {
+      const detail = { failedUnit: applyResult.failedUnit, errorMsg: applyResult.errorMsg, appliedUnits: applyResult.appliedUnits };
+      await recordSchemaDegradation(db, projectId, 'apply_failed', detail, { silent });
+      return { applied: false, reason: 'apply_failed', detail };
+    }
+
+    const failedIndexes = applyResult.integrityResults.filter((r) => !r.ok);
+    if (failedIndexes.length > 0) {
+      // R-6: fingerprint MUST NOT be upserted when any integrity-index result
+      // is ok:false — the fingerprint records "verified present", never
+      // "apply did not throw".
+      await recordSchemaDegradation(db, projectId, 'integrity_index_failed', { failedIndexes }, { silent });
+      return { applied: false, reason: 'integrity_index_failed', detail: { failedIndexes } };
+    }
+
+    // Post-apply structural verification (S-13): derive the expected-objects
+    // set from the applied units' manifest entries (never by parsing SQL) and
+    // probe the live catalog. Only upsert the fingerprint when every expected
+    // object is confirmed present.
+    const expected = { tables: [], columns: [], indexes: [] };
+    for (const u of units) {
+      const eo = (classification.manifest.units[u.basename] || {}).expected_objects || {};
+      expected.tables.push(...(eo.tables || []));
+      expected.columns.push(...(eo.columns || []));
+      expected.indexes.push(...(eo.indexes || []));
+    }
+    const verify = await db.schemaObjectsExist(expected);
+    if (!verify.ok) {
+      await recordSchemaDegradation(db, projectId, 'verification_failed', { missing: verify.missing }, { silent });
+      return { applied: false, reason: 'verification_failed', detail: { missing: verify.missing } };
+    }
+
+    await db.query(
+      `INSERT INTO project_settings (project_id, key, value) VALUES ($1, $2, $3)
+       ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
+      [projectId, 'schema_fingerprint', currentFingerprint]
+    );
+    await clearSchemaDegradation(db, projectId);
+    return { applied: true, reason: 'applied', detail: { appliedUnits: applyResult.appliedUnits, fingerprint: currentFingerprint } };
+  } finally {
+    await db.releaseSchemaApplyLock(lockKey);
+  }
 }
 
 // ─── INIT PRE-FLIGHT HELPERS ──────────────────────────────────────────────────
@@ -1721,16 +1976,33 @@ async function cmdInit(args) {
     process.exit(1);
   }
 
-  // Step 6: schema file present on disk — adapter knows the correct filename.
-  const schemaFileName = probeAdapter.schemaFileName;
-  const schemaFile = path.join(_ENGINE_ROOT, 'scripts', 'sql', schemaFileName);
-  const schemaExists = fs.existsSync(schemaFile);
-  if (schemaExists) {
-    console.log(`  [OK]    Schema file present: ${path.basename(schemaFile)}`);
-  } else {
-    console.log(`  [FAIL]  Schema file missing: ${schemaFile}`);
+  // Step 6: schema classification — total classification of scripts/sql/*.sql,
+  // resolved for the active dialect (cm#185 generalized bring-forward). Replaces
+  // the former single-file "is handoff-core-schema.sql present" check: the
+  // applicable unit set for Postgres is now [handoff-core-schema.sql,
+  // app-retrieval-events-schema.sql] (ordered), for SQLite it is
+  // [handoff-sqlite-schema.sql]. Any classification error is fatal at init
+  // time (a fresh install with a broken scripts/sql/ directory should not
+  // silently proceed).
+  let classification;
+  try {
+    classification = classifySchemaFiles({ engineRoot: _ENGINE_ROOT });
+  } catch (err) {
+    console.log(`  [FAIL]  Schema classification failed — ${err.message}`);
     process.exit(1);
   }
+  if (!classification.ok) {
+    console.log(`  [FAIL]  Schema classification errors:`);
+    for (const e of classification.errors) console.log(`          - ${e}`);
+    process.exit(1);
+  }
+  const rosterEntry = classification.manifest.units[probeAdapter.schemaFileName];
+  const units = rosterEntry ? classification.unitsByDialect[rosterEntry.classification] : null;
+  if (!units || units.length === 0) {
+    console.log(`  [FAIL]  No applicable schema units resolved for active dialect (roster file: ${probeAdapter.schemaFileName})`);
+    process.exit(1);
+  }
+  console.log(`  [OK]    Schema units resolved (${units.length}): ${units.map((u) => u.basename).join(', ')}`);
 
   // Connect to target DB — adapter handles dialect-specific connection setup.
   let db;
@@ -1741,24 +2013,17 @@ async function cmdInit(args) {
     process.exit(1);
   }
 
-  // Step 7: Apply schema in two phases — separated to ensure additive/table DDL
-  // commits even when a legacy-duplicate corpus prevents integrity index creation.
+  // Step 7: apply the classified unit set via the same engine used by the
+  // drift sentinel (applyAdditiveSchema) — per-file transaction, fail-fast:
+  // a failing unit stops the sequence; units already committed before it stay
+  // committed (this is a deliberate behavior change from the old single-file
+  // atomicity — see PR body R-6). Integrity-index creation for
+  // assertions_1to1_unique / assertions_1ton_exact_unique remains non-fatal
+  // on a legacy-duplicate corpus, exactly as before:
   //
-  // Phase A (transactional): tables, regular indexes, additive ALTER TABLE ADD COLUMN
-  //   statements.  These are safe to run idempotently and never fail due to existing
-  //   data.  Committed atomically; fatal on failure.
-  //
-  // Phase B (non-transactional, non-fatal): partial unique integrity indexes
-  //   (assertions_1to1_unique, assertions_1ton_exact_unique).  These can fail on a
-  //   legacy-duplicate corpus because existing rows violate the uniqueness constraint.
-  //   Each index is attempted individually via db.runIntegrityIndex().  Failure is
-  //   non-fatal: a clear actionable warning is printed and init continues to success.
-  //   On a clean DB (no legacy duplicates) both indexes are created and no warning
-  //   is emitted — behavior is identical to the pre-fix path.
-  //
-  //   State when index is NOT created (legacy-dupe corpus):
+  //   State when an integrity index is NOT created (legacy-dupe corpus):
   //     - The additive bi-temporal columns (valid_at, invalid_at, suppression_kind,
-  //       pinned) ARE present — Phase A guarantees this.
+  //       pinned) ARE present — the per-file DDL transaction guarantees this.
   //     - Supersession correctness is still enforced transactionally in
   //       writeAssertionWithSupersession (BEGIN/suppress+INSERT/COMMIT).
   //     - The missing index is a defense-in-depth layer, not the primary guarantee.
@@ -1767,62 +2032,20 @@ async function cmdInit(args) {
   //       resolve this condition. Resolving live-duplicate rows is corpus-dedupe
   //       work — precisely the §7 SKIP (WILL-NOT-RUN) decision — and requires
   //       explicit operator authorization, not a routine command.
-  let sql = fs.readFileSync(schemaFile, 'utf8');
-  // Remove psql meta-commands (\ir, \d, etc.) — not supported by pg client
-  sql = sql.replace(/^\\[a-z].*$/gm, '');
-
-  // Extract the two integrity index CREATE UNIQUE INDEX statements by name so they
-  // can be run separately in Phase B.  Each is a single statement ending with `;`.
-  // The regex matches from `CREATE UNIQUE INDEX IF NOT EXISTS <name>` to the closing `;`.
-  const INTEGRITY_INDEX_NAMES = ['assertions_1to1_unique', 'assertions_1ton_exact_unique'];
-  const integrityIndexSqls = [];
-  let coreSchemaSQL = sql;
-  for (const idxName of INTEGRITY_INDEX_NAMES) {
-    // Match the full CREATE UNIQUE INDEX statement for this index name.
-    // Uses a non-greedy match to the next `;` after the index name.
-    const pattern = new RegExp(
-      `CREATE\\s+UNIQUE\\s+INDEX\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?${idxName}[\\s\\S]*?;`,
-      'i'
-    );
-    const m = coreSchemaSQL.match(pattern);
-    if (m) {
-      integrityIndexSqls.push({ name: idxName, sql: m[0] });
-      coreSchemaSQL = coreSchemaSQL.replace(m[0], '');
-    }
-  }
-
-  // Phase A: apply core schema (no integrity indexes) inside a transaction.
-  try {
-    await db.query('BEGIN');
-    await db.runSchema(coreSchemaSQL);
-    // Idempotent migration: add `promoted` and `promoted_at` columns to assertions
-    // (used by /handoff:promote explicit-promotion command, added in Bundle A hardening).
-    // For Postgres: BOOLEAN / TIMESTAMPTZ. For SQLite: INTEGER / TEXT (seam rewrites DDL).
-    // MUST use db.runSchema() (not db.query()) so the SQLiteAdapter's IF NOT EXISTS
-    // strip-and-catch path is applied — node:sqlite does not support ADD COLUMN IF NOT EXISTS.
-    await db.runSchema(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted    BOOLEAN     NOT NULL DEFAULT false`);
-    await db.runSchema(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMPTZ`);
-    // L3 reality-check tag (additive, NULL-tolerant).
-    // 'verified' | 'mismatch' | 'unverifiable' | NULL (pre-L3 rows).
-    // On mismatch, conf/source/tier are NEVER modified — only this column.
-    await db.runSchema(`ALTER TABLE assertions ADD COLUMN IF NOT EXISTS reality_check TEXT`);
-    await db.query('COMMIT');
-    console.log(`  [OK]    Schema applied: ${path.basename(schemaFile)}`);
-  } catch (err) {
-    try { await db.query('ROLLBACK'); } catch (_) { /* ignore */ }
+  const applyResult = await applyAdditiveSchema(db, units, { silent: false });
+  if (!applyResult.ok) {
     await db.end();
-    console.log(`  [FAIL]  Schema apply failed — ${err.message}`);
-    console.log(`  [FAIL]  Transaction rolled back.`);
+    console.log(`  [FAIL]  Schema apply failed on ${applyResult.failedUnit} — ${applyResult.errorMsg}`);
+    console.log(`  [FAIL]  That unit's transaction rolled back; earlier unit(s) already applied remain committed: ${applyResult.appliedUnits.join(', ') || '(none)'}`);
     unwindFsLedger();  // ledger is empty at this point — prints accurate status
     process.exit(1);
   }
+  console.log(`  [OK]    Schema applied: ${applyResult.appliedUnits.join(', ')}`);
 
-  // Phase B: attempt each integrity index individually (non-fatal on legacy-dupe corpus).
-  for (const { name, sql: idxSql } of integrityIndexSqls) {
-    const result = await db.runIntegrityIndex(idxSql);
-    if (!result.ok) {
-      console.log(`  [WARN]  Integrity index NOT created: ${name}`);
-      console.log(`          Reason: ${result.msg}`);
+  for (const r of applyResult.integrityResults) {
+    if (!r.ok) {
+      console.log(`  [WARN]  Integrity index NOT created: ${r.name} (${r.unit})`);
+      console.log(`          Reason: ${r.msg}`);
       console.log(`          This means the DB contains pre-existing duplicate live rows`);
       console.log(`          (same project_id/subject/predicate with suppressed=false) that`);
       console.log(`          violate the uniqueness constraint — a legacy-duplicate corpus.`);
@@ -1838,6 +2061,31 @@ async function cmdInit(args) {
       console.log(`          defense-in-depth only.`);
     }
   }
+
+  // Post-apply structural verification (S-13): fatal at init time — a fresh
+  // install that fails this check indicates a real DDL problem, not benign
+  // extension absence (the expected-objects lists in schema-manifest.json
+  // deliberately exclude the pgvector/pg_trgm-gated objects — see that
+  // file's handoff-core-schema.sql "_note").
+  const expectedObjects = { tables: [], columns: [], indexes: [] };
+  for (const u of units) {
+    const eo = (classification.manifest.units[u.basename] || {}).expected_objects || {};
+    expectedObjects.tables.push(...(eo.tables || []));
+    expectedObjects.columns.push(...(eo.columns || []));
+    expectedObjects.indexes.push(...(eo.indexes || []));
+  }
+  const verify = await db.schemaObjectsExist(expectedObjects);
+  if (!verify.ok) {
+    await db.end();
+    console.log(`  [FAIL]  Post-apply schema verification failed — missing objects:`);
+    for (const m of verify.missing) console.log(`          - ${JSON.stringify(m)}`);
+    unwindFsLedger();
+    process.exit(1);
+  }
+  console.log(
+    `  [OK]    Post-apply schema verification passed ` +
+    `(${expectedObjects.tables.length} tables, ${expectedObjects.columns.length} columns, ${expectedObjects.indexes.length} indexes checked)`
+  );
 
   // Step 8: Insert default project_settings rows (idempotent)
   const defaults = {
@@ -2162,6 +2410,20 @@ async function cmdStatus(args = []) {
     }
   }
 
+  // cm#185 R-5: surface a current schema_apply_degraded row, if any.
+  let schemaDegraded = null;
+  try {
+    const { rows: schemaDegRows } = await db.query(
+      `SELECT value FROM project_settings WHERE project_id = $1 AND key = 'schema_apply_degraded'`,
+      [projectId]
+    );
+    if (schemaDegRows.length > 0) {
+      try { schemaDegraded = JSON.parse(schemaDegRows[0].value); } catch (_) { schemaDegraded = { reason: 'unknown' }; }
+    }
+  } catch (_) {
+    // Non-fatal — status still reports the rest even if this probe fails.
+  }
+
   await db.end();
 
   const lastClose = fm.last_close || 'never';
@@ -2199,6 +2461,7 @@ async function cmdStatus(args = []) {
       session_active: sip ? true : false,
       session_id:     sip || null,
       packaging:      packagingState,
+      schema_apply_degraded: schemaDegraded,
     };
     if (breakdownFlag && breakdown !== null) {
       out.breakdown = breakdown;
@@ -2222,6 +2485,9 @@ async function cmdStatus(args = []) {
   console.log(`  contracts:        ${contracts}`);
   console.log(`  session_active:   ${sip ? `YES (session_id=${sip})` : 'no'}`);
   if (packagingLine) console.log(packagingLine);
+  if (schemaDegraded) {
+    console.log(`  schema_apply:     DEGRADED (${schemaDegraded.reason || 'unknown'}) — see detail: ${JSON.stringify(schemaDegraded.detail)}`);
+  }
 
   if (breakdownFlag && breakdown !== null) {
     console.log('\n  --- breakdown ---');
@@ -2655,6 +2921,32 @@ async function cmdLoaderLoad(opts = {}) {
     }
   } catch (degradedCheckErr) {
     process.stderr.write('[handoff] degraded-close resume check failed (non-fatal): ' + degradedCheckErr.message + '\n');
+  }
+
+  // cm#185 R-5: resume banner — warn if the schema-apply sentinel is currently
+  // degraded (classification error, apply failure, integrity-index failure,
+  // verification failure, or an unparseable/ahead fingerprint). This is a
+  // CURRENT-state single row (not an accumulating log like degraded_close:*),
+  // cleared by clearSchemaDegradation() the next time a fully-verified apply
+  // succeeds. Non-fatal: any error here must not abort the load.
+  try {
+    const { rows: schemaDegRows } = await db.query(
+      `SELECT value FROM project_settings WHERE project_id = $1 AND key = 'schema_apply_degraded'`,
+      [projectId]
+    );
+    if (schemaDegRows.length > 0) {
+      let parsed = null;
+      try { parsed = JSON.parse(schemaDegRows[0].value); } catch (_) { /* fall through */ }
+      const reason = parsed && parsed.reason ? parsed.reason : 'unknown';
+      const bannerLine = `RESUME WARNING: schema apply is degraded (${reason}) — run /handoff:status for detail`;
+      if (!silent) {
+        console.log(`\n  ${bannerLine}`);
+      } else {
+        process.stderr.write(`[handoff] ${bannerLine}\n`);
+      }
+    }
+  } catch (schemaDegCheckErr) {
+    process.stderr.write('[handoff] schema-degradation resume check failed (non-fatal): ' + schemaDegCheckErr.message + '\n');
   }
 
   // Load retrieval_contract
@@ -7072,5 +7364,18 @@ if (require.main === module) {
     _suppressStaleLegacyPointers,
     validatePointers,
     runPointerGate,
+    // cm#185 schema bring-forward exports — the real engine functions, no
+    // test-side reimplementation (S-18: the former test-both-backends.js
+    // mirrors are deleted; those tests now require() these).
+    applyAdditiveSchema,
+    ensureSchemaCurrent,
+    _computeSchemaFingerprint,
+    _hashSchemaFileNormalized,
+    _parseSchemaFingerprint,
+    _compareSchemaFingerprint,
+    _extractIntegrityIndexOps,
+    recordSchemaDegradation,
+    clearSchemaDegradation,
+    SCHEMA_EPOCH,
   };
 }

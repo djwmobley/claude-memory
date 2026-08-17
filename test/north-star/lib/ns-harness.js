@@ -171,33 +171,42 @@ async function connectDb() {
 
 // ─── SCHEMA APPLY ─────────────────────────────────────────────────────────────
 
-// Schema files, applied in this order. Verified: test-handoff.js:176 applies
-// handoff-core-schema.sql THEN app-retrieval-events-schema.sql, stripping psql
-// meta-commands. handoff-core gives entities/assertions/edges/retrieval_contract/
-// project_settings; app-retrieval-events gives retrieval_events +
-// retrieval_event_assertions.
-const SCHEMA_FILES = ['handoff-core-schema.sql', 'app-retrieval-events-schema.sql'];
+// cm#185: schema files are no longer a hand-maintained hardcoded list here —
+// they are derived from the same total-classification manifest the engine
+// itself uses (scripts/lib/schema-classify.js + scripts/sql/schema-manifest.json),
+// filtered to the postgres classification and ordered per the manifest's
+// declared "order" (core, then app-retrieval-events). If a future PR adds,
+// removes, or reclassifies a scripts/sql/*.sql unit, this harness picks up the
+// change automatically instead of silently applying a stale two-file set.
+const { classifySchemaFiles } = require(
+  path.resolve(__dirname, '..', '..', '..', 'scripts', 'lib', 'schema-classify.js')
+);
 
 /**
- * Apply both canonical schemas idempotently against an open client. Strips psql
- * meta-commands (lines beginning with a backslash) so the JS client can run the
- * SQL. "already exists" errors are swallowed. Verified: test-handoff.js:175-190.
+ * Apply every postgres-classified schema unit (in manifest order) idempotently
+ * against an open client. Strips psql meta-commands (lines beginning with a
+ * backslash) so the JS client can run the SQL. "already exists" errors are
+ * swallowed. Throws if classification itself fails (a broken scripts/sql/
+ * directory should fail this harness loudly, not silently apply a partial set).
  *
  * @param {import('pg').Client} db
  */
 async function applySchemas(db) {
-  const sqlDir = path.resolve(__dirname, '..', '..', '..', 'scripts', 'sql');
-  for (const schemaName of SCHEMA_FILES) {
-    const schemaFile = path.join(sqlDir, schemaName);
-    if (!fs.existsSync(schemaFile)) continue;
-    let sql = fs.readFileSync(schemaFile, 'utf8');
-    // Strip psql meta-commands (e.g. \c, \echo) — same regex as test-handoff.js:181.
+  const engineRoot = path.resolve(__dirname, '..', '..', '..');
+  const classification = classifySchemaFiles({ engineRoot });
+  if (!classification.ok) {
+    throw new Error(`ns-harness applySchemas: schema classification failed: ${classification.errors.join('; ')}`);
+  }
+  for (const unit of classification.unitsByDialect.postgres) {
+    let sql = fs.readFileSync(unit.fullPath, 'utf8');
+    if (sql.charCodeAt(0) === 0xFEFF) sql = sql.slice(1);
+    // Strip psql meta-commands (e.g. \c, \echo).
     sql = sql.replace(/^\\[a-z].*$/gm, '');
     try {
       await db.query(sql);
     } catch (err) {
       if (!err.message.includes('already exists')) {
-        console.warn(`  Schema apply warning (${schemaName}): ${err.message}`);
+        console.warn(`  Schema apply warning (${unit.basename}): ${err.message}`);
       }
     }
   }

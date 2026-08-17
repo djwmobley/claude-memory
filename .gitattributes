@@ -1,0 +1,10 @@
+# Force LF line endings for tracked SQL schema files regardless of the
+# checking-out platform's core.autocrlf setting. The schema-apply engine's
+# fingerprint (scripts/handoff.js _computeSchemaFingerprint) hashes
+# EOL/BOM-normalized content, but pinning the on-disk representation to LF
+# here removes the platform-dependent checkout step from the equation
+# entirely (Windows core.autocrlf=true previously produced CRLF working-tree
+# copies of every *.sql file while CI checked them out as LF -- see cm#185
+# S-8). Schema files are DDL text meant to run unmodified through psql/pg/
+# node:sqlite clients; CRLF has no semantic meaning here.
+*.sql text eol=lf
