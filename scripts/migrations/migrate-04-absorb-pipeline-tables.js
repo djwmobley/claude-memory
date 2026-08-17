@@ -946,6 +946,27 @@ async function runRollback(tgtClient, sourceDbs, log) {
         WHERE source_db = $1 AND excluded_reason IS NULL AND source_table = ANY($2::text[])`,
       [sourceDb, TABLE_ORDER]
     );
+    // CATEGORICAL FIX (PR #190 independent review, 2026-08-17 -- same NULL-
+    // unsafe-equality bug class as writeManifestSlice's own FIELD-FOUND FIX
+    // above, flagged non-blocking at the review's own 4 call sites in THIS
+    // function). `projectId` here is read straight off migration_manifest.
+    // project_id_or_null (a nullable column) with NO null-filtering -- unlike
+    // every OTHER caller of migrate-04's manifest/lineage helpers in this
+    // repo (all verified provably non-null at their own call sites: db-level/
+    // topic-classifier fallbacks always resolve to an "unmapped-*"/
+    // "unmatched-*" string, never JS null; migrate-08/-09 require a non-empty
+    // --project-id/enrolled-dirs entry). Currently latent in THIS script --
+    // every migrate-04 write path (deriveDbLevelProjectId,
+    // classifyClaudeContextTopic) always yields a non-null projectId, and the
+    // one other script that DOES write a genuinely null-projectId manifest
+    // slice (migrate-05-sync-file-memory.js's Step B exclusions) uses its own
+    // ABSORB_MANIFEST_LABELS namespace ("memory_entries_db_absorb" etc.),
+    // disjoint from this script's own TABLE_ORDER, so today's rollback scope
+    // (`source_table = ANY(TABLE_ORDER)`) never actually reaches one. Fixed
+    // anyway, the general way (every DELETE below keyed on project_id_or_null
+    // uses NULL-safe equality), not left as a landmine for the next caller
+    // that writes a null-projectId slice under one of THIS script's 14 table
+    // names -- see PR body's classification table for the full sweep.
     // E-3: (claude_policy_framework, decisions) is explicitly OUT of this
     // script's scope in EVERY mode, forward migration included (see the
     // `continue` in main()'s per-table loop) -- rollback must apply the
@@ -985,11 +1006,11 @@ async function runRollback(tgtClient, sourceDbs, log) {
           [sourceDb, table, projectId]
         );
         await tgtClient.query(
-          `DELETE FROM migration_manifest WHERE source_db=$1 AND source_table=$2 AND project_id_or_null=$3`,
+          `DELETE FROM migration_manifest WHERE source_db=$1 AND source_table=$2 AND project_id_or_null IS NOT DISTINCT FROM $3`,
           [sourceDb, table, projectId]
         );
         await tgtClient.query(
-          `DELETE FROM migration_manifest_row_hashes WHERE source_db=$1 AND source_table=$2 AND project_id_or_null=$3`,
+          `DELETE FROM migration_manifest_row_hashes WHERE source_db=$1 AND source_table=$2 AND project_id_or_null IS NOT DISTINCT FROM $3`,
           [sourceDb, table, projectId]
         );
         await tgtClient.query('COMMIT');
@@ -1012,11 +1033,11 @@ async function runRollback(tgtClient, sourceDbs, log) {
     );
     for (const es of excludedSlices) {
       await tgtClient.query(
-        `DELETE FROM migration_manifest_row_hashes WHERE source_db=$1 AND source_table=$2 AND project_id_or_null=$3`,
+        `DELETE FROM migration_manifest_row_hashes WHERE source_db=$1 AND source_table=$2 AND project_id_or_null IS NOT DISTINCT FROM $3`,
         [sourceDb, es.source_table, es.project_id_or_null]
       );
       await tgtClient.query(
-        `DELETE FROM migration_manifest WHERE source_db=$1 AND source_table=$2 AND project_id_or_null=$3`,
+        `DELETE FROM migration_manifest WHERE source_db=$1 AND source_table=$2 AND project_id_or_null IS NOT DISTINCT FROM $3`,
         [sourceDb, es.source_table, es.project_id_or_null]
       );
     }
