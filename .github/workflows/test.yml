@@ -547,6 +547,52 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run file-memory sync migration tests (§6.1(f), memory-manager#11(f))
+        # Tests scripts/migrations/migrate-05-sync-file-memory.js -- three
+        # ordered steps: Step A (DB-absorb) migrates the DB-resident
+        # memory_entries/memory_entry_chunks slices from claude_policy_
+        # framework/pipeline_pipeline into staging, lineage-keyed via
+        # migrate-04's own pipeline_migration_row_ids mechanism (reused by
+        # reference); Step B writes per-slice excluded_reason manifest rows
+        # for the leaked/eval-fixture DBs (F5-11); Step C total-classifies
+        # every memory/-bearing project dir via migrate-09's SHARED
+        # enrollment config + classifier (reused by reference, never
+        # forked), walks each ENROLLED dir's *.md topic files (I-9/I-7,
+        # migrate-09's own listTopicFiles reused verbatim), and hash-gate-
+        # upserts each into memory_entries/memory_entry_chunks. Covers:
+        # lossless-fidelity column-shape precondition (content_hash is
+        # ALWAYS computed, never copied -- live-verified neither real
+        # absorb source carries that column at all); lineage-gated absorb
+        # idempotency; NULL-safe exclusion-slice re-writes (a field-found
+        # fix to migrate-04's own shared writeManifestSlice -- project_id_
+        # or_null=$3 never matched a NULL projectId under plain SQL
+        # equality, so every whole-db exclusion slice silently duplicated
+        # on re-run; fixed to IS NOT DISTINCT FROM, the general fix, not a
+        # narrow point-patch); MEMORY.md exclusion + unmatched-type
+        # fallback (both reused from migrate-09); the no-embedding-write
+        # invariant (F5-4); absorb-adoption vs. absorb-divergence diffing
+        # (F5-8/C-3 -- a live file's content_hash matching an absorbed
+        # row's adopts it in place, renamed to canonical form; a mismatch
+        # reports both hashes loud and leaves both rows coexisting);
+        # cross-project same-filename non-collision after the source_file
+        # UNIQUE-index supersession (F5-2); stale higher-idx chunk deletion
+        # on shrink (F5-3, the one destructive branch); file-gone rows kept
+        # and flagged, never deleted (F5-9); renamed-candidate reporting,
+        # never auto-merged; and rollback round-trips for all three steps
+        # (target rows + lineage + manifest slices all purged). Self-
+        # contained: creates/drops its own `_staging`-suffixed scratch
+        # target database and scratch absorb/excluded source databases
+        # (custom names, injected via runStepA/runStepB's own override
+        # params -- migrate-05's absorb/excluded source DB names are fixed
+        # literals in production, so this override exists purely for test
+        # isolation) plus an isolated scratch filesystem project tree;
+        # never touches claude_policy_framework/pipeline_pipeline/
+        # memory_manager_staging or any real ~/.claude/projects directory.
+        run: node test/migrations/test-migrate-05-sync-file-memory.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run seam-libraries smoke tests (§7.1-§7.8, issue #17)
         # Tests scripts/migrations/verify-19-seams-smoke.js (30-check operator
         # smoke test) and its regression harness test/migrations/test-verify-19.js

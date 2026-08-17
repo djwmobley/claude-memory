@@ -631,12 +631,28 @@ function computeContentFingerprint(orderedRows, contentCols) {
 }
 
 async function writeManifestSlice(tgtClient, sourceDb, sourceTable, projectId, rowsOrderedById, contentCols, excludedReason, idCol) {
+  // FIELD-FOUND FIX (migrate-05-sync-file-memory.js staging run, 2026-08-16):
+  // `project_id_or_null=$3` is a plain SQL equality -- when projectId is
+  // JS `null` (a whole-db/no-natural-project-id slice, e.g. Step B's
+  // exclusion writes), the bound parameter is SQL NULL, and `x = NULL` is
+  // UNKNOWN, never TRUE, for EVERY row including ones that are ALSO NULL.
+  // The DELETE below silently matched zero rows on every re-run for a
+  // null-projectId slice, so each re-run INSERTed a fresh duplicate
+  // migration_manifest row instead of replacing the prior one -- live-
+  // verified against memory_manager_staging: dozens of duplicate slices
+  // already accumulated across prior scripts' historical runs before this
+  // fix (claude_memory_eval_test/retrieval_contract alone had 282 rows for
+  // one slice). `IS NOT DISTINCT FROM` is NULL-safe equality (identical to
+  // `=` for two non-null values; matches NULL-to-NULL correctly, unlike
+  // `=`) -- this is the general fix (every caller of writeManifestSlice
+  // with a null projectId is fixed at once), not a narrow point-patch
+  // scoped to migrate-05's own call sites.
   await tgtClient.query(
-    `DELETE FROM migration_manifest WHERE source_db=$1 AND source_table=$2 AND project_id_or_null=$3`,
+    `DELETE FROM migration_manifest WHERE source_db=$1 AND source_table=$2 AND project_id_or_null IS NOT DISTINCT FROM $3`,
     [sourceDb, sourceTable, projectId]
   );
   await tgtClient.query(
-    `DELETE FROM migration_manifest_row_hashes WHERE source_db=$1 AND source_table=$2 AND project_id_or_null=$3`,
+    `DELETE FROM migration_manifest_row_hashes WHERE source_db=$1 AND source_table=$2 AND project_id_or_null IS NOT DISTINCT FROM $3`,
     [sourceDb, sourceTable, projectId]
   );
   const fingerprint = computeContentFingerprint(rowsOrderedById, contentCols);
