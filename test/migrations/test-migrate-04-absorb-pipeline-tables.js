@@ -349,6 +349,52 @@ async function main() {
         );
         assert(foreign[0].n === 1, `expected the foreign memory_entries manifest row to survive rollback, found ${foreign[0].n}`);
       });
+
+      // ── NULL-safe project_id_or_null equality (PR #190 independent
+      // review, categorical fix): runRollback()'s manifest/row_hashes
+      // DELETEs must match a slice whose project_id_or_null is SQL NULL --
+      // `project_id_or_null = $3` with $3 bound to JS null is `x = NULL`,
+      // UNKNOWN for every row (including other NULLs), so a plain-equality
+      // DELETE always matches ZERO rows for a null-scoped slice. Seeds a
+      // manifest (+row_hashes) row directly with project_id_or_null=NULL
+      // for one of this script's OWN TABLE_ORDER tables (never a live
+      // migrate-04 write path today -- see PR body's classification -- but
+      // exactly the shape a null-scoped slice would take if one ever
+      // reached this script's rollback scope) and asserts rollback removes
+      // it. Covers BOTH DELETE call sites in runRollback: the
+      // non-excluded `slices` loop and the `excludedSlices` loop.
+      await run('ROL-3', 'rollback matches a NULL-project_id_or_null manifest slice via NULL-safe equality, both the non-excluded and excluded-slice DELETE paths', async () => {
+        await tgt.query(`DELETE FROM migration_manifest WHERE source_db=$1 AND source_table IN ('gotchas','session_chunks')`, [SRC_A]);
+        await tgt.query(`DELETE FROM migration_manifest_row_hashes WHERE source_db=$1 AND source_table IN ('gotchas','session_chunks')`, [SRC_A]);
+        await tgt.query(
+          `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint, excluded_reason)
+           VALUES ($1,'gotchas',NULL,1,'null-slice-fp',NULL), ($1,'session_chunks',NULL,1,'null-excluded-fp','owner-review-example')`,
+          [SRC_A]
+        );
+        await tgt.query(
+          `INSERT INTO migration_manifest_row_hashes (source_db, source_table, project_id_or_null, source_row_id, source_hash)
+           VALUES ($1,'gotchas',NULL,'1','h1'), ($1,'session_chunks',NULL,'1','h2')`,
+          [SRC_A]
+        );
+        const { rows: before } = await tgt.query(
+          `SELECT source_table FROM migration_manifest WHERE source_db=$1 AND project_id_or_null IS NULL`,
+          [SRC_A]
+        );
+        assert(before.length === 2, `sanity: expected 2 NULL-scoped manifest rows before rollback, found ${before.length}`);
+
+        await migrate04.runRollback(tgt, [SRC_A], () => {});
+
+        const { rows: afterManifest } = await tgt.query(
+          `SELECT source_table FROM migration_manifest WHERE source_db=$1 AND source_table IN ('gotchas','session_chunks')`,
+          [SRC_A]
+        );
+        assert(afterManifest.length === 0, `expected both NULL-scoped manifest rows removed by rollback, found ${afterManifest.length}: ${JSON.stringify(afterManifest)}`);
+        const { rows: afterHashes } = await tgt.query(
+          `SELECT source_table FROM migration_manifest_row_hashes WHERE source_db=$1 AND source_table IN ('gotchas','session_chunks')`,
+          [SRC_A]
+        );
+        assert(afterHashes.length === 0, `expected both NULL-scoped row_hashes rows removed by rollback, found ${afterHashes.length}: ${JSON.stringify(afterHashes)}`);
+      });
     } finally {
       await tgt.end();
     }
