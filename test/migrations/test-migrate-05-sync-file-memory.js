@@ -536,9 +536,25 @@ async function main() {
       // review found ever reappears, these tests fail loud with the exact
       // "process.exit(N) was called" message, rather than silently
       // terminating the whole test runner the way the original bug would.
+      //
+      // FIELD-FOUND FIX (CI run on this PR's own fix commit): a fresh
+      // checkout (exactly what CI is) has NEITHER db-triage.json NOR
+      // file-memory-project-enrollment.json (both gitignored) -- migrate09.
+      // loadEnrollmentConfig ALSO called process.exit(1) on a missing file,
+      // a second run()-reachable exit this review's fix commit had not yet
+      // covered (see main()'s own loadConfigWithoutExit wrapper, added
+      // after this exact CI failure). These tests now swap BOTH config
+      // files (never just db-triage.json) for their duration, so they pass
+      // identically on a machine that already has real config and on a
+      // bare CI checkout that has neither -- and RUN-2's swapped enrollment
+      // config uses an EMPTY enrolled_dirs list, which as a side effect
+      // makes Step C a no-op and removes this suite's only prior dependency
+      // on real ~/.claude/projects filesystem content.
       {
         const DB_TRIAGE_REAL_PATH = migrate05.DB_TRIAGE_PATH;
+        const ENROLLMENT_REAL_PATH = migrate05.ENROLLMENT_CONFIG_PATH;
         const originalDbTriageContent = fs.existsSync(DB_TRIAGE_REAL_PATH) ? fs.readFileSync(DB_TRIAGE_REAL_PATH, 'utf8') : null;
+        const originalEnrollmentContent = fs.existsSync(ENROLLMENT_REAL_PATH) ? fs.readFileSync(ENROLLMENT_REAL_PATH, 'utf8') : null;
 
         function installExitGuard() {
           const originalExit = process.exit;
@@ -547,20 +563,38 @@ async function main() {
           };
           return () => { process.exit = originalExit; };
         }
-        function restoreDbTriage() {
-          if (originalDbTriageContent !== null) fs.writeFileSync(DB_TRIAGE_REAL_PATH, originalDbTriageContent, 'utf8');
-          else { try { fs.rmSync(DB_TRIAGE_REAL_PATH, { force: true }); } catch (_) { /* best-effort */ } }
+        function restoreFile(realPath, originalContent) {
+          if (originalContent !== null) fs.writeFileSync(realPath, originalContent, 'utf8');
+          else { try { fs.rmSync(realPath, { force: true }); } catch (_) { /* best-effort */ } }
         }
+        function restoreConfigs() {
+          restoreFile(DB_TRIAGE_REAL_PATH, originalDbTriageContent);
+          restoreFile(ENROLLMENT_REAL_PATH, originalEnrollmentContent);
+        }
+        const EMPTY_ENROLLMENT = JSON.stringify({ enrolled_dirs: [], test_artifact_patterns: [] });
 
         await run('RUN-1', 'run(): a db-triage classification refusal is a catchable false, never process.exit() (the reviewer\'s adversarial construction)', async () => {
           fs.writeFileSync(DB_TRIAGE_REAL_PATH, JSON.stringify({ databases: {} }), 'utf8'); // neither absorb source classified -- Step A must refuse
+          fs.writeFileSync(ENROLLMENT_REAL_PATH, EMPTY_ENROLLMENT, 'utf8'); // must exist + be valid so the db-triage refusal is the one that actually fires
           const restoreExit = installExitGuard();
           try {
             const result = await migrate05.run(TARGET_DB);
             assert(result === false, `expected run() to resolve false on a classification refusal, got ${JSON.stringify(result)}`);
           } finally {
             restoreExit();
-            restoreDbTriage();
+            restoreConfigs();
+          }
+        });
+
+        await run('RUN-1B', 'run(): a MISSING config file (the exact fresh-CI-checkout shape) is also a catchable false, never process.exit()', async () => {
+          try { fs.rmSync(ENROLLMENT_REAL_PATH, { force: true }); } catch (_) { /* already absent */ }
+          const restoreExit = installExitGuard();
+          try {
+            const result = await migrate05.run(TARGET_DB);
+            assert(result === false, `expected run() to resolve false when the enrollment config file is entirely absent, got ${JSON.stringify(result)}`);
+          } finally {
+            restoreExit();
+            restoreConfigs();
           }
         });
 
@@ -573,14 +607,11 @@ async function main() {
           // time is the only way to redirect Step A/B away from the real,
           // hardcoded claude_policy_framework/pipeline_pipeline/eval-fixture
           // names without ever touching them -- restored in the finally below
-          // regardless of outcome. Step C's filesystem scan has no such
-          // override (enumerateMemoryBearingDirs/DEFAULT_PROJECTS_ROOT are
-          // captured by value at module load, not overridable via run()),
-          // so this ONE test deliberately reads this machine's real
-          // ~/.claude/projects content into the disposable scratch TARGET_DB
-          // -- a narrow, explicit exception to this suite's otherwise-
-          // synthetic-only fixtures, required because run()'s own contract
-          // (not a parameter this script controls) is what's under test.
+          // regardless of outcome. The swapped-in EMPTY_ENROLLMENT config
+          // (enrolled_dirs: []) makes Step C's real ~/.claude/projects scan a
+          // total no-op (every dir it finds classifies unmatched-flagged,
+          // never enrolled), so this test never actually reads or writes any
+          // real project's memory content -- fully synthetic and CI-portable.
           const HAPPY_A = `migrate05_happy_a_${stamp}`;
           const HAPPY_B = `migrate05_happy_b_${stamp}`;
           await createDb(HAPPY_A);
@@ -592,6 +623,7 @@ async function main() {
           for (const k of Object.keys(migrate05.EXCLUDED_SOURCE_DBS)) delete migrate05.EXCLUDED_SOURCE_DBS[k];
 
           fs.writeFileSync(DB_TRIAGE_REAL_PATH, JSON.stringify({ databases: { [HAPPY_A]: 'REAL-MIGRATE', [HAPPY_B]: 'REAL-MIGRATE' } }), 'utf8');
+          fs.writeFileSync(ENROLLMENT_REAL_PATH, EMPTY_ENROLLMENT, 'utf8');
           const restoreExit = installExitGuard();
           try {
             const result = await migrate05.run(TARGET_DB);
@@ -602,7 +634,7 @@ async function main() {
             migrate05.ABSORB_SOURCE_DBS.push(...savedAbsorbDbs);
             for (const k of Object.keys(migrate05.EXCLUDED_SOURCE_DBS)) delete migrate05.EXCLUDED_SOURCE_DBS[k];
             Object.assign(migrate05.EXCLUDED_SOURCE_DBS, savedExcludedDbs);
-            restoreDbTriage();
+            restoreConfigs();
             await dropDb(HAPPY_A);
             await dropDb(HAPPY_B);
           }

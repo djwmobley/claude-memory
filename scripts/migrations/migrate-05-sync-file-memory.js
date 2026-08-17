@@ -797,6 +797,45 @@ async function rollbackExclusions(tgtClient, log, excludedSourceDbs = EXCLUDED_S
  *
  * @returns {Promise<boolean>} true = PASS, false = refused/FAIL.
  */
+
+/**
+ * FIELD-FOUND FIX (CI run on PR #190's own fix commit, 2026-08-17): a fresh
+ * checkout has NO `file-memory-project-enrollment.json` (gitignored, never
+ * committed) -- exactly the environment this PR's own RUN-1/RUN-2 tests
+ * (and, in production, a fresh CI/CD box actually plugging run() into
+ * verify-15-t8-idempotency.js) run in. `migrate04.loadDbTriage` and
+ * `migrate09.loadEnrollmentConfig` -- unlike everything else in THIS file
+ * -- still call `process.exit(1)` on a missing/malformed config file (their
+ * own FATAL-message pattern, shared with their own scripts' CLI entry
+ * points). Both are called unconditionally, early in main(), reachable via
+ * run() for exactly the same reason the three cited process.exit(1) calls
+ * were. Rewriting loadDbTriage/loadEnrollmentConfig themselves is out of
+ * this PR's scope (different files, their OWN callers/tests depend on the
+ * current CLI exit-on-missing-file behavior) -- this wrapper is main()'s
+ * OWN defense so THIS script's run() contract holds regardless of what its
+ * dependencies do. Both loaders are synchronous (fs.readFileSync, never an
+ * await) so there is no window for a concurrent async caller to observe
+ * the temporarily-swapped process.exit.
+ */
+class ConfigLoadExitAttempted extends Error {
+  constructor(code) {
+    super(`process.exit(${code}) attempted inside a config loader`);
+    this.code = code;
+  }
+}
+function loadConfigWithoutExit(fn) {
+  const originalExit = process.exit;
+  process.exit = (code) => { throw new ConfigLoadExitAttempted(code); };
+  try {
+    return { ok: true, value: fn() };
+  } catch (err) {
+    if (err instanceof ConfigLoadExitAttempted) return { ok: false };
+    throw err;
+  } finally {
+    process.exit = originalExit;
+  }
+}
+
 async function main() {
   let parsed;
   try {
@@ -826,8 +865,13 @@ async function main() {
     return false;
   }
 
-  const dbTriage = migrate04.loadDbTriage(parsed.dbTriagePath);
-  const enrollmentConfig = migrate09.loadEnrollmentConfig(parsed.enrollmentConfigPath);
+  const dbTriageResult = loadConfigWithoutExit(() => migrate04.loadDbTriage(parsed.dbTriagePath));
+  if (!dbTriageResult.ok) return false; // FATAL diagnostic already printed by loadDbTriage itself
+  const dbTriage = dbTriageResult.value;
+
+  const enrollmentResult = loadConfigWithoutExit(() => migrate09.loadEnrollmentConfig(parsed.enrollmentConfigPath));
+  if (!enrollmentResult.ok) return false; // FATAL diagnostic already printed by loadEnrollmentConfig itself
+  const enrollmentConfig = enrollmentResult.value;
 
   console.log(`migrate-05-sync-file-memory: target="${target}" (resolved from ${targetSource}) mode=${parsed.rollback ? 'ROLLBACK' : parsed.dryRun ? 'DRY-RUN' : 'MIGRATE'}`);
 
