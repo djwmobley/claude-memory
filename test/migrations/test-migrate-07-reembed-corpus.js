@@ -378,6 +378,11 @@ async function main() {
             calls.push(typeof sql === 'string' ? sql.trim().split('\n')[0].trim() : String(sql));
             return realClient.query(sql, params);
           },
+          // Delegated, not spied on -- escapeLiteral is a pure local string
+          // transform (no round trip), never a statement this spy needs to
+          // record. Present so any future probe fixture that DOES touch a
+          // commented view still works through this wrapper.
+          escapeLiteral: (val) => realClient.escapeLiteral(val),
         },
       };
     }
@@ -447,8 +452,20 @@ async function main() {
         );
         CREATE INDEX memory_entries_vec_idx ON memory_entries USING ivfflat (embedding vector_cosine_ops);
         CREATE INDEX mem_chunks_vec_idx ON memory_entry_chunks USING ivfflat (embedding vector_cosine_ops);
-        CREATE VIEW v_memory_hits AS SELECT id AS chunk_id, entry_id, content FROM memory_entry_chunks;
-        COMMENT ON VIEW v_memory_hits IS 'test fixture comment -- must survive the DROP/recreate round-trip';
+        -- Mirrors scripts/sql/v_memory_hits.sql's REAL shape: the view must
+        -- SELECT the embedding column itself (not just other sibling
+        -- columns) so pg_depend records a column-level dependency on
+        -- memory_entry_chunks.embedding specifically -- getDependentViews()
+        -- joins on a.attname = 'embedding'. A view that never selects
+        -- embedding (the pre-fix vacuous fixture) is never returned by that
+        -- query, so the DROP/recreate/comment-restore path never fires and
+        -- this whole test would pass even with the COMMENT ON VIEW ... IS
+        -- $1 syntax-error defect independent review #2 found live.
+        CREATE VIEW v_memory_hits AS SELECT id AS chunk_id, entry_id, content, embedding FROM memory_entry_chunks;
+        -- Single quote + embedded newline -- proves escapeLiteral's escaping,
+        -- not just the happy path (independent review #2's explicit ask).
+        COMMENT ON VIEW v_memory_hits IS 'it''s a test fixture comment
+with an embedded newline -- must survive the escapeLiteral round-trip';
       `);
 
       const r1 = await migrate07.runAlterLegacyVectorColumn(tgt, 'memory_entries', () => {});
@@ -461,14 +478,22 @@ async function main() {
       assert(t1 === 'halfvec(4000)', `memory_entries.embedding expected halfvec(4000), got ${t1}`);
       assert(t2 === 'halfvec(4000)', `memory_entry_chunks.embedding expected halfvec(4000), got ${t2}`);
 
-      // view preserved and queryable
-      const { rows: viewRows } = await tgt.query(`SELECT * FROM v_memory_hits`);
-      assert(Array.isArray(viewRows), 'expected v_memory_hits to still be queryable post-ALTER');
+      // view preserved and queryable -- including its embedding column,
+      // which is WHY this view was dropped/recreated at all (pg_depend).
+      const { rows: viewRows } = await tgt.query(`SELECT chunk_id, entry_id, content, embedding FROM v_memory_hits`);
+      assert(Array.isArray(viewRows), 'expected v_memory_hits to still be queryable post-ALTER, embedding column included');
 
-      // non-blocking review item (c): COMMENT ON VIEW must survive the
-      // DROP/pg_get_viewdef-recreate round-trip, not just the view body.
+      // non-blocking review item (c), re-fixed after independent review #2
+      // found the original fix syntactically broken (`COMMENT ON VIEW ...
+      // IS $1` -- bind params are not legal in utility statements) AND the
+      // original fixture vacuous (its view never selected `embedding`, so
+      // the DROP/recreate/comment-restore path never ran). This fixture's
+      // view now selects `embedding` (exercising the real path) and its
+      // comment carries a single quote + an embedded newline (exercising
+      // escapeLiteral's escaping, not just a quote-free happy path).
+      const EXPECTED_COMMENT = "it's a test fixture comment\nwith an embedded newline -- must survive the escapeLiteral round-trip";
       const { rows: commentRows } = await tgt.query(`SELECT obj_description('v_memory_hits'::regclass, 'pg_class') AS c`);
-      assert(commentRows[0].c === 'test fixture comment -- must survive the DROP/recreate round-trip', `expected the view comment to be preserved, got ${JSON.stringify(commentRows[0].c)}`);
+      assert(commentRows[0].c === EXPECTED_COMMENT, `expected the view comment (quote+newline intact) to be preserved, got ${JSON.stringify(commentRows[0].c)}`);
 
       // index opclass halfvec_cosine_ops, partial WHERE
       const { rows: idxRows } = await tgt.query(`SELECT indexdef FROM pg_indexes WHERE tablename = 'memory_entry_chunks' AND indexname = 'memory_entry_chunks_embedding_hnsw_idx'`);

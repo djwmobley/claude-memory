@@ -576,7 +576,20 @@ async function runAlterLegacyVectorColumn(client, table, log, dryRun = false) {
       await client.query(`CREATE VIEW "${viewName}" AS ${def}`);
       log(`  [ALTER] recreated view "${viewName}" from its captured pg_get_viewdef.`);
       if (comment) {
-        await client.query(`COMMENT ON VIEW "${viewName}" IS $1`, [comment]);
+        // FIELD-FOUND FIX (independent re-review, PR #195, 2026-08-18):
+        // `COMMENT ON VIEW ... IS $1` is a syntax error -- PostgreSQL does
+        // not accept bind parameters in utility statements (only in
+        // plannable DML: SELECT/INSERT/UPDATE/DELETE). This unconditionally
+        // failed on any target whose dependent view actually carries a
+        // comment -- which the real target (scripts/sql/v_memory_hits.sql)
+        // does, aborting the whole G-R2 transaction every time. Fixed by
+        // interpolating a SAFELY ESCAPED SQL literal via the pg Client's
+        // own `escapeLiteral` (doubles embedded single quotes, wraps in
+        // single quotes; a raw newline inside the resulting literal is
+        // valid SQL and requires no extra handling) -- NEVER a bind
+        // parameter in a utility statement, and NEVER raw, unescaped string
+        // concatenation of comment content.
+        await client.query(`COMMENT ON VIEW "${viewName}" IS ${client.escapeLiteral(comment)}`);
         log(`  [ALTER] restored COMMENT ON VIEW "${viewName}".`);
       }
     }
