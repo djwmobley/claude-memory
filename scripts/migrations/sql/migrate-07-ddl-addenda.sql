@@ -59,3 +59,18 @@ CREATE TABLE IF NOT EXISTS embedding_write_log (
 );
 CREATE INDEX IF NOT EXISTS embedding_write_log_batch_idx     ON embedding_write_log (batch_id);
 CREATE INDEX IF NOT EXISTS embedding_write_log_table_pk_idx  ON embedding_write_log (table_name, row_pk_value);
+
+-- OL-5 (2026-08-18, mm#11(g) follow-up, over-length-embed-input spec-
+-- adversary pass): truncated_to_chars records the FINAL embedded text
+-- length for a row whose embed-time text was shortened before the provider
+-- call (either by the 24,000-char pre-cap alone, or by one-or-more halving
+-- retries after a matched context-length-exceeded 400 -- see
+-- migrate-07-reembed-corpus.js's EMBED_TEXT_CAP_CHARS / embedWithHalvingRetry).
+-- NULL means untruncated -- the row's full content was embedded as-is.
+-- Discoverable via: SELECT * FROM embedding_write_log WHERE truncated_to_chars
+-- IS NOT NULL. A future change to EMBED_TEXT_CAP_CHARS (or to the halving
+-- policy) warrants a DELIBERATE re-embed sweep of exactly these rows -- the
+-- same accepted staleness class as this script's own documented G-R14/
+-- MUTATE-1 in-place-content-mutation limit (a config-driven cap change is
+-- not auto-detected any more than an in-place content edit is).
+ALTER TABLE embedding_write_log ADD COLUMN IF NOT EXISTS truncated_to_chars INTEGER NULL;
