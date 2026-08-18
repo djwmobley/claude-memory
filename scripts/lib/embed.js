@@ -68,9 +68,16 @@ function _loadFixtures(fixturePath) {
 }
 
 /**
- * POST to vLLM /v1/embeddings and return the embedding vector.
+ * POST to vLLM /v1/embeddings and return the RAW (untruncated, native-
+ * dimension) embedding vector. Extracted from what used to be this file's
+ * private _vllmEmbed (2026-08-18, §6.1(g)/G-R... amendment, mm#11(g)) so
+ * scripts/lib/embedding-provider.js can reuse the SAME POST/parse logic by
+ * reference for its own Matryoshka truncation to a DB-row-driven
+ * `stored_dims` value, rather than forking a second copy of this HTTP call.
+ * embedQuery()'s own behavior (truncate to the env-configured EMBED_DIMS)
+ * is unchanged — see _vllmEmbed below, now a thin wrapper over this.
  */
-function _vllmEmbed(text, vllmUrl, model) {
+function _vllmEmbedRaw(text, vllmUrl, model) {
   return new Promise((resolve, reject) => {
     const url  = new URL('/v1/embeddings', vllmUrl);
     const body = JSON.stringify({ model, input: text, encoding_format: 'float' });
@@ -109,8 +116,7 @@ function _vllmEmbed(text, vllmUrl, model) {
           reject(new Error(`[embed] vLLM response missing data[0].embedding — got: ${raw.slice(0, 200)}`));
           return;
         }
-        const truncated = EMBED_DIMS < embedding.length ? embedding.slice(0, EMBED_DIMS) : embedding;
-        resolve(truncated);
+        resolve(embedding);
       });
     });
 
@@ -121,6 +127,16 @@ function _vllmEmbed(text, vllmUrl, model) {
     req.write(body);
     req.end();
   });
+}
+
+/**
+ * POST to vLLM /v1/embeddings and return the embedding vector, truncated to
+ * the module's env-configured EMBED_DIMS (this file's own, pre-existing
+ * truncation discipline — unchanged by the _vllmEmbedRaw extraction above).
+ */
+async function _vllmEmbed(text, vllmUrl, model) {
+  const embedding = await _vllmEmbedRaw(text, vllmUrl, model);
+  return EMBED_DIMS < embedding.length ? embedding.slice(0, EMBED_DIMS) : embedding;
 }
 
 /**
@@ -186,4 +202,4 @@ async function embedQuery(text, opts = {}) {
   return _vllmEmbed(text, vllmUrl, model);
 }
 
-module.exports = { embedQuery };
+module.exports = { embedQuery, _vllmEmbedRaw };
