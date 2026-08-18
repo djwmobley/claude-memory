@@ -167,13 +167,15 @@ async function setupTargetSchema(client) {
     CREATE TABLE IF NOT EXISTS entities (
       id SERIAL PRIMARY KEY,
       project_id TEXT NOT NULL,
-      name TEXT NOT NULL
+      name TEXT NOT NULL,
+      suppressed BOOLEAN NOT NULL DEFAULT false
     );
     CREATE TABLE IF NOT EXISTS edges (
       id SERIAL PRIMARY KEY,
       from_entity TEXT NOT NULL,
       to_entity TEXT NOT NULL,
-      project_id TEXT NOT NULL
+      project_id TEXT NOT NULL,
+      suppressed BOOLEAN NOT NULL DEFAULT false
     );
     CREATE TABLE IF NOT EXISTS memory_entries (
       id SERIAL PRIMARY KEY,
@@ -1291,6 +1293,88 @@ async function testT6JoinKeyFix() {
   }
 }
 
+// T6-SUPPRESSION pass (2026-08-18, cm spec-adversary A-1/A-2/A-4/A-6,
+// BINDING): the orphan-edge check scopes to LIVE (non-suppressed) edges
+// only -- a suppressed edge is a tombstone whose referents may legitimately
+// no longer exist. These fixtures prove each binding finding is
+// FALSIFIABLE, not merely plausible:
+//   (i)   a suppressed orphan edge, alone -> PASS (tombstone excluded).
+//   (ii)  a LIVE orphan edge -> FAIL -- already covered by testT6ReferentialIntegrity's
+//         T6-b (kept, not duplicated here).
+//   (iii) A-6: one suppressed orphan edge + one live orphan edge -> FAIL
+//         with the count EXACTLY 1 (regex on the numeral, not just
+//         nonzero) -- the test that catches a scope bug where a suppressed
+//         row leaks into the count.
+//   (iv)  A-4: a live edge resolving to a SUPPRESSED entity -> PASS --
+//         entity existence is pinned to "row exists", never gated on
+//         entities.suppressed.
+//   (v)   A-1: against a fixture edges table that LACKS the suppressed
+//         column entirely (pre-migrate-15-mcp-addenda.sql shape), a live
+//         orphan edge still FAILs and the unscoped-mode INFO log line
+//         prints -- proves the column-absent branch runs (not silently
+//         skips) and is never silent about which mode ran.
+async function testT6SuppressionAware() {
+  const target = await pgConnect(TARGET_DB);
+  try {
+    await truncateAll(target, ['edges', 'entities', 'memory_entries', 'memory_entry_chunks']);
+    const rosterPath = writeTmpJson('t6-suppression-roster.json', BASE_ROSTER);
+
+    // (i) Suppressed orphan edge alone -> PASS.
+    await target.query(`INSERT INTO edges (project_id, from_entity, to_entity, suppressed) VALUES ('proj-a', 'ghost-a', 'ghost-b', true)`);
+    const r1 = runScript('verify-15-t6-referential-integrity.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r1.status === 0) pass('T6-supp-a', 'suppressed orphan edge, alone -> PASS (tombstone excluded from the orphan-edge check)');
+    else fail('T6-supp-a', 'suppressed orphan edge, alone -> PASS (tombstone excluded from the orphan-edge check)', `status=${r1.status} stdout=${r1.stdout} stderr=${r1.stderr}`);
+
+    // (iii) A-6: mixed -- one suppressed orphan edge + one live orphan edge
+    // -> FAIL with the count EXACTLY 1 (the suppressed row must not leak
+    // into the count).
+    await truncateAll(target, ['edges', 'entities']);
+    await target.query(`INSERT INTO edges (project_id, from_entity, to_entity, suppressed) VALUES ('proj-a', 'ghost-a', 'ghost-b', true)`);
+    await target.query(`INSERT INTO edges (project_id, from_entity, to_entity, suppressed) VALUES ('proj-a', 'ghost-c', 'ghost-d', false)`);
+    const r2 = runScript('verify-15-t6-referential-integrity.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    const countMatch = (r2.stdout + r2.stderr).match(/(\d+) orphan edge/);
+    if (r2.status !== 0 && countMatch && countMatch[1] === '1') {
+      pass('T6-supp-b', 'one suppressed orphan edge + one live orphan edge -> FAIL with exactly 1 orphan edge (A-6: suppressed row does not leak into the count)');
+    } else {
+      fail('T6-supp-b', 'one suppressed orphan edge + one live orphan edge -> FAIL with exactly 1 orphan edge (A-6: suppressed row does not leak into the count)', `status=${r2.status} countMatch=${countMatch ? countMatch[1] : 'none'} stdout=${r2.stdout} stderr=${r2.stderr}`);
+    }
+
+    // (iv) A-4: a live edge resolving to a SUPPRESSED entity -> PASS.
+    // entity existence is "row exists", regardless of entities.suppressed.
+    await truncateAll(target, ['edges', 'entities']);
+    await target.query(`INSERT INTO entities (project_id, name, suppressed) VALUES ('proj-a', 'Widget', true)`);
+    await target.query(`INSERT INTO edges (project_id, from_entity, to_entity, suppressed) VALUES ('proj-a', 'Widget', 'Widget', false)`);
+    const r3 = runScript('verify-15-t6-referential-integrity.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r3.status === 0) pass('T6-supp-c', 'live edge resolving to a SUPPRESSED entity -> PASS (a tombstone entity is still a valid referent)');
+    else fail('T6-supp-c', 'live edge resolving to a SUPPRESSED entity -> PASS (a tombstone entity is still a valid referent)', `status=${r3.status} stdout=${r3.stdout} stderr=${r3.stderr}`);
+
+    // (v) A-1: against a fixture edges table that LACKS the suppressed
+    // column entirely (pre-migrate-15-mcp-addenda.sql shape), a live
+    // orphan edge still FAILs and the unscoped-mode INFO log line prints.
+    // Column is dropped and restored on THIS fixture's edges table only,
+    // inside a nested finally, so it never leaks into any other test that
+    // shares TARGET_DB.
+    await truncateAll(target, ['edges', 'entities']);
+    await target.query('ALTER TABLE edges DROP COLUMN suppressed');
+    try {
+      await target.query(`INSERT INTO edges (project_id, from_entity, to_entity) VALUES ('proj-a', 'ghost-e', 'ghost-f')`);
+      const r4 = runScript('verify-15-t6-referential-integrity.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+      const out4 = r4.stdout + r4.stderr;
+      if (r4.status !== 0 && /orphan edge/.test(out4) && /suppressed column is ABSENT/.test(out4)) {
+        pass('T6-supp-d', 'edges.suppressed column ABSENT -> live orphan edge still FAILs, unscoped-mode INFO log line prints (A-1)');
+      } else {
+        fail('T6-supp-d', 'edges.suppressed column ABSENT -> live orphan edge still FAILs, unscoped-mode INFO log line prints (A-1)', `status=${r4.status} stdout=${r4.stdout} stderr=${r4.stderr}`);
+      }
+    } finally {
+      await target.query('ALTER TABLE edges ADD COLUMN suppressed BOOLEAN NOT NULL DEFAULT false');
+    }
+
+    await truncateAll(target, ['edges', 'entities']);
+  } finally {
+    await target.end();
+  }
+}
+
 async function testT7CavemanEconomy() {
   // The store-wide gate (test/north-star/test-caveman-economy-store-wide.js)
   // now EXISTS (memory-manager#12, T7's former blocker) — this test's
@@ -1768,6 +1852,7 @@ async function main() {
     await testT5EmbeddingCoverage();
     await testT6ReferentialIntegrity();
     await testT6JoinKeyFix();
+    await testT6SuppressionAware();
     await testT7CavemanEconomy();
     await testT8Idempotency();
     await testT9Negative();
