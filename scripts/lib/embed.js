@@ -33,6 +33,25 @@ const { loadConfig } = require('./shared');
 const EMBED_DIMS = parseInt(process.env.EMBED_DIMS || '4000', 10);
 
 /**
+ * VllmHttpError (OL-1/OL-2 prerequisite, 2026-08-18, mm#11(g) follow-up):
+ * thrown by _vllmEmbedRaw on a non-2xx vLLM response, carrying the FULL
+ * untruncated response body (`.rawBody`) and the HTTP status code
+ * (`.statusCode`) as first-class properties -- distinct from `.message`,
+ * which stays 200-char-truncated for display exactly as before. Callers
+ * that need to structurally classify a vLLM HTTP error (e.g. migrate-07-
+ * reembed-corpus.js's context-length-exceeded matcher) read `.statusCode`/
+ * `.rawBody` directly rather than regex-matching the truncated `.message`.
+ */
+class VllmHttpError extends Error {
+  constructor(message, statusCode, rawBody) {
+    super(message);
+    this.name = 'VllmHttpError';
+    this.statusCode = statusCode;
+    this.rawBody = rawBody;
+  }
+}
+
+/**
  * Read a key from pipeline.yml knowledge section without a full loadConfig parse.
  * Used to retrieve keys (like vllm_embed_url) that loadConfig does not expose yet.
  */
@@ -101,7 +120,7 @@ function _vllmEmbedRaw(text, vllmUrl, model) {
       res.on('data', (chunk) => { raw += chunk; });
       res.on('end', () => {
         if (res.statusCode < 200 || res.statusCode >= 300) {
-          reject(new Error(`[embed] vLLM returned HTTP ${res.statusCode}: ${raw.slice(0, 200)}`));
+          reject(new VllmHttpError(`[embed] vLLM returned HTTP ${res.statusCode}: ${raw.slice(0, 200)}`, res.statusCode, raw));
           return;
         }
         let parsed;
@@ -202,4 +221,4 @@ async function embedQuery(text, opts = {}) {
   return _vllmEmbed(text, vllmUrl, model);
 }
 
-module.exports = { embedQuery, _vllmEmbedRaw };
+module.exports = { embedQuery, _vllmEmbedRaw, VllmHttpError };

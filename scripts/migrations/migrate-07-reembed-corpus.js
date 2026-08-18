@@ -84,9 +84,29 @@
  *   COMPLETENESS GATE (G-R6): runCompletenessGate() classifies every
  *   residual NULL-embedding row into exactly one of embeddable-pending
  *   (FAILS the gate) / exempt-empty-content / exempt-suppressed-AND-empty /
- *   the corpus_files structural-disposition open question (a report-level
- *   flag layered ON TOP of, never instead of, its exempt-empty-content
- *   count -- see STRUCTURAL_DISPOSITION_TABLES below).
+ *   exempt-overlength / the corpus_files structural-disposition open
+ *   question (a report-level flag layered ON TOP of, never instead of, its
+ *   exempt-empty-content count -- see STRUCTURAL_DISPOSITION_TABLES below).
+ *
+ *   OVER-LENGTH EMBED INPUT (OL-1..OL-11, 2026-08-18, mm#11(g) follow-up):
+ *   the staging run hard-stopped on a 89,394-char memory_entries row --
+ *   vLLM's 8192-token max_model_len rejected it. Every row's embed text is
+ *   now pre-capped at EMBED_TEXT_CAP_CHARS (24,000) before the provider
+ *   call, for every table generically. If a matched context-length 400
+ *   (isContextLengthError -- structural: VllmHttpError, statusCode 400,
+ *   parsed rawBody's error.param==='input_tokens'; NEVER a regex on
+ *   `.message`) survives the cap, embedWithHalvingRetry() halves the text
+ *   up to HALVING_MAX_ATTEMPTS times (floored at HALVING_FLOOR_CHARS,
+ *   ~HALVING_DELAY_MS paced between attempts) before giving up and
+ *   bucketing the row exempt-overlength. Every other error class (5xx,
+ *   connection errors, non-length 400s, dim mismatches) keeps G-R8's
+ *   immediate-hard-stop discipline completely untouched. A truncated row's
+ *   final embedded length is recorded in embedding_write_log.
+ *   truncated_to_chars (NULL = untruncated). evaluateCardinalityAlarm()
+ *   fails the whole migration if exempt-overlength count exceeds
+ *   CARDINALITY_TOTAL_MAX (20) total or CARDINALITY_TABLE_RATIO_MAX (5%) of
+ *   any single table's candidates -- a total provider outage must not
+ *   masquerade as a big named exemption bucket.
  *
  * ══════════════════════════════════════════════════════════════════════
  * WHAT THIS SCRIPT DELIBERATELY DOES NOT DO
@@ -120,10 +140,147 @@ const migrateOne = require('./migrate-01-canonical-db');               // reused
 const shared = require('./lib/verify15-shared');                        // reused by reference: resolveRosterPath, resolveAndClassifyTargetDb-equivalent pieces
 const t9 = require('./verify-15-t9-negative');                          // reused by reference: checkExclusion (G-R11 preflight)
 const embeddingProvider = require('../lib/embedding-provider');         // reused by reference
+const { VllmHttpError } = require('../lib/embed');                      // reused by reference (OL-1/OL-2 matcher)
 
 const MIGRATIONS_DIR = __dirname;
 const SQL_FILE = path.join(MIGRATIONS_DIR, 'sql', 'migrate-07-ddl-addenda.sql');
 const LOCK_NAMESPACE = 44; // 42/43 are taken by scripts/lib/db-seam.js (G-R10)
+
+// ─── OVER-LENGTH EMBED INPUT HANDLING (OL-1..OL-11, 2026-08-18, mm#11(g) ──
+// follow-up spec-adversary pass, live-probed against the real vLLM
+// endpoint and the real row content that hard-stopped the staging run at
+// memory_entries id=88, 89,394 chars). See this script's own report/gate
+// section (runCompletenessGate / evaluateCardinalityAlarm) and
+// embedWithHalvingRetry below for how these constants are used.
+
+// (OL-3) Every row's constructed embed text is capped at this many chars
+// BEFORE the provider call, for every table (generic, never memory_entries-
+// special-cased). Live-verified 2026-08-18: the real row-88 content (89,394
+// chars) embeds successfully once capped to 24,000 chars; even 33,000
+// chars of dense English succeeds against this vLLM build's 8192-token
+// max_model_len. The cap alone resolves every known long row in today's
+// corpus -- the halving retry below is DORMANT DEFENSE for content shapes
+// not present in today's corpus (denser tokenization, non-English text,
+// etc.), not the primary mechanism.
+const EMBED_TEXT_CAP_CHARS = 24000;
+
+// (OL-4) Halving retry policy for a MATCHED context-length-exceeded 400
+// (see isContextLengthError below) that survives the pre-cap. vLLM's error
+// body reports only "at least N input tokens" -- no exact excess -- so
+// proportional trimming is impossible; blind halving is the only viable
+// strategy. HALVING_MAX_ATTEMPTS successive halvings, floored at
+// HALVING_FLOOR_CHARS (never trimmed below this), ~HALVING_DELAY_MS between
+// attempts on the SAME row -- pacing, not swallowing: the adversary pass
+// observed alternating 400/ECONNRESET flakiness under unpaced back-to-back
+// large POSTs against this endpoint, and pacing is the fix for that
+// flakiness. This delay is NOT part of the context-length matcher; a
+// simulated ECONNRESET (or any non-matched error) still hard-stops
+// immediately, exactly as before this change.
+const HALVING_MAX_ATTEMPTS = 4;
+const HALVING_FLOOR_CHARS = 1000;
+const HALVING_DELAY_MS = 300;
+
+// (OL-7) Cardinality alarm, pinned numbers: exceeding EITHER threshold
+// fails the completeness gate outright (nonzero exit), never
+// passes-with-exemption -- a total provider outage must not masquerade as
+// a big named "exempt-overlength" bucket. See evaluateCardinalityAlarm.
+const CARDINALITY_TOTAL_MAX = 20;
+const CARDINALITY_TABLE_RATIO_MAX = 0.05;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * OL-2 matcher, PINNED -- never a regex on `.message`. The context-length
+ * class is exactly: a VllmHttpError, statusCode===400, and a rawBody that
+ * parses as JSON with error.param === 'input_tokens'. A JSON parse failure
+ * or ANY other param value is NOT this class -- it falls through to the
+ * existing immediate-stop path untouched, same as a connection error, a
+ * 5xx, or a dim mismatch. This is deliberately narrow: it is pinned to
+ * THIS vLLM build's error-JSON shape (see this PR's blind-spot section).
+ */
+function isContextLengthError(err) {
+  if (!(err instanceof VllmHttpError) || err.statusCode !== 400) return false;
+  try {
+    const parsed = JSON.parse(err.rawBody);
+    return !!(parsed && parsed.error && parsed.error.param === 'input_tokens');
+  } catch (_parseErr) {
+    return false;
+  }
+}
+
+/**
+ * (OL-3/OL-4) Embed `text` (already pre-capped by the caller) against
+ * `provider`, halving on a matched context-length 400 up to
+ * HALVING_MAX_ATTEMPTS times, floored at HALVING_FLOOR_CHARS. Every
+ * halving progressively halves the PREVIOUS attempt's text (not the
+ * original each time). Any non-matched error (OL-2) propagates immediately
+ * -- this function is not a general retry wrapper, only a context-length
+ * one.
+ *
+ * @returns {Promise<{ok:true, result:object, halvings:number, finalLength:number}
+ *                   |{ok:false, halvings:number}>}
+ *   ok:false means the floor was exhausted and every attempt still matched
+ *   the context-length class -- caller buckets this row exempt-overlength.
+ */
+async function embedWithHalvingRetry(provider, text, log, ctxLabel, halvingDelayMs = HALVING_DELAY_MS) {
+  let attemptText = text;
+  for (let halvings = 0; halvings <= HALVING_MAX_ATTEMPTS; halvings++) {
+    if (halvings > 0) {
+      const nextLen = Math.max(HALVING_FLOOR_CHARS, Math.floor(attemptText.length / 2));
+      attemptText = attemptText.slice(0, nextLen);
+      log(`  [HALVING] ${ctxLabel}: context-length 400 matched -- retry ${halvings}/${HALVING_MAX_ATTEMPTS}, new length=${attemptText.length}.`);
+      await sleep(halvingDelayMs);
+    }
+    try {
+      const result = await provider.embed(attemptText);
+      return { ok: true, result, halvings, finalLength: attemptText.length };
+    } catch (err) {
+      if (!isContextLengthError(err)) throw err; // OL-2: not the matched class -> immediate hard stop (G-R8 untouched).
+      if (halvings === HALVING_MAX_ATTEMPTS) {
+        return { ok: false, halvings };
+      }
+      // else: matched class, floor not yet exhausted -- loop halves again.
+    }
+  }
+  /* istanbul ignore next -- loop always returns from within the body above */
+  throw new Error('embedWithHalvingRetry: unreachable');
+}
+
+/**
+ * (OL-7) Cardinality alarm. Runs AFTER the embed loop, over the per-table
+ * report the embed loop already produced. Exceeding either pinned
+ * threshold fails the whole migration regardless of what
+ * runCompletenessGate() concluded (that gate treats a SMALL
+ * exempt-overlength count as a legitimate exemption bucket -- this alarm
+ * is what keeps a LARGE one, e.g. a total provider outage, from silently
+ * passing under that same exemption umbrella).
+ */
+function evaluateCardinalityAlarm(report, log) {
+  let pass = true;
+  const totalExemptOverlength = report.reduce((sum, r) => sum + (r.exemptOverlength || 0), 0);
+  const perTable = [];
+  for (const r of report) {
+    const exemptOverlength = r.exemptOverlength || 0;
+    const candidates = r.candidates || 0;
+    const ratio = candidates > 0 ? exemptOverlength / candidates : 0;
+    const tableFail = candidates > 0 && exemptOverlength > 0 && ratio > CARDINALITY_TABLE_RATIO_MAX;
+    perTable.push({ table: r.table, exemptOverlength, candidates, ratio, tableFail });
+    if (tableFail) {
+      pass = false;
+      log(`  [CARDINALITY-ALARM] ${r.table}: exempt-overlength=${exemptOverlength}/${candidates} candidate row(s) (${(ratio * 100).toFixed(1)}%) exceeds the ${(CARDINALITY_TABLE_RATIO_MAX * 100).toFixed(0)}% per-table threshold -- completeness gate FAILS.`);
+    }
+  }
+  if (totalExemptOverlength > CARDINALITY_TOTAL_MAX) {
+    pass = false;
+    log(`  [CARDINALITY-ALARM] total exempt-overlength=${totalExemptOverlength} exceeds ${CARDINALITY_TOTAL_MAX} -- completeness gate FAILS.`);
+  }
+  if (pass && totalExemptOverlength > 0) {
+    log(`  [CARDINALITY-ALARM] OK: total exempt-overlength=${totalExemptOverlength} (<= ${CARDINALITY_TOTAL_MAX} and every table <= ${(CARDINALITY_TABLE_RATIO_MAX * 100).toFixed(0)}%) -- within the accepted exemption threshold.`);
+  }
+  return { pass, totalExemptOverlength, perTable };
+}
 
 // Tables genuinely at legacy vector(1024) on live staging today (G-R2). Both
 // carry ZERO live embedding values (live-verified) -- USING NULL never
@@ -604,7 +761,7 @@ async function runAlterLegacyVectorColumn(client, table, log, dryRun = false) {
 
 // ─── EMBED LOOP (G-R3/G-R4/G-R5/G-R7/G-R8/G-R9/G-R10) ──────────────────────
 
-async function embedTable(client, table, spec, provider, providerId, runId, excludedProjectIds, log, dryRun) {
+async function embedTable(client, table, spec, provider, providerId, runId, excludedProjectIds, log, dryRun, halvingDelayMs = HALVING_DELAY_MS) {
   const pkSpec = getPkSpec(table);
   const selectColsList = [...new Set([...pkSpec.cols, 'project_id'])];
   const selectCols = selectColsList.map((c) => `"${c}"`).join(', ');
@@ -629,14 +786,16 @@ async function embedTable(client, table, spec, provider, providerId, runId, excl
   sql += ` ORDER BY ${pkSpec.cols.map((c) => `"${c}"`).join(', ')}`;
   const { rows } = await client.query(sql, params);
 
-  const counts = { candidates: rows.length, embedded: 0, exemptEmptyContent: 0 };
+  const counts = { candidates: rows.length, embedded: 0, exemptEmptyContent: 0, exemptOverlength: 0 };
+  const truncatedRows = [];       // (OL-6) {table, pk, originalLength, finalLength, halvings}
+  const exemptOverlengthRows = []; // (OL-6) {table, pk, originalLength, halvings}
 
   if (dryRun) {
     for (const row of rows) {
       if (!row.__has_content) { counts.exemptEmptyContent++; continue; }
       log(`  [DRY-RUN] would embed ${table} pk=${encodePk(pkSpec, row).valStr}`);
     }
-    return counts;
+    return { ...counts, truncatedRows, exemptOverlengthRows };
   }
 
   const storedDims = provider.storedDims();
@@ -651,7 +810,12 @@ async function embedTable(client, table, spec, provider, providerId, runId, excl
     // __has_content (SQL trim(), matching the gate) already proved this is
     // non-empty; JS .trim() here is pure value normalization for the text
     // handed to the provider, never the emptiness decision.
-    const text = (row.__content_text || '').trim();
+    const originalText = (row.__content_text || '').trim();
+    // (OL-3) Pre-cap BEFORE the provider call, every table, generic.
+    const cappedText = originalText.length > EMBED_TEXT_CAP_CHARS
+      ? originalText.slice(0, EMBED_TEXT_CAP_CHARS)
+      : originalText;
+    const wasPreCapped = cappedText.length < originalText.length;
 
     if (batchId === null) {
       // NON-BLOCKING (independent review, PR #195, item (d)): this INSERT is
@@ -689,9 +853,34 @@ async function embedTable(client, table, spec, provider, providerId, runId, excl
         continue;
       }
 
-      // G-R8: first provider error is an immediate hard stop -- never
-      // caught-and-continued here; propagates out of this function.
-      const result = await provider.embed(text);
+      const pkLabelForLog = encodePk(pkSpec, row).valStr;
+
+      // G-R8 / OL-2: first NON-context-length provider error is an
+      // immediate hard stop -- never caught-and-continued here; propagates
+      // out of this function. A matched context-length 400 (OL-2) is
+      // handled INSIDE embedWithHalvingRetry via the halving policy
+      // (OL-4) and does NOT itself hard-stop unless the halving floor is
+      // exhausted, in which case this row is bucketed exempt-overlength
+      // (OL-4) rather than thrown.
+      const halvingResult = await embedWithHalvingRetry(
+        provider, cappedText, log, `${table} pk=${pkLabelForLog}`, halvingDelayMs
+      );
+
+      if (!halvingResult.ok) {
+        // (OL-4) Floor exhausted, still context-length-exceeded -- bucket
+        // exempt-overlength. Never a hard stop, never silently dropped:
+        // rolled back (no writes for this row) and counted/listed (OL-6),
+        // subject to the cardinality alarm (OL-7).
+        await client.query('ROLLBACK');
+        counts.exemptOverlength++;
+        exemptOverlengthRows.push({
+          table, pk: pkLabelForLog, originalLength: originalText.length, halvings: halvingResult.halvings,
+        });
+        log(`  [EXEMPT-OVERLENGTH] ${table} pk=${pkLabelForLog}: original_length=${originalText.length} halvings=${halvingResult.halvings} -- halving floor (${HALVING_FLOOR_CHARS} chars) exhausted, still context-length-exceeded. Never embedded.`);
+        continue;
+      }
+
+      const result = halvingResult.result;
 
       // G-R9: dim assertion before every write.
       if (!Array.isArray(result.vector) || result.vector.length !== storedDims) {
@@ -701,6 +890,13 @@ async function embedTable(client, table, spec, provider, providerId, runId, excl
         );
       }
 
+      // (OL-5/OL-6) truncated_to_chars is set when EITHER the pre-cap
+      // alone shortened the text OR a halving retry was needed (or both --
+      // halvings always implies pre-cap already fired, since halving only
+      // ever operates on the already-capped text). NULL means untouched.
+      const truncated = wasPreCapped || halvingResult.halvings > 0;
+      const truncatedToChars = truncated ? halvingResult.finalLength : null;
+
       const vectorLiteral = JSON.stringify(result.vector);
       await client.query(
         `UPDATE "${table}" SET embedding=$1::halfvec, embedded_by_provider_id=$2 WHERE ${pkWhereClause(pkSpec.cols, 2)}`,
@@ -708,17 +904,24 @@ async function embedTable(client, table, spec, provider, providerId, runId, excl
       );
       const { colStr, valStr } = encodePk(pkSpec, row);
       await client.query(
-        `INSERT INTO embedding_write_log (batch_id, table_name, row_pk_col, row_pk_value) VALUES ($1,$2,$3,$4)`,
-        [batchId, table, colStr, valStr]
+        `INSERT INTO embedding_write_log (batch_id, table_name, row_pk_col, row_pk_value, truncated_to_chars) VALUES ($1,$2,$3,$4,$5)`,
+        [batchId, table, colStr, valStr, truncatedToChars]
       );
       await client.query('COMMIT');
       counts.embedded++;
+      if (truncated) {
+        truncatedRows.push({
+          table, pk: pkLabelForLog, originalLength: originalText.length,
+          finalLength: truncatedToChars, halvings: halvingResult.halvings,
+        });
+        log(`  [EMBEDDED-TRUNCATED] ${table} pk=${pkLabelForLog}: original_length=${originalText.length} final_length=${truncatedToChars} halvings=${halvingResult.halvings} (${halvingResult.halvings === 0 ? 'pre-cap-only' : 'halving-triggered'}).`);
+      }
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
       throw err; // G-R8: hard stop, no skip-and-continue, no fallback embedder.
     }
   }
-  return counts;
+  return { ...counts, truncatedRows, exemptOverlengthRows };
 }
 
 // ─── G-R5 PROVENANCE VERIFICATION ──────────────────────────────────────────
@@ -750,7 +953,7 @@ async function runProvenanceVerification(client, tables, log) {
 async function runCompletenessGate(client, tableSpecs, log) {
   let pass = true;
   const report = [];
-  for (const { table, spec, hasSuppressed } of tableSpecs) {
+  for (const { table, spec, hasSuppressed, exemptOverlength } of tableSpecs) {
     const suppressedExpr = hasSuppressed ? '"suppressed"' : 'false';
     const { rows } = await client.query(
       `SELECT
@@ -760,12 +963,25 @@ async function runCompletenessGate(client, tableSpecs, log) {
        FROM "${table}" WHERE embedding IS NULL`
     );
     const r = rows[0];
-    const pending = Number(r.pending);
+    // (OL-3/OL-4/OL-6) exempt-overlength rows are, by construction, a
+    // subset of the raw SQL "pending" count above: they have non-empty
+    // content (they passed __has_content in the embed loop) and their
+    // embedding is still NULL (the halving floor exhausted before any
+    // write happened). Subtracting the KNOWN exempt-overlength count
+    // (computed by embedTable() during THIS SAME run, never re-derived
+    // from an SQL heuristic) reclassifies exactly those rows out of
+    // "pending" and into their own bucket -- never a silent drop, always
+    // still subject to the cardinality alarm (OL-7) below in main().
+    // `exemptOverlength` defaults to 0 for direct callers (e.g. this
+    // suite's GATE-1/2/3 tests) that never ran the embed loop at all.
+    const exemptOverlengthCount = exemptOverlength || 0;
+    const rawPending = Number(r.pending);
+    const pending = Math.max(0, rawPending - exemptOverlengthCount);
     const exemptEmpty = Number(r.exempt_empty);
     const exemptSuppressedEmpty = Number(r.exempt_suppressed_empty);
     if (pending > 0) pass = false;
-    report.push({ table, pending, exemptEmpty, exemptSuppressedEmpty });
-    log(`  [COMPLETENESS] ${table}: embeddable-pending=${pending} exempt-empty-content=${exemptEmpty} exempt-suppressed-and-empty=${exemptSuppressedEmpty}${pending > 0 ? ' [FAIL]' : ''}`);
+    report.push({ table, pending, exemptEmpty, exemptSuppressedEmpty, exemptOverlength: exemptOverlengthCount });
+    log(`  [COMPLETENESS] ${table}: embeddable-pending=${pending} exempt-empty-content=${exemptEmpty} exempt-suppressed-and-empty=${exemptSuppressedEmpty} exempt-overlength=${exemptOverlengthCount}${pending > 0 ? ' [FAIL]' : ''}`);
     if (STRUCTURAL_DISPOSITION_TABLES.includes(table) && exemptEmpty > 0) {
       log(`  [OPEN-QUESTION] ${table}: ${exemptEmpty} row(s) have structurally empty declared content -- whether this table belongs in the embeddable set at all (vs. a richer content expression, vs. exempt-structurally-non-content-bearing) is an OWNER decision, not auto-resolved here. See PR body.`);
     }
@@ -923,12 +1139,23 @@ async function main(runtimeOpts = {}) {
     const runId = runtimeOpts.runId || crypto.randomUUID();
     console.log(`RUN_ID: ${runId}`);
 
+    // (in-process-only injection point, same convention as transport/
+    // providerRow/runId below -- never expressible via argv; production
+    // default is HALVING_DELAY_MS, tests may override to avoid a slow
+    // real-time sleep when constructing many exempt-overlength rows.)
+    const halvingDelayMs = runtimeOpts.halvingDelayMs !== undefined ? runtimeOpts.halvingDelayMs : HALVING_DELAY_MS;
+
     const report = [];
     for (const ts of tableSpecs) {
       const excludedProjectIds = await getManifestExcludedProjectIds(client, roster, ts.table);
-      const counts = await embedTable(client, ts.table, ts.spec, provider, providerRow.id, runId, excludedProjectIds, console.log, parsed.dryRun);
+      const counts = await embedTable(client, ts.table, ts.spec, provider, providerRow.id, runId, excludedProjectIds, console.log, parsed.dryRun, halvingDelayMs);
+      // (OL-6/OL-7) attach this table's exempt-overlength count onto its
+      // tableSpec entry so runCompletenessGate() (reclassification) and
+      // evaluateCardinalityAlarm() (threshold check) both read it -- computed
+      // ONCE here, by the embed loop that actually ran, never re-derived.
+      ts.exemptOverlength = counts.exemptOverlength;
       report.push({ table: ts.table, ...counts, excludedByManifest: excludedProjectIds.size });
-      console.log(`  [EMBED] ${ts.table}: candidates=${counts.candidates} embedded=${counts.embedded} exempt-empty-content=${counts.exemptEmptyContent} excluded-project-ids=${excludedProjectIds.size}`);
+      console.log(`  [EMBED] ${ts.table}: candidates=${counts.candidates} embedded=${counts.embedded} exempt-empty-content=${counts.exemptEmptyContent} exempt-overlength=${counts.exemptOverlength} excluded-project-ids=${excludedProjectIds.size}`);
     }
 
     if (parsed.dryRun) {
@@ -941,10 +1168,11 @@ async function main(runtimeOpts = {}) {
 
     const provOk = await runProvenanceVerification(client, discovered.map((d) => d.table), console.log);
     const gate = await runCompletenessGate(client, tableSpecs, console.log);
+    const cardinality = evaluateCardinalityAlarm(report, console.log);
 
-    const pass = provOk && gate.pass;
-    console.log(JSON.stringify({ target, runId, report, completeness: gate.report }, null, 2));
-    console.log(`MIGRATION_RESULT: ${pass ? 'PASS' : 'FAIL'} (provenance_ok=${provOk}, completeness_gate_pass=${gate.pass})`);
+    const pass = provOk && gate.pass && cardinality.pass;
+    console.log(JSON.stringify({ target, runId, report, completeness: gate.report, cardinality }, null, 2));
+    console.log(`MIGRATION_RESULT: ${pass ? 'PASS' : 'FAIL'} (provenance_ok=${provOk}, completeness_gate_pass=${gate.pass}, cardinality_alarm_pass=${cardinality.pass}, total_exempt_overlength=${cardinality.totalExemptOverlength})`);
     return pass;
   } finally {
     await client.end();
@@ -962,10 +1190,12 @@ if (require.main === module) {
 
 /**
  * T8-idempotency-compatible entry point (mirrors migrate-05's run()).
- * `opts.transport`/`opts.providerRow`/`opts.runId` are in-process-only
- * injection points (never expressible via argv) -- this is how the test
- * suite exercises the embed loop deterministically without a live vLLM
- * endpoint (G-R13).
+ * `opts.transport`/`opts.providerRow`/`opts.runId`/`opts.halvingDelayMs`
+ * are in-process-only injection points (never expressible via argv) --
+ * this is how the test suite exercises the embed loop deterministically
+ * without a live vLLM endpoint (G-R13), and without waiting out the real
+ * HALVING_DELAY_MS pacing when a fixture needs many halving/exempt-
+ * overlength rows.
  */
 async function run(targetDbName, opts = {}) {
   const argv = ['--db', targetDbName];
@@ -973,7 +1203,7 @@ async function run(targetDbName, opts = {}) {
   if (opts.rollback) argv.push('--rollback', opts.rollback);
   if (opts.dryRun) argv.push('--dry-run');
   process.argv = [process.argv[0], process.argv[1] || __filename, ...argv];
-  return main({ transport: opts.transport, providerRow: opts.providerRow, runId: opts.runId });
+  return main({ transport: opts.transport, providerRow: opts.providerRow, runId: opts.runId, halvingDelayMs: opts.halvingDelayMs });
 }
 
 module.exports = {
@@ -1000,10 +1230,19 @@ module.exports = {
   runProvenanceVerification,
   runCompletenessGate,
   runRollback,
+  isContextLengthError,
+  embedWithHalvingRetry,
+  evaluateCardinalityAlarm,
   CONTENT_EXPRESSIONS,
   LEGACY_VECTOR_TABLES,
   STRUCTURAL_DISPOSITION_TABLES,
   PK_OVERRIDES,
   LOCK_NAMESPACE,
+  EMBED_TEXT_CAP_CHARS,
+  HALVING_MAX_ATTEMPTS,
+  HALVING_FLOOR_CHARS,
+  HALVING_DELAY_MS,
+  CARDINALITY_TOTAL_MAX,
+  CARDINALITY_TABLE_RATIO_MAX,
   SQL_FILE,
 };

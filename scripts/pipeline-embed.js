@@ -89,7 +89,10 @@ const TABLES = [
 // ─── EMBED CONSTANTS ─────────────────────────────────────────────────────────
 
 // Safety guard: mxbai-embed-large has a 512-token cap (~4 chars/token, 2000 bytes).
-// Qwen3-Embedding-8B has 32K context; use a much larger guard (16000 bytes).
+// Qwen3-Embedding-8B is configured with max_model_len=8192 tokens on this
+// deployment (live-verified 2026-08-18, mm#11(g) follow-up -- NOT the
+// model's theoretical 32K context, which this vLLM instance does not run
+// at); use a much larger guard (16000 bytes) than the mxbai case regardless.
 const MAX_EMBED_BYTES = USE_VLLM ? 16000 : 2000;
 
 // ─── CHUNK-COVERED TABLES ────────────────────────────────────────────────────

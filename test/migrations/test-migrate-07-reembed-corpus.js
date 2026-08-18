@@ -30,6 +30,7 @@ const migrate07 = require(MIGRATE07_PATH);
 const scriptsRequire = createRequire(require.resolve('../../scripts/package.json'));
 const { Client } = scriptsRequire('pg');
 const migrateOne = require(path.join(PROJECT_ROOT, 'scripts', 'migrations', 'migrate-01-canonical-db.js'));
+const { VllmHttpError } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'embed.js'));
 
 // ─── HARNESS ────────────────────────────────────────────────────────────────
 
@@ -117,6 +118,81 @@ function makeFailingTransport(dims, failAfter) {
   };
 }
 
+// ─── OL-8 FIXTURE: live-captured 400 body ──────────────────────────────────
+//
+// Verbatim from the spec-adversary pass's live probe against the real vLLM
+// endpoint, 2026-08-18. DEVIATION (surfaced, never silent): the spec text
+// this fixture is transcribed from is missing the outer object's closing
+// brace (`...,"code":400}` with only ONE trailing `}, never two) -- a
+// direct copy would not JSON.parse. Every character of the CONTENT is
+// verbatim; the second closing brace is added here only to make the JSON
+// structurally valid so isContextLengthError's JSON.parse(err.rawBody) can
+// actually parse it, matching what the real endpoint returns (a
+// well-formed JSON object).
+const OVERLENGTH_400_BODY = JSON.stringify({
+  error: {
+    message: "This model's maximum context length is 8192 tokens. However, you requested 0 output tokens and your prompt contains at least 8193 input tokens, for a total of at least 8193 tokens. Please reduce the length of the input prompt or the number of requested output tokens. (parameter=input_tokens, value=8193)",
+    type: 'BadRequestError',
+    param: 'input_tokens',
+    code: 400,
+  },
+});
+
+/**
+ * Transport that fails with the VERBATIM live-captured context-length 400
+ * body (OL-8) whenever the input text is "too long" -- either unconditionally
+ * (`alwaysFail`) or once its length exceeds `failThreshold`. `otherParam`
+ * swaps in a structurally-similar-but-DIFFERENT-param 400 body (OL-2
+ * negative case: a 400 that is NOT the context-length class).
+ */
+function makeOverlengthTransport(dims, { failThreshold = Infinity, alwaysFail = false, otherParam = false } = {}) {
+  return async (text) => {
+    const shouldFail = alwaysFail || text.length > failThreshold;
+    if (!shouldFail) return deterministicVector(text, dims);
+    const body = otherParam
+      ? JSON.stringify({ error: { message: 'unsupported model parameter', type: 'BadRequestError', param: 'model', code: 400 } })
+      : OVERLENGTH_400_BODY;
+    throw new VllmHttpError(`[embed] vLLM returned HTTP 400: ${body.slice(0, 200)}`, 400, body);
+  };
+}
+
+/** Simulated connection error (ECONNRESET) -- NOT a VllmHttpError, must still hard-stop (OL-2 negative case). */
+function makeConnectionErrorTransport() {
+  return async () => {
+    throw new Error('[embed] vLLM network error (http://fake-endpoint.invalid): ECONNRESET');
+  };
+}
+
+/**
+ * Runs `fn` with console.log captured for later assertion (grepping
+ * `lines` for e.g. "[EMBEDDED-TRUNCATED]"). Deliberately does NOT
+ * re-forward the captured arguments to the real console.log (CodeQL
+ * js/clear-text-logging, PR #200 follow-up, 2026-08-18): this wrapper is
+ * generic -- it captures WHATEVER any nested console.log call inside `fn`
+ * is invoked with, and the production code it wraps (migrate-07-reembed-
+ * corpus.js and everything it calls) is out of this function's control and
+ * can change independently of this test file. Rather than assume today's
+ * captured content is always safe to echo verbatim, this wrapper never
+ * calls the real console.log with the captured (or any derived) value --
+ * only a fixed, non-derived marker string, so no data this wrapper
+ * observes can ever reach a real logging sink through it. `lines` (a plain
+ * in-memory array, never a logging sink) is what tests assert against;
+ * `orig` is restored on exit and never itself invoked with data.
+ */
+async function captureConsoleLog(fn) {
+  const lines = [];
+  const orig = console.log;
+  let captured = 0;
+  console.log = (...args) => { lines.push(args.map(String).join(' ')); captured++; };
+  try {
+    const result = await fn();
+    orig(`  [captureConsoleLog] captured ${captured} console.log call(s) -- see returned \`lines\` for content, never re-logged here.`);
+    return { result, lines };
+  } finally {
+    console.log = orig;
+  }
+}
+
 // ─── MAIN ───────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -156,6 +232,77 @@ async function main() {
     ];
     const labels = migrate07.manifestLabelsForTable(roster, 'memory_entries').sort();
     assert(JSON.stringify(labels) === JSON.stringify(['file_memory_raw_entries', 'memory_entries', 'memory_entries_db_absorb'].sort()), `got ${JSON.stringify(labels)}`);
+  });
+
+  // ── OL-2 MATCHER (pure unit, no DB) -- pinned structural classification ──
+  await run('OL-MATCH-1', 'isContextLengthError: true for the exact matched shape (VllmHttpError, 400, error.param==="input_tokens")', () => {
+    const err = new VllmHttpError('x', 400, OVERLENGTH_400_BODY);
+    assert(migrate07.isContextLengthError(err) === true, 'expected true for the matched shape');
+  });
+  await run('OL-MATCH-2', 'isContextLengthError: false for a structurally similar 400 with a DIFFERENT param', () => {
+    const body = JSON.stringify({ error: { message: 'x', type: 'BadRequestError', param: 'model', code: 400 } });
+    const err = new VllmHttpError('x', 400, body);
+    assert(migrate07.isContextLengthError(err) === false, 'expected false for a non-input_tokens param');
+  });
+  await run('OL-MATCH-3', 'isContextLengthError: false for a non-400 status code carrying the same body', () => {
+    const err = new VllmHttpError('x', 503, OVERLENGTH_400_BODY);
+    assert(migrate07.isContextLengthError(err) === false, 'expected false for a 503');
+  });
+  await run('OL-MATCH-4', 'isContextLengthError: false (never throws) for unparseable rawBody', () => {
+    const err = new VllmHttpError('x', 400, 'not json{{{');
+    assert(migrate07.isContextLengthError(err) === false, 'expected false, not a throw, for malformed JSON');
+  });
+  await run('OL-MATCH-5', 'isContextLengthError: false for a plain Error even if it spoofs a .statusCode property (instanceof gate, never duck-typed)', () => {
+    const err = new Error('ECONNRESET');
+    err.statusCode = 400;
+    err.rawBody = OVERLENGTH_400_BODY;
+    assert(migrate07.isContextLengthError(err) === false, 'expected false for a non-VllmHttpError instance');
+  });
+
+  // ── OL-4 HALVING RETRY (pure unit, fake provider, no DB) ─────────────────
+  await run('OL-HALVE-1', 'embedWithHalvingRetry: halves progressively from the PREVIOUS attempt (not the original) and returns ok:true once under the fake threshold', async () => {
+    const attemptedLengths = [];
+    const provider = {
+      embed: async (text) => {
+        attemptedLengths.push(text.length);
+        if (text.length > 3000) throw new VllmHttpError('x', 400, OVERLENGTH_400_BODY);
+        return { vector: [0, 0, 0, 0] };
+      },
+    };
+    const result = await migrate07.embedWithHalvingRetry(provider, 'E'.repeat(10000), () => {}, 'unit-test', 1);
+    assert(result.ok === true, `expected ok:true, got ${JSON.stringify(result)}`);
+    assert(JSON.stringify(attemptedLengths) === JSON.stringify([10000, 5000, 2500]), `expected attempt lengths [10000,5000,2500], got ${JSON.stringify(attemptedLengths)}`);
+    assert(result.halvings === 2 && result.finalLength === 2500, `expected halvings=2 finalLength=2500, got ${JSON.stringify(result)}`);
+  });
+  await run('OL-HALVE-2', 'embedWithHalvingRetry: floors at HALVING_FLOOR_CHARS and returns ok:false after HALVING_MAX_ATTEMPTS', async () => {
+    const provider = { embed: async () => { throw new VllmHttpError('x', 400, OVERLENGTH_400_BODY); } };
+    const result = await migrate07.embedWithHalvingRetry(provider, 'F'.repeat(5000), () => {}, 'unit-test', 1);
+    assert(result.ok === false, `expected ok:false, got ${JSON.stringify(result)}`);
+    assert(result.halvings === migrate07.HALVING_MAX_ATTEMPTS, `expected halvings===HALVING_MAX_ATTEMPTS(${migrate07.HALVING_MAX_ATTEMPTS}), got ${result.halvings}`);
+  });
+  await run('OL-HALVE-3', 'embedWithHalvingRetry: a non-context-length error propagates immediately -- zero halving attempts', async () => {
+    let calls = 0;
+    const provider = { embed: async () => { calls++; throw new Error('SIMULATED-ECONNRESET'); } };
+    await assertThrows(() => migrate07.embedWithHalvingRetry(provider, 'G'.repeat(5000), () => {}, 'unit-test', 1), 'SIMULATED-ECONNRESET');
+    assert(calls === 1, `expected exactly 1 attempt (no halving retry for a non-matched error), got ${calls}`);
+  });
+
+  // ── OL-7 CARDINALITY ALARM (pure unit, no DB) -- pinned thresholds ───────
+  await run('OL-CARD-1', 'evaluateCardinalityAlarm: total exempt-overlength > 20 FAILS even with no single table over the per-table ratio', () => {
+    const report = [{ table: 't1', exemptOverlength: 11, candidates: 1000 }, { table: 't2', exemptOverlength: 10, candidates: 1000 }];
+    const result = migrate07.evaluateCardinalityAlarm(report, () => {});
+    assert(result.pass === false, 'expected FAIL (total=21>20)');
+    assert(result.totalExemptOverlength === 21, `expected total=21, got ${result.totalExemptOverlength}`);
+  });
+  await run('OL-CARD-2', 'evaluateCardinalityAlarm: a single table over 5% FAILS even when the total is small', () => {
+    const report = [{ table: 't1', exemptOverlength: 6, candidates: 100 }];
+    const result = migrate07.evaluateCardinalityAlarm(report, () => {});
+    assert(result.pass === false, 'expected FAIL (6/100=6%>5%)');
+  });
+  await run('OL-CARD-3', 'evaluateCardinalityAlarm: PASSES when both pinned thresholds are respected (5% exactly is not > 5%)', () => {
+    const report = [{ table: 't1', exemptOverlength: 5, candidates: 100 }, { table: 't2', exemptOverlength: 0, candidates: 50 }];
+    const result = migrate07.evaluateCardinalityAlarm(report, () => {});
+    assert(result.pass === true, `expected PASS (5/100=5% is not >5%; total=5<=20), got ${JSON.stringify(result)}`);
   });
 
   // ── LIVE DB fixtures ──────────────────────────────────────────────────
@@ -680,6 +827,138 @@ with an embedded newline -- must survive the escapeLiteral round-trip';
       await assertThrows(() => migrate07.run(TARGET_DB, { rosterPath: ROSTER_PATH,transport: badTransport, runId: crypto.randomUUID() }), 'DIM-MISMATCH');
       const { rows } = await tgt.query(`SELECT embedding FROM widget WHERE project_id='proj-dim'`);
       assert(rows[0].embedding === null, 'expected the row to remain unembedded after a dim-mismatch hard stop');
+    });
+
+    // ── OL-1..OL-11: OVER-LENGTH EMBED INPUT (2026-08-18, mm#11(g) follow-up) ─
+    // Full run()-through-DB integration proofs, on top of the pure-unit
+    // OL-MATCH-*/OL-HALVE-*/OL-CARD-* tests above. `halvingDelayMs: 1`
+    // throughout -- these tests override the real ~300ms HALVING_DELAY_MS
+    // pacing (in-process-only injection, never expressible via argv,
+    // mirroring transport/providerRow/runId) purely so this suite does not
+    // take real wall-clock minutes; the pacing VALUE itself is asserted by
+    // the module's exported HALVING_DELAY_MS constant, not re-timed here.
+
+    await run('OL-1', 'halving converges after the pre-cap alone is insufficient; provenance (truncated_to_chars + halvings) written; row embedded', async () => {
+      const bigText = 'A'.repeat(30000); // > EMBED_TEXT_CAP_CHARS(24000) -- pre-cap engages first
+      await tgt.query(`INSERT INTO widget (project_id, blurb) VALUES ('proj-ol1', $1)`, [bigText]);
+      const { result: ok, lines } = await captureConsoleLog(() => migrate07.run(TARGET_DB, {
+        rosterPath: ROSTER_PATH,
+        // capped text (24000) still fails; halves to 12000 (still fails); halves to 6000 (succeeds) -- halvings=2
+        transport: makeOverlengthTransport(NATIVE_DIMS, { failThreshold: 10000 }),
+        runId: crypto.randomUUID(),
+        halvingDelayMs: 1,
+      }));
+      assert(ok === true, 'expected run() to PASS');
+      const { rows } = await tgt.query(`SELECT id, embedding FROM widget WHERE project_id='proj-ol1'`);
+      assert(rows[0].embedding !== null, 'expected the row embedded after halving converged');
+      const { rows: logRows } = await tgt.query(`SELECT truncated_to_chars FROM embedding_write_log WHERE table_name='widget' AND row_pk_value=$1`, [JSON.stringify([rows[0].id])]);
+      assert(logRows.length === 1, `expected exactly 1 write_log row, got ${logRows.length}`);
+      assert(logRows[0].truncated_to_chars === 6000, `expected truncated_to_chars=6000 (24000 -> 12000 -> 6000), got ${logRows[0].truncated_to_chars}`);
+      assert(lines.some((l) => l.includes('[EMBEDDED-TRUNCATED]') && l.includes('halvings=2') && l.includes('halving-triggered')), `expected an [EMBEDDED-TRUNCATED] halvings=2 halving-triggered log line, got:\n${lines.join('\n')}`);
+      await tgt.query(`DELETE FROM widget WHERE project_id='proj-ol1'`);
+    });
+
+    await run('OL-2', 'pre-cap alone resolves an over-length row with zero halvings -- distinguished from halving-triggered', async () => {
+      const bigText = 'B'.repeat(26000); // > cap, but the CAPPED (24000-char) text embeds on the first attempt
+      await tgt.query(`INSERT INTO widget (project_id, blurb) VALUES ('proj-ol2', $1)`, [bigText]);
+      const { result: ok, lines } = await captureConsoleLog(() => migrate07.run(TARGET_DB, {
+        rosterPath: ROSTER_PATH,
+        transport: makeOverlengthTransport(NATIVE_DIMS, { failThreshold: 25000 }),
+        runId: crypto.randomUUID(),
+        halvingDelayMs: 1,
+      }));
+      assert(ok === true, 'expected run() to PASS');
+      const { rows } = await tgt.query(`SELECT id, embedding FROM widget WHERE project_id='proj-ol2'`);
+      assert(rows[0].embedding !== null, 'expected the row embedded');
+      const { rows: logRows } = await tgt.query(`SELECT truncated_to_chars FROM embedding_write_log WHERE table_name='widget' AND row_pk_value=$1`, [JSON.stringify([rows[0].id])]);
+      assert(logRows[0].truncated_to_chars === 24000, `expected truncated_to_chars=24000 (pre-cap only), got ${logRows[0].truncated_to_chars}`);
+      assert(lines.some((l) => l.includes('[EMBEDDED-TRUNCATED]') && l.includes('halvings=0') && l.includes('pre-cap-only')), `expected a pre-cap-only halvings=0 log line, got:\n${lines.join('\n')}`);
+      await tgt.query(`DELETE FROM widget WHERE project_id='proj-ol2'`);
+    });
+
+    await run('OL-3', 'halving floor exhausted lands a row in exempt-overlength, never embedded -- overall run still PASSES when diluted below both cardinality thresholds', async () => {
+      // 20 ordinary small rows + 1 always-over-threshold row => this
+      // table's candidate pool is 21 when embedTable's SELECT runs; 1/21
+      // ~= 4.8%, under the 5% per-table threshold, and 1 total is under
+      // the 20 total threshold -- isolates "floor exhausted -> exempt-
+      // overlength, row never embedded" from the SEPARATE cardinality-
+      // alarm behavior, which OL-4 below tests directly.
+      for (let i = 0; i < 20; i++) {
+        await tgt.query(`INSERT INTO widget (project_id, blurb) VALUES ('proj-ol3', $1)`, [`small content ${i}`]);
+      }
+      await tgt.query(`INSERT INTO widget (project_id, blurb) VALUES ('proj-ol3', $1)`, ['H'.repeat(30000)]);
+      const transport = makeOverlengthTransport(NATIVE_DIMS, { failThreshold: 500 }); // floor (1000) > 500 -- big row can never succeed
+      const { result: ok, lines } = await captureConsoleLog(() => migrate07.run(TARGET_DB, {
+        rosterPath: ROSTER_PATH, transport, runId: crypto.randomUUID(), halvingDelayMs: 1,
+      }));
+      assert(ok === true, `expected run() to PASS (1 exempt-overlength row diluted under both thresholds), got ${ok}`);
+      const { rows } = await tgt.query(`SELECT embedding FROM widget WHERE project_id='proj-ol3' AND length(blurb) > 1000`);
+      assert(rows.length === 1 && rows[0].embedding === null, 'expected the over-length row to remain unembedded (floor exhausted)');
+      const { rows: smallRows } = await tgt.query(`SELECT COUNT(*)::int AS n FROM widget WHERE project_id='proj-ol3' AND length(blurb) <= 1000 AND embedding IS NOT NULL`);
+      assert(smallRows[0].n === 20, `expected all 20 small rows embedded normally, got ${smallRows[0].n}`);
+      assert(lines.some((l) => l.includes('[EXEMPT-OVERLENGTH]') && l.includes(`halvings=${migrate07.HALVING_MAX_ATTEMPTS}`)), `expected an [EXEMPT-OVERLENGTH] log line, got:\n${lines.join('\n')}`);
+      await tgt.query(`DELETE FROM widget WHERE project_id='proj-ol3'`);
+    });
+
+    await run('OL-4', 'cardinality alarm trips when exempt-overlength exceeds 20 total -- migration FAILS, never passes-with-exemption', async () => {
+      for (let i = 0; i < 25; i++) {
+        await tgt.query(`INSERT INTO widget (project_id, blurb) VALUES ('proj-ol4', $1)`, [`I${i}`.repeat(6000)]);
+      }
+      const transport = makeOverlengthTransport(NATIVE_DIMS, { alwaysFail: true }); // simulated total provider outage for these rows
+      const { result: ok, lines } = await captureConsoleLog(() => migrate07.run(TARGET_DB, {
+        rosterPath: ROSTER_PATH, transport, runId: crypto.randomUUID(), halvingDelayMs: 1,
+      }));
+      assert(ok === false, 'expected run() to FAIL (25 exempt-overlength rows > CARDINALITY_TOTAL_MAX=20)');
+      const { rows } = await tgt.query(`SELECT COUNT(*)::int AS n FROM widget WHERE project_id='proj-ol4' AND embedding IS NULL`);
+      assert(rows[0].n === 25, `expected all 25 rows to remain unembedded, got ${rows[0].n}`);
+      assert(lines.some((l) => l.includes('[CARDINALITY-ALARM]') && l.includes('total exempt-overlength=25')), `expected a [CARDINALITY-ALARM] total-exceeded log line, got:\n${lines.join('\n')}`);
+      await tgt.query(`DELETE FROM widget WHERE project_id='proj-ol4'`);
+    });
+
+    await run('OL-5', 'a non-length 400 (different param) is NOT the context-length class -- immediate hard stop, G-R8 unchanged', async () => {
+      await tgt.query(`INSERT INTO widget (project_id, blurb) VALUES ('proj-ol5', 'short content -- the fake transport always 400s with a different param regardless')`);
+      const transport = makeOverlengthTransport(NATIVE_DIMS, { alwaysFail: true, otherParam: true });
+      await assertThrows(() => migrate07.run(TARGET_DB, { rosterPath: ROSTER_PATH, transport, runId: crypto.randomUUID(), halvingDelayMs: 1 }), 'vLLM returned HTTP 400');
+      const { rows } = await tgt.query(`SELECT embedding FROM widget WHERE project_id='proj-ol5'`);
+      assert(rows[0].embedding === null, 'expected the row to remain unembedded after the hard stop');
+      await tgt.query(`DELETE FROM widget WHERE project_id='proj-ol5'`);
+    });
+
+    await run('OL-6', 'a connection error (simulated ECONNRESET) is not a VllmHttpError -- immediate hard stop, G-R8 unchanged', async () => {
+      await tgt.query(`INSERT INTO widget (project_id, blurb) VALUES ('proj-ol6', 'content')`);
+      await assertThrows(() => migrate07.run(TARGET_DB, { rosterPath: ROSTER_PATH, transport: makeConnectionErrorTransport(), runId: crypto.randomUUID(), halvingDelayMs: 1 }), 'ECONNRESET');
+      const { rows } = await tgt.query(`SELECT embedding FROM widget WHERE project_id='proj-ol6'`);
+      assert(rows[0].embedding === null, 'expected the row to remain unembedded after the hard stop');
+      await tgt.query(`DELETE FROM widget WHERE project_id='proj-ol6'`);
+    });
+
+    await run('OL-7', 'normal (short) content is embedded unchanged -- pre-cap/halving logic never engages, truncated_to_chars stays NULL', async () => {
+      await tgt.query(`INSERT INTO widget (project_id, blurb) VALUES ('proj-ol7', 'a perfectly normal short row')`);
+      const ok = await migrate07.run(TARGET_DB, { rosterPath: ROSTER_PATH, transport: makeFakeTransport(NATIVE_DIMS), runId: crypto.randomUUID(), halvingDelayMs: 1 });
+      assert(ok === true, 'expected PASS');
+      const { rows } = await tgt.query(`SELECT id, embedding FROM widget WHERE project_id='proj-ol7'`);
+      assert(rows[0].embedding !== null, 'expected embedded');
+      const { rows: logRows } = await tgt.query(`SELECT truncated_to_chars FROM embedding_write_log WHERE table_name='widget' AND row_pk_value=$1`, [JSON.stringify([rows[0].id])]);
+      assert(logRows[0].truncated_to_chars === null, `expected truncated_to_chars NULL for a normal untouched row, got ${logRows[0].truncated_to_chars}`);
+      await tgt.query(`DELETE FROM widget WHERE project_id='proj-ol7'`);
+    });
+
+    await run('OL-8', 'a resumed run does not re-embed an already embedded-truncated row (IS NULL gate, same as any other row)', async () => {
+      const bigText = 'D'.repeat(30000);
+      await tgt.query(`INSERT INTO widget (project_id, blurb) VALUES ('proj-ol8', $1)`, [bigText]);
+      const transport = makeOverlengthTransport(NATIVE_DIMS, { failThreshold: 10000 });
+      await migrate07.run(TARGET_DB, { rosterPath: ROSTER_PATH, transport, runId: crypto.randomUUID(), halvingDelayMs: 1 });
+      const { rows: before } = await tgt.query(`SELECT id, embedding::text AS embedding FROM widget WHERE project_id='proj-ol8'`);
+      assert(before[0].embedding !== null, 'precondition: row embedded (truncated)');
+      const { rows: logBefore } = await tgt.query(`SELECT COUNT(*)::int AS n FROM embedding_write_log WHERE table_name='widget'`);
+
+      const ok2 = await migrate07.run(TARGET_DB, { rosterPath: ROSTER_PATH, transport, runId: crypto.randomUUID(), halvingDelayMs: 1 });
+      assert(ok2 === true, 'expected the resumed run to PASS as a no-op for this row');
+      const { rows: after } = await tgt.query(`SELECT embedding::text AS embedding FROM widget WHERE project_id='proj-ol8'`);
+      assert(after[0].embedding === before[0].embedding, 'expected the embedding UNCHANGED on resume (not re-embedded)');
+      const { rows: logAfter } = await tgt.query(`SELECT COUNT(*)::int AS n FROM embedding_write_log WHERE table_name='widget'`);
+      assert(logAfter[0].n === logBefore[0].n, `expected zero NEW write_log rows on resume, before=${logBefore[0].n} after=${logAfter[0].n}`);
+      await tgt.query(`DELETE FROM widget WHERE project_id='proj-ol8'`);
     });
 
   } finally {
