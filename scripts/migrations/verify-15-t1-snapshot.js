@@ -50,13 +50,13 @@ function parseArgs(argv) {
   return parsed;
 }
 
-async function tableHasColumn(client, table, column) {
-  const { rows } = await client.query(
-    `SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2`,
-    [table, column]
-  );
-  return rows.length > 0;
-}
+// tableHasColumn used to be defined locally here (this script introduced the
+// pattern first, for the SOURCE side); it now lives in lib/verify15-shared.js
+// so T2/T3/T3b/T6/T9 (the TARGET side, cm#187/cm#188) share the SAME
+// implementation rather than each re-declaring it. Re-exported below for
+// backward compatibility with any external caller that imported it from
+// this module specifically.
+const tableHasColumn = shared.tableHasColumn;
 
 function computeContentFingerprint(rowsOrderedById, cols) {
   const concatenated = rowsOrderedById.map((r) => shared.rowHash(cols, r)).join('');

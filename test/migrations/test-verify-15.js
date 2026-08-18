@@ -166,13 +166,14 @@ async function setupTargetSchema(client) {
     );
     CREATE TABLE IF NOT EXISTS entities (
       id SERIAL PRIMARY KEY,
-      project_id TEXT
+      project_id TEXT NOT NULL,
+      name TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS edges (
       id SERIAL PRIMARY KEY,
-      from_entity INTEGER,
-      to_entity INTEGER,
-      project_id TEXT
+      from_entity TEXT NOT NULL,
+      to_entity TEXT NOT NULL,
+      project_id TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS memory_entries (
       id SERIAL PRIMARY KEY,
@@ -188,6 +189,15 @@ async function setupTargetSchema(client) {
       project_id TEXT NOT NULL,
       role TEXT, preferred_model TEXT
     );
+    -- cm#187/cm#188 (2026-08-18): a retrieval_event_assertions-shaped
+    -- fixture -- NO id column, NO project_id column at all (a bare join
+    -- table), mirroring the live schema evidence in cm#187's issue body.
+    -- Used by T2/T3/T3b/T9's no-project_id-column fixtures (BF-R1/BF-R2/
+    -- BF-R3/BF-R4).
+    CREATE TABLE IF NOT EXISTS retrieval_event_assertions (
+      event_id INTEGER,
+      assertion_id INTEGER
+    );
   `);
 }
 
@@ -202,6 +212,10 @@ async function setupSourceSchema(client) {
       id SERIAL PRIMARY KEY,
       project_id TEXT,
       title TEXT, status TEXT
+    );
+    CREATE TABLE IF NOT EXISTS retrieval_event_assertions (
+      event_id INTEGER,
+      assertion_id INTEGER
     );
   `);
 }
@@ -223,6 +237,17 @@ const BASE_ROSTER = [
     requires_project_id_scope: true,
   },
 ];
+
+// cm#187/cm#188 (2026-08-18 spec-adversary pass): a SOURCED roster entry
+// whose targetTable has NO project_id column AND no id column at all --
+// mirrors the live-schema evidence for retrieval_event_assertions cited in
+// cm#187's issue body (event_id/assertion_id only). Reused across T2/T3/
+// T3b/T9's no-project_id-column fixtures below (BF-R1/BF-R2/BF-R3/BF-R4).
+const NO_COLUMN_ROSTER_ENTRY = {
+  source_db: SOURCE_DB, source_table: 'retrieval_event_assertions', targetTable: 'retrieval_event_assertions',
+  loadBearingCols: ['event_id', 'assertion_id'], hasContentBearingText: false,
+  requires_project_id_scope: false,
+};
 
 // A SOURCELESS (net-new:) roster entry — a §17/§18-shaped table with no
 // migration source. Reused across T0/T3/T3b's sourceless-classification
@@ -701,6 +726,86 @@ async function testT2Rowcount() {
   }
 }
 
+async function testT2NoColumnReconciliation() {
+  // BF-R1/BF-5 (cm#187 spec-adversary pass, 2026-08-18): T2 against a
+  // targetTable with NO project_id column at all -- the original crash
+  // shape (retrieval_event_assertions, live: manifest id=2548,
+  // project_id='90394596-...', row_count=2930).
+  const target = await pgConnect(TARGET_DB);
+  try {
+    await shared.applyDdl(target);
+    await truncateAll(target, ['migration_manifest', 'retrieval_event_assertions']);
+    const rosterPath = writeTmpJson('t2-nocolumn-roster.json', [NO_COLUMN_ROSTER_ENTRY]);
+
+    // NULL-scoped no-column row matching COUNT(*) -> PASS (no crash).
+    await target.query(`INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES (1,10), (2,20)`);
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint)
+       VALUES ($1,'retrieval_event_assertions',NULL,2,'fp')`,
+      [SOURCE_DB]
+    );
+    const r1 = runScript('verify-15-t2-rowcount.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r1.status === 0) pass('T2-nocolumn-a', 'NULL-scoped no-column row matching bare COUNT(*) -> PASS, no crash');
+    else fail('T2-nocolumn-a', 'NULL-scoped no-column row matching bare COUNT(*) -> PASS, no crash', `status=${r1.status} stdout=${r1.stdout} stderr=${r1.stderr}`);
+
+    // Mismatch -> FAIL.
+    await target.query(`INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES (3,30)`);
+    const r2 = runScript('verify-15-t2-rowcount.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r2.status !== 0) pass('T2-nocolumn-b', 'no-column row-count mismatch -> FAIL');
+    else fail('T2-nocolumn-b', 'no-column row-count mismatch -> FAIL', `status=${r2.status} stdout=${r2.stdout} stderr=${r2.stderr}`);
+
+    // MIXED NULL + project-scoped manifest rows whose SUM matches -> PASS
+    // (proves the reconciliation sums ALL manifest rows for the pair, not
+    // a single slice).
+    await truncateAll(target, ['migration_manifest', 'retrieval_event_assertions']);
+    await target.query(`INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES (1,10), (2,20), (3,30)`);
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint)
+       VALUES ($1,'retrieval_event_assertions',NULL,1,'fp1'), ($1,'retrieval_event_assertions','proj-x',2,'fp2')`,
+      [SOURCE_DB]
+    );
+    const r3 = runScript('verify-15-t2-rowcount.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r3.status === 0) pass('T2-nocolumn-c', 'MIXED NULL + project-scoped manifest rows whose SUM matches -> PASS (proves sum-not-single-slice)');
+    else fail('T2-nocolumn-c', 'MIXED NULL + project-scoped manifest rows whose SUM matches -> PASS (proves sum-not-single-slice)', `status=${r3.status} stdout=${r3.stdout} stderr=${r3.stderr}`);
+
+    // excluded_reason on a no-column table -> loud FATAL (never silently
+    // ignored/mis-reconciled -- a bare COUNT(*) cannot subtract an
+    // excluded project's rows).
+    await truncateAll(target, ['migration_manifest']);
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint, excluded_reason)
+       VALUES ($1,'retrieval_event_assertions','proj-y',5,'fp3','eval-junk')`,
+      [SOURCE_DB]
+    );
+    const r4 = runScript('verify-15-t2-rowcount.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r4.status !== 0 && /FATAL/.test(r4.stdout + r4.stderr) && /cannot subtract/.test(r4.stdout + r4.stderr)) {
+      pass('T2-nocolumn-d', 'excluded_reason on a no-column table -> loud FATAL (bare COUNT(*) cannot subtract excluded rows)');
+    } else {
+      fail('T2-nocolumn-d', 'excluded_reason on a no-column table -> loud FATAL (bare COUNT(*) cannot subtract excluded rows)', `status=${r4.status} stdout=${r4.stdout} stderr=${r4.stderr}`);
+    }
+
+    // roster-flag/live-schema divergence -> loud FATAL, BEFORE any
+    // reconciliation (BF-5).
+    await truncateAll(target, ['migration_manifest']);
+    const divergentRoster = writeTmpJson('t2-divergent-roster.json', [
+      { ...NO_COLUMN_ROSTER_ENTRY, requires_project_id_scope: true }, // WRONG: live schema has no project_id column
+    ]);
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint)
+       VALUES ($1,'retrieval_event_assertions',NULL,0,'fp')`,
+      [SOURCE_DB]
+    );
+    const r5 = runScript('verify-15-t2-rowcount.js', ['--db', TARGET_DB], rosterEnv(divergentRoster));
+    if (r5.status !== 0 && /disagrees with live schema/.test(r5.stdout + r5.stderr)) {
+      pass('T2-nocolumn-e', 'roster-flag/live-schema divergence -> loud FATAL before any reconciliation (BF-5)');
+    } else {
+      fail('T2-nocolumn-e', 'roster-flag/live-schema divergence -> loud FATAL before any reconciliation (BF-5)', `status=${r5.status} stdout=${r5.stdout} stderr=${r5.stderr}`);
+    }
+  } finally {
+    await target.end();
+  }
+}
+
 async function testT25Dualwrite() {
   const target = await pgConnect(TARGET_DB);
   try {
@@ -753,6 +858,38 @@ async function testT3ContentHash() {
     const r2 = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
     if (r2.status === 0) pass('T3-b', 'multiset counts match -> PASS');
     else fail('T3-b', 'multiset counts match -> PASS', `status=${r2.status} stdout=${r2.stdout} stderr=${r2.stderr}`);
+  } finally {
+    await source.end();
+    await target.end();
+  }
+}
+
+async function testT3NoColumnFixture() {
+  // BF-R3 (cm#187 spec-adversary pass, 2026-08-18): T3 against a SOURCED
+  // roster entry whose table has NEITHER an id NOR a project_id column
+  // (retrieval_event_assertions-shaped) -- end to end, no crash.
+  const source = await pgConnect(SOURCE_DB);
+  const target = await pgConnect(TARGET_DB);
+  try {
+    await truncateAll(source, ['retrieval_event_assertions']);
+    await truncateAll(target, ['retrieval_event_assertions']);
+    await source.query(`INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES (1,10), (2,20)`);
+    await target.query(`INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES (1,10), (2,20)`);
+
+    const rosterPath = writeTmpJson('t3-nocolumn-roster.json', [NO_COLUMN_ROSTER_ENTRY]);
+    const r1 = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r1.status === 0) pass('T3-nocolumn-a', 'no-id/no-project_id sourced table, matching content -> PASS, no crash');
+    else fail('T3-nocolumn-a', 'no-id/no-project_id sourced table, matching content -> PASS, no crash', `status=${r1.status} stdout=${r1.stdout} stderr=${r1.stderr}`);
+
+    // Mismatch -> FAIL, no crash.
+    await truncateAll(target, ['retrieval_event_assertions']);
+    await target.query(`INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES (1,10)`); // missing (2,20)
+    const r2 = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r2.status !== 0 && /multiset mismatch/.test(r2.stdout + r2.stderr)) {
+      pass('T3-nocolumn-b', 'no-id/no-project_id sourced table, mismatched content -> FAIL, no crash');
+    } else {
+      fail('T3-nocolumn-b', 'no-id/no-project_id sourced table, mismatched content -> FAIL, no crash', `status=${r2.status} stdout=${r2.stdout} stderr=${r2.stderr}`);
+    }
   } finally {
     await source.end();
     await target.end();
@@ -889,6 +1026,45 @@ async function testT3bReverseContainment() {
     const r3 = runScript('verify-15-t3b-reverse-containment.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
     if (r3.status !== 0 && /proj-unaccounted/.test(r3.stdout + r3.stderr)) pass('T3b-c', 'unaccounted target project_id -> FAIL');
     else fail('T3b-c', 'unaccounted target project_id -> FAIL', `status=${r3.status} stdout=${r3.stdout} stderr=${r3.stderr}`);
+  } finally {
+    await target.end();
+  }
+}
+
+async function testT3bNoColumnReconciliation() {
+  // BF-R4 (cm#187 spec-adversary pass, 2026-08-18): a SOURCED targetTable
+  // with no project_id column must be EXCLUDED from the project_id
+  // anti-join (it has no project_id to anti-join on) but stays VISIBLE via
+  // a separate summed-manifest-vs-bare-COUNT(*) reconciliation, never
+  // silently dropped from T3b's scope entirely.
+  const target = await pgConnect(TARGET_DB);
+  try {
+    await shared.applyDdl(target);
+    await truncateAll(target, ['migration_manifest', 'migration_manifest_row_hashes', 'memory_manager_staging_row_hashes', 'retrieval_event_assertions', 'decisions', 'tasks']);
+
+    await target.query(`INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES (1,10), (2,20)`);
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint)
+       VALUES ($1,'retrieval_event_assertions',NULL,2,'fp')`,
+      [SOURCE_DB]
+    );
+    const rosterPath = writeTmpJson('t3b-nocolumn-roster.json', [NO_COLUMN_ROSTER_ENTRY]);
+
+    const r1 = runScript('verify-15-t3b-reverse-containment.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r1.status === 0 && /excluded from the project_id anti-join/.test(r1.stdout + r1.stderr)) {
+      pass('T3b-nocolumn-a', 'no-project_id targetTable excluded from the anti-join but reconciled separately -> PASS, matching count');
+    } else {
+      fail('T3b-nocolumn-a', 'no-project_id targetTable excluded from the anti-join but reconciled separately -> PASS, matching count', `status=${r1.status} stdout=${r1.stdout} stderr=${r1.stderr}`);
+    }
+
+    // Mismatch -> FAIL (still visible, never silently skipped).
+    await target.query(`INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES (3,30)`);
+    const r2 = runScript('verify-15-t3b-reverse-containment.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r2.status !== 0 && /retrieval_event_assertions/.test(r2.stdout + r2.stderr)) {
+      pass('T3b-nocolumn-b', 'no-project_id targetTable row-count mismatch -> FAIL, named explicitly');
+    } else {
+      fail('T3b-nocolumn-b', 'no-project_id targetTable row-count mismatch -> FAIL, named explicitly', `status=${r2.status} stdout=${r2.stdout} stderr=${r2.stderr}`);
+    }
   } finally {
     await target.end();
   }
@@ -1037,7 +1213,7 @@ async function testT6ReferentialIntegrity() {
 
     // Orphan edge -> FAIL.
     const rosterPath2 = writeTmpJson('t6-roster-clean.json', BASE_ROSTER);
-    await target.query(`INSERT INTO edges (from_entity, to_entity, project_id) VALUES (9999, 9998, 'proj-a')`);
+    await target.query(`INSERT INTO edges (from_entity, to_entity, project_id) VALUES ('nonexistent-entity-a', 'nonexistent-entity-b', 'proj-a')`);
     const r2 = runScript('verify-15-t6-referential-integrity.js', ['--db', TARGET_DB], rosterEnv(rosterPath2));
     if (r2.status !== 0 && /orphan edge/.test(r2.stdout + r2.stderr)) pass('T6-b', 'orphan edge -> FAIL');
     else fail('T6-b', 'orphan edge -> FAIL', `status=${r2.status} stdout=${r2.stdout} stderr=${r2.stderr}`);
@@ -1047,6 +1223,69 @@ async function testT6ReferentialIntegrity() {
     const r3 = runScript('verify-15-t6-referential-integrity.js', ['--db', TARGET_DB], rosterEnv(rosterPath2));
     if (r3.status === 0) pass('T6-c', 'zero orphans + full project_id coverage -> PASS');
     else fail('T6-c', 'zero orphans + full project_id coverage -> PASS', `status=${r3.status} stdout=${r3.stdout} stderr=${r3.stderr}`);
+  } finally {
+    await target.end();
+  }
+}
+
+async function testT6JoinKeyFix() {
+  // BF-R5 (cm#188 spec-adversary pass, 2026-08-18): edges.from_entity/
+  // to_entity resolve to entities via (project_id, name), never
+  // entities.id. These fixtures prove the fixed join is FALSIFIABLE in
+  // both directions the pre-fix bug could never even reach (a type
+  // mismatch crashed before any of these cases could be evaluated).
+  const target = await pgConnect(TARGET_DB);
+  try {
+    await truncateAll(target, ['edges', 'entities', 'memory_entries', 'memory_entry_chunks']);
+    const rosterPath = writeTmpJson('t6-joinkey-roster.json', BASE_ROSTER);
+
+    // (i) Correct same-project match -> PASS, proving the join resolves a
+    // real entity by (project_id, name), not entities.id (there is no
+    // integer id anywhere in this fixture's edge/entity values).
+    await target.query(`INSERT INTO entities (project_id, name) VALUES ('proj-a', 'Widget')`);
+    await target.query(`INSERT INTO edges (project_id, from_entity, to_entity) VALUES ('proj-a', 'Widget', 'Widget')`);
+    const r1 = runScript('verify-15-t6-referential-integrity.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r1.status === 0) pass('T6-joinkey-a', 'edge resolves to entity via (project_id, name) -> PASS');
+    else fail('T6-joinkey-a', 'edge resolves to entity via (project_id, name) -> PASS', `status=${r1.status} stdout=${r1.stdout} stderr=${r1.stderr}`);
+
+    // (ii) A same-name entity in a DIFFERENT project coexists with the
+    // CORRECT same-project entity -> overall PASS, proving the
+    // different-project entity is correctly IGNORED (never wrongly
+    // borrowed to resolve a same-name edge in another project) rather than
+    // this being a coincidental pass.
+    await truncateAll(target, ['edges', 'entities']);
+    await target.query(`INSERT INTO entities (project_id, name) VALUES ('proj-other', 'Widget')`);
+    await target.query(`INSERT INTO entities (project_id, name) VALUES ('proj-a', 'Widget')`);
+    await target.query(`INSERT INTO edges (project_id, from_entity, to_entity) VALUES ('proj-a', 'Widget', 'Widget')`);
+    const r2 = runScript('verify-15-t6-referential-integrity.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r2.status === 0) pass('T6-joinkey-b', 'same-name entity in a DIFFERENT project coexists with the correct same-project entity -> PASS');
+    else fail('T6-joinkey-b', 'same-name entity in a DIFFERENT project coexists with the correct same-project entity -> PASS', `status=${r2.status} stdout=${r2.stdout} stderr=${r2.stderr}`);
+
+    // (iii) Falsifiability proof for (ii): remove the SAME-project entity,
+    // leaving ONLY the different-project same-name entity -> the edge must
+    // now be an orphan (FAIL). This proves (ii) passed because the join is
+    // correctly project-scoped, not because of some other coincidence.
+    await target.query(`DELETE FROM entities WHERE project_id = 'proj-a' AND name = 'Widget'`);
+    const r3 = runScript('verify-15-t6-referential-integrity.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r3.status !== 0 && /orphan edge/.test(r3.stdout + r3.stderr)) {
+      pass('T6-joinkey-c', 'ONLY a different-project same-name entity remains -> edge is an orphan -> FAIL (proves the cross-project non-match in (ii) is real)');
+    } else {
+      fail('T6-joinkey-c', 'ONLY a different-project same-name entity remains -> edge is an orphan -> FAIL (proves the cross-project non-match in (ii) is real)', `status=${r3.status} stdout=${r3.stdout} stderr=${r3.stderr}`);
+    }
+
+    // (iv) Case-variant pair ("Foo" entity, "foo" edge reference) -> FAIL,
+    // proving the exact-text-match pin (no case-folding) is enforced.
+    await truncateAll(target, ['edges', 'entities']);
+    await target.query(`INSERT INTO entities (project_id, name) VALUES ('proj-a', 'Foo')`);
+    await target.query(`INSERT INTO edges (project_id, from_entity, to_entity) VALUES ('proj-a', 'foo', 'Foo')`);
+    const r4 = runScript('verify-15-t6-referential-integrity.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r4.status !== 0 && /orphan edge/.test(r4.stdout + r4.stderr)) {
+      pass('T6-joinkey-d', 'case-variant pair ("Foo" entity, "foo" edge ref) -> FAIL (exact-match pin enforced, no case-folding)');
+    } else {
+      fail('T6-joinkey-d', 'case-variant pair ("Foo" entity, "foo" edge ref) -> FAIL (exact-match pin enforced, no case-folding)', `status=${r4.status} stdout=${r4.stdout} stderr=${r4.stderr}`);
+    }
+
+    await truncateAll(target, ['edges', 'entities']);
   } finally {
     await target.end();
   }
@@ -1144,7 +1383,7 @@ async function testT8Idempotency() {
         const { Client } = require(${JSON.stringify(path.join(PROJECT_ROOT, 'scripts', 'node_modules', 'pg'))});
         const c = new Client({ host: 'localhost', port: 5432, user: 'postgres', password: 'postgres', database: targetDbName });
         await c.connect();
-        await c.query("INSERT INTO edges (from_entity, to_entity, project_id) VALUES (77777, 77778, 'proj-a')");
+        await c.query("INSERT INTO edges (from_entity, to_entity, project_id) VALUES ('orphan-77777', 'orphan-77778', 'proj-a')");
         await c.end();
         return true;
       };
@@ -1154,7 +1393,7 @@ async function testT8Idempotency() {
     if (r3.status !== 0 && /T6 re-run/.test(r3.stdout + r3.stderr)) pass('T8-c', 'rerun introduces orphan edge -> T6 re-run catches it -> FAIL');
     else fail('T8-c', 'rerun introduces orphan edge -> T6 re-run catches it -> FAIL', `status=${r3.status} stdout=${r3.stdout} stderr=${r3.stderr}`);
 
-    await target.query(`DELETE FROM edges WHERE from_entity = 77777`);
+    await target.query(`DELETE FROM edges WHERE from_entity = 'orphan-77777'`);
   } finally {
     await target.end();
   }
@@ -1287,6 +1526,69 @@ async function testT9Negative() {
       pass('T9-g-unscoped-unchanged', 'C-7: omitting sourceDb keeps the ORIGINAL unscoped provenance behavior (backward-compatible for existing unit-test callers)');
     } else {
       fail('T9-g-unscoped-unchanged', 'C-7: omitting sourceDb keeps the ORIGINAL unscoped provenance behavior (backward-compatible for existing unit-test callers)', `unscoped=${JSON.stringify(unscoped)}`);
+    }
+  } finally {
+    await target.end();
+  }
+}
+
+async function testT9NoColumnProvenanceOnly() {
+  // BF-R2 (cm#187/cm#188 spec-adversary pass, 2026-08-18): T9 against a
+  // no-project_id-column table is PROVENANCE-ONLY -- no live-count query is
+  // attempted at all (there is no project_id to filter/compare against).
+  const target = await pgConnect(TARGET_DB);
+  try {
+    await shared.applyDdl(target);
+    await truncateAll(target, ['migration_manifest', 'retrieval_event_assertions']);
+    const rosterPath = writeTmpJson('t9-nocolumn-roster.json', [NO_COLUMN_ROSTER_ENTRY]);
+
+    // Project-scoped exclusion on the no-column table, provenance intact
+    // (the enumerated exclusion IS its own confirming manifest row) -> PASS,
+    // provenance-only mode logged, no crash.
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint, excluded_reason)
+       VALUES ($1,'retrieval_event_assertions','proj-noncol',3,'fp','eval-junk-project-id')`,
+      [SOURCE_DB]
+    );
+    const r1 = runScript('verify-15-t9-negative.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r1.status === 0 && /provenance-only/i.test(r1.stdout + r1.stderr)) {
+      pass('T9-nocolumn-a', 'no-column table, project-scoped exclusion, provenance intact -> PASS, provenance-only mode logged, no crash');
+    } else {
+      fail('T9-nocolumn-a', 'no-column table, project-scoped exclusion, provenance intact -> PASS, provenance-only mode logged, no crash', `status=${r1.status} stdout=${r1.stdout} stderr=${r1.stderr}`);
+    }
+
+    // Break provenance directly via the exported unit (same convention as
+    // the NULL-scoped T9-e test): confirms FAIL when migration_manifest no
+    // longer records the exclusion, and confirms this never crashes.
+    const t9mod = require(scriptPath('verify-15-t9-negative.js'));
+    const roster = JSON.parse(fs.readFileSync(rosterPath, 'utf8'));
+    const intact = await t9mod.checkExclusion(target, roster, {
+      excluded_reason: 'eval-junk-project-id', source_table: 'retrieval_event_assertions', project_id_or_null: 'proj-noncol',
+    }, SOURCE_DB);
+    await truncateAll(target, ['migration_manifest']);
+    const broken = await t9mod.checkExclusion(target, roster, {
+      excluded_reason: 'eval-junk-project-id', source_table: 'retrieval_event_assertions', project_id_or_null: 'proj-noncol',
+    }, SOURCE_DB);
+    if (intact.ok === true && intact.provenanceOnly === true && broken.ok === false) {
+      pass('T9-nocolumn-b', 'provenance-only unit: PASS when manifest row present, FAIL when absent, never a crash, always provenanceOnly=true for this table');
+    } else {
+      fail('T9-nocolumn-b', 'provenance-only unit: PASS when manifest row present, FAIL when absent, never a crash, always provenanceOnly=true for this table', `intact=${JSON.stringify(intact)} broken=${JSON.stringify(broken)}`);
+    }
+
+    // NULL-scoped exclusion on the SAME no-column table also runs
+    // provenance-only (IS NOT DISTINCT FROM handles NULL and project-scoped
+    // exclusions with the SAME query shape) -- provenance intact -> PASS.
+    await truncateAll(target, ['migration_manifest']);
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint, excluded_reason)
+       VALUES ($1,'retrieval_event_assertions',NULL,3,'fp','ephemeral-db-triage-drop')`,
+      [SOURCE_DB]
+    );
+    const r2 = runScript('verify-15-t9-negative.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r2.status === 0 && /provenance-only/i.test(r2.stdout + r2.stderr)) {
+      pass('T9-nocolumn-c', 'no-column table, NULL-scoped exclusion -> also provenance-only, PASS, no crash');
+    } else {
+      fail('T9-nocolumn-c', 'no-column table, NULL-scoped exclusion -> also provenance-only, PASS, no crash', `status=${r2.status} stdout=${r2.stdout} stderr=${r2.stderr}`);
     }
   } finally {
     await target.end();
@@ -1453,18 +1755,23 @@ async function main() {
     await testT1Snapshot();
     await testFreezePrecondition();
     await testT2Rowcount();
+    await testT2NoColumnReconciliation();
     await testT25Dualwrite();
     await testT3ContentHash();
+    await testT3NoColumnFixture();
     await testT3ExclusionAwareness();
     await testT3SourcelessSkip();
     await testT3bReverseContainment();
+    await testT3bNoColumnReconciliation();
     await testT3bSourceless();
     await testT4RecallEquivalence();
     await testT5EmbeddingCoverage();
     await testT6ReferentialIntegrity();
+    await testT6JoinKeyFix();
     await testT7CavemanEconomy();
     await testT8Idempotency();
     await testT9Negative();
+    await testT9NoColumnProvenanceOnly();
     await testAcceptanceIndependence();
     await testNotInSweep();
   } finally {

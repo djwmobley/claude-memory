@@ -61,11 +61,51 @@ function targetTableFor(roster, sourceTable) {
   return entry ? entry.targetTable : null;
 }
 
-async function checkExclusion(client, roster, exclusion, sourceDb) {
+async function checkExclusion(client, roster, exclusion, sourceDb, hasProjectIdOverride) {
   const { excluded_reason: excludedReason, source_table: sourceTable, project_id_or_null: projectIdOrNull } = exclusion;
   const targetTable = targetTableFor(roster, sourceTable);
   if (!targetTable) {
     return { ok: false, reason: `no roster entry maps source_table "${sourceTable}" to a targetTable — cannot verify exclusion` };
+  }
+
+  // BF-R2 (cm#187/cm#188 spec-adversary pass, 2026-08-18): the live-count
+  // query below assumes targetTable carries a project_id column -- exactly
+  // the same total-classification gap T2 had (BF-1). A target table with
+  // NO project_id column at all (retrieval_event_assertions: event_id/
+  // assertion_id only) is PROVENANCE-ONLY: there is no live-row count that
+  // can ever positively or negatively confirm an exclusion for it (no
+  // project_id to filter by), so no live-count query is attempted at all --
+  // never a downgrade, the check structurally cannot run that way.
+  const hasProjectId = hasProjectIdOverride !== undefined
+    ? hasProjectIdOverride
+    : await shared.tableHasColumn(client, targetTable, 'project_id');
+
+  if (!hasProjectId) {
+    // IS NOT DISTINCT FROM (not `=`) handles BOTH NULL-scoped and
+    // project-scoped exclusions with the SAME query shape -- `=` treats
+    // NULL <> NULL as unknown/false, which would silently never match a
+    // NULL-scoped exclusion's own recording row.
+    const params = sourceDb !== undefined
+      ? [sourceTable, excludedReason, sourceDb, projectIdOrNull]
+      : [sourceTable, excludedReason, projectIdOrNull];
+    const sql = sourceDb !== undefined
+      ? `SELECT COUNT(*) AS n FROM migration_manifest
+         WHERE source_table = $1 AND excluded_reason = $2 AND source_db = $3 AND project_id_or_null IS NOT DISTINCT FROM $4`
+      : `SELECT COUNT(*) AS n FROM migration_manifest
+         WHERE source_table = $1 AND excluded_reason = $2 AND project_id_or_null IS NOT DISTINCT FROM $3`;
+    const { rows: manifestRows } = await client.query(sql, params);
+    const provenanceOk = Number(manifestRows[0].n) > 0;
+    console.log(`  [INFO] ${targetTable}: no project_id column -- T9 running in PROVENANCE-ONLY mode for this exclusion (live-count check is not attempted; this is by design, not a downgrade).`);
+    return {
+      ok: provenanceOk,
+      targetTable,
+      liveCount: null,
+      provenanceOk,
+      provenanceOnly: true,
+      provenanceDetail: provenanceOk
+        ? null
+        : `no migration_manifest row confirms source_table="${sourceTable}"${sourceDb !== undefined ? ` source_db="${sourceDb}"` : ''} project_id_or_null=${projectIdOrNull ?? 'NULL'} was recorded excluded_reason="${excludedReason}" (provenance-only mode -- no project_id column on ${targetTable})`,
+    };
   }
 
   const { rows } = await client.query(
@@ -111,6 +151,7 @@ async function checkExclusion(client, roster, exclusion, sourceDb) {
     targetTable,
     liveCount,
     provenanceOk,
+    provenanceOnly: false,
     provenanceDetail,
   };
 }
@@ -146,10 +187,14 @@ async function main() {
         failed = true;
         if (result.reason) {
           console.error(`[T9] FAIL: ${label}: ${result.reason}`);
+        } else if (result.provenanceOnly) {
+          console.error(`[T9] FAIL: ${label}: provenance-only check failed — ${result.provenanceDetail}`);
         } else {
           if (result.liveCount > 0) console.error(`[T9] FAIL: ${label}: excluded but ${result.liveCount} row(s) present in ${result.targetTable}`);
           if (!result.provenanceOk) console.error(`[T9] FAIL: ${label}: provenance check failed — ${result.provenanceDetail}`);
         }
+      } else if (result.provenanceOnly) {
+        console.log(`[T9] OK: ${label}: provenance-only mode, provenance confirmed`);
       } else {
         console.log(`[T9] OK: ${label}: 0 rows present, provenance confirmed`);
       }

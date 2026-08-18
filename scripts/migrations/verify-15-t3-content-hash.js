@@ -158,18 +158,29 @@ async function main() {
           }
           const excludedProjectIds = exclusions.projectScoped.map((ex) => ex.project_id_or_null);
 
+          // BF-R3: idCol/projectCol are resolved per (table, connection) by
+          // hashTableMultiset/hashTableMultisetExcludingProjects themselves
+          // (shared.resolveHashCols via tableHasColumn) -- independently for
+          // the source and target sides, since their column shapes can
+          // diverge (retrieval_event_assertions: neither side has id or
+          // project_id). entry.idCol is an OPTIONAL roster-level override
+          // (mirrors the existing embeddingCol/contentCol convention), used
+          // for sample-logging identification ONLY -- never the hash, which
+          // is always computed over `cols` (loadBearingCols) alone.
+          const hashOpts = entry.idCol ? { idCol: entry.idCol } : {};
+
           let srcCounts, tgtCounts;
           try {
             srcCounts = excludedProjectIds.length > 0
-              ? await shared.hashTableMultisetExcludingProjects(srcClient, entry.source_table, cols, excludedProjectIds)
-              : await shared.hashTableMultiset(srcClient, entry.source_table, cols);
+              ? await shared.hashTableMultisetExcludingProjects(srcClient, entry.source_table, cols, excludedProjectIds, hashOpts)
+              : await shared.hashTableMultiset(srcClient, entry.source_table, cols, hashOpts);
           } catch (err) {
             failed = true;
             console.error(`[T3] FAIL: ${sourceDb}.${entry.source_table}: source query error: ${err.message}`);
             continue;
           }
           try {
-            tgtCounts = await shared.hashTableMultiset(tgtClient, entry.targetTable, cols);
+            tgtCounts = await shared.hashTableMultiset(tgtClient, entry.targetTable, cols, hashOpts);
           } catch (err) {
             failed = true;
             console.error(`[T3] FAIL: ${entry.targetTable}: target query error: ${err.message}`);
