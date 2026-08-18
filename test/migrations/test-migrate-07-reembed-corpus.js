@@ -302,6 +302,64 @@ async function main() {
       }
     });
 
+    // ── G-R2 SAFETY: reproduces the independent review's blocking finding ──
+    // (--dry-run performing the destructive ALTER, --rollback performing
+    // forward DDL) as a regression fixture, THEN proves the fix. Uses a
+    // THROWAWAY `memory_entries` table with ONE populated legacy-vector row
+    // -- created and dropped entirely within this block, before ALTER-1..4
+    // below creates the real (empty) fixture LEGACY_VECTOR_TABLES expects.
+    await run('ALTER-SAFETY-1', 'dry-run REPORTS the G-R2 ALTER but performs zero DDL -- column type AND populated count unchanged', async () => {
+      await tgt.query(`CREATE TABLE memory_entries (id SERIAL PRIMARY KEY, project_id TEXT, body TEXT, embedding vector(4))`);
+      await tgt.query(`INSERT INTO memory_entries (project_id, body, embedding) VALUES ('proj-alter-safety', 'has a real vector', '[1,2,3,4]')`);
+
+      const before = await migrate07.getFormatType(tgt, 'memory_entries', 'embedding');
+      const { rows: beforeCount } = await tgt.query(`SELECT COUNT(*)::int AS n FROM memory_entries WHERE embedding IS NOT NULL`);
+      assert(before === 'vector(4)' && beforeCount[0].n === 1, 'precondition: populated vector(4) column');
+
+      const result = await migrate07.runAlterLegacyVectorColumn(tgt, 'memory_entries', () => {}, true /* dryRun */);
+      assert(result.applied === false && result.dryRun === true && result.populatedCount === 1, `expected a dry-run report, got ${JSON.stringify(result)}`);
+
+      const after = await migrate07.getFormatType(tgt, 'memory_entries', 'embedding');
+      const { rows: afterCount } = await tgt.query(`SELECT COUNT(*)::int AS n FROM memory_entries WHERE embedding IS NOT NULL`);
+      const { rows: value } = await tgt.query(`SELECT embedding::text AS v FROM memory_entries WHERE project_id='proj-alter-safety'`);
+      assert(after === 'vector(4)', `expected column type UNCHANGED (vector(4)), got ${after}`);
+      assert(afterCount[0].n === 1, `expected populated count UNCHANGED (1), got ${afterCount[0].n}`);
+      assert(value[0].v === '[1,2,3,4]', `expected the stored vector value UNCHANGED, got ${value[0].v}`);
+    });
+    await run('ALTER-SAFETY-2', 'a real (non-dry-run) ALTER on a populated column is a loud refusal, never a silent USING NULL discard', async () => {
+      const before = await migrate07.getFormatType(tgt, 'memory_entries', 'embedding');
+      await assertThrows(() => migrate07.runAlterLegacyVectorColumn(tgt, 'memory_entries', () => {}, false), 'G-R2 SAFETY GUARD');
+      const after = await migrate07.getFormatType(tgt, 'memory_entries', 'embedding');
+      const { rows: value } = await tgt.query(`SELECT embedding::text AS v FROM memory_entries WHERE project_id='proj-alter-safety'`);
+      assert(after === before && after === 'vector(4)', `expected column type UNCHANGED after refusal, before=${before} after=${after}`);
+      assert(value[0].v === '[1,2,3,4]', `expected the stored vector value UNCHANGED after refusal, got ${value[0].v}`);
+    });
+    await run('ALTER-SAFETY-3', 'full run() with --dry-run never reaches the destructive ALTER (end-to-end reproduction of the reviewer\'s exact scenario)', async () => {
+      const ok = await migrate07.run(TARGET_DB, { dryRun: true, rosterPath: ROSTER_PATH, transport: makeFakeTransport(NATIVE_DIMS) });
+      assert(ok === true, 'expected the dry run itself to PASS (report-only, not a failure)');
+      const after = await migrate07.getFormatType(tgt, 'memory_entries', 'embedding');
+      const { rows: value } = await tgt.query(`SELECT embedding::text AS v FROM memory_entries WHERE project_id='proj-alter-safety'`);
+      assert(after === 'vector(4)', `expected memory_entries.embedding UNCHANGED after a full --dry-run invocation, got ${after}`);
+      assert(value[0].v === '[1,2,3,4]', `expected the stored vector value UNCHANGED after a full --dry-run invocation, got ${value[0].v}`);
+    });
+    await run('ALTER-SAFETY-4', 'full run() with --rollback never performs forward DDL (the ALTER loop sits below the rollback early-return)', async () => {
+      // A run_id with zero batches -- a trivial, legitimate rollback no-op --
+      // is enough to prove the ordering fix: if the ALTER loop still ran
+      // above the rollback branch, memory_entries would be silently
+      // converted to halfvec(4000) as a SIDE EFFECT of this call, discarding
+      // the populated row. It must not be touched at all.
+      const ok = await migrate07.run(TARGET_DB, { rollback: crypto.randomUUID(), rosterPath: ROSTER_PATH, transport: makeFakeTransport(NATIVE_DIMS) });
+      assert(ok === true, 'expected the (no-op) rollback to PASS');
+      const after = await migrate07.getFormatType(tgt, 'memory_entries', 'embedding');
+      const { rows: value } = await tgt.query(`SELECT embedding::text AS v FROM memory_entries WHERE project_id='proj-alter-safety'`);
+      assert(after === 'vector(4)', `expected memory_entries.embedding UNCHANGED after --rollback (no forward DDL), got ${after}`);
+      assert(value[0].v === '[1,2,3,4]', `expected the stored vector value UNCHANGED after --rollback, got ${value[0].v}`);
+
+      // Cleanup: drop this throwaway fixture so ALTER-1..4 below can create
+      // the real (empty) memory_entries/memory_entry_chunks pair it expects.
+      await tgt.query('DROP TABLE memory_entries');
+    });
+
     // ── G-R2 ALTER SUB-STEP (own isolated scratch schema) ────────────────
     await run('ALTER-1..4', 'legacy vector(1024) -> halfvec(4000): view preserved, opclass correct, idempotent second run', async () => {
       await tgt.query(`
@@ -314,6 +372,7 @@ async function main() {
         CREATE INDEX memory_entries_vec_idx ON memory_entries USING ivfflat (embedding vector_cosine_ops);
         CREATE INDEX mem_chunks_vec_idx ON memory_entry_chunks USING ivfflat (embedding vector_cosine_ops);
         CREATE VIEW v_memory_hits AS SELECT id AS chunk_id, entry_id, content FROM memory_entry_chunks;
+        COMMENT ON VIEW v_memory_hits IS 'test fixture comment -- must survive the DROP/recreate round-trip';
       `);
 
       const r1 = await migrate07.runAlterLegacyVectorColumn(tgt, 'memory_entries', () => {});
@@ -329,6 +388,11 @@ async function main() {
       // view preserved and queryable
       const { rows: viewRows } = await tgt.query(`SELECT * FROM v_memory_hits`);
       assert(Array.isArray(viewRows), 'expected v_memory_hits to still be queryable post-ALTER');
+
+      // non-blocking review item (c): COMMENT ON VIEW must survive the
+      // DROP/pg_get_viewdef-recreate round-trip, not just the view body.
+      const { rows: commentRows } = await tgt.query(`SELECT obj_description('v_memory_hits'::regclass, 'pg_class') AS c`);
+      assert(commentRows[0].c === 'test fixture comment -- must survive the DROP/recreate round-trip', `expected the view comment to be preserved, got ${JSON.stringify(commentRows[0].c)}`);
 
       // index opclass halfvec_cosine_ops, partial WHERE
       const { rows: idxRows } = await tgt.query(`SELECT indexdef FROM pg_indexes WHERE tablename = 'memory_entry_chunks' AND indexname = 'memory_entry_chunks_embedding_hnsw_idx'`);

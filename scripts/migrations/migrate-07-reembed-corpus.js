@@ -212,10 +212,19 @@ function printUsage() {
     '                    private estate data, gitignored). OPTIONAL: absent',
     '                    entirely degrades gracefully -- see this script\'s',
     '                    header comment ("CONTENT EXPRESSION RESOLUTION").',
-    '  --dry-run         Classify + enumerate candidates only; no DB writes.',
+    '  --dry-run         Classify + enumerate candidates + REPORT what the G-R2',
+    '                    legacy-vector ALTER sub-step would do; performs NO',
+    '                    embedding writes and NO destructive DDL (never runs',
+    '                    ALTER COLUMN ... TYPE halfvec(4000) USING NULL). Still',
+    '                    applies additive/idempotent DDL: the 2 lineage tables',
+    '                    and embedded_by_provider_id columns (ADD COLUMN IF NOT',
+    '                    EXISTS, same as every other migrate-NN-*.js script\'s',
+    '                    DDL preamble -- see the script header for why this is',
+    '                    a deliberately different category from the ALTER).',
     '  --rollback <id>   NULL out embedding+embedded_by_provider_id for every',
     '                    row this script wrote under run_id <id>. Scoped by',
     '                    embedding_write_log; never touches another run\'s rows.',
+    '                    Never runs the G-R2 ALTER sub-step.',
   ].join('\n'));
 }
 
@@ -413,7 +422,30 @@ async function runPreflight(client, roster, log) {
 
 // ─── G-R2: ALTER SUB-STEP (legacy vector(1024) -> halfvec(4000)) ──────────
 
-async function runAlterLegacyVectorColumn(client, table, log) {
+/**
+ * FIELD-FOUND FIX (independent review, PR #195, 2026-08-18): this function
+ * used to run its destructive `ALTER COLUMN ... USING NULL` unconditionally,
+ * trusting an out-of-band, comment-only fact ("both in-scope tables carry
+ * zero live embedding values on staging today") rather than checking it at
+ * run time, and with no `dryRun` awareness at all -- `--dry-run` therefore
+ * discarded any populated column's values and then reported "no writes
+ * performed" (reproduced live by the reviewer). Two independent fixes, both
+ * required, neither a substitute for the other:
+ *
+ *   1. A RUNTIME safety guard (categorical, not a comment): before any DDL,
+ *      `SELECT COUNT(*) WHERE embedding IS NOT NULL` on the column being
+ *      converted. Nonzero is a loud refusal naming the table and the count
+ *      -- this makes "the column is empty" a checked invariant that holds
+ *      on every target, not an assumption verified once by hand against one
+ *      target and then trusted forever after.
+ *   2. `dryRun` awareness: a dry run now REPORTS the current type, the
+ *      target type, the populated-row count, and every dependent view/
+ *      legacy index it WOULD touch, and performs zero DDL. The caller
+ *      (main()) also moved this call below the `if (parsed.rollback)`
+ *      early return, so `--rollback` never performs this forward DDL
+ *      either -- see main()'s own comment.
+ */
+async function runAlterLegacyVectorColumn(client, table, log, dryRun = false) {
   const coltype = await getFormatType(client, table, 'embedding');
   if (coltype === null) {
     log(`  [ALTER-SKIP] ${table}.embedding does not exist (pgvector likely not installed on this target) -- skipping.`);
@@ -428,9 +460,16 @@ async function runAlterLegacyVectorColumn(client, table, log) {
     return { applied: false, reason: 'unexpected-type' };
   }
 
+  // Runtime safety guard (fix 1 above) -- computed BEFORE any DDL, in both
+  // dry-run and real-apply mode, so the dry-run report and the real
+  // refusal message are backed by the exact same check.
+  const { rows: populatedRows } = await client.query(`SELECT COUNT(*) AS n FROM "${table}" WHERE embedding IS NOT NULL`);
+  const populatedCount = Number(populatedRows[0].n);
+
   // pg_depend: which views (if any) depend SPECIFICALLY on this column
   // (not merely on the table)? Live-verified: only v_memory_hits, only on
-  // memory_entry_chunks.embedding.
+  // memory_entry_chunks.embedding. Computed unconditionally (dry-run needs
+  // it for the report too).
   const { rows: depRows } = await client.query(
     `SELECT DISTINCT dv.relname AS view_name
        FROM pg_depend d
@@ -441,32 +480,61 @@ async function runAlterLegacyVectorColumn(client, table, log) {
       WHERE tc.relname = $1 AND a.attname = 'embedding' AND dv.relkind = 'v'`,
     [table]
   );
+  const dependentViews = depRows.map((r) => r.view_name);
+
+  const { rows: idxRows } = await client.query(
+    `SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND tablename = $1
+       AND indexdef ILIKE '%vector_cosine_ops%' AND indexdef NOT ILIKE '%WHERE%'`,
+    [table]
+  );
+  const legacyIndexes = idxRows.map((r) => r.indexname);
+
+  if (dryRun) {
+    log(
+      `  [DRY-RUN][ALTER] ${table}.embedding: current=${coltype} target=halfvec(4000) populated_rows=${populatedCount} ` +
+      `dependent_views=${JSON.stringify(dependentViews)} legacy_indexes=${JSON.stringify(legacyIndexes)} -- REPORT ONLY, no DDL performed.`
+    );
+    if (populatedCount > 0) {
+      log(`  [DRY-RUN][ALTER] REFUSAL-WOULD-FIRE: ${table}.embedding has ${populatedCount} populated row(s) -- a real (non-dry-run) invocation would refuse rather than discard them.`);
+    }
+    return { applied: false, reason: 'dry-run', dryRun: true, populatedCount, dependentViews, legacyIndexes };
+  }
+
+  if (populatedCount > 0) {
+    throw new Error(
+      `G-R2 SAFETY GUARD: refusing to ALTER "${table}".embedding from ${coltype} to halfvec(4000) -- ${populatedCount} row(s) ` +
+      `currently have a non-NULL embedding. "USING NULL" would discard them irrecoverably (no lineage table records a legacy-vector ` +
+      `value -- rollback has no path back). Nothing was altered. If these rows are genuinely safe to clear (e.g. a deliberate ` +
+      `re-embed), NULL them out explicitly first and re-run.`
+    );
+  }
 
   await client.query('BEGIN');
   try {
     const viewDefs = [];
-    for (const { view_name: viewName } of depRows) {
+    for (const viewName of dependentViews) {
       const { rows: defRows } = await client.query(`SELECT pg_get_viewdef($1::regclass, true) AS def`, [viewName]);
-      viewDefs.push({ viewName, def: defRows[0].def });
+      // FIELD-FOUND FIX (independent review, PR #195, non-blocking item (c)):
+      // pg_get_viewdef captures the view's SELECT body only, never its
+      // COMMENT ON VIEW -- a plain DROP VIEW/CREATE VIEW round-trip silently
+      // lost any comment. Captured here (obj_description over pg_class,
+      // NULL when no comment exists) and re-applied after recreation below.
+      const { rows: commentRows } = await client.query(`SELECT obj_description($1::regclass, 'pg_class') AS c`, [viewName]);
+      viewDefs.push({ viewName, def: defRows[0].def, comment: commentRows[0] ? commentRows[0].c : null });
       await client.query(`DROP VIEW "${viewName}"`);
-      log(`  [ALTER] dropped view "${viewName}" (depends on ${table}.embedding) -- captured its live pg_get_viewdef for recreation.`);
+      log(`  [ALTER] dropped view "${viewName}" (depends on ${table}.embedding) -- captured its live pg_get_viewdef + comment for recreation.`);
     }
 
-    const { rows: idxRows } = await client.query(
-      `SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND tablename = $1
-         AND indexdef ILIKE '%vector_cosine_ops%' AND indexdef NOT ILIKE '%WHERE%'`,
-      [table]
-    );
-    for (const { indexname } of idxRows) {
+    for (const indexname of legacyIndexes) {
       await client.query(`DROP INDEX "${indexname}"`);
       log(`  [ALTER] dropped legacy index "${indexname}" (vector_cosine_ops, non-partial) on ${table}.embedding.`);
     }
 
-    // USING NULL, NEVER a cast -- dims differ (1024 vs 4000) and both
-    // in-scope tables carry zero live embedding values on staging today,
-    // so nothing is discarded.
+    // USING NULL, NEVER a cast -- dims differ (1024 vs 4000). Safe here
+    // because the runtime guard above already refused loud on any populated
+    // row; by construction, every row's embedding is already NULL.
     await client.query(`ALTER TABLE "${table}" ALTER COLUMN embedding TYPE halfvec(4000) USING NULL`);
-    log(`  [ALTER] ${table}.embedding TYPE ${coltype} -> halfvec(4000) (USING NULL).`);
+    log(`  [ALTER] ${table}.embedding TYPE ${coltype} -> halfvec(4000) (USING NULL; guard confirmed 0 populated rows).`);
 
     const newIndexName = `${table}_embedding_hnsw_idx`;
     await client.query(
@@ -474,9 +542,13 @@ async function runAlterLegacyVectorColumn(client, table, log) {
     );
     log(`  [ALTER] created "${newIndexName}" USING hnsw (embedding halfvec_cosine_ops) WHERE embedding IS NOT NULL.`);
 
-    for (const { viewName, def } of viewDefs) {
+    for (const { viewName, def, comment } of viewDefs) {
       await client.query(`CREATE VIEW "${viewName}" AS ${def}`);
       log(`  [ALTER] recreated view "${viewName}" from its captured pg_get_viewdef.`);
+      if (comment) {
+        await client.query(`COMMENT ON VIEW "${viewName}" IS $1`, [comment]);
+        log(`  [ALTER] restored COMMENT ON VIEW "${viewName}".`);
+      }
     }
 
     await client.query('COMMIT');
@@ -484,7 +556,7 @@ async function runAlterLegacyVectorColumn(client, table, log) {
     await client.query('ROLLBACK');
     throw err;
   }
-  return { applied: true };
+  return { applied: true, populatedCount: 0 };
 }
 
 // ─── EMBED LOOP (G-R3/G-R4/G-R5/G-R7/G-R8/G-R9/G-R10) ──────────────────────
@@ -493,7 +565,19 @@ async function embedTable(client, table, spec, provider, providerId, runId, excl
   const pkSpec = getPkSpec(table);
   const selectColsList = [...new Set([...pkSpec.cols, 'project_id'])];
   const selectCols = selectColsList.map((c) => `"${c}"`).join(', ');
-  let sql = `SELECT ${selectCols}, (${spec.expr}) AS __content_text FROM "${table}" WHERE embedding IS NULL`;
+  // FIELD-FOUND FIX (independent review, PR #195, non-blocking item (b)):
+  // emptiness used to be checked with JavaScript's String.prototype.trim()
+  // here but with SQL trim() in runCompletenessGate() -- JS trim() also
+  // strips tabs/newlines/other Unicode whitespace that SQL trim() does not,
+  // so newline-only content was skipped as empty by this loop but counted
+  // as embeddable-pending by the gate: a real run could wedge forever (the
+  // gate fails on a row this loop will never touch). Unified onto ONE
+  // definition -- SQL `length(trim(coalesce(expr,''))) > 0`, computed once
+  // in the SELECT itself (__has_content) -- so both call sites agree by
+  // construction, not by convention.
+  let sql = `SELECT ${selectCols}, (${spec.expr}) AS __content_text, ` +
+    `length(trim(coalesce((${spec.expr}), ''))) > 0 AS __has_content ` +
+    `FROM "${table}" WHERE embedding IS NULL`;
   const params = [];
   if (excludedProjectIds.size > 0) {
     params.push([...excludedProjectIds]);
@@ -506,8 +590,7 @@ async function embedTable(client, table, spec, provider, providerId, runId, excl
 
   if (dryRun) {
     for (const row of rows) {
-      const text = (row.__content_text || '').trim();
-      if (!text) { counts.exemptEmptyContent++; continue; }
+      if (!row.__has_content) { counts.exemptEmptyContent++; continue; }
       log(`  [DRY-RUN] would embed ${table} pk=${encodePk(pkSpec, row).valStr}`);
     }
     return counts;
@@ -517,14 +600,28 @@ async function embedTable(client, table, spec, provider, providerId, runId, excl
   let batchId = null;
 
   for (const row of rows) {
-    const text = (row.__content_text || '').trim();
-    if (!text) {
+    if (!row.__has_content) {
       counts.exemptEmptyContent++;
       log(`  [EXEMPT-EMPTY-CONTENT] ${table} pk=${encodePk(pkSpec, row).valStr}: declared content expression trims to '' -- never embedded.`);
       continue;
     }
+    // __has_content (SQL trim(), matching the gate) already proved this is
+    // non-empty; JS .trim() here is pure value normalization for the text
+    // handed to the provider, never the emptiness decision.
+    const text = (row.__content_text || '').trim();
 
     if (batchId === null) {
+      // NON-BLOCKING (independent review, PR #195, item (d)): this INSERT is
+      // deliberately OUTSIDE the per-row transaction below -- G-R4 only
+      // requires the row UPDATE + embedding_write_log insert to share a
+      // transaction, not the batch row itself. Consequence, documented
+      // rather than engineered around: if the very first candidate row's
+      // embed attempt fails (provider error, dim mismatch), this batch row
+      // is left with zero corresponding write_log rows. This is HARMLESS --
+      // runRollback() keys exclusively on embedding_write_log via batch_id,
+      // never on embedding_migration_batches row COUNT or presence alone --
+      // but it does mean a batch row is not a reliable proxy for "this
+      // table had work attempted"; only its child write_log rows are.
       const { rows: br } = await client.query(
         `INSERT INTO embedding_migration_batches (table_name, run_id) VALUES ($1,$2) RETURNING id`,
         [table, runId]
@@ -710,21 +807,43 @@ async function main(runtimeOpts = {}) {
       return false;
     }
 
-    // ── G-R2 ALTER sub-step (idempotent, always attempted first) ──────────
-    for (const t of LEGACY_VECTOR_TABLES) {
-      await runAlterLegacyVectorColumn(client, t, console.log);
-    }
-
-    // ── G-R1 table discovery (post-ALTER) + provenance column ─────────────
+    // ── G-R1 table discovery + provenance column ───────────────────────────
+    // Additive/idempotent DDL only (ADD COLUMN IF NOT EXISTS) -- safe to run
+    // unconditionally, including under --rollback (rollback's own UPDATE
+    // needs embedded_by_provider_id to exist) and under --dry-run (this is
+    // exactly the class of DDL migrate-05's own precedent already runs
+    // unconditionally; see this script's header "CONTENT EXPRESSION
+    // RESOLUTION" note and the independent review that drew this line).
+    // discoverEmbeddableTables() matches BOTH vector and halfvec typnames,
+    // so running discovery before the (still-conditional) ALTER sub-step
+    // below finds the same table set either way.
     const discovered = await discoverEmbeddableTables(client);
     for (const { table } of discovered) {
       await ensureProvenanceColumn(client, table, console.log);
     }
 
     if (parsed.rollback) {
+      // FIELD-FOUND FIX (independent review, PR #195): the G-R2 ALTER
+      // sub-step (destructive forward DDL) used to run ABOVE this branch,
+      // so invoking --rollback also performed a forward schema conversion
+      // on its way to rolling back. The ALTER loop now runs ONLY below this
+      // early return -- --rollback never reaches it.
       const result = await runRollback(client, parsed.rollback, console.log);
       console.log(`ROLLBACK_RESULT: PASS (rolled_back=${result.rolledBack})`);
       return true;
+    }
+
+    // ── G-R2 ALTER sub-step (destructive; dry-run-aware; guarded) ──────────
+    // FIELD-FOUND FIX (independent review, PR #195): moved below the
+    // rollback early-return (above) and now threads parsed.dryRun through --
+    // see runAlterLegacyVectorColumn's own header comment for the full
+    // blocking-defect writeup. A dry run REPORTS what this step would do
+    // (current type, target type, populated-row count, dependent views/
+    // indexes) and performs zero DDL; a populated column is a loud runtime
+    // refusal in BOTH modes (reported in dry-run, thrown as a hard stop
+    // otherwise), never a silent `USING NULL` discard.
+    for (const t of LEGACY_VECTOR_TABLES) {
+      await runAlterLegacyVectorColumn(client, t, console.log, parsed.dryRun);
     }
 
     // ── classify every discovered table ────────────────────────────────
@@ -733,6 +852,22 @@ async function main(runtimeOpts = {}) {
       const spec = await resolveTableContentSpec(client, table, roster, console.log);
       const hasHash = await hasColumn(client, table, 'content_hash');
       const hasSuppressed = await hasColumn(client, table, 'suppressed');
+      // FIELD-FOUND FIX (independent review, PR #195, non-blocking item (a)):
+      // embedTable() unconditionally selects project_id; every one of the
+      // 18 present-day embeddable tables carries it, but a future table
+      // that doesn't would previously surface as a raw Postgres "column
+      // does not exist" error instead of this script's own classified
+      // refusal vocabulary. Checked here, alongside hasHash/hasSuppressed,
+      // and refused with the SAME UNCLASSIFIABLE discipline
+      // resolveTableContentSpec already uses for a missing content source.
+      const hasProjectId = await hasColumn(client, table, 'project_id');
+      if (!hasProjectId) {
+        throw new Error(
+          `UNCLASSIFIABLE: table "${table}" has an embedding column but no project_id column -- this script's batch-selection, ` +
+          `G-R7 exclusion-scoping, and lineage encoding all assume project_id exists. Refusing (total classification: every ` +
+          `embeddable table must resolve to a processable shape; an unrecognized shape is a loud FAIL, never a raw driver error).`
+        );
+      }
       const bucket = hasHash ? 'A' : (spec.source === 'roster' ? 'B' : 'C');
       tableSpecs.push({ table, spec, hasHash, hasSuppressed, bucket });
       console.log(`  [CLASSIFY] ${table}: bucket=${bucket} content-source=${spec.source} expr="${spec.expr}"`);
@@ -754,7 +889,10 @@ async function main(runtimeOpts = {}) {
     }
 
     if (parsed.dryRun) {
-      console.log('DRY_RUN_RESULT: PASS (no writes performed)');
+      console.log(
+        'DRY_RUN_RESULT: PASS (no embedding writes, no destructive DDL performed -- see [DRY-RUN][ALTER] lines above for the ' +
+        'G-R2 legacy-vector report; additive/idempotent DDL -- the 2 lineage tables + embedded_by_provider_id columns -- WAS applied, matching this script\'s CLI help text)'
+      );
       return true;
     }
 
