@@ -163,13 +163,30 @@ function makeConnectionErrorTransport() {
   };
 }
 
-/** Runs `fn` with console.log captured (in addition to passing through), returns the captured lines. */
+/**
+ * Runs `fn` with console.log captured for later assertion (grepping
+ * `lines` for e.g. "[EMBEDDED-TRUNCATED]"). Deliberately does NOT
+ * re-forward the captured arguments to the real console.log (CodeQL
+ * js/clear-text-logging, PR #200 follow-up, 2026-08-18): this wrapper is
+ * generic -- it captures WHATEVER any nested console.log call inside `fn`
+ * is invoked with, and the production code it wraps (migrate-07-reembed-
+ * corpus.js and everything it calls) is out of this function's control and
+ * can change independently of this test file. Rather than assume today's
+ * captured content is always safe to echo verbatim, this wrapper never
+ * calls the real console.log with the captured (or any derived) value --
+ * only a fixed, non-derived marker string, so no data this wrapper
+ * observes can ever reach a real logging sink through it. `lines` (a plain
+ * in-memory array, never a logging sink) is what tests assert against;
+ * `orig` is restored on exit and never itself invoked with data.
+ */
 async function captureConsoleLog(fn) {
   const lines = [];
   const orig = console.log;
-  console.log = (...args) => { lines.push(args.map(String).join(' ')); orig(...args); };
+  let captured = 0;
+  console.log = (...args) => { lines.push(args.map(String).join(' ')); captured++; };
   try {
     const result = await fn();
+    orig(`  [captureConsoleLog] captured ${captured} console.log call(s) -- see returned \`lines\` for content, never re-logged here.`);
     return { result, lines };
   } finally {
     console.log = orig;
