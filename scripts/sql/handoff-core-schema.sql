@@ -38,6 +38,35 @@ CREATE INDEX IF NOT EXISTS entities_project_idx
 CREATE INDEX IF NOT EXISTS entities_name_idx
   ON entities (project_id, name);
 
+-- ── Attribution columns (source_model / agent_id) ─────────────────────────────
+--
+-- Canon home as of this fix: these two columns originated in
+-- scripts/migrations/sql/attribution-columns.sql (applied only to staging
+-- targets by migrate-schema-addenda.js, which structurally refuses live
+-- project DBs). entity-graph-crud.js writes both columns unconditionally on
+-- every INSERT/supersede path against entities/assertions/edges, so any live
+-- DB the cm#185 bring-forward carries forward must also carry them — hence
+-- the move to canon here. attribution-columns.sql is UNCHANGED and still
+-- applies to staging targets (idempotent); see its header for the pointer
+-- back to this file. Future columns on engine-core tables go to canon FIRST.
+--
+-- Free text, NO enum/CHECK against a named model set (model-agnosticism —
+-- see attribution-columns.sql's header for the invariant this preserves).
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS source_model TEXT;
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS agent_id     TEXT;
+
+-- ── suppressed (M-4) ───────────────────────────────────────────────────────
+--
+-- Canon home as of this fix: this column originated in
+-- scripts/migrations/sql/migrate-15-mcp-addenda.sql (applied only to staging
+-- targets — no live-DB applier exists for that file either). entitySuppress
+-- and entityCreate's revival semantics (entity-graph-crud.js) both read/write
+-- this column unconditionally against entities on any target, live included.
+-- Same categorical gap and fix as source_model/agent_id above — see that
+-- comment for the general rationale. migrate-15-mcp-addenda.sql is UNCHANGED
+-- and stays as the staging applier (idempotent).
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS suppressed BOOLEAN NOT NULL DEFAULT false;
+
 
 -- ============================================================================
 -- ASSERTIONS — typed subject/predicate/object triples with 1-10 confidence.
@@ -93,6 +122,14 @@ ALTER TABLE assertions ADD COLUMN IF NOT EXISTS outcome_bias FLOAT NOT NULL DEFA
 -- Add promoted / promoted_at columns if not present (mirrors SQLite schema; used by cmdPromote).
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMPTZ;
+
+-- Attribution columns (source_model / agent_id) — see the comment above
+-- entities' own source_model/agent_id ALTERs (just above this table's
+-- CREATE) for this fix's canon-home rationale. entity-graph-crud.js writes
+-- both on every INSERT and on the supersede-INSERT of the write path.
+-- Free text, NO enum/CHECK against a named model set (model-agnosticism).
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS source_model TEXT;
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS agent_id     TEXT;
 
 -- ── PR-B bi-temporal supersession + suppression_kind + pinned-exemption ───────
 --
@@ -495,6 +532,20 @@ CREATE INDEX IF NOT EXISTS edges_from_idx
   ON edges (project_id, from_entity);
 CREATE INDEX IF NOT EXISTS edges_to_idx
   ON edges (project_id, to_entity);
+
+-- Attribution columns (source_model / agent_id) — see the comment above
+-- entities' own source_model/agent_id ALTERs for this fix's canon-home
+-- rationale. entity-graph-crud.js writes both on every edge INSERT.
+-- Free text, NO enum/CHECK against a named model set (model-agnosticism).
+ALTER TABLE edges ADD COLUMN IF NOT EXISTS source_model TEXT;
+ALTER TABLE edges ADD COLUMN IF NOT EXISTS agent_id     TEXT;
+
+-- suppressed (M-4) — canon home as of this fix; originated in
+-- scripts/migrations/sql/migrate-15-mcp-addenda.sql (staging-only applier).
+-- edgeSuppress (entity-graph-crud.js) marks an edge retracted via this
+-- column rather than a destructive DELETE. Same categorical gap and fix as
+-- entities.suppressed above.
+ALTER TABLE edges ADD COLUMN IF NOT EXISTS suppressed BOOLEAN NOT NULL DEFAULT false;
 
 
 -- ============================================================================

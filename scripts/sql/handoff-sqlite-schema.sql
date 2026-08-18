@@ -39,6 +39,18 @@ CREATE TABLE IF NOT EXISTS entities (
 CREATE INDEX IF NOT EXISTS entities_project_idx ON entities (project_id);
 CREATE INDEX IF NOT EXISTS entities_name_idx    ON entities (project_id, name);
 
+-- Attribution columns (source_model / agent_id) — dialect parity with
+-- handoff-core-schema.sql's own entities ALTERs (see that file's comment for
+-- this fix's canon-home rationale). Idempotent ADD COLUMN for existing DBs;
+-- safe no-op on fresh DBs created from the CREATE TABLE above.
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS source_model TEXT;
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS agent_id     TEXT;
+
+-- suppressed (M-4) — dialect parity with handoff-core-schema.sql's own
+-- entities ALTER (see that file's comment for this fix's canon-home
+-- rationale; origin: scripts/migrations/sql/migrate-15-mcp-addenda.sql).
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS suppressed INTEGER NOT NULL DEFAULT 0;
+
 
 -- ============================================================================
 -- ASSERTIONS
@@ -131,6 +143,13 @@ ALTER TABLE assertions ADD COLUMN IF NOT EXISTS reality_check TEXT;
 -- Schema: { "pointer": "path:N-M", "symbol": "...", "snippet": "...", "last_validated": "ISO" }
 -- NULL for rows that predate this feature or have no pointer in their object field.
 ALTER TABLE assertions ADD COLUMN IF NOT EXISTS anchor TEXT;
+
+-- Attribution columns (source_model / agent_id) — dialect parity with
+-- handoff-core-schema.sql's own assertions ALTERs (see that file's comment
+-- for this fix's canon-home rationale). Idempotent ADD COLUMN for existing
+-- DBs; safe no-op on fresh DBs created from the CREATE TABLE above.
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS source_model TEXT;
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS agent_id     TEXT;
 
 -- 1:1 partial unique index (same predicate set as Postgres version, including
 -- grandfathered aliases — see the comment above assertions_1to1_unique in
@@ -227,6 +246,18 @@ CREATE TABLE IF NOT EXISTS edges (
 CREATE INDEX IF NOT EXISTS edges_project_idx ON edges (project_id);
 CREATE INDEX IF NOT EXISTS edges_from_idx    ON edges (project_id, from_entity);
 CREATE INDEX IF NOT EXISTS edges_to_idx      ON edges (project_id, to_entity);
+
+-- Attribution columns (source_model / agent_id) — dialect parity with
+-- handoff-core-schema.sql's own edges ALTERs (see that file's comment for
+-- this fix's canon-home rationale). Idempotent ADD COLUMN for existing DBs;
+-- safe no-op on fresh DBs created from the CREATE TABLE above.
+ALTER TABLE edges ADD COLUMN IF NOT EXISTS source_model TEXT;
+ALTER TABLE edges ADD COLUMN IF NOT EXISTS agent_id     TEXT;
+
+-- suppressed (M-4) — dialect parity with handoff-core-schema.sql's own
+-- edges ALTER (see that file's comment for this fix's canon-home rationale;
+-- origin: scripts/migrations/sql/migrate-15-mcp-addenda.sql).
+ALTER TABLE edges ADD COLUMN IF NOT EXISTS suppressed INTEGER NOT NULL DEFAULT 0;
 
 
 -- ============================================================================
