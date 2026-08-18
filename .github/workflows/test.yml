@@ -593,6 +593,38 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run corpus re-embed migration tests (§6.1(g), memory-manager#11(g))
+        # Tests scripts/migrations/migrate-07-reembed-corpus.js -- batches
+        # every embeddable row on the target through the embedding_providers-
+        # resolved default provider. Covers: DDL-derived table enumeration
+        # (pg_attribute/pg_type/pg_class scan, never a hand-listed table
+        # array); content-expression resolution (a declared CONTENT_EXPRESSIONS
+        # entry for every table this script recognizes, cross-validated
+        # against a roster contentCol hint when one is present; an
+        # unrecognized table with no valid hint is a loud UNCLASSIFIABLE
+        # FATAL, never a silent skip); the G-R2 ALTER sub-step (legacy
+        # vector(1024) -> halfvec(4000), v_memory_hits view captured via
+        # pg_get_viewdef and recreated, wrong-opclass HNSW index replaced
+        # with a partial halfvec_cosine_ops index, idempotent second run);
+        # G-R11's preflight (reuses verify-15-t9-negative.js's checkExclusion
+        # by reference -- refuses the whole run if an excluded project_id
+        # has live target rows anyway, e.g. a leak); G-R7 manifest-exclusion
+        # batch-selection scoping; per-row advisory-locked single-row
+        # transactions (UPDATE + embedding_write_log insert together);
+        # provider-failure hard stop + zero-re-embed resumability; dim
+        # assertion against the resolved provider's stored_dims; rollback
+        # scoping across two independent runs; and the completeness gate
+        # (embeddable-pending / exempt-empty-content / exempt-suppressed-
+        # and-empty). No live vLLM anywhere in this suite -- every provider
+        # call goes through an injected deterministic fake transport (see
+        # scripts/lib/embedding-provider.js's VllmEmbeddingProvider). Self-
+        # contained: creates/drops its own scratch target database with a
+        # hand-crafted minimal schema; never touches memory_manager_staging.
+        run: node test/migrations/test-migrate-07-reembed-corpus.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run seam-libraries smoke tests (§7.1-§7.8, issue #17)
         # Tests scripts/migrations/verify-19-seams-smoke.js (30-check operator
         # smoke test) and its regression harness test/migrations/test-verify-19.js
