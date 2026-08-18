@@ -360,6 +360,82 @@ async function main() {
       await tgt.query('DROP TABLE memory_entries');
     });
 
+    // ── TOCTOU FIX: guard + ALTER in ONE transaction (structural proof) ──
+    // A lightweight query-spy wrapping the real client: delegates every
+    // query to the real connection (so behavior/correctness is exercised
+    // for real) while recording each statement's first line so the test can
+    // assert ORDERING and TRANSACTION BOUNDARIES. This is a structural
+    // assertion, NOT a true concurrent-writer test -- see this suite's
+    // header comment / the PR's blind-spots section for that honest limit:
+    // nothing here proves a second, genuinely concurrent client is actually
+    // blocked by the ACCESS EXCLUSIVE lock while it is held.
+    function querySpy(realClient) {
+      const calls = [];
+      return {
+        calls,
+        client: {
+          query: async (sql, params) => {
+            calls.push(typeof sql === 'string' ? sql.trim().split('\n')[0].trim() : String(sql));
+            return realClient.query(sql, params);
+          },
+        },
+      };
+    }
+
+    await run('ALTER-SAFETY-5', 'guard COUNT and ALTER run on the SAME client inside ONE open transaction (BEGIN -> LOCK -> COUNT -> ALTER -> COMMIT, in order)', async () => {
+      await tgt.query(`CREATE TABLE alter_txn_probe (id SERIAL PRIMARY KEY, project_id TEXT, embedding vector(4))`);
+      const { calls, client: spyClient } = querySpy(tgt);
+
+      const result = await migrate07.runAlterLegacyVectorColumn(spyClient, 'alter_txn_probe', () => {}, false);
+      assert(result.applied === true, `expected the ALTER to apply on an empty table, got ${JSON.stringify(result)}`);
+
+      const idx = (re) => calls.findIndex((c) => re.test(c));
+      const beginIdx = idx(/^BEGIN/i);
+      const lockIdx = idx(/^LOCK TABLE/i);
+      const countIdx = idx(/^SELECT COUNT\(\*\)/i);
+      const alterIdx = idx(/^ALTER TABLE/i);
+      const commitIdx = idx(/^COMMIT/i);
+      assert([beginIdx, lockIdx, countIdx, alterIdx, commitIdx].every((i) => i !== -1), `expected all 5 statements to appear, got ${JSON.stringify(calls)}`);
+      assert(beginIdx < lockIdx, `expected LOCK TABLE after BEGIN, got ${JSON.stringify(calls)}`);
+      assert(lockIdx < countIdx, `expected the guard COUNT to run AFTER the lock is held (closes the TOCTOU window), got ${JSON.stringify(calls)}`);
+      assert(countIdx < alterIdx, `expected the ALTER to run after the guard COUNT, got ${JSON.stringify(calls)}`);
+      assert(alterIdx < commitIdx, `expected COMMIT after the ALTER, got ${JSON.stringify(calls)}`);
+      // exactly ONE transaction bracket covering lock+count+alter (no
+      // interleaved second BEGIN/COMMIT that would reopen the TOCTOU window)
+      const secondBegin = calls.findIndex((c, i) => i > beginIdx && /^BEGIN/i.test(c));
+      assert(secondBegin === -1, `expected exactly one BEGIN...COMMIT bracket, got ${JSON.stringify(calls)}`);
+
+      await tgt.query('DROP TABLE alter_txn_probe');
+    });
+    await run('ALTER-SAFETY-6', 'refusal path ROLLBACKs the SAME transaction that held the lock; the ALTER itself never runs; column type unchanged', async () => {
+      await tgt.query(`CREATE TABLE alter_txn_probe2 (id SERIAL PRIMARY KEY, project_id TEXT, embedding vector(4))`);
+      await tgt.query(`INSERT INTO alter_txn_probe2 (project_id, embedding) VALUES ('p', '[1,2,3,4]')`);
+      const { calls, client: spyClient } = querySpy(tgt);
+
+      await assertThrows(() => migrate07.runAlterLegacyVectorColumn(spyClient, 'alter_txn_probe2', () => {}, false), 'G-R2 SAFETY GUARD');
+
+      const idx = (re) => calls.findIndex((c) => re.test(c));
+      const lockIdx = idx(/^LOCK TABLE/i);
+      const rollbackIdx = idx(/^ROLLBACK/i);
+      assert(lockIdx !== -1 && rollbackIdx !== -1 && lockIdx < rollbackIdx, `expected LOCK then ROLLBACK, got ${JSON.stringify(calls)}`);
+      assert(idx(/^ALTER TABLE/i) === -1, `expected the ALTER to never run when the guard refuses, got ${JSON.stringify(calls)}`);
+
+      const afterType = await migrate07.getFormatType(tgt, 'alter_txn_probe2', 'embedding');
+      assert(afterType === 'vector(4)', `expected type UNCHANGED after refusal, got ${afterType}`);
+      await tgt.query('DROP TABLE alter_txn_probe2');
+    });
+    await run('ALTER-SAFETY-7', 'dry-run NEVER takes the ACCESS EXCLUSIVE lock and NEVER opens a transaction', async () => {
+      await tgt.query(`CREATE TABLE alter_txn_probe3 (id SERIAL PRIMARY KEY, project_id TEXT, embedding vector(4))`);
+      const { calls, client: spyClient } = querySpy(tgt);
+
+      await migrate07.runAlterLegacyVectorColumn(spyClient, 'alter_txn_probe3', () => {}, true /* dryRun */);
+
+      assert(!calls.some((c) => /^BEGIN/i.test(c)), `expected NO BEGIN in dry-run mode, got ${JSON.stringify(calls)}`);
+      assert(!calls.some((c) => /^LOCK TABLE/i.test(c)), `expected NO LOCK TABLE in dry-run mode, got ${JSON.stringify(calls)}`);
+      assert(!calls.some((c) => /^ALTER TABLE/i.test(c)), `expected NO ALTER in dry-run mode, got ${JSON.stringify(calls)}`);
+      await tgt.query('DROP TABLE alter_txn_probe3');
+    });
+
     // ── G-R2 ALTER SUB-STEP (own isolated scratch schema) ────────────────
     await run('ALTER-1..4', 'legacy vector(1024) -> halfvec(4000): view preserved, opclass correct, idempotent second run', async () => {
       await tgt.query(`

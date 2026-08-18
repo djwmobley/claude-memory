@@ -423,27 +423,65 @@ async function runPreflight(client, roster, log) {
 // ─── G-R2: ALTER SUB-STEP (legacy vector(1024) -> halfvec(4000)) ──────────
 
 /**
+ * pg_depend: which views (if any) depend SPECIFICALLY on this column (not
+ * merely on the table)? Live-verified: only v_memory_hits, only on
+ * memory_entry_chunks.embedding. Read-only -- safe to call with or without
+ * an open transaction/lock.
+ */
+async function getDependentViews(client, table) {
+  const { rows } = await client.query(
+    `SELECT DISTINCT dv.relname AS view_name
+       FROM pg_depend d
+       JOIN pg_rewrite r ON d.objid = r.oid
+       JOIN pg_class dv ON r.ev_class = dv.oid
+       JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+       JOIN pg_class tc ON tc.oid = d.refobjid
+      WHERE tc.relname = $1 AND a.attname = 'embedding' AND dv.relkind = 'v'`,
+    [table]
+  );
+  return rows.map((r) => r.view_name);
+}
+
+/** The wrong-opclass (vector_cosine_ops, non-partial) legacy HNSW index names on `table`. Read-only. */
+async function getLegacyIndexes(client, table) {
+  const { rows } = await client.query(
+    `SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND tablename = $1
+       AND indexdef ILIKE '%vector_cosine_ops%' AND indexdef NOT ILIKE '%WHERE%'`,
+    [table]
+  );
+  return rows.map((r) => r.indexname);
+}
+
+/**
  * FIELD-FOUND FIX (independent review, PR #195, 2026-08-18): this function
  * used to run its destructive `ALTER COLUMN ... USING NULL` unconditionally,
  * trusting an out-of-band, comment-only fact ("both in-scope tables carry
  * zero live embedding values on staging today") rather than checking it at
  * run time, and with no `dryRun` awareness at all -- `--dry-run` therefore
  * discarded any populated column's values and then reported "no writes
- * performed" (reproduced live by the reviewer). Two independent fixes, both
- * required, neither a substitute for the other:
+ * performed" (reproduced live by the reviewer). First fix round added a
+ * runtime guard + dry-run reporting, but the guard's `SELECT COUNT(*)` ran
+ * BEFORE `BEGIN` -- a second, self-found gap: a concurrent writer could
+ * insert/update a non-NULL embedding in the window between the guard
+ * passing and the `ALTER` acquiring its lock, and that row would be
+ * silently discarded anyway (TOCTOU race).
  *
- *   1. A RUNTIME safety guard (categorical, not a comment): before any DDL,
- *      `SELECT COUNT(*) WHERE embedding IS NOT NULL` on the column being
- *      converted. Nonzero is a loud refusal naming the table and the count
- *      -- this makes "the column is empty" a checked invariant that holds
- *      on every target, not an assumption verified once by hand against one
- *      target and then trusted forever after.
- *   2. `dryRun` awareness: a dry run now REPORTS the current type, the
- *      target type, the populated-row count, and every dependent view/
- *      legacy index it WOULD touch, and performs zero DDL. The caller
- *      (main()) also moved this call below the `if (parsed.rollback)`
- *      early return, so `--rollback` never performs this forward DDL
- *      either -- see main()'s own comment.
+ * SECOND FIX ROUND (categorical, closes the TOCTOU window entirely): the
+ * guard and the ALTER now run inside ONE transaction, in this exact order:
+ *   BEGIN;
+ *   LOCK TABLE <t> IN ACCESS EXCLUSIVE MODE;   -- blocks every concurrent
+ *                                                  writer AND reader for the
+ *                                                  rest of this transaction
+ *   SELECT COUNT(*) WHERE embedding IS NOT NULL; -- nonzero -> ROLLBACK + throw
+ *   <DROP VIEW / DROP INDEX / ALTER / CREATE INDEX / CREATE VIEW>;
+ *   COMMIT;
+ * Because the ACCESS EXCLUSIVE lock is held continuously from immediately
+ * before the count through the ALTER and the COMMIT, nothing can write a
+ * new non-NULL embedding into the window the count and the ALTER used to
+ * leave open -- the check and the use are now the same atomic unit.
+ * `dryRun` mode NEVER takes this lock and NEVER opens this transaction (it
+ * is a plain read-only report, exactly as before) -- see the `dryRun`
+ * branch below, which runs entirely outside of any BEGIN/LOCK.
  */
 async function runAlterLegacyVectorColumn(client, table, log, dryRun = false) {
   const coltype = await getFormatType(client, table, 'embedding');
@@ -460,39 +498,17 @@ async function runAlterLegacyVectorColumn(client, table, log, dryRun = false) {
     return { applied: false, reason: 'unexpected-type' };
   }
 
-  // Runtime safety guard (fix 1 above) -- computed BEFORE any DDL, in both
-  // dry-run and real-apply mode, so the dry-run report and the real
-  // refusal message are backed by the exact same check.
-  const { rows: populatedRows } = await client.query(`SELECT COUNT(*) AS n FROM "${table}" WHERE embedding IS NOT NULL`);
-  const populatedCount = Number(populatedRows[0].n);
-
-  // pg_depend: which views (if any) depend SPECIFICALLY on this column
-  // (not merely on the table)? Live-verified: only v_memory_hits, only on
-  // memory_entry_chunks.embedding. Computed unconditionally (dry-run needs
-  // it for the report too).
-  const { rows: depRows } = await client.query(
-    `SELECT DISTINCT dv.relname AS view_name
-       FROM pg_depend d
-       JOIN pg_rewrite r ON d.objid = r.oid
-       JOIN pg_class dv ON r.ev_class = dv.oid
-       JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
-       JOIN pg_class tc ON tc.oid = d.refobjid
-      WHERE tc.relname = $1 AND a.attname = 'embedding' AND dv.relkind = 'v'`,
-    [table]
-  );
-  const dependentViews = depRows.map((r) => r.view_name);
-
-  const { rows: idxRows } = await client.query(
-    `SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND tablename = $1
-       AND indexdef ILIKE '%vector_cosine_ops%' AND indexdef NOT ILIKE '%WHERE%'`,
-    [table]
-  );
-  const legacyIndexes = idxRows.map((r) => r.indexname);
-
   if (dryRun) {
+    // Report-only: deliberately NO lock, NO transaction. A dry run must
+    // never hold a lock against a real target -- these are plain,
+    // independent, autocommitted reads.
+    const { rows: populatedRows } = await client.query(`SELECT COUNT(*) AS n FROM "${table}" WHERE embedding IS NOT NULL`);
+    const populatedCount = Number(populatedRows[0].n);
+    const dependentViews = await getDependentViews(client, table);
+    const legacyIndexes = await getLegacyIndexes(client, table);
     log(
       `  [DRY-RUN][ALTER] ${table}.embedding: current=${coltype} target=halfvec(4000) populated_rows=${populatedCount} ` +
-      `dependent_views=${JSON.stringify(dependentViews)} legacy_indexes=${JSON.stringify(legacyIndexes)} -- REPORT ONLY, no DDL performed.`
+      `dependent_views=${JSON.stringify(dependentViews)} legacy_indexes=${JSON.stringify(legacyIndexes)} -- REPORT ONLY, no DDL performed, no lock taken.`
     );
     if (populatedCount > 0) {
       log(`  [DRY-RUN][ALTER] REFUSAL-WOULD-FIRE: ${table}.embedding has ${populatedCount} populated row(s) -- a real (non-dry-run) invocation would refuse rather than discard them.`);
@@ -500,17 +516,29 @@ async function runAlterLegacyVectorColumn(client, table, log, dryRun = false) {
     return { applied: false, reason: 'dry-run', dryRun: true, populatedCount, dependentViews, legacyIndexes };
   }
 
-  if (populatedCount > 0) {
-    throw new Error(
-      `G-R2 SAFETY GUARD: refusing to ALTER "${table}".embedding from ${coltype} to halfvec(4000) -- ${populatedCount} row(s) ` +
-      `currently have a non-NULL embedding. "USING NULL" would discard them irrecoverably (no lineage table records a legacy-vector ` +
-      `value -- rollback has no path back). Nothing was altered. If these rows are genuinely safe to clear (e.g. a deliberate ` +
-      `re-embed), NULL them out explicitly first and re-run.`
-    );
-  }
-
   await client.query('BEGIN');
   try {
+    // ACCESS EXCLUSIVE, taken FIRST, before the guard count -- closes the
+    // TOCTOU window: no concurrent transaction can insert/update this
+    // table's rows (or even read them under certain isolation levels, but
+    // that is incidental here -- the write-exclusion is what matters) from
+    // this point until COMMIT/ROLLBACK.
+    await client.query(`LOCK TABLE "${table}" IN ACCESS EXCLUSIVE MODE`);
+
+    const { rows: populatedRows } = await client.query(`SELECT COUNT(*) AS n FROM "${table}" WHERE embedding IS NOT NULL`);
+    const populatedCount = Number(populatedRows[0].n);
+    if (populatedCount > 0) {
+      throw new Error(
+        `G-R2 SAFETY GUARD: refusing to ALTER "${table}".embedding from ${coltype} to halfvec(4000) -- ${populatedCount} row(s) ` +
+        `currently have a non-NULL embedding. "USING NULL" would discard them irrecoverably (no lineage table records a legacy-vector ` +
+        `value -- rollback has no path back). Nothing was altered. If these rows are genuinely safe to clear (e.g. a deliberate ` +
+        `re-embed), NULL them out explicitly first and re-run.`
+      );
+    }
+
+    const dependentViews = await getDependentViews(client, table);
+    const legacyIndexes = await getLegacyIndexes(client, table);
+
     const viewDefs = [];
     for (const viewName of dependentViews) {
       const { rows: defRows } = await client.query(`SELECT pg_get_viewdef($1::regclass, true) AS def`, [viewName]);
@@ -531,10 +559,12 @@ async function runAlterLegacyVectorColumn(client, table, log, dryRun = false) {
     }
 
     // USING NULL, NEVER a cast -- dims differ (1024 vs 4000). Safe here
-    // because the runtime guard above already refused loud on any populated
-    // row; by construction, every row's embedding is already NULL.
+    // because the guard above (inside THIS SAME transaction, under the
+    // ACCESS EXCLUSIVE lock taken before the count) already refused loud on
+    // any populated row; by construction, every row's embedding is already
+    // NULL and cannot have changed since the count.
     await client.query(`ALTER TABLE "${table}" ALTER COLUMN embedding TYPE halfvec(4000) USING NULL`);
-    log(`  [ALTER] ${table}.embedding TYPE ${coltype} -> halfvec(4000) (USING NULL; guard confirmed 0 populated rows).`);
+    log(`  [ALTER] ${table}.embedding TYPE ${coltype} -> halfvec(4000) (USING NULL; guard confirmed 0 populated rows under an ACCESS EXCLUSIVE lock held continuously since).`);
 
     const newIndexName = `${table}_embedding_hnsw_idx`;
     await client.query(
@@ -552,11 +582,11 @@ async function runAlterLegacyVectorColumn(client, table, log, dryRun = false) {
     }
 
     await client.query('COMMIT');
+    return { applied: true, populatedCount: 0 };
   } catch (err) {
-    await client.query('ROLLBACK');
+    await client.query('ROLLBACK').catch(() => {});
     throw err;
   }
-  return { applied: true, populatedCount: 0 };
 }
 
 // ─── EMBED LOOP (G-R3/G-R4/G-R5/G-R7/G-R8/G-R9/G-R10) ──────────────────────
