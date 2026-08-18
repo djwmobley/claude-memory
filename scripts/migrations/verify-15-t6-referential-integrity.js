@@ -30,10 +30,36 @@ const AUTHORED_BY = 'sonnet-t-battery-author-2026-07-27';
 const shared = require('./lib/verify15-shared');
 
 async function checkOrphans(client) {
+  // BF-R5 (cm#188 spec-adversary pass, 2026-08-18): edges.from_entity/
+  // to_entity reference entities BY NAME, not by entities.id -- the schema
+  // itself documents this (scripts/sql/handoff-core-schema.sql: "from_entity
+  // TEXT NOT NULL, -- entities.name (source)"). entities.id is an internal
+  // SERIAL surrogate key never referenced by edges at all; joining on it
+  // (the pre-fix query) is a type mismatch (integer vs text) that fails
+  // outright rather than resolving anything.
+  //
+  // Plain `=` (not IS NOT DISTINCT FROM) is SAFE here per the PR #191
+  // NULL-safe-equality classification discipline: entities.project_id/name
+  // and edges.project_id/from_entity/to_entity are ALL declared TEXT NOT
+  // NULL by DDL (handoff-core-schema.sql) -- NULL is structurally
+  // impossible on either side of this join, so `=`'s NULL-is-unknown
+  // behavior can never silently no-op it. This is the exact opposite shape
+  // of T2/T9's project_id_or_null comparisons, where NULL is a real,
+  // expected value that `=` would silently mishandle.
+  //
+  // Exact-text matching (no case-folding, no .trim()) is INTENTIONAL:
+  // entities carries UNIQUE(project_id, name) (handoff-core-schema.sql),
+  // so an exact-text match resolves to AT MOST ONE entities row by
+  // construction. A case-insensitive or whitespace-normalized join would
+  // risk silently resolving an edge to a DIFFERENT entities row than the
+  // one its writer actually named.
   const { rows: edgeRows } = await client.query(`
     SELECT COUNT(*) AS n FROM edges e
-    WHERE NOT EXISTS (SELECT 1 FROM entities x WHERE x.id = e.from_entity)
-       OR NOT EXISTS (SELECT 1 FROM entities x WHERE x.id = e.to_entity)
+    WHERE NOT EXISTS (
+      SELECT 1 FROM entities x WHERE x.project_id = e.project_id AND x.name = e.from_entity
+    ) OR NOT EXISTS (
+      SELECT 1 FROM entities x WHERE x.project_id = e.project_id AND x.name = e.to_entity
+    )
   `);
   const { rows: chunkRows } = await client.query(`
     SELECT COUNT(*) AS n FROM memory_entry_chunks c

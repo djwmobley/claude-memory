@@ -86,26 +86,69 @@ async function reverseContainment(client, roster) {
  * over every SOURCED roster targetTable (roster-driven, never a
  * hand-enumerated table list), anti-joined against migration_manifest.
  * SOURCELESS (net-new:) targetTables are excluded — see header comment.
+ *
+ * BF-R4 (cm#187 spec-adversary pass, 2026-08-18): `SELECT project_id FROM
+ * ${t}` assumes every SOURCED targetTable carries a project_id column — the
+ * same total-classification gap T2 had (BF-1). Sourced targetTables are now
+ * partitioned via the SAME cached tableHasColumn check T2 uses
+ * (`columnCache`, produced by shared.crossCheckProjectIdScope at the
+ * caller's startup): has-column tables keep the UNION ALL anti-join
+ * unchanged; no-column tables are excluded from it (loudly logged, never
+ * silently dropped) and instead separately reconciled via
+ * shared.reconcileNoColumnTable, per roster entry, so they stay VISIBLE to
+ * T3b rather than falling out of scope entirely.
  */
-async function totalRowcountReconciliation(client, roster) {
+async function totalRowcountReconciliation(client, roster, columnCache) {
   const { sourced } = shared.partitionRoster(roster);
-  const targetTables = [...new Set(sourced.map((e) => e.targetTable))];
-  if (targetTables.length === 0) return [];
+  if (sourced.length === 0) return { unaccounted: [], noColumnResults: [], noColumnTables: [] };
 
-  const unionSql = targetTables
-    .map((t) => `SELECT project_id FROM ${t}`)
-    .join('\nUNION ALL\n');
+  const hasColumnTables = [];
+  const noColumnEntries = [];
+  const seenHasColumnTargets = new Set();
+  for (const entry of sourced) {
+    const hasColumn = columnCache.has(entry.targetTable)
+      ? columnCache.get(entry.targetTable)
+      : await shared.tableHasColumn(client, entry.targetTable, 'project_id');
+    columnCache.set(entry.targetTable, hasColumn);
+    if (hasColumn) {
+      if (!seenHasColumnTargets.has(entry.targetTable)) {
+        hasColumnTables.push(entry.targetTable);
+        seenHasColumnTargets.add(entry.targetTable);
+      }
+    } else {
+      noColumnEntries.push(entry);
+    }
+  }
 
-  const { rows } = await client.query(`
-    SELECT staging.project_id, COUNT(*) AS unaccounted_rows
-    FROM (${unionSql}) staging
-    WHERE NOT EXISTS (
-      SELECT 1 FROM migration_manifest m
-      WHERE m.project_id_or_null = staging.project_id
-    )
-    GROUP BY staging.project_id
-  `);
-  return rows;
+  let unaccounted = [];
+  if (hasColumnTables.length > 0) {
+    const unionSql = hasColumnTables
+      .map((t) => `SELECT project_id FROM ${t}`)
+      .join('\nUNION ALL\n');
+
+    const { rows } = await client.query(`
+      SELECT staging.project_id, COUNT(*) AS unaccounted_rows
+      FROM (${unionSql}) staging
+      WHERE NOT EXISTS (
+        SELECT 1 FROM migration_manifest m
+        WHERE m.project_id_or_null = staging.project_id
+      )
+      GROUP BY staging.project_id
+    `);
+    unaccounted = rows;
+  }
+
+  const noColumnResults = [];
+  for (const entry of noColumnEntries) {
+    const result = await shared.reconcileNoColumnTable(client, entry.targetTable, entry.source_db, entry.source_table);
+    noColumnResults.push({ entry, result });
+  }
+
+  return {
+    unaccounted,
+    noColumnResults,
+    noColumnTables: [...new Set(noColumnEntries.map((e) => e.targetTable))],
+  };
 }
 
 async function main() {
@@ -124,6 +167,12 @@ async function main() {
   try {
     await shared.applyDdl(client);
 
+    // BF-R4/BF-5: same startup total-classification T2 runs -- loud FATAL
+    // on any divergence between live schema and the roster's own
+    // requires_project_id_scope flag, before either check below runs. The
+    // resulting cache is reused by totalRowcountReconciliation's partition.
+    const columnCache = await shared.crossCheckProjectIdScope(client, roster);
+
     const reverseGaps = await reverseContainment(client, roster);
     if (reverseGaps.length > 0) {
       failed = true;
@@ -134,13 +183,30 @@ async function main() {
       console.log('[T3b] OK: reverse containment holds — every target row has a matching source hash.');
     }
 
-    const unaccounted = await totalRowcountReconciliation(client, roster);
+    const { unaccounted, noColumnResults, noColumnTables } = await totalRowcountReconciliation(client, roster, columnCache);
+    if (noColumnTables.length) {
+      console.log(`[T3b] ${noColumnTables.length} sourced targetTable(s) excluded from the project_id anti-join (no project_id column) — reconciled separately below: ${noColumnTables.join(', ')}`);
+    }
     if (unaccounted.length > 0) {
       failed = true;
       console.error(`[T3b] FAIL: ${unaccounted.length} target project_id(s) with rows unaccounted for in migration_manifest:`);
       for (const r of unaccounted) console.error(`  - project_id=${r.project_id}: ${r.unaccounted_rows} unaccounted row(s)`);
     } else {
       console.log('[T3b] OK: every target project_id is accounted for in migration_manifest.');
+    }
+
+    for (const { entry, result } of noColumnResults) {
+      if (result.fatal) {
+        console.error(`[T3b] FATAL: ${result.reason}`);
+        process.exit(1);
+      }
+      const label = `${entry.targetTable} (source_table="${entry.source_table}", no project_id column, ${result.manifestRowsConsidered} manifest row(s) summed)`;
+      if (!result.ok) {
+        failed = true;
+        console.error(`[T3b] FAIL: ${label}: expected ${result.expected}, found ${result.liveCount}`);
+      } else {
+        console.log(`[T3b] OK: ${label}: ${result.liveCount} rows`);
+      }
     }
   } finally {
     await client.end();

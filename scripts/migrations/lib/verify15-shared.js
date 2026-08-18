@@ -326,6 +326,119 @@ function loadRoster() {
   return roster;
 }
 
+// ─── PROJECT_ID COLUMN TOTAL CLASSIFICATION (BF-1/BF-5/BF-R1, cm#187/#188) ───
+
+/**
+ * Does `table` (on `client`'s connection) carry a column named `column`?
+ * The single implementation every verify-15-*.js script and this shared lib
+ * use to total-classify a table's shape before building SQL against it —
+ * moved here from verify-15-t1-snapshot.js (which introduced the pattern
+ * first, for the SOURCE side) so every consumer on both the source and
+ * target side shares one implementation, never a second hand-written copy
+ * (T1 re-exports this same function for backward compatibility).
+ */
+async function tableHasColumn(client, table, column) {
+  const { rows } = await client.query(
+    `SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2`,
+    [table, column]
+  );
+  return rows.length > 0;
+}
+
+/**
+ * BF-1/BF-5 (cm#187 spec-adversary pass, 2026-08-18): migration_manifest's
+ * project_id_or_null nullness is NOT a proxy for whether a TARGET table
+ * physically carries a project_id column — a table can get a NON-NULL
+ * project-scoped manifest row (migrate-verify-own-graph.js's
+ * migrateRetrievalEventAssertions, live proof: manifest id=2548,
+ * project_id='90394596-...', row_count=2930 for retrieval_event_assertions,
+ * a table with NO project_id column at all) purely because the SOURCE side
+ * happened to iterate one project at a time — the column question can only
+ * be answered by asking the TARGET table's live schema, never inferred from
+ * manifest shape.
+ *
+ * This is the single total-classification pass every verify-15-*.js script
+ * that reconciles against target tables must run BEFORE any reconciliation:
+ * for every roster entry, tableHasColumn(client, entry.targetTable,
+ * 'project_id') MUST agree with that entry's own requires_project_id_scope
+ * flag. A disagreement between these two authorities is a LOUD FATAL — never
+ * silently trusted to either side alone (closes BF-5: "two authorities must
+ * never silently diverge").
+ *
+ * Returns a Map<targetTable, boolean> (hasProjectId) for reuse by the
+ * caller's own reconciliation loop — never re-queried table-by-table when a
+ * cached answer already exists for that targetTable in the SAME run.
+ */
+async function crossCheckProjectIdScope(client, roster) {
+  const cache = new Map();
+  const mismatches = [];
+  for (const entry of roster) {
+    const t = entry.targetTable;
+    if (!cache.has(t)) {
+      cache.set(t, await tableHasColumn(client, t, 'project_id'));
+    }
+    const hasColumn = cache.get(t);
+    if (hasColumn !== entry.requires_project_id_scope) {
+      mismatches.push({
+        targetTable: t,
+        sourceTable: entry.source_table,
+        hasColumn,
+        requiresProjectIdScope: entry.requires_project_id_scope,
+      });
+    }
+  }
+  if (mismatches.length > 0) {
+    console.error(`FATAL: roster requires_project_id_scope disagrees with live schema for ${mismatches.length} entr${mismatches.length === 1 ? 'y' : 'ies'} — refusing to reconcile until the roster or the schema is fixed:`);
+    for (const m of mismatches) {
+      console.error(`  - targetTable="${m.targetTable}" (source_table="${m.sourceTable}"): roster says requires_project_id_scope=${m.requiresProjectIdScope}, live schema ${m.hasColumn ? 'HAS' : 'does NOT have'} a project_id column.`);
+    }
+    process.exit(1);
+  }
+  return cache;
+}
+
+/**
+ * BF-R1/BF-R4: reconcile a target table with NO project_id column against
+ * migration_manifest, ONCE for the whole (source_db, source_table) pair —
+ * never once per manifest slice row (that was the original T2 bug: issuing
+ * the SAME live-count query, unconditionally assuming a project_id column,
+ * for every manifest row individually). Every non-excluded manifest row for
+ * this (source_db, source_table) pair is SUMMED (irrespective of
+ * project_id_or_null — a no-column table has no notion of "slice" at all)
+ * and compared against ONE bare COUNT(*) over the target table.
+ *
+ * A manifest row for a no-column table carrying excluded_reason IS NOT NULL
+ * is a LOUD FATAL, never silently ignored or mis-reconciled: a bare
+ * COUNT(*) structurally cannot subtract an excluded project's rows (there is
+ * no project_id column to filter by), so this reconciliation shape is
+ * provably wrong the instant an exclusion exists for a no-column table.
+ *
+ * @returns {Promise<{fatal:true,reason:string}|{fatal:false,ok:boolean,expected:number,liveCount:number,manifestRowsConsidered:number}>}
+ */
+async function reconcileNoColumnTable(client, targetTable, sourceDb, sourceTable) {
+  const { rows: manifestRows } = await client.query(
+    `SELECT row_count, excluded_reason FROM migration_manifest WHERE source_db = $1 AND source_table = $2`,
+    [sourceDb, sourceTable]
+  );
+  const excludedRows = manifestRows.filter((r) => r.excluded_reason !== null);
+  if (excludedRows.length > 0) {
+    return {
+      fatal: true,
+      reason: `targetTable="${targetTable}" (source_db="${sourceDb}" source_table="${sourceTable}") has no project_id column, but ${excludedRows.length} migration_manifest row(s) carry excluded_reason. A bare COUNT(*) over this table cannot subtract an excluded project's rows — this table cannot be safely reconciled this way. Fix: give this table a project_id column, or resolve the exclusion some other way before re-running.`,
+    };
+  }
+  const expected = manifestRows.reduce((sum, r) => sum + Number(r.row_count), 0);
+  const { rows: cntRows } = await client.query(`SELECT COUNT(*) AS n FROM ${targetTable}`);
+  const liveCount = Number(cntRows[0].n);
+  return {
+    fatal: false,
+    ok: liveCount === expected,
+    expected,
+    liveCount,
+    manifestRowsConsidered: manifestRows.length,
+  };
+}
+
 // ─── ROW HASHING (T3's reference implementation, §15.3 — reused everywhere) ─
 
 // A value no real column value can equal by construction. Written as source
@@ -348,19 +461,57 @@ function rowHash(cols, row) {
 }
 
 /**
+ * BF-R3 (cm#187, T3/hashTableMultiset): resolve the REAL idCol/projectCol
+ * for `table` on THIS `client` connection — never assume 'id'/'project_id'
+ * exist just because they're the common case. Source and target sides are
+ * resolved INDEPENDENTLY (this is called once per side, each with its own
+ * `client`) because their column shapes can diverge independently (T1's
+ * source-side tableHasColumn check already established this for
+ * project_id; retrieval_event_assertions additionally has no `id` column
+ * at all — BF-8).
+ *
+ * `opts.idCol`/`opts.projectCol`, when supplied (the roster-level `idCol`
+ * override convention, mirroring the existing embeddingCol/contentCol
+ * override fields), are still VALIDATED against this connection's live
+ * schema via tableHasColumn before use — an override intended for one
+ * table shape must never be blindly trusted against a different one, or
+ * against the side that doesn't actually have it. An override (or the
+ * 'id'/'project_id' default) that doesn't resolve to a real column yields
+ * `null` for that slot — never a crash, never a guess.
+ */
+async function resolveHashCols(client, table, opts = {}) {
+  const idCandidate = opts.idCol || 'id';
+  const projectCandidate = opts.projectCol || 'project_id';
+  const idCol = (await tableHasColumn(client, table, idCandidate)) ? idCandidate : null;
+  const projectCol = (await tableHasColumn(client, table, projectCandidate)) ? projectCandidate : null;
+  return { idCol, projectCol };
+}
+
+/**
  * Hash every row of `table` (via `client`) over `cols`, returning a
  * MULTISET: Map<hash, {count, sample}> — never a Set. Two identical-content
  * rows must count as 2, not collapse to 1 (closes A-8).
+ *
+ * idCol/projectCol are resolved via resolveHashCols (BF-R3) — a table with
+ * neither column (e.g. retrieval_event_assertions: event_id/assertion_id
+ * only) hashes and counts correctly; only per-row SAMPLE logging (id/
+ * project_id, used solely for FAIL diagnostics — never part of the hash
+ * itself, which is computed over `cols` only) is omitted, with an explicit
+ * log line, never a silent gap and never a crash.
  */
-async function hashTableMultiset(client, table, cols, { idCol = 'id', projectCol = 'project_id' } = {}) {
-  const selectCols = [idCol, projectCol, ...cols].filter((c, i, a) => a.indexOf(c) === i);
+async function hashTableMultiset(client, table, cols, opts = {}) {
+  const { idCol, projectCol } = await resolveHashCols(client, table, opts);
+  if (!idCol) {
+    console.log(`  [INFO] ${table}: no resolvable id column (checked "${opts.idCol || 'id'}") — per-row sample logging omitted for this table's hash multiset; the hash itself (over loadBearingCols) is unaffected.`);
+  }
+  const selectCols = [idCol, projectCol, ...cols].filter((c) => c !== null).filter((c, i, a) => a.indexOf(c) === i);
   const { rows } = await client.query(`SELECT ${selectCols.map((c) => `"${c}"`).join(', ')} FROM ${table}`);
   const counts = new Map();
   for (const r of rows) {
     const h = rowHash(cols, r);
     const entry = counts.get(h) || { count: 0, sample: [] };
     entry.count += 1;
-    if (entry.sample.length < 3) entry.sample.push({ id: r[idCol], project_id: r[projectCol] });
+    if (entry.sample.length < 3) entry.sample.push({ id: idCol ? r[idCol] : undefined, project_id: projectCol ? r[projectCol] : undefined });
     counts.set(h, entry);
   }
   return counts;
@@ -380,8 +531,17 @@ async function hashTableMultiset(client, table, cols, { idCol = 'id', projectCol
  * no filter (the WHERE clause is omitted entirely in that case, not run
  * with an empty unnest — cheaper and avoids a degenerate-array edge case).
  */
-async function hashTableMultisetExcludingProjects(client, table, cols, excludedProjectIds, { idCol = 'id', projectCol = 'project_id' } = {}) {
-  const selectCols = [idCol, projectCol, ...cols].filter((c, i, a) => a.indexOf(c) === i);
+async function hashTableMultisetExcludingProjects(client, table, cols, excludedProjectIds, opts = {}) {
+  const { idCol, projectCol } = await resolveHashCols(client, table, opts);
+  if (excludedProjectIds && excludedProjectIds.length > 0 && !projectCol) {
+    // A project-scoped exclusion can only exist for a project_id-scoped
+    // table by construction (project_id_or_null must be non-null to be
+    // "project-scoped" at all) — reaching this with a genuinely no-column
+    // table would mean the manifest and the live schema have already
+    // diverged (BF-5's job to catch upstream). Loud, not a silent no-op.
+    throw new Error(`hashTableMultisetExcludingProjects: table "${table}" has no resolvable project_id column, but ${excludedProjectIds.length} excluded project id(s) were supplied — cannot scope the exclusion filter.`);
+  }
+  const selectCols = [idCol, projectCol, ...cols].filter((c) => c !== null).filter((c, i, a) => a.indexOf(c) === i);
   let sql = `SELECT ${selectCols.map((c) => `"${c}"`).join(', ')} FROM ${table}`;
   const params = [];
   if (excludedProjectIds && excludedProjectIds.length > 0) {
@@ -394,7 +554,7 @@ async function hashTableMultisetExcludingProjects(client, table, cols, excludedP
     const h = rowHash(cols, r);
     const entry = counts.get(h) || { count: 0, sample: [] };
     entry.count += 1;
-    if (entry.sample.length < 3) entry.sample.push({ id: r[idCol], project_id: r[projectCol] });
+    if (entry.sample.length < 3) entry.sample.push({ id: idCol ? r[idCol] : undefined, project_id: projectCol ? r[projectCol] : undefined });
     counts.set(h, entry);
   }
   return counts;
@@ -692,8 +852,12 @@ module.exports = {
   validateRosterSourceDbShapes,
   validateRosterPartitionDisjoint,
   loadRoster,
+  tableHasColumn,
+  crossCheckProjectIdScope,
+  reconcileNoColumnTable,
   NULL_SENTINEL,
   rowHash,
+  resolveHashCols,
   hashTableMultiset,
   hashTableMultisetExcludingProjects,
   loadExclusionsFor,
