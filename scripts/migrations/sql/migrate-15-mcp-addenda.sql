@@ -27,6 +27,16 @@ ALTER TABLE retrieval_contract ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAU
 -- suppress operations and entityCreate's revival semantics both require
 -- this column. edges.suppressed additionally lets edgeSuppress mark an edge
 -- retracted without a destructive DELETE.
+--
+-- CANON NOTE (columns-canon fix): these two columns are now ALSO defined in
+-- scripts/sql/handoff-core-schema.sql and scripts/sql/handoff-sqlite-schema.sql
+-- (the cm#185 bring-forward canon, auto-applied to every live project DB).
+-- This file's applier (migrate-15-mcp-addenda.js) has no live-DB path either
+-- — same structural gap as attribution-columns.sql (see that file's own
+-- CANON NOTE for the full rationale). This file is UNCHANGED and stays as
+-- the staging applier; idempotent against a DB that already has the columns
+-- via canon. Future columns on engine-core tables go to the canon files
+-- FIRST, never here first.
 ALTER TABLE entities ADD COLUMN IF NOT EXISTS suppressed BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE edges ADD COLUMN IF NOT EXISTS suppressed BOOLEAN NOT NULL DEFAULT false;
 

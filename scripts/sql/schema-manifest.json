@@ -35,7 +35,15 @@
           { "table": "assertions", "column": "corroboration_count" },
           { "table": "assertions", "column": "reality_check" },
           { "table": "assertions", "column": "anchor" },
-          { "table": "retrieval_contract", "column": "version" }
+          { "table": "retrieval_contract", "column": "version" },
+          { "table": "entities", "column": "source_model" },
+          { "table": "entities", "column": "agent_id" },
+          { "table": "entities", "column": "suppressed" },
+          { "table": "assertions", "column": "source_model" },
+          { "table": "assertions", "column": "agent_id" },
+          { "table": "edges", "column": "source_model" },
+          { "table": "edges", "column": "agent_id" },
+          { "table": "edges", "column": "suppressed" }
         ],
         "indexes": [
           "entities_project_idx",
@@ -87,7 +95,15 @@
           { "table": "assertions", "column": "corroboration_count" },
           { "table": "assertions", "column": "reality_check" },
           { "table": "assertions", "column": "anchor" },
-          { "table": "retrieval_contract", "column": "version" }
+          { "table": "retrieval_contract", "column": "version" },
+          { "table": "entities", "column": "source_model" },
+          { "table": "entities", "column": "agent_id" },
+          { "table": "entities", "column": "suppressed" },
+          { "table": "assertions", "column": "source_model" },
+          { "table": "assertions", "column": "agent_id" },
+          { "table": "edges", "column": "source_model" },
+          { "table": "edges", "column": "agent_id" },
+          { "table": "edges", "column": "suppressed" }
         ],
         "indexes": [
           "entities_project_idx",
