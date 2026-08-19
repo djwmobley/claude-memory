@@ -1,6 +1,6 @@
 'use strict';
 
-const AUTHORED_BY = 'sonnet-t-battery-author-2026-07-27';
+const AUTHORED_BY = 'sonnet-cm194-196-197-199-author-2026-08-18';
 
 /**
  * verify-15-t0-roster.js — T0, roster totality (§15.2, closes A-1).
@@ -185,6 +185,9 @@ async function main() {
   console.log(`verify-15-t0-roster: target="${target}" (resolved from ${source})`);
 
   const roster = shared.loadRoster();
+  const { path: triagePath, databases: dbTriage } = shared.loadDbTriageForAudit(argv);
+  console.log(`[T0] db-triage: ${dbTriage ? `loaded from "${triagePath}" (${dbTriage.size} classified db(s))` : `absent at "${triagePath}" -- every plain-db-name manifest row classifies UNTRIAGED`}`);
+  const rosterPairSet = shared.buildRosterPairSet(roster);
   const { sourced, sourceless } = shared.partitionRoster(roster);
 
   if (sourceless.length) {
@@ -223,7 +226,7 @@ async function main() {
         FROM roster_t0 r
         WHERE NOT EXISTS (
           SELECT 1 FROM migration_manifest m
-          WHERE m.source_db = r.source_db AND m.source_table = r.source_table
+          WHERE m.source_db = r.source_db AND m.source_table = r.source_table AND m.retired_at IS NULL
         )
         ORDER BY r.source_db, r.source_table
       `);
@@ -237,28 +240,60 @@ async function main() {
       }
     }
 
-    // ── Inverse direction: every non-excluded manifest pair has a roster
-    // entry (see header comment for the excluded_reason IS NULL scoping) ──
-    const { rows: inverseGaps } = await client.query(`
-      SELECT DISTINCT m.source_db, m.source_table
-      FROM migration_manifest m
-      WHERE m.excluded_reason IS NULL
-        AND NOT EXISTS (
-          SELECT 1 FROM roster_t0 r
-          WHERE r.source_db = m.source_db AND r.source_table = m.source_table
-        )
-      ORDER BY m.source_db, m.source_table
-    `);
+    // ── Inverse direction: every non-excluded, RETAINED manifest pair has a
+    // roster entry (cm#197, S3' Phase 1). excluded_reason IS NOT NULL rows
+    // are skipped BEFORE Phase-1 classification even runs — this is T0's
+    // OWN, pre-existing, deliberate rule (see this file's header comment:
+    // an excluded slice must remain recordable without roster membership)
+    // and is orthogonal to Phase 1, which classifies by SOURCE_DB provenance
+    // alone and has no opinion on excluded_reason. For every OTHER
+    // (non-excluded) row: a disposable EPHEMERAL-DROP/ENGINE-INFRA-
+    // classified, roster-UNPAIRED source_db (verified live leakage:
+    // claude_memory_eval_ci/test, adv175_*_corpus) is EXCLUDE-BY-TRIAGE-
+    // classified and REMOVED from consideration here entirely — it never
+    // contributes an inverse gap, and it is never silently ignored either:
+    // shared.classifyManifestRow logs it loud, named, every run. A row
+    // whose db is OWNER-REVIEW-classified, or UNTRIAGED-and-roster-unpaired,
+    // is a Phase-1 FAIL (never a script-halting FATAL — see
+    // shared.classifyManifestRow's own header comment) reported here and
+    // folded into this script's overall exit code, but it does not block
+    // T0 from finishing every other check. Uses the SAME
+    // shared.classifyManifestRow Phase-1 classifier T2/T4/T9 consume —
+    // never a T0-local copy. ──
+    const { rows: allManifestRows } = await client.query(
+      `SELECT id, source_db, source_table, project_id_or_null, row_count, excluded_reason, retired_at FROM migration_manifest`
+    );
+    const nonExcludedRetainedPairs = new Set();
+    for (const row of allManifestRows) {
+      if (row.excluded_reason !== null) continue; // T0's own pre-existing exemption -- unrelated to Phase 1
+      const result = shared.classifyManifestRow(row, { dbTriage, rosterPairSet });
+      if (result.fail) {
+        failed = true;
+        console.error(`[T0] FAIL (inverse phase-1, ${result.branch}): ${result.reason}`);
+        continue;
+      }
+      if (result.warn) console.error(`[T0] WARN (inverse phase-1, ${result.branch}): ${result.reason}`);
+      if (result.info && result.branch === 'EXCLUDE-BY-TRIAGE') console.log(`[T0] INFO (inverse phase-1, ${result.branch}): ${result.reason}`);
+      if (result.retain) {
+        nonExcludedRetainedPairs.add(JSON.stringify([row.source_db, row.source_table]));
+      }
+    }
     await client.query('COMMIT');
+
+    const sourcedPairSet = new Set(sourced.map((e) => JSON.stringify([e.source_db, e.source_table])));
+    const inverseGaps = [...nonExcludedRetainedPairs]
+      .filter((key) => !sourcedPairSet.has(key))
+      .map((key) => JSON.parse(key))
+      .sort((a, b) => (a[0] + a[1]).localeCompare(b[0] + b[1]));
 
     if (inverseGaps.length) {
       failed = true;
-      console.error(`[T0] FAIL (inverse): ${inverseGaps.length} non-excluded migration_manifest pair(s) have NO roster entry:`);
-      for (const r of inverseGaps) {
-        console.error(`  - ${r.source_db} / ${r.source_table} — unregistered source: roster is the total classification; if this is a newly-landed backfill source, reclassify the target's sourceless roster entry to this real source.`);
+      console.error(`[T0] FAIL (inverse): ${inverseGaps.length} non-excluded, retained migration_manifest pair(s) have NO roster entry:`);
+      for (const [sourceDb, sourceTable] of inverseGaps) {
+        console.error(`  - ${sourceDb} / ${sourceTable} — unregistered source: roster is the total classification; if this is a newly-landed backfill source, reclassify the target's sourceless roster entry to this real source.`);
       }
     } else {
-      console.log('[T0] OK (inverse): every non-excluded migration_manifest pair has a roster entry.');
+      console.log('[T0] OK (inverse): every non-excluded, retained migration_manifest pair has a roster entry.');
     }
 
     // ── Live-table total classification (see header comment) ──────────────

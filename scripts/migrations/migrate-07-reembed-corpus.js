@@ -527,9 +527,19 @@ function manifestLabelsForTable(roster, table) {
 
 async function getManifestExcludedProjectIds(client, roster, table) {
   const labels = manifestLabelsForTable(roster, table);
+  // cm#197 (2026-08-18): retired_at IS NULL -- a RETIRED manifest row (a
+  // leaked test-fixture artifact, cured via
+  // cure-migration-manifest-retirement.js rather than excluded_reason,
+  // precisely so a leaked row for a target/project bucket that also
+  // carries hundreds of LEGITIMATE live rows never poisons this
+  // embedding-exclusion set) must never be treated as a real exclusion here
+  // -- excluding a live project's real rows from re-embedding because a
+  // disposed-of bookkeeping row happened to name the same project_id would
+  // be exactly the collision retirement (over excluded_reason) exists to
+  // avoid.
   const { rows } = await client.query(
     `SELECT DISTINCT project_id_or_null FROM migration_manifest
-      WHERE source_table = ANY($1::text[]) AND excluded_reason IS NOT NULL AND project_id_or_null IS NOT NULL`,
+      WHERE source_table = ANY($1::text[]) AND excluded_reason IS NOT NULL AND project_id_or_null IS NOT NULL AND retired_at IS NULL`,
     [labels]
   );
   return new Set(rows.map((r) => r.project_id_or_null));
@@ -561,8 +571,10 @@ function pkWhereClause(cols, offset) {
 // ─── G-R11 PREFLIGHT (reuses verify-15-t9-negative.checkExclusion by reference) ─
 
 async function runPreflight(client, roster, log) {
+  // cm#197: retired_at IS NULL -- a retired (cured) exclusion-recording row
+  // is disposed-of bookkeeping and must never be re-verified here forever.
   const { rows: exclusions } = await client.query(
-    `SELECT DISTINCT source_db, excluded_reason, source_table, project_id_or_null FROM migration_manifest WHERE excluded_reason IS NOT NULL`
+    `SELECT DISTINCT source_db, excluded_reason, source_table, project_id_or_null FROM migration_manifest WHERE excluded_reason IS NOT NULL AND retired_at IS NULL`
   );
   if (exclusions.length === 0) {
     log('  [PREFLIGHT] OK: zero excluded_reason slices present in migration_manifest -- nothing to verify (T9-equivalent trivial pass).');

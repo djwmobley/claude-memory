@@ -1,6 +1,6 @@
 'use strict';
 
-const AUTHORED_BY = 'sonnet-t-battery-author-2026-07-27';
+const AUTHORED_BY = 'sonnet-cm194-196-197-199-author-2026-08-18';
 
 /**
  * verify-15-t4-recall-equivalence.js — T4, recall-equivalence harness
@@ -85,14 +85,59 @@ function assertFixtureCoverageComplete(fixtures, manifestPairs) {
   return manifestPairs.filter((pair) => !covered.has(`${pair.targetTable}::${pair.projectId}`));
 }
 
-async function getManifestPairs(client, roster) {
+/**
+ * cm#196/#197 Phase 1 (shared.classifyManifestRow, the SAME classifier
+ * T0/T2/T9 consume): walks every NON-EXCLUDED, project-scoped
+ * migration_manifest row (the same excluded_reason IS NULL / project_id_or_
+ * null IS NOT NULL scope this function has always used — excluded and
+ * NULL-scoped rows are filtered out BEFORE Phase 1 runs, never classified at
+ * all, mirroring T0's identical "excluded_reason is T0/T4's own pre-existing
+ * exemption, orthogonal to Phase 1" rule) so retired/EXCLUDE-BY-TRIAGE rows
+ * never force a fixture-coverage requirement for disposable bookkeeping
+ * data, and a Phase-1 FAIL (OWNER-REVIEW / UNTRIAGED-unpaired — never a
+ * script-halting FATAL, see shared.classifyManifestRow's own header comment)
+ * is reported and excluded from the pair set rather than silently
+ * reconciled. targetTable is resolved via shared.buildTargetTableByPairMap
+ * — keyed on the full (source_db, source_table) pair, never source_table
+ * alone (the same matcher-bug fix T2/T9 apply; this function used to
+ * collapse via `new Map(roster.map(e => [e.source_table, e.targetTable]))`,
+ * silently picking whichever roster entry happened to be LAST in array
+ * order for a reused source_table name).
+ */
+async function getManifestPairs(client, roster, ctx) {
+  const { dbTriage, rosterPairSet, pairMap } = ctx;
   const { rows } = await client.query(
-    `SELECT DISTINCT source_table, project_id_or_null FROM migration_manifest WHERE excluded_reason IS NULL AND project_id_or_null IS NOT NULL`
+    `SELECT id, source_db, source_table, project_id_or_null, row_count, excluded_reason, retired_at
+     FROM migration_manifest WHERE excluded_reason IS NULL AND project_id_or_null IS NOT NULL`
   );
-  const bySourceTable = new Map(roster.map((e) => [e.source_table, e.targetTable]));
-  return rows
-    .map((r) => ({ targetTable: bySourceTable.get(r.source_table), projectId: r.project_id_or_null }))
-    .filter((p) => p.targetTable);
+  const pairs = [];
+  let failCount = 0;
+  for (const row of rows) {
+    const result = shared.classifyManifestRow(row, { dbTriage, rosterPairSet });
+    if (result.fail) {
+      failCount++;
+      console.error(`[T4] FAIL (phase 1, ${result.branch}): ${result.reason}`);
+      continue;
+    }
+    if (result.warn) console.error(`[T4] WARN (phase 1, ${result.branch}): ${result.reason}`);
+    if (!result.retain) continue;
+    const targetTable = shared.resolveTargetTableForPair(pairMap, row.source_db, row.source_table);
+    if (targetTable) pairs.push({ targetTable, projectId: row.project_id_or_null });
+  }
+  if (failCount > 0) {
+    console.error(`[T4] ${failCount} manifest row(s) failed phase-1 classification (see FAIL lines above) -- excluded from the fixture-coverage requirement; this does not stop T4 from checking the rest.`);
+  }
+  // De-duplicate (targetTable, projectId) pairs -- multiple contributing
+  // manifest rows for the same slice (cm#196) only need ONE fixture query.
+  const seen = new Set();
+  const deduped = [];
+  for (const p of pairs) {
+    const key = `${p.targetTable}::${p.projectId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(p);
+  }
+  return { pairs: deduped, failCount };
 }
 
 async function runFactQuery(srcClient, tgtClient, q) {
@@ -131,6 +176,11 @@ async function main() {
   }
 
   const roster = shared.loadRoster();
+  const rosterPath = shared.resolveRosterPath();
+  const { path: triagePath, databases: dbTriage } = shared.loadDbTriageForAudit(argv);
+  console.log(`[T4] db-triage: ${dbTriage ? `loaded from "${triagePath}" (${dbTriage.size} classified db(s))` : `absent at "${triagePath}" -- every plain-db-name manifest row classifies UNTRIAGED`}`);
+  const rosterPairSet = shared.buildRosterPairSet(roster);
+  const pairMap = shared.buildTargetTableByPairMap(roster, rosterPath);
   const fixtures = loadFixtures();
 
   const tgtClient = await shared.connect(target);
@@ -138,7 +188,8 @@ async function main() {
   try {
     await shared.applyDdl(tgtClient);
 
-    const manifestPairs = await getManifestPairs(tgtClient, roster);
+    const { pairs: manifestPairs, failCount: phase1FailCount } = await getManifestPairs(tgtClient, roster, { dbTriage, rosterPairSet, pairMap });
+    if (phase1FailCount > 0) failed = true;
     const missingCoverage = assertFixtureCoverageComplete(fixtures, manifestPairs);
     if (missingCoverage.length > 0) {
       console.error(`[T4] FATAL: fixture coverage precondition FAILED — ${missingCoverage.length} migration_manifest (table, project) pair(s) have zero fixture queries:`);

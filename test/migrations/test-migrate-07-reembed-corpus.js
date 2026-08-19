@@ -417,7 +417,11 @@ async function main() {
       CREATE UNIQUE INDEX embedding_providers_is_default_unique_idx
         ON embedding_providers (is_default) WHERE is_default;
 
-      -- migration_manifest (minimal shape this script reads from -- G-R7/G-R11)
+      -- migration_manifest (minimal shape this script reads from -- G-R7/G-R11).
+      -- retired_at (cm#197, 2026-08-18): getManifestExcludedProjectIds/
+      -- runPreflight now filter WHERE retired_at IS NULL (see
+      -- verify15-shared.js's DDL_SQL, the canonical shape this mirrors) --
+      -- included here so this test's private minimal DDL stays in sync.
       CREATE TABLE migration_manifest (
         id SERIAL PRIMARY KEY,
         source_db TEXT NOT NULL,
@@ -426,7 +430,9 @@ async function main() {
         row_count BIGINT NOT NULL,
         content_fingerprint TEXT NOT NULL,
         captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        excluded_reason TEXT
+        excluded_reason TEXT,
+        retired_at TIMESTAMPTZ,
+        retired_note TEXT
       );
 
       -- Bucket C (declared expression, has a 'suppressed' column -- exempt-

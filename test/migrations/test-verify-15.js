@@ -148,6 +148,10 @@ function rosterEnv(rosterPath) {
   return { SOURCE_TABLE_ROSTER: rosterPath };
 }
 
+function triageEnv(triagePath) {
+  return { DB_TRIAGE_PATH: triagePath };
+}
+
 // ── Fixture schema helpers ────────────────────────────────────────────────────
 
 async function setupTargetSchema(client) {
@@ -402,7 +406,13 @@ async function testT0InverseDirection() {
     );
 
     // (i) A non-excluded manifest pair with NO roster entry -> T0 FAILs,
-    // listing it by name.
+    // listing it by name. cm#197 (S3' Phase 1): this row's source_db is
+    // UNTRIAGED (no --triage passed) AND roster-unpaired for "gotchas", so
+    // it now surfaces as a Phase-1 "UNTRIAGED-UNPAIRED-FAIL" (the SAME
+    // shared classifier T2/T4/T9 consume) rather than the old bespoke
+    // "unregistered source" inverse-anti-join message -- a superset of the
+    // original check, not a narrowing: this exact row shape is still a
+    // loud, named FAIL, just with a more informative message.
     await target.query(
       `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint, excluded_reason)
        VALUES ($1,'gotchas','proj-a',3,'fp-gotchas',NULL)`,
@@ -410,10 +420,10 @@ async function testT0InverseDirection() {
     );
     const r1 = runScript('verify-15-t0-roster.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
     const out1 = r1.stdout + r1.stderr;
-    if (r1.status !== 0 && /FAIL \(inverse\)/.test(out1) && new RegExp(`${SOURCE_DB} / gotchas`).test(out1) && /unregistered source/.test(out1)) {
-      pass('T0-inverse-i', 'non-excluded manifest pair with no roster entry -> T0 FAILs, listing it');
+    if (r1.status !== 0 && /FAIL \(inverse phase-1, UNTRIAGED-UNPAIRED-FAIL\)/.test(out1) && new RegExp(`source_db="${SOURCE_DB}" source_table="gotchas"`).test(out1) && /cannot account for this row/.test(out1)) {
+      pass('T0-inverse-i', 'non-excluded manifest pair with no roster entry -> T0 FAILs (Phase 1, UNTRIAGED-UNPAIRED-FAIL), listing it');
     } else {
-      fail('T0-inverse-i', 'non-excluded manifest pair with no roster entry -> T0 FAILs, listing it', `status=${r1.status} stdout=${r1.stdout} stderr=${r1.stderr}`);
+      fail('T0-inverse-i', 'non-excluded manifest pair with no roster entry -> T0 FAILs (Phase 1, UNTRIAGED-UNPAIRED-FAIL), listing it', `status=${r1.status} stdout=${r1.stdout} stderr=${r1.stderr}`);
     }
 
     // (ii) Same shape, but EXCLUDED -> T0 still PASSes (no false positive).
@@ -2092,6 +2102,552 @@ async function testNotInSweep() {
   }
 }
 
+// ── T5 rewrite: six-branch classification (cm#194) ──────────────────────────
+
+async function testT5PhaseClassification() {
+  const target = await pgConnect(TARGET_DB);
+  try {
+    await truncateAll(target, ['decisions', 'tasks']);
+
+    // Branch (ii): live-embeddable, NO roster content-bearing coverage at
+    // all, but migrate-07 declares a CONTENT_EXPRESSIONS entry for
+    // "sessions" -- checked anyway (live instance: sessions).
+    await target.query('DROP TABLE IF EXISTS sessions');
+    await target.query(`CREATE TABLE sessions (id SERIAL PRIMARY KEY, project_id TEXT NOT NULL, summary TEXT, embedding halfvec(4000))`);
+    try {
+      await target.query(`INSERT INTO sessions (project_id, summary) VALUES ('proj-a', 'a real session summary')`);
+      const rosterPath = writeTmpJson('t5-branch-ii-roster.json', [BASE_ROSTER[0]]); // decisions only -- sessions has ZERO roster entries
+      const r1 = runScript('verify-15-t5-embedding-coverage.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+      if (r1.status !== 0 && /INFO \(ii\): sessions/.test(r1.stdout) && /FAIL \(ii\): sessions/.test(r1.stdout + r1.stderr)) {
+        pass('T5-branch-ii-a', 'sessions: live-embeddable, no roster coverage, declared CONTENT_EXPRESSIONS -> checked anyway, unembedded -> FAIL');
+      } else {
+        fail('T5-branch-ii-a', 'sessions: live-embeddable, no roster coverage, declared CONTENT_EXPRESSIONS -> checked anyway, unembedded -> FAIL', `status=${r1.status} stdout=${r1.stdout} stderr=${r1.stderr}`);
+      }
+      const fakeVec = `[${Array(4000).fill('0').join(',')}]`;
+      await target.query(`UPDATE sessions SET embedding = $1::halfvec(4000)`, [fakeVec]);
+      const r2 = runScript('verify-15-t5-embedding-coverage.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+      if (r2.status === 0 && /OK \(ii\): sessions/.test(r2.stdout)) {
+        pass('T5-branch-ii-b', 'sessions: embedded -> PASS via declared expression, no roster coverage required');
+      } else {
+        fail('T5-branch-ii-b', 'sessions: embedded -> PASS via declared expression, no roster coverage required', `status=${r2.status} stdout=${r2.stdout} stderr=${r2.stderr}`);
+      }
+    } finally {
+      await target.query('DROP TABLE IF EXISTS sessions');
+    }
+
+    // Branch (v): roster claims hasContentBearingText=false for "tasks",
+    // but tasks IS live-embeddable (has a real embedding column) -- the
+    // tasks A-5 class. Scoped ALTER on the shared `tasks` fixture table,
+    // reverted in finally so it never leaks into other tests sharing
+    // TARGET_DB.
+    await target.query('ALTER TABLE tasks ADD COLUMN IF NOT EXISTS embedding halfvec(4000)');
+    try {
+      const rosterPath = writeTmpJson('t5-branch-v-roster.json', BASE_ROSTER); // tasks entry: hasContentBearingText=false
+      const r3 = runScript('verify-15-t5-embedding-coverage.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+      if (r3.status !== 0 && /FAIL \(v\): tasks/.test(r3.stdout + r3.stderr) && /the tasks A-5 class/.test(r3.stdout + r3.stderr)) {
+        pass('T5-branch-v', 'tasks: roster says false but table IS live-embeddable -> FAIL (the tasks A-5 class)');
+      } else {
+        fail('T5-branch-v', 'tasks: roster says false but table IS live-embeddable -> FAIL (the tasks A-5 class)', `status=${r3.status} stdout=${r3.stdout} stderr=${r3.stderr}`);
+      }
+    } finally {
+      await target.query('ALTER TABLE tasks DROP COLUMN IF EXISTS embedding');
+    }
+
+    // Phantom contentCol -> loud FATAL naming the roster row, regardless of
+    // flag value or eventual use.
+    {
+      const phantomRoster = [
+        { ...BASE_ROSTER[0], contentCol: 'this_column_does_not_exist' },
+      ];
+      const rosterPath = writeTmpJson('t5-phantom-roster.json', phantomRoster);
+      const r4 = runScript('verify-15-t5-embedding-coverage.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+      if (r4.status !== 0 && /FATAL/.test(r4.stdout + r4.stderr) && /phantom contentCol/.test(r4.stdout + r4.stderr) && /this_column_does_not_exist/.test(r4.stdout + r4.stderr)) {
+        pass('T5-phantom-contentcol', 'phantom contentCol -> loud FATAL naming the roster row');
+      } else {
+        fail('T5-phantom-contentcol', 'phantom contentCol -> loud FATAL naming the roster row', `status=${r4.status} stdout=${r4.stdout} stderr=${r4.stderr}`);
+      }
+    }
+
+    // Conflicting contentCol on a targetTable with NO declared expression
+    // -> loud FAIL naming every entry (never first-entry-wins).
+    await target.query('DROP TABLE IF EXISTS t5_conflict_table');
+    await target.query(`CREATE TABLE t5_conflict_table (id SERIAL PRIMARY KEY, project_id TEXT NOT NULL, col_a TEXT, col_b TEXT, embedding halfvec(4000))`);
+    try {
+      const conflictRoster = [
+        { source_db: SOURCE_DB, source_table: 't5_conflict_source_a', targetTable: 't5_conflict_table',
+          loadBearingCols: ['col_a'], hasContentBearingText: true, requires_project_id_scope: true, contentCol: 'col_a' },
+        { source_db: SOURCE_DB, source_table: 't5_conflict_source_b', targetTable: 't5_conflict_table',
+          loadBearingCols: ['col_b'], hasContentBearingText: true, requires_project_id_scope: true, contentCol: 'col_b' },
+      ];
+      const rosterPath = writeTmpJson('t5-conflict-roster.json', conflictRoster);
+      const r5 = runScript('verify-15-t5-embedding-coverage.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+      if (r5.status !== 0 && /conflicting contentCol values/.test(r5.stdout + r5.stderr) && /col_a/.test(r5.stdout + r5.stderr) && /col_b/.test(r5.stdout + r5.stderr)) {
+        pass('T5-conflicting-contentcol', 'conflicting contentCol values on a table with no declared expression -> loud FAIL naming every entry');
+      } else {
+        fail('T5-conflicting-contentcol', 'conflicting contentCol values on a table with no declared expression -> loud FAIL naming every entry', `status=${r5.status} stdout=${r5.stdout} stderr=${r5.stderr}`);
+      }
+    } finally {
+      await target.query('DROP TABLE IF EXISTS t5_conflict_table');
+    }
+
+    // Object.hasOwn guard: a live-embeddable table literally named
+    // "constructor" (a real, inherited Object.prototype property) must NOT
+    // resolve a declared CONTENT_EXPRESSIONS entry via prototype-chain
+    // lookup -- it has zero roster entries, so it must classify as branch
+    // (iii) "unclassifiable" (a clean, named FAIL), never crash trying to
+    // use Function.prototype.toString's source as a SQL expression.
+    await target.query('DROP TABLE IF EXISTS "constructor"');
+    await target.query(`CREATE TABLE "constructor" (id SERIAL PRIMARY KEY, project_id TEXT NOT NULL, embedding halfvec(4000))`);
+    try {
+      const rosterPath = writeTmpJson('t5-hasown-roster.json', [BASE_ROSTER[0]]); // "constructor" has ZERO roster entries
+      const r6 = runScript('verify-15-t5-embedding-coverage.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+      const out = r6.stdout + r6.stderr;
+      if (r6.status !== 0 && /FAIL \(iii\): constructor/.test(out) && /genuinely unclassifiable/.test(out) && !/TypeError|is not a function/.test(out)) {
+        pass('T5-hasown-guard', '"constructor"-named table does not resolve CONTENT_EXPRESSIONS via inherited Object.prototype property -> classifies branch (iii), never crashes');
+      } else {
+        fail('T5-hasown-guard', '"constructor"-named table does not resolve CONTENT_EXPRESSIONS via inherited Object.prototype property -> classifies branch (iii), never crashes', `status=${r6.status} stdout=${r6.stdout} stderr=${r6.stderr}`);
+      }
+    } finally {
+      await target.query('DROP TABLE IF EXISTS "constructor"');
+    }
+  } finally {
+    await target.end();
+  }
+}
+
+// ── T6 rewrite: checkProjectIdCoverage relkind matrix (cm#199) ──────────────
+
+async function testT6RelkindMatrix() {
+  const target = await pgConnect(TARGET_DB);
+  try {
+    await truncateAll(target, ['edges', 'entities', 'memory_entries', 'memory_entry_chunks']);
+
+    // View branch, clean (all live rows non-NULL) -> PASS.
+    await target.query('DROP VIEW IF EXISTS t6_view_ok');
+    await target.query('DROP TABLE IF EXISTS t6_view_base');
+    await target.query('CREATE TABLE t6_view_base (id SERIAL PRIMARY KEY, project_id TEXT NOT NULL)');
+    await target.query('CREATE VIEW t6_view_ok AS SELECT project_id FROM t6_view_base');
+    try {
+      await target.query(`INSERT INTO t6_view_base (project_id) VALUES ('proj-a'), ('proj-b')`);
+      const rosterPath = writeTmpJson('t6-relkind-view-ok.json', [
+        ...BASE_ROSTER,
+        { source_db: SOURCE_DB, source_table: 't6_view_ok', targetTable: 't6_view_ok', loadBearingCols: ['project_id'], hasContentBearingText: false, requires_project_id_scope: true },
+      ]);
+      const r1 = runScript('verify-15-t6-referential-integrity.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+      if (r1.status === 0 && /INFO: "t6_view_ok" is a VIEW/.test(r1.stdout)) {
+        pass('T6-relkind-view-ok', 'view branch, zero live NULL project_id rows -> PASS, with the structural-limitation INFO line');
+      } else {
+        fail('T6-relkind-view-ok', 'view branch, zero live NULL project_id rows -> PASS, with the structural-limitation INFO line', `status=${r1.status} stdout=${r1.stdout} stderr=${r1.stderr}`);
+      }
+    } finally {
+      await target.query('DROP VIEW IF EXISTS t6_view_ok');
+      await target.query('DROP TABLE IF EXISTS t6_view_base');
+    }
+
+    // View branch, a live NULL project_id row -> FAIL via data-level probe
+    // (is_nullable is SKIPPED entirely for a view -- this proves the probe,
+    // not a constraint check, is what catches it).
+    await target.query('DROP VIEW IF EXISTS t6_view_bad');
+    await target.query('DROP TABLE IF EXISTS t6_view_src');
+    await target.query('CREATE TABLE t6_view_src (id SERIAL PRIMARY KEY, project_id TEXT)'); // nullable
+    await target.query('CREATE VIEW t6_view_bad AS SELECT project_id FROM t6_view_src');
+    try {
+      await target.query(`INSERT INTO t6_view_src (project_id) VALUES ('proj-a'), (NULL)`);
+      const rosterPath = writeTmpJson('t6-relkind-view-bad.json', [
+        ...BASE_ROSTER,
+        { source_db: SOURCE_DB, source_table: 't6_view_bad', targetTable: 't6_view_bad', loadBearingCols: ['project_id'], hasContentBearingText: false, requires_project_id_scope: true },
+      ]);
+      const r2 = runScript('verify-15-t6-referential-integrity.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+      if (r2.status !== 0 && /view live-probe found 1 row/.test(r2.stdout + r2.stderr)) {
+        pass('T6-relkind-view-bad', 'view branch, 1 live NULL project_id row -> FAIL via live probe, never via is_nullable');
+      } else {
+        fail('T6-relkind-view-bad', 'view branch, 1 live NULL project_id row -> FAIL via live probe, never via is_nullable', `status=${r2.status} stdout=${r2.stdout} stderr=${r2.stderr}`);
+      }
+    } finally {
+      await target.query('DROP VIEW IF EXISTS t6_view_bad');
+      await target.query('DROP TABLE IF EXISTS t6_view_src');
+    }
+
+    // Materialized view -> loud FAIL naming it a matview, NEVER a
+    // "missing column" message (information_schema.columns structurally
+    // excludes matviews).
+    await target.query('DROP MATERIALIZED VIEW IF EXISTS t6_matview_test');
+    await target.query('DROP TABLE IF EXISTS t6_matview_src');
+    await target.query('CREATE TABLE t6_matview_src (id SERIAL PRIMARY KEY, project_id TEXT NOT NULL)');
+    await target.query(`INSERT INTO t6_matview_src (project_id) VALUES ('proj-a')`);
+    await target.query('CREATE MATERIALIZED VIEW t6_matview_test AS SELECT project_id FROM t6_matview_src');
+    try {
+      const rosterPath = writeTmpJson('t6-relkind-matview.json', [
+        ...BASE_ROSTER,
+        { source_db: SOURCE_DB, source_table: 't6_matview_test', targetTable: 't6_matview_test', loadBearingCols: ['project_id'], hasContentBearingText: false, requires_project_id_scope: true },
+      ]);
+      const r3 = runScript('verify-15-t6-referential-integrity.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+      const out3 = r3.stdout + r3.stderr;
+      if (r3.status !== 0 && /MATERIALIZED VIEW/.test(out3) && !/MISSING entirely/.test(out3)) {
+        pass('T6-relkind-matview', 'materialized view -> loud FAIL naming it a matview, never a false "missing column" message');
+      } else {
+        fail('T6-relkind-matview', 'materialized view -> loud FAIL naming it a matview, never a false "missing column" message', `status=${r3.status} stdout=${out3}`);
+      }
+    } finally {
+      await target.query('DROP MATERIALIZED VIEW IF EXISTS t6_matview_test');
+      await target.query('DROP TABLE IF EXISTS t6_matview_src');
+    }
+
+    // Absent from pg_class entirely -> loud FAIL, missing object.
+    {
+      const rosterPath = writeTmpJson('t6-relkind-absent.json', [
+        ...BASE_ROSTER,
+        { source_db: SOURCE_DB, source_table: 't6_never_created_table', targetTable: 't6_never_created_table', loadBearingCols: ['project_id'], hasContentBearingText: false, requires_project_id_scope: true },
+      ]);
+      const r4 = runScript('verify-15-t6-referential-integrity.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+      if (r4.status !== 0 && /missing object/.test(r4.stdout + r4.stderr)) {
+        pass('T6-relkind-absent', 'roster-scoped targetTable absent from pg_class entirely -> loud FAIL, missing object');
+      } else {
+        fail('T6-relkind-absent', 'roster-scoped targetTable absent from pg_class entirely -> loud FAIL, missing object', `status=${r4.status} stdout=${r4.stdout} stderr=${r4.stderr}`);
+      }
+    }
+  } finally {
+    await target.end();
+  }
+}
+
+// ── T2 rewrite: Phase 1 (triage) / Phase 2 (duplicate) / Phase 3 (Branch A
+// duplicate-family) matrix (cm#196/cm#197) ──────────────────────────────────
+
+async function testT2PhaseMatrix() {
+  const target = await pgConnect(TARGET_DB);
+  try {
+    await truncateAll(target, ['migration_manifest', 'decisions', 'tasks']);
+    const rosterPath = writeTmpJson('t2-phase-roster.json', BASE_ROSTER);
+
+    // ── Phase 1: ENGINE-INFRA + roster-paired -> RETAIN (own-graph case),
+    // normal reconciliation still applies. ──
+    await target.query(`INSERT INTO decisions (project_id, topic, decision, reason) VALUES ('proj-a','t','d','r')`);
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint) VALUES ($1,'decisions','proj-a',1,'fp')`,
+      [SOURCE_DB]
+    );
+    const triagePaired = writeTmpJson('t2-triage-paired.json', { databases: { [SOURCE_DB]: 'ENGINE-INFRA' } });
+    const r1 = runScript('verify-15-t2-rowcount.js', ['--db', TARGET_DB, '--triage', triagePaired], rosterEnv(rosterPath));
+    if (r1.status === 0 && /TRIAGE-EXCLUDED-PAIRED-RETAIN/.test(r1.stdout)) {
+      pass('T2-phase1-enginfra-paired', 'ENGINE-INFRA-classified source_db, roster-paired -> RETAIN (own-graph legitimate case), reconciliation PASSes');
+    } else {
+      fail('T2-phase1-enginfra-paired', 'ENGINE-INFRA-classified source_db, roster-paired -> RETAIN (own-graph legitimate case), reconciliation PASSes', `status=${r1.status} stdout=${r1.stdout} stderr=${r1.stderr}`);
+    }
+
+    // ── Phase 1: EPHEMERAL-DROP + UNPAIRED -> EXCLUDE-BY-TRIAGE, removed
+    // entirely -- no FAIL for it, no contribution either direction. ──
+    await truncateAll(target, ['migration_manifest']);
+    const leakedDb = 't2_leaked_fixture_db_1779999999999';
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint) VALUES ($1,'decisions','some-leaked-project',9,'fp')`,
+      [leakedDb]
+    );
+    const triageUnpaired = writeTmpJson('t2-triage-unpaired.json', { databases: { [leakedDb]: 'EPHEMERAL-DROP' } });
+    const r2 = runScript('verify-15-t2-rowcount.js', ['--db', TARGET_DB, '--triage', triageUnpaired], rosterEnv(rosterPath));
+    if (r2.status === 0 && /EXCLUDE-BY-TRIAGE/.test(r2.stdout) && /row_count=9/.test(r2.stdout)) {
+      pass('T2-phase1-ephemeral-unpaired', 'EPHEMERAL-DROP-classified source_db, roster-UNPAIRED -> EXCLUDE-BY-TRIAGE, loud-named (row_count included), removed, no FAIL');
+    } else {
+      fail('T2-phase1-ephemeral-unpaired', 'EPHEMERAL-DROP-classified source_db, roster-UNPAIRED -> EXCLUDE-BY-TRIAGE, loud-named (row_count included), removed, no FAIL', `status=${r2.status} stdout=${r2.stdout} stderr=${r2.stderr}`);
+    }
+
+    // ── Phase 1: OWNER-REVIEW -> loud FAIL, "provenance undecided" (never a
+    // script-halting FATAL -- see shared.classifyManifestRow's own header
+    // comment on that distinction). ──
+    await truncateAll(target, ['migration_manifest']);
+    const ownerReviewDb = 't2_owner_review_db';
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint) VALUES ($1,'decisions','proj-a',1,'fp')`,
+      [ownerReviewDb]
+    );
+    const triageOwner = writeTmpJson('t2-triage-owner.json', { databases: { [ownerReviewDb]: 'OWNER-REVIEW' } });
+    const r3 = runScript('verify-15-t2-rowcount.js', ['--db', TARGET_DB, '--triage', triageOwner], rosterEnv(rosterPath));
+    if (r3.status !== 0 && /FAIL \(phase 1, OWNER-REVIEW-FAIL\)/.test(r3.stdout + r3.stderr) && /provenance undecided/.test(r3.stdout + r3.stderr)) {
+      pass('T2-phase1-owner-review', 'OWNER-REVIEW-classified source_db -> loud FAIL, "provenance undecided"');
+    } else {
+      fail('T2-phase1-owner-review', 'OWNER-REVIEW-classified source_db -> loud FAIL, "provenance undecided"', `status=${r3.status} stdout=${r3.stdout} stderr=${r3.stderr}`);
+    }
+
+    // ── Phase 1: invalid class VALUE in the triage FILE itself -> load-time
+    // FATAL (a config bug, genuinely script-halting -- distinct from every
+    // per-row FAIL branch above; never a per-row silent tolerance). ──
+    const triageBadValue = writeTmpJson('t2-triage-badvalue.json', { databases: { some_db_x: 'NOT-A-REAL-CLASS' } });
+    const r4 = runScript('verify-15-t2-rowcount.js', ['--db', TARGET_DB, '--triage', triageBadValue], rosterEnv(rosterPath));
+    if (r4.status !== 0 && /invalid class/.test(r4.stdout + r4.stderr)) {
+      pass('T2-phase1-bad-triage-value', 'invalid class value in db-triage.json -> load-time FATAL');
+    } else {
+      fail('T2-phase1-bad-triage-value', 'invalid class value in db-triage.json -> load-time FATAL', `status=${r4.status} stdout=${r4.stdout} stderr=${r4.stderr}`);
+    }
+
+    // ── Phase 1: UNTRIAGED (no --triage flag, no default file present in
+    // this worktree) + roster-UNPAIRED -> loud FAIL. ──
+    await truncateAll(target, ['migration_manifest']);
+    const untriagedDb = 't2_untriaged_unpaired_db';
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint) VALUES ($1,'decisions','proj-a',1,'fp')`,
+      [untriagedDb]
+    );
+    const r5 = runScript('verify-15-t2-rowcount.js', ['--db', TARGET_DB], rosterEnv(rosterPath)); // no --triage, no DB_TRIAGE_PATH env
+    if (r5.status !== 0 && /FAIL \(phase 1, UNTRIAGED-UNPAIRED-FAIL\)/.test(r5.stdout + r5.stderr) && /cannot account/.test(r5.stdout + r5.stderr)) {
+      pass('T2-phase1-untriaged-unpaired', 'UNTRIAGED (no triage file present) + roster-UNPAIRED -> loud FAIL');
+    } else {
+      fail('T2-phase1-untriaged-unpaired', 'UNTRIAGED (no triage file present) + roster-UNPAIRED -> loud FAIL', `status=${r5.status} stdout=${r5.stdout} stderr=${r5.stderr}`);
+    }
+
+    // ── Phase 1: UNTRIAGED + roster-PAIRED -> RETAIN + WARN (this is the
+    // CI-default posture every OTHER T2 test in this suite already relies
+    // on -- asserted explicitly here). ──
+    await truncateAll(target, ['migration_manifest']);
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint) VALUES ($1,'decisions','proj-a',1,'fp')`,
+      [SOURCE_DB]
+    );
+    const r6 = runScript('verify-15-t2-rowcount.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r6.status === 0 && /WARN.*UNTRIAGED-PAIRED-RETAIN/.test(r6.stdout + r6.stderr)) {
+      pass('T2-phase1-untriaged-paired', 'UNTRIAGED + roster-PAIRED -> RETAIN with a WARN, reconciliation still runs and PASSes');
+    } else {
+      fail('T2-phase1-untriaged-paired', 'UNTRIAGED + roster-PAIRED -> RETAIN with a WARN, reconciliation still runs and PASSes', `status=${r6.status} stdout=${r6.stdout} stderr=${r6.stderr}`);
+    }
+
+    // ── Phase 1: retired_at IS NOT NULL rows are skipped, one aggregate
+    // INFO line, never re-checked. A retired row that would OTHERWISE
+    // trigger a FAIL (wrong row_count) proves it is truly skipped, not
+    // just coincidentally passing. ──
+    await truncateAll(target, ['migration_manifest']);
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint, retired_at, retired_note)
+       VALUES ($1,'decisions','proj-a',999,'fp',NOW(),'test retirement')`,
+      [SOURCE_DB]
+    );
+    const r7 = runScript('verify-15-t2-rowcount.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r7.status === 0 && /1 manifest row\(s\) retired -- skipped/.test(r7.stdout) && !/expected 999/.test(r7.stdout + r7.stderr)) {
+      pass('T2-phase1-retired-skip', 'retired_at IS NOT NULL row is skipped (one aggregate INFO line), never reconciled even though its row_count (999) would otherwise FAIL');
+    } else {
+      fail('T2-phase1-retired-skip', 'retired_at IS NOT NULL row is skipped (one aggregate INFO line), never reconciled even though its row_count (999) would otherwise FAIL', `status=${r7.status} stdout=${r7.stdout} stderr=${r7.stderr}`);
+    }
+
+    // ── Phase 2: duplicate FATAL -- two retained, non-retired rows sharing
+    // the exact (source_db, source_table, project_id_or_null) triple. ──
+    await truncateAll(target, ['migration_manifest']);
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint) VALUES ($1,'decisions','proj-a',1,'fp1'), ($1,'decisions','proj-a',1,'fp2')`,
+      [SOURCE_DB]
+    );
+    const r8 = runScript('verify-15-t2-rowcount.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (r8.status !== 0 && /FATAL \(phase 2\)/.test(r8.stdout + r8.stderr) && /duplicate manifest rows/.test(r8.stdout + r8.stderr)) {
+      pass('T2-phase2-duplicate-fatal', 'two retained rows sharing the exact (source_db, source_table, project_id_or_null) triple -> loud FATAL naming both ids');
+    } else {
+      fail('T2-phase2-duplicate-fatal', 'two retained rows sharing the exact (source_db, source_table, project_id_or_null) triple -> loud FATAL naming both ids', `status=${r8.status} stdout=${r8.stdout} stderr=${r8.stderr}`);
+    }
+
+    // ── Phase 3: Branch A duplicate-family (manifest_label_duplicate_of) --
+    // sum reconciliation, mismatch FAIL, and mixed-exclusion WARN. ──
+    const SECOND_DB = 't2_second_source_db';
+    const dupFamilyRoster = [
+      ...BASE_ROSTER,
+      { source_db: SECOND_DB, source_table: 'decisions', targetTable: 'decisions', loadBearingCols: ['topic', 'decision', 'reason'], hasContentBearingText: true, requires_project_id_scope: true },
+      { source_db: SOURCE_DB, source_table: 'decisions_dup', targetTable: 'decisions', loadBearingCols: ['topic', 'decision', 'reason'], hasContentBearingText: true, requires_project_id_scope: true, manifest_label_duplicate_of: 'decisions' },
+    ];
+    const dupFamilyRosterPath = writeTmpJson('t2-dupfamily-roster.json', dupFamilyRoster);
+
+    // Match -> PASS.
+    await truncateAll(target, ['migration_manifest', 'decisions']);
+    await target.query(`INSERT INTO decisions (project_id, topic, decision, reason) VALUES ('proj-a','t1','d1','r1'), ('proj-a','t2','d2','r2'), ('proj-a','t3','d3','r3')`);
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint)
+       VALUES ($1,'decisions','proj-a',3,'fp-primary'), ($1,'decisions_dup','proj-a',3,'fp-dup')`,
+      [SOURCE_DB]
+    );
+    const r9 = runScript('verify-15-t2-rowcount.js', ['--db', TARGET_DB], rosterEnv(dupFamilyRosterPath));
+    if (r9.status === 0) {
+      pass('T2-phase3-dupfamily-match', 'duplicate family (manifest_label_duplicate_of) sum equals primary family sum -> PASS, duplicate NOT double-counted in expected total');
+    } else {
+      fail('T2-phase3-dupfamily-match', 'duplicate family (manifest_label_duplicate_of) sum equals primary family sum -> PASS, duplicate NOT double-counted in expected total', `status=${r9.status} stdout=${r9.stdout} stderr=${r9.stderr}`);
+    }
+
+    // Mismatch -> FAIL naming both labels/sums.
+    await truncateAll(target, ['migration_manifest']);
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint)
+       VALUES ($1,'decisions','proj-a',3,'fp-primary'), ($1,'decisions_dup','proj-a',5,'fp-dup')`,
+      [SOURCE_DB]
+    );
+    const r10 = runScript('verify-15-t2-rowcount.js', ['--db', TARGET_DB], rosterEnv(dupFamilyRosterPath));
+    if (r10.status !== 0 && /does not match primary label/.test(r10.stdout + r10.stderr) && /decisions_dup/.test(r10.stdout + r10.stderr)) {
+      pass('T2-phase3-dupfamily-mismatch', 'duplicate family sum does NOT equal primary family sum -> loud FAIL naming both');
+    } else {
+      fail('T2-phase3-dupfamily-mismatch', 'duplicate family sum does NOT equal primary family sum -> loud FAIL naming both', `status=${r10.status} stdout=${r10.stdout} stderr=${r10.stderr}`);
+    }
+
+    // Mixed excluded/non-excluded contributors to the SAME label within one
+    // slice (different source_dbs, same source_table label) -> WARN naming
+    // the T9 contradiction, reconciliation still runs on its own merits.
+    await truncateAll(target, ['migration_manifest']);
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint, excluded_reason)
+       VALUES ($1,'decisions','proj-a',3,'fp-a',NULL), ($2,'decisions','proj-a',2,'fp-b','some-exclusion-reason')`,
+      [SOURCE_DB, SECOND_DB]
+    );
+    const r11 = runScript('verify-15-t2-rowcount.js', ['--db', TARGET_DB], rosterEnv(dupFamilyRosterPath));
+    if (r11.status === 0 && /WARN/.test(r11.stdout + r11.stderr) && /mixed excluded\/non-excluded/.test(r11.stdout + r11.stderr) && /T9 contradiction/.test(r11.stdout + r11.stderr)) {
+      pass('T2-phase3-mixed-exclusion-warn', 'mixed excluded/non-excluded contributors to one label within one slice -> WARN naming the T9 contradiction, non-fatal');
+    } else {
+      fail('T2-phase3-mixed-exclusion-warn', 'mixed excluded/non-excluded contributors to one label within one slice -> WARN naming the T9 contradiction, non-fatal', `status=${r11.status} stdout=${r11.stdout} stderr=${r11.stderr}`);
+    }
+  } finally {
+    await target.end();
+  }
+}
+
+// ── Cure script: idempotency (cm#194/cm#196/cm#197/cm#199) ──────────────────
+
+async function testCureScriptIdempotency() {
+  const target = await pgConnect(TARGET_DB);
+  const src = await pgConnect(SOURCE_DB);
+  try {
+    await truncateAll(target, ['migration_manifest', 'migration_manifest_row_hashes']);
+    await src.query('DROP TABLE IF EXISTS edges');
+    // Mirrors RESNAPSHOT_CONTENT_COLS exactly (from_entity, edge_type,
+    // to_entity, weight, created_at, session_id) -- the cure script SELECTs
+    // this explicit, pinned column list (never `SELECT *`), so the fixture
+    // must carry all of them for step 4 to run at all. `weight` is
+    // DELIBERATELY not part of the roster's loadBearingCols below (cm#199
+    // review fix: the hash basis is a PINNED capture-time column set, never
+    // the roster's narrower loadBearingCols, and never a dynamic `SELECT
+    // *`-then-filter re-derivation against TODAY's live schema either --
+    // see RESNAPSHOT_CONTENT_COLS's own comment) -- its presence is what
+    // proves step 4 is hashing on the correct, wider basis.
+    await src.query('CREATE TABLE edges (id SERIAL PRIMARY KEY, project_id TEXT, from_entity TEXT, edge_type TEXT, to_entity TEXT, weight INTEGER, created_at TIMESTAMPTZ DEFAULT NOW(), session_id TEXT)');
+    await src.query(`INSERT INTO edges (project_id, from_entity, edge_type, to_entity, weight, session_id) VALUES ('C--Users-djwmo-dev-claude-memory', 'a', 'refs', 'b', 1, 's1'), ('C--Users-djwmo-dev-claude-memory', 'c', 'refs', 'd', 1, 's2')`);
+
+    // Step 1 scope: 6 leaked rows.
+    const leakedInserts = [
+      ['adv175_1786905342243_corpus', 'memory_entries', 'some-other-real-project-id', 1],
+      ['adv175_1786905342243_corpus', 'memory_entries', 'unmapped-orphan-memory-entry', 2],
+      ['claude_memory_eval_ci', 'memory_entries', 'unmapped-orphan-memory-entry', 42],
+      ['claude_memory_eval_ci', 'memory_entry_chunks', 'unmapped-orphan-memory-entry', 347],
+      ['claude_memory_eval_test', 'memory_entries', 'unmapped-orphan-memory-entry', 42],
+      ['claude_memory_eval_test', 'memory_entry_chunks', 'unmapped-orphan-memory-entry', 347],
+    ];
+    for (const [db, table, proj, cnt] of leakedInserts) {
+      await target.query(
+        `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint) VALUES ($1,$2,$3,$4,'fp')`,
+        [db, table, proj, cnt]
+      );
+    }
+
+    // Step 2 scope: one duplicate pair (older + newer capture).
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint, captured_at)
+       VALUES ('claude_policy_framework','memory_entries','dup-proj',10,'fp-old', NOW() - INTERVAL '2 days'),
+              ('claude_policy_framework','memory_entries','dup-proj',10,'fp-new', NOW())`
+    );
+
+    // Step 3 scope: excluded parent row + 2 orphan row-hashes.
+    await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint, excluded_reason)
+       VALUES ('claude_memory_eval_test','edges','9a212124-5abd-42b8-af0a-9650b21a8f98',2,'fp','eval-junk-project-id')`
+    );
+    await target.query(
+      `INSERT INTO migration_manifest_row_hashes (source_db, source_table, project_id_or_null, source_row_id, source_hash)
+       VALUES ('claude_memory_eval_test','edges','9a212124-5abd-42b8-af0a-9650b21a8f98','317','stale1'),
+              ('claude_memory_eval_test','edges','9a212124-5abd-42b8-af0a-9650b21a8f98','318','stale2')`
+    );
+
+    // Step 4 scope: manifest row + stale row_hashes for the re-snapshot slice.
+    const { rows: manifestRow } = await target.query(
+      `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint)
+       VALUES ('claude_memory_eval_test','edges','C--Users-djwmo-dev-claude-memory',2,'stale-fingerprint') RETURNING id`
+    );
+    await target.query(
+      `INSERT INTO migration_manifest_row_hashes (source_db, source_table, project_id_or_null, source_row_id, source_hash)
+       VALUES ('claude_memory_eval_test','edges','C--Users-djwmo-dev-claude-memory','1','stale-hash-1'),
+              ('claude_memory_eval_test','edges','C--Users-djwmo-dev-claude-memory','2','stale-hash-2')`
+    );
+
+    const rosterPath = writeTmpJson('cure-roster.json', [
+      { source_db: 'claude_memory_eval_test', source_table: 'edges', targetTable: 'edges', loadBearingCols: ['from_entity', 'edge_type', 'to_entity'], hasContentBearingText: false, requires_project_id_scope: true },
+    ]);
+
+    const run1 = runScript('cure-migration-manifest-retirement.js', ['--db', TARGET_DB, '--source-db', SOURCE_DB], rosterEnv(rosterPath));
+    const out1 = run1.stdout + run1.stderr;
+    if (run1.status === 0 && /RETIRED/.test(out1) && /step 4.*rowsWritten.*2/.test(out1.replace(/\n/g, ' '))) {
+      pass('cure-first-run', 'first run: retires leaked rows, older duplicate, orphan row-hashes, and re-snapshots the edges slice');
+    } else {
+      fail('cure-first-run', 'first run: retires leaked rows, older duplicate, orphan row-hashes, and re-snapshots the edges slice', `status=${run1.status} stdout=${run1.stdout} stderr=${run1.stderr}`);
+    }
+
+    // cm#199 review fix: hash basis must be RESNAPSHOT_CONTENT_COLS (the
+    // pinned, capture-time column set) -- proven here by the `weight`
+    // column (present on the source table, NOT in the roster's
+    // loadBearingCols) showing up in the logged hash-basis line, and by
+    // the pre-write guard reporting both rows as "changed" (their
+    // previously-stored hashes were dummy placeholders, so both differ from
+    // whatever gets computed -- this assertion is about WHICH COLUMNS the
+    // guard computed over, not about the changed count itself).
+    if (/hash basis \(PINNED to this slice's capture-time columns.*weight/.test(out1) && /pre-write guard: 0\/2 row\(s\) recompute to the SAME hash already stored; 2 row\(s\) will change/.test(out1)) {
+      pass('cure-hash-basis-includes-weight', 'step 4 hash basis includes "weight" (not in roster loadBearingCols) -- proves the pinned capture-time basis is used, not the roster basis');
+    } else {
+      fail('cure-hash-basis-includes-weight', 'step 4 hash basis includes "weight" (not in roster loadBearingCols) -- proves the pinned capture-time basis is used, not the roster basis', `stdout=${run1.stdout} stderr=${run1.stderr}`);
+    }
+
+    // Verify actual DB state after run 1.
+    const { rows: leakedAfter } = await target.query(`SELECT retired_at FROM migration_manifest WHERE source_db = 'claude_memory_eval_ci' AND source_table = 'memory_entries'`);
+    const { rows: dupAfter } = await target.query(`SELECT id, retired_at, content_fingerprint FROM migration_manifest WHERE source_db = 'claude_policy_framework' AND source_table = 'memory_entries' AND project_id_or_null = 'dup-proj' ORDER BY id`);
+    const survivorRetained = dupAfter.filter((r) => r.retired_at === null).length === 1;
+    const { rows: hashesAfter } = await target.query(`SELECT source_row_id, source_hash, retired_at FROM migration_manifest_row_hashes WHERE source_db = 'claude_memory_eval_test' AND source_table = 'edges' AND project_id_or_null = 'C--Users-djwmo-dev-claude-memory'`);
+    const { rows: manifestAfter } = await target.query(`SELECT content_fingerprint, row_count FROM migration_manifest WHERE id = $1`, [manifestRow[0].id]);
+    if (
+      leakedAfter.length === 1 && leakedAfter[0].retired_at !== null &&
+      survivorRetained &&
+      hashesAfter.length === 2 && hashesAfter.every((h) => h.retired_at === null && h.source_hash !== 'stale-hash-1' && h.source_hash !== 'stale-hash-2') &&
+      manifestAfter[0].content_fingerprint !== 'stale-fingerprint' &&
+      Number(manifestAfter[0].row_count) === 2 // row_count NEVER touched by re-snapshot
+    ) {
+      pass('cure-first-run-db-state', 'DB state after run 1: leaked row retired, duplicate survivor retained (exactly one), row_hashes replaced with live-computed hashes, content_fingerprint updated, row_count untouched');
+    } else {
+      fail('cure-first-run-db-state', 'DB state after run 1: leaked row retired, duplicate survivor retained (exactly one), row_hashes replaced with live-computed hashes, content_fingerprint updated, row_count untouched', JSON.stringify({ leakedAfter, dupAfter, hashesAfter, manifestAfter }));
+    }
+
+    // Second run: everything should be a no-op / idempotent re-converge --
+    // never a double-retirement, never a crash, never a conflict.
+    const run2 = runScript('cure-migration-manifest-retirement.js', ['--db', TARGET_DB, '--source-db', SOURCE_DB], rosterEnv(rosterPath));
+    const out2 = run2.stdout + run2.stderr;
+    if (run2.status === 0 && /NOOP/.test(out2) && !/conflict":[1-9]/.test(out2.replace(/\s/g, ''))) {
+      pass('cure-second-run-idempotent', 'second run (no state change in between): retirement steps report NOOP, no conflicts, re-snapshot step re-converges to the same state without error');
+    } else {
+      fail('cure-second-run-idempotent', 'second run (no state change in between): retirement steps report NOOP, no conflicts, re-snapshot step re-converges to the same state without error', `status=${run2.status} stdout=${run2.stdout} stderr=${run2.stderr}`);
+    }
+
+    const { rows: hashesAfterRun2 } = await target.query(`SELECT source_row_id, source_hash FROM migration_manifest_row_hashes WHERE source_db = 'claude_memory_eval_test' AND source_table = 'edges' AND project_id_or_null = 'C--Users-djwmo-dev-claude-memory' ORDER BY source_row_id`);
+    const hashesAfterRun1Sorted = [...hashesAfter].sort((a, b) => a.source_row_id.localeCompare(b.source_row_id));
+    const sameHashes = hashesAfterRun2.length === hashesAfterRun1Sorted.length &&
+      hashesAfterRun2.every((h, i) => h.source_hash === hashesAfterRun1Sorted[i].source_hash);
+    if (sameHashes) {
+      pass('cure-second-run-converges', 'second run re-snapshot converges to the IDENTICAL stored hashes (pure function of unchanged live content)');
+    } else {
+      fail('cure-second-run-converges', 'second run re-snapshot converges to the IDENTICAL stored hashes (pure function of unchanged live content)', JSON.stringify({ hashesAfter, hashesAfterRun2 }));
+    }
+
+    // Third run: mutate ONLY `weight` (not from_entity/edge_type/to_entity,
+    // i.e. not any roster loadBearingCols column) on one live source row.
+    // If step 4 were still hashing on the roster's 3-col basis, this
+    // mutation would be INVISIBLE to the pre-write guard (0 changed); on
+    // the correct own-graph-writer basis, exactly 1 row must show changed.
+    await src.query(`UPDATE edges SET weight = 99 WHERE from_entity = 'a'`);
+    const run3 = runScript('cure-migration-manifest-retirement.js', ['--db', TARGET_DB, '--source-db', SOURCE_DB], rosterEnv(rosterPath));
+    const out3 = run3.stdout + run3.stderr;
+    if (run3.status === 0 && /pre-write guard: 1\/2 row\(s\) recompute to the SAME hash already stored; 1 row\(s\) will change/.test(out3)) {
+      pass('cure-hash-basis-detects-weight-only-change', 'a weight-only mutation (no roster-column change) is detected as 1 changed row -- the hash basis is NOT the roster\'s 3-col loadBearingCols');
+    } else {
+      fail('cure-hash-basis-detects-weight-only-change', 'a weight-only mutation (no roster-column change) is detected as 1 changed row -- the hash basis is NOT the roster\'s 3-col loadBearingCols', `status=${run3.status} stdout=${run3.stdout} stderr=${run3.stderr}`);
+    }
+  } finally {
+    await target.end();
+    await src.end();
+  }
+}
+
 // ── Main ───────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -2126,6 +2682,7 @@ async function main() {
     await testFreezePrecondition();
     await testT2Rowcount();
     await testT2NoColumnReconciliation();
+    await testT2PhaseMatrix();
     await testT25Dualwrite();
     await testT3ContentHash();
     await testT3NoColumnFixture();
@@ -2139,15 +2696,18 @@ async function main() {
     await testT3bSourceless();
     await testT4RecallEquivalence();
     await testT5EmbeddingCoverage();
+    await testT5PhaseClassification();
     await testT6ReferentialIntegrity();
     await testT6JoinKeyFix();
     await testT6SuppressionAware();
+    await testT6RelkindMatrix();
     await testT7CavemanEconomy();
     await testT8Idempotency();
     await testT9Negative();
     await testT9NoColumnProvenanceOnly();
     await testAcceptanceIndependence();
     await testNotInSweep();
+    await testCureScriptIdempotency();
   } finally {
     for (const db of CREATED_DBS) {
       await dropDb(db);
