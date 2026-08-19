@@ -23,6 +23,8 @@
     { "targetTable": "routing_profiles",            "section": "17.1" },
     { "targetTable": "routing_session_overrides",   "section": "17.1" },
     { "targetTable": "turn_usage",          "section": "18.1" },
-    { "targetTable": "session_usage",       "section": "18.1" }
+    { "targetTable": "session_usage",       "section": "18.1" },
+    { "targetTable": "embedding_migration_batches", "section": "6.1(g) (migrate-07 re-embed lineage, G-R4, mm#11(g))" },
+    { "targetTable": "embedding_write_log",         "section": "6.1(g) (migrate-07 re-embed lineage, G-R4, mm#11(g))" }
   ]
 }

@@ -1070,6 +1070,8 @@
   "out_of_scope_tables": {
     "containment_evidence": "§15.2.1 migration-acceptance-battery infrastructure (containment evidence), not part of §5's target schema",
     "dual_write_shim_window": "§15 migration dual-write-shim infrastructure, not part of §5",
+    "embedding_migration_batches": "§6.1(g) migrate-07 re-embed lineage/rollback-identity infrastructure (G-R4, mm#11(g)), not part of §5",
+    "embedding_write_log": "§6.1(g) migrate-07 re-embed lineage/rollback-identity infrastructure (G-R4, mm#11(g)), not part of §5",
     "memory_manager_staging_row_hashes": "§15 T1/T3 content-hash reconciliation infrastructure, not part of §5",
     "migration_manifest": "§15 T0 roster/migration-manifest infrastructure, not part of §5",
     "migration_manifest_row_hashes": "§15 T3 content-hash reconciliation infrastructure, not part of §5",
