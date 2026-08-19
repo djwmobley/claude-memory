@@ -1,6 +1,6 @@
 'use strict';
 
-const AUTHORED_BY = 'sonnet-t-battery-author-2026-07-27';
+const AUTHORED_BY = 'sonnet-cm194-196-197-199-author-2026-08-18';
 
 /**
  * verify-15-t9-negative.js — T9, negative tests (§15.2, closes A-4/V-3).
@@ -162,6 +162,10 @@ async function main() {
   console.log(`verify-15-t9-negative: target="${target}" (resolved from ${source})`);
 
   const roster = shared.loadRoster();
+  const { path: triagePath, databases: dbTriage } = shared.loadDbTriageForAudit(argv);
+  console.log(`[T9] db-triage: ${dbTriage ? `loaded from "${triagePath}" (${dbTriage.size} classified db(s))` : `absent at "${triagePath}" -- every plain-db-name manifest row classifies UNTRIAGED`}`);
+  const rosterPairSet = shared.buildRosterPairSet(roster);
+
   const client = await shared.connect(target);
   let failed = false;
   try {
@@ -171,8 +175,38 @@ async function main() {
     // project_id_or_null, same excluded_reason) would collapse into ONE
     // enumerated row here, silently skipping the check for whichever source
     // didn't happen to be the surviving DISTINCT row.
+    //
+    // cm#196/#197 Phase 1 (shared.classifyManifestRow, the SAME classifier
+    // T0/T2/T4 consume): retired_at IS NULL keeps a cured/retired
+    // exclusion-recording row from being checked forever. T9's own use of
+    // the classifier is DELIBERATELY NARROWER than T0/T2/T4's: T0/T2/T4
+    // build POSITIVE reconciliation expectations FROM roster+manifest, so a
+    // roster-UNPAIRED source is genuinely unusable to them. T9 instead
+    // verifies a NEGATIVE assertion migration_manifest ALREADY records
+    // (excluded_reason) directly against live data -- it needs no roster
+    // pairing to do that, so an "unpaired" or "known-disposable" bookkeeping
+    // classification does not stop T9 from checking the underlying
+    // exclusion; it is reported (INFO/WARN) alongside the check, never
+    // gating it. The ONLY branches that DO gate (skip verification, contribute
+    // to this script's exit code) are the ones where the row's provenance is
+    // genuinely UNTRUSTWORTHY, not merely unregistered: OWNER-REVIEW (a
+    // human hasn't signed off on whether this should ever migrate at all --
+    // checking "did it migrate" is premature), a malformed net-new:-in-
+    // manifest shape (the row itself should not exist), and an unknown
+    // triage value (defensive; unreachable in practice, loadDbTriageForAudit
+    // already validates the file). Every branch classifyManifestRow can
+    // return is enumerated below EXPLICITLY (total classification, never an
+    // allow-list over open-ended data -- this switches over classifyManifestRow's
+    // OWN fixed, closed set of branch names, not external input).
+    const GATING_BRANCHES = new Set(['OWNER-REVIEW-FAIL', 'NETNEW-IN-MANIFEST-FAIL', 'UNKNOWN-TRIAGE-VALUE-FAIL']);
+    const NON_GATING_BRANCHES = new Set([
+      'FILESYSTEM-PAIRED-RETAIN', 'FILESYSTEM-UNPAIRED-FAIL',
+      'UNTRIAGED-PAIRED-RETAIN', 'UNTRIAGED-UNPAIRED-FAIL',
+      'REAL-MIGRATE-RETAIN', 'TRIAGE-EXCLUDED-PAIRED-RETAIN', 'EXCLUDE-BY-TRIAGE',
+    ]);
     const { rows: exclusions } = await client.query(
-      `SELECT DISTINCT source_db, excluded_reason, source_table, project_id_or_null FROM migration_manifest WHERE excluded_reason IS NOT NULL`
+      `SELECT id, source_db, excluded_reason, source_table, project_id_or_null, row_count, retired_at
+       FROM migration_manifest WHERE excluded_reason IS NOT NULL AND retired_at IS NULL`
     );
 
     if (exclusions.length === 0) {
@@ -180,7 +214,40 @@ async function main() {
       process.exit(0);
     }
 
-    for (const exclusion of exclusions) {
+    const distinctExclusions = [];
+    const seenTriples = new Set();
+    for (const row of exclusions) {
+      const phase1 = shared.classifyManifestRow(row, { dbTriage, rosterPairSet });
+      if (GATING_BRANCHES.has(phase1.branch)) {
+        failed = true;
+        console.error(`[T9] FAIL (phase 1, ${phase1.branch}): ${phase1.reason}`);
+        continue;
+      }
+      if (!NON_GATING_BRANCHES.has(phase1.branch)) {
+        // Defensive default branch: a branch name this switch doesn't
+        // recognize is a bug in this file, not in classifyManifestRow --
+        // loud, never a silent pass-through.
+        failed = true;
+        console.error(`[T9] FAIL: unrecognized phase-1 classification branch "${phase1.branch}" -- update GATING_BRANCHES/NON_GATING_BRANCHES in this file. reason: ${phase1.reason}`);
+        continue;
+      }
+      // Every NON-GATING branch's reason is printed, not just the ones
+      // classifyManifestRow happens to flag warn/info -- a branch this
+      // switch treats as non-gating despite classifyManifestRow marking it
+      // `fail:true` (FILESYSTEM-UNPAIRED-FAIL, UNTRIAGED-UNPAIRED-FAIL) was
+      // previously silently dropped here (neither `.warn` nor `.info` is
+      // set on those results), contradicting this function's own "reported
+      // (INFO/WARN) alongside the check, never gating it" comment above.
+      if (phase1.warn) console.error(`[T9] WARN (phase 1, ${phase1.branch}): ${phase1.reason}`);
+      else if (phase1.info) console.log(`[T9] INFO (phase 1, ${phase1.branch}): ${phase1.reason}`);
+      else if (phase1.fail) console.log(`[T9] INFO (phase 1, ${phase1.branch}, non-gating for T9): ${phase1.reason}`);
+      const triple = JSON.stringify([row.source_db, row.excluded_reason, row.source_table, row.project_id_or_null]);
+      if (seenTriples.has(triple)) continue;
+      seenTriples.add(triple);
+      distinctExclusions.push({ source_db: row.source_db, excluded_reason: row.excluded_reason, source_table: row.source_table, project_id_or_null: row.project_id_or_null });
+    }
+
+    for (const exclusion of distinctExclusions) {
       const label = `source_db="${exclusion.source_db}" / ${exclusion.source_table} / project_id_or_null=${exclusion.project_id_or_null ?? '(NULL-scoped)'} / excluded_reason="${exclusion.excluded_reason}"`;
       const result = await checkExclusion(client, roster, exclusion, exclusion.source_db);
       if (!result.ok) {

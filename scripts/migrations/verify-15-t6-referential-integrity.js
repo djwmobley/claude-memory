@@ -1,6 +1,6 @@
 'use strict';
 
-const AUTHORED_BY = 'sonnet-t-battery-author-2026-07-27';
+const AUTHORED_BY = 'sonnet-cm194-196-197-199-author-2026-08-18';
 
 /**
  * verify-15-t6-referential-integrity.js — T6, referential integrity
@@ -140,24 +140,128 @@ async function checkOrphans(client) {
   };
 }
 
+// Total, stated relkind classification for checkProjectIdCoverage's own
+// scopedTables set (cm#199, S4' rewrite). Mirrors T0's ENUMERATED_RELKINDS
+// posture: every relkind pg_class can report for a roster-scoped
+// targetTable is EXPLICITLY handled, never left to fall through to a
+// misleading generic message.
+const PROJECT_ID_RELKIND_LABELS = {
+  f: 'foreign table', t: 'TOAST table', i: 'index', S: 'sequence',
+  c: 'composite type', I: 'partitioned index',
+};
+
+/**
+ * Byte-exact relkind lookup for one scoped table — the SAME normalization
+ * engine as shared.tableHasColumn (parameterized, case-sensitive,
+ * current_schema()-scoped comparison; never a case-folded or LIKE match).
+ * Returns null when the name is absent from pg_class entirely (a missing
+ * object, distinct from "present but wrong kind").
+ */
+async function classifyScopedTableRelkind(client, table) {
+  const { rows } = await client.query(
+    `SELECT c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = current_schema() AND c.relname = $1`,
+    [table]
+  );
+  return rows.length ? rows[0].relkind : null;
+}
+
+/**
+ * checkProjectIdCoverage — cm#199, S4' rewrite. Every roster-scoped
+ * targetTable is total-classified by its LIVE pg_class relkind BEFORE any
+ * project_id check runs, rather than treating every scopedTable identically
+ * (the original bug: `v_handoff_card_inputs`, a VIEW whose underlying
+ * `assertions.project_id` IS declared NOT NULL, false-FAILed because
+ * PostgreSQL's information_schema.is_nullable is ALWAYS 'YES' for a view
+ * column, by construction — Postgres does not propagate a base table's NOT
+ * NULL constraint through a view, even a direct pass-through SELECT).
+ *
+ *   - 'r' (table) / 'p' (partitioned table): BASE branch — today's
+ *     missing-column + is_nullable checks, UNCHANGED.
+ *   - 'v' (view): VIEW branch — (a) KEEP the missing-column check (still
+ *     valid: a view can genuinely omit project_id from its SELECT list);
+ *     (b) SKIP is_nullable entirely (structurally meaningless for a view);
+ *     (c) run a live DATA-LEVEL probe instead: COUNT(*) WHERE project_id IS
+ *     NULL — nonzero is a real integrity gap, constraint or no constraint;
+ *     (d) log one INFO line stating constraint-level verification is
+ *     structurally unavailable for views and this probe is data-level only,
+ *     so nobody reading a clean view PASS mistakes it for the same
+ *     guarantee a NOT NULL constraint gives.
+ *   - 'm' (materialized view): loud FAIL naming it a matview — NEVER let a
+ *     matview fall through to the base branch's "missing column" message:
+ *     information_schema.columns structurally EXCLUDES materialized views
+ *     (the exact silent-escape shape T0's own live-table classification
+ *     closes one layer up), so a naive LEFT JOIN against it would report a
+ *     matview's project_id column as "missing" even when it genuinely has
+ *     one — a misleading diagnosis, not just a missed one.
+ *   - anything else present in pg_class ('f' foreign table, 't' TOAST,
+ *     'i' index, 'S' sequence, 'c' composite type, 'I' partitioned index):
+ *     loud FAIL naming the relkind — none of these are legitimate shapes
+ *     for a roster-scoped targetTable.
+ *   - absent from pg_class entirely: loud FAIL, missing object.
+ *
+ * T2's crossCheckProjectIdScope (lib/verify15-shared.js) is DELIBERATELY
+ * left untouched by this rewrite: it only asserts COLUMN PRESENCE (never
+ * is_nullable), which is already view-correct as written (a view either
+ * selects project_id or it doesn't — presence is a real, meaningful fact
+ * about a view, unlike nullability) — do not "harmonize" it with this
+ * function's relkind branching; they answer different questions.
+ */
 async function checkProjectIdCoverage(client, roster) {
   const scopedTables = [...new Set(roster.filter((e) => e.requires_project_id_scope === true).map((e) => e.targetTable))];
   if (scopedTables.length === 0) return [];
 
-  const { rows } = await client.query(`
-    SELECT expected.target_table,
-           c.column_name IS NULL AS missing_column,
-           c.is_nullable
-      FROM (SELECT unnest($1::text[]) AS target_table) expected
-      LEFT JOIN information_schema.columns c
-        ON c.table_name = expected.target_table AND c.column_name = 'project_id' AND c.table_schema = current_schema()
-     WHERE c.column_name IS NULL OR c.is_nullable = 'YES'
-  `, [scopedTables]);
-  return rows.map((r) => ({
-    targetTable: r.target_table,
-    missingColumn: r.missing_column,
-    isNullable: r.is_nullable,
-  }));
+  const gaps = [];
+  for (const table of scopedTables) {
+    // Every table interpolated into raw SQL below (the view branch's live
+    // NULL-probe is the only one that does) is byte-exact validated first
+    // -- same identifier-safety posture T5 established (shared.SAFE_IDENTIFIER_RE),
+    // applied uniformly here rather than only at the one interpolation site.
+    shared.assertSafeIdentifier(table, 'roster-scoped targetTable');
+    const relkind = await classifyScopedTableRelkind(client, table);
+
+    if (relkind === null) {
+      gaps.push({ targetTable: table, kind: 'MISSING-OBJECT' });
+      continue;
+    }
+
+    if (relkind === 'r' || relkind === 'p') {
+      const { rows } = await client.query(`
+        SELECT c.column_name IS NULL AS missing_column, c.is_nullable
+          FROM (SELECT $1::text AS target_table) expected
+          LEFT JOIN information_schema.columns c
+            ON c.table_name = expected.target_table AND c.column_name = 'project_id' AND c.table_schema = current_schema()
+      `, [table]);
+      const r = rows[0];
+      if (r.missing_column) gaps.push({ targetTable: table, kind: 'MISSING-COLUMN' });
+      else if (r.is_nullable === 'YES') gaps.push({ targetTable: table, kind: 'NULLABLE', isNullable: r.is_nullable });
+      continue;
+    }
+
+    if (relkind === 'v') {
+      const { rows: colRows } = await client.query(
+        `SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = 'project_id' AND table_schema = current_schema()`,
+        [table]
+      );
+      if (colRows.length === 0) {
+        gaps.push({ targetTable: table, kind: 'MISSING-COLUMN', isView: true });
+        continue;
+      }
+      console.log(`[T6] INFO: "${table}" is a VIEW — constraint-level (NOT NULL) verification is structurally unavailable for views (information_schema.is_nullable is always 'YES' for a view column); this check runs a data-level live probe (COUNT(*) WHERE project_id IS NULL) instead of an is_nullable check.`);
+      const { rows: probeRows } = await client.query(`SELECT COUNT(*) AS n FROM ${table} WHERE project_id IS NULL`);
+      const nullCount = Number(probeRows[0].n);
+      if (nullCount > 0) gaps.push({ targetTable: table, kind: 'VIEW-NULL-PROBE-FAIL', nullCount });
+      continue;
+    }
+
+    if (relkind === 'm') {
+      gaps.push({ targetTable: table, kind: 'MATVIEW' });
+      continue;
+    }
+
+    gaps.push({ targetTable: table, kind: 'UNEXPECTED-RELKIND', relkind, relkindLabel: PROJECT_ID_RELKIND_LABELS[relkind] || relkind });
+  }
+  return gaps;
 }
 
 /**
@@ -193,10 +297,31 @@ async function main() {
 
   if (result.projectIdGaps.length > 0) {
     for (const g of result.projectIdGaps) {
-      console.error(`[T6] FAIL: ${g.targetTable}: ${g.missingColumn ? 'project_id column MISSING entirely' : `project_id is nullable (is_nullable=${g.isNullable})`}`);
+      switch (g.kind) {
+        case 'MISSING-OBJECT':
+          console.error(`[T6] FAIL: ${g.targetTable}: missing object — not present in pg_class in this schema at all.`);
+          break;
+        case 'MISSING-COLUMN':
+          console.error(`[T6] FAIL: ${g.targetTable}: project_id column MISSING entirely${g.isView ? ' (view)' : ''}`);
+          break;
+        case 'NULLABLE':
+          console.error(`[T6] FAIL: ${g.targetTable}: project_id is nullable (is_nullable=${g.isNullable})`);
+          break;
+        case 'VIEW-NULL-PROBE-FAIL':
+          console.error(`[T6] FAIL: ${g.targetTable}: view live-probe found ${g.nullCount} row(s) with project_id IS NULL.`);
+          break;
+        case 'MATVIEW':
+          console.error(`[T6] FAIL: ${g.targetTable}: is a MATERIALIZED VIEW — information_schema.columns excludes matviews; this is a loud FAIL, never a silent "missing column".`);
+          break;
+        case 'UNEXPECTED-RELKIND':
+          console.error(`[T6] FAIL: ${g.targetTable}: has relkind="${g.relkind}" (${g.relkindLabel}) — not a legitimate shape for a roster-scoped targetTable.`);
+          break;
+        default:
+          console.error(`[T6] FAIL: ${g.targetTable}: ${JSON.stringify(g)}`);
+      }
     }
   } else {
-    console.log('[T6] OK: project_id NOT NULL holds on every roster-scoped table.');
+    console.log('[T6] OK: project_id NOT NULL holds on every roster-scoped table (base tables via constraint check, views via live NULL probe).');
   }
 
   process.exit(result.pass ? 0 : 1);
@@ -209,4 +334,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { AUTHORED_BY, checkOrphans, checkProjectIdCoverage, runReferentialIntegrity };
+module.exports = { AUTHORED_BY, checkOrphans, checkProjectIdCoverage, classifyScopedTableRelkind, runReferentialIntegrity };

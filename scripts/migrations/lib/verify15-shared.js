@@ -497,6 +497,285 @@ function loadRoster() {
   return roster;
 }
 
+// ─── IDENTIFIER SAFETY (T5 rewrite, cm#194) ──────────────────────────────────
+
+const SAFE_IDENTIFIER_RE = /^[a-z_][a-z0-9_]*$/;
+
+/**
+ * Every raw-SQL-interpolated identifier (table name, column name) this
+ * battery builds from roster/live-catalog data is byte-exact-validated
+ * against this pattern before interpolation — never trusted as-is. A
+ * targetTable/contentCol/embeddingCol value that fails this is refused loud
+ * (FATAL, naming the value and its source) rather than interpolated, which
+ * would otherwise be an identifier-injection hazard AND (independently) the
+ * exact shape that lets a table literally named "toString"/"constructor"
+ * resolve via JS's Object.prototype instead of an own property (see T5's
+ * CONTENT_EXPRESSIONS lookup, which pairs this with Object.hasOwn).
+ */
+function assertSafeIdentifier(name, label) {
+  if (typeof name !== 'string' || !SAFE_IDENTIFIER_RE.test(name)) {
+    console.error(`FATAL: ${label} "${name}" is not a safe SQL identifier (must match ${SAFE_IDENTIFIER_RE}).`);
+    process.exit(1);
+  }
+}
+
+// ─── targetTable RESOLUTION KEYED ON (source_db, source_table) (cm#196/#197) ─
+
+/**
+ * Build a Map<string, targetTable> (key = JSON.stringify([source_db, source_table])) from the roster —
+ * the single resolution authority every consumer that needs "what targetTable
+ * does this (source_db, source_table) pair migrate to" should use, replacing
+ * the source_table-ALONE `roster.find(e => e.source_table === sourceTable)`
+ * matcher bug (T2/T9's pre-existing targetTableFor): two different source_dbs
+ * legitimately reuse the same source_table name (e.g. "decisions" from three
+ * different pipeline databases) mapping to the SAME targetTable today, but a
+ * source_table-alone lookup would silently resolve every one of them via
+ * whichever roster entry happens to be FIRST in array order — correct only by
+ * coincidence when every same-named source_table maps to the same
+ * targetTable, and silently wrong the day one doesn't.
+ *
+ * Load-time FATAL (never silently first-entry-wins) if the SAME
+ * (source_db, source_table) pair appears more than once in the roster
+ * mapping to DIFFERENT targetTable values — a genuine roster contradiction,
+ * not a legitimate multi-source shape (the legitimate multi-source shape is
+ * DIFFERENT source_tables, e.g. "memory_entries" and
+ * "memory_entries_db_absorb", both under the same source_db, mapping to the
+ * same targetTable — that is normal and unaffected by this check).
+ */
+function buildTargetTableByPairMap(roster, rosterPath) {
+  const map = new Map();
+  const seenTargets = new Map(); // pairKey -> Set<targetTable>
+  for (const entry of roster) {
+    const key = JSON.stringify([entry.source_db, entry.source_table]);
+    if (!seenTargets.has(key)) seenTargets.set(key, new Set());
+    seenTargets.get(key).add(entry.targetTable);
+    map.set(key, entry.targetTable); // last-write is fine once we've FATALed on any real conflict below
+  }
+  const conflicts = [...seenTargets.entries()].filter(([, targets]) => targets.size > 1);
+  if (conflicts.length) {
+    console.error(`FATAL: roster at "${rosterPath || resolveRosterPath()}" has ${conflicts.length} (source_db, source_table) pair(s) mapping to CONFLICTING targetTable values:`);
+    for (const [key, targets] of conflicts) {
+      const [sourceDb, sourceTable] = JSON.parse(key);
+      console.error(`  - source_db="${sourceDb}" source_table="${sourceTable}": targetTable candidates = ${[...targets].map((t) => `"${t}"`).join(', ')}`);
+    }
+    process.exit(1);
+  }
+  return map;
+}
+
+/** Resolve targetTable for one (source_db, source_table) pair via the map above. */
+function resolveTargetTableForPair(pairMap, sourceDb, sourceTable) {
+  return pairMap.get(JSON.stringify([sourceDb, sourceTable])) || null;
+}
+
+/**
+ * Exact (source_db, source_table) pairs present in the roster — used by
+ * classifyManifestRow (Phase 1) to answer "is this manifest row's exact pair
+ * roster-paired" (byte-exact, never a source_table-alone match, for the same
+ * reason buildTargetTableByPairMap above exists).
+ */
+function buildRosterPairSet(roster) {
+  const set = new Set();
+  for (const entry of roster) set.add(JSON.stringify([entry.source_db, entry.source_table]));
+  return set;
+}
+
+function isRosterPaired(rosterPairSet, sourceDb, sourceTable) {
+  return rosterPairSet.has(JSON.stringify([sourceDb, sourceTable]));
+}
+
+// ─── db-triage.json (READ-SIDE, NON-FATAL-ON-ABSENCE) LOADER (cm#197) ───────
+//
+// This is a SEPARATE loader from migrate-04/05's own loadDbTriage(): those
+// scripts are WRITE-side migrators that must refuse to run at all against an
+// unclassified live database (FATAL on a missing file is correct there — see
+// migrate-04-absorb-pipeline-tables.js's loadDbTriage). T0/T2/T4/T9 are
+// READ-side audits of migration_manifest rows that may ALREADY exist from a
+// run where no db-triage.json was ever present (T2's own CI fixtures are
+// roster-paired and carry no triage file at all, by design — see
+// classifyManifestRow's UNTRIAGED branch) — an audit script FATALing on a
+// missing triage file would make the whole battery unable to run in that
+// legitimate configuration. Absence is therefore its own total-classification
+// OUTCOME (every row's db lands in the UNTRIAGED branch), never a refusal.
+// An estate file with an INVALID class VALUE inside it, by contrast, is a
+// config bug regardless of which rows reference it -- still a load-time
+// FATAL, mirroring migrate-04/05's own validation exactly.
+
+const DB_TRIAGE_ENV_VAR = 'DB_TRIAGE_PATH';
+const DB_TRIAGE_EXAMPLE_FILE = 'db-triage.example.json';
+const DB_TRIAGE_VALID_CLASSES = new Set(['REAL-MIGRATE', 'EPHEMERAL-DROP', 'OWNER-REVIEW', 'ENGINE-INFRA']);
+
+/** --triage <path> / --triage=<path>, mirroring parseDbFlag's own shape. */
+function parseTriageFlag(argv) {
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--triage') return argv[i + 1];
+    if (argv[i].startsWith('--triage=')) return argv[i].slice('--triage='.length);
+  }
+  return null;
+}
+
+function resolveDbTriagePath(argv) {
+  return parseTriageFlag(argv || []) || process.env[DB_TRIAGE_ENV_VAR] || path.join(MIGRATIONS_DIR, 'db-triage.json');
+}
+
+/**
+ * Load db-triage.json for READ-side (audit) consumers. Returns
+ * { path, databases: Map<dbName,class>|null } — `databases` is `null` when
+ * the file is absent (a legitimate, expected CI/no-triage-file posture, NOT
+ * an error); every db then classifies UNTRIAGED in classifyManifestRow.
+ * A PRESENT file with a malformed shape or an invalid class value is still a
+ * loud, run-blocking FATAL (a config bug, not an absence).
+ */
+function loadDbTriageForAudit(argv) {
+  const p = resolveDbTriagePath(argv);
+  if (!fs.existsSync(p)) {
+    return { path: p, databases: null };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch (err) {
+    console.error(`FATAL: db-triage config at "${p}" is not valid JSON: ${err.message}`);
+    process.exit(1);
+  }
+  if (!parsed.databases || typeof parsed.databases !== 'object') {
+    console.error(`FATAL: db-triage config at "${p}" must carry a "databases" object.`);
+    process.exit(1);
+  }
+  const bad = Object.entries(parsed.databases).filter(([, cls]) => !DB_TRIAGE_VALID_CLASSES.has(cls));
+  if (bad.length) {
+    console.error(`FATAL: db-triage config at "${p}" has ${bad.length} entr(y/ies) with an invalid class:`);
+    for (const [db, cls] of bad) console.error(`  - "${db}": "${cls}" (must be one of ${[...DB_TRIAGE_VALID_CLASSES].join(', ')})`);
+    process.exit(1);
+  }
+  const databases = new Map(Object.entries(parsed.databases));
+  return { path: p, databases };
+}
+
+// ─── PHASE 1: PER-ROW migration_manifest TOTAL CLASSIFICATION (cm#196/#197) ──
+//
+// ONE shared classifier, consumed by T0/T2/T4/T9 (never a per-script copy —
+// two normalization engines is exactly the class of bug this whole battery
+// exists to close). Classifies ONE migration_manifest row into EXACTLY one
+// named branch — see this PR's body for the full decision-tree rationale.
+// Every branch is named on the `branch` field; `retain` says whether the
+// caller's own reconciliation/audit logic should still consider this row;
+// `fatal`/`warn`/`info` say whether (and how loud) the caller should log it.
+// Callers own PRESENTATION (their own [T0]/[T2]/[T4]/[T9] prefixed log
+// lines) and the DECISION of what to do with a fail/warn (e.g. T2 removes
+// an EXCLUDE-BY-TRIAGE row from its working set entirely; T0 treats
+// `retain: false` as "does not count as manifest coverage for either
+// direction of its roster cross-check") — only the CLASSIFICATION itself is
+// shared.
+//
+// FAIL, NEVER FATAL (deliberate, load-bearing distinction): every non-RETAIN
+// branch below is a per-row "loud FAIL" — collected, reported, and folded
+// into the caller's own exit-1 decision, but it NEVER halts classification
+// of the OTHER rows in the same run. A single row with undecided provenance
+// (OWNER-REVIEW, an untriaged-and-unpaired source, …) is exactly that: a
+// problem with THAT row, not a reason to stop reporting on every other row
+// this run would otherwise have told the operator about. The only thing
+// that halts THIS run before it finishes is a malformed db-triage.json FILE
+// itself (validated at load time, by loadDbTriageForAudit, before any row
+// is classified at all) — a config bug is categorically different from a
+// per-row provenance question.
+
+const NETNEW_SOURCE_DB_PREFIX = 'net-new:';
+const FILESYSTEM_SOURCE_DB_PREFIX = 'filesystem:';
+
+/**
+ * @param {object} row - a migration_manifest row: {source_db, source_table,
+ *   project_id_or_null, excluded_reason, retired_at, id?}. `id` is optional
+ *   (used only for FAIL/WARN message context when present).
+ * @param {object} ctx
+ * @param {Map<string,string>|null} ctx.dbTriage - from loadDbTriageForAudit's
+ *   `databases` (null = no triage file present at all -> every plain-db-name
+ *   row is UNTRIAGED).
+ * @param {Set<string>} ctx.rosterPairSet - from buildRosterPairSet(roster).
+ * @returns {{branch:string, retain:boolean, fail?:boolean, warn?:boolean,
+ *   info?:boolean, reason?:string}}
+ */
+function classifyManifestRow(row, ctx) {
+  const { dbTriage, rosterPairSet } = ctx;
+  const label = `source_db="${row.source_db}" source_table="${row.source_table}" project_id_or_null=${row.project_id_or_null ?? 'NULL'}${row.id !== undefined ? ` (manifest id=${row.id})` : ''}`;
+
+  // Retirement is checked FIRST, before any other classification -- a
+  // retired row is disposed-of bookkeeping, full stop, regardless of what
+  // its source_db shape or triage class would otherwise say.
+  if (row.retired_at !== null && row.retired_at !== undefined) {
+    return { branch: 'RETIRED-SKIP', retain: false, info: true, reason: `${label}: retired (skipped)` };
+  }
+
+  const paired = isRosterPaired(rosterPairSet, row.source_db, row.source_table);
+
+  if (typeof row.source_db === 'string' && row.source_db.startsWith(NETNEW_SOURCE_DB_PREFIX)) {
+    // Sourceless (net-new:) roster entries never get a migration_manifest
+    // row by construction (T1 never snapshots one) -- a manifest row
+    // actually carrying this shape is a data-integrity bug, not a normal
+    // outcome, and is refused loud rather than silently reconciled.
+    return {
+      branch: 'NETNEW-IN-MANIFEST-FAIL', retain: false, fail: true,
+      reason: `${label}: source_db has the sourceless "net-new:" shape, but a real migration_manifest row exists for it -- sourceless tables never get manifest rows (nothing is ever migrated INTO them). This manifest row should not exist; investigate what wrote it.`,
+    };
+  }
+
+  if (typeof row.source_db === 'string' && row.source_db.startsWith(FILESYSTEM_SOURCE_DB_PREFIX)) {
+    if (paired) {
+      return { branch: 'FILESYSTEM-PAIRED-RETAIN', retain: true };
+    }
+    return {
+      branch: 'FILESYSTEM-UNPAIRED-FAIL', retain: false, fail: true,
+      reason: `${label}: filesystem: source with NO matching roster (source_db, source_table) entry -- markdown-sourced manifest rows must be roster-registered.`,
+    };
+  }
+
+  // Plain database name -- the only shape that reaches db-triage lookup.
+  const triageClass = dbTriage && dbTriage.has(row.source_db) ? dbTriage.get(row.source_db) : undefined;
+
+  if (triageClass === undefined) {
+    // UNTRIAGED: no triage file present at all, OR the file is present but
+    // doesn't mention this db.
+    if (paired) {
+      return { branch: 'UNTRIAGED-PAIRED-RETAIN', retain: true, warn: true, reason: `${label}: source_db is UNTRIAGED (no db-triage.json entry) but roster-paired -- retained with a warning.` };
+    }
+    return {
+      branch: 'UNTRIAGED-UNPAIRED-FAIL', retain: false, fail: true,
+      reason: `${label}: source_db is UNTRIAGED (no db-triage.json entry) AND has no matching roster (source_db, source_table) entry -- cannot account for this row.`,
+    };
+  }
+
+  if (triageClass === 'REAL-MIGRATE') {
+    return { branch: 'REAL-MIGRATE-RETAIN', retain: true };
+  }
+
+  if (triageClass === 'EPHEMERAL-DROP' || triageClass === 'ENGINE-INFRA') {
+    if (paired) {
+      return { branch: 'TRIAGE-EXCLUDED-PAIRED-RETAIN', retain: true, info: true, reason: `${label}: source_db is triage-classified "${triageClass}" but roster-paired (a legitimate own-graph/engine-infra source) -- retained.` };
+    }
+    return {
+      branch: 'EXCLUDE-BY-TRIAGE', retain: false, info: true,
+      reason: `${label}: source_db is triage-classified "${triageClass}" and NOT roster-paired -- excluded from this audit as known-disposable bookkeeping (row_count=${row.row_count ?? '?'}).`,
+    };
+  }
+
+  if (triageClass === 'OWNER-REVIEW') {
+    return {
+      branch: 'OWNER-REVIEW-FAIL', retain: false, fail: true,
+      reason: `${label}: source_db is triage-classified "OWNER-REVIEW" -- provenance undecided, cannot audit until reviewed.`,
+    };
+  }
+
+  // Defensive: loadDbTriageForAudit already validates every class value
+  // against DB_TRIAGE_VALID_CLASSES at load time, so this branch should be
+  // unreachable in practice -- kept as the explicit default branch anyway
+  // (never an implicit fall-through) per this project's total-classification
+  // canon.
+  return {
+    branch: 'UNKNOWN-TRIAGE-VALUE-FAIL', retain: false, fail: true,
+    reason: `${label}: source_db is triage-classified "${triageClass}", which is not one of ${[...DB_TRIAGE_VALID_CLASSES].join(', ')}.`,
+  };
+}
+
 // ─── PROJECT_ID COLUMN TOTAL CLASSIFICATION (BF-1/BF-5/BF-R1, cm#187/#188) ───
 
 /**
@@ -588,7 +867,7 @@ async function crossCheckProjectIdScope(client, roster) {
  */
 async function reconcileNoColumnTable(client, targetTable, sourceDb, sourceTable) {
   const { rows: manifestRows } = await client.query(
-    `SELECT row_count, excluded_reason FROM migration_manifest WHERE source_db = $1 AND source_table = $2`,
+    `SELECT row_count, excluded_reason FROM migration_manifest WHERE source_db = $1 AND source_table = $2 AND retired_at IS NULL`,
     [sourceDb, sourceTable]
   );
   const excludedRows = manifestRows.filter((r) => r.excluded_reason !== null);
@@ -745,7 +1024,7 @@ async function loadExclusionsFor(tgtClient, sourceDb, sourceTable) {
   const { rows } = await tgtClient.query(
     `SELECT project_id_or_null, row_count, excluded_reason
      FROM migration_manifest
-     WHERE source_db = $1 AND source_table = $2 AND excluded_reason IS NOT NULL`,
+     WHERE source_db = $1 AND source_table = $2 AND excluded_reason IS NOT NULL AND retired_at IS NULL`,
     [sourceDb, sourceTable]
   );
   const nullScoped = rows.find((r) => r.project_id_or_null === null) || null;
@@ -819,6 +1098,30 @@ CREATE TABLE IF NOT EXISTS migration_manifest (
 CREATE INDEX IF NOT EXISTS migration_manifest_source_idx ON migration_manifest (source_db, source_table);
 CREATE INDEX IF NOT EXISTS migration_manifest_excl_idx   ON migration_manifest (excluded_reason);
 
+-- RETIREMENT (cm#194/cm#196/cm#197/cm#199, 2026-08-18): a SEPARATE mechanism
+-- from excluded_reason -- see cure-migration-manifest-retirement.js's header
+-- comment for the full rationale. excluded_reason means "this slice was
+-- deliberately never migrated" (T9 then POSITIVELY asserts zero live target
+-- rows for it); retired_at means "this manifest/row-hash BOOKKEEPING ROW
+-- itself is disposed of" (a leaked test-fixture artifact, a stale duplicate
+-- capture, or a superseded snapshot) -- the underlying live target data, if
+-- any, is untouched and may legitimately still exist under a DIFFERENT,
+-- correctly-recorded manifest row. Applying excluded_reason to a leaked row
+-- instead would poison every consumer that treats excluded_reason as "prove
+-- zero live rows" (T9) or as an embedding-exclusion set (migrate-07 G-R7)
+-- for a project that in fact has hundreds of legitimate live rows under the
+-- SAME target/project bucket -- retirement avoids that collision entirely by
+-- removing the row from consideration everywhere, rather than asserting a
+-- false claim about live data. ADDITIVE ALTER (not part of the CREATE TABLE
+-- literal above) so an already-existing migration_manifest table on a
+-- previously-provisioned staging DB picks up these columns via applyDdl() on
+-- next touch, mirroring the PR #204 canon-class pattern (a column defined
+-- only inside a CREATE TABLE IF NOT EXISTS body is invisible to a table that
+-- already exists; an ALTER TABLE ADD COLUMN IF NOT EXISTS reaches it).
+ALTER TABLE migration_manifest ADD COLUMN IF NOT EXISTS retired_at  TIMESTAMPTZ;
+ALTER TABLE migration_manifest ADD COLUMN IF NOT EXISTS retired_note TEXT;
+CREATE INDEX IF NOT EXISTS migration_manifest_retired_idx ON migration_manifest (retired_at);
+
 CREATE TABLE IF NOT EXISTS migration_manifest_row_hashes (
   id                  SERIAL PRIMARY KEY,
   source_db           TEXT NOT NULL,
@@ -830,6 +1133,14 @@ CREATE TABLE IF NOT EXISTS migration_manifest_row_hashes (
 );
 CREATE INDEX IF NOT EXISTS migration_manifest_row_hashes_hash_idx ON migration_manifest_row_hashes (source_hash);
 CREATE INDEX IF NOT EXISTS migration_manifest_row_hashes_src_idx  ON migration_manifest_row_hashes (source_db, source_table);
+
+-- Same retirement mechanism, same rationale, applied to the per-row hash
+-- table (cm#199 comment: the 2 orphan row-hash rows for excluded slice
+-- 1642's project carry no excluded_reason column at all on THIS table --
+-- retired_at is the disposition mechanism here too, for consistency: one
+-- mechanism for every cure this PR ships, never a second ad hoc column).
+ALTER TABLE migration_manifest_row_hashes ADD COLUMN IF NOT EXISTS retired_at   TIMESTAMPTZ;
+ALTER TABLE migration_manifest_row_hashes ADD COLUMN IF NOT EXISTS retired_note TEXT;
 
 CREATE TABLE IF NOT EXISTS memory_manager_staging_row_hashes (
   id            SERIAL PRIMARY KEY,
@@ -1030,6 +1341,21 @@ module.exports = {
   countLineageRows,
   loadLineageMap,
   checkLineagePopulationOrFatal,
+  assertSafeIdentifier,
+  SAFE_IDENTIFIER_RE,
+  buildTargetTableByPairMap,
+  resolveTargetTableForPair,
+  buildRosterPairSet,
+  isRosterPaired,
+  DB_TRIAGE_ENV_VAR,
+  DB_TRIAGE_EXAMPLE_FILE,
+  DB_TRIAGE_VALID_CLASSES,
+  parseTriageFlag,
+  resolveDbTriagePath,
+  loadDbTriageForAudit,
+  classifyManifestRow,
+  NETNEW_SOURCE_DB_PREFIX,
+  FILESYSTEM_SOURCE_DB_PREFIX,
   tableHasColumn,
   crossCheckProjectIdScope,
   reconcileNoColumnTable,

@@ -467,5 +467,19 @@
     ],
     "hasContentBearingText": true,
     "requires_project_id_scope": true
+  },
+  {
+    "_comment": "manifest_label_duplicate_of (cm#196/cm#197 T2 Branch A rewrite, 2026-08-18): OPTIONAL field, set on a roster entry whose source_table label is a DUPLICATE bookkeeping recording of the SAME already-migrated physical target rows as another label in the SAME (targetTable, project_id_or_null) slice -- never a genuinely ADDITIVE second source of new rows (that shape needs no such field; T2's Branch A already sums every non-duplicate-labeled contributor to a slice). The value is the PRIMARY label's bare source_table name (byte-exact, no source_db qualifier -- the field describes a fact about the LABEL, not about one particular capture of it). T2 verifies (never assumes) this claim: the duplicate label's own row-count sum, within the slice, must equal the primary label's sum, or T2 FATALs naming both. Live precedent this field was added for: migrate-05-sync-file-memory.js's absorb step records memory_entries/memory_entry_chunks a SECOND time under an '_db_absorb'-suffixed label for its own audit trail, without writing new pipeline_migration_row_ids lineage (verified: 0 lineage rows under the '_db_absorb' label, exact row-count equality with the bare label) -- i.e. it is re-describing rows the ordinary migrate-04 absorption already counted, not adding new ones.",
+    "source_db": "example_pipeline_main_db",
+    "source_table": "example_decisions_db_absorb",
+    "targetTable": "decisions",
+    "loadBearingCols": [
+      "topic",
+      "decision",
+      "reason"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true,
+    "manifest_label_duplicate_of": "decisions"
   }
 ]
