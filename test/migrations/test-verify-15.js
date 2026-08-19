@@ -219,6 +219,17 @@ async function setupSourceSchema(client) {
       event_id INTEGER,
       assertion_id INTEGER
     );
+    -- cm#198 fix: T3 branch (b) fixtures need SOURCE-side parent tables for
+    -- retrieval_event_assertions' lineage-mapped columns (event_id ->
+    -- retrieval_events, assertion_id -> assertions). Plain INTEGER PRIMARY
+    -- KEY (never SERIAL) -- tests need to insert explicit, chosen ids.
+    CREATE TABLE IF NOT EXISTS retrieval_events (
+      id INTEGER PRIMARY KEY,
+      project_id TEXT
+    );
+    CREATE TABLE IF NOT EXISTS assertions (
+      id INTEGER PRIMARY KEY
+    );
   `);
 }
 
@@ -250,6 +261,38 @@ const NO_COLUMN_ROSTER_ENTRY = {
   loadBearingCols: ['event_id', 'assertion_id'], hasContentBearingText: false,
   requires_project_id_scope: false,
 };
+
+// cm#198 fix: T3 branch (b) -- a lineage-declared roster entry mirroring
+// the shipped source-table-roster.example.json's amended REA entry
+// verbatim (event_id -> retrieval_events, assertion_id -> assertions, both
+// via own_graph_migration_ids). Reused across every testT3LineageMappedCols
+// sub-case below.
+const LINEAGE_ROSTER_ENTRY = {
+  source_db: SOURCE_DB, source_table: 'retrieval_event_assertions', targetTable: 'retrieval_event_assertions',
+  loadBearingCols: ['event_id', 'assertion_id'], hasContentBearingText: false,
+  requires_project_id_scope: false,
+  lineageMappedCols: {
+    event_id: { lineage_table: 'own_graph_migration_ids', parent_source_table: 'retrieval_events' },
+    assertion_id: { lineage_table: 'own_graph_migration_ids', parent_source_table: 'assertions' },
+  },
+  lineageMembership: { lineage_table: 'own_graph_migration_ids', source_row_id_encoding: 'event_id:assertion_id' },
+};
+
+async function insertLineage(client, sourceDb, sourceTable, sourceRowId, projectId, targetTable, targetRowId) {
+  await client.query(
+    `INSERT INTO own_graph_migration_ids (source_db, source_table, source_row_id, project_id, target_table, target_row_id)
+     VALUES ($1,$2,$3,$4,$5,$6)`,
+    [sourceDb, sourceTable, String(sourceRowId), projectId, targetTable, targetRowId]
+  );
+}
+
+async function insertManifest(client, sourceDb, sourceTable, projectId, rowCount, excludedReason) {
+  await client.query(
+    `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint, excluded_reason)
+     VALUES ($1,$2,$3,$4,'fp',$5)`,
+    [sourceDb, sourceTable, projectId, rowCount, excludedReason]
+  );
+}
 
 // A SOURCELESS (net-new:) roster entry — a §17/§18-shaped table with no
 // migration source. Reused across T0/T3/T3b's sourceless-classification
@@ -999,6 +1042,249 @@ async function testT3ExclusionAwareness() {
   } finally {
     await source.end();
     await target.end();
+  }
+}
+
+// cm#198 fix: T3 branch (b) -- translated-id forward containment for
+// lineage-declared roster entries (retrieval_event_assertions-shaped).
+async function testT3LineageMappedCols() {
+  const source = await pgConnect(SOURCE_DB);
+  const target = await pgConnect(TARGET_DB);
+  try {
+    await shared.applyDdl(target);
+    await truncateAll(source, ['retrieval_event_assertions', 'retrieval_events', 'assertions']);
+    await truncateAll(target, ['retrieval_event_assertions', 'migration_manifest', 'own_graph_migration_ids']);
+
+    const rosterPath = writeTmpJson('t3-lineage-roster.json', [LINEAGE_ROSTER_ENTRY]);
+
+    // ── (1) duplicate source pair multiset survival ──────────────────────
+    // Two LITERAL duplicate source rows sharing (event_id=1, assertion_id=
+    // 100) -- membership is a keyed LOOKUP per source row, never an
+    // enumeration of lineage rows, so BOTH must count as MAPPED even though
+    // only ONE lineage row can exist at that composite key (own_graph_
+    // migration_ids' own UNIQUE(source_db,source_table,source_row_id)).
+    await source.query(`INSERT INTO retrieval_events (id, project_id) VALUES (1, 'proj-live')`);
+    await source.query(`INSERT INTO assertions (id) VALUES (100)`);
+    await source.query(`INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES (1,100), (1,100)`);
+    await insertLineage(target, SOURCE_DB, 'retrieval_events', '1', 'proj-live', 'retrieval_events', 501);
+    await insertLineage(target, SOURCE_DB, 'assertions', '100', null, 'assertions', 9001);
+    await insertLineage(target, SOURCE_DB, 'retrieval_event_assertions', '1:100', 'proj-live', 'retrieval_event_assertions', 501);
+    await insertManifest(target, SOURCE_DB, 'retrieval_event_assertions', 'proj-live', 2, null);
+    await target.query(`INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES (501,9001), (501,9001)`);
+
+    const rDup = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (rDup.status === 0 && /classified 2 MAPPED/.test(rDup.stdout + rDup.stderr) && /2 mapped rows == 2 summed/.test(rDup.stdout + rDup.stderr)) {
+      pass('T3-lineage-dup', 'duplicate source (event_id,assertion_id) pair -> both rows counted MAPPED (multiset survives a shared lineage key)');
+    } else {
+      fail('T3-lineage-dup', 'duplicate source (event_id,assertion_id) pair -> both rows counted MAPPED (multiset survives a shared lineage key)', `status=${rDup.status} stdout=${rDup.stdout} stderr=${rDup.stderr}`);
+    }
+
+    // ── (2) string-vs-int hash regression (worked example source (1,851)) ─
+    await truncateAll(source, ['retrieval_event_assertions', 'retrieval_events', 'assertions']);
+    await truncateAll(target, ['retrieval_event_assertions', 'migration_manifest', 'own_graph_migration_ids']);
+    await source.query(`INSERT INTO retrieval_events (id, project_id) VALUES (1, 'proj-live')`);
+    await source.query(`INSERT INTO assertions (id) VALUES (851)`);
+    await source.query(`INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES (1,851)`);
+    await insertLineage(target, SOURCE_DB, 'retrieval_events', '1', 'proj-live', 'retrieval_events', 777);
+    await insertLineage(target, SOURCE_DB, 'assertions', '851', null, 'assertions', 1187);
+    await insertLineage(target, SOURCE_DB, 'retrieval_event_assertions', '1:851', 'proj-live', 'retrieval_event_assertions', 777);
+    await insertManifest(target, SOURCE_DB, 'retrieval_event_assertions', 'proj-live', 1, null);
+    await target.query(`INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES (777,1187)`);
+
+    // Negative control: prove a STRING-typed translated tuple would NOT hash
+    // equal to the pg-native INTEGER target row -- demonstrates the exact
+    // regression this fix guards against (cm#198's root cause: two disjoint
+    // id spaces hashed as raw values never match; here, hashing the
+    // translated ids as strings instead of pg-native integers reproduces
+    // the identical failure shape one level down).
+    const intHash = shared.rowHash(['event_id', 'assertion_id'], { event_id: 777, assertion_id: 1187 });
+    const stringHash = shared.rowHash(['event_id', 'assertion_id'], { event_id: '777', assertion_id: '1187' });
+    if (intHash !== stringHash) {
+      pass('T3-lineage-typeregression-proof', 'string-typed vs integer-typed translated tuple hash DIFFER on this fixture (proves the string-vs-int bug shape is real, i.e. this fix must translate to pg-native ints, never strings)');
+    } else {
+      fail('T3-lineage-typeregression-proof', 'string-typed vs integer-typed translated tuple hash DIFFER on this fixture', 'hashes were equal -- fixture does not exercise the type-sensitivity of rowHash');
+    }
+
+    const rType = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (rType.status === 0) {
+      pass('T3-lineage-typeregression', 'translated tuple (pg-native integers) matches target row hash -> PASS (source (1,851) -> target (777,1187))');
+    } else {
+      fail('T3-lineage-typeregression', 'translated tuple (pg-native integers) matches target row hash -> PASS (source (1,851) -> target (777,1187))', `status=${rType.status} stdout=${rType.stdout} stderr=${rType.stderr}`);
+    }
+
+    // ── (3) lineage-wipe vacuous-green becomes FATAL via the anchor ──────
+    // 3 live source rows, manifest claims row_count=3, but only 2 of the 3
+    // have their OWN membership lineage row -- without the anchor, forward
+    // containment would only ever iterate the 2 mapped hashes and silently
+    // PASS while 1 real migrated-manifest row's translation is unaccounted
+    // for.
+    await truncateAll(source, ['retrieval_event_assertions', 'retrieval_events', 'assertions']);
+    await truncateAll(target, ['retrieval_event_assertions', 'migration_manifest', 'own_graph_migration_ids']);
+    await source.query(`INSERT INTO retrieval_events (id, project_id) VALUES (1,'proj-live'), (2,'proj-live'), (3,'proj-live')`);
+    await source.query(`INSERT INTO assertions (id) VALUES (101), (102), (103)`);
+    await source.query(`INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES (1,101), (2,102), (3,103)`);
+    await insertLineage(target, SOURCE_DB, 'retrieval_events', '1', 'proj-live', 'retrieval_events', 601);
+    await insertLineage(target, SOURCE_DB, 'retrieval_events', '2', 'proj-live', 'retrieval_events', 602);
+    await insertLineage(target, SOURCE_DB, 'retrieval_events', '3', 'proj-live', 'retrieval_events', 603);
+    await insertLineage(target, SOURCE_DB, 'assertions', '101', null, 'assertions', 9101);
+    await insertLineage(target, SOURCE_DB, 'assertions', '102', null, 'assertions', 9102);
+    await insertLineage(target, SOURCE_DB, 'assertions', '103', null, 'assertions', 9103);
+    // Only 2 of 3 REA membership rows -- "3:103" is MISSING (simulated wipe).
+    await insertLineage(target, SOURCE_DB, 'retrieval_event_assertions', '1:101', 'proj-live', 'retrieval_event_assertions', 601);
+    await insertLineage(target, SOURCE_DB, 'retrieval_event_assertions', '2:102', 'proj-live', 'retrieval_event_assertions', 602);
+    await insertManifest(target, SOURCE_DB, 'retrieval_event_assertions', 'proj-live', 3, null); // manifest still claims 3
+    await target.query(`INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES (601,9101), (602,9102)`);
+
+    const rAnchor = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (rAnchor.status !== 0 && /mapped-source-row count \(2\) != sum\(row_count\).*\(3\)/.test((rAnchor.stdout + rAnchor.stderr).replace(/\s+/g, ' '))) {
+      pass('T3-lineage-anchor', 'lineage row missing for 1 of 3 manifest-claimed rows -> anchor FATAL (2 != 3), never a silent vacuous PASS over only the 2 mapped hashes');
+    } else {
+      fail('T3-lineage-anchor', 'lineage row missing for 1 of 3 manifest-claimed rows -> anchor FATAL (2 != 3), never a silent vacuous PASS over only the 2 mapped hashes', `status=${rAnchor.status} stdout=${rAnchor.stdout} stderr=${rAnchor.stderr}`);
+    }
+
+    // ── (4) missing-parent-lineage FATAL (not a data-loss FAIL) ──────────
+    // REA's own membership row exists for (5,555), but assertions' OWN
+    // lineage row for source_row_id="555" does not -- a lineage-table
+    // integrity break, distinct from ordinary drift.
+    await truncateAll(source, ['retrieval_event_assertions', 'retrieval_events', 'assertions']);
+    await truncateAll(target, ['retrieval_event_assertions', 'migration_manifest', 'own_graph_migration_ids']);
+    await source.query(`INSERT INTO retrieval_events (id, project_id) VALUES (5,'proj-live')`);
+    await source.query(`INSERT INTO assertions (id) VALUES (555), (556)`); // 556 exists only so the assertions lineage table is non-empty (population check)
+    await source.query(`INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES (5,555)`);
+    await insertLineage(target, SOURCE_DB, 'retrieval_events', '5', 'proj-live', 'retrieval_events', 701);
+    await insertLineage(target, SOURCE_DB, 'assertions', '556', null, 'assertions', 9556); // 555's own lineage row is DELIBERATELY absent
+    await insertLineage(target, SOURCE_DB, 'retrieval_event_assertions', '5:555', 'proj-live', 'retrieval_event_assertions', 701);
+    await insertManifest(target, SOURCE_DB, 'retrieval_event_assertions', 'proj-live', 1, null);
+
+    const rInconsistent = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    if (rInconsistent.status !== 0 && /lineage inconsistency/.test(rInconsistent.stdout + rInconsistent.stderr) && !/multiset mismatch/.test(rInconsistent.stdout + rInconsistent.stderr)) {
+      pass('T3-lineage-inconsistency', 'membership present but a parent lineage resolution is missing -> FATAL "lineage inconsistency" (never miscounted as an ordinary data-loss FAIL)');
+    } else {
+      fail('T3-lineage-inconsistency', 'membership present but a parent lineage resolution is missing -> FATAL "lineage inconsistency" (never miscounted as an ordinary data-loss FAIL)', `status=${rInconsistent.status} stdout=${rInconsistent.stdout} stderr=${rInconsistent.stderr}`);
+    }
+
+    // ── (6) live-parent vs excluded-parent drift split + --allow-live-drift ─
+    await truncateAll(source, ['retrieval_event_assertions', 'retrieval_events', 'assertions']);
+    await truncateAll(target, ['retrieval_event_assertions', 'migration_manifest', 'own_graph_migration_ids']);
+    // Row C: fully migrated/mapped (keeps the lineage-population check
+    // satisfied and gives the anchor something non-zero to match).
+    await source.query(`INSERT INTO retrieval_events (id, project_id) VALUES (10,'proj-excluded'), (11,'proj-live'), (12,'proj-live')`);
+    await source.query(`INSERT INTO assertions (id) VALUES (1010), (1011), (1012)`);
+    await source.query(`INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES (10,1010), (11,1011), (12,1012)`);
+    await insertLineage(target, SOURCE_DB, 'retrieval_events', '12', 'proj-live', 'retrieval_events', 812);
+    await insertLineage(target, SOURCE_DB, 'assertions', '1012', null, 'assertions', 91012);
+    await insertLineage(target, SOURCE_DB, 'retrieval_event_assertions', '12:1012', 'proj-live', 'retrieval_event_assertions', 812);
+    await insertManifest(target, SOURCE_DB, 'retrieval_event_assertions', 'proj-live', 1, null);
+    // Row A's (10) parent project is EXCLUDED via retrieval_events' own manifest slice.
+    await insertManifest(target, SOURCE_DB, 'retrieval_events', 'proj-excluded', 1, 'eval-junk-project-id');
+    await target.query(`INSERT INTO retrieval_event_assertions (event_id, assertion_id) VALUES (812,91012)`);
+
+    const rDrift = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    const driftOut = rDrift.stdout + rDrift.stderr;
+    if (rDrift.status !== 0 && /1 EXCLUDED-PARENT/.test(driftOut) && /1 LIVE-PARENT DRIFT/.test(driftOut) && /live-parent drift/.test(driftOut)) {
+      pass('T3-lineage-drift-default-fails', 'default invocation (no --allow-live-drift): 1 excluded-parent row never blocks, but 1 live-parent-drift row FAILs the run');
+    } else {
+      fail('T3-lineage-drift-default-fails', 'default invocation (no --allow-live-drift): 1 excluded-parent row never blocks, but 1 live-parent-drift row FAILs the run', `status=${rDrift.status} stdout=${rDrift.stdout} stderr=${rDrift.stderr}`);
+    }
+
+    const rDriftAllowed = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB, '--allow-live-drift'], rosterEnv(rosterPath));
+    const driftAllowedOut = rDriftAllowed.stdout + rDriftAllowed.stderr;
+    if (rDriftAllowed.status === 0 && /--allow-live-drift.*acknowledged/.test(driftAllowedOut)) {
+      pass('T3-lineage-drift-allow-flag', '--allow-live-drift acknowledges the SAME live-parent-drift row and lets the run PASS');
+    } else {
+      fail('T3-lineage-drift-allow-flag', '--allow-live-drift acknowledges the SAME live-parent-drift row and lets the run PASS', `status=${rDriftAllowed.status} stdout=${rDriftAllowed.stdout} stderr=${rDriftAllowed.stderr}`);
+    }
+  } finally {
+    await source.end();
+    await target.end();
+  }
+}
+
+// cm#198 fix: shared.getMembershipCodec is registered PER targetTable, never
+// a generic ':'-splitter -- 139 real project_settings keys also contain ':'
+// (its natural key is (project_id, key), and `key` values routinely contain
+// colons). This is a pure unit test, no DB required.
+function testLineageCodecScoping() {
+  const wrongTableCodec = shared.getMembershipCodec({
+    targetTable: 'project_settings',
+    lineageMembership: { source_row_id_encoding: 'event_id:assertion_id' },
+  });
+  if (wrongTableCodec === null) {
+    pass('T3-lineage-codec-scoping', 'no codec resolves for a targetTable other than retrieval_event_assertions, even with a matching encoding string -- the registry is per-table, never generic');
+  } else {
+    fail('T3-lineage-codec-scoping', 'no codec resolves for a targetTable other than retrieval_event_assertions, even with a matching encoding string -- the registry is per-table, never generic', `expected null, got ${JSON.stringify(wrongTableCodec)}`);
+  }
+
+  const reaCodec = shared.MEMBERSHIP_CODECS.retrieval_event_assertions;
+  const decoded = reaCodec.decode('proj-123:apiKey');
+  if (decoded === null) {
+    pass('T3-lineage-decode-guard', 'a project_settings-style colon-bearing, non-numeric key decodes to null under the REA codec (never a best-effort partial parse)');
+  } else {
+    fail('T3-lineage-decode-guard', 'a project_settings-style colon-bearing, non-numeric key decodes to null under the REA codec (never a best-effort partial parse)', `expected null, got ${JSON.stringify(decoded)}`);
+  }
+
+  const tooManyParts = reaCodec.decode('1:2:3');
+  if (tooManyParts === null) {
+    pass('T3-lineage-decode-arity', 'a 3-part colon-separated key decodes to null (exact-2-part split, never a lenient split(":")[0..1])');
+  } else {
+    fail('T3-lineage-decode-arity', 'a 3-part colon-separated key decodes to null (exact-2-part split, never a lenient split(":")[0..1])', `expected null, got ${JSON.stringify(tooManyParts)}`);
+  }
+}
+
+// cm#198 fix: load-time roster-declaration validation branches (shared.
+// validateLineageDeclarations, exercised via loadRoster() inside any
+// verify-15-*.js script -- T3 itself, here).
+async function testLineageDeclarationValidation() {
+  const cases = [
+    {
+      name: 'T3-lineage-val-onefield',
+      roster: [{ ...LINEAGE_ROSTER_ENTRY, lineageMembership: undefined }],
+      expect: /declares only one of lineageMappedCols\/lineageMembership/,
+    },
+    {
+      name: 'T3-lineage-val-vocab',
+      roster: [{
+        ...LINEAGE_ROSTER_ENTRY,
+        lineageMembership: { ...LINEAGE_ROSTER_ENTRY.lineageMembership, lineage_table: 'some_other_table' },
+      }],
+      expect: /unrecognized lineage_table name/,
+    },
+    {
+      name: 'T3-lineage-val-notloadbearing',
+      roster: [{
+        ...LINEAGE_ROSTER_ENTRY,
+        lineageMappedCols: { ...LINEAGE_ROSTER_ENTRY.lineageMappedCols, extra_col: { lineage_table: 'own_graph_migration_ids', parent_source_table: 'x' } },
+      }],
+      expect: /does not appear in loadBearingCols/,
+    },
+    {
+      name: 'T3-lineage-val-sourceless',
+      roster: [{ ...LINEAGE_ROSTER_ENTRY, source_db: 'net-new:memory_manager' }],
+      expect: /non-SQL-sourced entry/,
+    },
+    {
+      name: 'T3-lineage-val-projectscope',
+      roster: [{ ...LINEAGE_ROSTER_ENTRY, requires_project_id_scope: true }],
+      expect: /combination not implemented/,
+    },
+    {
+      name: 'T3-lineage-val-badencoding',
+      roster: [{
+        ...LINEAGE_ROSTER_ENTRY,
+        lineageMembership: { ...LINEAGE_ROSTER_ENTRY.lineageMembership, source_row_id_encoding: 'assertion_id:event_id' },
+      }],
+      expect: /no registered membership-key codec/,
+    },
+  ];
+  for (const c of cases) {
+    const rosterPath = writeTmpJson(`${c.name}.json`, c.roster);
+    const r = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterPath));
+    const out = r.stdout + r.stderr;
+    if (r.status !== 0 && c.expect.test(out)) {
+      pass(c.name, `load-time lineage-declaration validation FATALs: ${c.expect}`);
+    } else {
+      fail(c.name, `load-time lineage-declaration validation FATALs: ${c.expect}`, `status=${r.status} stdout=${r.stdout} stderr=${r.stderr}`);
+    }
   }
 }
 
@@ -1844,6 +2130,9 @@ async function main() {
     await testT3ContentHash();
     await testT3NoColumnFixture();
     await testT3ExclusionAwareness();
+    await testT3LineageMappedCols();
+    testLineageCodecScoping();
+    await testLineageDeclarationValidation();
     await testT3SourcelessSkip();
     await testT3bReverseContainment();
     await testT3bNoColumnReconciliation();
