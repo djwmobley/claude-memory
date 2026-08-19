@@ -192,6 +192,7 @@
     "requires_project_id_scope": true
   },
   {
+    "_comment": "cm#198 fix: event_id/assertion_id are SURROGATE ids renumbered at migration time (own_graph_migration_ids), not content preserved byte-for-byte -- lineageMappedCols/lineageMembership opt this entry into T3's branch (b) translated-id forward-containment path instead of branch (a)'s raw-value hash (which is structurally guaranteed to 0-match for a renumbered-id table). See verify-15-t3-content-hash.js's header comment.",
     "source_db": "claude_memory_eval_test",
     "source_table": "retrieval_event_assertions",
     "targetTable": "retrieval_event_assertions",
@@ -200,7 +201,21 @@
       "assertion_id"
     ],
     "hasContentBearingText": false,
-    "requires_project_id_scope": false
+    "requires_project_id_scope": false,
+    "lineageMappedCols": {
+      "event_id": {
+        "lineage_table": "own_graph_migration_ids",
+        "parent_source_table": "retrieval_events"
+      },
+      "assertion_id": {
+        "lineage_table": "own_graph_migration_ids",
+        "parent_source_table": "assertions"
+      }
+    },
+    "lineageMembership": {
+      "lineage_table": "own_graph_migration_ids",
+      "source_row_id_encoding": "event_id:assertion_id"
+    }
   },
   {
     "_comment": "migrate-04-absorb-pipeline-tables.js (§6.1(e), mm#11(e)) roster entries. claude_policy_framework is already-public (migrate-02-decisions.js's own hardcoded DEFAULT_SOURCE_DB), kept literal; pipeline_pipeline/claude_context are NOT hardcoded anywhere in migrate-04's own committed source (only in its gitignored db-triage.json/pipeline-db-project-map.json config), so they are SYNTHETIC placeholders here."

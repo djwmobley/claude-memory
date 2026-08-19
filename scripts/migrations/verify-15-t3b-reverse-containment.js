@@ -49,6 +49,20 @@ const AUTHORED_BY = 'sonnet-t-battery-author-2026-07-27';
  *     uniformly (not just migrated ones) does not silently re-introduce
  *     the T2/A-7 bug shape one layer up.
  *
+ * TARGET-SIDE SURPLUS CLOSURE ARGUMENT (cm#198 fix, applies to BOTH T3's
+ * branch (a) and branch (b) -- retrieval_event_assertions): T3b's job
+ * (this script) is proving nothing EXTRA landed; T3's forward-containment
+ * job (either branch) is proving every source row survived WITH ITS
+ * CONTENT INTACT. Neither script alone closes the loop against a
+ * same-COUNT content SWAP (a target row whose count matches but whose
+ * content silently changed): T3b's total-rowcount reconciliation only
+ * counts rows, so a swap is invisible to it; T3's forward-containment
+ * (this run's mapped/hashed multiset, in either branch) is what catches a
+ * swap, because the swapped row's hash no longer appears in the source
+ * (or lineage-translated) multiset at the expected count. The two checks
+ * are deliberately complementary, run together, never substitutes for one
+ * another.
+ *
  * Usage: node scripts/migrations/verify-15-t3b-reverse-containment.js [--db <target>]
  * Exit codes: 0 = zero unaccounted target rows in both directions, 1 =
  * any reverse-containment gap or unaccounted project_id found.

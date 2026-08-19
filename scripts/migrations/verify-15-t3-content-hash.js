@@ -61,6 +61,52 @@ const AUTHORED_BY = 'sonnet-t-battery-author-2026-07-27';
  * matching source hash, and excluded rows never migrate, so they are
  * simply absent from the target-side multiset T3b scans. No change needed.
  *
+ * LINEAGE-MAPPED COLUMNS -- BRANCH (b) (cm#198 fix). Branch (a) above hashes
+ * RAW column values on both sides -- correct ONLY when a load-bearing
+ * column's value is preserved byte-for-byte from source to target. Some
+ * load-bearing columns are SURROGATE ids renumbered at migration time
+ * (retrieval_event_assertions.event_id/assertion_id -- see
+ * migrate-verify-own-graph.js's own_graph_migration_ids lineage table): the
+ * source id space and target id space are structurally disjoint, so
+ * hashing raw values produces a guaranteed 0-match total mismatch no matter
+ * how healthy the migration is (cm#198's diagnosed root cause: source
+ * assertions id 1 migrated to target id 1187; hashing "1" against "1187"
+ * can never match). A roster entry OPTS IN to branch (b) by declaring BOTH
+ * lineageMappedCols and lineageMembership (validated at roster-load time by
+ * shared.validateLineageDeclarations -- see verify15-shared.js); an entry
+ * with neither field takes branch (a), completely unchanged.
+ *
+ * Branch (b)'s five-way per-source-row classification (MAPPED /
+ * lineage-inconsistency-FATAL / EXCLUDED-PARENT / LIVE-PARENT-DRIFT /
+ * decode-failure-FATAL), the mapped-vs-manifest ANCHOR fatal check, and the
+ * --allow-live-drift default-fail policy are implemented in
+ * runLineageBranch() below -- see that function's own header comment for
+ * the full algorithm. This is a STRUCTURAL split, not a strengthening of
+ * branch (a): branch (a) is deliberately left ALONE (see the "branch
+ * asymmetry" note further down) because giving raw-value hashing its own
+ * drift-exclusion logic would silently defeat forward containment's whole
+ * point for tables where the SOURCE VALUE really is supposed to survive
+ * unchanged.
+ *
+ * BRANCH ASYMMETRY (disclosed, not a bug): after this fix,
+ * retrieval_event_assertions (branch (b)) reports a correctly-classified
+ * drift FAIL instead of a structurally-guaranteed 0-match FAIL. The OTHER
+ * own-graph tables (assertions, retrieval_events, edges, entities, …) stay
+ * on branch (a) and will STILL fail T3 on a staging DB with live-source
+ * drift (the same live-source drift this issue diagnosed for
+ * retrieval_event_assertions also exists for its sibling tables — they were
+ * simply never checked, because T3 was 0/2930-failing loudly enough on this
+ * table first). This is INTENTIONAL and CORRECT: branch (a)'s raw-value
+ * hash is the right tool for tables whose load-bearing columns are content,
+ * not surrogate ids, and MUST NOT gain drift-exclusion — doing so would
+ * silently let a genuinely lost/never-migrated row escape forward
+ * containment by reclassifying it as "excluded" or "drift" without the
+ * translated-id proof branch (b) requires. Remaining reds on those tables
+ * after this PR are genuine pending re-migration work, not a T3 defect.
+ * T3b's own header comment carries the matching closure-argument note (T3b
+ * count-anchor + T3 forward-content together close the loop; a same-count
+ * content swap is caught by T3's mapped-tuple miss, not by T3b alone).
+ *
  * SOURCELESS (net-new:) ROSTER ENTRIES have no source to hash at all — T3's
  * whole PREMISE (a source-side multiset compared to a target-side one)
  * does not apply. groupRosterBySourceDb partitions these out explicitly
@@ -71,11 +117,237 @@ const AUTHORED_BY = 'sonnet-t-battery-author-2026-07-27';
  * table in the same run.
  *
  * Usage: node scripts/migrations/verify-15-t3-content-hash.js [--db <target>]
+ *   [--allow-live-drift]
+ * --allow-live-drift acknowledges branch (b)'s LIVE-PARENT DRIFT classification
+ * (live-source rows under a non-excluded parent project that have not yet
+ * migrated) and lets the run PASS despite it. NEVER pass this by default --
+ * T10 and any pre-promotion invocation must run without it, so drift is
+ * always visible unless a human explicitly acknowledges it for one run.
  * Exit codes: 0 = every source hash found in target (multiset-complete),
- * 1 = any multiset mismatch, refused target, or roster mapping gap.
+ * 1 = any multiset mismatch, live-parent drift (without --allow-live-drift),
+ * refused target, roster mapping gap, or lineage FATAL.
  */
 
 const shared = require('./lib/verify15-shared');
+
+// ─── BRANCH (b): LINEAGE-MAPPED COLUMNS (cm#198 fix) ─────────────────────────
+
+/**
+ * Load every live row from `sourceTable` on `srcClient`, projecting exactly
+ * `cols`.
+ */
+async function loadLiveRows(client, table, cols) {
+  const { rows } = await client.query(`SELECT ${cols.map((c) => `"${c}"`).join(', ')} FROM ${table}`);
+  return rows;
+}
+
+/**
+ * Runs branch (b)'s translated-id forward-containment proof for one
+ * lineage-declared roster entry (cm#198 fix). Five-way per-source-row
+ * classification, applied to every LIVE source row (never an enumeration of
+ * lineage rows -- membership is a keyed LOOKUP per source row, so
+ * duplicate source pairs each count separately, multiset-style):
+ *
+ *   1. MAPPED: this row's membership key is present in the entry's own
+ *      lineage_table for (source_db, entry.source_table), AND every
+ *      lineage-mapped column resolves via ITS OWN parent lineage row
+ *      (source_db, parent_source_table, String(sourceValue)) ->
+ *      target_row_id. The translated tuple (pg-native INTEGER target_row_id
+ *      values, never strings) is hashed via the SAME rowHash() the target
+ *      side uses, so a string-vs-int mismatch can never recreate cm#198's
+ *      root cause.
+ *   2. Membership present but a lineage-mapped column's parent resolution
+ *      is MISSING -> FATAL "lineage inconsistency" (this is a lineage-table
+ *      integrity break, never silently treated as ordinary drift).
+ *   3. Membership absent AND the parent row's project is EXCLUDED (per the
+ *      parent table's own migration_manifest exclusion slices) ->
+ *      EXCLUDED-PARENT: counted + sampled, never blocks the run.
+ *   4. Membership absent AND the parent row's project is live/unknown ->
+ *      LIVE-PARENT DRIFT: counted + sampled (plus a named sub-count of rows
+ *      whose OTHER mapped column is dangling in its own source table --
+ *      structurally can never migrate regardless of project scope). FAILS
+ *      the run unless --allow-live-drift is passed.
+ *   5. Decode failure (the row's own values don't encode to a well-formed
+ *      membership key under this entry's registered codec) -> FATAL, never
+ *      silently reclassified as drift.
+ *
+ * MANDATORY ANCHOR: count of MAPPED rows must equal
+ * sum(row_count) over migration_manifest slices for (source_db,
+ * entry.source_table) with excluded_reason IS NULL. A mismatch is FATAL,
+ * naming both numbers and both candidate causes -- this is what prevents a
+ * "vacuous green" (an empty/short mappedRows set trivially passing the
+ * forward-containment loop below, which iterates zero or few hashes, by
+ * looking like nothing was wrong instead of like something was lost).
+ *
+ * Lineage rows with no corresponding live source row are reported
+ * separately ("source deletions post-migration"), exit-neutral.
+ */
+async function runLineageBranch(srcClient, tgtClient, sourceDb, entry, cols, hashOpts, allowLiveDrift) {
+  const codec = shared.getMembershipCodec(entry); // guaranteed non-null by roster-load validation
+  const lineageTable = entry.lineageMembership.lineage_table;
+
+  const { rows: srcCountRows } = await srcClient.query(`SELECT COUNT(*)::int AS n FROM ${entry.source_table}`);
+  const sourceRowCount = srcCountRows[0].n;
+  await shared.checkLineagePopulationOrFatal(tgtClient, lineageTable, sourceDb, entry.source_table, sourceRowCount, `${entry.targetTable} membership`);
+
+  const parentTables = [...new Set(Object.values(entry.lineageMappedCols).map((m) => m.parent_source_table))];
+  for (const pt of parentTables) {
+    const { rows } = await srcClient.query(`SELECT COUNT(*)::int AS n FROM ${pt}`);
+    await shared.checkLineagePopulationOrFatal(tgtClient, lineageTable, sourceDb, pt, rows[0].n, `${entry.targetTable}'s parent table "${pt}"`);
+  }
+
+  if (sourceRowCount === 0) {
+    console.log(`[T3] OK: ${entry.source_table} -> ${entry.targetTable}: 0 live source rows (VACUOUS) -- nothing further to check.`);
+    return { failed: false };
+  }
+
+  // Every lineage-table read below is scoped by BOTH source_db AND the
+  // relevant source_table (spec item 2(h)) -- never a blanket scan.
+  const membershipMap = await shared.loadLineageMap(tgtClient, lineageTable, sourceDb, entry.source_table);
+  const parentMaps = new Map();
+  for (const pt of parentTables) {
+    parentMaps.set(pt, await shared.loadLineageMap(tgtClient, lineageTable, sourceDb, pt));
+  }
+
+  const sourceRows = await loadLiveRows(srcClient, entry.source_table, cols);
+
+  // Parent-project classification (cases 3/4) needs the parent row's own
+  // project_id -- resolved via the source-side parent table named by this
+  // entry's own lineageMappedCols declaration (never a hardcoded table
+  // name), and parent-table exclusions come from the SAME
+  // migration_manifest mechanism T3's branch (a) already uses.
+  const eventParentTable = entry.lineageMappedCols.event_id ? entry.lineageMappedCols.event_id.parent_source_table : parentTables[0];
+  const { rows: parentProjectRows } = await srcClient.query(`SELECT id, project_id FROM ${eventParentTable}`);
+  const parentProjectMap = new Map(parentProjectRows.map((r) => [r.id, r.project_id]));
+
+  const exclusions = await shared.loadExclusionsFor(tgtClient, sourceDb, eventParentTable);
+  const excludedProjectIds = new Set(exclusions.projectScoped.map((e) => e.project_id_or_null));
+  const wholeParentExcluded = !!exclusions.nullScoped;
+
+  // Dangling-assertion_id sub-count (item 2(b)(4)) -- assertion_id has NO
+  // declared FK to assertions(id) (a real schema fact, see
+  // migrate-verify-own-graph.js's header comment), so a dangling
+  // assertion_id can exist independently of parent-project exclusion and
+  // can never migrate under any circumstance.
+  const assertionParentTable = entry.lineageMappedCols.assertion_id ? entry.lineageMappedCols.assertion_id.parent_source_table : null;
+  let assertionIdSet = null;
+  if (assertionParentTable) {
+    const { rows } = await srcClient.query(`SELECT id FROM ${assertionParentTable}`);
+    assertionIdSet = new Set(rows.map((r) => r.id));
+  }
+
+  const decodeFailures = [];
+  const lineageInconsistencies = [];
+  const mappedRows = [];
+  let excludedParentCount = 0;
+  let liveParentDriftCount = 0;
+  let liveParentDanglingCount = 0;
+  const excludedParentSample = [];
+  const liveParentDriftSample = [];
+  const liveSourceKeys = new Set();
+
+  for (const row of sourceRows) {
+    const key = codec.encode(row);
+    if (key === null || codec.decode(key) === null) {
+      decodeFailures.push(row);
+      continue;
+    }
+    liveSourceKeys.add(key);
+
+    if (membershipMap.has(key)) {
+      const translated = {};
+      let inconsistent = false;
+      for (const [col, mapping] of Object.entries(entry.lineageMappedCols)) {
+        const parentMap = parentMaps.get(mapping.parent_source_table);
+        const sourceVal = String(row[col]);
+        if (!parentMap.has(sourceVal)) { inconsistent = true; break; }
+        translated[col] = parentMap.get(sourceVal);
+      }
+      if (inconsistent) {
+        lineageInconsistencies.push(row);
+        continue;
+      }
+      mappedRows.push(translated);
+      continue;
+    }
+
+    const projectId = parentProjectMap.has(row.event_id) ? parentProjectMap.get(row.event_id) : undefined;
+    const isExcluded = wholeParentExcluded || (projectId !== undefined && excludedProjectIds.has(projectId));
+    if (isExcluded) {
+      excludedParentCount++;
+      if (excludedParentSample.length < 5) excludedParentSample.push(row);
+    } else {
+      liveParentDriftCount++;
+      if (liveParentDriftSample.length < 5) liveParentDriftSample.push(row);
+      if (assertionIdSet && !assertionIdSet.has(row.assertion_id)) liveParentDanglingCount++;
+    }
+  }
+
+  if (decodeFailures.length > 0) {
+    console.error(`[T3] FATAL: ${entry.source_table}: ${decodeFailures.length} row(s) failed membership-key decode (never silently reclassified as drift) -- sample: ${JSON.stringify(decodeFailures.slice(0, 3))}`);
+    process.exit(1);
+  }
+  if (lineageInconsistencies.length > 0) {
+    console.error(`[T3] FATAL: ${entry.source_table}: ${lineageInconsistencies.length} row(s) have membership in "${lineageTable}" but an unresolvable parent lineage mapping (lineage inconsistency, not ordinary drift) -- sample: ${JSON.stringify(lineageInconsistencies.slice(0, 3))}`);
+    process.exit(1);
+  }
+
+  console.log(`[T3] ${entry.source_table} -> ${entry.targetTable}: classified ${mappedRows.length} MAPPED, ${excludedParentCount} EXCLUDED-PARENT, ${liveParentDriftCount} LIVE-PARENT DRIFT (of which ${liveParentDanglingCount} have a dangling ${assertionParentTable ? assertionParentTable.replace(/s$/, '') + '_id' : 'mapped-column'} -- can never migrate).`);
+  if (excludedParentSample.length) console.log(`  EXCLUDED-PARENT sample: ${JSON.stringify(excludedParentSample)}`);
+  if (liveParentDriftSample.length) console.log(`  LIVE-PARENT DRIFT sample: ${JSON.stringify(liveParentDriftSample)}`);
+
+  const { rows: manifestRows } = await tgtClient.query(
+    `SELECT COALESCE(SUM(row_count),0)::int AS n FROM migration_manifest WHERE source_db=$1 AND source_table=$2 AND excluded_reason IS NULL`,
+    [sourceDb, entry.source_table]
+  );
+  const anchorExpected = manifestRows[0].n;
+  if (mappedRows.length !== anchorExpected) {
+    console.error(
+      `[T3] FATAL: ${entry.source_table}: mapped-source-row count (${mappedRows.length}) != sum(row_count) over non-excluded migration_manifest slices for (source_db="${sourceDb}", source_table="${entry.source_table}") (${anchorExpected}). ` +
+      `Candidate causes: (a) lineage rows were lost for some already-migrated source rows, or (b) migrate-verify-own-graph.js's writeManifestSlice recorded skipped rows in row_count too (a skipped join row -- parent not migrated this run -- counts toward the manifest total but never gets a lineage row).`
+    );
+    process.exit(1);
+  }
+  console.log(`[T3] OK: ${entry.source_table} anchor: ${mappedRows.length} mapped rows == ${anchorExpected} summed non-excluded manifest row_count.`);
+
+  const mappedMultiset = new Map();
+  for (const t of mappedRows) {
+    const h = shared.rowHash(cols, t);
+    const e = mappedMultiset.get(h) || { count: 0, sample: [] };
+    e.count += 1;
+    if (e.sample.length < 3) e.sample.push(t);
+    mappedMultiset.set(h, e);
+  }
+  const targetMultiset = await shared.hashTableMultiset(tgtClient, entry.targetTable, cols, hashOpts);
+  let tableOk = true;
+  for (const [hash, { count: mappedCount, sample }] of mappedMultiset) {
+    const targetCount = (targetMultiset.get(hash) || { count: 0 }).count;
+    if (targetCount < mappedCount) {
+      tableOk = false;
+      console.error(`[T3] FAIL: ${entry.source_table} -> ${entry.targetTable}: lineage-tracked hash ${hash} has ${mappedCount} mapped source row(s) but only ${targetCount} target row(s) (lineage-tracked row missing from target)`, JSON.stringify(sample));
+    }
+  }
+  if (tableOk) {
+    console.log(`[T3] OK: ${entry.source_table} -> ${entry.targetTable}: all ${mappedRows.length} lineage-tracked (mapped) row(s) found in target (multiset).`);
+  }
+
+  const deletedLineageRows = [...membershipMap.keys()].filter((k) => !liveSourceKeys.has(k));
+  if (deletedLineageRows.length > 0) {
+    console.log(`[T3] source deletions post-migration: ${deletedLineageRows.length} (lineage row(s) in "${lineageTable}" with no corresponding live source row) -- sample: ${JSON.stringify(deletedLineageRows.slice(0, 5))}`);
+  }
+
+  const driftFails = liveParentDriftCount > 0 && !allowLiveDrift;
+  if (driftFails) {
+    console.error(
+      `[T3] FAIL: ${entry.source_table} -> ${entry.targetTable}: ${liveParentDriftCount} live-source row(s) under a non-excluded parent project have NOT migrated (live-parent drift). ` +
+      `Re-run migrate-verify-own-graph.js against this source, or pass --allow-live-drift to acknowledge and proceed for this run only (NEVER the default -- T10 and pre-promotion runs must never pass this flag).`
+    );
+  } else if (liveParentDriftCount > 0 && allowLiveDrift) {
+    console.log(`[T3] --allow-live-drift: ${liveParentDriftCount} live-parent drift row(s) acknowledged for this run, not failing.`);
+  }
+
+  return { failed: !tableOk || driftFails };
+}
 
 /**
  * Group roster entries by source_db, dropping filesystem:-prefixed ones
@@ -104,8 +376,9 @@ function groupRosterBySourceDb(roster) {
 
 async function main() {
   const argv = process.argv.slice(2);
+  const allowLiveDrift = argv.includes('--allow-live-drift');
   const { name: target, source } = shared.resolveAndClassifyTargetDb(argv);
-  console.log(`verify-15-t3-content-hash: target="${target}" (resolved from ${source})`);
+  console.log(`verify-15-t3-content-hash: target="${target}" (resolved from ${source})${allowLiveDrift ? ' [--allow-live-drift ACKNOWLEDGED]' : ''}`);
 
   const roster = shared.loadRoster();
   shared.buildLoadBearingColsFromRoster(roster); // fatal-on-gap validation, result unused here (per-source below)
@@ -138,6 +411,27 @@ async function main() {
       try {
         for (const entry of entries) {
           const cols = entry.loadBearingCols;
+
+          if (entry.lineageMappedCols) {
+            // Branch (b): translated-id forward containment (cm#198 fix).
+            // Completely separate from branch (a)'s exclusion-loading below
+            // -- this entry's own migration_manifest slices are never
+            // NULL/project-scope-excluded in practice (see the script
+            // header's branch-asymmetry note), and exclusion for THIS
+            // classification comes from the PARENT table's manifest slices,
+            // handled inside runLineageBranch itself.
+            const hashOpts = entry.idCol ? { idCol: entry.idCol } : {};
+            let result;
+            try {
+              result = await runLineageBranch(srcClient, tgtClient, sourceDb, entry, cols, hashOpts, allowLiveDrift);
+            } catch (err) {
+              failed = true;
+              console.error(`[T3] FAIL: ${sourceDb}.${entry.source_table}: branch (b) error: ${err.message}`);
+              continue;
+            }
+            if (result.failed) failed = true;
+            continue;
+          }
 
           let exclusions;
           try {
@@ -218,4 +512,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { AUTHORED_BY, groupRosterBySourceDb };
+module.exports = { AUTHORED_BY, groupRosterBySourceDb, runLineageBranch, loadLiveRows };

@@ -285,6 +285,176 @@ function validateRosterPartitionDisjoint(roster, rosterPath) {
   }
 }
 
+// ─── LINEAGE-MAPPED COLUMNS (cm#198 fix: T3 branch (b) — translated-id path) ─
+//
+// A roster entry whose load-bearing columns are SURROGATE ids renumbered at
+// migration time (own_graph_migration_ids' own reason for existing — see
+// migrate-verify-own-graph.js) cannot be forward-hashed by RAW VALUE at all:
+// the source id space and the target id space are structurally disjoint, so
+// T3's branch-(a) algorithm (hash raw column values on both sides) produces
+// a guaranteed 0-match total mismatch no matter how healthy the migration
+// actually is — this was cm#198's root cause for retrieval_event_assertions.
+// An entry OPTS IN to branch (b) by declaring BOTH lineageMappedCols AND
+// lineageMembership; an entry with neither field takes branch (a), UNCHANGED
+// (this is a strict opt-in, never an inferred behavior change for any
+// existing roster entry).
+
+const LINEAGE_TABLE_VOCAB = new Set(['own_graph_migration_ids', 'pipeline_migration_row_ids']);
+
+/**
+ * Per-targetTable membership-key codecs. Registration is DELIBERATELY
+ * per-table (never a generic ':'-splitter): 139 project_settings keys also
+ * contain ':' (its own natural key is (project_id, key), and `key` values
+ * routinely contain colons) — a decoder that treated ANY colon-bearing
+ * source_row_id the same way would silently misinterpret them the moment a
+ * lineage-mapped declaration existed anywhere else in the roster. A table
+ * with a lineageMembership declaration but no codec registered here (or
+ * whose declared source_row_id_encoding does not match the registered
+ * codec's own encoding string, verbatim) is a LOUD FATAL at roster-load
+ * time (validateLineageDeclarations below) — never a silent fallback to a
+ * generic split.
+ */
+const MEMBERSHIP_CODECS = {
+  retrieval_event_assertions: {
+    encoding: 'event_id:assertion_id',
+    encode(row) {
+      if (row.event_id === null || row.event_id === undefined) return null;
+      if (row.assertion_id === null || row.assertion_id === undefined) return null;
+      return `${row.event_id}:${row.assertion_id}`;
+    },
+    // Exact-2-part ':' split, both parts /^\d+$/ — a key that doesn't match
+    // this shape (extra/missing colon, non-numeric part) decodes to null,
+    // never a best-effort partial parse.
+    decode(key) {
+      if (typeof key !== 'string') return null;
+      const parts = key.split(':');
+      if (parts.length !== 2) return null;
+      if (!/^\d+$/.test(parts[0]) || !/^\d+$/.test(parts[1])) return null;
+      return { event_id: Number(parts[0]), assertion_id: Number(parts[1]) };
+    },
+  },
+};
+
+/**
+ * Resolve the registered codec for a lineage-declared entry, or null if
+ * none is registered for this entry's (targetTable, declared encoding)
+ * pair. Callers must treat null as "cannot proceed" (a load-time FATAL via
+ * validateLineageDeclarations, never a silent generic decode).
+ */
+function getMembershipCodec(entry) {
+  if (!entry || !entry.lineageMembership) return null;
+  const codec = MEMBERSHIP_CODECS[entry.targetTable];
+  if (!codec) return null;
+  if (entry.lineageMembership.source_row_id_encoding !== codec.encoding) return null;
+  return codec;
+}
+
+/**
+ * Load-time validation of the OPTIONAL lineageMappedCols/lineageMembership
+ * declaration pair. An entry with NEITHER field is untouched (branch (a)).
+ * An entry with exactly one of the two, or a malformed combination, is a
+ * LOUD FATAL before any hashing starts — a half-declared entry is a roster
+ * bug, never silently treated as "no lineage declared."
+ */
+function validateLineageDeclarations(roster, rosterPath) {
+  const errors = [];
+  for (const entry of roster) {
+    const hasMapped = !!entry.lineageMappedCols;
+    const hasMembership = !!entry.lineageMembership;
+    if (!hasMapped && !hasMembership) continue; // branch (a), untouched
+    const label = `targetTable="${entry.targetTable}"`;
+    if (hasMapped !== hasMembership) {
+      errors.push(`${label}: declares only one of lineageMappedCols/lineageMembership -- both or neither are required.`);
+      continue;
+    }
+    const { isSourceless } = classifyRosterSourceDb(entry.source_db, label);
+    const isFilesystem = typeof entry.source_db === 'string' && entry.source_db.startsWith('filesystem:');
+    if (isSourceless || isFilesystem) {
+      errors.push(`${label}: lineageMappedCols/lineageMembership declared on a non-SQL-sourced entry (source_db="${entry.source_db}") -- lineage translation requires a real SQL source.`);
+      continue;
+    }
+    if (entry.requires_project_id_scope === true) {
+      errors.push(`${label}: requires_project_id_scope=true combined with lineageMappedCols -- combination not implemented (no entry needs both today; silent single-path selection is forbidden, so this is a loud refusal instead).`);
+      continue;
+    }
+    const vocabViolations = [];
+    if (!LINEAGE_TABLE_VOCAB.has(entry.lineageMembership.lineage_table)) {
+      vocabViolations.push(`lineageMembership.lineage_table="${entry.lineageMembership.lineage_table}"`);
+    }
+    for (const [col, mapping] of Object.entries(entry.lineageMappedCols)) {
+      if (!mapping || !LINEAGE_TABLE_VOCAB.has(mapping.lineage_table)) {
+        vocabViolations.push(`lineageMappedCols.${col}.lineage_table="${mapping && mapping.lineage_table}"`);
+      }
+      if (!entry.loadBearingCols.includes(col)) {
+        errors.push(`${label}: lineageMappedCols key "${col}" does not appear in loadBearingCols.`);
+      }
+    }
+    if (vocabViolations.length) {
+      errors.push(`${label}: unrecognized lineage_table name(s) outside the closed vocabulary {${[...LINEAGE_TABLE_VOCAB].join(', ')}}: ${vocabViolations.join(', ')}.`);
+    }
+    if (!getMembershipCodec(entry)) {
+      errors.push(`${label}: no registered membership-key codec for source_row_id_encoding="${entry.lineageMembership && entry.lineageMembership.source_row_id_encoding}" on this targetTable -- decode is defined ONLY per-entry, never generically.`);
+    }
+  }
+  if (errors.length) {
+    console.error(`FATAL: roster at "${rosterPath}" failed lineage-declaration validation:`);
+    for (const e of errors) console.error(`  - ${e}`);
+    process.exit(1);
+  }
+}
+
+/**
+ * Count rows in a (validated-vocabulary) lineage table for a
+ * (source_db, source_table) pair. `lineageTable` MUST already be validated
+ * against LINEAGE_TABLE_VOCAB by the caller (validateLineageDeclarations
+ * runs at roster-load time, before any script reaches this) — never called
+ * with an unvalidated/user-controlled table name.
+ */
+async function countLineageRows(tgtClient, lineageTable, sourceDb, sourceTable) {
+  const { rows } = await tgtClient.query(
+    `SELECT COUNT(*)::int AS n FROM ${lineageTable} WHERE source_db=$1 AND source_table=$2`,
+    [sourceDb, sourceTable]
+  );
+  return rows[0].n;
+}
+
+/**
+ * Load every lineage row for (source_db, source_table) into a
+ * Map<source_row_id, target_row_id> — scoped by BOTH source_db AND
+ * source_table on every call (spec item 2(h): "all lineage joins carry
+ * source_db = entry.source_db"), never a blanket scan of the shared lineage
+ * table.
+ */
+async function loadLineageMap(tgtClient, lineageTable, sourceDb, sourceTable) {
+  const { rows } = await tgtClient.query(
+    `SELECT source_row_id, target_row_id FROM ${lineageTable} WHERE source_db=$1 AND source_table=$2`,
+    [sourceDb, sourceTable]
+  );
+  const map = new Map();
+  for (const r of rows) map.set(r.source_row_id, r.target_row_id);
+  return map;
+}
+
+/**
+ * FATAL if a lineage declaration's (source_db, table) pair has zero rows in
+ * the lineage table while live source rows exist for that table (a
+ * migration that silently never ran, or whose lineage was wiped, must never
+ * be misread as "nothing to check"). Zero source rows AND zero lineage rows
+ * is legitimate (an empty table) but is logged explicitly as VACUOUS, never
+ * silently passed through.
+ */
+async function checkLineagePopulationOrFatal(tgtClient, lineageTable, sourceDb, sourceTable, sourceRowCount, label) {
+  const lineageCount = await countLineageRows(tgtClient, lineageTable, sourceDb, sourceTable);
+  if (lineageCount === 0 && sourceRowCount > 0) {
+    console.error(`[T3] FATAL: lineage declaration for ${label} (source_db="${sourceDb}" source_table="${sourceTable}", lineage_table="${lineageTable}") has ZERO rows, but ${sourceRowCount} live source row(s) exist -- lineage translation cannot proceed.`);
+    process.exit(1);
+  }
+  if (lineageCount === 0 && sourceRowCount === 0) {
+    console.log(`[T3] VACUOUS (source_count=0): ${label} (source_db="${sourceDb}" source_table="${sourceTable}") has no source rows and no lineage rows -- nothing to check, not silently skipped.`);
+  }
+  return lineageCount;
+}
+
 /**
  * Load + shape-validate the real source-table-roster.json. Loud fatal, never
  * a silent empty-array fallback, when the real roster is missing — names
@@ -323,6 +493,7 @@ function loadRoster() {
   validateRosterShape(roster, rosterPath);
   validateRosterSourceDbShapes(roster, rosterPath);
   validateRosterPartitionDisjoint(roster, rosterPath);
+  validateLineageDeclarations(roster, rosterPath);
   return roster;
 }
 
@@ -852,6 +1023,13 @@ module.exports = {
   validateRosterSourceDbShapes,
   validateRosterPartitionDisjoint,
   loadRoster,
+  LINEAGE_TABLE_VOCAB,
+  MEMBERSHIP_CODECS,
+  getMembershipCodec,
+  validateLineageDeclarations,
+  countLineageRows,
+  loadLineageMap,
+  checkLineagePopulationOrFatal,
   tableHasColumn,
   crossCheckProjectIdScope,
   reconcileNoColumnTable,
