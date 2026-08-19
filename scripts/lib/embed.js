@@ -52,6 +52,34 @@ class VllmHttpError extends Error {
 }
 
 /**
+ * VllmTimeoutError / VllmNetworkError (cm#202 S-B prerequisite, 2026-08-18):
+ * distinct, structurally-matchable error classes for the two remaining
+ * failure shapes _vllmEmbedRaw can produce besides an HTTP status
+ * (VllmHttpError, above) -- a request that never completes within an
+ * opt-in timeout, and every other transport-level failure (connection
+ * refused, DNS failure, reset, etc.). embedding-provider.js's probeProvider
+ * classifies on `instanceof` for these, never on a `.message` regex, so
+ * this PR's two live incidents (wrong port -> refused; wrong served-model
+ * id -> 404) are each diagnosable by CLASS, not by string-matching a
+ * message that could drift.
+ */
+class VllmTimeoutError extends Error {
+  constructor(message, timeoutMs) {
+    super(message);
+    this.name = 'VllmTimeoutError';
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+class VllmNetworkError extends Error {
+  constructor(message, code) {
+    super(message);
+    this.name = 'VllmNetworkError';
+    this.code = code; // the underlying Node error code (ECONNREFUSED, ENOTFOUND, ...), when available
+  }
+}
+
+/**
  * Read a key from pipeline.yml knowledge section without a full loadConfig parse.
  * Used to retrieve keys (like vllm_embed_url) that loadConfig does not expose yet.
  */
@@ -95,8 +123,18 @@ function _loadFixtures(fixturePath) {
  * `stored_dims` value, rather than forking a second copy of this HTTP call.
  * embedQuery()'s own behavior (truncate to the env-configured EMBED_DIMS)
  * is unchanged — see _vllmEmbed below, now a thin wrapper over this.
+ *
+ * OPT-IN TIMEOUT (cm#202 S-B.2): `opts.timeoutMs`, when set, applies
+ * `req.setTimeout(timeoutMs, ...)` + `req.destroy(...)` — a request that
+ * has not completed within that window is aborted and rejects with a
+ * VllmTimeoutError, distinguishable by class from a genuine connection
+ * error (VllmNetworkError). Row embeds (embedQuery, VllmEmbeddingProvider's
+ * production writes) NEVER pass this option and therefore carry NO
+ * timeout, unchanged from before this option existed — only
+ * embedding-provider.js's probeProvider() opts in.
  */
-function _vllmEmbedRaw(text, vllmUrl, model) {
+function _vllmEmbedRaw(text, vllmUrl, model, opts) {
+  const timeoutMs = opts && opts.timeoutMs;
   return new Promise((resolve, reject) => {
     const url  = new URL('/v1/embeddings', vllmUrl);
     const body = JSON.stringify({ model, input: text, encoding_format: 'float' });
@@ -104,7 +142,7 @@ function _vllmEmbedRaw(text, vllmUrl, model) {
     const isHttps = url.protocol === 'https:';
     const transport = isHttps ? require('https') : http;
 
-    const opts = {
+    const reqOpts = {
       hostname: url.hostname,
       port:     url.port || (isHttps ? 443 : 80),
       path:     url.pathname,
@@ -115,10 +153,15 @@ function _vllmEmbedRaw(text, vllmUrl, model) {
       },
     };
 
-    const req = transport.request(opts, (res) => {
+    let timedOut = false;
+    let settled = false;
+
+    const req = transport.request(reqOpts, (res) => {
       let raw = '';
       res.on('data', (chunk) => { raw += chunk; });
       res.on('end', () => {
+        if (settled) return;
+        settled = true;
         if (res.statusCode < 200 || res.statusCode >= 300) {
           reject(new VllmHttpError(`[embed] vLLM returned HTTP ${res.statusCode}: ${raw.slice(0, 200)}`, res.statusCode, raw));
           return;
@@ -139,8 +182,21 @@ function _vllmEmbedRaw(text, vllmUrl, model) {
       });
     });
 
+    if (timeoutMs) {
+      req.setTimeout(timeoutMs, () => {
+        timedOut = true;
+        req.destroy(new Error(`[embed] vLLM request timed out after ${timeoutMs}ms (${vllmUrl})`));
+      });
+    }
+
     req.on('error', (err) => {
-      reject(new Error(`[embed] vLLM network error (${vllmUrl}): ${err.message}`));
+      if (settled) return;
+      settled = true;
+      if (timedOut) {
+        reject(new VllmTimeoutError(`[embed] vLLM request timed out after ${timeoutMs}ms (${vllmUrl})`, timeoutMs));
+      } else {
+        reject(new VllmNetworkError(`[embed] vLLM network error (${vllmUrl}): ${err.message}`, err.code));
+      }
     });
 
     req.write(body);
@@ -221,4 +277,4 @@ async function embedQuery(text, opts = {}) {
   return _vllmEmbed(text, vllmUrl, model);
 }
 
-module.exports = { embedQuery, _vllmEmbedRaw, VllmHttpError };
+module.exports = { embedQuery, _vllmEmbedRaw, VllmHttpError, VllmTimeoutError, VllmNetworkError };

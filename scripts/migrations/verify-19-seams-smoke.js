@@ -10,8 +10,10 @@
  * scripts/lib/exchange-log.js, and scripts/lib/memory-lint.js against a
  * live target. Reuses scripts/migrations/lib/smoke-harness.js's
  * withTransactionRollback/runCheck/withSavepoint (verify-17/18's own
- * pattern) — 27 of 30 checks run inside one transaction that is ALWAYS
- * rolled back; the 3 exchange-log checks run against a separate dedicated
+ * pattern) — 27 of 32 checks run inside one transaction that is ALWAYS
+ * rolled back; the 5 exchange-log checks (cm#201 S-A.3 added 2: the
+ * appendExchange embedder/embedderProviderId both-or-neither validation,
+ * both directions) run against a separate dedicated
  * connection with explicit manual DELETE cleanup (appendExchange owns its
  * own transaction, per §7.7 — see runExchangeLogChecks()'s own comment).
  * Both halves are proven residue-free in scripts/lib data tables (see
@@ -593,6 +595,17 @@ async function runExchangeLogChecks(client2, prefix) {
   const results = [];
   let allOk = true;
 
+  // cm#201 S-A.3: appendExchange's injected `embedder` seam now REQUIRES
+  // `embedderProviderId` alongside it (both-or-neither -- never auto-stamp
+  // the live default provider's id next to an injected, not-actually-that-
+  // provider embedder). Resolve a real embedding_providers.id ONCE here --
+  // the FK on agent_exchange.embedded_by_provider_id requires a valid row,
+  // and embedding_providers is one of this suite's own PREREQUISITE_TABLES
+  // (a seeded default row is a standing precondition, exercised directly by
+  // check 21 above).
+  const { rows: mockProviderRows } = await client2.query(`SELECT id FROM embedding_providers WHERE is_default = true LIMIT 1`);
+  const mockProviderId = mockProviderRows.length > 0 ? mockProviderRows[0].id : null;
+
   async function check(name, fn) {
     const id = idCounter++;
     try {
@@ -606,11 +619,34 @@ async function runExchangeLogChecks(client2, prefix) {
     }
   }
 
+  await check('exchange-log: appendExchange rejects embedder without embedderProviderId (both-or-neither, cm#201 S-A.3)', async () => {
+    try {
+      await exchangeLog.appendExchange(client2, {
+        projectId: projectA, agentId: `${prefix}-agent`, kind: 'proposal',
+        body: 'body', summary: 'digest', embedder: mockEmbedder(),
+      });
+      throw new Error('expected a validation error');
+    } catch (err) {
+      assertEq(err.code, 'validation', 'error code');
+    }
+  });
+  await check('exchange-log: appendExchange rejects embedderProviderId without embedder (both-or-neither, cm#201 S-A.3)', async () => {
+    try {
+      await exchangeLog.appendExchange(client2, {
+        projectId: projectA, agentId: `${prefix}-agent`, kind: 'proposal',
+        body: 'body', summary: 'digest', embedderProviderId: mockProviderId,
+      });
+      throw new Error('expected a validation error');
+    } catch (err) {
+      assertEq(err.code, 'validation', 'error code');
+    }
+  });
+
   await check('exchange-log: appendExchange with injected mock embedder inserts a row', async () => {
     const result = await exchangeLog.appendExchange(client2, {
       projectId: projectA, agentId: `${prefix}-agent`, kind: 'proposal',
       body: 'caveman body full text', summary: 'short digest',
-      embedder: mockEmbedder(),
+      embedder: mockEmbedder(), embedderProviderId: mockProviderId,
     });
     assert(typeof result.id === 'number', 'row id returned');
     assert(result.created_at, 'created_at returned');
@@ -625,7 +661,7 @@ async function runExchangeLogChecks(client2, prefix) {
     const taskId = taskRes.rows[0].id;
     const result = await exchangeLog.appendExchange(client2, {
       projectId: projectA, agentId: `${prefix}-agent`, kind: 'ruling',
-      body: 'body', summary: 'digest', embedder: mockEmbedder(),
+      body: 'body', summary: 'digest', embedder: mockEmbedder(), embedderProviderId: mockProviderId,
       transition: { table: 'tasks', id: taskId, fromStatus: 'pending', toStatus: 'done' },
     });
     assert(result.transition && result.transition.status === 'done', 'transition applied in same call');
@@ -642,7 +678,7 @@ async function runExchangeLogChecks(client2, prefix) {
     try {
       await exchangeLog.appendExchange(client2, {
         projectId: projectA, agentId: `${prefix}-agent`, kind: 'ruling',
-        body: 'should-not-persist', summary: 'digest', embedder: mockEmbedder(),
+        body: 'should-not-persist', summary: 'digest', embedder: mockEmbedder(), embedderProviderId: mockProviderId,
         transition: { table: 'tasks', id: taskId, fromStatus: 'WRONG_STATUS', toStatus: 'done' },
       });
     } catch (err) {

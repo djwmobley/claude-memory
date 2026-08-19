@@ -121,6 +121,20 @@ function mockEmbedder() {
 }
 const EMBEDDER = process.env.EMBED_SKIP === '1' ? mockEmbedder() : undefined;
 
+/**
+ * cm#201 S-A.3: embedForWrite's injected `opts.embedder` seam now REQUIRES
+ * `opts.embedderProviderId` alongside it (both-or-neither). Resolves a real
+ * embedding_providers.id when EMBEDDER is the mock (EMBED_SKIP=1); returns
+ * undefined when EMBEDDER is undefined (the real default-provider path,
+ * which resolves its own providerId internally and never consults this
+ * value at all — see embedForWrite's `if (opts && opts.embedder)` gate).
+ */
+async function resolveMockEmbedderProviderId(client) {
+  if (!EMBEDDER) return undefined;
+  const { rows } = await client.query(`SELECT id FROM embedding_providers WHERE is_default = true LIMIT 1`);
+  return rows.length > 0 ? rows[0].id : null;
+}
+
 async function runChecks(client, prefix) {
   let allOk = true;
   const results = [];
@@ -129,6 +143,7 @@ async function runChecks(client, prefix) {
     results.push({ id, name, ok });
     if (!ok) allOk = false;
   }
+  const embedderProviderId = await resolveMockEmbedderProviderId(client);
 
   const projectA = `${prefix}-proj-a`;
 
@@ -154,11 +169,11 @@ async function runChecks(client, prefix) {
 
   // ── memory_upsert: decisions ON CONFLICT carve-out (M-1) + inline embed (M-2) ──
   await check(3, 'memory-upsert: upsertDecisionRow inserts then updates via ON CONFLICT (M-1)', async () => {
-    const embed = await writeTimeEmbed.embedForWrite(client, 'smoke decision text for embed', { embedder: EMBEDDER });
+    const embed = await writeTimeEmbed.embedForWrite(client, 'smoke decision text for embed', { embedder: EMBEDDER, embedderProviderId });
     assert(embed.vectorLiteral !== null, 'expected a real embedding (vLLM up)');
     const ins = await memoryUpsert.upsertDecisionRow(client, {
       project_id: projectA, topic: 'smoke-topic', decision: 'first', reason: 'r1',
-    }, { embeddingVectorLiteral: embed.vectorLiteral });
+    }, { embeddingVectorLiteral: embed.vectorLiteral, embeddedByProviderId: embed.providerId });
     assertEq(ins.inserted, true, 'first write is an insert');
     const upd = await memoryUpsert.upsertDecisionRow(client, {
       project_id: projectA, topic: 'smoke-topic', decision: 'second', reason: 'r2',
@@ -178,10 +193,10 @@ async function runChecks(client, prefix) {
   });
 
   await check(5, 'memory-upsert: writeMemoryRow accepts an embeddingVectorLiteral opt (M-2)', async () => {
-    const embed = await writeTimeEmbed.embedForWrite(client, 'gotcha issue and rule text', { embedder: EMBEDDER });
+    const embed = await writeTimeEmbed.embedForWrite(client, 'gotcha issue and rule text', { embedder: EMBEDDER, embedderProviderId });
     const row = await memoryUpsert.writeMemoryRow(client, 'gotchas', {
       project_id: projectA, issue: 'smoke issue', rule: 'smoke rule',
-    }, { embeddingVectorLiteral: embed.vectorLiteral });
+    }, { embeddingVectorLiteral: embed.vectorLiteral, embeddedByProviderId: embed.providerId });
     assert(row.embedding !== null, 'embedding column populated');
   });
 
@@ -217,11 +232,11 @@ async function runChecks(client, prefix) {
 
   await check(9, 'memory-search: hybrid hit across a table WITH fts_vec (decisions) and one WITHOUT (assertions)', async () => {
     const searchText = 'unicorn zephyr quantum decision text for search fixture';
-    const embed = await writeTimeEmbed.embedForWrite(client, searchText, { embedder: EMBEDDER });
+    const embed = await writeTimeEmbed.embedForWrite(client, searchText, { embedder: EMBEDDER, embedderProviderId });
     await memoryUpsert.writeMemoryRow(
       client, 'decisions',
       { project_id: projectA, topic: 'search-fixture', decision: searchText, reason: 'r' },
-      { embeddingVectorLiteral: embed.vectorLiteral }
+      { embeddingVectorLiteral: embed.vectorLiteral, embeddedByProviderId: embed.providerId }
     );
     await client.query(
       `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, embedding)
@@ -375,6 +390,13 @@ async function runSelfTransactioningChecks(client2, prefix) {
   const results = [];
   let allOk = true;
 
+  // cm#201 S-A.3: appendExchange's injected `embedder` seam now REQUIRES
+  // `embedderProviderId` alongside it (both-or-neither). Resolve a real
+  // embedding_providers.id once — mirrors verify-19-seams-smoke.js's own
+  // runExchangeLogChecks precedent.
+  const { rows: mockProviderRows } = await client2.query(`SELECT id FROM embedding_providers WHERE is_default = true LIMIT 1`);
+  const mockProviderId = mockProviderRows.length > 0 ? mockProviderRows[0].id : null;
+
   async function check(name, fn) {
     const id = idCounter++;
     try {
@@ -425,7 +447,7 @@ async function runSelfTransactioningChecks(client2, prefix) {
 
   await check('exchange-log: exchangeRead M-8 no-watermark vs watermark behavior', async () => {
     const r1 = await exchangeLog.appendExchange(client2, {
-      projectId: projectA, agentId: `${prefix}-agent-a`, kind: 'proposal', body: 'body one', summary: 'digest one', embedder: mockEmbedder(),
+      projectId: projectA, agentId: `${prefix}-agent-a`, kind: 'proposal', body: 'body one', summary: 'digest one', embedder: mockEmbedder(), embedderProviderId: mockProviderId,
     });
     const noFloor = await exchangeLog.exchangeRead(client2, { projectId: projectA, toAgent: `${prefix}-agent-b` });
     assert(noFloor.length >= 1, 'M-8: omitted watermark returns everything, not zero rows');
@@ -438,10 +460,10 @@ async function runSelfTransactioningChecks(client2, prefix) {
     // after insert (real concurrent same-millisecond inserts are not
     // reliably reproducible in a single-threaded test).
     const rA = await exchangeLog.appendExchange(client2, {
-      projectId: projectA, agentId: `${prefix}-agent-a`, kind: 'proposal', body: 'tie A', summary: 'tie A digest', embedder: mockEmbedder(),
+      projectId: projectA, agentId: `${prefix}-agent-a`, kind: 'proposal', body: 'tie A', summary: 'tie A digest', embedder: mockEmbedder(), embedderProviderId: mockProviderId,
     });
     const rB = await exchangeLog.appendExchange(client2, {
-      projectId: projectA, agentId: `${prefix}-agent-a`, kind: 'proposal', body: 'tie B', summary: 'tie B digest', embedder: mockEmbedder(),
+      projectId: projectA, agentId: `${prefix}-agent-a`, kind: 'proposal', body: 'tie B', summary: 'tie B digest', embedder: mockEmbedder(), embedderProviderId: mockProviderId,
     });
     await client2.query(`UPDATE agent_exchange SET created_at = $1 WHERE id IN ($2, $3)`, [rA.created_at, rA.id, rB.id]);
     const afterA = await exchangeLog.exchangeRead(client2, { projectId: projectA, toAgent: `${prefix}-agent-b`, afterCreatedAt: rA.created_at, afterId: rA.id });

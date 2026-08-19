@@ -201,6 +201,28 @@ function ollamaEmbed(texts, config) {
 }
 
 /**
+ * hasProvenanceColumn — runtime, per-table check for embedded_by_provider_id
+ * (cm#201's provenance column). Used by legacy per-project pipeline writers
+ * (tryEmbed below; also pipeline-embed.js, pipeline-memory-loader.js,
+ * migrate-05-sync-file-memory.js, phase0-decisions-backfill.js) to classify,
+ * AT RUN TIME, whether a given table has adopted the cm#201 provenance
+ * invariant — never assumed from a static table-name list, since adoption
+ * is a live-DB fact that varies per target/deployment, not a compile-time
+ * one.
+ *
+ * @param {object} client
+ * @param {string} table
+ * @returns {Promise<boolean>}
+ */
+async function hasProvenanceColumn(client, table) {
+  const { rows } = await client.query(
+    "SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1 AND column_name = 'embedded_by_provider_id'",
+    [table]
+  );
+  return rows.length > 0;
+}
+
+/**
  * Embed a single text and write the vector to a table row. Degrades gracefully —
  * if Ollama is not running or the embedding column doesn't exist, the row is
  * written without an embedding (can be backfilled later with `pipeline-embed.js index`).
@@ -213,14 +235,36 @@ function ollamaEmbed(texts, config) {
  * @param {object} config - pipeline config (for embedding_model)
  */
 async function tryEmbed(client, table, idCol, idVal, text, config) {
+  // cm#201 completeness item #8: the embedding-column check and the
+  // provenance-adoption guard run OUTSIDE the try/catch below on purpose.
+  // That catch is a DELIBERATE fail-soft swallow for "Ollama down" (this
+  // function's own documented contract) — letting a provenance refusal
+  // fall into it would silently swallow the exact error class cm#201 needs
+  // loud. The guard MUST fire BEFORE the write, never rely on the catch
+  // below to surface it.
+  let hasEmbeddingCol;
   try {
-    // Check if embedding column exists
     const { rows } = await client.query(
       "SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1 AND column_name = 'embedding'",
       [table]
     );
-    if (rows.length === 0) return; // no embedding column — skip silently
+    hasEmbeddingCol = rows.length > 0;
+  } catch (_) {
+    return; // introspection failed -- fail soft, same posture as before this change
+  }
+  if (!hasEmbeddingCol) return; // no embedding column — skip silently
 
+  if (await hasProvenanceColumn(client, table)) {
+    throw new Error(
+      `tryEmbed: refusing to write "${table}".embedding -- this table carries embedded_by_provider_id ` +
+      `(provenance-adopted per cm#201's invariant: every SQL statement that assigns embedding must ALSO assign ` +
+      `embedded_by_provider_id in the same statement). tryEmbed() is legacy per-project pipeline tooling with no ` +
+      `notion of embedding_providers -- route this table's writes through scripts/lib/embedding-provider.js instead, ` +
+      `or do not adopt embedded_by_provider_id on this table if it should stay out of provenance scope.`
+    );
+  }
+
+  try {
     const [embedding] = await ollamaEmbed([text], config);
     const vec = `[${embedding.join(',')}]`;
     await client.query(`UPDATE ${table} SET embedding = $1 WHERE ${idCol} = $2`, [vec, idVal]);
@@ -725,6 +769,6 @@ async function lateChunkEmbed(text, chunkOffsets, opts) {
 
 module.exports = {
   findProjectRoot, loadConfig, connect, c, ollamaDefaults, projectToDbName,
-  ollamaEmbed, vllmEmbed, tryEmbed, runWinBin, quoteForCmd, vllmRerank,
+  ollamaEmbed, vllmEmbed, tryEmbed, hasProvenanceColumn, runWinBin, quoteForCmd, vllmRerank,
   ollamaGenerateBlurb, vllmTokenize, vllmTokenEmbed, lateChunkEmbed,
 };

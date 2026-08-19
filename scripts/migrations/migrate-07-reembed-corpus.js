@@ -381,7 +381,15 @@ function printUsage() {
     '  --rollback <id>   NULL out embedding+embedded_by_provider_id for every',
     '                    row this script wrote under run_id <id>. Scoped by',
     '                    embedding_write_log; never touches another run\'s rows.',
-    '                    Never runs the G-R2 ALTER sub-step.',
+    '                    Never runs the G-R2 ALTER sub-step. Never probes/',
+    '                    resolves a provider -- zero provider I/O (cm#202).',
+    '',
+    'PREFLIGHT PROBE (cm#202): MIGRATE and DRY-RUN both resolve the default',
+    'embedding_providers row and issue ONE probe embed call against it before',
+    'any classification/DDL/write work starts -- a wire-config mismatch',
+    '(wrong port, wrong served-model id, unreachable host) fails loud in',
+    'seconds, naming the resolved endpoint/model, instead of surfacing on the',
+    'first real row after setup has already run. --rollback never probes.',
   ].join('\n'));
 }
 
@@ -937,6 +945,22 @@ async function runProvenanceVerification(client, tables, log) {
       ok = false;
       log(`  [PROVENANCE-FAIL] ${table}: ${gap} row(s) have embedding IS NOT NULL but embedded_by_provider_id IS NULL.`);
     }
+    // cm#201 §7: the INVERSE direction, so the sharpened invariant is
+    // CHECKED, not assumed. A row with embedding IS NULL but
+    // embedded_by_provider_id IS NOT NULL is exactly the shape a writer
+    // that assigns embedding=NULL without ALSO NULLing
+    // embedded_by_provider_id in the same statement would leave behind
+    // (e.g. a legacy re-embed-trigger UPDATE that only nulls the vector) --
+    // a stale, misleading "this was embedded by provider X" claim on a row
+    // that currently has no embedding at all.
+    const { rows: inverseGapRows } = await client.query(
+      `SELECT COUNT(*) AS n FROM "${table}" WHERE embedding IS NULL AND embedded_by_provider_id IS NOT NULL`
+    );
+    const inverseGap = Number(inverseGapRows[0].n);
+    if (inverseGap > 0) {
+      ok = false;
+      log(`  [PROVENANCE-FAIL] ${table}: ${inverseGap} row(s) have embedding IS NULL but embedded_by_provider_id IS NOT NULL (stale provenance on an unembedded row).`);
+    }
     const { rows: nonDefaultRows } = await client.query(
       `SELECT COUNT(*) AS n FROM "${table}" t JOIN embedding_providers p ON p.id = t.embedded_by_provider_id WHERE p.is_default = false`
     );
@@ -1055,6 +1079,43 @@ async function main(runtimeOpts = {}) {
   await client.connect();
 
   try {
+    // ── cm#202 S-B.4: provider resolution + preflight probe move to
+    // IMMEDIATELY after target classification/connect and BEFORE
+    // applySqlFile/preflight/discovery/the G-R2 ALTER (previously this
+    // resolved ~line 1135, after all of that setup work had already run --
+    // the whole point of the probe is failing loud in seconds, not after
+    // setup). Mode classification (total, S-B.3):
+    //   MIGRATE   -> probe
+    //   DRY-RUN   -> probe (probe failure fails the dry run loudly)
+    //   ROLLBACK  -> NO probe (rollback does zero provider I/O and must not
+    //                require a live endpoint) -- provider is never even
+    //                resolved in this mode, since rollback's own UPDATE
+    //                only NULLs embedding/embedded_by_provider_id and needs
+    //                no provider object at all.
+    const mode = parsed.rollback ? 'ROLLBACK' : (parsed.dryRun ? 'DRY-RUN' : 'MIGRATE');
+    let providerRow = null;
+    let provider = null;
+    if (mode !== 'ROLLBACK') {
+      providerRow = runtimeOpts.providerRow || await embeddingProvider.resolveDefaultProvider(client);
+      provider = embeddingProvider.createProviderFromRow(providerRow, { transport: runtimeOpts.transport });
+      console.log(`  [PROVIDER] resolved default provider "${providerRow.name}" (native_dims=${providerRow.native_dims}, stored_dims=${providerRow.stored_dims}).`);
+
+      // cm#202 S-B.5: mandatory wire into migrate-07 for MIGRATE and
+      // DRY-RUN. Goes through provider's own (possibly test-injected)
+      // transport -- preserves the existing test-suite transport-injection
+      // convention so CI stays hermetic (no live vLLM required to exercise
+      // this suite). NOT wired: a probe-once-per-process cache (deliberately
+      // NOT built -- this PR's scope is one probe per migrate-07 invocation,
+      // not a long-lived process) and per-write probing in exchange-log.js/
+      // write-time-embed.js (their first wire call IS the embed itself; a
+      // probe there would only add latency with zero earlier detection).
+      // Both negative decisions recorded here and in the PR body.
+      await embeddingProvider.probeProvider(provider, { timeoutMs: runtimeOpts.probeTimeoutMs });
+      console.log(`  [PROBE] OK: provider "${providerRow.name}" @ "${providerRow.endpoint}" reachable; native_dims=${providerRow.native_dims} stored_dims=${providerRow.stored_dims} verified.`);
+    } else {
+      console.log('  [PROBE] SKIPPED: ROLLBACK mode performs zero provider I/O (cm#202 S-B.3) -- no live endpoint required, no provider resolved.');
+    }
+
     await migrateOne.applySqlFile(client, SQL_FILE); // embedding_migration_batches + embedding_write_log
 
     const roster = tryLoadRoster(parsed.rosterPath, console.log);
@@ -1132,10 +1193,10 @@ async function main(runtimeOpts = {}) {
       console.log(`  [CLASSIFY] ${table}: bucket=${bucket} content-source=${spec.source} expr="${spec.expr}"`);
     }
 
-    const providerRow = runtimeOpts.providerRow || await embeddingProvider.resolveDefaultProvider(client);
-    const provider = embeddingProvider.createProviderFromRow(providerRow, { transport: runtimeOpts.transport });
-    console.log(`  [PROVIDER] resolved default provider "${providerRow.name}" (native_dims=${providerRow.native_dims}, stored_dims=${providerRow.stored_dims}).`);
-
+    // providerRow/provider were already resolved (+ probed) immediately
+    // after connect, above -- see the cm#202 S-B.4 block near the top of
+    // this function for why the resolution moved here from its pre-cm#202
+    // location.
     const runId = runtimeOpts.runId || crypto.randomUUID();
     console.log(`RUN_ID: ${runId}`);
 
@@ -1190,12 +1251,12 @@ if (require.main === module) {
 
 /**
  * T8-idempotency-compatible entry point (mirrors migrate-05's run()).
- * `opts.transport`/`opts.providerRow`/`opts.runId`/`opts.halvingDelayMs`
- * are in-process-only injection points (never expressible via argv) --
- * this is how the test suite exercises the embed loop deterministically
- * without a live vLLM endpoint (G-R13), and without waiting out the real
- * HALVING_DELAY_MS pacing when a fixture needs many halving/exempt-
- * overlength rows.
+ * `opts.transport`/`opts.providerRow`/`opts.runId`/`opts.halvingDelayMs`/
+ * `opts.probeTimeoutMs` are in-process-only injection points (never
+ * expressible via argv) -- this is how the test suite exercises the embed
+ * loop AND the cm#202 preflight probe deterministically without a live
+ * vLLM endpoint (G-R13), and without waiting out the real HALVING_DELAY_MS
+ * pacing when a fixture needs many halving/exempt-overlength rows.
  */
 async function run(targetDbName, opts = {}) {
   const argv = ['--db', targetDbName];
@@ -1203,7 +1264,7 @@ async function run(targetDbName, opts = {}) {
   if (opts.rollback) argv.push('--rollback', opts.rollback);
   if (opts.dryRun) argv.push('--dry-run');
   process.argv = [process.argv[0], process.argv[1] || __filename, ...argv];
-  return main({ transport: opts.transport, providerRow: opts.providerRow, runId: opts.runId, halvingDelayMs: opts.halvingDelayMs });
+  return main({ transport: opts.transport, providerRow: opts.providerRow, runId: opts.runId, halvingDelayMs: opts.halvingDelayMs, probeTimeoutMs: opts.probeTimeoutMs });
 }
 
 module.exports = {

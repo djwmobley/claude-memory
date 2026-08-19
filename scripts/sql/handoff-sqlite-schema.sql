@@ -369,3 +369,33 @@ CREATE TABLE IF NOT EXISTS retrieval_event_assertions (
 );
 CREATE INDEX IF NOT EXISTS rea_event_idx     ON retrieval_event_assertions (event_id);
 CREATE INDEX IF NOT EXISTS rea_assertion_idx ON retrieval_event_assertions (assertion_id);
+
+
+-- ============================================================================
+-- EMBEDDING_PROVIDERS — cm#201 canon bring-forward (PR #204 canon-class
+-- pattern; see handoff-core-schema.sql's own comment on this table for the
+-- full rationale). Mirrored here for schema symmetry even though the
+-- halfvec-typed embedding COLUMNS this table's ids are stamped onto exist
+-- Postgres-side only (SQLite has no pgvector/halfvec) — resolveDefaultProvider
+-- and resolveProviderById's queries against THIS table are dialect-neutral
+-- SQL and must not raw-fail with "no such table" under STORAGE_BACKEND=sqlite;
+-- they should reach the SAME clean FATAL ("no embedding_providers row has
+-- is_default = true") every other target without a seeded provider gets.
+-- Not project-scoped (a single global provider registry). No seed row here
+-- — canon carries schema only, never per-deployment operator data.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS embedding_providers (
+  id           INTEGER PRIMARY KEY,
+  name         TEXT    NOT NULL UNIQUE,
+  model_label  TEXT    NOT NULL,
+  native_dims  INTEGER NOT NULL,
+  stored_dims  INTEGER NOT NULL,
+  endpoint     TEXT,
+  is_default   INTEGER NOT NULL DEFAULT 0,
+  data_egress_approved    INTEGER NOT NULL DEFAULT 0,
+  data_egress_approved_by TEXT,
+  data_egress_approved_at TEXT,
+  created_at   TEXT DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS embedding_providers_is_default_unique_idx
+  ON embedding_providers (is_default) WHERE is_default;

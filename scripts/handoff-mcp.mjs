@@ -45,7 +45,7 @@ const exchangeLogLib = require('./lib/exchange-log.js');
 const routeResolveLib = require('./lib/route-resolve.js');
 const routingProfileLib = require('./lib/routing-profile.js');
 const usageTelemetryLib = require('./lib/usage-telemetry.js');
-const { embedForWrite } = require('./lib/write-time-embed.js');
+const { writeRowWithProvenanceRetry } = require('./lib/write-time-embed.js');
 
 // ── Ground-truth paths (verified 2026-07-11; overridable via env for other hosts) ──
 
@@ -328,15 +328,19 @@ async function toolPersistDecisions({ projectRoot, rows, verifyQuery }) {
         const embedText = memoryUpsertLib.buildEmbedText('decisions', {
           topic: row.topic, decision: row.decision, reason: row.reason,
         });
-        const embed = await embedForWrite(db, embedText);
-        if (embed.warning) warnings.push({ topic: row.topic, warning: embed.warning });
-        const written_row = await memoryUpsertLib.upsertDecisionRow(db, {
-          project_id: projectId,
-          topic: row.topic,
-          decision: row.decision,
-          reason: row.reason,
-          session_num: row.session_num ?? null,
-        }, { embeddingVectorLiteral: embed.vectorLiteral });
+        // cm#201: threads providerId alongside the vector (both-or-neither)
+        // and classifies a race-window FK 23503 on embedded_by_provider_id
+        // (re-resolve once, retry; degrade to neither on persistent failure).
+        const { written: written_row, warning } = await writeRowWithProvenanceRetry(db, embedText, (opts) =>
+          memoryUpsertLib.upsertDecisionRow(db, {
+            project_id: projectId,
+            topic: row.topic,
+            decision: row.decision,
+            reason: row.reason,
+            session_num: row.session_num ?? null,
+          }, opts)
+        );
+        if (warning) warnings.push({ topic: row.topic, warning });
         written.push({ id: written_row.id, topic: written_row.topic, inserted: written_row.inserted });
       }
 
@@ -371,15 +375,14 @@ async function toolMemoryUpsert({ projectRoot, table, row }) {
     return await withProjectDb(projectRoot, async (db, projectId) => {
       const rowWithProject = { ...row, project_id: projectId };
       const embedText = memoryUpsertLib.buildEmbedText(table, rowWithProject);
-      const embed = await embedForWrite(db, embedText);
-
-      let written;
-      if (table === 'decisions') {
-        written = await memoryUpsertLib.upsertDecisionRow(db, rowWithProject, { embeddingVectorLiteral: embed.vectorLiteral });
-      } else {
-        written = await memoryUpsertLib.writeMemoryRow(db, table, rowWithProject, { embeddingVectorLiteral: embed.vectorLiteral });
-      }
-      return textResult({ row: written, embedWarning: embed.warning });
+      const writeFn = (opts) => table === 'decisions'
+        ? memoryUpsertLib.upsertDecisionRow(db, rowWithProject, opts)
+        : memoryUpsertLib.writeMemoryRow(db, table, rowWithProject, opts);
+      // cm#201: threads providerId alongside the vector (both-or-neither)
+      // and classifies a race-window FK 23503 on embedded_by_provider_id
+      // (re-resolve once, retry; degrade to neither on persistent failure).
+      const { written, warning } = await writeRowWithProvenanceRetry(db, embedText, writeFn);
+      return textResult({ row: written, embedWarning: warning });
     });
   } catch (err) {
     return libToolError(err);

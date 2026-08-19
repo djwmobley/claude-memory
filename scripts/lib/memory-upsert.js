@@ -339,6 +339,14 @@ function validateRow(table, columnMap, row) {
  *   tool-orchestration layer populates this opt, from its own
  *   server-computed vector, mirroring exchange_append's "tool ships it"
  *   posture). null/omitted = embedding left NULL (fail-soft path, M-2).
+ * @param {number|null} [opts.embeddedByProviderId] - cm#201 S-A.4:
+ *   both-or-neither with opts.embeddingVectorLiteral — supplying one
+ *   without the other is a MemoryUpsertError('validation'), checked via
+ *   `!== null && !== undefined` (never truthiness, so a legitimate
+ *   providerId of 0 — not reachable with a SERIAL PK starting at 1, but
+ *   never assumed — is never misread as "absent"). embedded_by_provider_id
+ *   is deliberately absent from TABLE_COLUMN_MAP (an unknownKey error if a
+ *   caller tries to smuggle it in via `row`) — this opt is the ONLY path.
  * @returns {Promise<{id: *}>} the inserted row's primary-key value(s) —
  *   `id` for every table except `findings`, where it echoes back the
  *   caller-supplied (project_id, id) pair as `{id, project_id}`.
@@ -362,16 +370,28 @@ async function writeMemoryRow(client, table, row, opts) {
   );
   const values = cols.map((c) => row[c]);
 
-  const embeddingVectorLiteral = opts && opts.embeddingVectorLiteral ? opts.embeddingVectorLiteral : null;
+  const embeddingVectorLiteral = (opts && opts.embeddingVectorLiteral !== undefined && opts.embeddingVectorLiteral !== null)
+    ? opts.embeddingVectorLiteral : null;
+  const embeddedByProviderId = (opts && opts.embeddedByProviderId !== undefined && opts.embeddedByProviderId !== null)
+    ? opts.embeddedByProviderId : null;
+  if ((embeddingVectorLiteral === null) !== (embeddedByProviderId === null)) {
+    throw new MemoryUpsertError(
+      'validation',
+      `memory_upsert: table "${table}" opts.embeddingVectorLiteral and opts.embeddedByProviderId must be supplied together (both-or-neither, cm#201 invariant) — a non-NULL vector must carry TRUE provenance, and a provenance id is meaningless without a vector.`,
+      { table }
+    );
+  }
   if (embeddingVectorLiteral !== null) {
     cols.push('embedding');
     values.push(embeddingVectorLiteral);
+    cols.push('embedded_by_provider_id');
+    values.push(embeddedByProviderId);
   }
   const placeholders = values.map((_, i) => `$${i + 1}`);
 
   // Identifiers (table, cols) come ONLY from TABLE_COLUMN_MAP's own key set
-  // above, plus the single hardcoded literal "embedding" — never from caller
-  // input directly (S-1). Every value is parameterized.
+  // above, plus the two hardcoded literals "embedding"/"embedded_by_provider_id"
+  // — never from caller input directly (S-1). Every value is parameterized.
   const quotedCols = cols.map((c) => `"${c}"`).join(', ');
   const sql = `INSERT INTO "${table}" (${quotedCols}) VALUES (${placeholders.join(', ')}) RETURNING *`;
 
@@ -409,6 +429,14 @@ async function writeMemoryRow(client, table, row, opts) {
  * @param {object} [opts]
  * @param {string|null} [opts.embeddingVectorLiteral] - §8 M-2, same
  *   contract as writeMemoryRow's opt.
+ * @param {number|null} [opts.embeddedByProviderId] - cm#201 S-A.4, same
+ *   both-or-neither contract as writeMemoryRow's opt. On the ON CONFLICT
+ *   UPDATE branch specifically: if this call edits an embed-text-feeding
+ *   column (decision/reason — topic is the conflict key and never changes)
+ *   WITHOUT supplying a fresh embeddingVectorLiteral, BOTH embedding and
+ *   embedded_by_provider_id are explicitly SET to NULL in that same
+ *   statement — a stale vector is never left standing with clean-looking
+ *   provenance; it degrades to backfillable-NULL instead.
  * @returns {Promise<object>} the post-write row (RETURNING *) plus
  *   `{ inserted: boolean }` (xmax = 0 idiom, same as usage-telemetry.js's
  *   usageRecord — true iff this call's own upsert performed the physical
@@ -424,22 +452,48 @@ async function upsertDecisionRow(client, row, opts) {
   );
   const values = cols.map((c) => row[c]);
 
-  const embeddingVectorLiteral = opts && opts.embeddingVectorLiteral ? opts.embeddingVectorLiteral : null;
+  const embeddingVectorLiteral = (opts && opts.embeddingVectorLiteral !== undefined && opts.embeddingVectorLiteral !== null)
+    ? opts.embeddingVectorLiteral : null;
+  const embeddedByProviderId = (opts && opts.embeddedByProviderId !== undefined && opts.embeddedByProviderId !== null)
+    ? opts.embeddedByProviderId : null;
+  if ((embeddingVectorLiteral === null) !== (embeddedByProviderId === null)) {
+    throw new MemoryUpsertError(
+      'validation',
+      `memory_upsert: table "decisions" opts.embeddingVectorLiteral and opts.embeddedByProviderId must be supplied together (both-or-neither, cm#201 invariant) — a non-NULL vector must carry TRUE provenance, and a provenance id is meaningless without a vector.`,
+      { table: 'decisions' }
+    );
+  }
   if (embeddingVectorLiteral !== null) {
     cols.push('embedding');
     values.push(embeddingVectorLiteral);
+    cols.push('embedded_by_provider_id');
+    values.push(embeddedByProviderId);
   }
   const placeholders = values.map((_, i) => `$${i + 1}`);
   const quotedCols = cols.map((c) => `"${c}"`).join(', ');
 
-  // UPDATE SET list: every column this call actually supplied, EXCEPT the
-  // conflict-key columns (project_id, topic) themselves — those never
-  // change on an update-by-key. embedding (when supplied) IS re-set on
-  // conflict, so a topic edit's new embedding replaces the stale one.
-  const setCols = cols.filter((c) => c !== 'project_id' && c !== 'topic');
-  const setClause = setCols.length
-    ? setCols.map((c) => `"${c}" = EXCLUDED."${c}"`).join(', ')
-    : null;
+  // UPDATE SET list: every OTHER column this call actually supplied,
+  // EXCEPT the conflict-key columns (project_id, topic) themselves — those
+  // never change on an update-by-key. embedding/embedded_by_provider_id
+  // are handled separately below (never via the generic EXCLUDED loop):
+  //   - a fresh vector WAS supplied -> both re-set from EXCLUDED (a topic
+  //     edit's new embedding+provenance replaces the stale pair together).
+  //   - no fresh vector, but decision/reason (the embed-text-feeding
+  //     columns) WAS edited -> both explicitly NULLed (cm#201: never leave
+  //     a stale vector standing with clean-looking provenance — degrade to
+  //     backfillable-NULL instead).
+  //   - neither -> the existing embedding/embedded_by_provider_id pair is
+  //     left untouched (this call touched neither the vector nor the text
+  //     that feeds it).
+  const setCols = cols.filter((c) => c !== 'project_id' && c !== 'topic' && c !== 'embedding' && c !== 'embedded_by_provider_id');
+  const setParts = setCols.map((c) => `"${c}" = EXCLUDED."${c}"`);
+  const embedTextColumnsEdited = cols.includes('decision') || cols.includes('reason');
+  if (embeddingVectorLiteral !== null) {
+    setParts.push('"embedding" = EXCLUDED."embedding"', '"embedded_by_provider_id" = EXCLUDED."embedded_by_provider_id"');
+  } else if (embedTextColumnsEdited) {
+    setParts.push('"embedding" = NULL', '"embedded_by_provider_id" = NULL');
+  }
+  const setClause = setParts.length ? setParts.join(', ') : null;
 
   const sql = setClause
     ? `INSERT INTO "decisions" (${quotedCols}) VALUES (${placeholders.join(', ')})

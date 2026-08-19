@@ -140,6 +140,7 @@ const migrate09 = require('./migrate-09-file-memory-markdown');           // reu
 const { chunkText } = require('../pipeline-chunker');                     // reused by reference
 const { filesystemSourceDb } = require('../lib/fs-path-normalize');       // reused by reference (H-14/I-14 shared normalizer)
 const sourceFileNormalize = require('../lib/source-file-normalize');      // reused by reference (D3-2 comparison normalizer)
+const { hasProvenanceColumn } = require('../lib/shared');                 // reused by reference (cm#201 completeness item #10)
 
 // ─── PATHS / CONSTANTS ──────────────────────────────────────────────────────
 
@@ -604,16 +605,26 @@ async function processTopicFile(tgtClient, projectId, dirFsDb, fileName, memoryD
       [entryId]
     );
     const existingChunkHashes = new Map(existingChunks.map((r) => [r.chunk_idx, r.content_hash]));
+    // cm#201 completeness item #10 (inverse violator): classified ONCE per
+    // call (this function runs per topic file, not per chunk) -- when
+    // memory_entry_chunks has adopted embedded_by_provider_id, the stale
+    // provenance id must be NULLed alongside embedding in the SAME
+    // statement, never left standing on a row whose embedding was just
+    // cleared.
+    const chunksHaveProvenanceCol = await hasProvenanceColumn(tgtClient, 'memory_entry_chunks');
     for (const chunk of chunks) {
       const h = sha256(chunk.content);
       if (existingChunkHashes.get(chunk.chunkIdx) === h) continue; // skip = no write at all
-      await tgtClient.query(
-        `INSERT INTO memory_entry_chunks (project_id, entry_id, chunk_idx, content, content_hash, embedding)
-         VALUES ($1,$2,$3,$4,$5,NULL)
-         ON CONFLICT (entry_id, chunk_idx) DO UPDATE
-           SET content=EXCLUDED.content, content_hash=EXCLUDED.content_hash, embedding=NULL, project_id=EXCLUDED.project_id`,
-        [projectId, entryId, chunk.chunkIdx, chunk.content, h]
-      );
+      const chunkSql = chunksHaveProvenanceCol
+        ? `INSERT INTO memory_entry_chunks (project_id, entry_id, chunk_idx, content, content_hash, embedding, embedded_by_provider_id)
+           VALUES ($1,$2,$3,$4,$5,NULL,NULL)
+           ON CONFLICT (entry_id, chunk_idx) DO UPDATE
+             SET content=EXCLUDED.content, content_hash=EXCLUDED.content_hash, embedding=NULL, embedded_by_provider_id=NULL, project_id=EXCLUDED.project_id`
+        : `INSERT INTO memory_entry_chunks (project_id, entry_id, chunk_idx, content, content_hash, embedding)
+           VALUES ($1,$2,$3,$4,$5,NULL)
+           ON CONFLICT (entry_id, chunk_idx) DO UPDATE
+             SET content=EXCLUDED.content, content_hash=EXCLUDED.content_hash, embedding=NULL, project_id=EXCLUDED.project_id`;
+      await tgtClient.query(chunkSql, [projectId, entryId, chunk.chunkIdx, chunk.content, h]);
       chunkWrites++;
     }
     // F5-3: the one intended destructive branch -- delete stale higher-idx

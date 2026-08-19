@@ -697,3 +697,49 @@ CREATE TABLE IF NOT EXISTS extraction_queue (
 );
 CREATE INDEX IF NOT EXISTS extraction_queue_project_status_idx
   ON extraction_queue (project_id, status);
+
+
+-- ============================================================================
+-- EMBEDDING_PROVIDERS — cm#201 canon bring-forward (PR #204 canon-class
+-- pattern).
+--
+-- Canon home as of this fix: this table originated in
+-- scripts/migrations/sql/embedding-providers-base.sql (applied only to
+-- staging targets by migrate-schema-addenda.js, which structurally refuses
+-- live project DBs — same gap PR #204 fixed for source_model/agent_id/
+-- suppressed). exchange-log.js's resolveDefaultEmbedder and write-time-
+-- embed.js's embedForWrite both query embedding_providers unconditionally
+-- against ANY target, live included, via handoff-mcp.mjs's live MCP tool
+-- surface (memory_upsert / persist_decisions / exchange_append) — so any
+-- live DB the cm#185 bring-forward carries forward must also carry this
+-- table. embedding-providers-base.sql is UNCHANGED and stays the staging-
+-- target applier (idempotent: CREATE TABLE IF NOT EXISTS / CREATE UNIQUE
+-- INDEX IF NOT EXISTS); see its own header for the pointer back to here.
+--
+-- Not project-scoped (a single global provider registry, unlike every
+-- other table in this schema). The seed row (data, not schema) stays in
+-- embedding-providers-base.sql ONLY — canon carries schema, never per-
+-- deployment operator data; a live project DB with no seeded default
+-- provider correctly gets resolveDefaultProvider's FATAL "no
+-- embedding_providers row has is_default = true" until an operator seeds
+-- one (L6 "vLLM or stop" — never a silent hardcoded fallback).
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS embedding_providers (
+  id           SERIAL PRIMARY KEY,
+  name         TEXT NOT NULL UNIQUE,
+  model_label  TEXT NOT NULL,
+  native_dims  INTEGER NOT NULL,
+  stored_dims  INTEGER NOT NULL,
+  endpoint     TEXT,
+  is_default   BOOLEAN NOT NULL DEFAULT false,
+  data_egress_approved    BOOLEAN NOT NULL DEFAULT false,
+  data_egress_approved_by TEXT,
+  data_egress_approved_at TIMESTAMPTZ,
+  created_at   TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- cm#201 S-A.2: at most one row may be is_default=true — a write-time DB
+-- guarantee, not merely a read-time convention (see embedding-providers-
+-- base.sql's own comment for the full rationale).
+CREATE UNIQUE INDEX IF NOT EXISTS embedding_providers_is_default_unique_idx
+  ON embedding_providers (is_default) WHERE is_default;

@@ -83,6 +83,36 @@ function spawn(scriptPath, args, extraEnv = {}, timeoutMs = 60000) {
   });
 }
 
+/**
+ * cm#201 test-fixture helper: mirrors migrate-07-reembed-corpus.js's own
+ * discoverEmbeddableTables() + ensureProvenanceColumn() (DDL-derived scan
+ * for every base table with a vector/halfvec column, then an idempotent
+ * ADD COLUMN) — reused HERE rather than hand-listing table names. See
+ * test-verify-19.js's identical helper for the full rationale (this
+ * suite's scratch DB deliberately never runs migrate-07 either).
+ */
+async function ensureProvenanceColumnsOnDiscoveredTables(dbName) {
+  const client = await pgConnect(dbName);
+  try {
+    const { rows } = await client.query(`
+      SELECT DISTINCT c.relname AS table_name
+        FROM pg_attribute a
+        JOIN pg_class c ON a.attrelid = c.oid
+        JOIN pg_namespace n ON c.relnamespace = n.oid
+        JOIN pg_type t ON a.atttypid = t.oid
+       WHERE n.nspname = current_schema()
+         AND c.relkind = 'r'
+         AND a.attnum > 0 AND NOT a.attisdropped
+         AND t.typname IN ('vector', 'halfvec')
+    `);
+    for (const { table_name: table } of rows) {
+      await client.query(`ALTER TABLE "${table}" ADD COLUMN IF NOT EXISTS embedded_by_provider_id INTEGER REFERENCES embedding_providers(id)`);
+    }
+  } finally {
+    await client.end();
+  }
+}
+
 async function setupFullStackThroughMigrate14(dbName) {
   let r = spawn(MIGRATE_ONE_PATH, ['--db', dbName]);
   if (r.status !== 0) throw new Error(`migrate-01 failed: ${r.stderr}`);
@@ -99,6 +129,11 @@ async function setupFullStackThroughMigrate14(dbName) {
   // (trigger wiring + the tables themselves), so the exit code is
   // deliberately NOT asserted here.
   spawn(MIGRATE13_PATH, ['--db', dbName]);
+  // cm#201: see ensureProvenanceColumnsOnDiscoveredTables's own header —
+  // this scratch DB needs the SAME embedded_by_provider_id columns a real
+  // pre-cutover target already has (via migrate-07), which this suite's
+  // migration set (through migrate-15) never adds on its own.
+  await ensureProvenanceColumnsOnDiscoveredTables(dbName);
 }
 
 const DB_MAIN = `verify20_main_${TS}_staging`;

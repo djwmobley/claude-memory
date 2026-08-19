@@ -38,7 +38,7 @@
  */
 
 const path = require('path');
-const { embedQuery } = require('./embed.js');
+const embeddingProvider = require('./embedding-provider.js');
 
 const KNOWN_KINDS = new Set([
   'proposal', 'response', 'opinion', 'ruling', 'observation', 'research', 'handoff',
@@ -53,37 +53,59 @@ class ExchangeLogError extends Error {
 }
 
 /**
- * resolveDefaultEmbedder — reads the `embedding_providers` row with
- * is_default=true and returns an `embedder(text) => Promise<number[]>`
- * function bound to it. Throws loudly if no default row exists, or if the
- * resolved vector's length does not match the provider's declared
- * stored_dims (a silent dimension mismatch would otherwise corrupt the
- * halfvec(4000) column at INSERT time with a cryptic Postgres error
- * instead of a named one).
+ * resolveDefaultEmbedder — cm#201 S-A.2: ONE resolution engine. Delegates
+ * to embedding-provider.js's resolveDefaultProvider (strict: throws on 0 or
+ * >1 default rows) + createProviderFromRow, and its wire call now goes
+ * through that PROVIDER OBJECT (row-driven endpoint/model/stored_dims) --
+ * NO LONGER through embed.js's embedQuery()/pipeline.yml. This is a
+ * DELIBERATE, PINNED change from the pre-cm#201 shape: embedQuery() stays
+ * reserved for the read-time resurrect query-embedding seed only (a
+ * genuinely different, env-configured call path -- see embed.js's own
+ * header). The reason this matters beyond style: provenance must be TRUE,
+ * not merely present -- embedded_by_provider_id must name the row whose
+ * endpoint/model ACTUALLY produced the vector, and only the provider-object
+ * path is guaranteed to be the SAME object whose `.id` gets stamped
+ * alongside it (embedQuery() had no notion of a provider id at all).
+ *
+ * RETURN-SHAPE CHANGE (PINNED, cm#201 S-A.2): this now returns
+ * `{ embed, providerId }` instead of a bare `embedder(text) => vector`
+ * function. All FOUR consumers of this shape (exchange-log.js's own
+ * appendExchange below, write-time-embed.js, verify-19-seams-smoke.js,
+ * verify-20-mcp-surface.js) were updated in the same PR that introduced
+ * this change -- see the PR body for the full consumer list.
+ *
+ * Throws loudly (via resolveDefaultProvider) if zero or more than one
+ * default row exists, or if the resolved vector's length does not match
+ * the provider's declared stored_dims (a silent dimension mismatch would
+ * otherwise corrupt the halfvec(4000) column at INSERT time with a cryptic
+ * Postgres error instead of a named one).
  *
  * @param {object} client
- * @returns {Promise<(text: string) => Promise<number[]>>}
+ * @returns {Promise<{ providerId: number, embed: (text: string) => Promise<number[]> }>}
  */
 async function resolveDefaultEmbedder(client) {
-  const { rows } = await client.query(
-    `SELECT name, stored_dims FROM embedding_providers WHERE is_default = true LIMIT 1`
-  );
-  if (rows.length === 0) {
+  let providerRow;
+  try {
+    providerRow = await embeddingProvider.resolveDefaultProvider(client);
+  } catch (err) {
     throw new ExchangeLogError(
       'noDefaultProvider',
-      'exchange-log: no embedding_providers row with is_default=true — refusing to embed silently (never a silent skip/fallback per §7.7)'
+      `exchange-log: ${err.message} — refusing to embed silently (never a silent skip/fallback per §7.7)`
     );
   }
-  const provider = rows[0];
-  return async function defaultEmbedder(text) {
-    const vector = await embedQuery(text); // fail-loud by embed.js's own contract
-    if (!Array.isArray(vector) || vector.length !== provider.stored_dims) {
-      throw new ExchangeLogError(
-        'dimensionMismatch',
-        `exchange-log: default embedder ("${provider.name}") returned ${Array.isArray(vector) ? vector.length : typeof vector} dims, expected ${provider.stored_dims}`
-      );
-    }
-    return vector;
+  const provider = embeddingProvider.createProviderFromRow(providerRow);
+  return {
+    providerId: providerRow.id,
+    embed: async function defaultEmbedder(text) {
+      const result = await provider.embed(text); // provider-object-driven wire call (row endpoint/model/stored_dims)
+      if (!Array.isArray(result.vector) || result.vector.length !== providerRow.stored_dims) {
+        throw new ExchangeLogError(
+          'dimensionMismatch',
+          `exchange-log: default embedder ("${providerRow.name}") returned ${Array.isArray(result.vector) ? result.vector.length : typeof result.vector} dims, expected ${providerRow.stored_dims}`
+        );
+      }
+      return result.vector;
+    },
   };
 }
 
@@ -108,7 +130,16 @@ async function resolveDefaultEmbedder(client) {
  * @param {number} [params.docketId]
  * @param {number} [params.parentId]
  * @param {(text:string) => Promise<number[]>} [params.embedder] - injectable
- *   embedder seam; defaults to resolveDefaultEmbedder(client)
+ *   embedder seam; defaults to resolveDefaultEmbedder(client). cm#201
+ *   S-A.3: when supplied, `params.embedderProviderId` MUST also be
+ *   supplied explicitly (both-or-neither) — the injector names the
+ *   provider id its stub vector is attributed to; this seam NEVER
+ *   auto-stamps the live default provider's id alongside an injected
+ *   (i.e. NOT-actually-that-provider's) embedder, which would be a false
+ *   provenance claim.
+ * @param {number} [params.embedderProviderId] - required iff params.embedder
+ *   is supplied (see above); ignored/unused when params.embedder is absent
+ *   (the default path resolves its own providerId internally).
  * @param {{table:'tasks', id:number, fromStatus:string, toStatus:string}} [params.transition]
  *   - optional ONE guarded atomic state transition in the SAME transaction
  *     as the INSERT. `table` is a closed enum of 'tasks' only in Phase 7
@@ -120,7 +151,7 @@ async function appendExchange(client, params) {
   const {
     projectId, agentId, kind, body, summary,
     sourceModel = null, toAgent = null, docketId = null, parentId = null,
-    embedder, transition,
+    embedder, embedderProviderId, transition,
   } = params || {};
 
   if (typeof projectId !== 'string' || !projectId.trim()) {
@@ -142,23 +173,47 @@ async function appendExchange(client, params) {
     throw new ExchangeLogError('validation', `exchange-log: transition.table must be "tasks" in Phase 7 (got "${transition.table}")`);
   }
 
+  // cm#201 S-A.3: injected embedder/embedderProviderId is both-or-neither —
+  // never auto-stamp the live default provider's id alongside a caller
+  // that supplied its OWN embedder (that would be a false provenance
+  // claim: the stamped id must name the provider that ACTUALLY produced
+  // the vector).
+  const embedderGiven = embedder !== undefined && embedder !== null;
+  const embedderProviderIdGiven = embedderProviderId !== undefined && embedderProviderId !== null;
+  if (embedderGiven !== embedderProviderIdGiven) {
+    throw new ExchangeLogError(
+      'validation',
+      'exchange-log: appendExchange requires BOTH params.embedder and params.embedderProviderId when either is supplied (test seam; never an auto-stamped default alongside an injected embedder).'
+    );
+  }
+
   const kindWarning = KNOWN_KINDS.has(kind)
     ? null
     : `kind "${kind}" is not one of the documented vocabulary values (${[...KNOWN_KINDS].join('|')}) — accepted per §5.8's "extend by convention, not by migration", but flagged here for visibility`;
 
   // ── Embed BEFORE opening the transaction (§7.7 requirement) ────────────
-  const embedFn = embedder || await resolveDefaultEmbedder(client);
+  let embedFn, providerId;
+  if (embedderGiven) {
+    embedFn = embedder;
+    providerId = embedderProviderId;
+  } else {
+    const resolved = await resolveDefaultEmbedder(client);
+    embedFn = resolved.embed;
+    providerId = resolved.providerId;
+  }
   const vector = await embedFn(summary);
   const vectorLiteral = `[${vector.join(',')}]`;
 
   await client.query('BEGIN');
   try {
+    // cm#201 invariant: every statement that assigns `embedding` ALSO
+    // assigns `embedded_by_provider_id` in the SAME statement.
     const insertRes = await client.query(
       `INSERT INTO agent_exchange
-         (project_id, docket_id, parent_id, agent_id, source_model, to_agent, kind, body_caveman, embedding)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         (project_id, docket_id, parent_id, agent_id, source_model, to_agent, kind, body_caveman, embedding, embedded_by_provider_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING id, created_at`,
-      [projectId, docketId, parentId, agentId, sourceModel, toAgent, kind, body, vectorLiteral]
+      [projectId, docketId, parentId, agentId, sourceModel, toAgent, kind, body, vectorLiteral, providerId]
     );
     const exchangeRow = insertRes.rows[0];
 

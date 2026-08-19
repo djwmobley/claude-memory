@@ -7,7 +7,7 @@
  * RUNBOOK.md §7.1-§7.8, memory-manager#17).
  *
  * Group A: subprocess tests of verify-19-seams-smoke.js itself (fresh
- * full-stack apply -> exit 0 + SMOKE19_RESULT: PASS with all 30 checks
+ * full-stack apply -> exit 0 + SMOKE19_RESULT: PASS with all 32 checks
  * green; prerequisite-missing FAIL naming migrate-14-seam-tables.js).
  *
  * Group B: direct, DB-free unit tests for the pure/static pieces of
@@ -15,7 +15,7 @@
  * scripts/lib/reality-checks.js's isEntityShaped, and
  * scripts/lib/carryover-render.js's renderCarryoverTable — the
  * DB-dependent behavior of all of these is already exercised end-to-end by
- * verify-19-seams-smoke.js's 30 checks (Group A proves that script itself
+ * verify-19-seams-smoke.js's 32 checks (Group A proves that script itself
  * passes); Group B adds fast, standalone regression coverage for the
  * adversarial fixtures that do NOT need a live database.
  *
@@ -77,6 +77,36 @@ function spawn(scriptPath, args, timeoutMs = 30000) {
   return spawnSync(process.execPath, [scriptPath, ...args], { cwd: PROJECT_ROOT, env: process.env, encoding: 'utf8', timeout: timeoutMs });
 }
 
+/**
+ * cm#201 test-fixture helper: mirrors migrate-07-reembed-corpus.js's own
+ * discoverEmbeddableTables() + ensureProvenanceColumn() (DDL-derived scan
+ * for every base table with a vector/halfvec column, then an idempotent
+ * ADD COLUMN) — reused HERE rather than hand-listing table names, so this
+ * fixture stays correct if the seam-table DDL ever adds/removes an
+ * embedding column without this file being remembered.
+ */
+async function ensureProvenanceColumnsOnDiscoveredTables(dbName) {
+  const client = await pgConnect(dbName);
+  try {
+    const { rows } = await client.query(`
+      SELECT DISTINCT c.relname AS table_name
+        FROM pg_attribute a
+        JOIN pg_class c ON a.attrelid = c.oid
+        JOIN pg_namespace n ON c.relnamespace = n.oid
+        JOIN pg_type t ON a.atttypid = t.oid
+       WHERE n.nspname = current_schema()
+         AND c.relkind = 'r'
+         AND a.attnum > 0 AND NOT a.attisdropped
+         AND t.typname IN ('vector', 'halfvec')
+    `);
+    for (const { table_name: table } of rows) {
+      await client.query(`ALTER TABLE "${table}" ADD COLUMN IF NOT EXISTS embedded_by_provider_id INTEGER REFERENCES embedding_providers(id)`);
+    }
+  } finally {
+    await client.end();
+  }
+}
+
 async function setupFullSeamStack(dbName) {
   let r = spawn(MIGRATE_ONE_PATH, ['--db', dbName]);
   if (r.status !== 0) throw new Error(`migrate-01 failed: ${r.stderr}`);
@@ -93,6 +123,19 @@ async function setupFullSeamStack(dbName) {
   // tables.js's testTriggerReapplyWires16 for the full explanation. Its
   // trigger-wiring classification, which is what verify-19 actually
   // depends on, is unaffected.)
+
+  // cm#201: every embeddable table's write paths now stamp
+  // embedded_by_provider_id (the sharpened provenance invariant). On a REAL
+  // target this column is added by migrate-07-reembed-corpus.js's
+  // DDL-derived ensureProvenanceColumn() scan (ALTER TABLE <t> ADD COLUMN
+  // IF NOT EXISTS embedded_by_provider_id INTEGER REFERENCES
+  // embedding_providers(id), for every table it discovers with a
+  // vector/halfvec column) — but this suite's fresh scratch DB deliberately
+  // never runs migrate-07 (out of scope for the §7 seam stack it is
+  // proving). Mirrored here directly, via the SAME DDL-derived discovery
+  // query migrate-07 itself uses (never a hand-listed table name), so this
+  // fixture matches what a real pre-cutover target already has.
+  await ensureProvenanceColumnsOnDiscoveredTables(dbName);
 }
 
 const DB_MAIN = `verify19_main_${TS}_staging`;
@@ -109,7 +152,10 @@ async function testFreshApplyAllGreen() {
   const failLines = (r.stdout.match(/\[SMOKE-19\]\[\d+\] FAIL.*/g) || []);
   assert(failLines.length === 0, `expected zero FAIL lines, got: ${failLines.join(' | ')}`);
   const passCount = (r.stdout.match(/\[SMOKE-19\]\[\d+\] PASS/g) || []).length;
-  assert(passCount === 30, `expected all 30 checks to PASS, got ${passCount}`);
+  // cm#201 S-A.3 added 2 checks (appendExchange embedder/embedderProviderId
+  // both-or-neither, both directions) to verify-19-seams-smoke.js's
+  // existing 30 -- see this suite's own comment update below.
+  assert(passCount === 32, `expected all 32 checks to PASS, got ${passCount}`);
   assert(/residue scan: clean \(0 rows\)/.test(r.stdout), `expected a clean residue scan. stdout=${r.stdout}`);
 }
 
@@ -237,7 +283,7 @@ function testPromotionPathConfinedToAssertions() {
 }
 
 async function main() {
-  await run('A1', 'Fresh full-stack apply -> exit 0, SMOKE19_RESULT: PASS, all 30 checks green, clean residue scan', testFreshApplyAllGreen);
+  await run('A1', 'Fresh full-stack apply -> exit 0, SMOKE19_RESULT: PASS, all 32 checks green, clean residue scan', testFreshApplyAllGreen);
   await run('A2', 'decisions table missing -> refusal naming migrate-14-seam-tables.js', testPrereqMissing);
 
   await run('B1', 'normalize-text: case/whitespace/punctuation normalization + materiallyDifferent', () => testNormalizeTextCaseWhitespacePunctuation());

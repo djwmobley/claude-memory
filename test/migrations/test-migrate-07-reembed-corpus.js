@@ -31,6 +31,8 @@ const scriptsRequire = createRequire(require.resolve('../../scripts/package.json
 const { Client } = scriptsRequire('pg');
 const migrateOne = require(path.join(PROJECT_ROOT, 'scripts', 'migrations', 'migrate-01-canonical-db.js'));
 const { VllmHttpError } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'embed.js'));
+const embeddingProvider = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'embedding-provider.js'));
+const { PROBE_TEXT } = embeddingProvider;
 
 // ─── HARNESS ────────────────────────────────────────────────────────────────
 
@@ -108,10 +110,19 @@ function makeFakeTransport(dims) {
   return async (text) => deterministicVector(text, dims);
 }
 
-/** Fails on the (failAfter+1)-th call onward -- for provider-failure-resume tests. */
+/**
+ * Fails on the (failAfter+1)-th call onward -- for provider-failure-resume
+ * tests. The cm#202 preflight probe (PROBE_TEXT, a fixed short literal)
+ * fires BEFORE main()'s embed loop starts as of this PR; this fixture
+ * exempts that exact literal from its call-counting so `failAfter` still
+ * counts only the REAL embed-loop calls it was written to count (probe
+ * coverage for THIS specific failure shape lives in the dedicated PROBE-*
+ * tests below, not here).
+ */
 function makeFailingTransport(dims, failAfter) {
   let calls = 0;
   return async (text) => {
+    if (text === PROBE_TEXT) return deterministicVector(text, dims);
     calls += 1;
     if (calls > failAfter) throw new Error('SIMULATED-PROVIDER-FAILURE');
     return deterministicVector(text, dims);
@@ -147,6 +158,13 @@ const OVERLENGTH_400_BODY = JSON.stringify({
  */
 function makeOverlengthTransport(dims, { failThreshold = Infinity, alwaysFail = false, otherParam = false } = {}) {
   return async (text) => {
+    // The cm#202 preflight probe (PROBE_TEXT, 16 chars) fires BEFORE main()'s
+    // embed loop as of this PR. This fixture simulates a provider that
+    // rejects OVER-LENGTH content specifically -- a probe with trivially
+    // short text must still succeed against such a provider (a provider
+    // that fails on EVERYTHING, including a 16-char string, is a DIFFERENT
+    // failure class, covered by the dedicated PROBE-* tests below).
+    if (text === PROBE_TEXT) return deterministicVector(text, dims);
     const shouldFail = alwaysFail || text.length > failThreshold;
     if (!shouldFail) return deterministicVector(text, dims);
     const body = otherParam
@@ -156,9 +174,19 @@ function makeOverlengthTransport(dims, { failThreshold = Infinity, alwaysFail = 
   };
 }
 
-/** Simulated connection error (ECONNRESET) -- NOT a VllmHttpError, must still hard-stop (OL-2 negative case). */
-function makeConnectionErrorTransport() {
-  return async () => {
+/**
+ * Simulated connection error (ECONNRESET) -- NOT a VllmHttpError, must
+ * still hard-stop (OL-2 negative case). `dims`, when supplied, exempts the
+ * cm#202 preflight probe's fixed literal (PROBE_TEXT) from the simulated
+ * failure -- see makeOverlengthTransport's comment above for why: this
+ * fixture is meant to exercise the EMBED LOOP's per-row hard stop on a
+ * connection error, not the probe stage (probe-specific connection-error
+ * coverage lives in the dedicated PROBE-* tests below). Omitting `dims`
+ * (legacy call shape) fails unconditionally, including the probe.
+ */
+function makeConnectionErrorTransport(dims) {
+  return async (text) => {
+    if (dims && text === PROBE_TEXT) return deterministicVector(text, dims);
     throw new Error('[embed] vLLM network error (http://fake-endpoint.invalid): ECONNRESET');
   };
 }
@@ -305,6 +333,55 @@ async function main() {
     assert(result.pass === true, `expected PASS (5/100=5% is not >5%; total=5<=20), got ${JSON.stringify(result)}`);
   });
 
+  // ── cm#202 S-B: probeProvider (pure unit, fake provider, no DB) ─────────
+  function fakeProvider(embedImpl, { nativeDims = 8, storedDims = 4 } = {}) {
+    return {
+      name: 'fake-provider', endpoint: 'http://fake-endpoint.invalid', modelLabel: 'fake-model',
+      nativeDims, _storedDims: storedDims, storedDims: () => storedDims,
+      embed: embedImpl,
+    };
+  }
+  await run('PROBE-1', 'probeProvider: success — vector matches native_dims/stored_dims, all elements finite', async () => {
+    const provider = fakeProvider(async (text) => {
+      assert(text === PROBE_TEXT, `expected the probe to send PROBE_TEXT, got ${JSON.stringify(text)}`);
+      return { vector: [0.1, 0.2, 0.3, 0.4], dims: 4, model: 'fake-model', rawDims: 8 };
+    });
+    const result = await embeddingProvider.probeProvider(provider);
+    assert(result.ok === true && result.nativeDims === 8 && result.storedDims === 4, `expected ok:true nativeDims=8 storedDims=4, got ${JSON.stringify(result)}`);
+  });
+  await run('PROBE-2', 'probeProvider: dim mismatch (native) is a named ProviderProbeError naming observed vs expected', async () => {
+    const provider = fakeProvider(async () => ({ vector: [0.1, 0.2, 0.3, 0.4], dims: 4, model: 'fake-model', rawDims: 6 }));
+    await assertThrows(() => embeddingProvider.probeProvider(provider), 'observed native (pre-truncation) dims=6, expected native_dims=8');
+  });
+  await run('PROBE-3', 'probeProvider: dim mismatch (stored) is a named ProviderProbeError naming observed vs expected', async () => {
+    const provider = fakeProvider(async () => ({ vector: [0.1, 0.2, 0.3], dims: 3, model: 'fake-model', rawDims: 8 }));
+    await assertThrows(() => embeddingProvider.probeProvider(provider), 'observed stored (post-truncation) dims=3, expected stored_dims=4');
+  });
+  await run('PROBE-4', 'probeProvider: non-finite vector element is a named ProviderProbeError', async () => {
+    const provider = fakeProvider(async () => ({ vector: [0.1, NaN, 0.3, 0.4], dims: 4, model: 'fake-model', rawDims: 8 }));
+    await assertThrows(() => embeddingProvider.probeProvider(provider), 'non-finite vector element');
+  });
+  await run('PROBE-5', 'probeProvider: HTTP status failure names the status + body head', async () => {
+    const provider = fakeProvider(async () => { throw new VllmHttpError('x', 404, JSON.stringify({ error: 'model not found' })); });
+    await assertThrows(() => embeddingProvider.probeProvider(provider), 'HTTP 404');
+  });
+  await run('PROBE-6', 'probeProvider: connection-refused is classified distinctly (VllmNetworkError, ECONNREFUSED code)', async () => {
+    const { VllmNetworkError } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'embed.js'));
+    const provider = fakeProvider(async () => { throw new VllmNetworkError('x: ECONNREFUSED', 'ECONNREFUSED'); });
+    await assertThrows(() => embeddingProvider.probeProvider(provider), 'connection refused');
+  });
+  await run('PROBE-7', 'probeProvider: timeout is classified distinctly (VllmTimeoutError) and names the timeout window', async () => {
+    const { VllmTimeoutError } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'embed.js'));
+    const provider = fakeProvider(async () => { throw new VllmTimeoutError('x', 10000); });
+    await assertThrows(() => embeddingProvider.probeProvider(provider, { timeoutMs: 10000 }), 'timeout (exceeded 10000ms)');
+  });
+  await run('PROBE-8', 'probeProvider: threads opts.timeoutMs (or the EMBED_PROBE_TIMEOUT_MS-else-DEFAULT_PROBE_TIMEOUT_MS default) into provider.embed', async () => {
+    let receivedOpts = null;
+    const provider = fakeProvider(async (text, opts) => { receivedOpts = opts; return { vector: [0, 0, 0, 0], dims: 4, model: 'x', rawDims: 8 }; });
+    await embeddingProvider.probeProvider(provider, { timeoutMs: 4242 });
+    assert(receivedOpts && receivedOpts.timeoutMs === 4242, `expected timeoutMs=4242 threaded to embed(), got ${JSON.stringify(receivedOpts)}`);
+  });
+
   // ── LIVE DB fixtures ──────────────────────────────────────────────────
   const stamp = Date.now();
   const TARGET_DB = `migrate07_test_${stamp}_staging`;
@@ -332,6 +409,13 @@ async function main() {
       );
       INSERT INTO embedding_providers (name, model_label, native_dims, stored_dims, endpoint, is_default)
       VALUES ('test-provider', 'test-model', ${NATIVE_DIMS}, ${STORED_DIMS}, 'http://fake-endpoint.invalid', true);
+
+      -- cm#201 S-A.2: the same partial unique index this PR ships in canon
+      -- (embedding-providers-base.sql + scripts/sql/handoff-core-schema.sql)
+      -- — mirrored here so this suite proves it actually enforces "at most
+      -- one default row", not merely that the migration script assumes it.
+      CREATE UNIQUE INDEX embedding_providers_is_default_unique_idx
+        ON embedding_providers (is_default) WHERE is_default;
 
       -- migration_manifest (minimal shape this script reads from -- G-R7/G-R11)
       CREATE TABLE migration_manifest (
@@ -823,7 +907,11 @@ with an embedded newline -- must survive the escapeLiteral round-trip';
     // ── DIM ASSERTION (G-R9) ───────────────────────────────────────────────
     await run('DIM-1', 'a provider returning the wrong vector length is a hard stop, never silently truncated/padded', async () => {
       await tgt.query(`INSERT INTO widget (project_id, blurb) VALUES ('proj-dim', 'dim mismatch fixture')`);
-      const badTransport = async () => [1, 2]; // wrong length (native/stored both 8/4 here)
+      // wrong length (native/stored both 8/4 here); PROBE_TEXT exempted so
+      // the preflight probe succeeds and this test reaches the EMBED
+      // LOOP's own G-R9 dim assertion (dedicated probe-dim-mismatch
+      // coverage lives in the PROBE-* tests below).
+      const badTransport = async (text) => (text === PROBE_TEXT ? deterministicVector(text, NATIVE_DIMS) : [1, 2]);
       await assertThrows(() => migrate07.run(TARGET_DB, { rosterPath: ROSTER_PATH,transport: badTransport, runId: crypto.randomUUID() }), 'DIM-MISMATCH');
       const { rows } = await tgt.query(`SELECT embedding FROM widget WHERE project_id='proj-dim'`);
       assert(rows[0].embedding === null, 'expected the row to remain unembedded after a dim-mismatch hard stop');
@@ -926,7 +1014,7 @@ with an embedded newline -- must survive the escapeLiteral round-trip';
 
     await run('OL-6', 'a connection error (simulated ECONNRESET) is not a VllmHttpError -- immediate hard stop, G-R8 unchanged', async () => {
       await tgt.query(`INSERT INTO widget (project_id, blurb) VALUES ('proj-ol6', 'content')`);
-      await assertThrows(() => migrate07.run(TARGET_DB, { rosterPath: ROSTER_PATH, transport: makeConnectionErrorTransport(), runId: crypto.randomUUID(), halvingDelayMs: 1 }), 'ECONNRESET');
+      await assertThrows(() => migrate07.run(TARGET_DB, { rosterPath: ROSTER_PATH, transport: makeConnectionErrorTransport(NATIVE_DIMS), runId: crypto.randomUUID(), halvingDelayMs: 1 }), 'ECONNRESET');
       const { rows } = await tgt.query(`SELECT embedding FROM widget WHERE project_id='proj-ol6'`);
       assert(rows[0].embedding === null, 'expected the row to remain unembedded after the hard stop');
       await tgt.query(`DELETE FROM widget WHERE project_id='proj-ol6'`);
@@ -959,6 +1047,74 @@ with an embedded newline -- must survive the escapeLiteral round-trip';
       const { rows: logAfter } = await tgt.query(`SELECT COUNT(*)::int AS n FROM embedding_write_log WHERE table_name='widget'`);
       assert(logAfter[0].n === logBefore[0].n, `expected zero NEW write_log rows on resume, before=${logBefore[0].n} after=${logAfter[0].n}`);
       await tgt.query(`DELETE FROM widget WHERE project_id='proj-ol8'`);
+    });
+
+    // ── cm#202 S-B: probe MODE MATRIX (full run()-through-DB) ─────────────
+    await run('PROBE-MODE-1', 'MIGRATE mode: a broken provider fails the probe loud, BEFORE any classification/DDL/embed work — the row is never touched', async () => {
+      await tgt.query(`INSERT INTO widget (project_id, blurb) VALUES ('proj-probemode1', 'untouched row')`);
+      const brokenTransport = async () => { throw new Error('SIMULATED-PROBE-DOWN'); };
+      await assertThrows(
+        () => migrate07.run(TARGET_DB, { rosterPath: ROSTER_PATH, transport: brokenTransport, runId: crypto.randomUUID() }),
+        'preflight probe FAILED'
+      );
+      const { rows } = await tgt.query(`SELECT embedding FROM widget WHERE project_id='proj-probemode1'`);
+      assert(rows[0].embedding === null, 'expected the row untouched (probe failed before the embed loop ever ran)');
+      await tgt.query(`DELETE FROM widget WHERE project_id='proj-probemode1'`);
+    });
+
+    await run('PROBE-MODE-2', 'DRY-RUN mode: a broken provider fails the dry run loud (probe still runs under --dry-run)', async () => {
+      const brokenTransport = async () => { throw new Error('SIMULATED-PROBE-DOWN'); };
+      await assertThrows(
+        () => migrate07.run(TARGET_DB, { dryRun: true, rosterPath: ROSTER_PATH, transport: brokenTransport }),
+        'preflight probe FAILED'
+      );
+    });
+
+    await run('PROBE-MODE-3', 'ROLLBACK mode: performs ZERO provider I/O — succeeds even with a totally broken transport (no live endpoint required)', async () => {
+      const brokenTransport = async () => { throw new Error('SIMULATED-PROBE-DOWN'); };
+      const ok = await migrate07.run(TARGET_DB, {
+        rollback: crypto.randomUUID(), rosterPath: ROSTER_PATH, transport: brokenTransport,
+      });
+      assert(ok === true, 'expected the (no-op) rollback to PASS despite a transport that always throws — rollback never resolves or probes a provider');
+    });
+
+    // ── cm#201 §7: G-R5 inverse-direction provenance check ─────────────────
+    await run('GR5-INV-1', 'runProvenanceVerification: FAILS on the inverse-direction gap (embedding IS NULL, embedded_by_provider_id IS NOT NULL)', async () => {
+      const ins = await tgt.query(`INSERT INTO widget (project_id, blurb, embedding) VALUES ('proj-gr5inv', 'x', NULL) RETURNING id`);
+      // Stale provenance on an unembedded row — exactly the shape a writer
+      // that assigns embedding=NULL without ALSO NULLing
+      // embedded_by_provider_id would leave behind.
+      await tgt.query(`UPDATE widget SET embedded_by_provider_id = (SELECT id FROM embedding_providers WHERE is_default = true) WHERE id = $1`, [ins.rows[0].id]);
+      const lines = [];
+      const ok = await migrate07.runProvenanceVerification(tgt, ['widget'], (l) => lines.push(l));
+      assert(ok === false, 'expected runProvenanceVerification to FAIL on the inverse-direction gap');
+      assert(lines.some((l) => l.includes('embedding IS NULL but embedded_by_provider_id IS NOT NULL')), `expected an inverse-direction PROVENANCE-FAIL line, got:\n${lines.join('\n')}`);
+      await tgt.query(`DELETE FROM widget WHERE project_id='proj-gr5inv'`);
+    });
+    await run('UNIQUE-IDX-1', 'embedding_providers_is_default_unique_idx: a second is_default=true row is rejected (unique partial index enforces at most one default)', async () => {
+      let threw = false;
+      try {
+        await tgt.query(
+          `INSERT INTO embedding_providers (name, model_label, native_dims, stored_dims, endpoint, is_default) VALUES ('second-default', 'x', 8, 4, 'http://x.invalid', true)`
+        );
+      } catch (err) {
+        threw = true;
+        assert(err.code === '23505', `expected a unique-violation (23505), got code=${err.code} message=${err.message}`);
+      }
+      assert(threw, 'expected the second is_default=true INSERT to be rejected');
+    });
+    await run('UNIQUE-IDX-2', 'embedding_providers_is_default_unique_idx: a second is_default=false row is UNAFFECTED (partial index only covers is_default=true)', async () => {
+      const { rows } = await tgt.query(
+        `INSERT INTO embedding_providers (name, model_label, native_dims, stored_dims, endpoint, is_default) VALUES ('a-non-default', 'x', 8, 4, 'http://x.invalid', false) RETURNING id`
+      );
+      assert(Number.isInteger(rows[0].id), 'expected the non-default INSERT to succeed');
+      await tgt.query(`DELETE FROM embedding_providers WHERE name = 'a-non-default'`);
+    });
+
+    await run('GR5-INV-2', 'runProvenanceVerification: PASSES when neither direction has a gap', async () => {
+      const lines = [];
+      const ok = await migrate07.runProvenanceVerification(tgt, ['widget'], (l) => lines.push(l));
+      assert(ok === true, `expected PASS with no gaps present, got FAIL:\n${lines.join('\n')}`);
     });
 
   } finally {

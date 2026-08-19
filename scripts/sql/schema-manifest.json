@@ -19,7 +19,8 @@
           "retrieval_contract_history",
           "project_settings",
           "entity_communities",
-          "extraction_queue"
+          "extraction_queue",
+          "embedding_providers"
         ],
         "columns": [
           { "table": "assertions", "column": "suppressed" },
@@ -60,7 +61,8 @@
           "retrieval_contract_history_idx",
           "entity_communities_lookup_idx",
           "entity_communities_run_idx",
-          "extraction_queue_project_status_idx"
+          "extraction_queue_project_status_idx",
+          "embedding_providers_is_default_unique_idx"
         ],
         "_note": "The pgvector-gated assertions.embedding column, assertions_embedding_hnsw_idx, and the pg_trgm-gated assertions_trgm_text_idx are deliberately EXCLUDED from this expected-objects list. Both DO $$ blocks that create them are designed to degrade gracefully (EXCEPTION WHEN OTHERS) when the extension is absent -- the file's own header states 'no extensions, no halfvec, no pgvector dependency'. Including them here would convert an intentional optional degrade into a permanent stuck-degraded state on every stock Postgres instance without pgvector/pg_trgm installed. See PR body for the full rationale (S-13 scope interpretation)."
       }
@@ -79,7 +81,8 @@
           "entity_communities",
           "extraction_queue",
           "retrieval_events",
-          "retrieval_event_assertions"
+          "retrieval_event_assertions",
+          "embedding_providers"
         ],
         "columns": [
           { "table": "assertions", "column": "suppressed" },
@@ -125,7 +128,8 @@
           "retrieval_events_outcome_idx",
           "retrieval_events_time_idx",
           "rea_event_idx",
-          "rea_assertion_idx"
+          "rea_assertion_idx",
+          "embedding_providers_is_default_unique_idx"
         ]
       }
     },
