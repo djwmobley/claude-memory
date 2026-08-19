@@ -30,7 +30,7 @@ const crypto = require('crypto');
 
 const { chunkText }          = require('./pipeline-chunker');
 const { getClaudeProjectDir } = require('./lib/encoded-cwd');
-const { loadConfig, connect, c, ollamaEmbed } = require('./lib/shared');
+const { loadConfig, connect, c, ollamaEmbed, hasProvenanceColumn } = require('./lib/shared');
 const { embedWithRetry }                       = require('./pipeline-embed');
 
 const BATCH                = 8;
@@ -166,6 +166,23 @@ async function embedPending(db, config, table, buildCtx, stats) {
 
   if (rows.length === 0) return;
 
+  // cm#201 completeness item #7: this table may have adopted
+  // embedded_by_provider_id (cm#201's provenance column) since this legacy
+  // Ollama-direct embed pass was written -- it has no notion of
+  // embedding_providers at all. REFUSE loudly (abort this loader command)
+  // rather than silently skip when the table has adopted the column;
+  // otherwise proceed unchanged (legacy tables without the column are out
+  // of provenance scope).
+  if (await hasProvenanceColumn(db, table)) {
+    throw new Error(
+      `pipeline-memory-loader.js: refusing to write "${table}".embedding -- this table carries ` +
+      `embedded_by_provider_id (provenance-adopted per cm#201's invariant: every SQL statement that assigns ` +
+      `embedding must ALSO assign embedded_by_provider_id in the same statement). embedPending() is legacy ` +
+      `per-project pipeline tooling with no notion of embedding_providers -- route this table's embedding writes ` +
+      `through scripts/lib/embedding-provider.js instead, or do not adopt embedded_by_provider_id on this table.`
+    );
+  }
+
   // Pre-compute text for each row so embedFn is a pure (texts) => vectors call
   for (const row of rows) {
     row.text = buildCtx(row);
@@ -205,6 +222,10 @@ async function loadMemory(db, config) {
     printMemoryStats(stats, Date.now() - start);
     return;
   }
+
+  // cm#201 completeness item #10 (inverse violator): computed ONCE for this
+  // run, not per-chunk -- see the SET embedding=NULL branch below for why.
+  const chunksHaveProvenanceCol = (!dryRun && db) ? await hasProvenanceColumn(db, 'memory_entry_chunks') : false;
 
   for (const filename of files) {
     const filePath  = path.join(memDir, filename);
@@ -278,16 +299,28 @@ async function loadMemory(db, config) {
             [entryId, chunk.chunkIdx, chunk.content, hash]
           );
         } else {
-          // New or changed chunk — upsert with NULL embedding to trigger re-embed
-          await db.query(
-            `INSERT INTO memory_entry_chunks (entry_id, chunk_idx, content, content_hash, embedding)
-             VALUES ($1, $2, $3, $4, NULL)
-             ON CONFLICT (entry_id, chunk_idx) DO UPDATE
-               SET content      = EXCLUDED.content,
-                   content_hash = EXCLUDED.content_hash,
-                   embedding    = NULL`,
-            [entryId, chunk.chunkIdx, chunk.content, hash]
-          );
+          // New or changed chunk — upsert with NULL embedding to trigger
+          // re-embed. cm#201 completeness item #10: when this table
+          // carries embedded_by_provider_id, the stale provenance id must
+          // be NULLed alongside embedding in the SAME statement (never
+          // leave a stale "embedded by provider X" claim standing on a row
+          // whose embedding was just cleared) -- classified at run time
+          // (chunksHaveProvenanceCol, computed once above), never assumed.
+          const sql = chunksHaveProvenanceCol
+            ? `INSERT INTO memory_entry_chunks (entry_id, chunk_idx, content, content_hash, embedding, embedded_by_provider_id)
+               VALUES ($1, $2, $3, $4, NULL, NULL)
+               ON CONFLICT (entry_id, chunk_idx) DO UPDATE
+                 SET content      = EXCLUDED.content,
+                     content_hash = EXCLUDED.content_hash,
+                     embedding    = NULL,
+                     embedded_by_provider_id = NULL`
+            : `INSERT INTO memory_entry_chunks (entry_id, chunk_idx, content, content_hash, embedding)
+               VALUES ($1, $2, $3, $4, NULL)
+               ON CONFLICT (entry_id, chunk_idx) DO UPDATE
+                 SET content      = EXCLUDED.content,
+                     content_hash = EXCLUDED.content_hash,
+                     embedding    = NULL`;
+          await db.query(sql, [entryId, chunk.chunkIdx, chunk.content, hash]);
         }
         stats.chunks++;
       }
@@ -346,6 +379,10 @@ async function loadSessions(db, config) {
     printSessionStats(stats, Date.now() - start);
     return;
   }
+
+  // cm#201 completeness item #10 (inverse violator): computed ONCE for this
+  // run -- see the SET embedding=NULL branch below.
+  const sessionChunksHaveProvenanceCol = (!dryRun && db) ? await hasProvenanceColumn(db, 'session_chunks') : false;
 
   for (const filePath of jsonlFiles) {
     const filename  = path.basename(filePath);
@@ -430,14 +467,20 @@ async function loadSessions(db, config) {
               // Hash match — preserve embedding, skip re-embed
               stats.skipped++;
             } else {
-              // Changed content — update with NULL embedding to trigger re-embed
-              await db.query(
-                `UPDATE session_chunks
-                 SET content = $1, content_hash = $2, chunk_kind = $3,
-                     embedding = NULL, source_jsonl = $4
-                 WHERE id = $5`,
-                [chunkContent, hash, role, filePath, existing.id]
-              );
+              // Changed content — update with NULL embedding to trigger
+              // re-embed. cm#201 completeness item #10: pair
+              // embedded_by_provider_id = NULL in the SAME statement when
+              // this table has adopted the column (classified once above).
+              const sql = sessionChunksHaveProvenanceCol
+                ? `UPDATE session_chunks
+                   SET content = $1, content_hash = $2, chunk_kind = $3,
+                       embedding = NULL, embedded_by_provider_id = NULL, source_jsonl = $4
+                   WHERE id = $5`
+                : `UPDATE session_chunks
+                   SET content = $1, content_hash = $2, chunk_kind = $3,
+                       embedding = NULL, source_jsonl = $4
+                   WHERE id = $5`;
+              await db.query(sql, [chunkContent, hash, role, filePath, existing.id]);
             }
           }
         }
@@ -479,6 +522,10 @@ async function loadPolicy(db, config) {
     { docId: 'global-CLAUDE.md', filePath: path.join(os.homedir(), '.claude', 'CLAUDE.md') },
   ];
   const stats = { files: 0, sections: 0, chunks: 0, embedded: 0, skipped: 0, errors: 0 };
+
+  // cm#201 completeness item #10 (inverse violator): computed ONCE for this
+  // run -- see the SET embedding=NULL branch below.
+  const policySectionsHaveProvenanceCol = (!dryRun && db) ? await hasProvenanceColumn(db, 'policy_sections') : false;
 
   for (const { docId, filePath } of sources) {
     if (!fs.existsSync(filePath)) continue;
@@ -526,12 +573,17 @@ async function loadPolicy(db, config) {
             if (!force && existing.content_hash === hash) {
               stats.skipped++;
             } else {
-              await db.query(
-                `UPDATE policy_sections
-                 SET section_title = $1, content = $2, content_hash = $3, embedding = NULL
-                 WHERE id = $4`,
-                [section.sectionTitle, chunk.content, hash, existing.id]
-              );
+              // cm#201 completeness item #10: pair
+              // embedded_by_provider_id = NULL in the SAME statement when
+              // this table has adopted the column (classified once above).
+              const sql = policySectionsHaveProvenanceCol
+                ? `UPDATE policy_sections
+                   SET section_title = $1, content = $2, content_hash = $3, embedding = NULL, embedded_by_provider_id = NULL
+                   WHERE id = $4`
+                : `UPDATE policy_sections
+                   SET section_title = $1, content = $2, content_hash = $3, embedding = NULL
+                   WHERE id = $4`;
+              await db.query(sql, [section.sectionTitle, chunk.content, hash, existing.id]);
             }
           }
         }

@@ -69,6 +69,7 @@ if (!process.env._PATHS_INJECTED) {
 const { Client } = require('pg');
 const { loadConfig } = require('./lib/shared');
 const { embedQuery } = require('./lib/embed');
+const embeddingProvider = require('./lib/embedding-provider');
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -156,14 +157,37 @@ async function main() {
   try {
     await client.connect();
 
-    // Insert scratch row using the truncated vector from T1
-    const vecLiteral = '[' + vec.join(',') + ']';
-    const ins = await client.query(
-      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, embedding)
-       VALUES ($1, $2, $3, $4, 10, 'user_stated', $5::halfvec)
-       RETURNING id`,
-      [SCRATCH_PID, 'smoketest-subject', 'is', 'smoketest-object', vecLiteral]
+    // Insert scratch row using the truncated vector from T1. cm#201 #9:
+    // stamp via the shared resolver when this target has adopted
+    // embedded_by_provider_id (it exercises the real provider anyway, and
+    // this scratch row is deleted in the finally block below regardless).
+    // Total-classified at run time, same as every other legacy writer this
+    // PR touches: a target that has NOT been through the schema bring-
+    // forward that adds the column (e.g. claude_memory_eval_test as of
+    // 2026-08-18, this script's own default target) proceeds unchanged --
+    // out of provenance scope, never a hard requirement for this smoke test.
+    const { rows: provenanceColRows } = await client.query(
+      `SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'assertions' AND column_name = 'embedded_by_provider_id'`
     );
+    const hasProvenanceCol = provenanceColRows.length > 0;
+    let providerId = null;
+    if (hasProvenanceCol) {
+      const providerRow = await embeddingProvider.resolveDefaultProvider(client);
+      providerId = providerRow.id;
+    }
+
+    const vecLiteral = '[' + vec.join(',') + ']';
+    const insertSql = hasProvenanceCol
+      ? `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, embedding, embedded_by_provider_id)
+         VALUES ($1, $2, $3, $4, 10, 'user_stated', $5::halfvec, $6)
+         RETURNING id`
+      : `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, embedding)
+         VALUES ($1, $2, $3, $4, 10, 'user_stated', $5::halfvec)
+         RETURNING id`;
+    const insertParams = hasProvenanceCol
+      ? [SCRATCH_PID, 'smoketest-subject', 'is', 'smoketest-object', vecLiteral, providerId]
+      : [SCRATCH_PID, 'smoketest-subject', 'is', 'smoketest-object', vecLiteral];
+    const ins = await client.query(insertSql, insertParams);
     scratchId = ins.rows[0].id;
 
     // Run the exact SQL from handoff.js:1986-1997

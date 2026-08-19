@@ -29,6 +29,20 @@
  * Cast pattern (mirrors handoff.js:1985 runResurrectQuery):
  *   Bind '[v0,v1,...,v3999]' as a string, cast with $1::halfvec in SQL.
  *
+ * Provenance (cm#201): every write is routed through the embedding_providers
+ * -resolved DEFAULT provider object (row-driven endpoint/model/stored_dims
+ * -- never embedQuery()/pipeline.yml's EMBED_DIMS env var, which this
+ * script used before cm#201 and which had no notion of a provider id to
+ * stamp). Resolved ONCE at the top of the run and reused for every row
+ * (stamped-at-write-time semantics: a mid-run is_default flip by an
+ * operator does NOT change which provider id this run's rows are stamped
+ * with). Every UPDATE sets embedding AND embedded_by_provider_id together,
+ * in the same statement. If the target database has NOT been through the
+ * schema bring-forward that adds embedding_providers/embedded_by_provider_id
+ * (e.g. claude_memory_eval_test as of 2026-08-18), this script REFUSES
+ * loudly and writes nothing — never a provenance-less write, never a
+ * silent skip.
+ *
  * Usage:
  *   node scripts/dev/backfill-assertion-embeddings.js [--project-id=<id>]
  *       [--dry-run] [--batch-size=N] [--verbose]
@@ -112,7 +126,7 @@ const { Client } = require('pg');
 // ─── Internal lib imports ─────────────────────────────────────────────────────
 
 const { loadConfig, findProjectRoot }     = require('../lib/shared');
-const { embedQuery }                       = require('../lib/embed');
+const embeddingProvider                    = require('../lib/embedding-provider');
 const { findProjectRootByMarker, readMarker } = require('../lib/project-marker');
 const { encodeCwd }                        = require('../lib/encoded-cwd');
 
@@ -142,7 +156,12 @@ Environment:
   PGUSER             Postgres user (default: postgres).
   PGPASSWORD         Postgres password (default: postgres).
   HANDOFF_DB         Override database name (default: from pipeline.yml).
-  EMBED_DIMS         Matryoshka truncation dimension (default: 4000).
+
+Provenance (cm#201): requires the target DB to carry embedding_providers AND
+assertions.embedded_by_provider_id (bring it current via
+migrate-07-reembed-corpus.js first if it does not) — this script refuses
+loudly, writing nothing, if either is absent. Truncation dims are read from
+the resolved default provider row's native_dims/stored_dims, not an env var.
 
 Exit codes:
   0  Success (including dry-run).
@@ -247,6 +266,52 @@ async function main() {
   console.log(`  batch_size : ${BATCH_SIZE}`);
 
   try {
+    // ── cm#201 S-A.5: total-classify provenance readiness BEFORE any write ──
+    // (a) embedding_providers table AND assertions.embedded_by_provider_id
+    //     column both present -> stamped writes via the shared provider
+    //     object (resolved ONCE for this whole run -- see below).
+    // (b) either absent -> LOUD REFUSAL naming the missing object and the
+    //     step that adds it. Never a provenance-less write, never a silent
+    //     skip -- this mirrors the exact live gap found against
+    //     claude_memory_eval_test (this script's own current default
+    //     target, per resolveDbName() above): it has assertions.embedding
+    //     but neither embedding_providers nor embedded_by_provider_id.
+    const { rows: providerTableRows } = await client.query(
+      `SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'embedding_providers'`
+    );
+    const hasProviderTable = providerTableRows.length > 0;
+    const { rows: provenanceColRows } = await client.query(
+      `SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'assertions' AND column_name = 'embedded_by_provider_id'`
+    );
+    const hasProvenanceColumn = provenanceColRows.length > 0;
+
+    if (!hasProviderTable || !hasProvenanceColumn) {
+      const missing = [
+        !hasProviderTable ? '"embedding_providers" table' : null,
+        !hasProvenanceColumn ? '"assertions.embedded_by_provider_id" column' : null,
+      ].filter(Boolean).join(' and ');
+      process.stderr.write(
+        `ERROR: backfill-assertion-embeddings refuses to write "assertions".embedding without true provenance — ${missing} missing on database "${dbName}".\n` +
+        `  Fix: bring this database through migrate-07-reembed-corpus.js (or the same schema bring-forward it applies via ` +
+        `ensureProvenanceColumn) so embedding_providers exists and every embeddable table (including assertions) carries ` +
+        `embedded_by_provider_id, then re-run this script. Never a provenance-less write, never a silent skip (cm#201).\n`
+      );
+      await client.end();
+      process.exit(1);
+    }
+
+    // Resolve the default provider ONCE for this whole run (cm#201 S-A.5:
+    // "stamped-at-write-time semantics on mid-run default flips -- do NOT
+    // re-resolve per row" — every row this run embeds is attributed to the
+    // SAME provider row this run resolved at startup, even if an operator
+    // flips is_default mid-run). Wire call routes through the provider
+    // object (row-driven endpoint/model/stored_dims) — never embedQuery()/
+    // pipeline.yml (the provenance-truth rule: the stamped id must name the
+    // provider object that ACTUALLY produced the vector).
+    const providerRow = await embeddingProvider.resolveDefaultProvider(client);
+    const provider = embeddingProvider.createProviderFromRow(providerRow);
+    console.log(`  provider   : "${providerRow.name}" (id=${providerRow.id}, native_dims=${providerRow.native_dims}, stored_dims=${providerRow.stored_dims}, resolved once for this run)`);
+
     // ── Count already-embedded rows (for summary) ──────────────────────────
 
     const { rows: countRows } = await client.query(
@@ -314,8 +379,8 @@ async function main() {
       const updates = [];
       for (const row of batch) {
         try {
-          const vec = await embedQuery(row.subject);
-          const vecLiteral = '[' + vec.join(',') + ']';
+          const result = await provider.embed(row.subject);
+          const vecLiteral = '[' + result.vector.join(',') + ']';
           updates.push({ id: row.id, subject: row.subject, vecLiteral });
           if (VERBOSE) {
             process.stderr.write(`  [${batchStart + updates.length}/${pending.length}] embedded id=${row.id} subject="${row.subject.slice(0, 60)}"\n`);
@@ -336,9 +401,13 @@ async function main() {
       try {
         await client.query('BEGIN');
         for (const u of updates) {
+          // cm#201 invariant: this statement assigns embedding, so it ALSO
+          // assigns embedded_by_provider_id, in the same statement -- the
+          // run-resolved providerRow.id (stamped-at-write-time; never
+          // re-resolved per row, see the total-classification note above).
           await client.query(
-            'UPDATE assertions SET embedding = $1::halfvec WHERE id = $2',
-            [u.vecLiteral, u.id]
+            'UPDATE assertions SET embedding = $1::halfvec, embedded_by_provider_id = $2 WHERE id = $3',
+            [u.vecLiteral, providerRow.id, u.id]
           );
         }
         await client.query('COMMIT');

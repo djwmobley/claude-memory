@@ -37,7 +37,7 @@ const crypto = require('crypto');
 const { Client } = require('pg');
 
 const { chunkText }  = require('./pipeline-chunker');
-const { loadConfig } = require('./lib/shared');
+const { loadConfig, hasProvenanceColumn } = require('./lib/shared');
 
 // ─── ARGUMENT PARSING ────────────────────────────────────────────────────────
 
@@ -181,6 +181,14 @@ async function main() {
   log(`phase0-decisions-backfill: fetched ${rows.length} rows from pipeline_pipeline.decisions`);
   if (dryRun) log(`  (dry-run mode — no DB writes)`);
 
+  // cm#201 completeness item #10 (inverse violator): classified ONCE for
+  // this whole run -- when memory_entries/memory_entry_chunks have adopted
+  // embedded_by_provider_id, every embedding=NULL this script writes must
+  // pair embedded_by_provider_id=NULL in the SAME statement, never left
+  // standing stale on a row whose embedding was just cleared/omitted.
+  const entriesHaveProvenanceCol = !dryRun ? await hasProvenanceColumn(tgtDb, 'memory_entries') : false;
+  const chunksHaveProvenanceCol  = !dryRun ? await hasProvenanceColumn(tgtDb, 'memory_entry_chunks') : false;
+
   // ── 2. Process rows ─────────────────────────────────────────────────────────
   const stats = {
     rows:       rows.length,
@@ -224,21 +232,34 @@ async function main() {
     try {
       await tgtDb.query('BEGIN');
 
-      // a. Upsert memory_entries row
-      const parentRes = await tgtDb.query(
-        `INSERT INTO memory_entries
-           (name, description, mem_type, body, source_file, content_hash, embedding)
-         VALUES ($1, NULL, 'decision', $2, $3, $4, NULL)
-         ON CONFLICT (source_file) DO UPDATE
-           SET name         = EXCLUDED.name,
-               mem_type     = EXCLUDED.mem_type,
-               body         = EXCLUDED.body,
-               content_hash = EXCLUDED.content_hash,
-               embedding    = NULL,
-               updated_at   = NOW()
-         RETURNING id`,
-        [name, body, sourceFile, hash]
-      );
+      // a. Upsert memory_entries row (cm#201: pair embedded_by_provider_id
+      // = NULL alongside embedding = NULL, in the same statement, when
+      // this table has adopted the column -- classified once above).
+      const entrySql = entriesHaveProvenanceCol
+        ? `INSERT INTO memory_entries
+             (name, description, mem_type, body, source_file, content_hash, embedding, embedded_by_provider_id)
+           VALUES ($1, NULL, 'decision', $2, $3, $4, NULL, NULL)
+           ON CONFLICT (source_file) DO UPDATE
+             SET name         = EXCLUDED.name,
+                 mem_type     = EXCLUDED.mem_type,
+                 body         = EXCLUDED.body,
+                 content_hash = EXCLUDED.content_hash,
+                 embedding    = NULL,
+                 embedded_by_provider_id = NULL,
+                 updated_at   = NOW()
+           RETURNING id`
+        : `INSERT INTO memory_entries
+             (name, description, mem_type, body, source_file, content_hash, embedding)
+           VALUES ($1, NULL, 'decision', $2, $3, $4, NULL)
+           ON CONFLICT (source_file) DO UPDATE
+             SET name         = EXCLUDED.name,
+                 mem_type     = EXCLUDED.mem_type,
+                 body         = EXCLUDED.body,
+                 content_hash = EXCLUDED.content_hash,
+                 embedding    = NULL,
+                 updated_at   = NOW()
+           RETURNING id`;
+      const parentRes = await tgtDb.query(entrySql, [name, body, sourceFile, hash]);
       const entryId = parentRes.rows[0].id;
 
       // b. Delete existing chunks for this entry (clean-slate re-insert)
@@ -247,15 +268,21 @@ async function main() {
         [entryId]
       );
 
-      // c. Insert fresh chunk rows
+      // c. Insert fresh chunk rows (cm#201: pair embedded_by_provider_id
+      // explicitly when this table has adopted the column -- this is a
+      // fresh INSERT, so "explicit NULL" and "omitted" are equivalent in
+      // effect, but explicit keeps the invariant self-evident at the call
+      // site rather than relying on the table default).
+      const chunkSql = chunksHaveProvenanceCol
+        ? `INSERT INTO memory_entry_chunks
+             (entry_id, chunk_idx, content, content_hash, embedding, embedded_by_provider_id)
+           VALUES ($1, $2, $3, $4, NULL, NULL)`
+        : `INSERT INTO memory_entry_chunks
+             (entry_id, chunk_idx, content, content_hash, embedding)
+           VALUES ($1, $2, $3, $4, NULL)`;
       for (const chunk of chunks) {
         const chunkHash = contentHash(chunk.content);
-        await tgtDb.query(
-          `INSERT INTO memory_entry_chunks
-             (entry_id, chunk_idx, content, content_hash, embedding)
-           VALUES ($1, $2, $3, $4, NULL)`,
-          [entryId, chunk.chunkIdx, chunk.content, chunkHash]
-        );
+        await tgtDb.query(chunkSql, [entryId, chunk.chunkIdx, chunk.content, chunkHash]);
       }
 
       await tgtDb.query('COMMIT');

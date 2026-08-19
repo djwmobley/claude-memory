@@ -407,6 +407,27 @@ async function cmdIndex(forceAll) {
         continue;
       }
 
+      // cm#201 completeness item #6: this table may have adopted
+      // embedded_by_provider_id (cm#201's provenance column) since this
+      // legacy Ollama/vLLM-direct pipeline was written -- it has no notion
+      // of embedding_providers at all. The guard applies ONLY when writing
+      // the actual "embedding" column (the column embedded_by_provider_id
+      // pairs with) -- an EMBED_COLUMN redirect to an alternate column
+      // (e.g. embedding_4096) is a DIFFERENT column and out of this
+      // invariant's scope regardless of whether embedded_by_provider_id
+      // exists on the table. REFUSE loudly (abort the whole run, matching
+      // this codebase's fail-loud convention) rather than silently skip.
+      if (EMBED_COLUMN === 'embedding' && (await columnExists(client, tbl.name, 'embedded_by_provider_id'))) {
+        throw new Error(
+          `pipeline-embed.js: refusing to write "${tbl.name}".${EMBED_COLUMN} -- this table carries ` +
+          `embedded_by_provider_id (provenance-adopted per cm#201's invariant: every SQL statement that assigns ` +
+          `embedding must ALSO assign embedded_by_provider_id in the same statement). pipeline-embed.js is legacy ` +
+          `per-project pipeline tooling with no notion of embedding_providers -- route this table's embedding ` +
+          `writes through scripts/lib/embedding-provider.js instead (see migrate-07-reembed-corpus.js), or do not ` +
+          `adopt embedded_by_provider_id on this table if it should stay out of provenance scope.`
+        );
+      }
+
       // Late chunking path for memory_entry_chunks when LATE_CHUNKING=1 + vLLM
       if (LATE_CHUNKING && USE_VLLM && tbl.name === 'memory_entry_chunks') {
         const query = forceAll
