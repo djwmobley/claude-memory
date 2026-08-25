@@ -38,6 +38,31 @@ const AUTHORED_BY = 'sonnet-t-battery-author-2026-07-27';
  * ever migrated FROM one. Skipped explicitly, with a printed count — never
  * silently dropped from `distinctSqlSourceDbs`'s output without comment.
  *
+ * LABEL-DUPLICATE ENTRIES ARE NEVER SELECTED AS THE PROBE TABLE (cm#210 fix,
+ * closes A-2). This script probes ONE table per distinct source_db --
+ * previously "the first roster entry's source_table for that source_db," a
+ * POSITIONAL assumption over a human-edited file (this repo's own canon
+ * forbids exactly this shape: humans reorder roster entries by hand, and a
+ * parser that assumes position breaks silently on the next such edit). A
+ * label-duplicate entry's source_table is a manifest-bookkeeping LABEL, not
+ * a physical relation (see verify-15-t3-content-hash.js's branch (c) header
+ * comment) -- probing it with `UPDATE <label> SET id=id WHERE false` against
+ * a relation that was never supposed to exist throws "relation does not
+ * exist" (Postgres 42P01), which the OLD probeFrozen miscounted as
+ * `rejected: true` ("freeze confirmed") regardless of whether the source was
+ * actually writable. Concrete exploit this closed: reorder the real roster
+ * so a label-duplicate entry (e.g. memory_entries_db_absorb) is FIRST for
+ * its source_db -- the old code silently "confirmed" freeze on a fully
+ * writable source, zero code changes needed to trigger. distinctSqlSourceDbs
+ * now skips label-duplicate entries when choosing a probe table (load-time
+ * validation guarantees a real SQL-sourced physical sibling exists under the
+ * SAME source_db, so a source_db can never end up probe-less because of this
+ * skip); probeFrozen ALSO now total-classifies 42P01 specifically (see its
+ * own header comment) as an independent, general fix -- so ANY probe target
+ * that doesn't exist is refused loud as a config error, not silently
+ * confirmed as evidence of freeze, closing the underlying bug class, not
+ * just this one instance of it.
+ *
 
  * Usage: node scripts/migrations/verify-15-freeze-precondition.js
  * (reads --source-db repeated, or defaults to every distinct source_db in
@@ -50,11 +75,19 @@ const AUTHORED_BY = 'sonnet-t-battery-author-2026-07-27';
 const shared = require('./lib/verify15-shared');
 
 function distinctSqlSourceDbs(roster) {
-  const map = new Map(); // source_db -> first source_table
+  const map = new Map(); // source_db -> first NON-label-duplicate source_table
   for (const entry of roster) {
     if (entry.source_db.startsWith('filesystem:')) continue;
     const { isSourceless } = shared.classifyRosterSourceDb(entry.source_db, `roster entry targetTable=${entry.targetTable}`);
     if (isSourceless) continue; // net-new: no source system exists to freeze
+    // cm#210 fix (A-2): never select a label-duplicate entry as the probe
+    // table -- its source_table is a manifest-bookkeeping LABEL, not a
+    // physical relation (see this file's header comment). Load-time
+    // validation (validateManifestLabelDuplicates) guarantees a real,
+    // SQL-sourced physical sibling exists under this SAME source_db, so
+    // skipping label-duplicate entries here can never leave a source_db
+    // probe-less.
+    if (entry.manifest_label_duplicate_of) continue;
     if (!map.has(entry.source_db)) map.set(entry.source_db, entry.source_table);
   }
   return map;
@@ -62,24 +95,43 @@ function distinctSqlSourceDbs(roster) {
 
 /**
  * Probe one source: attempt a no-op-but-real UPDATE through a live
- * connection. Returns { rejected: boolean, errMessage: string|null }.
- * Exported standalone so the test suite can exercise it directly against a
- * deliberately non-frozen (writable) scratch DB to prove the FAIL branch
- * fires, and against a frozen one to prove the PASS branch fires.
+ * connection. Returns { rejected: boolean, errMessage: string|null,
+ * configError: string|null }.
+ *
+ * TOTAL CLASSIFICATION OF THE QUERY ERROR (cm#210 fix, closes A-2's general
+ * form). Before this fix, ANY thrown error -- including Postgres 42P01
+ * (undefined_table, "relation ... does not exist") -- was folded into
+ * `rejected: true`, i.e. "freeze confirmed." A probe table that doesn't
+ * exist is not evidence of freeze either way: it is a CONFIG error (the
+ * roster's probe-table selection named something that isn't live on this
+ * source), reported as `configError`, never silently counted as `rejected`.
+ * Every OTHER error still classifies `rejected: true` exactly as before
+ * (permission-denied from a REVOKEd role, read-only-transaction from
+ * default_transaction_read_only -- both are genuine freeze-enforcement
+ * evidence). Exported standalone so the test suite can exercise it directly
+ * against a deliberately non-frozen (writable) scratch DB to prove the FAIL
+ * branch fires, against a frozen one to prove the PASS branch fires, and
+ * against a nonexistent relation to prove the configError branch fires
+ * (never silently miscounted as PASS).
  */
 async function probeFrozen(sourceDb, table) {
   const client = await shared.connect(sourceDb);
   let rejected = false;
   let errMessage = null;
+  let configError = null;
   try {
     await client.query(`UPDATE ${table} SET id = id WHERE false`);
   } catch (err) {
-    rejected = true;
-    errMessage = err.message;
+    if (err && err.code === '42P01') {
+      configError = `probe table "${table}" does not exist on source_db "${sourceDb}" (Postgres 42P01 undefined_table) — this is not evidence of freeze; fix the roster's probe-table selection (or the source schema), never treat this as "freeze confirmed."`;
+    } else {
+      rejected = true;
+      errMessage = err.message;
+    }
   } finally {
     await client.end();
   }
-  return { rejected, errMessage };
+  return { rejected, errMessage, configError };
 }
 
 async function main() {
@@ -120,8 +172,15 @@ async function main() {
   let failed = false;
   for (const [sourceDb, table] of toProbe) {
     try {
-      const { rejected, errMessage } = await probeFrozen(sourceDb, table);
-      if (rejected) {
+      const { rejected, errMessage, configError } = await probeFrozen(sourceDb, table);
+      if (configError) {
+        // cm#210 fix (A-2): a 42P01 (undefined_table) probe result is a
+        // config error, never evidence of freeze either way -- reported as
+        // its own FATAL-shaped branch, distinct from both PASS and the
+        // ordinary "freeze not enforced" FAIL.
+        failed = true;
+        console.error(`[freeze-precondition] FATAL: ${sourceDb} (probed via ${table}): ${configError}`);
+      } else if (rejected) {
         console.log(`[freeze-precondition] OK: ${sourceDb} (probed via ${table}) rejected the throwaway write: ${errMessage}`);
       } else {
         failed = true;

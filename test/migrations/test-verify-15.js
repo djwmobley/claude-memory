@@ -36,6 +36,7 @@ const { Client } = scriptsRequire('pg');
 
 const shared = require(path.join(MIGRATIONS_DIR, 'lib', 'verify15-shared.js'));
 const migrateOne = require(path.join(MIGRATIONS_DIR, 'migrate-01-canonical-db.js'));
+const freezeScript = require(path.join(MIGRATIONS_DIR, 'verify-15-freeze-precondition.js'));
 
 const TS = Date.now();
 
@@ -234,6 +235,21 @@ async function setupSourceSchema(client) {
     CREATE TABLE IF NOT EXISTS assertions (
       id INTEGER PRIMARY KEY
     );
+    -- cm#210 fix, Gap 1 (label-duplicate): a "decisions_dup" source table is
+    -- DELIBERATELY never created here -- a label-duplicate roster entry's
+    -- source_table is a manifest-bookkeeping LABEL that branch (c) never
+    -- queries (T3c-1 proves this: the entry's own physical table is absent
+    -- and T3 still PASSes, because branch (c) skips it before ever opening a
+    -- query against it).
+    --
+    -- cm#210 fix, Gap 2 (lineage-based source-project exclusion): a
+    -- claude_context.decisions-shaped source table -- real content columns,
+    -- an "id" primary key, but DELIBERATELY NO project_id column (the exact
+    -- structural shape branch (a2) exists for).
+    CREATE TABLE IF NOT EXISTS decisions_noproj (
+      id SERIAL PRIMARY KEY,
+      topic TEXT, decision TEXT, reason TEXT
+    );
   `);
 }
 
@@ -297,6 +313,40 @@ async function insertManifest(client, sourceDb, sourceTable, projectId, rowCount
     [sourceDb, sourceTable, projectId, rowCount, excludedReason]
   );
 }
+
+// cm#210 fix, Gap 2 (T3 branch (a2)): pipeline_migration_row_ids' own shape
+// mirrors own_graph_migration_ids' insertLineage helper above, EXCEPT
+// project_id is NOT NULL on this table (migrate-04-absorb-pipeline-tables.js
+// E-6's own schema, registered in verify15-shared.js's DDL_SQL) -- every
+// caller below always supplies a real project id, never null.
+async function insertPipelineLineage(client, sourceDb, sourceTable, sourceRowId, projectId, targetTable, targetRowId) {
+  await client.query(
+    `INSERT INTO pipeline_migration_row_ids (source_db, source_table, source_row_id, project_id, target_table, target_row_id)
+     VALUES ($1,$2,$3,$4,$5,$6)`,
+    [sourceDb, sourceTable, String(sourceRowId), projectId, targetTable, targetRowId]
+  );
+}
+
+// cm#210 fix, Gap 1 (label-duplicate) -- a roster entry declaring
+// manifest_label_duplicate_of="decisions", pairing with BASE_ROSTER[0]
+// (source_table="decisions") as its primary. Reused across every
+// testT3LabelDuplicate sub-case below.
+const DUP_ROSTER_ENTRY = {
+  source_db: SOURCE_DB, source_table: 'decisions_dup', targetTable: 'decisions',
+  loadBearingCols: ['topic', 'decision', 'reason'], hasContentBearingText: true,
+  requires_project_id_scope: true, manifest_label_duplicate_of: 'decisions',
+};
+
+// cm#210 fix, Gap 2 (lineage-based source-project exclusion) -- a roster
+// entry pointing at the no-project-column decisions_noproj fixture table,
+// declaring sourceProjectExclusions against pipeline_migration_row_ids.
+// Reused across every testT3LineageExclusion sub-case below.
+const A2_ROSTER_ENTRY = {
+  source_db: SOURCE_DB, source_table: 'decisions_noproj', targetTable: 'decisions',
+  loadBearingCols: ['topic', 'decision', 'reason'], hasContentBearingText: true,
+  requires_project_id_scope: true,
+  sourceProjectExclusions: { mode: 'lineage', lineage_table: 'pipeline_migration_row_ids', source_id_col: 'id' },
+};
 
 // A SOURCELESS (net-new:) roster entry — a §17/§18-shaped table with no
 // migration source. Reused across T0/T3/T3b's sourceless-classification
@@ -1295,6 +1345,295 @@ async function testLineageDeclarationValidation() {
     } else {
       fail(c.name, `load-time lineage-declaration validation FATALs: ${c.expect}`, `status=${r.status} stdout=${r.stdout} stderr=${r.stderr}`);
     }
+  }
+}
+
+// cm#210 fix, Gap 1: T3 branch (c) LABEL-DUPLICATE-SKIP + the five load-time
+// manifest_label_duplicate_of validations (T3c-1..8, spec section 2.3).
+async function testT3LabelDuplicate() {
+  const source = await pgConnect(SOURCE_DB);
+  const target = await pgConnect(TARGET_DB);
+  try {
+    await setupSourceSchema(source);
+    await shared.applyDdl(target);
+
+    // T3c-1: duplicate entry + primary entry, physical table only under
+    // primary -> T3 prints LABEL-DUPLICATE-SKIP, exit unaffected (primary
+    // entry still hashes normally in the SAME run).
+    await truncateAll(source, ['decisions']);
+    await truncateAll(target, ['decisions', 'migration_manifest']);
+    await source.query(`INSERT INTO decisions (project_id, topic, decision, reason) VALUES ('proj-a','t1','d1','r1')`);
+    await target.query(`INSERT INTO decisions (project_id, topic, decision, reason) VALUES ('proj-a','t1','d1','r1')`);
+    const rosterHappy = writeTmpJson('t3c-happy-roster.json', [BASE_ROSTER[0], DUP_ROSTER_ENTRY]);
+    const r1 = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterHappy));
+    const out1 = r1.stdout + r1.stderr;
+    if (r1.status === 0 && /SKIP \(label-duplicate\)/.test(out1) && /decisions_dup/.test(out1) && /duplicates label "decisions"/.test(out1) && /OK: decisions -> decisions/.test(out1)) {
+      pass('T3c-1', 'label-duplicate entry with NO physical table -> LABEL-DUPLICATE-SKIP printed, primary entry still hashed normally, exit 0');
+    } else {
+      fail('T3c-1', 'label-duplicate entry with NO physical table -> LABEL-DUPLICATE-SKIP printed, primary entry still hashed normally, exit 0', `status=${r1.status} stdout=${r1.stdout} stderr=${r1.stderr}`);
+    }
+
+    // T3c-2: duplicate entry missing its primary pair -> loadRoster FATAL.
+    const rosterMissingPrimary = writeTmpJson('t3c-missing-primary-roster.json', [DUP_ROSTER_ENTRY]);
+    const r2 = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterMissingPrimary));
+    const out2 = r2.stdout + r2.stderr;
+    if (r2.status !== 0 && /has no matching roster entry for \(source_db=/.test(out2) && /the declared primary pair is absent from the roster/.test(out2)) {
+      pass('T3c-2', 'duplicate entry with no matching primary pair present in the roster -> loadRoster FATAL');
+    } else {
+      fail('T3c-2', 'duplicate entry with no matching primary pair present in the roster -> loadRoster FATAL', `status=${r2.status} stdout=${r2.stdout} stderr=${r2.stderr}`);
+    }
+
+    // T3c-3: self-reference -> FATAL.
+    const rosterSelfRef = writeTmpJson('t3c-selfref-roster.json', [
+      BASE_ROSTER[0],
+      { ...DUP_ROSTER_ENTRY, manifest_label_duplicate_of: 'decisions_dup' },
+    ]);
+    const r3 = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterSelfRef));
+    const out3 = r3.stdout + r3.stderr;
+    if (r3.status !== 0 && /is a self-reference/.test(out3)) {
+      pass('T3c-3', 'manifest_label_duplicate_of self-reference (equals own source_table) -> FATAL');
+    } else {
+      fail('T3c-3', 'manifest_label_duplicate_of self-reference (equals own source_table) -> FATAL', `status=${r3.status} stdout=${r3.stdout} stderr=${r3.stderr}`);
+    }
+
+    // T3c-4: chain (a duplicate declaring itself the primary of another
+    // duplicate) -> FATAL.
+    const rosterChain = writeTmpJson('t3c-chain-roster.json', [
+      BASE_ROSTER[0],
+      DUP_ROSTER_ENTRY,
+      { source_db: SOURCE_DB, source_table: 'decisions_dup2', targetTable: 'decisions',
+        loadBearingCols: ['topic', 'decision', 'reason'], hasContentBearingText: true,
+        requires_project_id_scope: true, manifest_label_duplicate_of: 'decisions_dup' },
+    ]);
+    const r4 = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterChain));
+    const out4 = r4.stdout + r4.stderr;
+    if (r4.status !== 0 && /chained duplicate-of declarations are not allowed/.test(out4)) {
+      pass('T3c-4', 'chained manifest_label_duplicate_of (a duplicate-of-a-duplicate) -> FATAL, must resolve to a real primary in one hop');
+    } else {
+      fail('T3c-4', 'chained manifest_label_duplicate_of (a duplicate-of-a-duplicate) -> FATAL, must resolve to a real primary in one hop', `status=${r4.status} stdout=${r4.stdout} stderr=${r4.stderr}`);
+    }
+
+    // T3c-5: duplicate + lineage declarations on ONE entry -> FATAL
+    // (validateDeclarationMutualExclusion, never a silent branch pick).
+    const rosterDupPlusLineage = writeTmpJson('t3c-dupluslineage-roster.json', [
+      { ...LINEAGE_ROSTER_ENTRY, manifest_label_duplicate_of: 'decisions' },
+    ]);
+    const r5 = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterDupPlusLineage));
+    const out5 = r5.stdout + r5.stderr;
+    if (r5.status !== 0 && /mutually-exclusive branch-selecting fields/.test(out5)) {
+      pass('T3c-5', 'manifest_label_duplicate_of combined with lineageMappedCols/lineageMembership on one entry -> FATAL (mutual exclusion)');
+    } else {
+      fail('T3c-5', 'manifest_label_duplicate_of combined with lineageMappedCols/lineageMembership on one entry -> FATAL (mutual exclusion)', `status=${r5.status} stdout=${r5.stdout} stderr=${r5.stderr}`);
+    }
+
+    // T3c-6: T1 run over a source_db containing a duplicate entry ->
+    // WARN-skip, zero manifest rows written for the label.
+    await truncateAll(source, ['decisions']);
+    await truncateAll(target, ['migration_manifest', 'migration_manifest_row_hashes']);
+    await source.query(`INSERT INTO decisions (project_id, topic, decision, reason) VALUES ('proj-a','t1','d1','r1')`);
+    const rosterT1 = writeTmpJson('t3c-t1-roster.json', [BASE_ROSTER[0], DUP_ROSTER_ENTRY]);
+    const r6 = runScript('verify-15-t1-snapshot.js', ['--source-db', SOURCE_DB, '--db', TARGET_DB], rosterEnv(rosterT1));
+    const out6 = r6.stdout + r6.stderr;
+    const { rows: dupManifestRows } = await target.query(`SELECT * FROM migration_manifest WHERE source_table = 'decisions_dup'`);
+    if (r6.status === 0 && /label-duplicate entry/.test(out6) && /decisions_dup \(duplicates "decisions"\)/.test(out6) && dupManifestRows.length === 0) {
+      pass('T3c-6', 'T1 run over a source_db containing a duplicate entry -> WARN-skip printed, zero migration_manifest rows written for the label');
+    } else {
+      fail('T3c-6', 'T1 run over a source_db containing a duplicate entry -> WARN-skip printed, zero migration_manifest rows written for the label', `status=${r6.status} stdout=${r6.stdout} stderr=${r6.stderr} dupManifestRows=${JSON.stringify(dupManifestRows)}`);
+    }
+
+    // T3c-7: freeze-precondition with the duplicate entry FIRST in roster
+    // order -> probes the physical sibling ("decisions"), never the label
+    // (closes A-2's roster-reorder exploit).
+    const rosterFreezeOrder = writeTmpJson('t3c-freeze-order-roster.json', [DUP_ROSTER_ENTRY, BASE_ROSTER[0]]);
+    const r7 = runScript('verify-15-freeze-precondition.js', [], rosterEnv(rosterFreezeOrder));
+    const out7 = r7.stdout + r7.stderr;
+    if (r7.status !== 0 && /probed via decisions\)/.test(out7) && !/probed via decisions_dup\)/.test(out7)) {
+      pass('T3c-7', 'freeze-precondition with the label-duplicate entry FIRST in roster order -> probes the physical sibling ("decisions"), never the label ("decisions_dup")');
+    } else {
+      fail('T3c-7', 'freeze-precondition with the label-duplicate entry FIRST in roster order -> probes the physical sibling ("decisions"), never the label ("decisions_dup")', `status=${r7.status} stdout=${r7.stdout} stderr=${r7.stderr}`);
+    }
+
+    // T3c-8: probeFrozen against a nonexistent relation -> configError
+    // (Postgres 42P01), NEVER rejected:true ("freeze confirmed") -- the
+    // general form of A-2's exploit, independent of the roster-reorder
+    // shape T3c-7 covers.
+    const probeResult = await freezeScript.probeFrozen(FREEZE_WRITABLE_DB, 'this_table_does_not_exist_xyz');
+    if (probeResult.rejected === false && probeResult.configError && /does not exist/.test(probeResult.configError) && /42P01/.test(probeResult.configError)) {
+      pass('T3c-8', 'probeFrozen against a nonexistent relation -> configError (42P01 undefined_table), never rejected:true ("freeze confirmed")');
+    } else {
+      fail('T3c-8', 'probeFrozen against a nonexistent relation -> configError (42P01 undefined_table), never rejected:true ("freeze confirmed")', JSON.stringify(probeResult));
+    }
+  } finally {
+    await source.end();
+    await target.end();
+  }
+}
+
+// cm#210 fix, Gap 2: T3 branch (a2), lineage-based source-project exclusion
+// (T3a2-1..9, spec section 2.3).
+async function testT3LineageExclusion() {
+  const source = await pgConnect(SOURCE_DB);
+  const target = await pgConnect(TARGET_DB);
+  try {
+    await setupSourceSchema(source);
+    await shared.applyDdl(target);
+
+    // T3a2-1: happy path -- N=3 source rows, k=1 excluded (no lineage),
+    // N-k=2 migrated (lineage present), target holds the 2 migrated rows ->
+    // PASS.
+    await truncateAll(source, ['decisions_noproj']);
+    await truncateAll(target, ['decisions', 'migration_manifest', 'pipeline_migration_row_ids']);
+    await source.query(`INSERT INTO decisions_noproj (topic, decision, reason) VALUES ('t1','d1','r1'), ('t2','d2','r2'), ('t3','d3','r3')`); // ids 1,2,3
+    await target.query(`INSERT INTO decisions (project_id, topic, decision, reason) VALUES ('proj-live','t1','d1','r1'), ('proj-live','t2','d2','r2')`);
+    await insertPipelineLineage(target, SOURCE_DB, 'decisions_noproj', 1, 'proj-live', 'decisions', 9001);
+    await insertPipelineLineage(target, SOURCE_DB, 'decisions_noproj', 2, 'proj-live', 'decisions', 9002);
+    await insertManifest(target, SOURCE_DB, 'decisions_noproj', 'proj-excluded', 1, 'owner-review-consulting-portal');
+    const rosterA2 = writeTmpJson('t3a2-roster.json', [A2_ROSTER_ENTRY]);
+    const r1 = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterA2));
+    const out1 = r1.stdout + r1.stderr;
+    if (r1.status === 0 && /OK \(a2 count anchor\)/.test(out1) && /all 2 migrated/.test(out1)) {
+      pass('T3a2-1', 'happy path: N=3 source rows, k=1 excluded (no lineage), N-k=2 migrated (lineage present), target holds the 2 -> PASS');
+    } else {
+      fail('T3a2-1', 'happy path: N=3 source rows, k=1 excluded (no lineage), N-k=2 migrated (lineage present), target holds the 2 -> PASS', `status=${r1.status} stdout=${r1.stdout} stderr=${r1.stderr}`);
+    }
+
+    // T3a2-2: one migrated row missing from target -> multiset FAIL.
+    await target.query(`DELETE FROM decisions WHERE topic = 't2'`);
+    const r2 = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterA2));
+    const out2 = r2.stdout + r2.stderr;
+    if (r2.status !== 0 && /multiset mismatch, lineage-based exclusion branch/.test(out2)) {
+      pass('T3a2-2', 'one migrated row missing from target -> multiset FAIL');
+    } else {
+      fail('T3a2-2', 'one migrated row missing from target -> multiset FAIL', `status=${r2.status} stdout=${r2.stdout} stderr=${r2.stderr}`);
+    }
+    await target.query(`INSERT INTO decisions (project_id, topic, decision, reason) VALUES ('proj-live','t2','d2','r2')`); // restore
+
+    // T3a2-3: one extra no-lineage row (drift, NOT counted in the declared
+    // exclusion) -> count-anchor FAIL, direction "greater".
+    await source.query(`INSERT INTO decisions_noproj (topic, decision, reason) VALUES ('t4','d4','r4')`); // id 4, no lineage, not excluded
+    const r3 = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterA2));
+    const out3 = r3.stdout + r3.stderr;
+    if (r3.status !== 0 && /excluded-candidate count \(2, no-lineage live rows\) != declared excluded sum \(1\)/.test(out3) && /direction: greater/.test(out3)) {
+      pass('T3a2-3', 'one extra no-lineage row beyond the declared exclusion -> count-anchor FAIL, direction "greater"');
+    } else {
+      fail('T3a2-3', 'one extra no-lineage row beyond the declared exclusion -> count-anchor FAIL, direction "greater"', `status=${r3.status} stdout=${r3.stdout} stderr=${r3.stderr}`);
+    }
+    await source.query(`DELETE FROM decisions_noproj WHERE topic = 't4'`); // restore
+
+    // T3a2-4: the excluded row itself deleted from source post-exclusion ->
+    // count-anchor FAIL, direction "less" (declared excludedSum=1 now
+    // overstates the live no-lineage rows, which is 0).
+    await source.query(`DELETE FROM decisions_noproj WHERE topic = 't3'`);
+    const r4 = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterA2));
+    const out4 = r4.stdout + r4.stderr;
+    if (r4.status !== 0 && /excluded-candidate count \(0, no-lineage live rows\) != declared excluded sum \(1\)/.test(out4) && /direction: less/.test(out4)) {
+      pass('T3a2-4', 'excluded row deleted from source post-exclusion -> count-anchor FAIL, direction "less"');
+    } else {
+      fail('T3a2-4', 'excluded row deleted from source post-exclusion -> count-anchor FAIL, direction "less"', `status=${r4.status} stdout=${r4.stdout} stderr=${r4.stderr}`);
+    }
+    await source.query(`INSERT INTO decisions_noproj (id, topic, decision, reason) VALUES (3, 't3','d3','r3')`); // restore (explicit id -- SERIAL sequence already advanced past 3)
+
+    // T3a2-5: a lineage row recorded under an EXCLUDED project id -> the
+    // migrated-AND-excluded contradiction, FATAL (never miscounted as
+    // ordinary drift).
+    await insertPipelineLineage(target, SOURCE_DB, 'decisions_noproj', 3, 'proj-excluded', 'decisions', 9003);
+    const r5 = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterA2));
+    const out5 = r5.stdout + r5.stderr;
+    if (r5.status !== 0 && /lineage row\(s\) in "pipeline_migration_row_ids" are recorded MIGRATED under an EXCLUDED project id/.test(out5)) {
+      pass('T3a2-5', 'lineage row recorded under an EXCLUDED project id -> migrated-AND-excluded contradiction, FATAL');
+    } else {
+      fail('T3a2-5', 'lineage row recorded under an EXCLUDED project id -> migrated-AND-excluded contradiction, FATAL', `status=${r5.status} stdout=${r5.stdout} stderr=${r5.stderr}`);
+    }
+    await target.query(`DELETE FROM pipeline_migration_row_ids WHERE source_db=$1 AND source_table='decisions_noproj' AND source_row_id='3'`, [SOURCE_DB]); // restore
+
+    // T3a2-6: sourceProjectExclusions declared on a table that NOW HAS a
+    // resolvable project_id column -> stale-declaration FATAL (A-7).
+    await truncateAll(target, ['migration_manifest']);
+    await insertManifest(target, SOURCE_DB, 'decisions', 'proj-y', 1, 'test-exclusion-for-staleness-check');
+    const staleEntry = {
+      source_db: SOURCE_DB, source_table: 'decisions', targetTable: 'decisions',
+      loadBearingCols: ['topic', 'decision', 'reason'], hasContentBearingText: true, requires_project_id_scope: true,
+      sourceProjectExclusions: { mode: 'lineage', lineage_table: 'pipeline_migration_row_ids', source_id_col: 'id' },
+    };
+    const rosterStale = writeTmpJson('t3a2-stale-roster.json', [staleEntry]);
+    const r6 = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterStale));
+    const out6 = r6.stdout + r6.stderr;
+    if (r6.status !== 0 && /declaration stale/.test(out6)) {
+      pass('T3a2-6', 'sourceProjectExclusions declared on a source table that NOW HAS a resolvable project_id column -> stale-declaration FATAL (A-7)');
+    } else {
+      fail('T3a2-6', 'sourceProjectExclusions declared on a source table that NOW HAS a resolvable project_id column -> stale-declaration FATAL (A-7)', `status=${r6.status} stdout=${r6.stdout} stderr=${r6.stderr}`);
+    }
+
+    // T3a2-7: every live row excluded, ZERO lineage rows -> PASS (the
+    // exclusion-aware population guard does NOT misfire on a table that
+    // migrated nothing because it was entirely excluded, A-8).
+    await truncateAll(source, ['decisions_noproj']);
+    await truncateAll(target, ['decisions', 'migration_manifest', 'pipeline_migration_row_ids']);
+    await source.query(`INSERT INTO decisions_noproj (topic, decision, reason) VALUES ('tA','dA','rA'), ('tB','dB','rB')`);
+    await insertManifest(target, SOURCE_DB, 'decisions_noproj', 'proj-all-excluded', 2, 'owner-review-consulting-portal');
+    const r7 = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterA2));
+    const out7 = r7.stdout + r7.stderr;
+    if (r7.status === 0 && /all 0 migrated/.test(out7) && !/FATAL/.test(out7)) {
+      pass('T3a2-7', 'every live source row excluded, zero lineage rows -> PASS (population guard does not misfire on a wholly-excluded table)');
+    } else {
+      fail('T3a2-7', 'every live source row excluded, zero lineage rows -> PASS (population guard does not misfire on a wholly-excluded table)', `status=${r7.status} stdout=${r7.stdout} stderr=${r7.stderr}`);
+    }
+
+    // T3a2-8: undeclared no-column table WITH a project-scoped exclusion ->
+    // the EXISTING branch-(a) throw fires, extended to name
+    // sourceProjectExclusions as the fix (A-1's original crash shape, still
+    // reachable when the declaration is simply absent).
+    await truncateAll(source, ['decisions_noproj']);
+    await truncateAll(target, ['migration_manifest', 'pipeline_migration_row_ids']);
+    await source.query(`INSERT INTO decisions_noproj (topic, decision, reason) VALUES ('tC','dC','rC')`);
+    await insertManifest(target, SOURCE_DB, 'decisions_noproj', 'proj-z', 1, 'some-exclusion');
+    const undeclaredEntry = { ...A2_ROSTER_ENTRY, sourceProjectExclusions: undefined };
+    delete undeclaredEntry.sourceProjectExclusions;
+    const rosterUndeclared = writeTmpJson('t3a2-undeclared-roster.json', [undeclaredEntry]);
+    const r8 = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterUndeclared));
+    const out8 = r8.stdout + r8.stderr;
+    if (r8.status !== 0 && /cannot scope the exclusion filter/.test(out8) && /declare sourceProjectExclusions on the roster entry/.test(out8)) {
+      pass('T3a2-8', 'undeclared no-column table with a project-scoped exclusion -> the existing branch-(a) throw fires, message extended to point at sourceProjectExclusions');
+    } else {
+      fail('T3a2-8', 'undeclared no-column table with a project-scoped exclusion -> the existing branch-(a) throw fires, message extended to point at sourceProjectExclusions', `status=${r8.status} stdout=${r8.stdout} stderr=${r8.stderr}`);
+    }
+
+    // T3a2-9: numeric-vs-string source_id_col round-trip (A-9). Postgres
+    // returns a SERIAL id column as a JS `number`; pipeline_migration_row_ids'
+    // source_row_id is TEXT, written as String(...) by every lineage writer
+    // (T1, migrate-04). A lookup keyed by the RAW pg integer would be a
+    // guaranteed 0-hit Map lookup (cm#198's root cause, re-created) -- this
+    // proves both that the type mismatch is real AND that the actual code
+    // path bridges it correctly end to end.
+    await truncateAll(source, ['decisions_noproj']);
+    await truncateAll(target, ['decisions', 'migration_manifest', 'pipeline_migration_row_ids']);
+    const { rows: insertedRows } = await source.query(`INSERT INTO decisions_noproj (topic, decision, reason) VALUES ('tX','dX','rX') RETURNING id`);
+    const insertedId = insertedRows[0].id;
+    if (typeof insertedId === 'number') {
+      pass('T3a2-9-typeproof', 'pg returns the SERIAL id column as a JS number (not a string) -- proves the id/lineage-key type mismatch this fix guards against (A-9) is real, not hypothetical');
+    } else {
+      fail('T3a2-9-typeproof', 'pg returns the SERIAL id column as a JS number (not a string) -- proves the id/lineage-key type mismatch this fix guards against (A-9) is real, not hypothetical', `typeof insertedId = ${typeof insertedId}`);
+    }
+    await target.query(`INSERT INTO decisions (project_id, topic, decision, reason) VALUES ('proj-live','tX','dX','rX')`);
+    await insertPipelineLineage(target, SOURCE_DB, 'decisions_noproj', insertedId, 'proj-live', 'decisions', 9099); // stores String(insertedId) internally
+    // A manifest exclusion row (row_count=0 -- the single live row is
+    // migrated, not excluded) is REQUIRED to route this entry into branch
+    // (a2) at all (main()'s dispatch fires only when
+    // exclusions.projectScoped.length > 0 AND sourceProjectExclusions is
+    // declared) -- without it, this fixture would silently fall through to
+    // plain branch (a) and never exercise the numeric/string lookup at all.
+    await insertManifest(target, SOURCE_DB, 'decisions_noproj', 'proj-irrelevant', 0, 'no-op-for-a2-routing');
+    const rosterA2Single = writeTmpJson('t3a2-typeround-roster.json', [A2_ROSTER_ENTRY]);
+    const r9 = runScript('verify-15-t3-content-hash.js', ['--db', TARGET_DB], rosterEnv(rosterA2Single));
+    const out9 = r9.stdout + r9.stderr;
+    if (r9.status === 0 && /all 1 migrated/.test(out9)) {
+      pass('T3a2-9', 'numeric pg id column value matches its String()-encoded lineage key -> row correctly classified MIGRATED, not misclassified as excluded');
+    } else {
+      fail('T3a2-9', 'numeric pg id column value matches its String()-encoded lineage key -> row correctly classified MIGRATED, not misclassified as excluded', `status=${r9.status} stdout=${r9.stdout} stderr=${r9.stderr}`);
+    }
+  } finally {
+    await source.end();
+    await target.end();
   }
 }
 
@@ -2690,6 +3029,8 @@ async function main() {
     await testT3LineageMappedCols();
     testLineageCodecScoping();
     await testLineageDeclarationValidation();
+    await testT3LabelDuplicate();
+    await testT3LineageExclusion();
     await testT3SourcelessSkip();
     await testT3bReverseContainment();
     await testT3bNoColumnReconciliation();

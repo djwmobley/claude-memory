@@ -218,9 +218,7 @@
     }
   },
   {
-    "_comment": "migrate-04-absorb-pipeline-tables.js (§6.1(e), mm#11(e)) roster entries. claude_policy_framework is already-public (migrate-02-decisions.js's own hardcoded DEFAULT_SOURCE_DB), kept literal; pipeline_pipeline/claude_context are NOT hardcoded anywhere in migrate-04's own committed source (only in its gitignored db-triage.json/pipeline-db-project-map.json config), so they are SYNTHETIC placeholders here."
-  },
-  {
+    "_comment": "migrate-04-absorb-pipeline-tables.js (§6.1(e), mm#11(e)) roster entries below. claude_policy_framework is already-public (migrate-02-decisions.js's own hardcoded DEFAULT_SOURCE_DB), kept literal; pipeline_pipeline/claude_context are NOT hardcoded anywhere in migrate-04's own committed source (only in its gitignored db-triage.json/pipeline-db-project-map.json config), so they are SYNTHETIC placeholders here. cm#210 fix: this used to be a STANDALONE comment-only array element with none of the required roster fields -- harmless as long as nothing ever ran the full shared.loadRoster() validation pipeline (validateRosterShape) against this file directly, but that is exactly what audit-roster-t3-declarations.js's --no-connect mode now does in CI, so the comment is folded onto this entry instead of standing alone.",
     "source_db": "claude_policy_framework",
     "source_table": "gotchas",
     "targetTable": "gotchas",
@@ -481,5 +479,23 @@
     "hasContentBearingText": true,
     "requires_project_id_scope": true,
     "manifest_label_duplicate_of": "decisions"
+  },
+  {
+    "_comment": "sourceProjectExclusions (cm#210 Gap 2, lineage-based source-project exclusion): OPTIONAL field, set on a roster entry that has (or will have) a project-scoped migration_manifest exclusion for a source table that structurally has NO project_id column of its own -- ordinary branch-(a) project-scoped exclusion filtering (hashTableMultisetExcludingProjects) requires a live source-side project_id column to filter by, which this shape cannot provide. Live precedent this field was added for: claude_context.decisions had an excluded manifest slice (owner-review-consulting-portal) but the source pipeline DB's decisions table has no project_id column -- T3 branch (a) crashed loud with 'cannot scope the exclusion filter' rather than silently passing (cm#210's second live gap). WHY LINEAGE, NOT A COUNT ALLOWANCE: an earlier candidate design (hash all source rows, tolerate up to sum(excluded row_count) unmatched hashes) is an N-row LOSS MASK -- it cannot tell 'these 3 rows were correctly excluded' from '3 different rows were lost and 3 wrongly-excluded rows migrated instead,' both of which present identically as '3 unmatched hashes.' The chosen mechanism instead PINS WHICH rows are excluded via pipeline_migration_row_ids (or own_graph_migration_ids): a live source row with NO lineage row IS the excluded set, checked per-row, never by count alone. `mode` is a closed vocabulary (only 'lineage' is defined); `lineage_table` must be one of the registered LINEAGE_TABLE_VOCAB tables; `source_id_col` is the source table's own primary-key-shaped column (verify-15-t3-content-hash.js's runLineageExclusionBranch reads it via String(row[source_id_col]), matching the write-side String(r.id)/String(row[idCol]) convention every lineage-table writer already uses). This declaration is INERT (branch (a) hashing proceeds normally, unaffected) the moment the pair has ZERO project-scoped exclusions in migration_manifest -- it only changes T3's behavior once an exclusion actually exists to account for. Mutually exclusive with manifest_label_duplicate_of and lineageMappedCols/lineageMembership on the SAME entry (validateDeclarationMutualExclusion FATALs any entry declaring more than one).",
+    "source_db": "example_shared_context_db",
+    "source_table": "decisions_no_project_col_example",
+    "targetTable": "decisions",
+    "loadBearingCols": [
+      "topic",
+      "decision",
+      "reason"
+    ],
+    "hasContentBearingText": true,
+    "requires_project_id_scope": true,
+    "sourceProjectExclusions": {
+      "mode": "lineage",
+      "lineage_table": "pipeline_migration_row_ids",
+      "source_id_col": "id"
+    }
   }
 ]

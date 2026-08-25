@@ -455,6 +455,189 @@ async function checkLineagePopulationOrFatal(tgtClient, lineageTable, sourceDb, 
   return lineageCount;
 }
 
+// ─── LABEL-DUPLICATE DECLARATIONS (cm#210 Gap 1: absorb-label roster entries) ─
+//
+// manifest_label_duplicate_of already existed (cm#196/cm#197 T2 Branch A
+// rewrite) as a fact about a source_table LABEL's manifest bookkeeping
+// (T2 verifies the duplicate's row-count sum against its declared primary's
+// sum, within a slice). cm#210's spec-adversary pass (A-1) found the field
+// was UNVALIDATED at load time -- five malformed shapes (self-reference,
+// chains, an absent primary pair, a targetTable mismatch, and a contradictory
+// combination with lineageMappedCols/lineageMembership/sourceProjectExclusions)
+// all previously surfaced as confusing runtime failures deep inside whichever
+// check touched the entry first, instead of a clear load-time FATAL. This
+// section closes that gap AND is what lets T3 (verify-15-t3-content-hash.js)
+// total-classify a label-duplicate entry into its own branch (c)
+// LABEL-DUPLICATE-SKIP, rather than interpolating the LABEL as a physical
+// relation name and crashing with "relation does not exist" (A-1's root
+// cause: the label and the physical table name are deliberately different by
+// migrate-05's own design -- see that script's header comment point 1).
+
+/**
+ * Every declaration field that SELECTS a T3 branch for a roster entry.
+ * mutually exclusive per cm#210 spec 2.1.3 point 6 / 2.2.1: an entry may
+ * declare at most ONE of these, ever -- a combination is a roster
+ * contradiction (which branch would even run?), never resolved by picking
+ * one silently.
+ */
+function branchSelectionFlags(entry) {
+  const flags = [];
+  if (entry.manifest_label_duplicate_of) flags.push('manifest_label_duplicate_of');
+  if (entry.lineageMappedCols || entry.lineageMembership) flags.push('lineageMappedCols/lineageMembership');
+  if (entry.sourceProjectExclusions) flags.push('sourceProjectExclusions');
+  return flags;
+}
+
+/**
+ * Load-time FATAL if any roster entry declares more than one of
+ * {manifest_label_duplicate_of, lineageMappedCols+lineageMembership,
+ * sourceProjectExclusions} -- these are the three T3 branch-selecting
+ * declarations (branch (c), branch (b), branch (a2) respectively) and a
+ * single entry can only take ONE branch. Run BEFORE validateManifestLabelDuplicates
+ * and validateSourceProjectExclusionDeclarations so both of those can assume
+ * the field they're validating is the entry's ONLY branch-selecting
+ * declaration.
+ */
+function validateDeclarationMutualExclusion(roster, rosterPath) {
+  const errors = [];
+  for (const entry of roster) {
+    const flags = branchSelectionFlags(entry);
+    if (flags.length > 1) {
+      errors.push(`source_db="${entry.source_db}" source_table="${entry.source_table}" (targetTable="${entry.targetTable}") declares ${flags.length} mutually-exclusive branch-selecting fields: ${flags.join(', ')} -- an entry may declare at most ONE.`);
+    }
+  }
+  if (errors.length) {
+    console.error(`FATAL: roster at "${rosterPath}" has entries declaring more than one mutually-exclusive branch-selection field:`);
+    for (const e of errors) console.error(`  - ${e}`);
+    process.exit(1);
+  }
+}
+
+/**
+ * Load-time validation of the OPTIONAL manifest_label_duplicate_of
+ * declaration (cm#210 spec 2.1.3, closes A-1/A-10). An entry without the
+ * field is untouched. An entry that declares it is checked against every
+ * one of the five malformed shapes the spec-adversary pass found; each
+ * violation is a collected error, FATAL at the end (T2's own message style
+ * -- a bulleted list under one FATAL header, never one exit() per error).
+ */
+function validateManifestLabelDuplicates(roster, rosterPath) {
+  const errors = [];
+  const rosterPairSet = buildRosterPairSet(roster);
+  const bySourceDbTable = new Map(); // JSON.stringify([source_db, source_table]) -> entry
+  for (const e of roster) {
+    bySourceDbTable.set(JSON.stringify([e.source_db, e.source_table]), e);
+  }
+  for (const entry of roster) {
+    const dupOf = entry.manifest_label_duplicate_of;
+    if (dupOf === undefined || dupOf === null) continue;
+    const label = `source_db="${entry.source_db}" source_table="${entry.source_table}" (targetTable="${entry.targetTable}")`;
+
+    if (typeof dupOf !== 'string' || !SAFE_IDENTIFIER_RE.test(dupOf)) {
+      errors.push(`${label}: manifest_label_duplicate_of=${JSON.stringify(dupOf)} is not a safe SQL identifier (must match ${SAFE_IDENTIFIER_RE}, no schema qualifier, no quoting).`);
+      continue; // unsafe value -- do not use it in any further lookup below
+    }
+    if (dupOf === entry.source_table) {
+      errors.push(`${label}: manifest_label_duplicate_of="${dupOf}" is a self-reference (equals its own source_table).`);
+      continue;
+    }
+    const pairKey = JSON.stringify([entry.source_db, dupOf]);
+    if (!rosterPairSet.has(pairKey)) {
+      errors.push(`${label}: manifest_label_duplicate_of="${dupOf}" has no matching roster entry for (source_db="${entry.source_db}", source_table="${dupOf}") -- the declared primary pair is absent from the roster.`);
+      continue;
+    }
+    const primary = bySourceDbTable.get(pairKey);
+    if (primary.manifest_label_duplicate_of) {
+      errors.push(`${label}: primary entry (source_table="${dupOf}") itself declares manifest_label_duplicate_of="${primary.manifest_label_duplicate_of}" -- chained duplicate-of declarations are not allowed (must resolve to a real, non-duplicate primary in one hop).`);
+    }
+    const { isSourceless } = classifyRosterSourceDb(primary.source_db, label);
+    const isFilesystem = typeof primary.source_db === 'string' && primary.source_db.startsWith('filesystem:');
+    if (isSourceless || isFilesystem) {
+      errors.push(`${label}: primary entry (source_table="${dupOf}") is ${isSourceless ? 'a SOURCELESS (net-new:) entry' : 'a filesystem:-sourced entry'} -- a duplicate label must resolve to a real SQL-sourced primary.`);
+    }
+    if (primary.targetTable !== entry.targetTable) {
+      errors.push(`${label}: targetTable="${entry.targetTable}" does not byte-exact match primary entry's targetTable="${primary.targetTable}".`);
+    }
+  }
+  if (errors.length) {
+    console.error(`FATAL: roster at "${rosterPath}" failed manifest_label_duplicate_of validation:`);
+    for (const e of errors) console.error(`  - ${e}`);
+    process.exit(1);
+  }
+}
+
+// ─── SOURCE-PROJECT EXCLUSIONS DECLARATION (cm#210 Gap 2: lineage-based) ─────
+//
+// New OPTIONAL roster field for a source table with project-scoped
+// migration_manifest exclusions but NO project_id column of its own (the
+// second half of cm#210's issue: claude_context.decisions). Chosen semantic
+// is LINEAGE-BASED exclusion (spec 2.2, rejects "target-side-only scoping
+// with a count allowance" -- A-5 -- and a bare "no source project column"
+// skip marker, both of which convert a checkable exclusion into an
+// unchecked one). An excluded row is precisely a live source row with no
+// row in the declared lineage table.
+
+/**
+ * Load-time validation of the OPTIONAL sourceProjectExclusions declaration
+ * (cm#210 spec 2.2.1). `mode` is a closed vocabulary of exactly one value
+ * today ("lineage") -- an unrecognized mode is the default/unknown branch,
+ * FATAL, never silently treated as "lineage" or silently ignored.
+ */
+function validateSourceProjectExclusionDeclarations(roster, rosterPath) {
+  const errors = [];
+  for (const entry of roster) {
+    const decl = entry.sourceProjectExclusions;
+    if (decl === undefined || decl === null) continue;
+    const label = `source_db="${entry.source_db}" source_table="${entry.source_table}" (targetTable="${entry.targetTable}")`;
+
+    if (typeof decl !== 'object' || Array.isArray(decl)) {
+      errors.push(`${label}: sourceProjectExclusions must be an object, got ${JSON.stringify(decl)}.`);
+      continue;
+    }
+    if (decl.mode !== 'lineage') {
+      errors.push(`${label}: sourceProjectExclusions.mode=${JSON.stringify(decl.mode)} is not a recognized mode -- only "lineage" is defined today (closed vocabulary; an unrecognized mode is refused, never silently treated as "lineage").`);
+    }
+    if (!LINEAGE_TABLE_VOCAB.has(decl.lineage_table)) {
+      errors.push(`${label}: sourceProjectExclusions.lineage_table=${JSON.stringify(decl.lineage_table)} is outside the closed vocabulary {${[...LINEAGE_TABLE_VOCAB].join(', ')}}.`);
+    }
+    if (typeof decl.source_id_col !== 'string' || !SAFE_IDENTIFIER_RE.test(decl.source_id_col)) {
+      errors.push(`${label}: sourceProjectExclusions.source_id_col=${JSON.stringify(decl.source_id_col)} is not a safe SQL identifier (must match ${SAFE_IDENTIFIER_RE}).`);
+    }
+    const { isSourceless } = classifyRosterSourceDb(entry.source_db, label);
+    const isFilesystem = typeof entry.source_db === 'string' && entry.source_db.startsWith('filesystem:');
+    if (isSourceless || isFilesystem) {
+      errors.push(`${label}: sourceProjectExclusions declared on a non-SQL-sourced entry (source_db="${entry.source_db}") -- lineage-based exclusion requires a real SQL source to read live rows from.`);
+    }
+  }
+  if (errors.length) {
+    console.error(`FATAL: roster at "${rosterPath}" failed sourceProjectExclusions validation:`);
+    for (const e of errors) console.error(`  - ${e}`);
+    process.exit(1);
+  }
+}
+
+/**
+ * Load every lineage row for (source_db, source_table) into a
+ * Map<source_row_id, {target_row_id, project_id}> -- the SAME scoping
+ * discipline as loadLineageMap (both source_db AND source_table on every
+ * call), but ALSO carrying each lineage row's own project_id, which T3's
+ * branch (a2) needs to detect the migrated-AND-excluded contradiction (A-6):
+ * a lineage row recorded under a project id that is ALSO in this pair's
+ * excluded set is a data contradiction, not ordinary drift. `lineageTable`
+ * MUST already be validated against LINEAGE_TABLE_VOCAB by the caller
+ * (validateSourceProjectExclusionDeclarations runs at roster-load time,
+ * before any script reaches this) -- same precondition as loadLineageMap.
+ */
+async function loadLineageMapWithProjectId(tgtClient, lineageTable, sourceDb, sourceTable) {
+  const { rows } = await tgtClient.query(
+    `SELECT source_row_id, target_row_id, project_id FROM ${lineageTable} WHERE source_db=$1 AND source_table=$2`,
+    [sourceDb, sourceTable]
+  );
+  const map = new Map();
+  for (const r of rows) map.set(r.source_row_id, { target_row_id: r.target_row_id, project_id: r.project_id });
+  return map;
+}
+
 /**
  * Load + shape-validate the real source-table-roster.json. Loud fatal, never
  * a silent empty-array fallback, when the real roster is missing — names
@@ -494,6 +677,9 @@ function loadRoster() {
   validateRosterSourceDbShapes(roster, rosterPath);
   validateRosterPartitionDisjoint(roster, rosterPath);
   validateLineageDeclarations(roster, rosterPath);
+  validateDeclarationMutualExclusion(roster, rosterPath);
+  validateManifestLabelDuplicates(roster, rosterPath);
+  validateSourceProjectExclusionDeclarations(roster, rosterPath);
   return roster;
 }
 
@@ -989,7 +1175,7 @@ async function hashTableMultisetExcludingProjects(client, table, cols, excludedP
     // "project-scoped" at all) — reaching this with a genuinely no-column
     // table would mean the manifest and the live schema have already
     // diverged (BF-5's job to catch upstream). Loud, not a silent no-op.
-    throw new Error(`hashTableMultisetExcludingProjects: table "${table}" has no resolvable project_id column, but ${excludedProjectIds.length} excluded project id(s) were supplied — cannot scope the exclusion filter.`);
+    throw new Error(`hashTableMultisetExcludingProjects: table "${table}" has no resolvable project_id column, but ${excludedProjectIds.length} excluded project id(s) were supplied — cannot scope the exclusion filter. If this source table structurally has no project column, declare sourceProjectExclusions on the roster entry (see source-table-roster.example.json) so T3 uses the lineage-based exclusion branch instead.`);
   }
   const selectCols = [idCol, projectCol, ...cols].filter((c) => c !== null).filter((c, i, a) => a.indexOf(c) === i);
   let sql = `SELECT ${selectCols.map((c) => `"${c}"`).join(', ')} FROM ${table}`;
@@ -1340,7 +1526,12 @@ module.exports = {
   validateLineageDeclarations,
   countLineageRows,
   loadLineageMap,
+  loadLineageMapWithProjectId,
   checkLineagePopulationOrFatal,
+  branchSelectionFlags,
+  validateDeclarationMutualExclusion,
+  validateManifestLabelDuplicates,
+  validateSourceProjectExclusionDeclarations,
   assertSafeIdentifier,
   SAFE_IDENTIFIER_RE,
   buildTargetTableByPairMap,

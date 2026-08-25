@@ -107,6 +107,53 @@ const AUTHORED_BY = 'sonnet-t-battery-author-2026-07-27';
  * count-anchor + T3 forward-content together close the loop; a same-count
  * content swap is caught by T3's mapped-tuple miss, not by T3b alone).
  *
+ * LABEL-DUPLICATE ROSTER ENTRIES -- BRANCH (c) (cm#210 fix, closes A-1). A
+ * roster entry whose source_table is a LABEL for manifest bookkeeping
+ * purposes only (manifest_label_duplicate_of declared -- see
+ * lib/verify15-shared.js's validateManifestLabelDuplicates) never names a
+ * live physical relation on the source side (migrate-05's own absorb-label
+ * design: the label exists specifically so this bookkeeping row never
+ * collides with another script's manifest key for the SAME underlying
+ * table -- see migrate-05-sync-file-memory.js's header comment point 1).
+ * Interpolating the label as a physical relation name (what branch (a) did
+ * before this fix) crashes loud with "relation ... does not exist" -- not a
+ * false pass, but not useful either, since the label was never SUPPOSED to
+ * resolve to a table. This entry's forward-containment proof is instead
+ * carried entirely by the PRIMARY entry it duplicates (byte-exact row-count
+ * equality within the slice is T2's job, not T3's); T3 prints one explicit
+ * SKIP line per label-duplicate entry and moves on -- a designed skip, never
+ * silent, and never mistaken for "excluded" or "sourceless." An entry taking
+ * this branch is total-classification-guaranteed to have a real SQL-sourced
+ * primary sibling in the roster (validateManifestLabelDuplicates FATALs
+ * otherwise at load time), so `groupRosterBySourceDb` still opens a real
+ * source connection for this source_db via that sibling -- this branch never
+ * needs (and never opens) a source connection of its own.
+ *
+ * LINEAGE-BASED SOURCE-PROJECT EXCLUSIONS -- BRANCH (a2) (cm#210 fix, closes
+ * A-5/A-6/A-7/A-8/A-9/A-12). Branch (a)'s existing project-scoped-exclusion
+ * path (hashTableMultisetExcludingProjects) requires the SOURCE table to
+ * carry a real project_id column to filter by -- structurally impossible for
+ * a source table that has no such column at all (claude_context.decisions,
+ * this issue's second live gap). A roster entry OPTS IN to branch (a2) by
+ * declaring `sourceProjectExclusions` (mode:"lineage", a lineage_table from
+ * the closed LINEAGE_TABLE_VOCAB, and source_id_col -- validated at
+ * roster-load time by shared.validateSourceProjectExclusionDeclarations);
+ * fires ONLY when project-scoped exclusions actually exist for the pair AND
+ * this declaration is present (spec 2.1.1 item 5) -- with zero exclusions
+ * the declaration is inert and the entry takes ordinary branch (a) hashing.
+ * runLineageExclusionBranch() below implements the full per-source-row
+ * classification (migrated-vs-excluded-candidate, keyed by
+ * String(row[source_id_col]) per A-9), the migrated-AND-excluded
+ * contradiction FATAL (A-6), the exclusion-aware lineage-population guard
+ * (A-8: FATAL only when lineageCount===0 AND liveSourceCount>excludedSum),
+ * the bidirectional count anchor (A-12: both "more excluded-candidates than
+ * declared" and "fewer" FAIL loud, naming both numbers and both directions'
+ * candidate causes), and forward containment of the MIGRATED subset into the
+ * target multiset. Division of labor (spec 2.2.2 item 9): this branch proves
+ * migrated-row survival and excluded-row accounting SOURCE-side; target-side
+ * absence of excluded projects' rows remains T9's live-count check, never
+ * duplicated here.
+ *
  * SOURCELESS (net-new:) ROSTER ENTRIES have no source to hash at all — T3's
  * whole PREMISE (a source-side multiset compared to a target-side one)
  * does not apply. groupRosterBySourceDb partitions these out explicitly
@@ -349,6 +396,166 @@ async function runLineageBranch(srcClient, tgtClient, sourceDb, entry, cols, has
   return { failed: !tableOk || driftFails };
 }
 
+// ─── BRANCH (a2): LINEAGE-BASED SOURCE-PROJECT EXCLUSIONS (cm#210 fix) ───────
+
+/**
+ * Runs branch (a2)'s lineage-based forward-containment + exclusion-accounting
+ * proof for one roster entry that declares `sourceProjectExclusions`
+ * (spec 2.2.2). `exclusions` is the caller's already-loaded
+ * shared.loadExclusionsFor(...) result (nullScoped is guaranteed null here --
+ * the caller checks that branch BEFORE routing into this function, same as
+ * branch (a)'s own ordering).
+ *
+ * Returns { failed: boolean }. FATAL conditions (stale declaration, missing
+ * source_id_col, the migrated-AND-excluded contradiction, the exclusion-aware
+ * population guard) exit the process directly -- these are roster/data
+ * integrity breaks the run cannot meaningfully continue past, mirroring
+ * runLineageBranch's own FATAL-vs-FAIL posture. The bidirectional count
+ * anchor and forward-containment multiset misses are ordinary FAILs (return
+ * failed:true, caller sets the run's overall exit code but keeps checking
+ * every other roster entry).
+ */
+async function runLineageExclusionBranch(srcClient, tgtClient, sourceDb, entry, cols, hashOpts, exclusions) {
+  const decl = entry.sourceProjectExclusions;
+  const lineageTable = decl.lineage_table;
+  const idCol = decl.source_id_col;
+  const label = `${sourceDb}.${entry.source_table}`;
+
+  // Step 1 (spec 2.2.2/A-7): runtime schema cross-checks, each FATAL.
+  const hasProjectCol = await shared.tableHasColumn(srcClient, entry.source_table, 'project_id');
+  if (hasProjectCol) {
+    console.error(
+      `[T3] FATAL: ${label}: sourceProjectExclusions is declared, but the live source table NOW HAS a resolvable project_id column -- ` +
+      `declaration stale; use ordinary project-scoped filtering (remove sourceProjectExclusions from the roster entry and let branch (a) resolve the exclusion via the project_id column directly).`
+    );
+    process.exit(1);
+  }
+  const hasIdCol = await shared.tableHasColumn(srcClient, entry.source_table, idCol);
+  if (!hasIdCol) {
+    console.error(`[T3] FATAL: ${label}: sourceProjectExclusions.source_id_col="${idCol}" does not exist on the live source table.`);
+    process.exit(1);
+  }
+
+  // Step 2: excludedProjectIds (byte-exact TEXT strings, A-9) + excludedSum.
+  const excludedProjectIds = new Set(exclusions.projectScoped.map((ex) => String(ex.project_id_or_null)));
+  const excludedSum = exclusions.projectScoped.reduce((sum, ex) => sum + Number(ex.row_count), 0);
+  for (const ex of exclusions.projectScoped) {
+    console.log(`[T3] ${entry.source_table}: excluding ${ex.row_count} row(s) for project_id=${ex.project_id_or_null} from T3 scope (lineage-based -- source has no project column) as '${ex.excluded_reason}'.`);
+  }
+
+  // Step 3: lineage map (with each row's own project_id) + migrated-AND-
+  // excluded contradiction FATAL (A-6).
+  const lineageMap = await shared.loadLineageMapWithProjectId(tgtClient, lineageTable, sourceDb, entry.source_table);
+  const contradictions = [];
+  for (const [srcRowId, info] of lineageMap) {
+    if (info.project_id !== null && info.project_id !== undefined && excludedProjectIds.has(String(info.project_id))) {
+      contradictions.push({ source_row_id: srcRowId, project_id: info.project_id });
+    }
+  }
+  if (contradictions.length > 0) {
+    console.error(
+      `[T3] FATAL: ${label}: ${contradictions.length} lineage row(s) in "${lineageTable}" are recorded MIGRATED under an EXCLUDED project id -- ` +
+      `a row cannot be both migrated and excluded; cure the manifest or the lineage before re-running. Sample: ${JSON.stringify(contradictions.slice(0, 5))}`
+    );
+    process.exit(1);
+  }
+
+  // Step 4 (A-8): exclusion-aware population guard. FATAL iff the lineage
+  // table has ZERO rows for this pair while MORE live source rows exist than
+  // are declared excluded (a migration that silently never ran, or whose
+  // lineage was wiped) -- but NOT when every live row is accounted for by
+  // the declared exclusions (a table that migrated nothing because it was
+  // entirely excluded is a healthy state, never misclassified as vacuous
+  // wipe).
+  const { rows: liveCountRows } = await srcClient.query(`SELECT COUNT(*)::int AS n FROM ${entry.source_table}`);
+  const liveSourceCount = liveCountRows[0].n;
+  const lineageCount = lineageMap.size;
+  if (lineageCount === 0 && liveSourceCount > excludedSum) {
+    console.error(
+      `[T3] FATAL: ${label}: lineage table "${lineageTable}" has ZERO rows for this pair, but ${liveSourceCount} live source row(s) exist ` +
+      `and only ${excludedSum} are declared excluded -- lineage translation cannot proceed (a migration that silently never ran, or whose lineage was wiped).`
+    );
+    process.exit(1);
+  }
+  if (lineageCount === 0 && liveSourceCount === 0) {
+    console.log(`[T3] VACUOUS (source_count=0): ${label} has no live source rows and no lineage rows -- nothing to check, not silently skipped.`);
+  } else if (lineageCount === 0) {
+    console.log(`[T3] OK (a2 population guard): ${label}: 0 lineage rows, but ${liveSourceCount} live source row(s) <= ${excludedSum} declared excluded -- consistent with a table entirely excluded (never migrated by design).`);
+  }
+
+  // Step 5: per-live-source-row classification, key = String(row[idCol])
+  // (A-9 -- matches the write-side String(r.id)/String(row[idCol])
+  // convention T1 and migrate-04 already use for every lineage table).
+  const selectCols = [idCol, ...cols].filter((c, i, a) => a.indexOf(c) === i);
+  const { rows: sourceRows } = await srcClient.query(`SELECT ${selectCols.map((c) => `"${c}"`).join(', ')} FROM ${entry.source_table}`);
+  const migratedRows = [];
+  let excludedCandidateCount = 0;
+  const excludedCandidateSample = [];
+  for (const row of sourceRows) {
+    const key = String(row[idCol]);
+    if (lineageMap.has(key)) {
+      migratedRows.push(row);
+    } else {
+      excludedCandidateCount++;
+      if (excludedCandidateSample.length < 5) excludedCandidateSample.push(row);
+    }
+  }
+
+  // Step 6 (A-12): bidirectional count anchor -- both directions FAIL loud,
+  // naming both numbers and both directions' candidate causes.
+  if (excludedCandidateCount !== excludedSum) {
+    const direction = excludedCandidateCount > excludedSum ? 'greater' : 'less';
+    const causes = direction === 'greater'
+      ? 'un-migrated non-excluded live drift (rows that should have migrated but have no lineage row), or lineage loss'
+      : 'source rows deleted post-exclusion, or a stale/inflated declared exclusion row_count';
+    console.error(
+      `[T3] FAIL: ${label}: excluded-candidate count (${excludedCandidateCount}, no-lineage live rows) != declared excluded sum (${excludedSum}) -- ` +
+      `direction: ${direction} (candidate causes: ${causes}). Sample no-lineage rows: ${JSON.stringify(excludedCandidateSample)}`
+    );
+    return { failed: true };
+  }
+  console.log(`[T3] OK (a2 count anchor): ${label}: excluded-candidate count (${excludedCandidateCount}) == declared excluded sum (${excludedSum}).`);
+
+  // Step 7: forward containment, MIGRATED subset only (raw-value hash --
+  // this branch does NOT translate ids, unlike branch (b); load-bearing
+  // column values are still preserved byte-for-byte from source to target).
+  const migratedMultiset = new Map();
+  for (const r of migratedRows) {
+    const h = shared.rowHash(cols, r);
+    const e = migratedMultiset.get(h) || { count: 0, sample: [] };
+    e.count += 1;
+    if (e.sample.length < 3) e.sample.push(r);
+    migratedMultiset.set(h, e);
+  }
+  const targetMultiset = await shared.hashTableMultiset(tgtClient, entry.targetTable, cols, hashOpts);
+  let tableOk = true;
+  for (const [hash, { count: migratedCount, sample }] of migratedMultiset) {
+    const targetCount = (targetMultiset.get(hash) || { count: 0 }).count;
+    if (targetCount < migratedCount) {
+      tableOk = false;
+      console.error(`[T3] FAIL: ${entry.source_table} -> ${entry.targetTable}: hash ${hash} has ${migratedCount} migrated (non-excluded) source row(s) but only ${targetCount} target row(s) (multiset mismatch, lineage-based exclusion branch)`, JSON.stringify(sample));
+    }
+  }
+  if (tableOk) {
+    console.log(`[T3] OK: ${entry.source_table} -> ${entry.targetTable}: all ${migratedRows.length} migrated (non-excluded) row(s) found in target (multiset, lineage-based exclusion branch).`);
+  }
+
+  // Step 8: lineage rows with no corresponding live source row -- reported
+  // as source deletions post-migration, exit-neutral (branch (b) precedent).
+  const liveKeys = new Set(sourceRows.map((r) => String(r[idCol])));
+  const deletedLineageRows = [...lineageMap.keys()].filter((k) => !liveKeys.has(k));
+  if (deletedLineageRows.length > 0) {
+    console.log(`[T3] source deletions post-migration: ${deletedLineageRows.length} (lineage row(s) in "${lineageTable}" with no corresponding live source row) -- sample: ${JSON.stringify(deletedLineageRows.slice(0, 5))}`);
+  }
+
+  // Step 9 (division of labor, spec 2.2.2 item 9): this branch proves
+  // migrated-row survival and excluded-row accounting SOURCE-side only;
+  // target-side absence of excluded projects' rows remains T9's live-count
+  // check -- (a2) deliberately does not duplicate it.
+
+  return { failed: !tableOk };
+}
+
 /**
  * Group roster entries by source_db, dropping filesystem:-prefixed ones
  * (markdown, out of this battery's cut) and sourceless net-new: ones
@@ -412,6 +619,18 @@ async function main() {
         for (const entry of entries) {
           const cols = entry.loadBearingCols;
 
+          // Branch (c): LABEL-DUPLICATE-SKIP (spec 2.1.1 item 3, cm#210 fix
+          // for A-1). Checked FIRST, before lineageMappedCols/branch (a) --
+          // load-time mutual exclusion (validateDeclarationMutualExclusion)
+          // guarantees an entry never carries this alongside either of the
+          // other two branch-selecting declarations, so this ordering is
+          // never ambiguous in practice; it mirrors the spec's own fixed
+          // total-classification order regardless.
+          if (entry.manifest_label_duplicate_of) {
+            console.log(`[T3] SKIP (label-duplicate): ${sourceDb}.${entry.source_table} duplicates label "${entry.manifest_label_duplicate_of}" — physical forward containment for these rows is proven by the primary entry; manifest accounting is T2's cross-check (manifest_label_duplicate_of).`);
+            continue;
+          }
+
           if (entry.lineageMappedCols) {
             // Branch (b): translated-id forward containment (cm#198 fix).
             // Completely separate from branch (a)'s exclusion-loading below
@@ -447,11 +666,6 @@ async function main() {
             continue;
           }
 
-          for (const ex of exclusions.projectScoped) {
-            console.log(`[T3] ${entry.source_table}: excluding ${ex.row_count} row(s) for project_id=${ex.project_id_or_null} from T3 scope as '${ex.excluded_reason}'.`);
-          }
-          const excludedProjectIds = exclusions.projectScoped.map((ex) => ex.project_id_or_null);
-
           // BF-R3: idCol/projectCol are resolved per (table, connection) by
           // hashTableMultiset/hashTableMultisetExcludingProjects themselves
           // (shared.resolveHashCols via tableHasColumn) -- independently for
@@ -462,6 +676,31 @@ async function main() {
           // for sample-logging identification ONLY -- never the hash, which
           // is always computed over `cols` (loadBearingCols) alone.
           const hashOpts = entry.idCol ? { idCol: entry.idCol } : {};
+
+          // Branch (a2): lineage-based source-project exclusion (spec 2.1.1
+          // item 5's second sub-bullet, cm#210 fix for A-5/A-6/A-7/A-8/A-9/
+          // A-12). Fires ONLY when project-scoped exclusions actually exist
+          // for this pair AND sourceProjectExclusions is declared -- with
+          // zero exclusions the declaration is inert (documented in the
+          // field's own _comment in source-table-roster.example.json) and
+          // the entry falls through to ordinary branch (a) hashing below.
+          if (exclusions.projectScoped.length > 0 && entry.sourceProjectExclusions) {
+            let result;
+            try {
+              result = await runLineageExclusionBranch(srcClient, tgtClient, sourceDb, entry, cols, hashOpts, exclusions);
+            } catch (err) {
+              failed = true;
+              console.error(`[T3] FAIL: ${sourceDb}.${entry.source_table}: branch (a2) error: ${err.message}`);
+              continue;
+            }
+            if (result.failed) failed = true;
+            continue;
+          }
+
+          for (const ex of exclusions.projectScoped) {
+            console.log(`[T3] ${entry.source_table}: excluding ${ex.row_count} row(s) for project_id=${ex.project_id_or_null} from T3 scope as '${ex.excluded_reason}'.`);
+          }
+          const excludedProjectIds = exclusions.projectScoped.map((ex) => ex.project_id_or_null);
 
           let srcCounts, tgtCounts;
           try {
@@ -512,4 +751,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { AUTHORED_BY, groupRosterBySourceDb, runLineageBranch, loadLiveRows };
+module.exports = { AUTHORED_BY, groupRosterBySourceDb, runLineageBranch, runLineageExclusionBranch, loadLiveRows };
