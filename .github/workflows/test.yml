@@ -155,19 +155,25 @@ jobs:
         # Covers: prerequisite-table refusal on an empty (but existing)
         # target vs. a target that was never created at all (two distinct
         # code paths), fresh apply + full derived verification (tables,
-        # columns, declared types, CHECK constraints, indexes/partial-index
-        # WHERE clauses, UNIQUE constraints, seed-row values), idempotent
-        # re-run, refused target names + a reference-identity proof that
+        # columns, declared types, CHECK constraints, indexes (including
+        # standalone CREATE UNIQUE INDEX statements, recorded unique:true —
+        # cm#208) + their partial-index WHERE clauses verified symmetrically,
+        # constraint-shaped UNIQUEs, seed-row values), idempotent re-run,
+        # refused target names + a reference-identity proof that
         # classifyTarget is imported from migrate-01 rather than forked,
-        # verification proof-of-firing for six distinct perturbations
+        # verification proof-of-firing for seven distinct perturbations
         # (dropped table, dropped column, pre-existing stub table with
         # missing columns, a column present but its CHECK absent, a deleted
-        # seed row, a divergently-updated seed row), static SQL-text
-        # invariant sweeps (no INSERT INTO model_registry, every CREATE
-        # TABLE/ADD COLUMN uses IF NOT EXISTS, no DROP statements, no CHECK
-        # added to a pre-existing column), derivation-helper unit cases
-        # against a synthetic fixture, and a forced mid-sequence apply
-        # failure followed by an idempotent heal.
+        # seed row, a divergently-updated seed row, a standalone unique index
+        # recreated non-unique under the same name — cm#208 F-4/F-6), static
+        # SQL-text invariant sweeps (no INSERT INTO model_registry, every
+        # CREATE TABLE/ADD COLUMN uses IF NOT EXISTS, no DROP statements, no
+        # CHECK added to a pre-existing column), derivation-helper unit cases
+        # against a synthetic fixture (including the cm#208 index grammar's
+        # positive shapes and its total-classification loud DerivationError
+        # on every CREATE-INDEX shape it does not recognize — never a silent
+        # skip), and a forced mid-sequence apply failure followed by an
+        # idempotent heal.
         # Creates/drops its own _staging-suffixed scratch DBs; never touches
         # claude_memory_eval_test beyond the connection-avoidance assertion.
         run: node test/migrations/test-migrate-schema-addenda.js
@@ -257,8 +263,15 @@ jobs:
         # and migrate-schema-addenda.js's own exported helpers by reference (never
         # forked); the generic tables/columns/indexes/checks/uniques/seeds
         # verification pass is migrate-schema-addenda.js's own exported
-        # verifyAddenda, called with this migration's own SQL file list — no
-        # changes to migrate-schema-addenda.js itself. The smoke script runs its
+        # verifyAddenda, called with this migration's own SQL file list —
+        # verifyAddenda/deriveSchemaAddenda are a SHARED derivation/
+        # verification layer (cm#208), not private to migrate-schema-
+        # addenda.js's own six files; this file's DO-block-wrapped
+        # agent_exchange_embedding_idx (graceful pgvector-absent degradation)
+        # stays out of that shared derivation layer's reach by documented
+        # design (cm#208 F-3) — a fragment beginning "DO $$ BEGIN" is never
+        # index-shaped at its trimmed start, so it neither derives nor loud-
+        # errors. The smoke script runs its
         # entire fixture lifecycle inside one transaction that is always rolled
         # back -- safe to run against a live staging database; nothing is wiped
         # (no global-pool table is involved), only prefix-residue-scanned.
@@ -311,9 +324,13 @@ jobs:
         # migrate-schema-addenda.js's verifyAddenda for generic derived
         # verification (against the dollar-quote-free migrate-14-seam-
         # tables.sql ONLY, per §7.9/S-16 — the embedding/HNSW DO-blocks live
-        # in a separate sidecar file never passed to that derivation layer)
-        # and migrate-13-agent-exchange.js's own trigger-wiring DO block
-        # (unmodified in its wiring logic) for audit-trigger wiring.
+        # in a separate sidecar file never passed to that derivation layer),
+        # including (cm#208) the four `*_fts_idx` USING gin full-text indexes
+        # (decisions/gotchas/findings/code_index) — previously invisible to
+        # that derivation layer entirely (silently skipped, the same defect
+        # class cm#208 was filed against) and now derived + verified like any
+        # other index, and migrate-13-agent-exchange.js's own trigger-wiring
+        # DO block (unmodified in its wiring logic) for audit-trigger wiring.
         # Covers: fresh apply -> PASS; idempotent re-run; prerequisite
         # (agent_exchange) missing -> refusal naming migrate-13-agent-
         # exchange.js; re-applying migrate-13-agent-exchange.js after this
@@ -675,7 +692,12 @@ jobs:
         # index, decisions_project_topic_unique — the exact same statement/name a
         # concurrent migrate-02 PR bundles, kept in its own file/runner precisely
         # to avoid a merge collision on migrate-schema-addenda.js's shared
-        # SQL_FILES list) and scripts/migrations/verify-20-mcp-surface.js (27
+        # SQL_FILES list; both entities_name_trgm_idx and the standalone
+        # decisions_project_topic_unique UNIQUE index were previously invisible
+        # to the shared verifyAddenda derivation layer entirely — cm#208 — and
+        # are now derived + verified there too, decisions_project_topic_unique
+        # with a unique:true flag; migrate-15's own checkIndexByName calls stay,
+        # belt-and-braces) and scripts/migrations/verify-20-mcp-surface.js (27
         # checks covering every new §8 direct-pg tool's underlying library
         # function, plus a real stdio MCP round-trip proving all 30
         # handoff-mcp.mjs tools register and one is independently callable
