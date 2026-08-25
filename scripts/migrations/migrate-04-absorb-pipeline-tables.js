@@ -478,9 +478,190 @@ function loadDbTriage(p) {
   return parsed.databases;
 }
 
-/** E-1: total classification, default branch = UNCLASSIFIED (loud, blocks the run). */
+/**
+ * E-1: total classification, default branch = UNCLASSIFIED (loud, blocks
+ * the run). cm#189/A-7 fix: Object.hasOwn, never a plain `triage[dbName]`
+ * truthiness check -- a database literally named "constructor" previously
+ * resolved via Object.prototype.constructor (truthy) instead of an own
+ * property, silently escaping E-1's totality FATAL. Object.hasOwn closes
+ * this for every caller of this function (migrate-04 itself, and migrate-05
+ * via `migrate04.classifyDb`) in the same stroke.
+ */
 function classifyDb(dbName, triage) {
-  return triage[dbName] || 'UNCLASSIFIED';
+  return Object.hasOwn(triage, dbName) ? triage[dbName] : 'UNCLASSIFIED';
+}
+
+// ─── db-triage.json FULL LOADER + SHARED PROVENANCE CLASSIFIER (cm#189) ────
+//
+// A SECOND, WRITE-side loader for the SAME db-triage.json file, extended
+// with one new required top-level key (`test_artifact_db_patterns`) and
+// consumed by migrate-03-corpus-project-id.js's total provenance
+// classification (spec-adversary A-1/A-4/A-7, cm#189). loadDbTriage()
+// above is UNCHANGED and stays the loader for THIS script and migrate-05 --
+// it already ignores unknown top-level keys (it reads only
+// parsed.databases), so adding test_artifact_db_patterns to the real
+// db-triage.json is backward-compatible with both loaders sharing the one
+// file. loadDbTriageFull() is for consumers that ALSO need the
+// pattern-overlay half of the classification (currently: migrate-03 only).
+
+/**
+ * Collected multi-error FATAL (never one-error-per-run whack-a-mole; an
+ * operator fixing this file sees every problem in one pass): missing file;
+ * invalid JSON; `databases` missing/non-object/array; an invalid class
+ * value; `test_artifact_db_patterns` missing or non-array; a pattern entry
+ * that is non-string/empty; a pattern that fails to compile as a regex; a
+ * pattern not anchored with a leading `^` (A-5: an unanchored pattern can
+ * match a SUBSTRING of a real database name); a pattern that matches any
+ * name this SAME file triages REAL-MIGRATE or OWNER-REVIEW (A-5: the
+ * load-time cross-check that catches a pattern drifting wide enough to
+ * shadow a real source before it is ever run against live `pg_database`).
+ *
+ * Returns { path, databases, compiledPatterns } -- `databases` is the SAME
+ * plain object loadDbTriage() would build (looked up ONLY via
+ * Object.hasOwn by classifyDbProvenance below -- never plain `[dbName]`,
+ * A-7's prototype-pollution hole); `compiledPatterns` is `[{ src, re }]`,
+ * `re` already RegExp-compiled and validated.
+ */
+function loadDbTriageFull(p) {
+  if (!fs.existsSync(p)) {
+    console.error(`FATAL: db-triage config not found at "${p}".`);
+    console.error('This file carries private instance data (real database names) and is gitignored, never committed.');
+    console.error('See scripts/migrations/db-triage.example.json for the required shape, or pass --db-triage <path>.');
+    process.exit(1);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch (err) {
+    console.error(`FATAL: db-triage config at "${p}" is not valid JSON: ${err.message}`);
+    process.exit(1);
+  }
+
+  const errors = [];
+  let databases = {};
+  if (!parsed.databases || typeof parsed.databases !== 'object' || Array.isArray(parsed.databases)) {
+    errors.push('"databases" must be an object.');
+  } else {
+    databases = parsed.databases;
+    for (const [db, cls] of Object.entries(databases)) {
+      if (!DB_TRIAGE_VALID_CLASSES.has(cls)) {
+        errors.push(`databases["${db}"] = "${cls}" is not a valid class (must be one of ${[...DB_TRIAGE_VALID_CLASSES].join(', ')}).`);
+      }
+    }
+  }
+
+  const compiledPatterns = [];
+  if (!Array.isArray(parsed.test_artifact_db_patterns)) {
+    errors.push('"test_artifact_db_patterns" must be an array (required key -- may be empty, never absent).');
+  } else {
+    parsed.test_artifact_db_patterns.forEach((src, i) => {
+      if (typeof src !== 'string' || src.length === 0) {
+        errors.push(`test_artifact_db_patterns[${i}] must be a non-empty string, got ${JSON.stringify(src)}.`);
+        return;
+      }
+      if (!src.startsWith('^')) {
+        errors.push(`test_artifact_db_patterns[${i}] = "${src}" is not anchored -- every pattern must start with "^" (A-5: an unanchored pattern can match a substring of a real database name).`);
+        return;
+      }
+      let re;
+      try {
+        re = new RegExp(src);
+      } catch (err) {
+        errors.push(`test_artifact_db_patterns[${i}] = "${src}" is not a valid regular expression: ${err.message}`);
+        return;
+      }
+      compiledPatterns.push({ src, re });
+    });
+  }
+
+  // A-5 load-time cross-check: a pattern that ALSO matches a name this same
+  // file triages REAL-MIGRATE or OWNER-REVIEW is a FATAL config error --
+  // never discovered later as a silent false-exclusion at run time.
+  if (Object.keys(databases).length > 0 && compiledPatterns.length > 0) {
+    for (const [db, cls] of Object.entries(databases)) {
+      if (cls !== 'REAL-MIGRATE' && cls !== 'OWNER-REVIEW') continue;
+      for (const { src, re } of compiledPatterns) {
+        if (re.test(db)) {
+          errors.push(`test_artifact_db_patterns pattern "${src}" matches "${db}", which this file triages "${cls}" -- a test-artifact pattern must never shadow a real or owner-review database.`);
+        }
+      }
+    }
+  }
+
+  if (errors.length) {
+    console.error(`FATAL: db-triage config at "${p}" failed validation (${errors.length} problem(s)):`);
+    for (const e of errors) console.error(`  - ${e}`);
+    process.exit(1);
+  }
+
+  return { path: p, databases, compiledPatterns };
+}
+
+/**
+ * cm#189 (A-1/A-2/A-4/A-7): the ONE shared total-classification engine for
+ * "what is this database, before any connection is opened to it" -- every
+ * consumer that needs this question answered (currently: migrate-03) calls
+ * THIS function, never a private reimplementation (one normalization
+ * engine). Precedence order, first match wins, every datname resolved to
+ * exactly one branch:
+ *
+ *   1. bookkeeping-target -- datname === resolvedTarget, BYTE-EXACT. Never
+ *      a corpus source, never manifested as source_db, never pattern-
+ *      checked (closes A-2's latent double-count-against-T2-Branch-A bug:
+ *      the consolidation target itself must never be discovered as its own
+ *      migration source).
+ *   2. Triage branch -- Object.hasOwn(databases, datname) (A-7: never a
+ *      plain `databases[datname]` truthiness check):
+ *        REAL-MIGRATE    -> 'real-migrate' (caller connects + classifies
+ *                           holds-corpus/no-corpus/unreachable, unchanged).
+ *        EPHEMERAL-DROP  -> 'test-artifact-db' (explicit form).
+ *        ENGINE-INFRA    -> 'engine-infra-skip' (THIS branch, not the
+ *                           pattern list, is what stops the A-2 resurrection
+ *                           of claude_memory_eval_ci/claude_memory_eval_test
+ *                           -- neither is fixture-named, so only an explicit
+ *                           ENGINE-INFRA triage entry can refuse them).
+ *        OWNER-REVIEW    -> 'owner-review-skip' (A-9: never connected, never
+ *                           ALTERed).
+ *   3. Pattern branch -- not in triage, first compiledPatterns entry whose
+ *      `re.test(datname)` is true -> 'test-artifact-db' (pattern form,
+ *      `patternSrc` names the matched source).
+ *   4. DEFAULT: 'unclassified' -- the caller collects every one of these
+ *      and refuses the whole run (E-1 posture); never a silent skip.
+ *
+ * `shadowedPattern` is set, only for the triage branch (2), to the source
+ * of a compiledPatterns entry that ALSO matches this datname -- callers
+ * print this as an INFO line ("explicit triage wins over pattern X") per
+ * spec 2.1. Always null for the other three branches (there is no "other"
+ * resolution to shadow in those cases).
+ */
+function classifyDbProvenance(datname, triage, resolvedTarget) {
+  const { databases, compiledPatterns } = triage;
+
+  if (datname === resolvedTarget) {
+    return { datname, branch: 'bookkeeping-target', shadowedPattern: null };
+  }
+
+  if (Object.hasOwn(databases, datname)) {
+    const cls = databases[datname];
+    const matched = compiledPatterns.find((p) => p.re.test(datname));
+    const shadowedPattern = matched ? matched.src : null;
+    if (cls === 'REAL-MIGRATE') return { datname, branch: 'real-migrate', triageClass: cls, shadowedPattern };
+    if (cls === 'EPHEMERAL-DROP') return { datname, branch: 'test-artifact-db', triageClass: cls, source: 'triage-explicit', shadowedPattern };
+    if (cls === 'ENGINE-INFRA') return { datname, branch: 'engine-infra-skip', triageClass: cls, shadowedPattern };
+    if (cls === 'OWNER-REVIEW') return { datname, branch: 'owner-review-skip', triageClass: cls, shadowedPattern };
+    // Defensive: loadDbTriageFull already validates every class value
+    // against DB_TRIAGE_VALID_CLASSES at load time -- unreachable in
+    // practice, kept as the explicit default branch anyway (never an
+    // implicit fall-through) per this project's total-classification canon.
+    return { datname, branch: 'unclassified', reason: `invalid triage class "${cls}"`, shadowedPattern };
+  }
+
+  const matched = compiledPatterns.find((p) => p.re.test(datname));
+  if (matched) {
+    return { datname, branch: 'test-artifact-db', source: 'pattern', patternSrc: matched.src, shadowedPattern: null };
+  }
+
+  return { datname, branch: 'unclassified', shadowedPattern: null };
 }
 
 // ─── pipeline-db-project-map.json LOADER ───────────────────────────────────
@@ -1275,6 +1456,8 @@ module.exports = {
   loadDbTriage,
   classifyDb,
   DB_TRIAGE_VALID_CLASSES,
+  loadDbTriageFull,
+  classifyDbProvenance,
   loadPipelineDbProjectMap,
   deriveDbLevelProjectId,
   loadClaudeContextTopicRules,

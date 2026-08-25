@@ -91,8 +91,10 @@ const { createRequire } = require('module');
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
 const MIGRATE_ONE_PATH = path.join(PROJECT_ROOT, 'scripts', 'migrations', 'migrate-01-canonical-db.js');
 const MIGRATE03_PATH = path.join(PROJECT_ROOT, 'scripts', 'migrations', 'migrate-03-corpus-project-id.js');
+const MIGRATE04_PATH = path.join(PROJECT_ROOT, 'scripts', 'migrations', 'migrate-04-absorb-pipeline-tables.js');
 
 const migrate03 = require(MIGRATE03_PATH);
+const migrate04 = require(MIGRATE04_PATH); // db-triage: loadDbTriageFull/classifyDbProvenance (cm#189)
 const projectMarker = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'project-marker.js'));
 
 const scriptsRequire = createRequire(require.resolve('../../scripts/package.json'));
@@ -210,15 +212,49 @@ async function setupTargetSchema(dbName) {
 // a caller needing a DIFFERENT backup dir simply passes its own
 // --backup-dir later in argv, which migrate-03's own parseArgs takes
 // last-flag-wins on (mirrors test-migrate-02-decisions.js's
-// EXAMPLE_ROUTING_MAP_PATH convention).
+// EXAMPLE_ROUTING_MAP_PATH convention). --db-triage is injected the SAME
+// way (cm#189): a scratch fixture file, last-flag-wins, so P5a/P5b below
+// can override it with their own missing/malformed path.
 let BACKUP_DIR;
+let TRIAGE_PATH;
 function runMigrate03(args, extraEnv = {}, timeoutMs = 30000) {
-  return spawnSync(process.execPath, [MIGRATE03_PATH, '--db-prefix', DB_PREFIX, '--backup-dir', BACKUP_DIR, ...args], {
+  return spawnSync(process.execPath, [MIGRATE03_PATH, '--db-prefix', DB_PREFIX, '--backup-dir', BACKUP_DIR, '--db-triage', TRIAGE_PATH, ...args], {
     cwd: PROJECT_ROOT,
     env: { ...process.env, ...extraEnv },
     encoding: 'utf8',
     timeout: timeoutMs,
   });
+}
+
+// ─── db-triage.json fixture (cm#189) ────────────────────────────────────
+//
+// migrate-03 now REQUIRES --db-triage (A-6: write-side FATAL on a missing
+// file) and runs its total provenance classification BEFORE any
+// connection (A-4). TRIAGE_DATABASES/TRIAGE_PATTERNS are mutated in place
+// as each test mints a new fixture DB, and writeTriageFixture() re-
+// serializes the CURRENT state to TRIAGE_PATH -- every test that adds an
+// entry calls it before the next runMigrate03 invocation that needs to see
+// it. The bookkeeping target (DB_TARGET) deliberately gets NO entry here:
+// classifyDbProvenance's bookkeeping-target branch resolves it via a
+// byte-exact match against the CLI's own --db value, ahead of the triage
+// branch (spec §2.1 precedence order) -- see test P8 for the regression
+// proving this precedence explicitly.
+let TRIAGE_DATABASES = {};
+let TRIAGE_PATTERNS = [];
+function writeTriageFixture() {
+  fs.writeFileSync(TRIAGE_PATH, JSON.stringify({ databases: TRIAGE_DATABASES, test_artifact_db_patterns: TRIAGE_PATTERNS }, null, 2), 'utf8');
+}
+
+// Fixture DBs minted by the cm#189 classification tests (Group 3, below)
+// beyond the fixed CREATED_DBS roster -- tracked here so cleanup()'s
+// best-effort finally-drop covers them too (issue item 3: teardown
+// hardening is a secondary, non-load-bearing defense; the classifier
+// branch itself is the load-bearing fix, per A-1/A-4).
+let EXTRA_DBS = [];
+async function createExtraCorpusDb(dbName, rows) {
+  await setupCorpusDb(dbName, rows);
+  EXTRA_DBS.push(dbName);
+  return dbName;
 }
 
 // ─── Fixture filesystem tree ────────────────────────────────────────────
@@ -287,6 +323,8 @@ let fixtureBase;
 
 async function main() {
   BACKUP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-backups-'));
+  TRIAGE_PATH = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'm03-triage-')), 'db-triage.json');
+  writeTriageFixture(); // starts empty -- populated as each fixture DB is minted, below
 
   // ── Group 1: pure unit tests (no DB) ────────────────────────────────
 
@@ -617,8 +655,20 @@ async function main() {
     try { await client.query('DROP TABLE memory_entry_chunks; DROP TABLE memory_entries;'); } finally { await client.end(); }
   });
 
-  await run('I2', 'discovery classification: holds-corpus vs no-corpus, scoped by --db-prefix', async () => {
-    const classifications = await migrate03.discoverAndClassify(DB_PREFIX);
+  // cm#189: every corpus DB used by the "MIGRATE"-mode tests below must be
+  // explicitly enrolled REAL-MIGRATE -- migrate-03 now runs a TOTAL
+  // provenance classification (A-1) and refuses the whole run on any
+  // unenrolled name. The bookkeeping target (DB_TARGET) needs NO entry
+  // here -- it resolves via the bookkeeping-target branch instead (spec
+  // §2.1 precedence order 1, ahead of the triage branch).
+  TRIAGE_DATABASES[DB_CORPUS_HAPPY] = 'REAL-MIGRATE';
+  TRIAGE_DATABASES[DB_CORPUS_ORPHAN] = 'REAL-MIGRATE';
+  TRIAGE_DATABASES[DB_NOCORPUS] = 'REAL-MIGRATE';
+  writeTriageFixture();
+
+  await run('I2', 'discovery classification: holds-corpus vs no-corpus, scoped by --db-prefix; the bookkeeping target is its OWN branch, never a corpus source (cm#189 A-2)', async () => {
+    const triage = migrate04.loadDbTriageFull(TRIAGE_PATH);
+    const classifications = await migrate03.discoverAndClassify(DB_PREFIX, triage, DB_TARGET);
     const byName = Object.fromEntries(classifications.map((c) => [c.dbName, c]));
     assert(byName[DB_CORPUS_HAPPY].status === 'holds-corpus', 'expected DB_CORPUS_HAPPY holds-corpus');
     assert(byName[DB_CORPUS_HAPPY].hasChunks === true, 'expected hasChunks=true');
@@ -626,14 +676,20 @@ async function main() {
     // DB_TARGET is provisioned via migrate-01-canonical-db.js, which applies
     // the FULL canonical schema (setup.sql included) -- it genuinely DOES
     // carry (empty) memory_entries/memory_entry_chunks tables, same as any
-    // other corpus DB. This is correct, not a classification bug: the
-    // consolidation target is itself a legitimate corpus-holding database.
-    assert(byName[DB_TARGET].status === 'holds-corpus', `expected the bookkeeping target to genuinely hold (empty) corpus tables via migrate-01's setup.sql, got ${byName[DB_TARGET].status}`);
+    // other corpus DB, physically. Pre-cm#189 this classified holds-corpus
+    // like any other DB (a latent bug, A-2: an unscoped run would manifest
+    // the consolidation TARGET as its own migration source, double-
+    // counting every absorbed row against T2 Branch A). The bookkeeping-
+    // target branch now takes precedence over the corpus-source discovery
+    // path entirely -- the target is never even connected via
+    // classifyDatabase for this purpose.
+    assert(byName[DB_TARGET].branch === 'bookkeeping-target', `expected the bookkeeping target classified via its OWN branch (never a corpus source, cm#189 A-2), got branch=${byName[DB_TARGET].branch}`);
+    assert(byName[DB_TARGET].status === 'bookkeeping-target', `expected status=bookkeeping-target, got ${byName[DB_TARGET].status}`);
   });
 
   await run('I3', '--discover-only mutates nothing (no project_id column added anywhere)', async () => {
-    const r = runMigrate03(['--discover-only'], { HANDOFF_BASE_DIR: fixtureBase });
-    assert(r.status === 0, `expected exit 0, got ${r.status}: ${r.stderr}`);
+    const r = runMigrate03(['--discover-only', '--db', DB_TARGET], { HANDOFF_BASE_DIR: fixtureBase });
+    assert(r.status === 0, `expected exit 0, got ${r.status}\nstdout:${r.stdout}\nstderr:${r.stderr}`);
     const client = await pgConnect(DB_CORPUS_HAPPY);
     try {
       const has = await migrate03.columnExists(client, 'memory_entries', 'project_id');
@@ -807,6 +863,10 @@ async function main() {
     ]);
   });
 
+  TRIAGE_DATABASES[DB_CORPUS_A] = 'REAL-MIGRATE';
+  TRIAGE_DATABASES[DB_CORPUS_B] = 'REAL-MIGRATE';
+  writeTriageFixture();
+
   await run('I9', 'cross-DB disambiguation: each DB resolves its identically-named MEMORY.md row to its OWN project via full-set overlap, not a name collision', async () => {
     const r = runMigrate03(['--db', DB_TARGET], { HANDOFF_BASE_DIR: fixtureBase });
     assert(r.status === 0, `expected exit 0, got ${r.status}\nstdout:${r.stdout}\nstderr:${r.stderr}`);
@@ -825,6 +885,8 @@ async function main() {
 
   await run('I10', 'rollback: drops project_id from a corpus DB + clears its manifest slices', async () => {
     await setupCorpusDb(DB_ROLLBACK, [{ name: 'x', body: 'x', source_file: 'memory/nowhere.md' }]);
+    TRIAGE_DATABASES[DB_ROLLBACK] = 'REAL-MIGRATE';
+    writeTriageFixture();
     const first = runMigrate03(['--db', DB_TARGET], { HANDOFF_BASE_DIR: fixtureBase });
     assert(first.status === 0, `expected exit 0 on forward run, got ${first.status}: ${first.stderr}`);
 
@@ -848,11 +910,221 @@ async function main() {
     } finally { await tgtClient.end(); }
   });
 
+  // ── Group 3: cm#189 total provenance classification (spec §2.5) ─────
+
+  await run('P1', 'pattern-matched fixture DB (holds corpus): classified test-artifact-db via pattern, never connected, never manifested, exit 0', async () => {
+    const dbName = `${DB_PREFIX}patterntest_p1`;
+    await createExtraCorpusDb(dbName, [{ name: 'x', body: 'x', source_file: 'memory/x.md' }]);
+    TRIAGE_PATTERNS.push(`^${DB_PREFIX}patterntest_p1$`);
+    writeTriageFixture();
+
+    const r = runMigrate03(['--db', DB_TARGET], { HANDOFF_BASE_DIR: fixtureBase });
+    assert(r.status === 0, `expected exit 0, got ${r.status}\nstdout:${r.stdout}\nstderr:${r.stderr}`);
+    assert(r.stdout.includes(`[TEST-ARTIFACT-DB] "${dbName}" (pattern /`), `expected the pattern-form report line, got:\n${r.stdout}`);
+
+    const client = await pgConnect(dbName);
+    try {
+      assert(!(await migrate03.columnExists(client, 'memory_entries', 'project_id')), 'a pattern-matched test-artifact DB must never be connected/altered');
+    } finally { await client.end(); }
+    const tgtClient = await pgConnect(DB_TARGET);
+    try {
+      const slices = await getManifestSlices(tgtClient, dbName, 'memory_entries');
+      assert(slices.length === 0, `expected zero manifest slices for a pattern-excluded DB, got ${slices.length}`);
+    } finally { await tgtClient.end(); }
+  });
+
+  await run('P2', 'EPHEMERAL-DROP triage entry: same disposition as a pattern match, reported in the "explicit form"', async () => {
+    const dbName = `${DB_PREFIX}ephemeral_p2`;
+    await createExtraCorpusDb(dbName, [{ name: 'x', body: 'x', source_file: 'memory/x.md' }]);
+    TRIAGE_DATABASES[dbName] = 'EPHEMERAL-DROP';
+    writeTriageFixture();
+
+    const r = runMigrate03(['--db', DB_TARGET], { HANDOFF_BASE_DIR: fixtureBase });
+    assert(r.status === 0, `expected exit 0, got ${r.status}\nstdout:${r.stdout}\nstderr:${r.stderr}`);
+    assert(r.stdout.includes(`[TEST-ARTIFACT-DB] "${dbName}" (triage EPHEMERAL-DROP)`), `expected the explicit-form report line, got:\n${r.stdout}`);
+
+    const client = await pgConnect(dbName);
+    try {
+      assert(!(await migrate03.columnExists(client, 'memory_entries', 'project_id')), 'an EPHEMERAL-DROP DB must never be connected/altered');
+    } finally { await client.end(); }
+  });
+
+  await run('P3-A2-regression', 'A-2 regression (LOAD-BEARING): an ENGINE-INFRA holds-corpus DB with a PRE-RETIRED manifest triple stays retired across a re-run -- never resurrected, never re-connected', async () => {
+    const dbName = `${DB_PREFIX}engineinfra_p3`;
+    await createExtraCorpusDb(dbName, [{ name: 'x', body: 'x', source_file: 'memory/x.md' }]);
+    TRIAGE_DATABASES[dbName] = 'ENGINE-INFRA';
+    writeTriageFixture();
+
+    let manifestIdBefore;
+    const tgtClientA = await pgConnect(DB_TARGET);
+    try {
+      const ins = await tgtClientA.query(
+        `INSERT INTO migration_manifest (source_db, source_table, project_id_or_null, row_count, content_fingerprint, excluded_reason, retired_at, retired_note)
+         VALUES ($1,'memory_entries','unmapped-orphan-memory-entry',1,'deadbeef',NULL,NOW(),'pre-retired fixture for the cm#189 A-2 regression test')
+         RETURNING id, retired_at`,
+        [dbName]
+      );
+      manifestIdBefore = ins.rows[0];
+      assert(manifestIdBefore.retired_at !== null, 'sanity: fixture row must start retired');
+    } finally { await tgtClientA.end(); }
+
+    const r = runMigrate03(['--db', DB_TARGET], { HANDOFF_BASE_DIR: fixtureBase });
+    assert(r.status === 0, `expected exit 0, got ${r.status}\nstdout:${r.stdout}\nstderr:${r.stderr}`);
+    assert(r.stdout.includes(`[ENGINE-INFRA-SKIP] "${dbName}"`), `expected the engine-infra-skip report line, got:\n${r.stdout}`);
+
+    // Never reconnected/altered -- the classifier refusal, not a pattern
+    // match, is what stops this (neither claude_memory_eval_ci nor
+    // claude_memory_eval_test is fixture-named; only an explicit
+    // ENGINE-INFRA triage entry can refuse them, per A-2/A-4).
+    const client = await pgConnect(dbName);
+    try {
+      assert(!(await migrate03.columnExists(client, 'memory_entries', 'project_id')), 'an ENGINE-INFRA DB must never be connected/altered');
+    } finally { await client.end(); }
+
+    // The pre-existing retired row is UNCHANGED -- same row id, still
+    // retired, never DELETEd-and-reINSERTed as a fresh live row. Under the
+    // pre-cm#189 code, an unscoped discovery would have connected to this
+    // DB, found holds-corpus, and writeManifestForTable's DELETE-then-
+    // INSERT would have wiped this retired row and replaced it with a
+    // live one (excluded_reason=NULL, retired_at=NULL) -- exactly the
+    // resurrection this test guards against.
+    const tgtClientB = await pgConnect(DB_TARGET);
+    try {
+      const { rows } = await tgtClientB.query(
+        `SELECT id, retired_at, retired_note FROM migration_manifest WHERE source_db=$1 AND source_table='memory_entries'`,
+        [dbName]
+      );
+      assert(rows.length === 1, `expected exactly the one pre-existing row, got ${rows.length}: ${JSON.stringify(rows)}`);
+      assert(rows[0].id === manifestIdBefore.id, 'expected the SAME row (never deleted+reinserted)');
+      assert(rows[0].retired_at !== null, 'expected the row to remain retired (never resurrected as a live row -- the A-2 hazard)');
+    } finally { await tgtClientB.end(); }
+  });
+
+  await run('P4', 'unlisted DB: full classification printed, run refused, nothing altered anywhere (E-1 default branch)', async () => {
+    const dbName = `${DB_PREFIX}unlisted_p4`;
+    await createDb(dbName); // deliberately self-contained -- dropped at the end of THIS test, never left for later tests to trip over
+    try {
+      const client = await pgConnect(dbName);
+      try { await client.query(MINIMAL_CORPUS_DDL); } finally { await client.end(); }
+
+      const r = runMigrate03(['--db', DB_TARGET], { HANDOFF_BASE_DIR: fixtureBase });
+      assert(r.status !== 0, `expected non-zero exit for an UNCLASSIFIED database, got ${r.status}`);
+      assert(r.stdout.includes(`[UNCLASSIFIED] "${dbName}"`), `expected the UNCLASSIFIED report line, got:\n${r.stdout}`);
+      assert(/Refused \(E-1 total classification\)/.test(r.stderr), `expected the E-1 refusal message, got: ${r.stderr}`);
+
+      const chkClient = await pgConnect(DB_CORPUS_HAPPY);
+      try {
+        assert(await migrate03.columnExists(chkClient, 'memory_entries', 'project_id'), 'sanity: DB_CORPUS_HAPPY was already migrated by earlier tests and must remain unaffected by this refused run');
+      } finally { await chkClient.end(); }
+    } finally {
+      await dropDb(dbName); // must not leak into later tests' total classification
+    }
+  });
+
+  await run('P5a', 'missing --db-triage file: loud FATAL (A-6 write-side posture, distinct from T0/T2/T4/T9\'s read-side non-fatal-on-absence)', async () => {
+    const missingPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'm03-triage-missing-')), 'does-not-exist.json');
+    const r = runMigrate03(['--db', DB_TARGET, '--db-triage', missingPath], { HANDOFF_BASE_DIR: fixtureBase });
+    assert(r.status !== 0, `expected non-zero exit, got ${r.status}`);
+    assert(/FATAL: db-triage config not found/.test(r.stderr), `expected the missing-file FATAL, got: ${r.stderr}`);
+  });
+
+  await run('P5b', 'malformed --db-triage file: collected multi-error FATAL naming EVERY problem (bad class, unanchored pattern, invalid regex, a pattern shadowing a REAL-MIGRATE name)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'm03-triage-malformed-'));
+    const malformedPath = path.join(dir, 'db-triage.json');
+    fs.writeFileSync(malformedPath, JSON.stringify({
+      databases: {
+        [DB_CORPUS_HAPPY]: 'REAL-MIGRATE',
+        bad_class_db: 'NOT-A-REAL-CLASS',
+      },
+      test_artifact_db_patterns: [
+        'not-anchored',
+        '^[invalid(',
+        `^${DB_CORPUS_HAPPY}$`,
+      ],
+    }, null, 2), 'utf8');
+
+    const r = runMigrate03(['--db', DB_TARGET, '--db-triage', malformedPath], { HANDOFF_BASE_DIR: fixtureBase });
+    assert(r.status !== 0, `expected non-zero exit, got ${r.status}`);
+    assert(/is not a valid class/.test(r.stderr), `expected the invalid-class problem named, got: ${r.stderr}`);
+    assert(/is not anchored/.test(r.stderr), `expected the unanchored-pattern problem named, got: ${r.stderr}`);
+    assert(/is not a valid regular expression/.test(r.stderr), `expected the invalid-regex problem named, got: ${r.stderr}`);
+    assert(new RegExp(`matches "${DB_CORPUS_HAPPY}", which this file triages "REAL-MIGRATE"`).test(r.stderr), `expected the pattern-shadows-REAL-MIGRATE cross-check problem named, got: ${r.stderr}`);
+  });
+
+  await run('P6-A7', 'classifyDbProvenance (A-7): an OWN "constructor" property in triage.databases classifies by ITS OWN value; a DB literally named "constructor" ABSENT from triage is UNCLASSIFIED, never Object.prototype.constructor', async () => {
+    const triageWithConstructor = { databases: JSON.parse('{"constructor":"REAL-MIGRATE"}'), compiledPatterns: [] };
+    const r1 = migrate04.classifyDbProvenance('constructor', triageWithConstructor, 'some_bookkeeping_target');
+    assert(r1.branch === 'real-migrate', `expected real-migrate for an explicit own-property "constructor" entry, got ${r1.branch}`);
+
+    const triageWithoutConstructor = { databases: {}, compiledPatterns: [] };
+    const r2 = migrate04.classifyDbProvenance('constructor', triageWithoutConstructor, 'some_bookkeeping_target');
+    assert(r2.branch === 'unclassified', `expected UNCLASSIFIED for a DB literally named "constructor" absent from triage (never a silent escape via Object.prototype.constructor), got ${r2.branch}`);
+  });
+
+  // NOTE on class choice (author's resolution of a genuine spec tension,
+  // documented in the PR body): spec item (7) names REAL-MIGRATE, but A-5's
+  // own load-time cross-check (implemented in loadDbTriageFull, spec §2.2)
+  // FATALs the ENTIRE config load if any pattern matches a name triaged
+  // REAL-MIGRATE or OWNER-REVIEW -- the two requirements are mutually
+  // exclusive for those two classes specifically (a REAL-MIGRATE fixture
+  // that also matches a pattern can never reach the runtime classifier at
+  // all; the config is refused first). ENGINE-INFRA and EPHEMERAL-DROP are
+  // NOT covered by that cross-check, so "explicit wins over pattern" is
+  // demonstrated here via ENGINE-INFRA instead -- the same precedence
+  // property (spec §2.1's precedence order 2 over 3), proven by the
+  // triage branch's OWN report line (ENGINE-INFRA-SKIP) firing instead of
+  // the pattern branch's (TEST-ARTIFACT-DB), plus the shadow INFO line.
+  await run('P7', 'explicit-wins: a name BOTH triaged ENGINE-INFRA AND pattern-matching resolves via the triage branch (not the pattern branch), with a shadow INFO line', async () => {
+    const dbName = `${DB_PREFIX}patterntest_p7_shadow`;
+    await createExtraCorpusDb(dbName, [{ name: 'x', body: 'shadow test', source_file: 'memory/x.md' }]);
+    TRIAGE_PATTERNS.push(`^${DB_PREFIX}patterntest_p7_`); // matches dbName
+    TRIAGE_DATABASES[dbName] = 'ENGINE-INFRA'; // explicit entry ALSO applies -- must win over the pattern
+    writeTriageFixture();
+
+    const r = runMigrate03(['--db', DB_TARGET], { HANDOFF_BASE_DIR: fixtureBase });
+    assert(r.status === 0, `expected exit 0, got ${r.status}\nstdout:${r.stdout}\nstderr:${r.stderr}`);
+    assert(r.stdout.includes('explicit triage class "ENGINE-INFRA" wins over shadowed pattern'), `expected the shadow INFO line, got:\n${r.stdout}`);
+    assert(r.stdout.includes(`[ENGINE-INFRA-SKIP] "${dbName}"`), `expected the triage branch's own report line to win, got:\n${r.stdout}`);
+    assert(!r.stdout.includes(`[TEST-ARTIFACT-DB] "${dbName}"`), 'the pattern-form report line must NOT fire once an explicit triage entry claims this name');
+  });
+
+  await run('P8', 'bookkeeping target matching a pattern: classified bookkeeping-target (precedence order 1, ahead of the pattern branch), run proceeds unaffected', async () => {
+    TRIAGE_PATTERNS.push(`^${DB_TARGET}$`); // deliberately matches the bookkeeping target's own name
+    writeTriageFixture();
+    try {
+      const r = runMigrate03(['--db', DB_TARGET], { HANDOFF_BASE_DIR: fixtureBase });
+      assert(r.status === 0, `expected exit 0, got ${r.status}\nstdout:${r.stdout}\nstderr:${r.stderr}`);
+      assert(r.stdout.includes(`[BOOKKEEPING-TARGET] "${DB_TARGET}"`), `expected the bookkeeping-target report line despite the pattern match, got:\n${r.stdout}`);
+      assert(!r.stdout.includes(`[TEST-ARTIFACT-DB] "${DB_TARGET}"`), 'the bookkeeping target must NEVER be reported as test-artifact-db, even when a pattern matches its own name');
+    } finally {
+      TRIAGE_PATTERNS.pop(); // must not carry this pattern forward into later tests
+      writeTriageFixture();
+    }
+  });
+
+  await run('P9', '--discover-only: prints all branches, exits 1 iff an UNCLASSIFIED database is present', async () => {
+    const clean = runMigrate03(['--discover-only', '--db', DB_TARGET], { HANDOFF_BASE_DIR: fixtureBase });
+    assert(clean.status === 0, `expected exit 0 with no UNCLASSIFIED names present, got ${clean.status}\nstdout:${clean.stdout}\nstderr:${clean.stderr}`);
+
+    const dbName = `${DB_PREFIX}unlisted_p9`;
+    await createDb(dbName);
+    try {
+      const client = await pgConnect(dbName);
+      try { await client.query(MINIMAL_CORPUS_DDL); } finally { await client.end(); }
+      const dirty = runMigrate03(['--discover-only', '--db', DB_TARGET], { HANDOFF_BASE_DIR: fixtureBase });
+      assert(dirty.status !== 0, `expected non-zero exit with an UNCLASSIFIED name present, got ${dirty.status}`);
+      assert(dirty.stdout.includes(`[UNCLASSIFIED] "${dbName}"`), `expected the UNCLASSIFIED report line, got:\n${dirty.stdout}`);
+    } finally {
+      await dropDb(dbName);
+    }
+  });
+
   console.log(`\n${passed} passed, ${failed} failed`);
 }
 
 async function cleanup() {
   for (const db of CREATED_DBS) await dropDb(db);
+  for (const db of EXTRA_DBS) await dropDb(db); // cm#189 Group 3 fixtures (best-effort, non-load-bearing)
   if (fixtureBase) { try { fs.rmSync(fixtureBase, { recursive: true, force: true }); } catch (_) {} }
   if (BACKUP_DIR) { try { fs.rmSync(BACKUP_DIR, { recursive: true, force: true }); } catch (_) {} }
 }

@@ -1,5 +1,5 @@
 {
-  "_comment": "SYNTHETIC EXAMPLE ONLY — obviously-fake database names throughout. The real db-triage.json carries private instance data (real Postgres database names on the owner's own instance) and is gitignored, never committed. This file documents the required SHAPE migrate-04-absorb-pipeline-tables.js's loadDbTriage()/classifyDb() implement, and is also what test/migrations/test-migrate-04-absorb-pipeline-tables.js loads (via --db-triage) so the suite runs green with no private data present, in CI or anywhere else. E-1/E-8 (CONSOLIDATION-RUNBOOK.md §6.1(e) amendment, memory-manager#11(e)): TOTAL classification over every non-template pg_database entry — a flat map of db name -> one of four classes. classifyDb()'s DEFAULT branch (a db name absent from this map) is 'UNCLASSIFIED', a loud, run-blocking refusal — never a silent skip and never a silent REAL-MIGRATE guess.",
+  "_comment": "SYNTHETIC EXAMPLE ONLY — obviously-fake database names throughout. The real db-triage.json carries private instance data (real Postgres database names on the owner's own instance) and is gitignored, never committed. This file documents the required SHAPE migrate-04-absorb-pipeline-tables.js's loadDbTriage()/classifyDb() implement, and is also what test/migrations/test-migrate-04-absorb-pipeline-tables.js loads (via --db-triage) so the suite runs green with no private data present, in CI or anywhere else. E-1/E-8 (CONSOLIDATION-RUNBOOK.md §6.1(e) amendment, memory-manager#11(e)): TOTAL classification over every non-template pg_database entry — a flat map of db name -> one of four classes. classifyDb()'s DEFAULT branch (a db name absent from this map) is 'UNCLASSIFIED', a loud, run-blocking refusal — never a silent skip and never a silent REAL-MIGRATE guess. cm#189: this same file also feeds migrate-03-corpus-project-id.js's total provenance classification (loadDbTriageFull()/classifyDbProvenance(), scripts/migrations/migrate-04-absorb-pipeline-tables.js) via the added `test_artifact_db_patterns` key below — one file, two loaders, backward-compatible (loadDbTriage() ignores keys it doesn't read).",
   "classes": {
     "_comment": "The four real classes. REAL-MIGRATE: this script connects and migrates in-scope tables from it (an empty result for a REAL-MIGRATE db with zero in-scope tables is a normal, reported outcome, never an error). EPHEMERAL-DROP: loud-skipped, self-evidently disposable test/debug scratch data, mirrors CONSOLIDATION-RUNBOOK.md §16.3's own triage table. OWNER-REVIEW: loud-skipped, V6 'leave alone' — never migrated, never dropped, without explicit owner sign-off. ENGINE-INFRA: loud-skipped; this repo's OWN target/test-fixture databases (memory_manager_staging, claude_memory_eval_test, the Postgres maintenance db, etc.) — distinguished from EPHEMERAL-DROP only for clearer reporting: permanent infra this script structurally must never touch as a SOURCE, not disposable test debris a human might someday delete."
   },
@@ -15,5 +15,27 @@
     "postgres":                        "ENGINE-INFRA",
     "example_memory_manager_staging":  "ENGINE-INFRA",
     "example_eval_test_fixture_db":    "ENGINE-INFRA"
-  }
+  },
+  "_comment_test_artifact_db_patterns": "cm#189 (spec-adversary A-1/A-5) -- REQUIRED key below (may be an empty array, never absent). Every entry MUST be a plain pattern string, anchored with a leading '^' (an unanchored pattern can match a substring of a real database name), and MUST NOT match any name this file triages REAL-MIGRATE or OWNER-REVIEW (checked at load time, loadDbTriageFull() FATALs on a violation) -- never a comment/annotation entry inside the array itself, since every array entry IS a live pattern. This is an OVERLAY on top of the `databases` explicit map, never the totality mechanism -- an unmatched, untriaged name is still UNCLASSIFIED, a loud refusal (A-1). These patterns are evidence-derived from this repo's own test/scripts/test-* fixture-DB minting sites (see the authoring PR body for the verified minting-site cross-check); a fixture suite that mints a NEW naming convention adds its own pattern here, or the operator adds an explicit EPHEMERAL-DROP entry to `databases` above -- never widen an existing pattern to cover an unrelated convention.",
+  "test_artifact_db_patterns": [
+    "^adv\\d+_\\d{10,}_",
+    "^t0check_(source|target)_\\d{10,}",
+    "^verify(0\\d|1\\d|own)[a-z0-9]*_.*_\\d{10,}(_staging)?$",
+    "^migrate0\\d_test_",
+    "^mm09_test_\\d{10,}_staging$",
+    "^msa_prereq_\\d{10,}_staging$",
+    "^caveman_(gate_test|gate_prereq|storewide)_\\d{10,}",
+    "^cm_bb_test_\\d{10,}_\\d+$",
+    "^cm_s\\d+[a-z0-9_]*_\\d{10,}_\\d+$",
+    "^cm185_t\\d_\\d{10,}$",
+    "^cm_test_hrow_\\d{10,}$",
+    "^l3_(t\\d+|debug\\d*)_\\d{10,}$",
+    "^claude_memory_l4_t\\d_\\d{10,}$",
+    "^claude_memory_ptr_gate_\\d{10,}$",
+    "^(pipeline_)?handoff_confirm_c\\d_\\d{10,}$",
+    "^claude_mem_(adv|debug)_[a-z]_\\d{10,}$",
+    "^claude_memory_(w\\d|c\\d|harden|debug|graphtest_[A-Za-z])_\\d{10,}$",
+    "^distill_gate3_\\d{10,}$",
+    "^cm_fixture_"
+  ]
 }

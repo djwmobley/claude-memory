@@ -25,22 +25,51 @@
  *
  * WHAT THIS SCRIPT DOES:
  *
- *   1. DISCOVERY (D3-4, total classification, BEFORE any ALTER anywhere):
- *      enumerates `pg_database` (every non-template, connectable-in-
- *      principle database name), CONNECTS TO EACH ONE INDIVIDUALLY (never
- *      a cross-DB `information_schema` query — verified false-result-prone
- *      across DBs), and classifies it:
+ *   1. DISCOVERY (D3-4, extended by cm#189's spec-adversary hardened total
+ *      PROVENANCE classification, BEFORE any ALTER anywhere): enumerates
+ *      `pg_database` (every non-template, connectable-in-principle
+ *      database name) and classifies EACH `datname` via the shared
+ *      `migrate04.classifyDbProvenance()` (scripts/migrations/migrate-04-
+ *      absorb-pipeline-tables.js, reused by reference) STRICTLY BEFORE any
+ *      connection is opened to it -- provenance is a NAME property, never
+ *      inferred from a connection attempt. Precedence order, first match
+ *      wins:
+ *        1. bookkeeping-target -- `datname === <resolved --db target>`,
+ *           byte-exact. Never a corpus source, never manifested, never
+ *           pattern-checked (closes cm#189/A-2: an unscoped run previously
+ *           discovered the consolidation TARGET itself as its own
+ *           migration source, double-counting every absorbed row).
+ *        2. Triage branch -- an explicit `--db-triage` (default
+ *           `db-triage.json`, gitignored) entry, looked up via
+ *           `Object.hasOwn` (never a plain `[dbName]` truthiness check --
+ *           A-7's prototype-pollution hole): REAL-MIGRATE proceeds to
+ *           CONNECT + classify holds-corpus/no-corpus/unreachable (below,
+ *           unchanged); EPHEMERAL-DROP/ENGINE-INFRA/OWNER-REVIEW are a
+ *           loud, named skip -- NEVER connected, never manifested, never
+ *           ALTERed (ENGINE-INFRA is the branch that stops the A-2
+ *           resurrection hazard for `claude_memory_eval_ci`/
+ *           `claude_memory_eval_test`, neither of which is fixture-named).
+ *        3. Pattern branch -- not in triage, first `test_artifact_db_
+ *           patterns` regex match -> a loud, named skip (same disposition
+ *           as EPHEMERAL-DROP, reported as the "pattern form").
+ *        4. DEFAULT: UNCLASSIFIED -- collected, printed, then a whole-run
+ *           refusal (nothing applied to ANY database) before any backup/
+ *           ALTER/manifest write anywhere (E-1 posture) -- never a silent
+ *           REAL-MIGRATE guess.
+ *      Only a `real-migrate`-branch name is ever CONNECTED to (A-4/A-9),
+ *      individually (never a cross-DB `information_schema` query --
+ *      verified false-result-prone across DBs), and classified:
  *        - holds-corpus   -- has a `memory_entries` base table (chunks
  *                            tracked as present/absent separately: a
  *                            corpus DB with entries but no chunks table
  *                            is a valid, if unusual, state)
  *        - no-corpus      -- neither corpus table exists
  *        - unreachable    -- the connection itself failed
- *      The FULL classification is printed before any ALTER TABLE is
- *      issued anywhere. Any `unreachable` database is a loud FATAL that
- *      refuses the entire run (nothing applied to any database) — this
- *      script never silently skips a database it could not reach.
- *      `--db-prefix <prefix>` scopes discovery to `datname LIKE
+ *      The FULL classification (every branch) is printed before any ALTER
+ *      TABLE is issued anywhere. Any `unreachable` real-migrate database is
+ *      a loud FATAL that refuses the entire run (nothing applied to any
+ *      database) -- this script never silently skips a database it could
+ *      not reach. `--db-prefix <prefix>` scopes discovery to `datname LIKE
  *      '<prefix>%'` -- an explicit, printed, operator-declared boundary
  *      for test isolation (this repo's test suite never touches a real
  *      local database), never a silent narrowing: production invocations
@@ -198,6 +227,7 @@ const crypto = require('crypto');
 const { Client } = require('pg');
 
 const migrateOne = require('./migrate-01-canonical-db');
+const migrate04 = require('./migrate-04-absorb-pipeline-tables'); // db-triage: loadDbTriageFull/classifyDbProvenance, reused by reference (cm#189)
 const shared = require('./lib/verify15-shared'); // migration_manifest DDL + rowHash, reused by reference
 const sfn = require('../lib/source-file-normalize');
 const { resolveBaseDir } = require('../lib/handoff-paths');
@@ -209,6 +239,7 @@ const MIGRATIONS_DIR = __dirname;
 const DEFAULT_MAP_OUT_PATH = path.join(MIGRATIONS_DIR, 'memory-entry-project-map.json');
 const DEFAULT_BACKUP_DIR = path.join(MIGRATIONS_DIR, 'backups'); // already gitignored -- shared with migrate-02's backups
 const DEFAULT_DIR_OVERRIDES_PATH = path.join(MIGRATIONS_DIR, 'memory-entry-dir-overrides.json');
+const DEFAULT_DB_TRIAGE_PATH = path.join(MIGRATIONS_DIR, 'db-triage.json'); // real file gitignored; see db-triage.example.json (cm#189)
 const ORPHAN_PROJECT_ID = 'unmapped-orphan-memory-entry';
 const DEFAULT_BATCH_SIZE = 500;
 
@@ -229,6 +260,7 @@ function parseArgs(argv) {
     db: null, dbPrefix: null, batchSize: DEFAULT_BATCH_SIZE,
     mapOut: DEFAULT_MAP_OUT_PATH, backupDir: DEFAULT_BACKUP_DIR,
     dirOverridesPath: DEFAULT_DIR_OVERRIDES_PATH,
+    dbTriagePath: DEFAULT_DB_TRIAGE_PATH,
     discoverOnly: false, rollback: false, help: false,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -245,6 +277,8 @@ function parseArgs(argv) {
     else if (a.startsWith('--backup-dir=')) parsed.backupDir = a.slice('--backup-dir='.length);
     else if (a === '--dir-overrides') parsed.dirOverridesPath = argv[++i];
     else if (a.startsWith('--dir-overrides=')) parsed.dirOverridesPath = a.slice('--dir-overrides='.length);
+    else if (a === '--db-triage') parsed.dbTriagePath = argv[++i];
+    else if (a.startsWith('--db-triage=')) parsed.dbTriagePath = a.slice('--db-triage='.length);
     else if (a === '--discover-only') parsed.discoverOnly = true;
     else if (a === '--rollback') parsed.rollback = true;
     else if (a === '--help' || a === '-h') parsed.help = true;
@@ -285,8 +319,16 @@ function printUsage() {
     '                       transcript resolution, on an exact dirName match.',
     '                       Optional -- a missing file means zero overrides;',
     '                       a PRESENT but malformed file is a loud FATAL.',
+    '  --db-triage <path>   Path to db-triage.json (default: alongside this',
+    '                       script). REQUIRED -- a missing file is a loud',
+    '                       FATAL (cm#189): total provenance classification',
+    '                       (bookkeeping-target / triage / pattern /',
+    '                       UNCLASSIFIED) runs BEFORE any database is',
+    '                       enumerated for connection; a name absent from',
+    '                       every branch refuses the entire run.',
     '  --discover-only      Print the discovery classification and exit -- no',
-    '                       database is altered.',
+    '                       database is altered. Exits 1 if any database is',
+    '                       UNCLASSIFIED, even though nothing was mutated.',
     '  --rollback           Drop project_id from every corpus DB found in',
     '                       discovery + delete this run\'s manifest slices.',
   ].join('\n'));
@@ -349,26 +391,103 @@ async function classifyDatabase(dbName) {
   }
 }
 
-async function discoverAndClassify(dbPrefix) {
+/**
+ * cm#189 (spec-adversary hardened, 2026-08-24, spec §2.1): TOTAL provenance
+ * classification, replacing D3-4's old three-branch model (holds-corpus /
+ * no-corpus / unreachable applied to EVERY enumerated name with no gate in
+ * front of it). Every enumerated `datname` is classified via the SHARED
+ * `migrate04.classifyDbProvenance()` (scripts/migrations/migrate-04-absorb-
+ * pipeline-tables.js, reused by reference -- one engine, never a private
+ * copy) STRICTLY BEFORE any connection is opened to it (A-4). ONLY a name
+ * resolved to the 'real-migrate' branch is ever connected to (via
+ * classifyDatabase, D3-4's original connect-and-inspect step, unchanged --
+ * it still answers holds-corpus/no-corpus/unreachable for that name).
+ * Every other branch (bookkeeping-target / test-artifact-db /
+ * engine-infra-skip / owner-review-skip / unclassified) is reported with
+ * ZERO connection ever attempted (A-4/A-9) -- this, not the pattern list
+ * alone, is what stops the A-2 resurrection hazard for ENGINE-INFRA-
+ * triaged sources like claude_memory_eval_ci/claude_memory_eval_test,
+ * neither of which is fixture-named.
+ *
+ * `status` on the returned record equals the resolved branch name for
+ * every non-real-migrate entry (so a caller filtering
+ * `c.status === 'holds-corpus'` for the corpus-DB worklist, or
+ * `c.status === 'unreachable'` for the whole-run refusal, is unaffected --
+ * those two statuses can only ever originate from the real-migrate branch).
+ */
+async function discoverAndClassify(dbPrefix, triage, resolvedTarget) {
   const names = await enumerateDatabases(dbPrefix);
   const classifications = [];
   for (const name of names) {
-    classifications.push(await classifyDatabase(name));
+    const provenance = migrate04.classifyDbProvenance(name, triage, resolvedTarget);
+    if (provenance.branch === 'real-migrate') {
+      const c = await classifyDatabase(name);
+      classifications.push({ ...c, branch: 'real-migrate', provenance });
+    } else {
+      classifications.push({ dbName: name, status: provenance.branch, branch: provenance.branch, provenance });
+    }
   }
   return classifications;
 }
 
+/**
+ * Report-line format per spec §2.1: one line per branch, an INFO line for
+ * any triage entry that shadows a pattern, and a per-branch summary count.
+ * `[TEST-ARTIFACT-DB]`/`[ENGINE-INFRA-SKIP]`/`[OWNER-REVIEW-SKIP]` name
+ * "never connected, never manifested" explicitly (never ALTERed, for
+ * owner-review) -- the loudness this classification's refusal/skip
+ * behavior lives in, since none of those branches ever write a manifest
+ * row for the caller's own T9 roster machinery to see (spec §2.4).
+ */
 function printClassification(classifications, dbPrefix) {
-  console.log(`Discovery (D3-4)${dbPrefix ? ` -- scoped to datname LIKE "${dbPrefix}%" (TEST ISOLATION SCOPE, never silent)` : ' -- TRUE TOTAL enumeration (no --db-prefix scope)'}:`);
+  console.log(`Discovery + total provenance classification (D3-4 + cm#189 §2.1)${dbPrefix ? ` -- scoped to datname LIKE "${dbPrefix}%" (TEST ISOLATION SCOPE, never silent)` : ' -- TRUE TOTAL enumeration (no --db-prefix scope)'}:`);
+  const counts = {
+    'bookkeeping-target': 0, 'real-migrate-holds-corpus': 0, 'real-migrate-no-corpus': 0,
+    'real-migrate-unreachable': 0, 'test-artifact-db': 0, 'engine-infra-skip': 0,
+    'owner-review-skip': 0, unclassified: 0,
+  };
   for (const c of classifications) {
-    if (c.status === 'unreachable') {
-      console.log(`  - "${c.dbName}": UNREACHABLE (${c.error})`);
+    const prov = c.provenance;
+    if (prov.shadowedPattern) {
+      console.log(`  [INFO] "${c.dbName}": explicit triage class "${prov.triageClass}" wins over shadowed pattern /${prov.shadowedPattern}/`);
+    }
+    if (c.branch === 'bookkeeping-target') {
+      console.log(`  [BOOKKEEPING-TARGET] "${c.dbName}" -- never a corpus source, never manifested, never pattern-checked.`);
+      counts['bookkeeping-target']++;
+    } else if (c.branch === 'test-artifact-db') {
+      const src = prov.source === 'pattern' ? `pattern /${prov.patternSrc}/` : 'triage EPHEMERAL-DROP';
+      console.log(`  [TEST-ARTIFACT-DB] "${c.dbName}" (${src}) -- never connected, never manifested`);
+      counts['test-artifact-db']++;
+    } else if (c.branch === 'engine-infra-skip') {
+      console.log(`  [ENGINE-INFRA-SKIP] "${c.dbName}" (triage ENGINE-INFRA) -- never connected, never manifested`);
+      counts['engine-infra-skip']++;
+    } else if (c.branch === 'owner-review-skip') {
+      console.log(`  [OWNER-REVIEW-SKIP] "${c.dbName}" (triage OWNER-REVIEW) -- never connected, never ALTERed, never manifested`);
+      counts['owner-review-skip']++;
+    } else if (c.branch === 'unclassified') {
+      console.log(`  [UNCLASSIFIED] "${c.dbName}"${prov.reason ? ` (${prov.reason})` : ''} -- BLOCKS THE RUN (E-1 posture)`);
+      counts.unclassified++;
+    } else if (c.status === 'unreachable') {
+      console.log(`  [REAL-MIGRATE] "${c.dbName}": UNREACHABLE (${c.error})`);
+      counts['real-migrate-unreachable']++;
     } else if (c.status === 'holds-corpus') {
-      console.log(`  - "${c.dbName}": holds-corpus (entries=${c.hasEntries}, chunks=${c.hasChunks})`);
+      console.log(`  [REAL-MIGRATE] "${c.dbName}": holds-corpus (entries=${c.hasEntries}, chunks=${c.hasChunks})`);
+      counts['real-migrate-holds-corpus']++;
     } else {
-      console.log(`  - "${c.dbName}": no-corpus`);
+      console.log(`  [REAL-MIGRATE] "${c.dbName}": no-corpus`);
+      counts['real-migrate-no-corpus']++;
     }
   }
+  console.log(
+    `  Summary: bookkeeping-target=${counts['bookkeeping-target']} ` +
+    `real-migrate-holds-corpus=${counts['real-migrate-holds-corpus']} ` +
+    `real-migrate-no-corpus=${counts['real-migrate-no-corpus']} ` +
+    `real-migrate-unreachable=${counts['real-migrate-unreachable']} ` +
+    `test-artifact-db=${counts['test-artifact-db']} ` +
+    `engine-infra-skip=${counts['engine-infra-skip']} ` +
+    `owner-review-skip=${counts['owner-review-skip']} ` +
+    `unclassified=${counts.unclassified}`
+  );
 }
 
 // ─── MAP-BUILDING (D3-1/D3-2) ───────────────────────────────────────────────
@@ -1116,13 +1235,30 @@ async function rollbackOneDb(client, tgtClient, dbName, hasChunks) {
 
 // ─── MAP AUDIT ARTIFACT (D3-7) ─────────────────────────────────────────────
 
-function writeMapArtifact(mapOutPath, dirIndex, perDbResults) {
+/**
+ * `classifications`, when supplied (omitted only by the pre-cm#189 rollback
+ * caller which never runs discovery's provenance step at all under
+ * --rollback -- see main()), is D3-4/§2.1's own array from
+ * discoverAndClassify -- serialized here as `db_classification` per spec
+ * §2.1's last line ("The map audit artifact gains a db_classification
+ * section recording every branch decision").
+ */
+function writeMapArtifact(mapOutPath, dirIndex, perDbResults, classifications) {
   const payload = {
     _comment: 'AUDIT ARTIFACT of a migrate-03-corpus-project-id.js run -- never read back as input (D3-7: map-build and map-apply happen in one atomic pass). Real instance data -- gitignored, never committed. See memory-entry-project-map.example.json for the shape documented for public consumption.',
     generated_at: new Date().toISOString(),
     projects_root: dirIndex.projectsRoot,
     resolved_dirs: dirIndex.dirs.filter((d) => d.projectId).map((d) => ({ dirName: d.dirName, projectId: d.projectId, fileCount: d.files.size })),
     unmapped_dirs: dirIndex.dirs.filter((d) => !d.projectId).map((d) => ({ dirName: d.dirName, reason: d.unmappedReason })),
+    db_classification: (classifications || []).map((c) => ({
+      dbName: c.dbName,
+      branch: c.branch,
+      status: c.status,
+      triageClass: c.provenance ? c.provenance.triageClass || null : null,
+      source: c.provenance ? c.provenance.source || null : null,
+      patternSrc: c.provenance ? c.provenance.patternSrc || null : null,
+      shadowedPattern: c.provenance ? c.provenance.shadowedPattern || null : null,
+    })),
     per_db: {},
   };
   for (const [dbName, r] of Object.entries(perDbResults)) {
@@ -1169,9 +1305,37 @@ async function main() {
 
   console.log(`migrate-03-corpus-project-id: bookkeeping target="${target}" (resolved from ${targetSource}) mode=${parsed.rollback ? 'ROLLBACK' : parsed.discoverOnly ? 'DISCOVER-ONLY' : 'MIGRATE'}`);
 
-  // ── Discovery (D3-4) -- ALWAYS runs first, before any ALTER anywhere ──
-  const classifications = await discoverAndClassify(parsed.dbPrefix);
+  // ── db-triage (cm#189, A-6): FATAL on missing/malformed, BEFORE any
+  // enumeration or connection -- write-side posture (mirrors migrate-04's
+  // own loadDbTriage refusal), never the read-side non-fatal-on-absence
+  // posture T0/T2/T4/T9 use (loadDbTriage exits the process itself on any
+  // problem, so no further handling is needed here on failure).
+  const triage = migrate04.loadDbTriageFull(parsed.dbTriagePath);
+  console.log(`db-triage: "${triage.path}" -- ${Object.keys(triage.databases).length} explicitly triaged database(s), ${triage.compiledPatterns.length} test-artifact pattern(s) loaded.`);
+
+  // ── Discovery + total provenance classification (D3-4 + cm#189 §2.1) --
+  // ALWAYS runs first, before any ALTER anywhere. Classification is a NAME
+  // property resolved BEFORE any connection (A-4) -- only a name resolved
+  // to the 'real-migrate' branch is ever connected to.
+  const classifications = await discoverAndClassify(parsed.dbPrefix, triage, target);
   printClassification(classifications, parsed.dbPrefix);
+
+  // UNCLASSIFIED is the E-1 total-classification default branch: a loud,
+  // whole-run refusal BEFORE any backup/ALTER/manifest write anywhere --
+  // checked even in --discover-only / --rollback mode (spec §2.1's last
+  // line: "applies identically ... in rollback mode"), and checked BEFORE
+  // the pre-existing unreachable refusal below (both are pre-mutation
+  // refusals; order between them is not itself load-bearing, but an
+  // operator fixing UNCLASSIFIED names first is the more useful order).
+  const unclassified = classifications.filter((c) => c.branch === 'unclassified');
+  if (unclassified.length) {
+    console.error(`Refused (E-1 total classification): ${unclassified.length} database(s) are UNCLASSIFIED -- absent from db-triage.json's "databases" map AND matched by no "test_artifact_db_patterns" entry. Nothing was applied to ANY database:`);
+    for (const u of unclassified) console.error(`  - "${u.dbName}"${u.provenance.reason ? ` (${u.provenance.reason})` : ''}`);
+    console.error('Total classification: every database must resolve to bookkeeping-target, an explicit db-triage.json class, a test_artifact_db_patterns match, or UNCLASSIFIED (which blocks the run) -- never a silent guess.');
+    process.exitCode = 1;
+    return;
+  }
+
   const unreachable = classifications.filter((c) => c.status === 'unreachable');
   if (unreachable.length) {
     console.error(`Refused: ${unreachable.length} database(s) were unreachable during discovery (D3-4) — nothing was applied to ANY database:`);
@@ -1180,7 +1344,7 @@ async function main() {
     return;
   }
   const corpusDbs = classifications.filter((c) => c.status === 'holds-corpus');
-  console.log(`Discovery complete: ${corpusDbs.length} corpus-holding database(s), ${classifications.length - corpusDbs.length} without corpus tables.`);
+  console.log(`Discovery complete: ${corpusDbs.length} corpus-holding database(s) eligible for backfill (${classifications.length - corpusDbs.length} other database(s) reported above -- bookkeeping-target/no-corpus/test-artifact-db/engine-infra-skip/owner-review-skip).`);
 
   if (parsed.discoverOnly) {
     process.exitCode = 0;
@@ -1267,7 +1431,7 @@ async function main() {
 
     if (corpusDbs.length === 0) {
       console.log('No corpus-holding databases found — nothing to backfill.');
-      writeMapArtifact(parsed.mapOut, dirIndex, {});
+      writeMapArtifact(parsed.mapOut, dirIndex, {}, classifications);
       console.log(`MIGRATION_RESULT: PASS (0 corpus database(s))`);
       exitCode = 0;
       return;
@@ -1358,7 +1522,7 @@ async function main() {
       }
     }
 
-    writeMapArtifact(parsed.mapOut, dirIndex, perDbResults);
+    writeMapArtifact(parsed.mapOut, dirIndex, perDbResults, classifications);
     console.log(`Map audit artifact written: ${parsed.mapOut}`);
 
     console.log(`MIGRATION_RESULT: ${allPass ? 'PASS' : 'FAIL'} (${corpusDbs.length} corpus database(s))`);
@@ -1408,6 +1572,7 @@ module.exports = {
   DEFAULT_MAP_OUT_PATH,
   DEFAULT_BACKUP_DIR,
   DEFAULT_DIR_OVERRIDES_PATH,
+  DEFAULT_DB_TRIAGE_PATH,
   ENTRIES_TABLE,
   CHUNKS_TABLE,
   ENTRIES_LOAD_BEARING_COLS,
