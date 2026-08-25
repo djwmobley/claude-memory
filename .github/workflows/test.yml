@@ -144,6 +144,27 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run roster T3-declaration audit (--no-connect, example roster)
+        # Runs scripts/migrations/audit-roster-t3-declarations.js in
+        # --no-connect mode against the committed, synthetic
+        # source-table-roster.example.json (cm#210, PR #216). This gates two
+        # things: (1) declaration-shape validity of the example roster itself
+        # -- class 3 (every _db_absorb-suffixed entry declares
+        # manifest_label_duplicate_of) and class 4's name-difference sweep --
+        # and (2) the audit script's own load-time checks (shared.loadRoster's
+        # validateRosterShape/validateRosterSourceDbShapes/
+        # validateRosterPartitionDisjoint/validateLineageDeclarations), since
+        # a malformed example roster would FATAL there before either class
+        # runs. No live database connection is opened -- SOURCE_TABLE_ROSTER
+        # points at the committed example file, which carries no real
+        # source/target DBs to connect to. This does NOT run the script's
+        # full mode (classes 1/2 and class 4's missing-column check): full
+        # mode requires live source AND target connections and is the
+        # orchestrator-run staging check (spec 2.5), not a CI-appropriate
+        # check against synthetic data -- see this PR's blind-spot section.
+        run: node scripts/migrations/audit-roster-t3-declarations.js --no-connect
+        env:
+          SOURCE_TABLE_ROSTER: scripts/migrations/source-table-roster.example.json
       - name: Run migrate-schema-addenda tests
         # Tests scripts/migrations/migrate-schema-addenda.js, the schema-only
         # addenda runner that applies six net-new SQL pieces on top of a
