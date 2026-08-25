@@ -361,6 +361,30 @@ async function testProofOfFiring() {
     }
     await client.query(`UPDATE embedding_providers SET native_dims = 4096 WHERE name = 'vllm-local'`); // heal (manual — matches header note)
 
+    // (h) [cm#208 S-5 T5h] DROP the standalone unique index and recreate it,
+    // SAME NAME, as a PLAIN (non-unique) index -- a live proof that the
+    // unique-flag symmetric check (S-4/F-4) actually fires end-to-end
+    // against a real catalog, not just the T7 unit-level fixtures.
+    // CREATE UNIQUE INDEX IF NOT EXISTS never fires this perturbation on its
+    // own (F-6: IF NOT EXISTS keys on the NAME, not the definition) -- it
+    // only reaches the live catalog via an explicit DROP first.
+    await client.query('DROP INDEX IF EXISTS embedding_providers_is_default_unique_idx');
+    await client.query('CREATE INDEX embedding_providers_is_default_unique_idx ON embedding_providers (is_default) WHERE is_default');
+    v = await addenda.verifyAddenda(client, sqlFiles);
+    const uniqueMismatch = v.malformedIndexes.find(
+      (i) => i.name === 'embedding_providers_is_default_unique_idx' && /unique mismatch/i.test(i.reason || '')
+    );
+    if (v.pass === false && uniqueMismatch) {
+      pass('T5h', 'proof-of-firing: standalone unique index recreated non-unique under the same name → verifyAddenda FAILs with a unique-mismatch malformedIndexes entry (cm#208 F-4/S-4)');
+    } else {
+      fail('T5h', 'proof-of-firing: standalone unique index recreated non-unique under the same name → verifyAddenda FAILs with a unique-mismatch malformedIndexes entry', JSON.stringify(v.malformedIndexes));
+    }
+    // Heal per F-6: re-applying embedding-providers-base.sql alone would be
+    // a silent no-op against the same-named impostor (IF NOT EXISTS keys on
+    // the name) -- an explicit DROP INDEX is required FIRST, then re-apply.
+    await client.query('DROP INDEX IF EXISTS embedding_providers_is_default_unique_idx');
+    await addenda.applySqlFile(client, findFile('embedding-providers-base.sql'));
+
     // Final sanity: fully healed state re-passes.
     v = await addenda.verifyAddenda(client, sqlFiles);
     if (v.pass) {
@@ -455,11 +479,17 @@ CREATE TABLE IF NOT EXISTS "synth_table" (
   "quoted_col" TEXT NOT NULL UNIQUE,
   tier TEXT CHECK (tier IN ('a','b','c')),
   amount NUMERIC(8,2),
+  flag BOOLEAN NOT NULL DEFAULT false,
   UNIQUE (id, tier)
 );
 CREATE INDEX IF NOT EXISTS synth_idx ON synth_table (tier) WHERE tier = 'a';
 ALTER TABLE synth_table ADD COLUMN IF NOT EXISTS extra1 TEXT;
 ALTER TABLE synth_table ADD COLUMN IF NOT EXISTS extra2 INTEGER CHECK (extra2 > 0);
+	create\tUNIQUE   index  if  not  exists  synth_flag_unique_idx
+  on synth_table
+\t(flag) -- interleaved comment before a partial, bare-boolean WHERE
+  WHERE flag;
+CREATE INDEX IF NOT EXISTS synth_trgm_idx ON synth_table USING gin(tier gin_trgm_ops);
 `;
   fs.writeFileSync(tmpFile, synthetic, 'utf8');
 
@@ -468,7 +498,7 @@ ALTER TABLE synth_table ADD COLUMN IF NOT EXISTS extra2 INTEGER CHECK (extra2 > 
 
     // Multiple ALTERs for the same table + CREATE TABLE body extraction (A-1).
     const colNames = d.columns.filter((c) => c.table === 'synth_table').map((c) => c.column).sort();
-    const expectedCols = ['amount', 'extra1', 'extra2', 'id', 'quoted_col', 'tier'].sort();
+    const expectedCols = ['amount', 'extra1', 'extra2', 'flag', 'id', 'quoted_col', 'tier'].sort();
     if (JSON.stringify(colNames) === JSON.stringify(expectedCols)) {
       pass('T7a', 'derivation: CREATE TABLE body + multiple ALTERs on the same table all captured (A-1)');
     } else {
@@ -521,8 +551,84 @@ ALTER TABLE synth_table ADD COLUMN IF NOT EXISTS extra2 INTEGER CHECK (extra2 > 
     } else {
       fail('T7f', 'derivation: comment noise stripped before scanning (reuses migrate-01\'s stripSqlNoise)', 'comment text leaked into a derived object');
     }
+
+    // cm#208 S-5 positive fixtures: a standalone CREATE UNIQUE INDEX (mixed
+    // keyword case, a literal tab, an interleaved -- comment, and a partial
+    // bare-boolean WHERE) plus a USING gin index with no space before "(" and
+    // an opclass. Assert both derived tuples exactly.
+    const flagUniqueIdx = d.indexes.find((i) => i.name === 'synth_flag_unique_idx');
+    const expectedFlagUniqueIdx = { name: 'synth_flag_unique_idx', table: 'synth_table', columns: ['flag'], method: 'btree', hasWhere: true, unique: true };
+    if (flagUniqueIdx && JSON.stringify(flagUniqueIdx) === JSON.stringify(expectedFlagUniqueIdx)) {
+      pass('T7h', 'derivation: standalone CREATE UNIQUE INDEX (mixed case, tab, interleaved comment, bare-boolean WHERE) derived exactly (cm#208 S-1/S-2)');
+    } else {
+      fail('T7h', 'derivation: standalone CREATE UNIQUE INDEX (mixed case, tab, interleaved comment, bare-boolean WHERE) derived exactly (cm#208 S-1/S-2)', JSON.stringify(flagUniqueIdx));
+    }
+
+    const trgmIdx = d.indexes.find((i) => i.name === 'synth_trgm_idx');
+    const expectedTrgmIdx = { name: 'synth_trgm_idx', table: 'synth_table', columns: ['tier'], method: 'gin', hasWhere: false, unique: false };
+    if (trgmIdx && JSON.stringify(trgmIdx) === JSON.stringify(expectedTrgmIdx)) {
+      pass('T7i', 'derivation: USING gin(col opclass) with no space before "(" derived exactly, opclass remainder unverified (cm#208 F-1/F-9)');
+    } else {
+      fail('T7i', 'derivation: USING gin(col opclass) with no space before "(" derived exactly, opclass remainder unverified (cm#208 F-1/F-9)', JSON.stringify(trgmIdx));
+    }
   } finally {
     fs.unlinkSync(tmpFile);
+  }
+
+  // cm#208 S-5 negative (loud) cases: each shape below is CREATE-INDEX-shaped
+  // but NOT recognized by the grammar, so deriveSchemaAddenda must throw a
+  // DerivationError naming the tempfile and the offending statement -- never
+  // silently skip it (S-3's total-classification loud default branch).
+  const negativeCases = [
+    { id: 'T7j', label: 'no IF NOT EXISTS -> DerivationError, never silently skipped', sql: 'CREATE UNIQUE INDEX x ON t (a);' },
+    { id: 'T7k', label: 'CONCURRENTLY -> DerivationError, never silently skipped', sql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS x ON t (a);' },
+    { id: 'T7l', label: 'schema-qualified table name -> DerivationError, never silently skipped', sql: 'CREATE INDEX IF NOT EXISTS x ON public.t (a);' },
+    { id: 'T7m', label: 'expression index (nested parens defeat [^()]*) -> DerivationError, never silently skipped', sql: 'CREATE INDEX IF NOT EXISTS x ON t ((lower(a)));' },
+    { id: 'T7n', label: 'NULLS NOT DISTINCT trailer -> DerivationError, never silently skipped', sql: 'CREATE UNIQUE INDEX IF NOT EXISTS x ON t (a) NULLS NOT DISTINCT;' },
+    { id: 'T7o', label: 'quoted identifier containing an uppercase letter -> DerivationError, never silently skipped (F-8)', sql: 'CREATE UNIQUE INDEX IF NOT EXISTS "MyIdx" ON t (a);' },
+  ];
+  for (const { id, label, sql } of negativeCases) {
+    const negFile = path.join(os.tmpdir(), `msa-derive-neg-${id}-${TS}.sql`);
+    fs.writeFileSync(negFile, sql, 'utf8');
+    try {
+      let threw = null;
+      try {
+        addenda.deriveSchemaAddenda([negFile]);
+      } catch (err) {
+        threw = err;
+      }
+      const ok = threw instanceof addenda.DerivationError &&
+        threw.derivationErrors.some((e) => e.file === negFile && e.statement.includes(sql.replace(/;\s*$/, '')));
+      if (ok) {
+        pass(id, `derivation total classification: ${label}`);
+      } else {
+        fail(id, `derivation total classification: ${label}`, threw ? `wrong error: ${threw.name}: ${threw.message}` : 'did not throw');
+      }
+    } finally {
+      fs.unlinkSync(negFile);
+    }
+  }
+
+  // cm#208 F-3 non-firing case: a DO-block fragment that CONTAINS "CREATE
+  // INDEX" but does not BEGIN with it (the fragment starts with "DO $$
+  // BEGIN") must NOT throw and must NOT be derived -- DO-wrapped index DDL
+  // stays out of derivation reach by documented design (same as migrate-14's
+  // DO-block sidecar file).
+  {
+    const doFile = path.join(os.tmpdir(), `msa-derive-doblock-${TS}.sql`);
+    fs.writeFileSync(doFile, 'DO $$ BEGIN CREATE INDEX IF NOT EXISTS d ON t (a); END $$;', 'utf8');
+    try {
+      const d2 = addenda.deriveSchemaAddenda([doFile]);
+      if (d2.indexes.length === 0) {
+        pass('T7p', 'derivation: DO-block fragment containing but not starting with CREATE INDEX does NOT throw and is NOT derived (cm#208 F-3)');
+      } else {
+        fail('T7p', 'derivation: DO-block fragment containing but not starting with CREATE INDEX does NOT throw and is NOT derived (cm#208 F-3)', JSON.stringify(d2.indexes));
+      }
+    } catch (err) {
+      fail('T7p', 'derivation: DO-block fragment containing but not starting with CREATE INDEX does NOT throw and is NOT derived (cm#208 F-3)', `unexpectedly threw: ${err.message}`);
+    } finally {
+      fs.unlinkSync(doFile);
+    }
   }
 
   // Exact expected sets for the shipped files (computed once, pinned here).
@@ -532,13 +638,38 @@ ALTER TABLE synth_table ADD COLUMN IF NOT EXISTS extra2 INTEGER CHECK (extra2 > 
   const tablesOk = JSON.stringify(shippedTables) === JSON.stringify(expectedShippedTables);
   const countsOk = shipped.columns.length === 82 &&
     shipped.checks.length === 5 &&
-    shipped.indexes.length === 5 &&
+    shipped.indexes.length === 6 &&
     shipped.uniques.length === 6 &&
     shipped.seeds.length === 1;
   if (tablesOk && countsOk) {
-    pass('T7g', 'derivation yields exactly the expected sets for the shipped six files (6 tables, 82 columns, 5 CHECKs, 5 indexes, 6 UNIQUEs, 1 seed)');
+    pass('T7g', 'derivation yields exactly the expected sets for the shipped six files (6 tables, 82 columns, 5 CHECKs, 6 indexes, 6 UNIQUEs, 1 seed)');
   } else {
     fail('T7g', 'derivation yields exactly the expected sets for the shipped six files', `tables=${JSON.stringify(shippedTables)} columns=${shipped.columns.length} checks=${shipped.checks.length} indexes=${shipped.indexes.length} uniques=${shipped.uniques.length} seeds=${shipped.seeds.length}`);
+  }
+
+  // cm#208 F-7 repin: the pinned COUNT alone is flag-blind (an author could
+  // bump 5->6 while still recording unique:false and this count-only check
+  // would still pass). Pin the exact derived tuple for the one shipped
+  // standalone unique index AND that exactly one derived index has
+  // unique===true AND that uniques.length (constraint-shaped, F-5) stays 6
+  // unchanged -- a regression that misroutes the unique index into
+  // `uniques` instead of `indexes` must fail this, not just T7g's count.
+  const uniqueFlaggedIndexes = shipped.indexes.filter((i) => i.unique === true);
+  const expectedProviderIdx = {
+    name: 'embedding_providers_is_default_unique_idx',
+    table: 'embedding_providers',
+    columns: ['is_default'],
+    method: 'btree',
+    hasWhere: true,
+    unique: true,
+  };
+  const providerIdxOk = uniqueFlaggedIndexes.length === 1 &&
+    JSON.stringify(uniqueFlaggedIndexes[0]) === JSON.stringify(expectedProviderIdx) &&
+    shipped.uniques.length === 6;
+  if (providerIdxOk) {
+    pass('T7q', 'cm#208 F-7 repin: exactly one derived index has unique===true, deep-equal to the exact embedding_providers_is_default_unique_idx tuple, uniques.length unchanged at 6 (F-5 misrouting guard)');
+  } else {
+    fail('T7q', 'cm#208 F-7 repin: exactly one derived index has unique===true, deep-equal to the exact embedding_providers_is_default_unique_idx tuple, uniques.length unchanged at 6 (F-5 misrouting guard)', `uniqueFlaggedIndexes=${JSON.stringify(uniqueFlaggedIndexes)} uniques.length=${shipped.uniques.length}`);
   }
 }
 

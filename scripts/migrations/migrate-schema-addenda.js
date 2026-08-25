@@ -29,10 +29,17 @@
  *      applySqlFile (no psql/pg_dump shell-outs, same plain pg-client apply
  *      pattern as migrate-01).
  *   5. Verifies the result: derives every expected table, column (+ its
- *      declared type), CHECK constraint, index, and UNIQUE constraint FROM
- *      THE SIX SQL FILES' OWN TEXT at verify time (never a hand-maintained
- *      list — same D-4 rule migrate-01 established), diffs each against the
- *      live catalog, and verifies the embedding_providers seed row's values.
+ *      declared type), CHECK constraint, index (including standalone
+ *      CREATE UNIQUE INDEX statements, recorded with a `unique: true` flag
+ *      — cm#208), and constraint-shaped UNIQUE FROM THE SIX SQL FILES' OWN
+ *      TEXT at verify time (never a hand-maintained list — same D-4 rule
+ *      migrate-01 established), diffs each against the live catalog, and
+ *      verifies the embedding_providers seed row's values. Index derivation
+ *      is a TOTAL classification (cm#208 S-3): a CREATE-INDEX-shaped
+ *      statement the grammar does not recognize is a loud DerivationError,
+ *      never a silent skip — deriveSchemaAddenda/verifyAddenda are reused
+ *      by reference (not forked) by migrate-13/14/15/16's own runners, so
+ *      this is a shared verification gate, not private to this script.
  *
  * WHAT THIS SCRIPT DELIBERATELY DOES NOT DO (out of scope):
  *   - No data migration, no route_resolve/usage_record logic, no MCP tools,
@@ -301,6 +308,93 @@ function normalizeType(typeToken) {
   return TYPE_NORMALIZE[typeToken.toUpperCase()] || null;
 }
 
+// ─── INDEX-STATEMENT GRAMMAR + IDENTIFIER NORMALIZATION (cm#208 S-1/S-4) ────
+//
+// cm#208: the prior CREATE-INDEX branch was anchored `^CREATE\s+INDEX\s+IF\s+
+// NOT\s+EXISTS`, so the `UNIQUE` keyword made a standalone `CREATE UNIQUE
+// INDEX IF NOT EXISTS ...` statement invisible to derivation entirely —
+// silently skipped, never verified. This grammar recognizes BOTH the plain
+// and UNIQUE forms in one regex, records the unique flag on the derived
+// object, and (per S-3 below) refuses to silently skip any OTHER
+// CREATE-INDEX shape it doesn't recognize.
+//
+// Identifiers are captured WITH any surrounding double quotes still
+// attached (rather than letting the regex's own `"?` alternatives discard
+// the quote characters before they reach a capture group) so
+// normalizeIdent() below can tell whether an identifier was quoted at all —
+// that distinction is exactly what F-8's case-folding rule needs: an
+// UNQUOTED mixed-case identifier is folded to lowercase by Postgres itself
+// (safe to lowercase here too), but a QUOTED one preserves case exactly,
+// and folding a quoted `"MyIdx"` to `myidx` would make this scanner derive
+// the WRONG name — a live lookup that either misses the real index (false
+// "missing") or, worse, hits an unrelated lowercase `myidx` that happens to
+// already exist (false PASS against the wrong object).
+const INDEX_STMT_RE =
+  /^CREATE\s+(UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+("?[A-Za-z_][A-Za-z0-9_]*"?)\s+ON\s+("?[A-Za-z_][A-Za-z0-9_]*"?)\s*(?:USING\s+([A-Za-z_]+)\s*)?\(([^()]*)\)([\s\S]*)$/i;
+
+// Any statement shaped like `CREATE [UNIQUE] INDEX` at its trimmed START
+// (never a "contains" test — see S-3's DerivationError below for why that
+// distinction is load-bearing).
+const INDEX_STMT_SHAPE_RE = /^CREATE\s+(UNIQUE\s+)?INDEX\b/i;
+
+/**
+ * Normalize a possibly double-quoted SQL identifier (F-8/S-4). Strips one
+ * pair of surrounding double quotes if present, then requires the unquoted
+ * body to consist solely of `[A-Za-z0-9_]`. A QUOTED identifier containing
+ * any uppercase letter is refused (returns null) — see the grammar
+ * comment above for why. An UNQUOTED identifier is simply lowercased
+ * (Postgres itself case-folds unquoted identifiers, so mixed case there is
+ * harmless). Returns the normalized lowercase identifier, or null if `raw`
+ * is not a recognizable identifier under this rule — the caller treats
+ * null as "unrecognized", which routes the whole statement to S-3's total-
+ * classification fallthrough rather than silently deriving a wrong name.
+ */
+function normalizeIdent(raw) {
+  let body = raw;
+  let quoted = false;
+  if (body.length >= 2 && body[0] === '"' && body[body.length - 1] === '"') {
+    quoted = true;
+    body = body.slice(1, -1);
+  }
+  if (!/^[A-Za-z0-9_]+$/.test(body)) return null;
+  if (quoted && body !== body.toLowerCase()) return null;
+  return body.toLowerCase();
+}
+
+/**
+ * S-3: the total-classification loud default branch. Never silently skip a
+ * CREATE-INDEX-shaped statement the grammar above didn't recognize — that
+ * silent-skip is the exact defect class cm#208 was filed against (a second
+ * instance of it, `decisions_project_topic_unique` in migrate-15, was found
+ * by the spec-adversary pass that produced this fix). Enumerates every
+ * offending statement (file + a truncated excerpt) so the operator gets a
+ * complete, actionable list in one failure rather than a whack-a-mole
+ * sequence of single-statement errors across repeated runs.
+ */
+class DerivationError extends Error {
+  constructor(derivationErrors) {
+    const lines = derivationErrors.map((e) => {
+      const excerpt = e.statement.length > 120 ? `${e.statement.slice(0, 120)}…` : e.statement;
+      return `  [${e.file}] ${excerpt.replace(/\s+/g, ' ')}`;
+    });
+    super(
+      [
+        `deriveSchemaAddenda: ${derivationErrors.length} CREATE [UNIQUE] INDEX statement(s) did not match ` +
+          'the recognized grammar and were NOT silently skipped (cm#208 — silent under-derivation is forbidden):',
+        ...lines,
+        '',
+        'Recognized grammar: CREATE [UNIQUE] INDEX IF NOT EXISTS <name> ON <table> [USING <method>] (<cols>) [WHERE <predicate>]',
+        'Not recognized: missing IF NOT EXISTS, CONCURRENTLY, schema-qualified names, expression indexes, ' +
+          'NULLS NOT DISTINCT/INCLUDE/WITH/TABLESPACE trailers, or a quoted identifier containing an uppercase letter.',
+        'Either this is a genuinely new statement shape the deriver must be taught, or it is a typo/regression ' +
+          'in the SQL file — both require a human decision, never a silent skip.',
+      ].join('\n')
+    );
+    this.name = 'DerivationError';
+    this.derivationErrors = derivationErrors;
+  }
+}
+
 // ─── DERIVED SCHEMA-ADDENDA OBJECT SET (A-1/A-2/A-3/A-5 — never a
 // hand-maintained list; derived from the six SQL files' own text at verify
 // time, mirroring migrate-01's D-4 rule and deriveExpectedObjects style) ────
@@ -320,9 +414,12 @@ function normalizeType(typeToken) {
 function deriveSchemaAddenda(sqlFiles) {
   const columns = [];   // { table, column, typeToken, source: 'CREATE TABLE'|'ALTER' }
   const checks = [];    // { table, column, literals: string[] }
-  const indexes = [];   // { name, table, columns: string[], hasWhere: boolean }
-  const uniques = [];   // { table, columns: string[] }
+  const indexes = [];   // { name, table, columns: string[], method: string, hasWhere: boolean, unique: boolean }
+  const uniques = [];   // { table, columns: string[] } -- constraint-shaped (contype='u') ONLY; a
+                         // standalone CREATE UNIQUE INDEX creates no pg_constraint row and belongs
+                         // in `indexes` with unique:true instead (F-5) -- this branch never adds to it.
   const seeds = [];     // { table, columns: string[], values: {type,value}[], conflictColumns: string[] }
+  const derivationErrors = []; // { file, statement } -- S-3 total-classification loud default branch
 
   for (const file of sqlFiles) {
     const clean = migrateOne.stripSqlNoise(fs.readFileSync(file, 'utf8'));
@@ -382,13 +479,55 @@ function deriveSchemaAddenda(sqlFiles) {
         continue;
       }
 
-      // CREATE INDEX IF NOT EXISTS <name> ON <table> (<cols>) [WHERE ...]
-      if ((m = /^CREATE\s+INDEX\s+IF\s+NOT\s+EXISTS\s+"?([a-zA-Z_][a-zA-Z0-9_]*)"?\s+ON\s+"?([a-zA-Z_][a-zA-Z0-9_]*)"?\s*\(([^)]*)\)([\s\S]*)$/i.exec(stmt))) {
-        const name = m[1].toLowerCase();
-        const table = m[2].toLowerCase();
-        const cols = m[3].split(',').map((c) => c.trim().replace(/"/g, '').toLowerCase());
-        const trailing = m[4] || '';
-        indexes.push({ name, table, columns: cols, hasWhere: /\bWHERE\b/i.test(trailing) });
+      // CREATE [UNIQUE] INDEX IF NOT EXISTS <name> ON <table> [USING <method>]
+      // (<cols>) [WHERE ...] -- cm#208 S-1/S-2/S-4. One grammar for both the
+      // plain and UNIQUE forms (the prior code's `UNIQUE` made the statement
+      // invisible to derivation entirely -- the defect cm#208 was filed
+      // against); identifier normalization (F-8) and a total
+      // sub-classification of the trailing clause (F-9/F-10, S-2) so a
+      // recognized-but-not-matching shape falls through to S-3 below rather
+      // than being silently skipped.
+      if ((m = INDEX_STMT_RE.exec(stmt))) {
+        const name = normalizeIdent(m[2]);
+        const table = normalizeIdent(m[3]);
+        const method = m[4] ? m[4].toLowerCase() : 'btree';
+        const columns = splitTopLevelSql(m[5], ',').map((part) => {
+          const firstTok = part.trim().split(/\s+/)[0] || '';
+          return normalizeIdent(firstTok); // opclass remainder (if any) recorded nowhere -- unverified blind spot
+        });
+        // S-2: the trailing clause is a TOTAL sub-classification -- empty or
+        // WHERE-led is recognized; anything else (NULLS NOT DISTINCT,
+        // INCLUDE, WITH (...), TABLESPACE, ...) is NOT, and falls through.
+        const trailMatch = /^\s*(WHERE\b[\s\S]+)?$/i.exec(m[6]);
+        const identifiersOk = name !== null && table !== null && columns.length > 0 && columns.every((c) => c !== null);
+        if (identifiersOk && trailMatch) {
+          indexes.push({
+            name,
+            table,
+            columns,
+            method,
+            hasWhere: Boolean(trailMatch[1]),
+            unique: Boolean(m[1]),
+          });
+          continue;
+        }
+        // Matched the coarse index shape but failed identifier
+        // normalization or trailing-clause classification -- falls through
+        // to S-3's total-classification check below, never silently
+        // skipped.
+      }
+
+      // S-3: total classification / loud default branch. A statement that
+      // IS index-shaped at its trimmed START (a "contains" test would
+      // false-positive on DO-block fragments, e.g. migrate-13's
+      // `DO $$ BEGIN\n  CREATE INDEX ...` -- that fragment CONTAINS
+      // "CREATE INDEX" but begins with "DO", and DO-wrapped index DDL stays
+      // out of derivation reach by documented design, same as migrate-14's
+      // DO-block sidecar file) but was not consumed by the grammar above is
+      // a loud derivation error -- see DerivationError. Never a silent
+      // skip; that silent-skip is the exact defect class this fix closes.
+      if (INDEX_STMT_SHAPE_RE.test(stmt)) {
+        derivationErrors.push({ file, statement: stmt });
         continue;
       }
 
@@ -399,6 +538,13 @@ function deriveSchemaAddenda(sqlFiles) {
         continue;
       }
     }
+  }
+
+  // S-3: any unrecognized CREATE-INDEX-shaped statement is a loud, whole-
+  // batch failure -- propagates through verifyAddenda to every runner's
+  // main().catch -> exit 1 (cm#208).
+  if (derivationErrors.length > 0) {
+    throw new DerivationError(derivationErrors);
   }
 
   return { columns, checks, indexes, uniques, seeds };
@@ -532,7 +678,24 @@ async function verifyAddenda(client, sqlFiles) {
     if (!found) missingChecks.push(chk);
   }
 
-  // ── Indexes + partial-index WHERE clauses (A-3) ─────────────────────────
+  // ── Indexes + UNIQUE-flag + partial-index WHERE clauses (A-3, cm#208 S-4) ──
+  //
+  // Three symmetric (both-directions) checks per index, each comparing the
+  // derived expectation against `pg_get_indexdef`'s live rendering:
+  //   - table:    the indexdef must reference the expected table (regex
+  //               containment -- safe because normalizeIdent has already
+  //               pinned the table charset to [a-z0-9_]+, so this string
+  //               cannot inject regex metacharacters into the RegExp).
+  //   - unique:   `CREATE UNIQUE INDEX` is always the indexdef's own prefix
+  //               (F-4) -- a mismatch in EITHER direction is drift. Because
+  //               `IF NOT EXISTS` keys on the index NAME, re-running the
+  //               migration will NOT heal a same-named impostor of the
+  //               wrong uniqueness (F-6) -- the reason text says so.
+  //   - hasWhere: presence of a WHERE clause, symmetric (F-10) -- the prior
+  //               code only caught "expected partial, found total"; the
+  //               converse (a declared-total index silently narrowed to
+  //               partial, quietly excluding rows from the guarantee) now
+  //               fails too.
   const missingIndexes = [];
   const malformedIndexes = [];
   for (const idx of derived.indexes) {
@@ -544,8 +707,30 @@ async function verifyAddenda(client, sqlFiles) {
       missingIndexes.push(idx);
       continue;
     }
-    if (idx.hasWhere && !/\bWHERE\b/i.test(rows[0].indexdef)) {
-      malformedIndexes.push({ ...idx, reason: 'expected a partial index (WHERE clause) but none was found', indexdef: rows[0].indexdef });
+    const indexdef = rows[0].indexdef;
+    const reasons = [];
+
+    const tableRe = new RegExp(`\\bON\\s+(?:ONLY\\s+)?(?:[a-z_][a-z0-9_]*\\.)?${idx.table}\\b`, 'i');
+    if (!tableRe.test(indexdef)) {
+      reasons.push(`expected index on table "${idx.table}", but indexdef does not reference it`);
+    }
+
+    const liveUnique = /^CREATE\s+UNIQUE\s+INDEX\b/i.test(indexdef);
+    if (liveUnique !== idx.unique) {
+      reasons.push(
+        `unique mismatch: expected unique=${idx.unique}, live index is unique=${liveUnique} -- ` +
+          'CREATE [UNIQUE] INDEX IF NOT EXISTS keys on the index NAME, so re-running this migration ' +
+          'will NOT heal this; the operator must DROP INDEX and re-apply'
+      );
+    }
+
+    const liveHasWhere = /\bWHERE\b/i.test(indexdef);
+    if (liveHasWhere !== idx.hasWhere) {
+      reasons.push(`WHERE-presence mismatch: expected hasWhere=${idx.hasWhere}, live index hasWhere=${liveHasWhere}`);
+    }
+
+    if (reasons.length > 0) {
+      malformedIndexes.push({ ...idx, reason: reasons.join('; '), indexdef });
     }
   }
 
@@ -766,6 +951,9 @@ module.exports = {
   verifySeedRow,
   TYPE_NORMALIZE,
   normalizeType,
+  normalizeIdent,
+  DerivationError,
+  INDEX_STMT_RE,
   splitTopLevelSql,
   extractParenGroupAt,
   extractCheckClause,
