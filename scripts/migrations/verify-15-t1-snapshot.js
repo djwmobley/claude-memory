@@ -143,10 +143,20 @@ async function main() {
   }
 
   const roster = shared.loadRoster();
-  const sqlEntries = roster.filter((e) => e.source_db === sourceDb && !e.source_db.startsWith('filesystem:'));
+  const sqlEntries = roster.filter((e) => e.source_db === sourceDb && !e.source_db.startsWith('filesystem:') && !e.manifest_label_duplicate_of);
   const skippedFilesystemEntries = roster.filter((e) => e.source_db === sourceDb && e.source_db.startsWith('filesystem:'));
+  // cm#210 fix (A-1/A-3): a label-duplicate entry's source_table is a
+  // manifest-bookkeeping LABEL, not a physical relation -- snapshotting it
+  // here (interpolating the label as a table name) would either crash
+  // ("relation does not exist," T1's own instance of A-1) or, worse, if a
+  // decoy relation happens to exist under that name (A-4), write a SECOND,
+  // duplicate migration_manifest row for the same underlying rows the
+  // primary label already snapshots -- exactly the T2 phase-2 duplicate
+  // FATAL this field exists to prevent. Skipped here with an explicit WARN,
+  // counted as neither pass nor fail (spec 2.1.2).
+  const skippedLabelDuplicateEntries = roster.filter((e) => e.source_db === sourceDb && !e.source_db.startsWith('filesystem:') && e.manifest_label_duplicate_of);
 
-  if (sqlEntries.length === 0 && skippedFilesystemEntries.length === 0) {
+  if (sqlEntries.length === 0 && skippedFilesystemEntries.length === 0 && skippedLabelDuplicateEntries.length === 0) {
     console.error(`FATAL: no roster entries found with source_db="${sourceDb}".`);
     process.exit(1);
   }
@@ -154,6 +164,12 @@ async function main() {
   console.log(`verify-15-t1-snapshot: source_db="${sourceDb}", target="${target}" (resolved from ${targetSource})`);
   if (skippedFilesystemEntries.length) {
     console.log(`  [WARN] ${skippedFilesystemEntries.length} filesystem:-prefixed roster entr${skippedFilesystemEntries.length === 1 ? 'y' : 'ies'} skipped — markdown-source snapshotting (migrate-08/09) is out of this battery's cut. NOT counted as a pass.`);
+  }
+  if (skippedLabelDuplicateEntries.length) {
+    console.log(`  [WARN] ${skippedLabelDuplicateEntries.length} label-duplicate roster entr${skippedLabelDuplicateEntries.length === 1 ? 'y' : 'ies'} skipped — label-duplicate entry — its physical table is snapshotted under the primary label; snapshotting here would double-write manifest rows. Counts as neither pass nor fail:`);
+    for (const e of skippedLabelDuplicateEntries) {
+      console.log(`    - ${e.source_table} (duplicates "${e.manifest_label_duplicate_of}")`);
+    }
   }
 
   const srcClient = await shared.connect(sourceDb);
