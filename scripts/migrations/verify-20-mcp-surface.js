@@ -8,8 +8,10 @@
  * against a live target — the SAME "exercise the lib, not the stdio
  * transport" convention verify-13/17/18/19 already use. A separate,
  * lightweight stdio round-trip (runMcpRegistrationCheck, invoked from
- * main()) proves handoff-mcp.mjs actually REGISTERS all 30 tools (5
- * pre-existing + 25 new) and that at least one new direct-pg tool is
+ * main()) proves handoff-mcp.mjs actually REGISTERS all 31 tools (5
+ * pre-existing + 25 new + handoff_resume, added later on the same
+ * child-process transport as the 5 pre-existing tools) and that at least
+ * one new direct-pg tool is
  * independently callable end-to-end through the real MCP protocol via
  * mcp-db-connect.js + ensureProjectIdentity (M-19) against a disposable
  * scratch project root — never the real claude-memory dogfood project.
@@ -508,7 +510,8 @@ async function runSelfTransactioningChecks(client2, prefix) {
 
 /**
  * runMcpRegistrationCheck — spawns the REAL handoff-mcp.mjs over stdio,
- * lists tools (asserts all 30 names present — 5 pre-existing + 25 new),
+ * lists tools (asserts all 31 names present — 5 pre-existing + 25 new +
+ * handoff_resume),
  * then calls entity_create through the real protocol against a disposable
  * scratch tmpdir project root (its own `.git` + a fresh marker minted by
  * `node handoff.js init -y`) — NEVER the real claude-memory dogfood
@@ -542,6 +545,7 @@ async function runMcpRegistrationCheck(dbName, cleanupClient) {
     const actualNames = new Set(toolsList.tools.map((t) => t.name));
     const expected = [
       'handoff_status', 'handoff_checkpoint', 'handoff_close', 'handoff_init', 'persist_decisions',
+      'handoff_resume',
       'memory_search', 'memory_upsert', 'memory_get', 'memory_lint',
       'memory_view_set', 'memory_view_run',
       'entity_create', 'entity_read', 'entity_update', 'entity_suppress',
@@ -583,7 +587,7 @@ async function runMcpRegistrationCheck(dbName, cleanupClient) {
     try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}
   }
 
-  console.log(`[SMOKE-${LABEL}][mcp-registration] ${ok ? 'PASS' : 'FAIL'} 30-tool registration + entity_create through the real stdio MCP transport`);
+  console.log(`[SMOKE-${LABEL}][mcp-registration] ${ok ? 'PASS' : 'FAIL'} 31-tool registration + entity_create through the real stdio MCP transport`);
   for (const f of failures) console.log(`    ${f}`);
   return ok;
 }
