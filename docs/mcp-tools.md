@@ -2,9 +2,10 @@
 
 `scripts/handoff-mcp.mjs` is the one MCP server this repo ships (stdio
 transport, registered via `claude mcp add`). It started with 5 tools
-(session-lifecycle + a decisions-persistence tool) and now exposes 30: the
-original 5 plus 25 new direct-Postgres tools that generalize the store's
-write/read surface outside the checkpoint/close batch-payload flow.
+(session-lifecycle + a decisions-persistence tool) and now exposes 31: the
+original 5 plus `handoff_resume` (added later, same child-process transport
+shape — see below) plus 25 new direct-Postgres tools that generalize the
+store's write/read surface outside the checkpoint/close batch-payload flow.
 
 Every table and tool named on this page exists on `main` as of this
 writing; if you find a mismatch, the code is authoritative — start at
@@ -13,10 +14,14 @@ writing; if you find a mismatch, the code is authoritative — start at
 
 ## Two transport shapes
 
-The original 5 tools spawn `node scripts/handoff.js <subcommand>` as a
-child process per call — the engine needs host filesystem paths, real git
-checkouts, and localhost Postgres, all of which a host-run child process
-gets for free by inheriting the parent's cwd/env.
+The original 5 tools, plus `handoff_resume`, spawn `node scripts/handoff.js
+<subcommand>` as a child process per call — the engine needs host
+filesystem paths, real git checkouts, and localhost Postgres, all of which
+a host-run child process gets for free by inheriting the parent's cwd/env.
+`handoff_resume` runs `handoff.js resume`, which has no `--json` mode, so
+the tool returns the child process's raw stdout verbatim as a `context`
+string rather than a parsed object — the same "reads it as context" shape
+the CLI form and the SessionStart loader-hook both already rely on.
 
 The 25 new tools open a Postgres connection **in-process** instead
 (`scripts/lib/mcp-db-connect.js`), because several of them need to run a
