@@ -172,11 +172,30 @@ function probePackagingState(root) {
  * File-existence probe for in_file-style predicates.
  *
  * Interprets the asserted object as a file path relative to root (or absolute).
+ * "in_file" objects are routinely authored using this codebase's own POINTER_RE
+ * code-pointer syntax (see handoff.js POINTER_RE) — "path/to/file.ext:N" or
+ * "path/to/file.ext:N-M" — because that is the format close.md/model authors
+ * naturally reach for when citing a specific location in a file (e.g.
+ * "ClientEditPage.cs:80-85"). The trailing ":N" / ":N-M" line-locator is not
+ * part of the filesystem path; checking the literal string (locator included)
+ * against fs always fails even when the referenced file genuinely exists.
+ * PRIOR BUG (root-caused during the OneDrive-path investigation — the
+ * space/hyphen hypothesis did NOT reproduce; this pointer-suffix mismatch is
+ * the actual, path-shape-independent false negative): probeFileExists checked
+ * the object literally with no suffix-stripping fallback, so any "in_file"
+ * assertion authored in pointer form was permanently unverifiable-as-mismatch
+ * regardless of root path. Fixed by trying the object as-is first (preserves
+ * all prior behavior for plain paths, including the edge case of a literal
+ * filename that happens to contain a colon), then falling back to the same
+ * check with a trailing ":N" / ":N-M" locator stripped.
  *
  * Returns:
- *   object (the path)   — if the file exists at that path (verified)
- *   '<absent>'          — if the object looks like a path but the file is absent (mismatch)
- *   null                — if the object is not a plausible file path or an error occurs
+ *   object (the path)   — if the file exists at that path, OR at the path with
+ *                         a trailing ":N"/":N-M" pointer locator stripped (verified)
+ *   '<absent>'          — if the object looks like a path (with or without a
+ *                         stripped locator) but the file is absent (mismatch)
+ *   null                — if neither the object nor its stripped form is a
+ *                         plausible file path, or an error occurs
  *                         (unverifiable — fail-soft)
  *
  * This encoding lets the standard dispatcher logic work:
@@ -187,23 +206,36 @@ function probePackagingState(root) {
  * Used by the 'verify'-mode 'in_file' entry as a concrete, tested verify path.
  *
  * @param {string} root   - absolute project root
- * @param {string} object - asserted object value (expected: a relative file path)
+ * @param {string} object - asserted object value (expected: a relative file path,
+ *                         optionally in "path:N" / "path:N-M" pointer syntax)
  * @returns {string | null}
  */
 function probeFileExists(root, object) {
   try {
     if (!object || typeof object !== 'string') return null;
-    // Only attempt to verify objects that look like a file path (contain a / or \,
-    // or end in a known extension).  This prevents spurious mismatches on objects
-    // that are plain descriptive strings.
-    const looksLikePath = /[/\\]/.test(object) || /\.\w{1,6}$/.test(object);
-    if (!looksLikePath) return null;
+
+    // Strip a trailing ":<line>" or ":<line>-<line>" pointer locator, if present.
+    // A drive-letter colon ("C:\...") is never at the END of the string, so this
+    // anchored-at-$ pattern cannot mistake it for a locator.
+    const strippedForPointer = object.replace(/:[1-9]\d*(?:-[1-9]\d*)?$/, '');
+    const candidates = strippedForPointer === object ? [object] : [object, strippedForPointer];
 
     const fs = require('fs');
-    const target = path.isAbsolute(object) ? object : path.join(root, object);
-    // Return the path itself when file exists (so probeResult === row.object → verified).
-    // Return '<absent>' when file does not exist (so probeResult !== row.object → mismatch).
-    return fs.existsSync(target) ? object : '<absent>';
+    let sawPlausiblePath = false;
+    for (const candidate of candidates) {
+      // Only attempt to verify candidates that look like a file path (contain a
+      // / or \, or end in a known extension). This prevents spurious mismatches
+      // on objects that are plain descriptive strings.
+      const looksLikePath = /[/\\]/.test(candidate) || /\.\w{1,6}$/.test(candidate);
+      if (!looksLikePath) continue;
+      sawPlausiblePath = true;
+
+      const target = path.isAbsolute(candidate) ? candidate : path.join(root, candidate);
+      if (fs.existsSync(target)) return object; // echo the ORIGINAL object → verified
+    }
+
+    if (!sawPlausiblePath) return null; // neither form is path-shaped — unverifiable
+    return '<absent>';
   } catch (_) {
     return null;
   }
