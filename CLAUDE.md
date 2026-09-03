@@ -36,3 +36,9 @@ These rules are canon. They override convenience, time pressure, and apparent co
 ## Durable facts
 
 - (No durable facts promoted yet — promoted by `/handoff:close` when confidence ≥ 9 and user_stated across multiple sessions)
+
+---
+
+## Next session — read first
+
+- 2026-09-02: §17 routing harness (CONSOLIDATION-RUNBOOK.md §17) — read docs/notes/2026-09-02-s17-routing-harness-status.md. Gap-audit existing route_resolve / routing_profile_* / usage_* MCP tools against the §17 schema before any planning. Thread was mis-filed in DentalTalentConnect and re-parked here.
