@@ -777,6 +777,115 @@ async function testT10CleanCloseNoMismatch() {
   }
 }
 
+// ── T11: probeFileExists / probeCommitMerged / probeBranchExists against a
+//         REAL git repo whose root path contains a space AND a hyphen
+//         (OneDrive-style: ".../OneDrive - Advisicon/...") ───────────────────
+//
+// Investigates the reported false-negative: "in_file <absent> for pointers
+// that exist; commit_merged <not-merged> for commits that are on master" on
+// OneDrive-hosted (space+hyphen) project roots. Prior to this test, NO test
+// in this suite exercised probeCommitMerged or probeBranchExists against a
+// real git repository at all (both were only unit-tested via static registry
+// checks / DB-mocked verify rows) — a real coverage gap regardless of outcome.
+//
+// Root-cause finding (see reality-checks.js probeFileExists): the space+hyphen
+// path-handling hypothesis does NOT reproduce — gitExec/probeCommitMerged/
+// probeBranchExists all use execFileSync with array argv (never shell-
+// interpolated), and probeFileExists uses path.join/fs.existsSync, none of
+// which mishandle spaces or hyphens. The REAL bug is unrelated to OneDrive
+// paths: probeFileExists checks the asserted object as a literal filesystem
+// path, but "in_file" objects are routinely authored using this codebase's
+// own POINTER_RE syntax ("path/to/file.ext:N" or "path/to/file.ext:N-M" —
+// see handoff.js POINTER_RE) — e.g. "ClientEditPage.cs:80-85". The trailing
+// ":N-M" locator is never part of the filesystem path, so fs.existsSync on
+// the literal string always fails even when the referenced file genuinely
+// exists — a real false negative, reproducible on ANY OS/path (this test
+// pins it down on a space+hyphen root only because that is the fixture shape
+// the field report used, not because the bug is path-shape-dependent).
+async function testT11SpaceHyphenRootAndPointerSuffix() {
+  const label = 'T11: verify probes on a space+hyphen git root; in_file pointer-suffix (path:N-M) false negative';
+  const fixtureRoot = path.join(os.tmpdir(), `l3 t11 - onedrive style ${TS}`);
+  try {
+    const { execFileSync } = require('child_process');
+    const {
+      probeFileExists,
+      probeCommitMerged,
+      probeBranchExists,
+    } = require(REALITY_CHECKS_PATH);
+
+    // ── Build a real git fixture under a "x - y"-shaped root ─────────────────
+    const subDir = path.join(fixtureRoot, 'tests', 'Infrastructure');
+    fs.mkdirSync(subDir, { recursive: true });
+    const fileRel = 'tests/Infrastructure/ClientEditPage.cs';
+    fs.writeFileSync(path.join(fixtureRoot, fileRel), 'public class ClientEditPage {\n}\n', 'utf8');
+
+    const gitOpts = { cwd: fixtureRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] };
+    execFileSync('git', ['init', '-q'], gitOpts);
+    execFileSync('git', ['config', 'user.email', 't11@test.local'], gitOpts);
+    execFileSync('git', ['config', 'user.name', 'T11 Test'], gitOpts);
+    execFileSync('git', ['add', '-A'], gitOpts);
+    execFileSync('git', ['commit', '-q', '-m', 'T11 fixture commit'], gitOpts);
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], gitOpts).trim();
+    const branchOut = execFileSync('git', ['branch', '--show-current'], gitOpts).trim();
+
+    // ── branch_exists: sanity — must not be broken by the space+hyphen root ──
+    if (probeBranchExists(fixtureRoot, branchOut) !== 'exists') {
+      fail(label, `probeBranchExists('${branchOut}') on space+hyphen root did not return 'exists'`);
+      return;
+    }
+    if (probeBranchExists(fixtureRoot, 'no-such-branch-t11') !== '<absent>') {
+      fail(label, `probeBranchExists on a nonexistent branch did not return '<absent>'`);
+      return;
+    }
+
+    // ── commit_merged: sanity — must not be broken by the space+hyphen root ──
+    const commitMergedResult = probeCommitMerged(fixtureRoot, `${sha} on ${branchOut}`);
+    if (commitMergedResult !== `${sha} on ${branchOut}`) {
+      fail(label, `probeCommitMerged echoed '${commitMergedResult}', expected the object echoed back (verified) — got a false '<not-merged>'/'unverifiable' on a space+hyphen root`);
+      return;
+    }
+
+    // ── in_file: plain path (no pointer suffix) — must verify ────────────────
+    const plainResult = probeFileExists(fixtureRoot, fileRel);
+    if (plainResult !== fileRel) {
+      fail(label, `probeFileExists(plain path) on space+hyphen root returned '${plainResult}', expected the path echoed back`);
+      return;
+    }
+
+    // ── in_file: THE BUG — pointer syntax "path:N-M" for a file that EXISTS ──
+    const pointerObj = `${fileRel}:80-85`;
+    const pointerResult = probeFileExists(fixtureRoot, pointerObj);
+    if (pointerResult !== pointerObj) {
+      fail(label, `probeFileExists('${pointerObj}') returned '${pointerResult}' — false negative: the file exists but the pointer's ":N-M" line-locator suffix was checked as a literal path segment instead of being stripped`);
+      return;
+    }
+
+    // ── in_file: single-line pointer syntax "path:N" — must also verify ─────
+    const singleLineObj = `${fileRel}:80`;
+    const singleLineResult = probeFileExists(fixtureRoot, singleLineObj);
+    if (singleLineResult !== singleLineObj) {
+      fail(label, `probeFileExists('${singleLineObj}') returned '${singleLineResult}' — single-line pointer suffix not stripped`);
+      return;
+    }
+
+    // ── in_file: pointer syntax for a file that genuinely does NOT exist ────
+    // (must still correctly report '<absent>' — the fix must not paper over
+    // real absences by being too permissive with the stripped candidate).
+    const missingPointerObj = 'tests/Infrastructure/NoSuchFile.cs:5-10';
+    const missingResult = probeFileExists(fixtureRoot, missingPointerObj);
+    if (missingResult !== '<absent>') {
+      fail(label, `probeFileExists('${missingPointerObj}') for a genuinely absent file returned '${missingResult}', expected '<absent>'`);
+      return;
+    }
+
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    try { fs.rmSync(fixtureRoot, { recursive: true, force: true }); } catch (_) {}
+  }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -793,9 +902,10 @@ async function main() {
     console.error('Set PGHOST/PGUSER/PGPASSWORD to run these tests.');
   }
 
-  // T8 and T9 are pure static/unit tests — run regardless of Postgres.
+  // T8, T9, T11 are pure unit tests (no DB) — run regardless of Postgres.
   await testT8NoUpdateSetTier();
   await testT9IsAtCommitNotAuthoritative();
+  await testT11SpaceHyphenRootAndPointerSuffix();
 
   if (!pgAvail) {
     console.error('[SKIP] Postgres unavailable — skipping Postgres-dependent L3 tests (T1-T7, T10)');
