@@ -21,6 +21,9 @@ const { readMarker } = require('./lib/project-marker');
 const { resolveHandoffMdPath } = require('./lib/handoff-paths');
 const path = require('path');
 const { Client } = require('pg');
+// cm#224 follow-up: shared guarded pgvector-extension installer — see its
+// own header comment in test-pg-helpers.js for the full rationale.
+const { ensureVectorExtension } = require('./lib/test-pg-helpers');
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
 
@@ -401,6 +404,7 @@ async function createSmokeDb(dbName, projectDir) {
   }
   await sysDb.query(`CREATE DATABASE "${dbName}"`);
   await sysDb.end();
+  await ensureVectorExtension(dbName);
   fs.mkdirSync(projectDir, { recursive: true });
 }
 

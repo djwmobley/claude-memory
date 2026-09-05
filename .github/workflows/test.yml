@@ -50,6 +50,16 @@ jobs:
         run: psql -h localhost -U postgres -c "CREATE DATABASE claude_memory_eval_ci"
         env:
           PGPASSWORD: postgres
+      - name: Enable pgvector on claude_memory_eval_ci
+        # cm#224 follow-up: CREATE DATABASE never inherits an extension unless
+        # template1 has it; the pgvector/pgvector:pg16 image provides the
+        # extension but each DB still needs its own CREATE EXTENSION. Guarded
+        # -- a Postgres genuinely without pgvector logs one line and
+        # continues; ensureSchemaCurrent's pgvector-gated-column check then
+        # legitimately reports 'degraded' for this DB, which is correct.
+        run: psql -h localhost -U postgres -d claude_memory_eval_ci -c "CREATE EXTENSION IF NOT EXISTS vector" || echo "pgvector unavailable on claude_memory_eval_ci -- pgvector-gated columns will legitimately report degraded"
+        env:
+          PGPASSWORD: postgres
       - name: Run retrieval eval (FTS-only smoke test)
         run: node test/eval/eval-retrieval.js --embed-skip
         env:
@@ -68,6 +78,15 @@ jobs:
         # setup() then applies handoff-core-schema.sql AND app-retrieval-events-schema.sql
         # into it (both are idempotent). This step is a no-op if the DB already exists.
         run: psql -h localhost -U postgres -c "CREATE DATABASE claude_memory_eval_test" || true
+        env:
+          PGPASSWORD: postgres
+      - name: Enable pgvector on claude_memory_eval_test
+        # cm#224 follow-up: same rationale as "Enable pgvector on
+        # claude_memory_eval_ci" above -- this persistent DB is reused by
+        # test-handoff.js, test-serve-time-staleness.js, and every other
+        # test/handoff/*.js and test/north-star/*.js step below that says
+        # "Reuses claude_memory_eval_test".
+        run: psql -h localhost -U postgres -d claude_memory_eval_test -c "CREATE EXTENSION IF NOT EXISTS vector" || echo "pgvector unavailable on claude_memory_eval_test -- pgvector-gated columns will legitimately report degraded"
         env:
           PGPASSWORD: postgres
       - name: Run init atomicity tests

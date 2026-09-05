@@ -63,6 +63,8 @@ const PROJECT_ROOT = path.resolve(__dirname, '..');
 const handoffModule = require(path.join(PROJECT_ROOT, 'scripts', 'handoff.js'));
 const { PostgresAdapter } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'db-seam.js'));
 const { classifySchemaFiles, normalizeContent } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'schema-classify.js'));
+// cm#224 follow-up: shared guarded pgvector-extension installer.
+const { ensureVectorExtension } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'test-pg-helpers.js'));
 
 let passed = 0;
 let failed = 0;
@@ -273,18 +275,20 @@ async function testT3() {
   const PID = 'cm185-t3-project';
   try {
     await createThrowawayDb(dbName);
-    const db = await pgConnect(dbName);
-    const adapter = new PostgresAdapter(db);
 
     // cm#224 follow-up: this test's own intent is run-twice IDEMPOTENCY,
-    // unrelated to pgvector — create the extension (best-effort) so the
-    // second-call assertion below isn't confounded by the independent
-    // pgvector-gated-degradation check ensureSchemaCurrent now also runs on
-    // every call (a scratch DB with no vector extension genuinely IS
-    // degraded post-apply, correctly reported as reason:'degraded' rather
-    // than 'current' — see test/test-decisions-canon.js's dedicated T3 for
-    // that behavior's own test coverage).
-    try { await db.query('CREATE EXTENSION IF NOT EXISTS vector'); } catch (_) { /* pgvector not installed on this Postgres */ }
+    // unrelated to pgvector — create the extension (via the ONE shared,
+    // guarded implementation) so the second-call assertion below isn't
+    // confounded by the independent pgvector-gated-degradation check
+    // ensureSchemaCurrent now also runs on every call (a scratch DB with no
+    // vector extension genuinely IS degraded post-apply, correctly
+    // reported as reason:'degraded' rather than 'current' — see
+    // test/test-decisions-canon.js's dedicated T3 for that behavior's own
+    // test coverage).
+    await ensureVectorExtension(dbName);
+
+    const db = await pgConnect(dbName);
+    const adapter = new PostgresAdapter(db);
 
     // ensureSchemaCurrent's precondition (unchanged from the pre-cm#185 engine)
     // is that project_settings already exists -- cmdInit always runs the full

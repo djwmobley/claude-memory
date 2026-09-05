@@ -76,6 +76,14 @@ const PROJECT_ROOT  = path.resolve(__dirname, '..');
 // require() the engine's own functions rather than reimplementing them).
 const handoffModule = require(HANDOFF_JS);
 const { classifySchemaFiles } = require('./lib/schema-classify');
+// cm#224 follow-up: shared guarded pgvector-extension installer — every
+// scratch DB this file's own bothBackends() harness creates now routes
+// through the SAME function test-pg-helpers.js's createDb/createTestDb use
+// (this file predates test-pg-helpers.js and has its own inline harness,
+// never converted to require() it wholesale — but the extension-install
+// step itself must be the ONE shared implementation, not a second ad-hoc
+// copy — see that function's own header comment for the full rationale).
+const { ensureVectorExtension } = require('./lib/test-pg-helpers');
 
 // ── Hoisted: static source read ───────────────────────────────────────────────
 // Read once at module load; all static-analysis sections share this reference.
@@ -280,16 +288,18 @@ async function bothBackends(label, fn) {
       await sysClient.end();
       sysClient = null;
 
+      // cm#224 follow-up: create the extension (guarded, via the ONE shared
+      // implementation) BEFORE applying the schema below, so handoff-core-
+      // schema.sql's own DO-block-guarded assertions.embedding/
+      // assertions_embedding_hnsw_idx actually land on this scratch DB
+      // instead of silently degrading — a fresh CREATE DATABASE never
+      // inherits an extension unless template1 itself has it, which it does
+      // not here. Any test that specifically calls ensureSchemaCurrent
+      // (e.g. S12.c*/S12.e2) now sees a genuinely non-degraded DB, matching
+      // this harness's pre-cm#224 assumption.
+      await ensureVectorExtension(dbName);
+
       testClient = await pgConnect(dbName);
-      // cm#224 follow-up: create the extension (best-effort) BEFORE applying
-      // the schema below, so handoff-core-schema.sql's own DO-block-guarded
-      // assertions.embedding/assertions_embedding_hnsw_idx actually land on
-      // this scratch DB instead of silently degrading — a fresh CREATE
-      // DATABASE never inherits an extension unless template1 itself has
-      // it, which it does not here. Any test that specifically calls
-      // ensureSchemaCurrent (e.g. S12.c*/S12.e2) now sees a genuinely
-      // non-degraded DB, matching this harness's pre-cm#224 assumption.
-      try { await testClient.query('CREATE EXTENSION IF NOT EXISTS vector'); } catch (_) { /* pgvector not installed on this Postgres */ }
       // Apply the Postgres schema
       const schemaSql = fs.readFileSync(
         path.resolve(__dirname, 'sql', 'handoff-core-schema.sql'), 'utf8'

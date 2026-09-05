@@ -29,6 +29,8 @@ const os            = require('os');
 const path          = require('path');
 const { Client }    = require('pg');
 const { readMarker } = require('./lib/project-marker');
+// cm#224 follow-up: shared guarded pgvector-extension installer.
+const { ensureVectorExtension } = require('./lib/test-pg-helpers');
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
 
@@ -156,6 +158,7 @@ async function createTestDb(dbName, projectDir) {
   }
   await sysDb.query(`CREATE DATABASE "${dbName}"`);
   await sysDb.end();
+  await ensureVectorExtension(dbName);
   fs.mkdirSync(projectDir, { recursive: true });
 }
 

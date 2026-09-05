@@ -30,6 +30,8 @@ const fs   = require('fs');
 const os   = require('os');
 const path = require('path');
 const { Client } = require('pg');
+// cm#224 follow-up: shared guarded pgvector-extension installer.
+const { ensureVectorExtension } = require('./lib/test-pg-helpers');
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -84,6 +86,7 @@ async function createAqDb() {
   const sys = await pgConnect('postgres');
   await sys.query(`CREATE DATABASE "${AQ_DB}"`);
   await sys.end();
+  await ensureVectorExtension(AQ_DB);
   // Apply schema
   const schemaSql = fs.readFileSync(SCHEMA_FILE, 'utf8');
   const db = await pgConnect(AQ_DB);
