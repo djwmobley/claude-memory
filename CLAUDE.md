@@ -28,7 +28,7 @@ These rules are canon. They override convenience, time pressure, and apparent co
 
 ## Key paths
 
-- Handoff file: `~/.claude/projects/<encoded-cwd>/handoff.md` (populated by `/handoff:init`)
+- Handoff file: `~/.claude/projects/<project-id>/handoff.md`, where `<project-id>` is the marker UUID read from `.memory-engine` (or legacy `.claude-memory`) at the repo root — falling back to the encoded-cwd id only for un-migrated projects with no marker file. See `scripts/lib/handoff-paths.js` (`resolveHandoffMdPath`) for the resolution logic.
 - Helper script: `<repo-root>/scripts/handoff.js`
 
 ---
@@ -41,4 +41,5 @@ These rules are canon. They override convenience, time pressure, and apparent co
 
 ## Next session — read first
 
-- 2026-09-02: §17 routing harness (CONSOLIDATION-RUNBOOK.md §17) — read docs/notes/2026-09-02-s17-routing-harness-status.md. Gap-audit existing route_resolve / routing_profile_* / usage_* MCP tools against the §17 schema before any planning. Thread was mis-filed in DentalTalentConnect and re-parked here.
+- 2026-09-05: pwa-etl per-project engine onboarding, driven from THIS repo (owner directive). Prerequisites done: backup + restore rehearsal in `~/Downloads/pg-backups`; seed close payload at `%TEMP%\handoff-close-pwa-etl-seed-2026-09-05.json`; wiring edits staged on the pwa-etl local branch `chore/engine-cutover` @ `8a5b993` — apply locally only, never as a PR (those files are untracked by design). Steps: verify PR #225 landed (decisions canon), vLLM up, run `handoff.js init -y` in `C:\Users\djwmo\dev\pwa-etl`, copy the 549 decisions rows from `claude_policy_framework` preserving original ids (topics unique), re-embed via vLLM, close with the seed payload, resume-verify, then apply the three local wiring edits. Runbook §16 amendment 2026-09-05 has the detail.
+- §17 routing gap-audit is still the plan's next step after that (CONSOLIDATION-RUNBOOK.md §17) — read docs/notes/2026-09-02-s17-routing-harness-status.md. Gap-audit existing route_resolve / routing_profile_* / usage_* MCP tools against the §17 schema before any planning. Thread was mis-filed in DentalTalentConnect and re-parked here.
