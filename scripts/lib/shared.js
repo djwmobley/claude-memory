@@ -65,6 +65,26 @@ function projectToDbName(projectName) {
   return `pipeline_${sanitized}`;
 }
 
+// Total classification, no silent branch: a pipeline.yml `embedding_model`
+// value of unset (null) or an exact match to VLLM_MODEL (the served vLLM
+// model id, defined below in the "VLLM EMBED" section — referenced here by
+// closure; safe because this function only runs after the whole module has
+// finished loading) resolves normally. Any other explicit value is a hard
+// error at config-load time naming the key, the value, and the single
+// supported model — same style as the EMBED_BACKEND validation in
+// pipeline-embed.js and test/eval/eval-retrieval.js. This runs INSIDE
+// loadConfig() so every caller of loadConfig() is protected uniformly —
+// including scripts/lib/embed.js's resurrect semantic-search path, which
+// sends knowledge.embedding_model to vLLM as the model name on every call.
+function validateEmbeddingModel(value) {
+  if (value !== null && value !== VLLM_MODEL) {
+    throw new Error(
+      `pipeline.yml: knowledge.embedding_model="${value}" is not supported -- vLLM ` +
+      `(${VLLM_MODEL}) is the only embedding backend; unset embedding_model or set it to "${VLLM_MODEL}".`
+    );
+  }
+}
+
 function loadConfig() {
   const root = findProjectRoot();
   const configPath = path.join(root, '.claude', 'pipeline.yml');
@@ -75,7 +95,10 @@ function loadConfig() {
     project: projectName,
   };
 
-  if (!fs.existsSync(configPath)) return { ...defaults, root, knowledge: { tier: 'files', host: defaults.host, port: defaults.port, database: defaults.database, user: defaults.user, embedding_model: null, num_ctx: null } };
+  if (!fs.existsSync(configPath)) {
+    validateEmbeddingModel(null);
+    return { ...defaults, root, knowledge: { tier: 'files', host: defaults.host, port: defaults.port, database: defaults.database, user: defaults.user, embedding_model: null, num_ctx: null } };
+  }
   const content = fs.readFileSync(configPath, 'utf8');
 
   // Get a top-level key (not indented)
@@ -104,6 +127,7 @@ function loadConfig() {
   const database = getInSection('knowledge', 'database') || defaults.database;
   const user = getInSection('knowledge', 'user') || defaults.user;
   const embedding_model = getInSection('knowledge', 'embedding_model') || null;
+  validateEmbeddingModel(embedding_model);
   const num_ctx = getInSection('knowledge', 'num_ctx') || null;
   // storage_backend: 'postgres' (default) or 'sqlite' — read from top-level key.
   // Used by db-seam.js to select the embedded SQLite backend when set to 'sqlite'.
