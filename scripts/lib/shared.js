@@ -1,7 +1,7 @@
 /**
  * shared.js — Common utilities for pipeline scripts
  *
- * Exports: findProjectRoot, loadConfig, connect, c, ollamaDefaults
+ * Exports: findProjectRoot, loadConfig, connect, c
  */
 
 const { Client } = require('pg');
@@ -19,12 +19,17 @@ const c = {
   dim:    (s) => `\x1b[2m${s}\x1b[0m`,
 };
 
-// ─── OLLAMA DEFAULTS ────────────────────────────────────────────────────────
+// ─── OLLAMA BLURB DEFAULTS ──────────────────────────────────────────────────
+// Ollama is retired as an EMBEDDING backend (vLLM/Qwen3-Embedding-8B is the
+// sole embedding backend now — see the "VLLM EMBED" section below). Ollama
+// remains in use, unrelated to embeddings, as the LLM completion backend for
+// contextual blurb generation (ollamaGenerateBlurb / qwen2.5:14b). These are
+// its connection defaults for that use only — there is no "model" default
+// here because the blurb model default lives inline in ollamaGenerateBlurb.
 
-const ollamaDefaults = {
+const ollamaBlurbDefaults = {
   host: 'localhost',
   port: 11434,
-  model: 'mxbai-embed-large',
 };
 
 // ─── PROJECT ROOT ───────────────────────────────────────────────────────────
@@ -60,6 +65,26 @@ function projectToDbName(projectName) {
   return `pipeline_${sanitized}`;
 }
 
+// Total classification, no silent branch: a pipeline.yml `embedding_model`
+// value of unset (null) or an exact match to VLLM_MODEL (the served vLLM
+// model id, defined below in the "VLLM EMBED" section — referenced here by
+// closure; safe because this function only runs after the whole module has
+// finished loading) resolves normally. Any other explicit value is a hard
+// error at config-load time naming the key, the value, and the single
+// supported model — same style as the EMBED_BACKEND validation in
+// pipeline-embed.js and test/eval/eval-retrieval.js. This runs INSIDE
+// loadConfig() so every caller of loadConfig() is protected uniformly —
+// including scripts/lib/embed.js's resurrect semantic-search path, which
+// sends knowledge.embedding_model to vLLM as the model name on every call.
+function validateEmbeddingModel(value) {
+  if (value !== null && value !== VLLM_MODEL) {
+    throw new Error(
+      `pipeline.yml: knowledge.embedding_model="${value}" is not supported -- vLLM ` +
+      `(${VLLM_MODEL}) is the only embedding backend; unset embedding_model or set it to "${VLLM_MODEL}".`
+    );
+  }
+}
+
 function loadConfig() {
   const root = findProjectRoot();
   const configPath = path.join(root, '.claude', 'pipeline.yml');
@@ -70,7 +95,10 @@ function loadConfig() {
     project: projectName,
   };
 
-  if (!fs.existsSync(configPath)) return { ...defaults, root, knowledge: { tier: 'files', host: defaults.host, port: defaults.port, database: defaults.database, user: defaults.user, embedding_model: null, num_ctx: null } };
+  if (!fs.existsSync(configPath)) {
+    validateEmbeddingModel(null);
+    return { ...defaults, root, knowledge: { tier: 'files', host: defaults.host, port: defaults.port, database: defaults.database, user: defaults.user, embedding_model: null, num_ctx: null } };
+  }
   const content = fs.readFileSync(configPath, 'utf8');
 
   // Get a top-level key (not indented)
@@ -99,6 +127,7 @@ function loadConfig() {
   const database = getInSection('knowledge', 'database') || defaults.database;
   const user = getInSection('knowledge', 'user') || defaults.user;
   const embedding_model = getInSection('knowledge', 'embedding_model') || null;
+  validateEmbeddingModel(embedding_model);
   const num_ctx = getInSection('knowledge', 'num_ctx') || null;
   // storage_backend: 'postgres' (default) or 'sqlite' — read from top-level key.
   // Used by db-seam.js to select the embedded SQLite backend when set to 'sqlite'.
@@ -134,71 +163,7 @@ async function connect(config) {
   return client;
 }
 
-// ─── OLLAMA EMBED ──────────────────────────────────────────────────────────
-
 const http = require('http');
-
-/**
- * Call Ollama /api/embed to generate vector embeddings for one or more texts.
- * Returns an array of embedding arrays (one per input text).
- */
-function ollamaEmbed(texts, config) {
-  const model = (config && config.embedding_model) || ollamaDefaults.model;
-  const host = ollamaDefaults.host;
-  const port = ollamaDefaults.port;
-  const numCtx = config && config.num_ctx ? parseInt(config.num_ctx) : null;
-
-  return new Promise((resolve, reject) => {
-    const reqBody = { model, input: texts };
-    if (numCtx) reqBody.options = { num_ctx: numCtx };
-    const body = JSON.stringify(reqBody);
-    const opts = {
-      hostname: host, port, path: '/api/embed', method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-    };
-    const req = http.request(opts, (res) => {
-      let data = '';
-      res.on('data', d => { data += d; });
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          if (!parsed.embeddings || !Array.isArray(parsed.embeddings)) {
-            return reject(new Error(`Ollama error: ${JSON.stringify(parsed).slice(0, 200)}`));
-          }
-          if (parsed.embeddings.length !== texts.length) {
-            return reject(new Error(
-              `Ollama returned ${parsed.embeddings.length} embeddings for ${texts.length} inputs ` +
-              `(likely context overrun — chunk text smaller before retry)`
-            ));
-          }
-          for (let i = 0; i < parsed.embeddings.length; i++) {
-            const vec = parsed.embeddings[i];
-            if (!Array.isArray(vec) || vec.length === 0) {
-              return reject(new Error(
-                `Ollama returned empty embedding at index ${i} ` +
-                `(likely context overrun — chunk text smaller before retry)`
-              ));
-            }
-            let sumSquares = 0;
-            for (let j = 0; j < vec.length; j++) sumSquares += vec[j] * vec[j];
-            if (Math.sqrt(sumSquares) < 1e-9) {
-              return reject(new Error(
-                `Ollama returned zero-magnitude embedding at index ${i} ` +
-                `(likely context overrun — chunk text smaller before retry)`
-              ));
-            }
-          }
-          resolve(parsed.embeddings);
-        } catch (e) { reject(e); }
-      });
-    });
-    req.on('error', (e) => {
-      reject(new Error(`Cannot reach Ollama at ${host}:${port} — is it running? (${e.message})`));
-    });
-    req.write(body);
-    req.end();
-  });
-}
 
 /**
  * hasProvenanceColumn — runtime, per-table check for embedded_by_provider_id
@@ -224,7 +189,7 @@ async function hasProvenanceColumn(client, table) {
 
 /**
  * Embed a single text and write the vector to a table row. Degrades gracefully —
- * if Ollama is not running or the embedding column doesn't exist, the row is
+ * if vLLM is not running or the embedding column doesn't exist, the row is
  * written without an embedding (can be backfilled later with `pipeline-embed.js index`).
  *
  * @param {Client} client - connected pg Client
@@ -232,12 +197,13 @@ async function hasProvenanceColumn(client, table) {
  * @param {string} idCol - column name for the row identifier
  * @param {*} idVal - value of the row identifier
  * @param {string} text - text to embed
- * @param {object} config - pipeline config (for embedding_model)
+ * @param {object} config - pipeline config (unused now that vLLM is the sole
+ *   backend; retained for call-site compatibility)
  */
 async function tryEmbed(client, table, idCol, idVal, text, config) {
   // cm#201 completeness item #8: the embedding-column check and the
   // provenance-adoption guard run OUTSIDE the try/catch below on purpose.
-  // That catch is a DELIBERATE fail-soft swallow for "Ollama down" (this
+  // That catch is a DELIBERATE fail-soft swallow for "vLLM down" (this
   // function's own documented contract) — letting a provenance refusal
   // fall into it would silently swallow the exact error class cm#201 needs
   // loud. The guard MUST fire BEFORE the write, never rely on the catch
@@ -265,11 +231,11 @@ async function tryEmbed(client, table, idCol, idVal, text, config) {
   }
 
   try {
-    const [embedding] = await ollamaEmbed([text], config);
+    const [embedding] = await vllmEmbed([text]);
     const vec = `[${embedding.join(',')}]`;
     await client.query(`UPDATE ${table} SET embedding = $1 WHERE ${idCol} = $2`, [vec, idVal]);
   } catch (_) {
-    // Ollama not running or embed failed — row exists without embedding.
+    // vLLM not running or embed failed — row exists without embedding.
     // Backfill later with: node pipeline-embed.js index
   }
 }
@@ -392,7 +358,7 @@ function _parseBaseUrl(baseUrl) {
 /**
  * Call a vLLM-compatible OpenAI /v1/embeddings endpoint to generate vector
  * embeddings for one or more texts. Returns an array of embedding arrays
- * (one per input text), matching the same signature as ollamaEmbed.
+ * (one per input text). This is the sole embedding backend (Qwen3-Embedding-8B).
  *
  * @param {string[]} texts - Array of strings to embed.
  * @param {object}   [opts] - Optional overrides (currently unused; reserved).
@@ -523,8 +489,8 @@ async function vllmRerank(query, documents, opts) {
  */
 function ollamaGenerateBlurb(parentName, heading, content, opts) {
   const model  = (opts && opts.model)  || 'qwen2.5:14b';
-  const host   = (opts && opts.host)   || ollamaDefaults.host;
-  const port   = (opts && opts.port)   || ollamaDefaults.port;
+  const host   = (opts && opts.host)   || ollamaBlurbDefaults.host;
+  const port   = (opts && opts.port)   || ollamaBlurbDefaults.port;
 
   const headingContext = heading ? ` under the section "${heading}"` : '';
   const prompt =
@@ -768,7 +734,7 @@ async function lateChunkEmbed(text, chunkOffsets, opts) {
 // ─── EXPORTS ────────────────────────────────────────────────────────────────
 
 module.exports = {
-  findProjectRoot, loadConfig, connect, c, ollamaDefaults, projectToDbName,
-  ollamaEmbed, vllmEmbed, tryEmbed, hasProvenanceColumn, runWinBin, quoteForCmd, vllmRerank,
+  findProjectRoot, loadConfig, connect, c, ollamaBlurbDefaults, projectToDbName,
+  vllmEmbed, tryEmbed, hasProvenanceColumn, runWinBin, quoteForCmd, vllmRerank,
   ollamaGenerateBlurb, vllmTokenize, vllmTokenEmbed, lateChunkEmbed,
 };

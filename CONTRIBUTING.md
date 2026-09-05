@@ -64,7 +64,7 @@ No manual database setup required. The harness generates a unique throwaway
 database, creates it at startup, and drops it when finished (even on failure).
 
 This exercises the SQL/loader/schema path. Vector-quality regression detection
-requires a local Ollama or vLLM instance and is skipped in CI.
+requires a local vLLM instance and is skipped in CI.
 
 ### Step 6 — Graph edge-traversal tests
 

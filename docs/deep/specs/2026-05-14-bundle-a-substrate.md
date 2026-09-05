@@ -234,7 +234,13 @@ place. Dimension must be established before downstream schema and pipeline phase
 **Substrate touched.** `memory_entries.embedding`, `memory_entry_chunks.embedding` — column type
 change from `vector(1024)` to `vector(4096)`. HNSW index rebuilt at new dimension. vLLM container
 for the embedder. The `pipeline.yml` config key `embedding_model` and embed endpoint URL are
-updated.
+updated. **[Update, post-migration]** `shared.js`'s `loadConfig()` now validates this key at
+load time: unset or an exact match to the sole supported vLLM model id
+(`Qwen/Qwen3-Embedding-8B`) resolves normally; any other value hard-errors naming the key, the
+value, and the supported model. The Phase 1 rollback steps below, which set this key to
+`mxbai-embed-large`, now hard-fail at config-load time rather than silently taking effect —
+Ollama is no longer a supported embedding backend at all (the code path was removed, not just
+feature-flagged off).
 
 **Order of operations.**
 1. Bring up the vLLM embedder service (see Section 4 for native WSL launch commands; Docker

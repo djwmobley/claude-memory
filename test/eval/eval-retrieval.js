@@ -38,7 +38,7 @@ const { execFileSync } = require('child_process');
 // pg is in scripts/node_modules — load via explicit path since test/ has no
 // node_modules of its own. Using path.resolve so this works from any cwd.
 const { Client }                               = require(path.resolve(__dirname, '..', '..', 'scripts', 'node_modules', 'pg'));
-const { loadConfig, connect, ollamaEmbed, vllmEmbed, vllmRerank, c } = require('../../scripts/lib/shared');
+const { loadConfig, connect, vllmEmbed, vllmRerank, c } = require('../../scripts/lib/shared');
 const { encodeCwd }                            = require('../../scripts/lib/encoded-cwd');
 
 // ─── CLI FLAGS ────────────────────────────────────────────────────────────────
@@ -50,14 +50,26 @@ const FLAG_EMBED_SKIP = argv.includes('--embed-skip');
 const FLAG_RERANK = argv.includes('--rerank') || process.env.RERANK === '1';
 const RERANK_CANDIDATE_POOL = parseInt(process.env.RERANK_CANDIDATE_POOL || '20', 10);
 
-// ─── EMBED BACKEND / COLUMN ROUTING ──────────────────────────────────────────
-// When EMBED_BACKEND=vllm, embed queries with vllmEmbed.
-// Both backends now share the single `embedding halfvec(4000)` column and the
-// v_memory_hits view. The two-column architecture (embedding_4096 alternate
-// column + v_memory_hits_4096) was retired in Phase 1 step 5 when the primary
-// embedding column was converted to halfvec(4000) via Matryoshka truncation.
-const EMBED_BACKEND_ENV = (process.env.EMBED_BACKEND || '').toLowerCase();
-const USE_VLLM_EVAL     = EMBED_BACKEND_ENV === 'vllm';
+// ─── EMBED BACKEND VALIDATION ─────────────────────────────────────────────────
+// vLLM (Qwen3-Embedding-8B) is the only supported embedding backend now that
+// the Ollama mxbai-embed-large backend has been removed. EMBED_BACKEND is
+// still read for explicit-value validation: unset or "vllm" resolves to
+// vLLM; any other explicit value is a hard error naming the removed backend
+// — never a silent fallthrough. Queries use the single `embedding
+// halfvec(4000)` column and the v_memory_hits view. (The two-column
+// architecture — embedding_4096 alternate column + v_memory_hits_4096 — was
+// retired in Phase 1 step 5 when the primary embedding column was converted
+// to halfvec(4000) via Matryoshka truncation.)
+const EMBED_BACKEND_RAW = process.env.EMBED_BACKEND;
+const EMBED_BACKEND_ENV = (EMBED_BACKEND_RAW || 'vllm').toLowerCase();
+if (EMBED_BACKEND_ENV !== 'vllm') {
+  throw new Error(
+    `EMBED_BACKEND="${EMBED_BACKEND_RAW}" is not supported -- the Ollama mxbai-embed-large ` +
+    `backend was removed. vLLM (Qwen3-Embedding-8B) is the only embedding backend; unset ` +
+    `EMBED_BACKEND or set it to "vllm".`
+  );
+}
+const USE_VLLM_EVAL     = true; // retained as a named constant for readability at call sites below
 const HITS_VIEW         = 'v_memory_hits';
 
 // ─── NEGATIVE PRECISION — SCORE-AWARE GATE ───────────────────────────────────
@@ -70,9 +82,8 @@ const HITS_VIEW         = 'v_memory_hits';
 // retrieval hit for the user.
 const NEG_PREC_SCORE_THRESHOLD = parseFloat(process.env.NEG_PREC_SCORE_THRESHOLD || '0.5');
 
-function evalEmbed(texts, config) {
-  if (USE_VLLM_EVAL) return vllmEmbed(texts);
-  return ollamaEmbed(texts, config);
+function evalEmbed(texts) {
+  return vllmEmbed(texts);
 }
 
 // ─── PATHS ────────────────────────────────────────────────────────────────────
@@ -267,7 +278,7 @@ async function main() {
   console.log('');
   console.log(c.bold('eval-retrieval — Hybrid retrieval quality eval'));
   console.log(`  DB:      ${EVAL_DB_NAME}${EVAL_DB_OWNED ? c.dim(' (throwaway — will be created and dropped)') : c.dim(' (caller-supplied — lifecycle not managed here)')}`);
-  console.log(`  Backend: ${FLAG_EMBED_SKIP ? 'SKIP (--embed-skip)' : (USE_VLLM_EVAL ? 'vLLM (Qwen3-Embedding-8B)' : 'Ollama (mxbai-embed-large)')}`);
+  console.log(`  Backend: ${FLAG_EMBED_SKIP ? 'SKIP (--embed-skip)' : 'vLLM (Qwen3-Embedding-8B)'}`);
   console.log(`  View:    ${HITS_VIEW}`);
   console.log(`  Started: ${runStartedAt}`);
   console.log('');
@@ -407,62 +418,47 @@ async function main() {
 
     // Verify all chunks have embeddings (unless --embed-skip)
     if (!FLAG_EMBED_SKIP) {
-      if (USE_VLLM_EVAL) {
-        // vLLM path: the loader may have embedded via Ollama (if running) into the
-        // `embedding` column. Run pipeline-embed with vLLM backend to (re-)embed
-        // all chunks into the halfvec(4000) embedding column using Qwen3-Embedding-8B
-        // with Matryoshka truncation to 4000 dims.
-        const EMBED_SCRIPT = path.join(path.resolve(__dirname, '..', '..'), 'scripts', 'pipeline-embed.js');
-        log(c.dim('  Running vLLM re-embed pass to populate embedding (halfvec 4000)...'));
-        try {
-          const embedOut = execFileSync(
-            'node',
-            [EMBED_SCRIPT, 'index', '--all'],
-            {
-              env: {
-                ...process.env,
-                PROJECT_ROOT:    path.resolve(__dirname, '..', '..'),
-                EMBED_BACKEND:   'vllm',
-                VLLM_EMBED_URL:  process.env.VLLM_EMBED_URL || 'http://localhost:8800',
-                PGDATABASE:      EVAL_DB_NAME,
-              },
-              stdio:    'pipe',
-              encoding: 'utf8',
-              timeout:  300000,
-            }
-          );
-          log(embedOut.slice(0, 600));
-        } catch (err) {
-          const msg = (err.stdout || '') + (err.stderr || '') + err.message;
-          infraFail(`vLLM embed pass failed: ${msg.slice(0, 500)}`);
-        }
-
-        // Verify embedding coverage
-        const nullRes = await db.query(
-          'SELECT COUNT(*) AS n FROM memory_entry_chunks WHERE embedding IS NULL'
+      // The loader already embeds inline via vLLM (pipeline-memory-loader.js
+      // embedPending), but this pass force re-embeds everything (--all) to
+      // guarantee a clean, deterministic baseline regardless of content-hash
+      // skip behavior in the loader's incremental-embed path.
+      const EMBED_SCRIPT = path.join(path.resolve(__dirname, '..', '..'), 'scripts', 'pipeline-embed.js');
+      log(c.dim('  Running vLLM re-embed pass to populate embedding (halfvec 4000)...'));
+      try {
+        const embedOut = execFileSync(
+          'node',
+          [EMBED_SCRIPT, 'index', '--all'],
+          {
+            env: {
+              ...process.env,
+              PROJECT_ROOT:    path.resolve(__dirname, '..', '..'),
+              EMBED_BACKEND:   'vllm',
+              VLLM_EMBED_URL:  process.env.VLLM_EMBED_URL || 'http://localhost:8800',
+              PGDATABASE:      EVAL_DB_NAME,
+            },
+            stdio:    'pipe',
+            encoding: 'utf8',
+            timeout:  300000,
+          }
         );
-        const nullCount = parseInt(nullRes.rows[0].n, 10);
-        const embedOk   = nullCount === 0;
-        step(
-          `Chunks with NULL embedding (halfvec 4000): ${nullCount} (expected 0)`,
-          embedOk,
-          embedOk ? null : `${nullCount} chunk(s) missing vLLM embeddings`
-        );
-        if (!embedOk) infraFail(`${nullCount} chunk(s) have NULL embedding. Check vLLM service.`);
-      } else {
-        // Ollama path: check standard embedding column
-        const nullRes = await db.query(
-          'SELECT COUNT(*) AS n FROM memory_entry_chunks WHERE embedding IS NULL'
-        );
-        const nullCount = parseInt(nullRes.rows[0].n, 10);
-        const embedOk   = nullCount === 0;
-        step(
-          `Chunks with NULL embedding: ${nullCount} (expected 0)`,
-          embedOk,
-          embedOk ? null : `${nullCount} chunk(s) missing embeddings — check Ollama`
-        );
-        if (!embedOk) infraFail(`${nullCount} chunk(s) have NULL embeddings. Ensure Ollama is running.`);
+        log(embedOut.slice(0, 600));
+      } catch (err) {
+        const msg = (err.stdout || '') + (err.stderr || '') + err.message;
+        infraFail(`vLLM embed pass failed: ${msg.slice(0, 500)}`);
       }
+
+      // Verify embedding coverage
+      const nullRes = await db.query(
+        'SELECT COUNT(*) AS n FROM memory_entry_chunks WHERE embedding IS NULL'
+      );
+      const nullCount = parseInt(nullRes.rows[0].n, 10);
+      const embedOk   = nullCount === 0;
+      step(
+        `Chunks with NULL embedding (halfvec 4000): ${nullCount} (expected 0)`,
+        embedOk,
+        embedOk ? null : `${nullCount} chunk(s) missing vLLM embeddings`
+      );
+      if (!embedOk) infraFail(`${nullCount} chunk(s) have NULL embedding. Check vLLM service.`);
     } else {
       step('Embedding verification skipped (--embed-skip)', true);
     }
@@ -502,7 +498,7 @@ async function main() {
         // Reranker mode: vector recall pool -> cross-encoder rerank -> top-5
         let qVec;
         try {
-          const embeddings = await evalEmbed([query], config && config.knowledge);
+          const embeddings = await evalEmbed([query]);
           qVec = `[${embeddings[0].join(',')}]`;
         } catch (err) {
           infraFail(`Embedding failed for query "${query}": ${err.message}`);
@@ -543,7 +539,7 @@ async function main() {
         // Standard hybrid mode
         let qVec;
         try {
-          const embeddings = await evalEmbed([query], config && config.knowledge);
+          const embeddings = await evalEmbed([query]);
           qVec = `[${embeddings[0].join(',')}]`;
         } catch (err) {
           infraFail(`Embedding failed for query "${query}": ${err.message}`);
@@ -739,7 +735,7 @@ async function main() {
           mrr,
           negative_precision,
           neg_prec_score_threshold: NEG_PREC_SCORE_THRESHOLD,
-          embedding_type: USE_VLLM_EVAL ? 'halfvec(4000)' : 'vector(1024)',
+          embedding_type: 'halfvec(4000)',
           negative_query_nearest_fp,
           updatedAt: runStartedAt,
         };

@@ -4,7 +4,8 @@
  * pipeline-memory-loader.js
  *
  * CLI loader: reads filesystem sources, chunks via pipeline-chunker, embeds
- * via ollamaEmbed (BATCH=8), and upserts idempotently into the three chunk tables.
+ * via vLLM (vllmEmbed, BATCH=8), and upserts idempotently into the three
+ * chunk tables.
  *
  * Usage:
  *   node scripts/pipeline-memory-loader.js memory      # Load ~/.claude/projects/<cwd>/memory/*.md
@@ -30,7 +31,7 @@ const crypto = require('crypto');
 
 const { chunkText }          = require('./pipeline-chunker');
 const { getClaudeProjectDir } = require('./lib/encoded-cwd');
-const { loadConfig, connect, c, ollamaEmbed, hasProvenanceColumn } = require('./lib/shared');
+const { loadConfig, connect, c, vllmEmbed, hasProvenanceColumn } = require('./lib/shared');
 const { embedWithRetry }                       = require('./pipeline-embed');
 
 const BATCH                = 8;
@@ -119,10 +120,11 @@ function sha256(text) {
 
 /**
  * Embed all rows with NULL embedding in a given table.
- * Selects rows, groups into BATCH=8 windows, calls ollamaEmbed, writes back.
+ * Selects rows, groups into BATCH=8 windows, calls vllmEmbed, writes back.
  *
  * @param {object}   db       - pg Client (null in dry-run mode)
- * @param {object}   config   - pipeline config (for embedding_model)
+ * @param {object}   config   - pipeline config (unused now that vLLM is the
+ *   sole backend; retained for call-site compatibility)
  * @param {string}   table    - 'memory_entry_chunks' | 'policy_sections' | 'session_chunks'
  * @param {Function} buildCtx - (row) => string — context-prefixed text for embedding
  * @param {object}   stats    - mutable stats object with .embedded / .errored keys
@@ -130,14 +132,13 @@ function sha256(text) {
 async function embedPending(db, config, table, buildCtx, stats) {
   if (dryRun || !db) return;
 
-  // When EMBED_BACKEND=vllm, skip the Ollama inline embed pass entirely.
-  // The caller (eval harness or pipeline-embed index) will re-embed via vLLM
-  // after load. Trying Ollama with a Qwen3 model config would time out on
-  // per-row retries (2s + 4s + 8s × N rows). See eval-retrieval.js step 5.
-  // Same short-circuit honors EMBED_SKIP=1 — used by CI (no embedding backend
-  // on the runner) so the eval harness's loader subprocess can stage fixtures
-  // into the FTS path without a 3-retry-per-row failure cascade.
-  if ((process.env.EMBED_BACKEND || '').toLowerCase() === 'vllm') return;
+  // EMBED_SKIP=1 — used by CI (no embedding backend on the runner) so the
+  // eval harness's loader subprocess can stage fixtures into the FTS path
+  // without an embed-call failure cascade. (The former EMBED_BACKEND=vllm
+  // skip-guard that lived here is gone: this function now calls vLLM
+  // directly, which was the whole point of that guard in the first place —
+  // it existed only to dodge a backend mismatch when this path still
+  // hardcoded a call to the now-removed Ollama embed function.)
   if (process.env.EMBED_SKIP === '1') return;
 
   // Allowlist guard — prevent arbitrary table names from reaching SQL
@@ -168,7 +169,7 @@ async function embedPending(db, config, table, buildCtx, stats) {
 
   // cm#201 completeness item #7: this table may have adopted
   // embedded_by_provider_id (cm#201's provenance column) since this legacy
-  // Ollama-direct embed pass was written -- it has no notion of
+  // vLLM-direct embed pass was written -- it has no notion of
   // embedding_providers at all. REFUSE loudly (abort this loader command)
   // rather than silently skip when the table has adopted the column;
   // otherwise proceed unchanged (legacy tables without the column are out
@@ -188,7 +189,7 @@ async function embedPending(db, config, table, buildCtx, stats) {
     row.text = buildCtx(row);
   }
 
-  const embedFn = (texts) => ollamaEmbed(texts, config && config.knowledge);
+  const embedFn = (texts) => vllmEmbed(texts);
 
   const result = await embedWithRetry(rows, embedFn, { batchSize: BATCH });
 

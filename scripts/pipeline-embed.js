@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * pipeline-embed.js — Generic Ollama-backed embedding pipeline for
+ * pipeline-embed.js — vLLM-backed embedding pipeline for
  * memory_entries and memory_entry_chunks.
  *
  * This file is the embedding engine for claude-memory, a generic memory
- * schema for AI agents on Postgres + pgvector + Ollama. It was forked from
+ * schema for AI agents on Postgres + pgvector + vLLM. It was forked from
  * the pipeline plugin (https://github.com/djwmobley/pipeline) as a spiritual
  * callback — the pipeline embed engine proved robust for production use and
  * serves as the foundation here.
@@ -19,29 +19,45 @@
  *   node pipeline-embed.js stats              # Show embedding coverage per table
  *
  * Requires:
- *   - Ollama running at localhost:11434
- *   - Model pulled: ollama pull mxbai-embed-large
+ *   - vLLM running at http://127.0.0.1:8800 (Qwen/Qwen3-Embedding-8B).
+ *     Start via ~/start-vllm-040.sh (WSL) or ~/start-vllm-fg.sh.
  *   - PostgreSQL with pgvector extension
+ *
+ * vLLM (Qwen3-Embedding-8B) is the ONLY embedding backend — the Ollama
+ * mxbai-embed-large backend was removed. EMBED_BACKEND is still read below
+ * purely for validation: unset or "vllm" resolves to vLLM; any other
+ * explicit value is a hard error naming the removed backend.
  */
 
 const {
-  loadConfig, connect, c, ollamaDefaults,
-  ollamaEmbed, vllmEmbed, tryEmbed,
+  loadConfig, connect, c, ollamaBlurbDefaults,
+  vllmEmbed, tryEmbed,
   ollamaGenerateBlurb, lateChunkEmbed,
 } = require('./lib/shared');
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 
 const CONFIG = loadConfig();
-const OLLAMA_HOST = ollamaDefaults.host;
-const OLLAMA_PORT = ollamaDefaults.port;
-const EMBED_MODEL = CONFIG.embedding_model || ollamaDefaults.model;
+// Ollama connection defaults below are for the `blurbs` command only
+// (qwen2.5:14b LLM completion) — unrelated to the embedding backend.
+const OLLAMA_HOST = ollamaBlurbDefaults.host;
+const OLLAMA_PORT = ollamaBlurbDefaults.port;
+const EMBED_MODEL_DISPLAY = 'Qwen/Qwen3-Embedding-8B';
 
-// ─── EMBED BACKEND ROUTING ───────────────────────────────────────────────────
-// EMBED_BACKEND=vllm  → use vllmEmbed (Qwen3-Embedding-8B, 4096-dim)
-// EMBED_BACKEND unset → use ollamaEmbed (mxbai-embed-large, 1024-dim)
-const EMBED_BACKEND = (process.env.EMBED_BACKEND || '').toLowerCase();
-const USE_VLLM = EMBED_BACKEND === 'vllm';
+// ─── EMBED BACKEND VALIDATION ────────────────────────────────────────────────
+// vLLM is the only supported embedding backend. Unset or "vllm" resolves to
+// vLLM; any other explicit value (e.g. a leftover "ollama") is a hard error
+// naming the removed backend — never a silent fallthrough.
+const EMBED_BACKEND_RAW = process.env.EMBED_BACKEND;
+const EMBED_BACKEND = (EMBED_BACKEND_RAW || 'vllm').toLowerCase();
+if (EMBED_BACKEND !== 'vllm') {
+  throw new Error(
+    `EMBED_BACKEND="${EMBED_BACKEND_RAW}" is not supported -- the Ollama mxbai-embed-large ` +
+    `backend was removed. vLLM (Qwen3-Embedding-8B) is the only embedding backend; unset ` +
+    `EMBED_BACKEND or set it to "vllm".`
+  );
+}
+const USE_VLLM = true; // retained as a named constant for readability at call sites below
 
 // EMBED_COLUMN=embedding_4096 → write 4096-dim vectors to the alternate column.
 // Default is 'embedding' (the production 1024-dim column).
@@ -88,12 +104,11 @@ const TABLES = [
 
 // ─── EMBED CONSTANTS ─────────────────────────────────────────────────────────
 
-// Safety guard: mxbai-embed-large has a 512-token cap (~4 chars/token, 2000 bytes).
-// Qwen3-Embedding-8B is configured with max_model_len=8192 tokens on this
-// deployment (live-verified 2026-08-18, mm#11(g) follow-up -- NOT the
-// model's theoretical 32K context, which this vLLM instance does not run
-// at); use a much larger guard (16000 bytes) than the mxbai case regardless.
-const MAX_EMBED_BYTES = USE_VLLM ? 16000 : 2000;
+// Safety guard byte cap for embed input. Qwen3-Embedding-8B is configured
+// with max_model_len=8192 tokens on this deployment (live-verified
+// 2026-08-18, mm#11(g) follow-up -- NOT the model's theoretical 32K
+// context, which this vLLM instance does not run at).
+const MAX_EMBED_BYTES = 16000;
 
 // ─── CHUNK-COVERED TABLES ────────────────────────────────────────────────────
 // Derived from information_schema at first use; cached for the process lifetime.
@@ -151,7 +166,7 @@ async function hasAnyEmbeddings(client, tableName) {
  *                                           Caller must set row.text before calling.
  * @param {Function} embedFn               - async (string[]) => number[][] — one vector per input.
  * @param {object}   [opts]
- * @param {number}   [opts.batchSize=32]   - Number of rows per Ollama call.
+ * @param {number}   [opts.batchSize=32]   - Number of rows per vLLM call.
  * @param {number}   [opts.maxRetries=3]   - Per-row retry attempts after batch failure.
  * @param {Function} [opts.onBatchError]   - (err, batch) => void — called on batch rejection.
  * @returns {Promise<{ embedded: number, skipped: number, failed: number }>}
@@ -385,15 +400,11 @@ async function cmdIndex(forceAll) {
   try {
     let totalDone = 0;
 
-    // Route the embed function based on EMBED_BACKEND env var.
-    const embedFn = USE_VLLM
-      ? (texts) => vllmEmbed(texts)
-      : (texts) => ollamaEmbed(texts, CONFIG);
-
-    const backendLabel = USE_VLLM ? `vLLM (${process.env.VLLM_EMBED_URL || 'http://localhost:8800'})` : `Ollama ${EMBED_MODEL}`;
+    const embedFn = (texts) => vllmEmbed(texts);
+    const backendLabel = `vLLM (${process.env.VLLM_EMBED_URL || 'http://localhost:8800'})`;
     console.log(c.dim(`Backend: ${backendLabel} | Column: ${EMBED_COLUMN} | Max bytes: ${MAX_EMBED_BYTES}`));
 
-    if (LATE_CHUNKING && USE_VLLM) {
+    if (LATE_CHUNKING) {
       console.log(c.dim('Late chunking: ENABLED (memory_entry_chunks will use per-token pooling)'));
     }
 
@@ -409,7 +420,7 @@ async function cmdIndex(forceAll) {
 
       // cm#201 completeness item #6: this table may have adopted
       // embedded_by_provider_id (cm#201's provenance column) since this
-      // legacy Ollama/vLLM-direct pipeline was written -- it has no notion
+      // legacy vLLM-direct pipeline was written -- it has no notion
       // of embedding_providers at all. The guard applies ONLY when writing
       // the actual "embedding" column (the column embedded_by_provider_id
       // pairs with) -- an EMBED_COLUMN redirect to an alternate column
@@ -428,8 +439,8 @@ async function cmdIndex(forceAll) {
         );
       }
 
-      // Late chunking path for memory_entry_chunks when LATE_CHUNKING=1 + vLLM
-      if (LATE_CHUNKING && USE_VLLM && tbl.name === 'memory_entry_chunks') {
+      // Late chunking path for memory_entry_chunks when LATE_CHUNKING=1
+      if (LATE_CHUNKING && tbl.name === 'memory_entry_chunks') {
         const query = forceAll
           ? `SELECT COUNT(*) FROM memory_entry_chunks`
           : `SELECT COUNT(*) FROM memory_entry_chunks WHERE ${EMBED_COLUMN} IS NULL`;
@@ -502,7 +513,7 @@ async function cmdSearch(query) {
       return;
     }
 
-    const embedQueryFn = USE_VLLM ? vllmEmbed : (texts) => ollamaEmbed(texts, CONFIG);
+    const embedQueryFn = vllmEmbed;
     const [qEmbedding] = await embedQueryFn([query]);
     const vec = `[${qEmbedding.join(',')}]`;
 
@@ -586,7 +597,7 @@ async function cmdHybrid(query) {
   try {
     let resultNum = 0;
     let qEmb = null;
-    const embedQueryFnH = USE_VLLM ? vllmEmbed : (texts) => ollamaEmbed(texts, CONFIG);
+    const embedQueryFnH = vllmEmbed;
 
     // ── v_memory_hits (chunked: memory + sessions + policy) ──
     const { rows: viewExists } = await client.query(
@@ -738,7 +749,7 @@ async function cmdStats() {
 function help() {
   console.log(`
 ${c.bold('pipeline-embed.js')} — Multi-table embedding index + semantic search
-${c.dim(`Database: ${CONFIG.database} | Ollama: ${OLLAMA_HOST}:${OLLAMA_PORT} | Model: ${EMBED_MODEL}`)}
+${c.dim(`Database: ${CONFIG.database} | Embed backend: vLLM (${process.env.VLLM_EMBED_URL || 'http://localhost:8800'}) | Model: ${EMBED_MODEL_DISPLAY}`)}
 ${c.dim(`Tables: ${TABLES.map(t => t.name).join(', ')}`)}
 
   ${c.cyan('blurbs')}
@@ -751,8 +762,8 @@ ${c.dim(`Tables: ${TABLES.map(t => t.name).join(', ')}`)}
   ${c.cyan('index')}
       Embed all unembedded entries across all tables.
       Reads blurb column from DB and prepends to chunk text before embedding.
-      Set LATE_CHUNKING=1 + EMBED_BACKEND=vllm to use per-token pooling for
-      memory_entry_chunks (vLLM late chunking via /pooling?task=token_embed).
+      Set LATE_CHUNKING=1 to use per-token pooling for memory_entry_chunks
+      (vLLM late chunking via /pooling?task=token_embed).
 
   ${c.cyan('index --all')}
       Re-embed everything (force refresh)
@@ -768,11 +779,15 @@ ${c.dim(`Tables: ${TABLES.map(t => t.name).join(', ')}`)}
 
 Operational sequence for full corpus refresh:
   1. node scripts/pipeline-memory-loader.js memory   (load chunks; embeddings + blurbs NULL)
-  2. node scripts/pipeline-embed.js blurbs           (fill NULL blurbs via Ollama)
-  3. node scripts/pipeline-embed.js index            (embed, reading blurbs from DB)
+  2. node scripts/pipeline-embed.js blurbs           (fill NULL blurbs via Ollama, qwen2.5:14b)
+  3. node scripts/pipeline-embed.js index            (embed via vLLM, reading blurbs from DB)
 
-Requires: Ollama running at ${OLLAMA_HOST}:${OLLAMA_PORT}
-  ollama pull ${EMBED_MODEL}
+Requires:
+  - vLLM running at ${process.env.VLLM_EMBED_URL || 'http://localhost:8800'} for embedding
+    (index / search / hybrid). Start: ~/start-vllm-040.sh (WSL) or ~/start-vllm-fg.sh, port 8800.
+    Model: ${EMBED_MODEL_DISPLAY}
+  - Ollama running at ${OLLAMA_HOST}:${OLLAMA_PORT} for blurb generation only (blurbs command).
+    Model: ollama pull qwen2.5:14b
 `);
 }
 

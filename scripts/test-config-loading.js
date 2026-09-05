@@ -17,6 +17,11 @@
  *   T6  findProjectRoot: walks up from cwd to find .git directory
  *   T7  loadConfig: project name derived from root directory basename when no config
  *   T8  loadConfig: nested knowledge object has all required fields in no-config fallback
+ *   T9  loadConfig: embedding_model validation — unset AND exact vLLM model id both
+ *       resolve without error (total classification, branch (a))
+ *   T10 loadConfig: embedding_model validation — any other value hard-errors at
+ *       load time, naming the key, the value, and the single supported model
+ *       (total classification, branch (b); e.g. a leftover "mxbai-embed-large")
  *
  * IMPORTANT — CRLF footgun analysis (shared.js getInSection / getTopLevel):
  *   The regex `([^"\n]+)` followed by `.trim()` would capture a trailing \r from
@@ -112,7 +117,7 @@ const FIXTURE_LF = [
   '  port: 5433',
   '  database: my_test_db',
   '  user: myuser',
-  '  embedding_model: mxbai-embed-large',
+  '  embedding_model: Qwen/Qwen3-Embedding-8B',
   '  num_ctx: 8192',
   'storage_backend: postgres',
   '',
@@ -150,7 +155,7 @@ async function main() {
       if (cfg.database !== 'my_test_db')      throw new Error(`database: expected 'my_test_db', got '${cfg.database}'`);
       if (cfg.user !== 'myuser')              throw new Error(`user: expected 'myuser', got '${cfg.user}'`);
       if (cfg.knowledge.tier !== 'embeddings') throw new Error(`tier: expected 'embeddings', got '${cfg.knowledge.tier}'`);
-      if (cfg.knowledge.embedding_model !== 'mxbai-embed-large') throw new Error(`embedding_model: expected 'mxbai-embed-large', got '${cfg.knowledge.embedding_model}'`);
+      if (cfg.knowledge.embedding_model !== 'Qwen/Qwen3-Embedding-8B') throw new Error(`embedding_model: expected 'Qwen/Qwen3-Embedding-8B', got '${cfg.knowledge.embedding_model}'`);
       if (cfg.storage_backend !== 'postgres') throw new Error(`storage_backend: expected 'postgres', got '${cfg.storage_backend}'`);
 
       fs.unlinkSync(cfgPath);
@@ -184,7 +189,7 @@ async function main() {
       if (cfg.database !== 'my_test_db')      throw new Error(`CRLF: database: expected 'my_test_db', got ${JSON.stringify(cfg.database)}`);
       if (cfg.user !== 'myuser')              throw new Error(`CRLF: user: expected 'myuser', got ${JSON.stringify(cfg.user)}`);
       if (cfg.knowledge.tier !== 'embeddings') throw new Error(`CRLF: tier: expected 'embeddings', got ${JSON.stringify(cfg.knowledge.tier)}`);
-      if (cfg.knowledge.embedding_model !== 'mxbai-embed-large') throw new Error(`CRLF: embedding_model: expected 'mxbai-embed-large', got ${JSON.stringify(cfg.knowledge.embedding_model)}`);
+      if (cfg.knowledge.embedding_model !== 'Qwen/Qwen3-Embedding-8B') throw new Error(`CRLF: embedding_model: expected 'Qwen/Qwen3-Embedding-8B', got ${JSON.stringify(cfg.knowledge.embedding_model)}`);
       if (cfg.storage_backend !== 'postgres') throw new Error(`CRLF: storage_backend: expected 'postgres', got ${JSON.stringify(cfg.storage_backend)}`);
 
       fs.unlinkSync(cfgPath);
@@ -303,6 +308,84 @@ async function main() {
       for (const field of required) {
         if (!(field in k)) throw new Error(`knowledge.${field} is missing from fallback config`);
       }
+    });
+
+    // T9 — embedding_model validation, branch (a): unset AND exact vLLM model
+    // id both resolve without throwing. "Unset" is exercised via T4/T8's
+    // no-config fallback (embedding_model: null) above; this test adds the
+    // explicit unset-with-a-present-config-file case (knowledge section
+    // present, embedding_model key absent) plus the exact-match case, so
+    // both flavors of branch (a) are covered directly by name.
+    await runTest('T9: loadConfig — embedding_model validation: unset and exact vLLM model id both resolve', () => {
+      const cfgPath = path.join(claudeDir, 'pipeline.yml');
+
+      // (a1) config file present, knowledge section present, embedding_model absent
+      fs.writeFileSync(cfgPath, [
+        'project:',
+        '  name: my-test-project',
+        'knowledge:',
+        '  tier: embeddings',
+        '',
+      ].join('\n'), { encoding: 'utf8' });
+      process.env.PROJECT_ROOT = tmpBase;
+      let cfg;
+      try {
+        cfg = loadConfig();
+      } catch (err) {
+        throw new Error(`unset embedding_model (config present) should not throw, but got: ${err.message}`);
+      }
+      if (cfg.knowledge.embedding_model !== null) {
+        throw new Error(`expected embedding_model null when key absent, got '${cfg.knowledge.embedding_model}'`);
+      }
+
+      // (a2) exact vLLM model id
+      fs.writeFileSync(cfgPath, FIXTURE_LF, { encoding: 'utf8' });
+      process.env.PROJECT_ROOT = tmpBase;
+      try {
+        cfg = loadConfig();
+      } catch (err) {
+        throw new Error(`exact vLLM model id should not throw, but got: ${err.message}`);
+      }
+      if (cfg.knowledge.embedding_model !== 'Qwen/Qwen3-Embedding-8B') {
+        throw new Error(`expected embedding_model 'Qwen/Qwen3-Embedding-8B', got '${cfg.knowledge.embedding_model}'`);
+      }
+
+      fs.unlinkSync(cfgPath);
+    });
+
+    // T10 — embedding_model validation, branch (b): any other value hard-errors
+    // at load time, naming the key, the value, and the single supported model.
+    // Same style as the EMBED_BACKEND validation in pipeline-embed.js /
+    // eval-retrieval.js. Adversarial example: a leftover "mxbai-embed-large"
+    // config value from the removed Ollama backend must not be silently
+    // ignored.
+    await runTest('T10: loadConfig — embedding_model validation: unsupported value hard-errors naming key, value, and supported model', () => {
+      const cfgPath = path.join(claudeDir, 'pipeline.yml');
+      fs.writeFileSync(cfgPath, [
+        'project:',
+        '  name: my-test-project',
+        'knowledge:',
+        '  embedding_model: mxbai-embed-large',
+        '',
+      ].join('\n'), { encoding: 'utf8' });
+
+      process.env.PROJECT_ROOT = tmpBase;
+
+      let threw = false;
+      let message = '';
+      try {
+        loadConfig();
+      } catch (err) {
+        threw = true;
+        message = err.message;
+      }
+
+      if (!threw) throw new Error('expected loadConfig() to throw for embedding_model="mxbai-embed-large", but it did not');
+      if (!message.includes('embedding_model')) throw new Error(`error message must name the key 'embedding_model'; got: ${message}`);
+      if (!message.includes('mxbai-embed-large')) throw new Error(`error message must name the offending value 'mxbai-embed-large'; got: ${message}`);
+      if (!message.includes('Qwen/Qwen3-Embedding-8B')) throw new Error(`error message must name the single supported model; got: ${message}`);
+
+      fs.unlinkSync(cfgPath);
     });
 
   } finally {
