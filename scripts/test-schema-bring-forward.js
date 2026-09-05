@@ -63,6 +63,8 @@ const PROJECT_ROOT = path.resolve(__dirname, '..');
 const handoffModule = require(path.join(PROJECT_ROOT, 'scripts', 'handoff.js'));
 const { PostgresAdapter } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'db-seam.js'));
 const { classifySchemaFiles, normalizeContent } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'schema-classify.js'));
+// cm#224 follow-up: shared guarded pgvector-extension installer.
+const { ensureVectorExtension } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'test-pg-helpers.js'));
 
 let passed = 0;
 let failed = 0;
@@ -273,6 +275,18 @@ async function testT3() {
   const PID = 'cm185-t3-project';
   try {
     await createThrowawayDb(dbName);
+
+    // cm#224 follow-up: this test's own intent is run-twice IDEMPOTENCY,
+    // unrelated to pgvector — create the extension (via the ONE shared,
+    // guarded implementation) so the second-call assertion below isn't
+    // confounded by the independent pgvector-gated-degradation check
+    // ensureSchemaCurrent now also runs on every call (a scratch DB with no
+    // vector extension genuinely IS degraded post-apply, correctly
+    // reported as reason:'degraded' rather than 'current' — see
+    // test/test-decisions-canon.js's dedicated T3 for that behavior's own
+    // test coverage).
+    await ensureVectorExtension(dbName);
+
     const db = await pgConnect(dbName);
     const adapter = new PostgresAdapter(db);
 

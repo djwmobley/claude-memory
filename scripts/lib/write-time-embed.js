@@ -144,4 +144,74 @@ async function writeRowWithProvenanceRetry(client, embedText, writeFn, embedOpts
   }
 }
 
-module.exports = { embedForWrite, writeRowWithProvenanceRetry };
+/**
+ * EmbeddingColumnAbsentError — cm#224 follow-up (independent PR #225 review
+ * finding): thrown in place of letting a raw Postgres 42703 ("column
+ * ... does not exist") escape to an MCP caller when a write attempts to
+ * set a table's `embedding` column but that column is absent on this
+ * database. This is the GENERAL replacement for the silent-degrade class
+ * of bug — every embeddable table's `embedding` column is wrapped in a
+ * `DO $$ ... EXCEPTION WHEN OTHERS $$` block at schema-apply time
+ * (degrades gracefully, no CREATE EXTENSION issued, per handoff-core-
+ * schema.sql's assertions.embedding pattern and decisions-base.sql's own
+ * copy of it) — so a pgvector-absent target silently ends up with the row
+ * present but no embedding column at all. Reusable across every writer,
+ * not a decisions-specific special case: today the only LIVE write-time
+ * path that can hit this is memory-upsert.js's upsertDecisionRow/
+ * writeMemoryRow (via persist_decisions/memory_upsert); assertions.
+ * embedding has no live write-time path at all today (it is populated
+ * only by the offline migrate-07-reembed-corpus.js backfill, which is
+ * already structurally immune — discoverEmbeddableTables() there
+ * enumerates embeddable tables via a live pg_catalog scan, so it can
+ * never attempt to write a column it did not already find present) — but
+ * any FUTURE live assertions/agent_exchange/seam-table embedding write
+ * path gets this same behavior for free by reusing
+ * classifyEmbeddingWriteError below instead of letting its own 42703 leak.
+ *
+ * Reuses this repo's existing named-error-class convention (code + message
+ * + details, e.g. MemoryUpsertError/MemorySearchError/ExchangeLogError) —
+ * scripts/handoff-mcp.mjs's libToolError maps this class by name.
+ */
+class EmbeddingColumnAbsentError extends Error {
+  constructor(table, details) {
+    const message =
+      `embedding column absent on "${table}": pgvector is not installed on this database ` +
+      `(or the pgvector-gated column/index was otherwise skipped at schema-apply time) — see ` +
+      `project_settings.schema_apply_degraded (reason 'pgvector_gated_skip') for the full record. ` +
+      `Remedy: have a Postgres superuser run \`CREATE EXTENSION vector;\` on this database, then ask ` +
+      `an operator to force a schema re-apply (a SCHEMA_EPOCH bump, or a direct \`ALTER TABLE\`/` +
+      `\`CREATE INDEX\`) — installing the extension alone does not retroactively add the column; the ` +
+      `gated DDL only runs during an actual apply pass.`;
+    super(message);
+    this.name = 'EmbeddingColumnAbsentError';
+    this.code = 'embeddingColumnAbsent';
+    this.table = table;
+    this.details = details || null;
+  }
+}
+
+/**
+ * classifyEmbeddingWriteError — if `err` is a Postgres 42703 (undefined
+ * column) naming the `embedding` column specifically, returns a new
+ * EmbeddingColumnAbsentError(table, ...) for the caller to throw instead;
+ * otherwise returns null (caller re-throws `err` unchanged — every other
+ * error class, e.g. 23505 collision, 23503 provenance-FK race, is NOT this
+ * function's concern).
+ *
+ * @param {Error & {code?:string, message:string}} err
+ * @param {string} table
+ * @returns {EmbeddingColumnAbsentError|null}
+ */
+function classifyEmbeddingWriteError(err, table) {
+  if (err && err.code === '42703' && typeof err.message === 'string' && /column\s+"embedding"/i.test(err.message)) {
+    return new EmbeddingColumnAbsentError(table, { pgCode: err.code, pgMessage: err.message });
+  }
+  return null;
+}
+
+module.exports = {
+  embedForWrite,
+  writeRowWithProvenanceRetry,
+  EmbeddingColumnAbsentError,
+  classifyEmbeddingWriteError,
+};

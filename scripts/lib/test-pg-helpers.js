@@ -43,6 +43,34 @@ async function pgConnect(database = 'postgres') {
   return client;
 }
 
+/**
+ * cm#224 follow-up (PR #225 CI-red finding, bisected to 6e76e11): every
+ * scratch DB this shared helper creates goes through this ONE call so
+ * ensureSchemaCurrent's pgvector-gated-column check (assertions.embedding,
+ * decisions.embedding — see scripts/handoff.js's checkPgvectorGatedObjects)
+ * sees a genuinely non-degraded fixture on any Postgres that actually HAS
+ * pgvector available (every CI runner uses the pgvector/pgvector:pg16
+ * image, which provides the extension but does not auto-install it into
+ * every fresh database — each DB still needs its own CREATE EXTENSION).
+ * Guarded: a Postgres with no pgvector at all logs ONE line and continues
+ * — that DB is then a genuine pgvector-absent fixture, and the
+ * gated-column check legitimately reports 'degraded' for it (this is the
+ * correct, intended behavior for that case, not a bug to work around).
+ *
+ * @param {string} dbName — target database (already created, may not exist
+ *   yet on a caller error — connection failure propagates, not swallowed)
+ */
+async function ensureVectorExtension(dbName) {
+  const db = await pgConnect(dbName);
+  try {
+    await db.query('CREATE EXTENSION IF NOT EXISTS vector');
+  } catch (err) {
+    console.log(`[test-pg-helpers] CREATE EXTENSION vector skipped on "${dbName}" -- pgvector not installed on this Postgres (${err.message}); any pgvector-gated column check against this DB will legitimately report degraded.`);
+  } finally {
+    await db.end();
+  }
+}
+
 // ── DB lifecycle — quiet (L0/L2/L3/L4 style) ─────────────────────────────────
 
 /**
@@ -56,6 +84,7 @@ async function createDb(dbName, projectDir) {
     await sysDb.query(`CREATE DATABASE "${dbName}"`);
   }
   await sysDb.end();
+  await ensureVectorExtension(dbName);
   fs.mkdirSync(projectDir, { recursive: true });
 }
 
@@ -96,6 +125,7 @@ async function createTestDb(dbName, projectDir) {
   }
   await sysDb.query(`CREATE DATABASE "${dbName}"`);
   await sysDb.end();
+  await ensureVectorExtension(dbName);
   fs.mkdirSync(projectDir, { recursive: true });
 }
 
@@ -290,6 +320,9 @@ module.exports = {
   // DB lifecycle — quiet (L0/L2/L3/L4)
   createDb,
   dropDb,
+  // pgvector — cm#224 follow-up: available for any test that creates its own
+  // scratch DB by a mechanism OTHER than createDb/createTestDb above.
+  ensureVectorExtension,
   // DB lifecycle — strict with teardown log (resurrect/operator-pin)
   createTestDb,
   dropTestDb,

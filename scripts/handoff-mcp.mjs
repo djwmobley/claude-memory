@@ -36,6 +36,14 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const { connectForRoot } = require('./lib/mcp-db-connect.js');
 const { ensureProjectIdentity } = require('./lib/project-identity.js');
+// cm#224 (decisions canon fix): the SAME ensureSchemaCurrent handoff.js itself
+// calls from cmdLoaderLoad/cmdClose/cmdInit — never a second implementation.
+// Requiring handoff.js here does NOT run its CLI router: handoff.js's own
+// `if (require.main === module)` guard is false when it is require()'d
+// (CJS, via createRequire) from this ESM server process, so only its
+// module.exports object is evaluated — verified empirically (see the PR
+// body for the probe transcript).
+const { ensureSchemaCurrent } = require('./handoff.js');
 const memoryUpsertLib = require('./lib/memory-upsert.js');
 const memorySearchLib = require('./lib/memory-search.js');
 const entityCrudLib = require('./lib/entity-graph-crud.js');
@@ -131,7 +139,62 @@ async function withProjectDb(projectRoot, fn) {
   const db = await connectForRoot(projectRoot);
   try {
     const identity = await ensureProjectIdentity(db, { cwd: projectRoot, silent: true });
-    return await fn(db, identity.projectId);
+    // cm#224: bring the schema forward for MCP-only sessions on pre-existing
+    // project DBs — before this fix, an MCP client that never runs `handoff.js
+    // init`/`resume` on this projectRoot could hit an every-§8-tool DB whose
+    // schema was fingerprinted current at an OLDER epoch (e.g. missing
+    // `decisions`/`audit_log`/the decisions_audit trigger canonized by this
+    // same fix) and every §8 tool touching it would 42P01 with no actionable
+    // remedy. ensureSchemaCurrent has NO interactive confirmation gate of its
+    // own (that gate is cmdInit's DB-*creation* prompt only — see handoff.js's
+    // "Confirmation gate — BEFORE any DDL" comment) and never throws by
+    // contract (every failure path returns {applied:false, reason, detail}),
+    // so this call always attempts the additive apply. The total behavior:
+    //   - reason 'current' or applied:true  -> proceed silently (the common case).
+    //   - reason 'degraded' (cm#224 follow-up, PR #225 independent review
+    //     finding) -> a pgvector-gated column/index (e.g. decisions.embedding,
+    //     assertions.embedding) was silently skipped at apply time -- the
+    //     REST of the schema is fine, so this is allowed to PROCEED (a tool
+    //     that never touches a gated column must not be blocked by an
+    //     unrelated degradation) but schemaResult.detail is attached to the
+    //     tool's own error below whenever it later fails specifically on a
+    //     gated column, so the MCP caller sees the full degradation record,
+    //     not just a bare error.
+    //   - anything else (manifest_error, classification_error, ahead, unknown,
+    //     lock_acquire_failed, apply_failed, integrity_index_failed,
+    //     verification_failed) -> FAIL LOUD here, never silently skip. This is
+    //     a deliberate divergence from cmdLoaderLoad/cmdClose's own non-fatal
+    //     stderr-only swallow of the same call (documented in docs/mcp-tools.md)
+    //     — an MCP caller has no stderr to read and no interactive prompt to
+    //     answer, so surfacing the degradation as a hard tool error with an
+    //     actionable remedy is strictly better than deferring to a more
+    //     confusing SQL-layer failure inside the tool's own write.
+    const schemaResult = await ensureSchemaCurrent(db, identity.projectId, { silent: true });
+    if (!schemaResult.applied && schemaResult.reason !== 'current' && schemaResult.reason !== 'degraded') {
+      throw new Error(
+        `withProjectDb: schema is not current for this project DB and the automatic bring-forward did ` +
+        `not succeed (reason: ${schemaResult.reason}` +
+        `${schemaResult.detail ? `, detail: ${JSON.stringify(schemaResult.detail)}` : ''}). ` +
+        `Remedy: run \`node scripts/handoff.js init\` (or \`resume\`) directly against this project root ` +
+        `in an interactive terminal to resolve the degraded state, then retry this MCP tool call.`
+      );
+    }
+    try {
+      return await fn(db, identity.projectId);
+    } catch (toolErr) {
+      // cm#224 follow-up: only attach when this specific call was degraded
+      // AND the tool's own failure is actually a gated-column failure (our
+      // named EmbeddingColumnAbsentError, or a raw 42703 that slipped past
+      // some future path not yet routed through classifyEmbeddingWriteError)
+      // — never stamp an unrelated tool error with a degradation record
+      // that has nothing to do with it.
+      if (schemaResult.reason === 'degraded' && toolErr &&
+          (toolErr.name === 'EmbeddingColumnAbsentError' || toolErr.code === '42703') &&
+          !toolErr.schemaApplyDegraded) {
+        toolErr.schemaApplyDegraded = schemaResult.detail;
+      }
+      throw toolErr;
+    }
   } finally {
     await db.end();
   }
@@ -140,17 +203,26 @@ async function withProjectDb(projectRoot, fn) {
 /** Maps every §8 lib error class's `.code` to a stable MCP-tool error
  * response. Named library errors (MemoryUpsertError, MemorySearchError,
  * EntityGraphCrudError, MemoryViewError, ExchangeLogError,
- * RoutingProfileError) are reported with their code + message; anything
- * else falls through to errorResult's generic stack-trace formatting. */
+ * RoutingProfileError, EmbeddingColumnAbsentError — cm#224 follow-up) are
+ * reported with their code + message; anything else falls through to
+ * errorResult's generic stack-trace formatting. Either way, if
+ * withProjectDb attached a `.schemaApplyDegraded` record (a gated-column
+ * failure during a 'degraded' schema state), it is appended so the MCP
+ * caller sees the full degradation record alongside the error, not just
+ * the bare message. */
 function libToolError(err) {
   const namedCodes = new Set([
     'MemoryUpsertError', 'MemorySearchError', 'EntityGraphCrudError',
     'MemoryViewError', 'ExchangeLogError', 'RoutingProfileError',
+    'EmbeddingColumnAbsentError',
   ]);
-  if (err && namedCodes.has(err.name)) {
-    return toolError(`${err.name} [${err.code}]: ${err.message}`);
+  const result = (err && namedCodes.has(err.name))
+    ? toolError(`${err.name} [${err.code}]: ${err.message}`)
+    : errorResult(err);
+  if (err && err.schemaApplyDegraded) {
+    result.content[0].text += `\n\n-- project_settings.schema_apply_degraded --\n${JSON.stringify(err.schemaApplyDegraded, null, 2)}`;
   }
-  return errorResult(err);
+  return result;
 }
 
 // ── MCP result helpers ───────────────────────────────────────────────────────

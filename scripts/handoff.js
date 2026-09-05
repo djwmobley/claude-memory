@@ -1451,7 +1451,10 @@ const { classifySchemaFiles, normalizeContent } = require('./lib/schema-classify
 // Must match scripts/sql/schema-manifest.json's top-level "schema_epoch".
 // Bump BOTH together whenever the applicable-unit set or any unit's DDL
 // changes in a way that must force a re-apply on already-current databases.
-const SCHEMA_EPOCH = 1;
+// Bumped to 2 (cm#224): decisions-base.sql added to the postgres unit set --
+// every already-current live project DB must re-apply once to pick up
+// `decisions`/`audit_log`/the decisions_audit trigger.
+const SCHEMA_EPOCH = 2;
 
 // Module-level cache: maps schemaFilePath → { mtimeMs, size, hash } so repeated
 // calls in one process don't re-read or re-hash the SQL files. Keyed on
@@ -1694,6 +1697,94 @@ async function clearSchemaDegradation(db, projectId) {
 }
 
 /**
+ * cm#224 follow-up (independent PR #225 review finding): detects
+ * pgvector-gated schema objects that were silently SKIPPED on THIS
+ * database. "Gated" = a column/index wrapped in a
+ * `DO $$ ... EXCEPTION WHEN OTHERS $$` block that degrades gracefully
+ * (RAISE NOTICE, no CREATE EXTENSION) when pgvector is absent —
+ * handoff-core-schema.sql's assertions.embedding/
+ * assertions_embedding_hnsw_idx and decisions-base.sql's
+ * decisions.embedding/decisions_embedding_idx today. Before this fix, a
+ * skipped gated object was invisible everywhere: no `pg` 'notice' listener
+ * was ever registered, `schemaObjectsExist()` deliberately excludes gated
+ * objects from `expected_objects` (so post-apply verification still
+ * passes), and `ensureSchemaCurrent` reported `applied:true`/
+ * `reason:'current'` regardless.
+ *
+ * GENERAL mechanism, declarative — reads `pgvector_gated` off EVERY
+ * manifest unit in the active dialect's applicable set (today:
+ * handoff-core-schema.sql, decisions-base.sql; a future gated object on
+ * any other table needs only a manifest entry, never a code change here).
+ * Runs on EVERY call (both the 'current' fast path and a fresh apply) —
+ * a DB fingerprinted current BEFORE pgvector was ever installed must keep
+ * reporting the degradation on every subsequent touch, not just the one
+ * apply that first skipped it (that "reported once, then silent forever"
+ * gap is exactly the finding this closes).
+ *
+ * @param {object} db — connected StoragePort adapter
+ * @param {object} manifest — classification.manifest (schema-manifest.json, parsed)
+ * @param {Array<{basename:string}>} units — the active dialect's applicable unit set
+ * @returns {Promise<{ok:boolean, vectorExtensionPresent:boolean|null, missing:Array<{unit:string,table:string,column:string}>}>}
+ */
+async function checkPgvectorGatedObjects(db, manifest, units) {
+  const gatedColumns = [];
+  for (const u of units) {
+    const entry = manifest.units[u.basename];
+    const gated = entry && entry.pgvector_gated;
+    if (gated && Array.isArray(gated.columns)) {
+      for (const c of gated.columns) gatedColumns.push({ unit: u.basename, table: c.table, column: c.column });
+    }
+  }
+  if (gatedColumns.length === 0) return { ok: true, vectorExtensionPresent: null, missing: [] };
+
+  let vectorExtensionPresent = null;
+  try {
+    const { rows } = await db.query(`SELECT 1 FROM pg_extension WHERE extname = 'vector'`);
+    vectorExtensionPresent = rows.length > 0;
+  } catch (_) {
+    // pg_extension itself unreadable — leave null (unknown), the check
+    // below (the actual column probe) is authoritative regardless.
+  }
+
+  const check = await db.schemaObjectsExist({
+    columns: gatedColumns.map((gc) => ({ table: gc.table, column: gc.column })),
+  });
+  const missingSet = new Set(
+    (check.missing || [])
+      .filter((m) => m.type === 'column')
+      .map((m) => `${m.table}.${m.column}`)
+  );
+  const missing = gatedColumns.filter((gc) => missingSet.has(`${gc.table}.${gc.column}`));
+  return { ok: missing.length === 0, vectorExtensionPresent, missing };
+}
+
+/**
+ * cm#224 follow-up: shared "is this DB currently degraded by a skipped
+ * pgvector-gated object?" check + record-and-build-response helper, used
+ * by all three ensureSchemaCurrent call sites that can otherwise report
+ * success (the 'current' fast path, the post-lock-acquire re-check, and a
+ * freshly successful apply). Returns `null` when nothing is gated-missing
+ * (caller proceeds with its own normal success return); otherwise records
+ * the persistent degradation and returns the final response object.
+ */
+async function reportPgvectorGatedDegradation(db, projectId, classification, units, { silent, applied, extraDetail } = {}) {
+  const gated = await checkPgvectorGatedObjects(db, classification.manifest, units);
+  if (gated.ok) return null;
+  const detail = {
+    missing: gated.missing.map((m) => ({ unit: m.unit, table: m.table, column: m.column })),
+    vectorExtensionPresent: gated.vectorExtensionPresent,
+    remedy:
+      'Have a Postgres superuser run `CREATE EXTENSION vector;` on this database, then ask an operator ' +
+      'to force a schema re-apply (a SCHEMA_EPOCH bump, or a direct manual ALTER TABLE/CREATE INDEX) — ' +
+      'installing the extension alone does not retroactively add a column/index that was already skipped ' +
+      'at apply time.',
+    ...(extraDetail || {}),
+  };
+  await recordSchemaDegradation(db, projectId, 'pgvector_gated_skip', detail, { silent });
+  return { applied: !!applied, reason: 'degraded', detail };
+}
+
+/**
  * Schema-apply drift sentinel — the sole entry point used by cmdInit,
  * cmdLoaderLoad, and cmdClose.
  *
@@ -1773,7 +1864,15 @@ async function ensureSchemaCurrent(db, projectId, { silent } = {}) {
   const stored = rows.length > 0 ? rows[0].value : null;
   const cmp = _compareSchemaFingerprint(stored, currentFingerprint);
 
-  if (cmp === 'current') return { applied: false, reason: 'current' }; // no-op — the common case.
+  if (cmp === 'current') {
+    // cm#224 follow-up: a fingerprint-current DB can still be silently
+    // missing a pgvector-gated column/index (stamped current before
+    // pgvector was ever installed, or the gap simply never surfaced) —
+    // check on every call, not just the one apply that first skipped it.
+    const degraded = await reportPgvectorGatedDegradation(db, projectId, classification, units, { silent, applied: false });
+    if (degraded) return degraded;
+    return { applied: false, reason: 'current' }; // no-op — the common case.
+  }
 
   if (cmp === 'ahead') {
     // Stored epoch is newer than this engine build knows about — refuse to
@@ -1813,6 +1912,8 @@ async function ensureSchemaCurrent(db, projectId, { silent } = {}) {
     );
     const stored2 = rows2.length > 0 ? rows2[0].value : null;
     if (_compareSchemaFingerprint(stored2, currentFingerprint) === 'current') {
+      const degraded = await reportPgvectorGatedDegradation(db, projectId, classification, units, { silent, applied: false });
+      if (degraded) return degraded;
       return { applied: false, reason: 'current' };
     }
 
@@ -1854,6 +1955,16 @@ async function ensureSchemaCurrent(db, projectId, { silent } = {}) {
        ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
       [projectId, 'schema_fingerprint', currentFingerprint]
     );
+
+    // cm#224 follow-up: the DDL itself applied and verified successfully
+    // (fingerprint upserted above), but a pgvector-gated column/index may
+    // still have been silently skipped — degraded, not a clean 'applied'.
+    const degraded = await reportPgvectorGatedDegradation(db, projectId, classification, units, {
+      silent, applied: true,
+      extraDetail: { appliedUnits: applyResult.appliedUnits, fingerprint: currentFingerprint },
+    });
+    if (degraded) return degraded;
+
     await clearSchemaDegradation(db, projectId);
     return { applied: true, reason: 'applied', detail: { appliedUnits: applyResult.appliedUnits, fingerprint: currentFingerprint } };
   } finally {
@@ -7440,6 +7551,8 @@ if (require.main === module) {
     _extractIntegrityIndexOps,
     recordSchemaDegradation,
     clearSchemaDegradation,
+    checkPgvectorGatedObjects,
+    reportPgvectorGatedDegradation,
     SCHEMA_EPOCH,
   };
 }

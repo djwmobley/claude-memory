@@ -36,6 +36,10 @@
  */
 
 const path = require('path');
+// cm#224 follow-up: classify a raw 42703 on the `embedding` column into a
+// named, actionable error instead of letting it escape to an MCP caller —
+// see write-time-embed.js's own header comment for the full rationale.
+const { classifyEmbeddingWriteError } = require('./write-time-embed.js');
 
 // ─── Column contract per table (S-1: hardcoded, never derived from caller
 // input; S-3: app-level validation rules per column). type: 'text' | 'int'
@@ -408,6 +412,11 @@ async function writeMemoryRow(client, table, row, opts) {
         { table, constraint: err.constraint, pgMessage: err.message }
       );
     }
+    // cm#224 follow-up: an embedding was supplied but the column is absent
+    // (pgvector not installed / gated column skipped at apply time) — a
+    // named, actionable error instead of a raw 42703.
+    const embedErr = classifyEmbeddingWriteError(err, table);
+    if (embedErr) throw embedErr;
     throw err;
   }
 }
@@ -503,7 +512,17 @@ async function upsertDecisionRow(client, row, opts) {
        ON CONFLICT (project_id, topic) DO NOTHING
        RETURNING *, (xmax = 0) AS inserted`;
 
-  const { rows } = await client.query(sql, values);
+  let rows;
+  try {
+    ({ rows } = await client.query(sql, values));
+  } catch (err) {
+    // cm#224 follow-up: an embedding was supplied but the column is absent
+    // (pgvector not installed / gated column skipped at apply time) — a
+    // named, actionable error instead of a raw 42703.
+    const embedErr = classifyEmbeddingWriteError(err, 'decisions');
+    if (embedErr) throw embedErr;
+    throw err;
+  }
   if (rows.length === 0) {
     // Only reachable via the DO NOTHING branch (no non-key column supplied
     // on a conflicting row) — the existing row is unchanged; re-select it so
