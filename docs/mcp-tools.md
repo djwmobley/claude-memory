@@ -45,6 +45,38 @@ still has legacy-encoded rows and no project marker yet will have the
 one-shot identity migration run inline, on first use, exactly as it would
 under `handoff.js status`.
 
+**Schema bring-forward for MCP-only sessions.** `withProjectDb`
+(`scripts/handoff-mcp.mjs`) also calls the SAME `ensureSchemaCurrent()`
+function `handoff.js` itself calls from `cmdLoaderLoad`/`cmdClose` — again,
+never a second implementation — immediately after `ensureProjectIdentity()`
+resolves `project_id`. Before this, an MCP client that never ran `handoff.js
+init`/`resume` against a given `projectRoot` could hit a §8 tool against a
+project DB whose schema was stamped current at an older engine epoch (most
+concretely: missing `decisions`/`audit_log`/`decisions_audit`, see above) —
+every tool touching the missing object would fail with a raw Postgres error
+(`42P01 relation does not exist`) and no actionable next step.
+`ensureSchemaCurrent()` carries no interactive confirmation gate of its own
+(the "apply DDL?" prompt is `cmdInit`'s DB-*creation* gate only — schema
+bring-forward on an already-existing DB is always additive/idempotent DDL,
+never a DB creation) and never throws by contract — every failure path
+returns a `{applied, reason, detail}` status object instead. `withProjectDb`
+treats this as total: `reason === 'current'` or `applied === true` means
+proceed silently (the overwhelming common case); anything else is a real
+degradation (a classification error, a lock that could not be acquired, a
+failed post-apply verification, …) and `withProjectDb` throws a hard tool
+error naming `handoff.js init`/`resume` as the remedy, run directly against
+the project root in an interactive terminal. This is a deliberate divergence
+from `cmdLoaderLoad`/`cmdClose`'s own non-fatal, stderr-only handling of the
+same call: those run in a human's terminal (stderr is visible, the CLI
+process itself is disposable); an MCP tool call has no stderr channel an
+agent caller can read and no interactive prompt to answer, so failing loud
+with an explicit remedy is strictly better than deferring to a more
+confusing SQL-layer error inside the tool's own write. Pre-existing
+constraint, unchanged by this fix: a `projectRoot` whose DB has NEVER been
+`init`-ed at all (zero core tables) was already out of scope for the whole
+§8 surface before this change — `ensureProjectIdentity()` itself queries
+core tables and requires them to exist.
+
 ## `memory_search` — hybrid vector+FTS, project-scoped
 
 Runs the same `ts_rank * 0.3 + cosine * 0.7` scoring formula the engine's
@@ -79,9 +111,16 @@ live write surface (`decisions`, `gotchas`, `findings`, `research`,
 Every table is INSERT-ONLY — a primary-key or unique collision is a loud
 error — **except `decisions`**, which upserts by `(project_id, topic)`:
 this is the one, explicitly named carve-out in the whole schema, backed by
-`decisions_audit` (an `AFTER UPDATE` trigger) so the update is
+`decisions_audit` (an `AFTER UPDATE OR DELETE` trigger) so the update is
 non-destructive in the append-only audit ledger even though the row itself
-changes in place.
+changes in place. `decisions_audit`, its underlying `audit_log` table, and
+the `decisions_project_topic_unique` arbiter index this carve-out's `ON
+CONFLICT (project_id, topic)` requires are canonized into
+`scripts/sql/decisions-base.sql` (applied to every live project DB by the
+schema-drift sentinel — see "Schema bring-forward for MCP-only sessions"
+below) — before that fix, this carve-out's claim only held on the staging
+consolidation target, never on a live per-project DB, because `decisions`
+did not exist there at all.
 
 Every row written through `memory_upsert` (and through `persist_decisions`,
 below) is embedded inline at write time, using the same default-provider

@@ -190,7 +190,8 @@ loud, visible error rather than a silent skip. The current classification:
 |---|---|---|
 | `handoff-core-schema.sql` | `/handoff:init` and the schema-drift auto-apply sentinel (Postgres backend) | `entities`, `assertions`, `edges`, `retrieval_contract`, `retrieval_contract_history`, `project_settings`, `entity_communities`, `extraction_queue` |
 | `app-retrieval-events-schema.sql` | Same, ordered immediately after `handoff-core-schema.sql` | `retrieval_events`, `retrieval_event_assertions` |
-| `handoff-sqlite-schema.sql` | Same (SQLite backend only — `STORAGE_BACKEND=sqlite`) | Self-contained equivalent of both files above, dialect-adapted |
+| `decisions-base.sql` | Same, ordered after `app-retrieval-events-schema.sql` | `decisions` (plus its FTS/arbiter indexes and `embedded_by_provider_id`/`embedding` columns) and `audit_log` + the `decisions_audit` trigger — closes the gap where a fresh per-project DB had no `decisions` table at all (`persist_decisions`/`memory_upsert` write to it unconditionally) |
+| `handoff-sqlite-schema.sql` | Same (SQLite backend only — `STORAGE_BACKEND=sqlite`) | Self-contained equivalent of both files above, dialect-adapted (no `decisions` table — SQLite is out of scope for this table today) |
 | `phase3b-schema.sql` | Not applied by the handoff engine (excluded) | App-specific; targets `memory_entry_chunks` in the separate canonical/pipeline database provisioned by `scripts/setup.sql` |
 | `v_memory_hits.sql` | Not applied by the handoff engine (excluded) | Same canonical/pipeline database; sourced by `scripts/setup.sql`'s own `\ir` |
 

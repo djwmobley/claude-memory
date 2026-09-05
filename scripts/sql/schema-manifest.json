@@ -1,10 +1,11 @@
 {
   "_doc": "cm#185 schema bring-forward manifest. Cross-checked against each file's own in-file header directive (first non-blank lines: '-- handoff:dialect postgres' | '-- handoff:dialect sqlite' | '-- handoff:excluded <reason>') by scripts/lib/schema-classify.js. This file provides CLASSIFICATION + EXPECTED-OBJECTS metadata only -- it is never the source of enumeration. Enumeration always reads the filesystem (scripts/sql/*.sql, non-recursive) and cross-checks git-tracked status; any enumerated file absent from this manifest, or any manifest entry whose classification disagrees with the file's own header directive, is a loud classification error (persistent project_settings 'schema_apply_degraded' row + stderr), never a silent skip. schema_epoch is a monotonically-bumped integer bumped whenever the applicable-unit set or any unit's DDL changes in a way that must force a re-apply on already-current databases; it is embedded as the '<epoch>:<hash>' prefix of the stored project_settings.schema_fingerprint value (see _computeSchemaFingerprint in scripts/handoff.js).",
-  "schema_epoch": 1,
+  "schema_epoch": 2,
   "required_roster": [
     "handoff-core-schema.sql",
     "handoff-sqlite-schema.sql",
-    "app-retrieval-events-schema.sql"
+    "app-retrieval-events-schema.sql",
+    "decisions-base.sql"
   ],
   "units": {
     "handoff-core-schema.sql": {
@@ -150,6 +151,28 @@
           "rea_assertion_idx"
         ]
       }
+    },
+    "decisions-base.sql": {
+      "classification": "postgres",
+      "order": 30,
+      "expected_objects": {
+        "tables": [
+          "decisions",
+          "audit_log"
+        ],
+        "columns": [
+          { "table": "decisions", "column": "embedded_by_provider_id" }
+        ],
+        "indexes": [
+          "decisions_project_idx",
+          "decisions_topic_idx",
+          "decisions_fts_idx",
+          "decisions_project_topic_unique",
+          "audit_log_table_op_idx",
+          "audit_log_created_idx"
+        ]
+      },
+      "_note": "The pgvector-gated decisions.embedding column and decisions_embedding_idx HNSW index are deliberately EXCLUDED from expected_objects -- same rationale as handoff-core-schema.sql's own _note: both are wrapped in DO $$ blocks with EXCEPTION WHEN OTHERS so a pgvector-absent target degrades gracefully, and including them here would convert that intentional optional degrade into a permanent stuck-degraded state on any stock Postgres instance without pgvector. The decisions_audit trigger and log_guarded_change() function are also excluded from expected_objects: schemaObjectsExist() only probes tables/columns/indexes (see db-seam.js), it has no trigger/function probe, so there is nothing meaningful to add there -- their presence is instead proven by test/test-decisions-canon.js's live INSERT ... ON CONFLICT ... DO UPDATE + audit_log assertion (cm#224 S6)."
     },
     "phase3b-schema.sql": {
       "classification": "excluded",

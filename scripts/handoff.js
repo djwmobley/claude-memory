@@ -1451,7 +1451,10 @@ const { classifySchemaFiles, normalizeContent } = require('./lib/schema-classify
 // Must match scripts/sql/schema-manifest.json's top-level "schema_epoch".
 // Bump BOTH together whenever the applicable-unit set or any unit's DDL
 // changes in a way that must force a re-apply on already-current databases.
-const SCHEMA_EPOCH = 1;
+// Bumped to 2 (cm#224): decisions-base.sql added to the postgres unit set --
+// every already-current live project DB must re-apply once to pick up
+// `decisions`/`audit_log`/the decisions_audit trigger.
+const SCHEMA_EPOCH = 2;
 
 // Module-level cache: maps schemaFilePath → { mtimeMs, size, hash } so repeated
 // calls in one process don't re-read or re-hash the SQL files. Keyed on

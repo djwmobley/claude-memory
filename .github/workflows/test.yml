@@ -748,6 +748,29 @@ jobs:
           PGUSER: postgres
           PGPASSWORD: postgres
           EMBED_SKIP: '1'
+      - name: Run decisions canon test (cm#224, PR #204 follow-up)
+        # Proves scripts/sql/decisions-base.sql — the canon-class fix that
+        # closes "fresh handoff.js init leaves a per-project DB with no
+        # decisions table" — is idempotent against, and never diverges from,
+        # the staging-only source files it duplicates (migrate-14-seam-
+        # tables.sql, migrate-15-mcp-addenda.sql, migrate-13-agent-
+        # exchange.sql, migrate-14-seam-tables-embeddings.sql). T1: real
+        # ensureSchemaCurrent apply on a core-only-provisioned scratch DB,
+        # then raw `psql -f` re-apply of all four staging source files
+        # (zero errors), decisions_project_topic_unique's pg_indexes shape,
+        # and a live INSERT ... ON CONFLICT DO UPDATE proving the
+        # decisions_audit trigger actually fires into audit_log. T2:
+        # adversary-residue proof — a staging DB where migrate-14 ran but
+        # migrate-15 never did (arbiter index genuinely absent) is repaired,
+        # not left permanently degraded, by the same ensureSchemaCurrent
+        # touch. Creates/drops its own cm_decisions_canon_test_*-prefixed
+        # scratch databases; never touches claude_memory_eval_test/
+        # memory_manager_staging.
+        run: node test/test-decisions-canon.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run smoketest (all sections)
         # Runs the full smoketest suite — all 13 sections including collision (OQ-5
         # supersession invariant) and registry (SQL-1:1-index-vs-registry-JSON drift).

@@ -2902,8 +2902,8 @@ async function runS12() {
       assertEqual(result.errors.length, 0, 'S12.g1: zero classification errors');
       assertTrue(
         result.unitsByDialect.postgres.map((u) => u.basename).join(',') ===
-          'handoff-core-schema.sql,app-retrieval-events-schema.sql',
-        `S12.g1: postgres unit order is [core, app-retrieval-events], got: ${result.unitsByDialect.postgres.map((u) => u.basename)}`
+          'handoff-core-schema.sql,app-retrieval-events-schema.sql,decisions-base.sql',
+        `S12.g1: postgres unit order is [core, app-retrieval-events, decisions-base], got: ${result.unitsByDialect.postgres.map((u) => u.basename)}`
       );
       assertEqual(result.unitsByDialect.sqlite.length, 1, 'S12.g1: exactly one sqlite unit');
       assertEqual(result.unitsByDialect.sqlite[0].basename, 'handoff-sqlite-schema.sql', 'S12.g1: sqlite unit is handoff-sqlite-schema.sql');
