@@ -34,7 +34,7 @@ Each query object has this shape:
 |-------------|------------------------------------------------------------------------|
 | `entity`    | Named entities from the `entities` table (optionally filtered by name).|
 | `assertion` | Subject/predicate/object triples from `assertions`, decay-ranked (top-N via LIMIT). |
-| `vector`    | Semantic nearest-neighbor search (requires Ollama/vLLM embedding).     |
+| `vector`    | Semantic nearest-neighbor search (requires vLLM embedding).            |
 | `recency`   | Most-recently-reinforced assertions (recency window, no filter).       |
 
 The loader executes queries **in order**; a query that exceeds the remaining token budget is

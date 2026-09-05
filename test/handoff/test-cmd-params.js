@@ -98,7 +98,7 @@ function runHelper(sub, extraArgs = [], opts = {}) {
     ...process.env,
     PROJECT_ROOT:              fakeRoot,
     HANDOFF_TEST_PROJECT_ID:   PROJECT_ID,
-    // Disable vLLM/Ollama embedding so resurrect falls back to fuzzy match.
+    // Disable vLLM embedding so resurrect falls back to fuzzy match.
     EMBED_SKIP: '1',
     ...(opts.extraEnv || {}),
   };

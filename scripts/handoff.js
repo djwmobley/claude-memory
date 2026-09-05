@@ -3429,7 +3429,7 @@ async function cmdLoaderLoad(opts = {}) {
       }
 
     } else if (q.type === 'vector' || q.kind === 'vector') {
-      // Vector search requires Ollama or vLLM — skip gracefully if unavailable.
+      // Vector search requires vLLM — skip gracefully if unavailable.
       sections.push(`### Vector query (${q.query || ''}) — skipped in loader (Phase 3.6 hook)`);
     }
   }

@@ -41,7 +41,7 @@
 const http = require('http');
 const { Client } = require('pg');
 
-const { loadConfig, ollamaDefaults, findProjectRoot } = require('./lib/shared');
+const { loadConfig, ollamaBlurbDefaults, findProjectRoot } = require('./lib/shared');
 const { encodeCwd } = require('./lib/encoded-cwd');
 
 // ─── CONSTANTS ───────────────────────────────────────────────────────────────
@@ -89,8 +89,8 @@ async function connectDb(targetDb) {
  */
 function ollamaGenerate(prompt, opts) {
   const model = (opts && opts.model) || EXTRACT_MODEL;
-  const host  = (opts && opts.host)  || ollamaDefaults.host;
-  const port  = (opts && opts.port)  || ollamaDefaults.port;
+  const host  = (opts && opts.host)  || ollamaBlurbDefaults.host;
+  const port  = (opts && opts.port)  || ollamaBlurbDefaults.port;
 
   return new Promise((resolve) => {
     const body = JSON.stringify({

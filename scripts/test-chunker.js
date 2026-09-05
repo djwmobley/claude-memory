@@ -4,7 +4,7 @@
  * test-chunker.js — Automated acceptance-gate test runner (DECISION-003)
  *
  * Six tests: five pathological-input tests (chunker logic + simulations) and
- * one full E2E round-trip (DB + Ollama + retrieval). Exit 0 = all pass; exit 1 = any failure.
+ * one full E2E round-trip (DB + vLLM + retrieval). Exit 0 = all pass; exit 1 = any failure.
  *
  * Usage:
  *   node scripts/test-chunker.js          # Run all 6 tests
@@ -397,7 +397,9 @@ async function test5() {
 
   step('Constructing bad (2000-char CJK) and healthy chunks...', true);
 
-  // Bad chunk: 2000 CJK characters (well above 512-token Ollama limit for CJK ~1 char/token)
+  // Bad chunk: 2000 CJK characters — an oversized synthetic input for this
+  // batch-failure simulation (a fixed size chosen for the test; independent
+  // of the live embed backend's actual token limit).
   const badContent  = '啊'.repeat(2000);
   // Healthy chunk: normal English phrase
   const goodContent = 'normal english test phrase ' + Date.now();
@@ -407,11 +409,12 @@ async function test5() {
     { chunkIdx: 9998, content: goodContent, id: 9998 },
   ];
 
-  // Mock ollamaEmbed: for the bad chunk (by index in batch), throw an error simulating
-  // Ollama refusing an oversized input. For the healthy chunk, return a valid 1024-d vector.
+  // Mock embed function: for the bad chunk (by index in batch), throw an error
+  // simulating the embed backend (vLLM) refusing an oversized input. For the
+  // healthy chunk, return a valid vector.
   const mockVector = Array.from({ length: 1024 }, (_, i) => (i + 1) / 1024);
 
-  async function mockOllamaEmbed(texts, origContents) {
+  async function mockEmbedFn(texts, origContents) {
     // Simulate: if the original chunk content is predominantly CJK and > 512 chars,
     // reject. origContents is a parallel array of raw chunk content (without prefix).
     // If not provided, fall back to checking the full text for CJK density.
@@ -423,7 +426,7 @@ async function test5() {
       const isCjkHeavy = hanCount > raw.length * 0.5 && raw.length > 512;
       if (isCjkHeavy) {
         throw new Error(
-          `Ollama returned ${texts.length - 1} embeddings for ${texts.length} inputs ` +
+          `vLLM returned ${texts.length - 1} embeddings for ${texts.length} inputs ` +
           `(likely context overrun — chunk text smaller before retry)`
         );
       }
@@ -448,14 +451,14 @@ async function test5() {
     const ids      = batch.map(ch => ch.id);
 
     try {
-      await mockOllamaEmbed(texts, contents);
+      await mockEmbedFn(texts, contents);
       // If batch succeeded, all are embedded
       for (const id of ids) embeddedIds.push(id);
     } catch (batchErr) {
       // Batch failed — retry each chunk individually
       for (let j = 0; j < batch.length; j++) {
         try {
-          await mockOllamaEmbed([texts[j]], [contents[j]]);
+          await mockEmbedFn([texts[j]], [contents[j]]);
           embeddedIds.push(ids[j]);
         } catch (chunkErr) {
           errorLog.push(`[SKIP] chunk_idx=${batch[j].chunkIdx} err=${chunkErr.message.slice(0, 80)}`);
@@ -508,7 +511,7 @@ async function test5() {
     `Windows encodeCwd: expected 'C--Users-djwmo-dev-pipeline', got '${winResult}'`);
 }
 
-// ─── TEST 6 — Real E2E (DB + Ollama + retrieval round-trip) ──────────────────
+// ─── TEST 6 — Real E2E (DB + vLLM + retrieval round-trip) ────────────────────
 
 async function test6() {
   if (process.env.EMBED_SKIP === '1') {
@@ -676,7 +679,7 @@ async function test6() {
     assert.ok(idemSkipOk,
       `Idempotence fail: expected >= ${chunkCount} chunks skipped on run 2, got ${skipped2}`);
 
-    console.log(`  PASS — Test 6 — E2E round-trip (loader→DB→Ollama→hybrid retrieval)`);
+    console.log(`  PASS — Test 6 — E2E round-trip (loader→DB→vLLM→hybrid retrieval)`);
 
   } finally {
     // ── Cleanup (always runs) ──────────────────────────────────────────────────
@@ -706,7 +709,7 @@ const ALL_TESTS = [
   { num: 3, title: 'Pathological session message >4000 chars JSONL',   fn: test3 },
   { num: 4, title: 'Idempotence — content_hash skip logic',            fn: test4 },
   { num: 5, title: 'Partial failure resilience — BATCH=8 isolation',   fn: test5 },
-  { num: 6, title: 'E2E round-trip (loader→DB→Ollama→hybrid retrieval)', fn: test6 },
+  { num: 6, title: 'E2E round-trip (loader→DB→vLLM→hybrid retrieval)', fn: test6 },
 ];
 
 async function main() {

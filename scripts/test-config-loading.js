@@ -112,7 +112,7 @@ const FIXTURE_LF = [
   '  port: 5433',
   '  database: my_test_db',
   '  user: myuser',
-  '  embedding_model: mxbai-embed-large',
+  '  embedding_model: Qwen/Qwen3-Embedding-8B',
   '  num_ctx: 8192',
   'storage_backend: postgres',
   '',
@@ -150,7 +150,7 @@ async function main() {
       if (cfg.database !== 'my_test_db')      throw new Error(`database: expected 'my_test_db', got '${cfg.database}'`);
       if (cfg.user !== 'myuser')              throw new Error(`user: expected 'myuser', got '${cfg.user}'`);
       if (cfg.knowledge.tier !== 'embeddings') throw new Error(`tier: expected 'embeddings', got '${cfg.knowledge.tier}'`);
-      if (cfg.knowledge.embedding_model !== 'mxbai-embed-large') throw new Error(`embedding_model: expected 'mxbai-embed-large', got '${cfg.knowledge.embedding_model}'`);
+      if (cfg.knowledge.embedding_model !== 'Qwen/Qwen3-Embedding-8B') throw new Error(`embedding_model: expected 'Qwen/Qwen3-Embedding-8B', got '${cfg.knowledge.embedding_model}'`);
       if (cfg.storage_backend !== 'postgres') throw new Error(`storage_backend: expected 'postgres', got '${cfg.storage_backend}'`);
 
       fs.unlinkSync(cfgPath);
@@ -184,7 +184,7 @@ async function main() {
       if (cfg.database !== 'my_test_db')      throw new Error(`CRLF: database: expected 'my_test_db', got ${JSON.stringify(cfg.database)}`);
       if (cfg.user !== 'myuser')              throw new Error(`CRLF: user: expected 'myuser', got ${JSON.stringify(cfg.user)}`);
       if (cfg.knowledge.tier !== 'embeddings') throw new Error(`CRLF: tier: expected 'embeddings', got ${JSON.stringify(cfg.knowledge.tier)}`);
-      if (cfg.knowledge.embedding_model !== 'mxbai-embed-large') throw new Error(`CRLF: embedding_model: expected 'mxbai-embed-large', got ${JSON.stringify(cfg.knowledge.embedding_model)}`);
+      if (cfg.knowledge.embedding_model !== 'Qwen/Qwen3-Embedding-8B') throw new Error(`CRLF: embedding_model: expected 'Qwen/Qwen3-Embedding-8B', got ${JSON.stringify(cfg.knowledge.embedding_model)}`);
       if (cfg.storage_backend !== 'postgres') throw new Error(`CRLF: storage_backend: expected 'postgres', got ${JSON.stringify(cfg.storage_backend)}`);
 
       fs.unlinkSync(cfgPath);

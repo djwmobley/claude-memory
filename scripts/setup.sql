@@ -4,8 +4,8 @@
 -- Usage: psql -d <your_db> -f scripts/setup.sql
 -- Pre-reqs: Postgres 14+, pgvector extension installed in the target database.
 --           Script degrades gracefully (FTS only) if pgvector is absent.
---           Ollama with mxbai-embed-large is required only for embedding; FTS
---           works without it.
+--           vLLM (Qwen/Qwen3-Embedding-8B) is required only for embedding;
+--           FTS works without it.
 
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- EXTENSIONS
@@ -77,8 +77,9 @@ CREATE INDEX IF NOT EXISTS memory_entries_type_idx ON memory_entries (mem_type);
 -- MEMORY ENTRY CHUNKS
 -- Sibling table: one row per semantic chunk of a memory_entries row.
 -- Why a separate table rather than storing chunks in memory_entries directly?
--- Embedding models have a fixed context window (~512 tokens for mxbai). Long
--- memory files must be split before embedding. Keeping chunks as siblings lets
+-- Embedding models have a fixed context window (max_model_len=8192 tokens for
+-- the vLLM Qwen3-Embedding-8B deployment used here). Long memory files must
+-- be split before embedding. Keeping chunks as siblings lets
 -- the parent row stay intact for display/sync purposes while the chunk table
 -- holds the searchable units. CASCADE delete keeps referential integrity clean.
 -- ═══════════════════════════════════════════════════════════════════════════════
