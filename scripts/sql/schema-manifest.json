@@ -66,6 +66,12 @@
           "embedding_providers_is_default_unique_idx"
         ],
         "_note": "The pgvector-gated assertions.embedding column, assertions_embedding_hnsw_idx, and the pg_trgm-gated assertions_trgm_text_idx are deliberately EXCLUDED from this expected-objects list. Both DO $$ blocks that create them are designed to degrade gracefully (EXCEPTION WHEN OTHERS) when the extension is absent -- the file's own header states 'no extensions, no halfvec, no pgvector dependency'. Including them here would convert an intentional optional degrade into a permanent stuck-degraded state on every stock Postgres instance without pgvector/pg_trgm installed. See PR body for the full rationale (S-13 scope interpretation)."
+      },
+      "pgvector_gated": {
+        "_doc": "cm#224 follow-up (PR #225 independent review finding): declares the SAME excluded-from-expected_objects columns above so ensureSchemaCurrent's checkPgvectorGatedObjects (scripts/handoff.js) can detect, on every call, whether they were actually skipped on this DB -- a structured project_settings.schema_apply_degraded record + reason:'degraded' instead of a silent applied:true/reason:'current'.",
+        "columns": [
+          { "table": "assertions", "column": "embedding" }
+        ]
       }
     },
     "handoff-sqlite-schema.sql": {
@@ -172,7 +178,13 @@
           "audit_log_created_idx"
         ]
       },
-      "_note": "The pgvector-gated decisions.embedding column and decisions_embedding_idx HNSW index are deliberately EXCLUDED from expected_objects -- same rationale as handoff-core-schema.sql's own _note: both are wrapped in DO $$ blocks with EXCEPTION WHEN OTHERS so a pgvector-absent target degrades gracefully, and including them here would convert that intentional optional degrade into a permanent stuck-degraded state on any stock Postgres instance without pgvector. The decisions_audit trigger and log_guarded_change() function are also excluded from expected_objects: schemaObjectsExist() only probes tables/columns/indexes (see db-seam.js), it has no trigger/function probe, so there is nothing meaningful to add there -- their presence is instead proven by test/test-decisions-canon.js's live INSERT ... ON CONFLICT ... DO UPDATE + audit_log assertion (cm#224 S6)."
+      "_note": "The pgvector-gated decisions.embedding column and decisions_embedding_idx HNSW index are deliberately EXCLUDED from expected_objects -- same rationale as handoff-core-schema.sql's own _note: both are wrapped in DO $$ blocks with EXCEPTION WHEN OTHERS so a pgvector-absent target degrades gracefully, and including them here would convert that intentional optional degrade into a permanent stuck-degraded state on any stock Postgres instance without pgvector. The decisions_audit trigger and log_guarded_change() function are also excluded from expected_objects: schemaObjectsExist() only probes tables/columns/indexes (see db-seam.js), it has no trigger/function probe, so there is nothing meaningful to add there -- their presence is instead proven by test/test-decisions-canon.js's live INSERT ... ON CONFLICT ... DO UPDATE + audit_log assertion (cm#224 S6).",
+      "pgvector_gated": {
+        "_doc": "cm#224 follow-up (PR #225 independent review finding): declares decisions.embedding (excluded from expected_objects above, same rationale) so ensureSchemaCurrent's checkPgvectorGatedObjects can detect a real skip on this DB and report reason:'degraded' + a project_settings.schema_apply_degraded record instead of silently reporting success.",
+        "columns": [
+          { "table": "decisions", "column": "embedding" }
+        ]
+      }
     },
     "phase3b-schema.sql": {
       "classification": "excluded",

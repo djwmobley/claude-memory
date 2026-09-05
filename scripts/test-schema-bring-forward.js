@@ -276,6 +276,16 @@ async function testT3() {
     const db = await pgConnect(dbName);
     const adapter = new PostgresAdapter(db);
 
+    // cm#224 follow-up: this test's own intent is run-twice IDEMPOTENCY,
+    // unrelated to pgvector — create the extension (best-effort) so the
+    // second-call assertion below isn't confounded by the independent
+    // pgvector-gated-degradation check ensureSchemaCurrent now also runs on
+    // every call (a scratch DB with no vector extension genuinely IS
+    // degraded post-apply, correctly reported as reason:'degraded' rather
+    // than 'current' — see test/test-decisions-canon.js's dedicated T3 for
+    // that behavior's own test coverage).
+    try { await db.query('CREATE EXTENSION IF NOT EXISTS vector'); } catch (_) { /* pgvector not installed on this Postgres */ }
+
     // ensureSchemaCurrent's precondition (unchanged from the pre-cm#185 engine)
     // is that project_settings already exists -- cmdInit always runs the full
     // bootstrap apply before ensureSchemaCurrent is ever invoked in production

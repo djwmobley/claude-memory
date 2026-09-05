@@ -201,6 +201,20 @@ as current. On every `/handoff:close` and `/handoff:resume` after that, a drift 
 a content hash of the applicable files against what's recorded for your project and re-applies
 additively if anything changed — you never run a manual migration step.
 
+**pgvector-gated columns.** `assertions.embedding` and `decisions.embedding` (plus their HNSW
+indexes) are wrapped in a `DO $$ ... EXCEPTION WHEN OTHERS $$` block so a target with no `vector`
+extension degrades gracefully rather than aborting the whole apply — no `CREATE EXTENSION` is ever
+issued by this engine (installing extensions is an operator/DBA action, out of scope for an
+additive schema apply). Every unit that carries such a column declares it in a `pgvector_gated`
+entry in `schema-manifest.json`; the drift sentinel checks these on **every** call (not just a
+fresh apply) and, if any are actually missing on your database, records a structured
+`project_settings.schema_apply_degraded` row (surfaced by `/handoff:status`) and returns
+`reason: 'degraded'` instead of silently claiming success. A live write against a missing
+embedding column gets a named, actionable error (naming pgvector and pointing at
+`schema_apply_degraded`) instead of a bare database error. This does **not** detect a `vector`
+extension that is installed but too old to provide the `halfvec` type — that case still shows up
+as a loud degradation (a column genuinely missing), just without a version-specific diagnosis.
+
 ---
 
 ## A word on what the hooks are doing

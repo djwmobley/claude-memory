@@ -40,6 +40,20 @@
  *   a schema-drift-sentinel touch (handoff:resume/close, or this MCP fix's
  *   own withProjectDb call), not left permanently degraded.
  *
+ * T3 — cm#224 follow-up (independent PR #225 review finding): a
+ *   pgvector-ABSENT target (core canon applied, no `vector` extension ever
+ *   created). Asserts (a) ensureSchemaCurrent reports reason:'degraded'
+ *   (not 'current') with the skipped columns listed and
+ *   vectorExtensionPresent:false, a project_settings.schema_apply_degraded
+ *   row populated with reason 'pgvector_gated_skip', and that a SECOND call
+ *   (fingerprint now current) still reports 'degraded' rather than
+ *   silently reverting to 'current' forever; (b) memory-upsert.js's
+ *   upsertDecisionRow throws the named EmbeddingColumnAbsentError (not a
+ *   raw 42703) when an embedding is supplied against the missing column;
+ *   (c) `handoff.js status --json`, run as a real subprocess (same
+ *   PROJECT_ROOT/HANDOFF_DB pattern scripts/test-schema-bring-forward.js's
+ *   T5 uses), surfaces the degraded record.
+ *
  * BLIND SPOT (adversary residue (b), documented not proven — cannot be
  * proven differently by a test, only stated): `CREATE INDEX IF NOT EXISTS`
  * never verifies a same-named index's DEFINITION, only its NAME. T1(c)'s
@@ -58,6 +72,8 @@
  * Usage: node test/test-decisions-canon.js
  */
 
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const { createRequire } = require('module');
@@ -65,6 +81,8 @@ const { createRequire } = require('module');
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 const handoffModule = require(path.join(PROJECT_ROOT, 'scripts', 'handoff.js'));
 const { PostgresAdapter } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'db-seam.js'));
+const memoryUpsertLib = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'memory-upsert.js'));
+const { encodeCwd } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'encoded-cwd.js'));
 
 // test/ has no node_modules of its own (only scripts/ does) — same fix
 // test/migrations/test-migrate-14-seam-tables.js and friends already use.
@@ -360,12 +378,110 @@ async function testT2() {
   }
 }
 
+// ── T3: pgvector-absent — loud degradation + named error + handoff_status ──
+
+async function testT3() {
+  const label = 'T3: pgvector-absent target — reason:"degraded", named EmbeddingColumnAbsentError, handoff_status surfaces the record';
+  if (!(await isPgAvailable())) { skip(label, 'Postgres unavailable'); return; }
+  if (!isPsqlAvailable()) { skip(label, 'psql CLI unavailable'); return; }
+
+  const dbName = `cm_decisions_canon_test_pgvabsent_${Date.now()}`;
+  const projDir = path.join(os.tmpdir(), `cm-decisions-canon-t3-${Date.now()}`);
+
+  try {
+    await createThrowawayDb(dbName);
+    // Bootstrap core ONLY, raw via psql, deliberately WITHOUT creating the
+    // vector extension — a genuine pgvector-absent target (no
+    // tryCreateOptionalExtensions call here, unlike T1/T2).
+    psqlApplyRaw(dbName, path.join(PROJECT_ROOT, 'scripts', 'sql', 'handoff-core-schema.sql'));
+
+    const db = await pgConnect(dbName);
+    const adapter = new PostgresAdapter(db);
+
+    // Fresh git-initialized scratch project dir — `handoff.js status`'s own
+    // resolveProjectId() falls back to encodeCwd(root) when no marker exists
+    // (same pattern scripts/test-schema-bring-forward.js's T5 relies on for
+    // `handoff.js init`); computing the SAME value here lets this test seed
+    // rows under the exact project_id the T3c subprocess will independently
+    // derive.
+    fs.mkdirSync(projDir, { recursive: true });
+    const gitInit = spawnSync('git', ['-C', projDir, 'init', '-q'], { encoding: 'utf8' });
+    if (gitInit.status !== 0) throw new Error(`T3: git init failed: ${gitInit.stderr}`);
+    const PID = encodeCwd(projDir);
+
+    // (a) real ensureSchemaCurrent against the pgvector-absent target.
+    const result = await handoffModule.ensureSchemaCurrent(adapter, PID, { silent: true });
+    assertEqual(result.reason, 'degraded', `T3a: reason must be 'degraded' on a pgvector-absent target, got: ${JSON.stringify(result)}`);
+    assertTrue(Array.isArray(result.detail.missing) && result.detail.missing.length > 0, 'T3a: detail.missing lists the skipped gated columns');
+    assertTrue(result.detail.missing.some((m) => m.table === 'decisions' && m.column === 'embedding'), 'T3a: decisions.embedding is in the missing list');
+    assertTrue(result.detail.missing.some((m) => m.table === 'assertions' && m.column === 'embedding'), 'T3a: assertions.embedding is ALSO in the missing list (general mechanism, not decisions-only)');
+    assertEqual(result.detail.vectorExtensionPresent, false, 'T3a: vectorExtensionPresent correctly false');
+
+    const { rows: degRows } = await db.query(
+      `SELECT value FROM project_settings WHERE project_id=$1 AND key='schema_apply_degraded'`, [PID]
+    );
+    assertEqual(degRows.length, 1, 'T3a: schema_apply_degraded row populated');
+    const degParsed = JSON.parse(degRows[0].value);
+    assertEqual(degParsed.reason, 'pgvector_gated_skip', 'T3a: degradation reason is pgvector_gated_skip');
+
+    // Re-run — the fingerprint is now 'current', but this must STILL report
+    // degraded, never silently revert to 'current' forever (the finding's
+    // core complaint).
+    const result2 = await handoffModule.ensureSchemaCurrent(adapter, PID, { silent: true });
+    assertEqual(result2.reason, 'degraded', 'T3a: second call (fingerprint now current) still reports degraded');
+    assertEqual(result2.applied, false, 'T3a: second call is a DDL no-op (applied:false) but still reports degraded');
+
+    // (b) a real embedding write against the missing column throws the
+    // NAMED error, never a raw 42703.
+    let namedErr = null;
+    try {
+      await memoryUpsertLib.upsertDecisionRow(db, {
+        project_id: PID, topic: 't3-topic', decision: 't3 decision', reason: 'probe',
+      }, { embeddingVectorLiteral: '[0.1,0.2,0.3]', embeddedByProviderId: 1 });
+    } catch (err) {
+      namedErr = err;
+    }
+    assertTrue(namedErr !== null, 'T3b: upsertDecisionRow must throw when an embedding is supplied and the column is absent');
+    assertEqual(namedErr.name, 'EmbeddingColumnAbsentError', 'T3b: error is the named EmbeddingColumnAbsentError, not a raw pg DatabaseError');
+    assertEqual(namedErr.code, 'embeddingColumnAbsent', 'T3b: error code is embeddingColumnAbsent');
+    assertTrue(/pgvector is not installed/.test(namedErr.message), 'T3b: message names pgvector as the cause');
+    assertTrue(/schema_apply_degraded/.test(namedErr.message), 'T3b: message points at schema_apply_degraded for the full record');
+
+    await db.end();
+
+    // (c) `handoff.js status --json`, a real subprocess, surfaces the
+    // degraded record. Stdout carries a "Running: ..." preamble line and a
+    // trailing "Done: ..." summary line around the pretty-printed JSON
+    // block — extract just the JSON object.
+    const statusResult = spawnSync(
+      process.execPath,
+      [path.join(PROJECT_ROOT, 'scripts', 'handoff.js'), 'status', '--json'],
+      { cwd: projDir, encoding: 'utf8', timeout: 30000, env: { ...process.env, HANDOFF_DB: dbName, PROJECT_ROOT: projDir } }
+    );
+    assertEqual(statusResult.status, 0, `T3c: handoff.js status --json must exit 0, got ${statusResult.status}. stdout:\n${statusResult.stdout}\nstderr:\n${statusResult.stderr}`);
+    const doneIdx = statusResult.stdout.indexOf('\nDone:');
+    const jsonBlockText = doneIdx >= 0 ? statusResult.stdout.slice(0, doneIdx) : statusResult.stdout;
+    const firstBrace = jsonBlockText.indexOf('{');
+    const statusJson = JSON.parse(jsonBlockText.slice(firstBrace));
+    assertTrue(!!statusJson.schema_apply_degraded, 'T3c: handoff_status JSON output includes a schema_apply_degraded record');
+    assertEqual(statusJson.schema_apply_degraded.reason, 'pgvector_gated_skip', 'T3c: surfaced record has the right reason');
+
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+    try { fs.rmSync(projDir, { recursive: true, force: true }); } catch (_) { /* best-effort */ }
+  }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────
 
 async function main() {
   console.log('=== test-decisions-canon.js (cm#224 decisions-base.sql canon proof) ===');
   await testT1();
   await testT2();
+  await testT3();
 
   console.log('');
   console.log(`Results: ${passed} passed, ${failed} failed`);

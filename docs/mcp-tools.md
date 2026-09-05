@@ -60,22 +60,71 @@ every tool touching the missing object would fail with a raw Postgres error
 bring-forward on an already-existing DB is always additive/idempotent DDL,
 never a DB creation) and never throws by contract — every failure path
 returns a `{applied, reason, detail}` status object instead. `withProjectDb`
-treats this as total: `reason === 'current'` or `applied === true` means
-proceed silently (the overwhelming common case); anything else is a real
-degradation (a classification error, a lock that could not be acquired, a
-failed post-apply verification, …) and `withProjectDb` throws a hard tool
-error naming `handoff.js init`/`resume` as the remedy, run directly against
-the project root in an interactive terminal. This is a deliberate divergence
-from `cmdLoaderLoad`/`cmdClose`'s own non-fatal, stderr-only handling of the
-same call: those run in a human's terminal (stderr is visible, the CLI
-process itself is disposable); an MCP tool call has no stderr channel an
-agent caller can read and no interactive prompt to answer, so failing loud
-with an explicit remedy is strictly better than deferring to a more
-confusing SQL-layer error inside the tool's own write. Pre-existing
-constraint, unchanged by this fix: a `projectRoot` whose DB has NEVER been
-`init`-ed at all (zero core tables) was already out of scope for the whole
-§8 surface before this change — `ensureProjectIdentity()` itself queries
+treats this as total, three-way: `reason === 'current'` or `applied ===
+true` means proceed silently (the overwhelming common case); `reason ===
+'degraded'` (see "pgvector-gated columns" below) also proceeds, since the
+rest of the schema is fine and most tools never touch a gated column;
+anything else is a real degradation (a classification error, a lock that
+could not be acquired, a failed post-apply verification, …) and
+`withProjectDb` throws a hard tool error naming `handoff.js init`/`resume`
+as the remedy, run directly against the project root in an interactive
+terminal. This is a deliberate divergence from `cmdLoaderLoad`/`cmdClose`'s
+own non-fatal, stderr-only handling of the same call: those run in a
+human's terminal (stderr is visible, the CLI process itself is disposable);
+an MCP tool call has no stderr channel an agent caller can read and no
+interactive prompt to answer, so failing loud with an explicit remedy is
+strictly better than deferring to a more confusing SQL-layer error inside
+the tool's own write. Pre-existing constraint, unchanged by this fix: a
+`projectRoot` whose DB has NEVER been `init`-ed at all (zero core tables)
+was already out of scope for the whole §8 surface before this change —
+`ensureProjectIdentity()` itself queries
 core tables and requires them to exist.
+
+**pgvector-gated columns — loud, not silent.** `assertions.embedding` and
+`decisions.embedding` (and their HNSW indexes) are wrapped in `DO $$ ...
+EXCEPTION WHEN OTHERS $$` blocks at schema-apply time so a target with no
+`vector` extension degrades gracefully instead of aborting the whole apply
+— but "gracefully" previously also meant *silently*: no `pg` `'notice'`
+listener existed anywhere, the gated columns are deliberately excluded from
+`schemaObjectsExist()`'s expected-objects probe (so post-apply verification
+still passed), and `ensureSchemaCurrent()` reported `applied:true`/
+`reason:'current'` regardless — a live write against the missing column
+threw a bare `42703` with no signal anywhere that this was a known,
+expected condition. `ensureSchemaCurrent()` now runs a declarative,
+general check (`checkPgvectorGatedObjects`, driven by each manifest unit's
+own `pgvector_gated` entry in `schema-manifest.json` — today: `handoff-
+core-schema.sql`'s `assertions.embedding`, `decisions-base.sql`'s
+`decisions.embedding`) on **every** call, including the `'current'` fast
+path — a DB fingerprinted current before `vector` was ever installed keeps
+reporting the gap on every subsequent touch, not just the one apply that
+first skipped it. When anything is missing: a structured record is written
+to `project_settings.schema_apply_degraded` (`reason:
+'pgvector_gated_skip'`, listing every skipped `{unit, table, column}`, the
+live `pg_extension` probe result, and a remedy string), the call returns
+`reason:'degraded'`, and `handoff.js status` surfaces the same record (it
+already reads this key generically). At the write layer,
+`scripts/lib/write-time-embed.js`'s `classifyEmbeddingWriteError()` turns a
+raw `42703` on the `embedding` column into a named `EmbeddingColumnAbsentError`
+instead — `memory-upsert.js`'s `upsertDecisionRow`/`writeMemoryRow` both use
+it, so `persist_decisions`/`memory_upsert` calls hitting this get an
+actionable message (naming pgvector and `schema_apply_degraded`) instead of
+a bare driver error; `withProjectDb` also attaches the full degraded record
+from its own `ensureSchemaCurrent()` call onto that same error before it
+reaches the MCP caller. `assertions.embedding` has no live write-time path
+today (populated only by the offline `migrate-07-reembed-corpus.js`
+backfill, which is already immune — it discovers embeddable tables via a
+live `pg_catalog` scan, so it never attempts to write a column it did not
+already find) — but `classifyEmbeddingWriteError()` is table-agnostic, so
+any future live write path gets the same behavior for free. **Not
+detected**: a target where the `vector` extension itself is present but an
+old version lacks the `halfvec` type (or `hnsw`/`halfvec_cosine_ops`) — the
+DO block's `EXCEPTION WHEN OTHERS` still degrades gracefully there, but
+`checkPgvectorGatedObjects()`'s `pg_extension` probe only checks whether
+`vector` is installed at all, not its version or which types it provides;
+that specific case is reported as "column missing, extension present"
+(`vectorExtensionPresent: true` alongside a non-empty `missing` list) —
+still loud (a `schema_apply_degraded` row IS written), just without a
+version-specific diagnosis.
 
 ## `memory_search` — hybrid vector+FTS, project-scoped
 
