@@ -223,9 +223,9 @@ The QUICKSTART mentions "hooks" — session hooks that run at start and stop. A 
 
 **SessionStart hook.** Runs before Claude reads your first message. It connects to the database, runs the retrieval queries (recency, confidence, vector search, resurrect check — the resurrect path uses semantic embedding via vLLM with a pg_trgm fuzzy fallback), and writes the selected entries into the session context. The librarian arriving for work, in other words.
 
-**Stop hook.** Runs when the session ends or Claude stops. It writes a brief status record. This is not the same as `/handoff:close` — the stop hook is lightweight housekeeping. The full session summary (the 5-15 new journal entries) only gets written when you explicitly run `/handoff:close`.
+**SessionEnd hook.** Runs once, when the session truly ends (not at every back-and-forth turn — that used to be the case under the old Stop hook, which fired at every turn end and could clobber a fresh session's summary within seconds of it starting). It writes a brief status record. This is not the same as `/handoff:close` — the SessionEnd hook is lightweight housekeeping. The full session summary (the 5-15 new journal entries) only gets written when you explicitly run `/handoff:close`.
 
-This distinction matters. If you close the window without running `/handoff:close`, the session's decisions and findings don't get saved to the journal. The stop hook catches the session ended, but it doesn't extract what happened. Run `/handoff:close` before you're done.
+This distinction matters. If you close the window without running `/handoff:close`, the session's decisions and findings don't get saved to the journal. The SessionEnd hook catches the session ended, but it doesn't extract what happened. Run `/handoff:close` before you're done.
 
 ---
 
@@ -286,7 +286,7 @@ For the full design-goals framing behind this model — the three things the sys
 
 **Capture happens at seams.** Extraction runs when you explicitly run `/handoff:close` or `/handoff:checkpoint`. What you produce *during* a session is not automatically recorded as it happens — it is recorded when you close or checkpoint.
 
-**Mid-session insights that never reach a seam can be lost.** If you have a durable insight mid-session — a decision, a finding, a change of direction — and you close the window without running `/handoff:close`, that insight is not in the journal. The stop hook records the session ended; it does not extract what happened.
+**Mid-session insights that never reach a seam can be lost.** If you have a durable insight mid-session — a decision, a finding, a change of direction — and you close the window without running `/handoff:close`, that insight is not in the journal. The SessionEnd hook records the session ended; it does not extract what happened.
 
 **Compaction is a real risk.** Claude Code's context compaction mechanism can summarize and compress early parts of a long session before `/handoff:close` runs. If a key insight arose early in the session and was compacted away before close, the extractor never sees it. Checkpointing mid-session (via `/handoff:checkpoint`) is the mitigation. This is the contract of a relay: hand off in the zone, not whenever you feel like it.
 

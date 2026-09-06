@@ -153,7 +153,7 @@ Add this to `.claude/settings.local.json` in your project (create the file if it
         "command": "node /full/path/to/claude-memory/scripts/handoff.js loader-hook"
       }
     ],
-    "Stop": [
+    "SessionEnd": [
       {
         "command": "node /full/path/to/claude-memory/scripts/handoff.js loader-stop"
       }

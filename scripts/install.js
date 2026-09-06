@@ -6,8 +6,11 @@
  * Does two things so you don't have to do them by hand:
  *   1. Copies every *.md file from <repo>/commands/handoff/ to
  *      ~/.claude/commands/handoff/ so Claude Code can find them.
- *   2. Merges SessionStart and Stop hooks into .claude/settings.local.json
+ *   2. Merges SessionStart and SessionEnd hooks into .claude/settings.local.json
  *      in your CURRENT project directory — preserving any hooks already there.
+ *      A re-run also migrates a pre-existing loader-stop entry OUT of the Stop
+ *      array (its old, buggy home — Stop fires at every turn end) and into
+ *      SessionEnd (fires once, at true session end). See mergeHooks().
  *
  * Usage:
  *   node scripts/install.js [--dry-run] [--force] [--non-interactive] [--help|-h]
@@ -19,6 +22,10 @@
  *   --help, -h         Print usage and exit 0.
  *
  * Exit codes: 0 success, 1 error or user abort.
+ *
+ * Testability: mergeHooks() is exported for unit testing (see
+ * scripts/test-install-sessionend-migration.js) against an in-memory hooks
+ * object — main() only runs when this file is executed directly.
  */
 
 const fs   = require('node:fs');
@@ -31,9 +38,10 @@ const USAGE = `
 Usage: node scripts/install.js [--dry-run] [--force] [--non-interactive] [--help|-h]
 
 Copies /handoff:* slash commands to ~/.claude/commands/handoff/ and wires
-SessionStart + Stop hooks into .claude/settings.local.json in your current project.
-Existing hooks in settings.local.json are preserved — the script only adds entries
-that aren't already there.
+SessionStart + SessionEnd hooks into .claude/settings.local.json in your current
+project. Existing hooks in settings.local.json are preserved — the script only
+adds entries that aren't already there. A re-run also removes a loader-stop
+entry left over in the Stop array by an older install (see README/CHANGELOG).
 
 Flags:
   --dry-run          Show what would happen without writing anything.
@@ -96,7 +104,20 @@ function listSourceFiles() {
 
 /**
  * Merge hook entries into an existing parsed settings object.
- * Mutates in place; also returns { addedStart, addedStop }.
+ * Mutates in place; also returns { addedStart, addedSessionEnd, removedStop }.
+ *
+ * loader-stop's home moved from the Stop hook (fires at EVERY turn end —
+ * the bug this PR fixes) to SessionEnd (fires once, at true session end).
+ * This function is idempotent across the migration:
+ *   - A fresh install gets SessionStart + SessionEnd wired, nothing in Stop.
+ *   - Re-running on an install from BEFORE this PR removes the old Stop
+ *     entry (so it doesn't sit there forever paying a stdin-parse cost for
+ *     nothing) and adds the new SessionEnd entry.
+ *   - Re-running on an already-migrated install is a no-op (both addedStart
+ *     and addedSessionEnd come back false, removedStop false).
+ * Any OTHER entries a user has in Stop/SessionStart/SessionEnd are always
+ * preserved untouched — only a loader-stop/loader-hook command string is
+ * ever matched.
  */
 function mergeHooks(settings) {
   if (!settings.hooks || typeof settings.hooks !== 'object') {
@@ -111,15 +132,25 @@ function mergeHooks(settings) {
   const addedStart = !hasLoader;
   if (addedStart) settings.hooks.SessionStart.push({ command: hookLoader });
 
-  // Stop
+  // Stop — migration: remove any pre-existing loader-stop entry. Everything
+  // else in the Stop array (a user's own hooks, or other tools' hooks) is
+  // left exactly as it was.
   if (!Array.isArray(settings.hooks.Stop)) settings.hooks.Stop = [];
-  const hasStop = settings.hooks.Stop.some(
+  const stopLengthBefore = settings.hooks.Stop.length;
+  settings.hooks.Stop = settings.hooks.Stop.filter(
+    (e) => !(typeof e.command === 'string' && e.command.includes('handoff.js loader-stop'))
+  );
+  const removedStop = settings.hooks.Stop.length < stopLengthBefore;
+
+  // SessionEnd — loader-stop's new (and only correct) home.
+  if (!Array.isArray(settings.hooks.SessionEnd)) settings.hooks.SessionEnd = [];
+  const hasSessionEnd = settings.hooks.SessionEnd.some(
     (e) => typeof e.command === 'string' && e.command.includes('handoff.js loader-stop')
   );
-  const addedStop = !hasStop;
-  if (addedStop) settings.hooks.Stop.push({ command: hookStop });
+  const addedSessionEnd = !hasSessionEnd;
+  if (addedSessionEnd) settings.hooks.SessionEnd.push({ command: hookStop });
 
-  return { addedStart, addedStop };
+  return { addedStart, addedSessionEnd, removedStop };
 }
 
 // ─── CONFIRM PROMPT ──────────────────────────────────────────────────────────
@@ -148,7 +179,7 @@ async function main() {
   console.log(`    → ${enginePathContent}`);
   console.log(`  ${settingsExists ? 'Merge hooks into' : 'Create'} ${settingsPath}`);
   console.log(`    SessionStart → ${hookLoader}`);
-  console.log(`    Stop         → ${hookStop}`);
+  console.log(`    SessionEnd   → ${hookStop}`);
   console.log('');
 
   // ── Confirm ───────────────────────────────────────────────────────────────
@@ -190,9 +221,10 @@ async function main() {
   }
 
   // ── Step 2: Wire hooks ────────────────────────────────────────────────────
-  let addedStart  = false;
-  let addedStop   = false;
-  let hooksAction = '';
+  let addedStart     = false;
+  let addedSessionEnd = false;
+  let removedStop    = false;
+  let hooksAction    = '';
 
   if (!dryRun) {
     fs.mkdirSync(settingsDir, { recursive: true });
@@ -211,9 +243,10 @@ async function main() {
       hooksAction = 'created';
     }
 
-    const result = mergeHooks(settings);
-    addedStart   = result.addedStart;
-    addedStop    = result.addedStop;
+    const result   = mergeHooks(settings);
+    addedStart     = result.addedStart;
+    addedSessionEnd = result.addedSessionEnd;
+    removedStop    = result.removedStop;
     fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n', 'utf8');
   } else {
     // Dry-run: preview without writing
@@ -224,9 +257,10 @@ async function main() {
     } else {
       hooksAction = 'would create';
     }
-    const result = mergeHooks(settings);
-    addedStart   = result.addedStart;
-    addedStop    = result.addedStop;
+    const result   = mergeHooks(settings);
+    addedStart     = result.addedStart;
+    addedSessionEnd = result.addedSessionEnd;
+    removedStop    = result.removedStop;
   }
 
   // ── Print summary ─────────────────────────────────────────────────────────
@@ -243,8 +277,11 @@ async function main() {
   }
   console.log('');
   console.log(`  Hooks (${hooksAction} ${settingsPath}):`);
-  console.log(`    SessionStart: ${addedStart ? 'added' : 'already present — skipped'}`);
-  console.log(`    Stop:         ${addedStop  ? 'added' : 'already present — skipped'}`);
+  console.log(`    SessionStart: ${addedStart      ? 'added' : 'already present — skipped'}`);
+  console.log(`    SessionEnd:   ${addedSessionEnd ? 'added' : 'already present — skipped'}`);
+  if (removedStop) {
+    console.log(`    Stop:         removed a pre-existing loader-stop entry (migrated to SessionEnd)`);
+  }
   console.log('');
 
   if (dryRun) {
@@ -255,7 +292,11 @@ async function main() {
   console.log('');
 }
 
-main().catch((err) => {
-  console.error('Error:', err.message);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error('Error:', err.message);
+    process.exit(1);
+  });
+}
+
+module.exports = { mergeHooks };
