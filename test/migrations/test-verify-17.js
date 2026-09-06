@@ -316,9 +316,22 @@ async function testRequiredTierOrder(client) {
 
   await assertThrows(
     () => resolveRequiredTier(client, { projectId, role }),
-    new RegExp(`unconfigured routing for role '${role}'.*run routing init Q&A`),
-    'unconfigured role must hard-error naming the role and pointing at the init Q&A'
+    new RegExp(`unconfigured routing for role '${role}'`),
+    'unconfigured role must hard-error naming the role'
   );
+
+  // B2b (G3): the hard-error hint must name only tools that exist today —
+  // routing_profile_set — and must never point the operator at the
+  // nonexistent "init Q&A" flow (docs/notes/2026-09-06-s17-routing-gap-audit.md).
+  let hintErr = null;
+  try {
+    await resolveRequiredTier(client, { projectId, role });
+  } catch (err) {
+    hintErr = err;
+  }
+  assert(hintErr !== null, 'expected resolveRequiredTier to throw for an unconfigured role');
+  assert(!/init Q&A/.test(hintErr.message), `unconfigured-role hint must not name the nonexistent "init Q&A" flow: "${hintErr.message}"`);
+  assert(/routing_profile_set/.test(hintErr.message), `unconfigured-role hint must name the real routing_profile_set tool: "${hintErr.message}"`);
 
   await insertProfile(client, { projectId: '*', role, tier: 'low', version: 1 });
   await insertProfile(client, { projectId, role, tier: 'mid', version: 1 });
