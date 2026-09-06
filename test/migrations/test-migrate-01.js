@@ -249,6 +249,79 @@ async function testStagingPrecedenceOverProbe() {
   }
 }
 
+async function testMemoryManagerStagingLiteralIsStaging() {
+  // PR #251 review finding: the exact literal `memory_manager_staging` must
+  // classify as branch STAGING, matching the header contract (STAGING: name
+  // is exactly `memory_manager_staging`, or ends in `_staging`) — NOT CANON
+  // (CANON: name is exactly `memory_manager`). Proven behaviorally, same as
+  // T14: an injected connect() that throws if ever called shows the marker
+  // probe never runs for this name either.
+  const connectShouldNotBeCalled = async () => {
+    throw new Error('probe connect() must not be called for memory_manager_staging');
+  };
+  const result = await migrateModule.classifyTarget({
+    dbName: 'memory_manager_staging',
+    projectId: null,
+    connect: connectShouldNotBeCalled,
+  });
+  if (result.branch === 'STAGING' && result.allowed === true && result.reason === null && result.connectionOpened === false) {
+    pass('T25', 'literal "memory_manager_staging" classifies STAGING, not CANON, with no note when no --project-id is given');
+  } else {
+    fail('T25', 'literal "memory_manager_staging" classifies STAGING, not CANON, with no note when no --project-id is given', JSON.stringify(result));
+  }
+}
+
+async function testMemoryManagerIsCanon() {
+  const result = await migrateModule.classifyTarget({ dbName: 'memory_manager', projectId: null });
+  if (result.branch === 'CANON' && result.allowed === true && result.reason === null && result.connectionOpened === false) {
+    pass('T26', 'literal "memory_manager" classifies CANON with no note when no --project-id is given');
+  } else {
+    fail('T26', 'literal "memory_manager" classifies CANON with no note when no --project-id is given', JSON.stringify(result));
+  }
+}
+
+async function testProjectIdIgnoredNoteOnStagingWellFormed() {
+  // A well-formed --project-id alongside a STAGING target is still ignored
+  // (STAGING never probes) — but the caller is told so via `reason`, not met
+  // with silence. Classification stays allowed.
+  const result = await migrateModule.classifyTarget({
+    dbName: 'memory_manager_staging',
+    projectId: PROJECT_UUID_A,
+  });
+  if (result.branch === 'STAGING' && result.allowed === true &&
+      result.reason === 'project-id ignored for STAGING target' && result.connectionOpened === false) {
+    pass('T27', '--project-id alongside memory_manager_staging is ignored-but-noted (well-formed)');
+  } else {
+    fail('T27', '--project-id alongside memory_manager_staging is ignored-but-noted (well-formed)', JSON.stringify(result));
+  }
+}
+
+async function testProjectIdIgnoredNoteOnStagingMalformed() {
+  const result = await migrateModule.classifyTarget({
+    dbName: 'memory_manager_staging',
+    projectId: 'not-a-uuid',
+  });
+  if (result.branch === 'STAGING' && result.allowed === true &&
+      result.reason === 'project-id ignored for STAGING target (malformed)' && result.connectionOpened === false) {
+    pass('T28', '--project-id alongside memory_manager_staging is ignored-but-noted (malformed)');
+  } else {
+    fail('T28', '--project-id alongside memory_manager_staging is ignored-but-noted (malformed)', JSON.stringify(result));
+  }
+}
+
+async function testProjectIdIgnoredNoteOnCanon() {
+  const result = await migrateModule.classifyTarget({
+    dbName: 'memory_manager',
+    projectId: PROJECT_UUID_A,
+  });
+  if (result.branch === 'CANON' && result.allowed === true &&
+      result.reason === 'project-id ignored for CANON target' && result.connectionOpened === false) {
+    pass('T29', '--project-id alongside memory_manager is ignored-but-noted (well-formed)');
+  } else {
+    fail('T29', '--project-id alongside memory_manager is ignored-but-noted (well-formed)', JSON.stringify(result));
+  }
+}
+
 async function testProbeConnectionRefused() {
   // Connection-refused path, mocked via an injected connect() — never a
   // thrown exception out of classifyTarget.
@@ -481,6 +554,11 @@ async function main() {
     await testDefaultBranchRefusesUnknownName();
     await testUnrecognizedNameBadUuidRejected();
     await testStagingPrecedenceOverProbe();
+    await testMemoryManagerStagingLiteralIsStaging();
+    await testMemoryManagerIsCanon();
+    await testProjectIdIgnoredNoteOnStagingWellFormed();
+    await testProjectIdIgnoredNoteOnStagingMalformed();
+    await testProjectIdIgnoredNoteOnCanon();
     await testProbeConnectionRefused();
     await testProbeLiveBranches();
     await testInvalidIdentifierRejected();
