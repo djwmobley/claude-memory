@@ -38,6 +38,7 @@
  */
 
 const assert         = require('assert');
+const crypto         = require('crypto');
 const fs             = require('fs');
 const os             = require('os');
 const path           = require('path');
@@ -52,6 +53,7 @@ const {
   detectOursPresent,
   serializeSettings,
   reconcileFormatting,
+  makeBackupPath,
 } = require('./install.js');
 
 const REPO_ROOT       = path.resolve(__dirname, '..');
@@ -399,6 +401,34 @@ test('detectIndent: 4-space file', () => assert.strictEqual(detectIndent('{\n   
 test('detectIndent: tab file', () => assert.strictEqual(detectIndent('{\n\t"a": 1\n}\n'), '\t'));
 test('detectIndent: one-line file defaults to 2 spaces', () => assert.strictEqual(detectIndent('{"a":1}'), '  '));
 
+// ── makeBackupPath: collision-safe naming ───────────────────────────────────
+test('makeBackupPath: appends a numeric suffix when the timestamped name already exists, and never overwrites', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'install-backup-collision-'));
+  try {
+    const target = path.join(dir, 'settings.local.json');
+    fs.writeFileSync(target, '{}', 'utf8');
+    const ts = '2026-09-06T00-00-00.000Z';
+    const base = `${target}.bak-${ts}`;
+    fs.writeFileSync(base, 'existing backup 1', 'utf8');
+
+    const first = makeBackupPath(target, ts);
+    assert.notStrictEqual(first, base, 'must not reuse a name that already exists on disk');
+    assert.ok(!fs.existsSync(first), 'chosen name must be free');
+
+    fs.writeFileSync(first, 'existing backup 2', 'utf8');
+    const second = makeBackupPath(target, ts);
+    assert.notStrictEqual(second, base);
+    assert.notStrictEqual(second, first);
+    assert.ok(!fs.existsSync(second), 'second collision also resolves to a free name');
+
+    // makeBackupPath only ever picks a name; it must never itself write/overwrite.
+    assert.strictEqual(fs.readFileSync(base, 'utf8'), 'existing backup 1', 'first pre-existing backup left untouched');
+    assert.strictEqual(fs.readFileSync(first, 'utf8'), 'existing backup 2', 'second pre-existing backup left untouched');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 // PART B — file-level: scope, dry-run diff, backup+atomic, safety, format
 // ═══════════════════════════════════════════════════════════════════════════
@@ -480,6 +510,52 @@ function userSettingsPath(homeDir) {
       assert.strictEqual(second.status, 0, `second run exited ${second.status}; stderr: ${second.stderr}`);
       const secondContent = fs.readFileSync(projectSettingsPath(projectDir), 'utf8');
       assert.strictEqual(secondContent, firstContent, 'settings.local.json content unchanged by a no-op re-run');
+    });
+
+    // ── B-BACKUP-FIRST-RUN ───────────────────────────────────────────────
+    test('B-BACKUP-FIRST-RUN: first real migrating run creates exactly one .bak- file', () => {
+      const { projectDir, homeDir } = freshProject(tmpBase, 'backup-first-run');
+      const settingsFile = projectSettingsPath(projectDir);
+      fs.mkdirSync(path.dirname(settingsFile), { recursive: true });
+      const original = JSON.stringify({
+        hooks: { Stop: [{ hooks: [{ type: 'command', command: 'node /old/scripts/handoff.js loader-stop' }] }] },
+      }, null, 2) + '\n';
+      fs.writeFileSync(settingsFile, original, 'utf8');
+
+      const result = runEngine(engineScript, projectDir, homeDir, ['--force', '--non-interactive']);
+      assert.strictEqual(result.status, 0, `stderr: ${result.stderr}`);
+      const backups = fs.readdirSync(path.dirname(settingsFile)).filter((f) => f.startsWith('settings.local.json.bak-'));
+      assert.strictEqual(backups.length, 1, 'exactly one backup file after the first migrating run');
+    });
+
+    // ── B-NOOP-NO-BACKUP ─────────────────────────────────────────────────
+    test('B-NOOP-NO-BACKUP: a re-run on an already-migrated file writes no new backup and no new content', () => {
+      const { projectDir, homeDir } = freshProject(tmpBase, 'noop-no-backup');
+      const settingsFile = projectSettingsPath(projectDir);
+      fs.mkdirSync(path.dirname(settingsFile), { recursive: true });
+      const original = JSON.stringify({
+        hooks: { Stop: [{ hooks: [{ type: 'command', command: 'node /old/scripts/handoff.js loader-stop' }] }] },
+      }, null, 2) + '\n';
+      fs.writeFileSync(settingsFile, original, 'utf8');
+
+      const first = runEngine(engineScript, projectDir, homeDir, ['--force', '--non-interactive']);
+      assert.strictEqual(first.status, 0, `first run exited ${first.status}; stderr: ${first.stderr}`);
+      const backupsAfterFirst = fs.readdirSync(path.dirname(settingsFile)).filter((f) => f.startsWith('settings.local.json.bak-'));
+      assert.strictEqual(backupsAfterFirst.length, 1, 'sanity: first run performed a real migration and backed up once');
+
+      const contentBefore = fs.readFileSync(settingsFile, 'utf8');
+      const md5Before = crypto.createHash('md5').update(contentBefore).digest('hex');
+
+      const second = runEngine(engineScript, projectDir, homeDir, ['--force', '--non-interactive']);
+      assert.strictEqual(second.status, 0, `second run exited ${second.status}; stderr: ${second.stderr}`);
+      assert.match(second.stdout, /no changes; nothing written/i, 'no-op run prints the one-line no-op summary');
+
+      const backupsAfterSecond = fs.readdirSync(path.dirname(settingsFile)).filter((f) => f.startsWith('settings.local.json.bak-'));
+      assert.strictEqual(backupsAfterSecond.length, 1, 'no new backup file created by the no-op second run');
+
+      const contentAfter = fs.readFileSync(settingsFile, 'utf8');
+      const md5After = crypto.createHash('md5').update(contentAfter).digest('hex');
+      assert.strictEqual(md5After, md5Before, 'settings file content (md5) unchanged by the no-op run');
     });
 
     // ── B-DRYRUN-NOOP ─────────────────────────────────────────────────────

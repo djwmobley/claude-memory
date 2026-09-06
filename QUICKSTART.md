@@ -126,7 +126,7 @@ Replace `<path-to-this-repo>` with the absolute path where you cloned `claude-me
 - Copy the nine `/handoff:*` slash command files to `~/.claude/commands/handoff/`
 - Add SessionStart and SessionEnd hooks to a Claude Code settings file (creating it if it doesn't exist, or merging with whatever hooks are already there — it never touches anyone else's hooks, and only re-points its own if the engine path moved)
 
-By default (`--hooks-scope auto`) the installer writes to `~/.claude/settings.json` (user scope) if it already has a loader-hook/loader-stop entry there, otherwise to `.claude/settings.local.json` in your current project (project scope). Pass `--hooks-scope user` or `--hooks-scope project` to force one or the other. Add `--dry-run` to see a diff of exactly what would change before writing anything — nothing is written in dry-run mode, not even a backup.
+By default (`--hooks-scope auto`) the installer writes to `~/.claude/settings.json` (user scope) if it already has a loader-hook/loader-stop entry there, otherwise to `.claude/settings.local.json` in your current project (project scope). Pass `--hooks-scope user` or `--hooks-scope project` to force one or the other. Add `--dry-run` to see a diff of exactly what would change before writing anything — nothing is written in dry-run mode, not even a backup. Re-running the installer when the hooks are already reconciled writes nothing and creates no backup either — a backup is only written alongside a real change to the settings file.
 
 **You should see** a short summary listing what was copied and wired, then "Done. Restart Claude Code or open a fresh session to pick up the changes."
 

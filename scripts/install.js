@@ -657,6 +657,26 @@ async function confirm(question) {
 
 // ─── HOOKS SUMMARY PRINTING (S6) ─────────────────────────────────────────────
 
+/**
+ * Choose a backup path for `targetSettingsPath` that doesn't collide with an
+ * existing file. The base name is timestamped to millisecond precision
+ * (`.bak-<ISO-ts-with-colons-dashed>`), so a collision only happens when two
+ * real writes land in the same millisecond (or a prior backup with that
+ * exact name is still on disk) — in that case a numeric suffix (`-2`, `-3`,
+ * ...) is appended until a free name is found. `ts` is injectable for tests;
+ * defaults to the current time.
+ */
+function makeBackupPath(targetSettingsPath, ts) {
+  const stamp = ts || new Date().toISOString().replace(/:/g, '-');
+  let backupPath = `${targetSettingsPath}.bak-${stamp}`;
+  let n = 2;
+  while (fs.existsSync(backupPath)) {
+    backupPath = `${targetSettingsPath}.bak-${stamp}-${n}`;
+    n++;
+  }
+  return backupPath;
+}
+
 function printHooksSummary(report, scope, targetPath, backupPath) {
   console.log(`  Hooks scope: ${scope}`);
   console.log(`  Hooks file:  ${targetPath}`);
@@ -779,22 +799,28 @@ async function main(cfg) {
   // ── Step 1b: Record engine path for standalone installs ───────────────────
   fs.writeFileSync(enginePathFile, enginePathContent + '\n', 'utf8');
 
-  // ── Step 2: Wire hooks (backup + atomic write) ────────────────────────────
+  // ── Step 2: Wire hooks (compute output first; backup + write only on a real change) ──
   fs.mkdirSync(path.dirname(targetSettingsPath), { recursive: true });
-
-  let backupPath = null;
-  if (settingsExists) {
-    const ts = new Date().toISOString().replace(/:/g, '-');
-    backupPath = `${targetSettingsPath}.bak-${ts}`;
-    fs.copyFileSync(targetSettingsPath, backupPath);
-  }
 
   const report = mergeHooks(readSettings, { hookLoaderCmd, hookStopCmd });
   const outText = serializeSettings(readSettings, { indent, eol, hadBOM, originalJsonText: jsonTextLF });
 
-  const tmpPath = `${targetSettingsPath}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(tmpPath, outText, 'utf8');
-  fs.renameSync(tmpPath, targetSettingsPath);
+  // settingsExists && outText === raw means mergeHooks + reconciled serialization
+  // reproduced the file's exact current bytes — the hooks are already fully
+  // reconciled, so there is nothing to back up and nothing to write.
+  const noop = settingsExists && outText === raw;
+
+  let backupPath = null;
+  if (!noop) {
+    if (settingsExists) {
+      backupPath = makeBackupPath(targetSettingsPath);
+      fs.copyFileSync(targetSettingsPath, backupPath);
+    }
+
+    const tmpPath = `${targetSettingsPath}.tmp-${process.pid}-${Date.now()}`;
+    fs.writeFileSync(tmpPath, outText, 'utf8');
+    fs.renameSync(tmpPath, targetSettingsPath);
+  }
 
   // ── Print summary ─────────────────────────────────────────────────────────
   console.log('  Slash commands:');
@@ -805,7 +831,11 @@ async function main(cfg) {
   console.log(`    → ${enginePathContent}`);
   console.log('');
   console.log(`  Hooks (${settingsExists ? 'merged into' : 'created'} ${targetSettingsPath}):`);
-  printHooksSummary(report, scope, targetSettingsPath, backupPath);
+  if (noop) {
+    console.log('    no changes; nothing written.');
+  } else {
+    printHooksSummary(report, scope, targetSettingsPath, backupPath);
+  }
   console.log('');
   console.log('Done. Restart Claude Code or open a fresh session to pick up the changes.');
   console.log('');
@@ -831,4 +861,5 @@ module.exports = {
   scanEntries,
   diffLines,
   reconcileFormatting,
+  makeBackupPath,
 };
