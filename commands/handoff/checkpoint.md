@@ -39,9 +39,19 @@ Before calling the helper, extract the following from this conversation:
    Supported types: `entity`, `assertion`, `vector`, `recency`.
    Example: `{"queries": [{"type": "recency", "token_budget": 500}]}`
 
-5. **TL;DR** — 3–5 sentences summarizing where things stand.
+5. **Decisions** — standing decisions worth recalling by topic across sessions (distinct from
+   `assertions`, which are subject/predicate/object facts). Each needs: `topic` (REQUIRED,
+   lowercase kebab-case with at least one hyphen, e.g. `vllm-embedding-default`), `decision`
+   (REQUIRED, non-empty), `reason` (REQUIRED, non-empty), `session_num` (optional). Persisted
+   through the SAME write path as the standalone `persist_decisions` MCP tool — re-using the
+   SAME `topic` across a close/checkpoint **updates** that decision (`ON CONFLICT (project_id,
+   topic) DO UPDATE`) rather than creating a duplicate. See `commands/handoff/close.md`'s
+   "Decisions" section for full field/failure-mode detail (fail-soft embedding, DIVERGENCE
+   surfacing on validation/write failure).
 
-6. **Open threads** — list of pending decisions or tasks.
+6. **TL;DR** — 3–5 sentences summarizing where things stand.
+
+7. **Open threads** — list of pending decisions or tasks.
 
 ## Preferred path — MCP
 
@@ -61,6 +71,7 @@ mcp__handoff__handoff_checkpoint({
     entities: [{ "name": "entity-name", "entity_type": "system", "description": "..." }],
     assertions: [{ "subject": "X", "predicate": "uses", "object": "Y", "confidence": 8, "source": "model_extracted" }],
     edges: [{ "from_entity": "X", "edge_type": "depends_on", "to_entity": "Y" }],
+    decisions: [{ "topic": "vllm-embedding-default", "decision": "use vLLM Qwen3 for embeddings", "reason": "Ollama path removed" }],
     contract: { "queries": [{ "type": "recency", "token_budget": 500 }] },
     open_threads: ["item 1", "item 2"]
   }

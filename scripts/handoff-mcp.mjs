@@ -55,6 +55,11 @@ const routingProfileLib = require('./lib/routing-profile.js');
 const routingWriteSurfaceLib = require('./lib/routing-write-surface.js');
 const usageTelemetryLib = require('./lib/usage-telemetry.js');
 const { writeRowWithProvenanceRetry } = require('./lib/write-time-embed.js');
+// cm#230: validateDecisionRows/persistDecisionRow moved to decisions-writer.js
+// so scripts/handoff.js's writeExtraction (payload.decisions[] from a close/
+// checkpoint stdin payload) can share the SAME write path — never a second
+// implementation of decisions-row validation or the embed+upsert chain.
+const decisionsWriterLib = require('./lib/decisions-writer.js');
 
 // ── Ground-truth paths (verified 2026-07-11; overridable via env for other hosts) ──
 
@@ -371,34 +376,10 @@ async function toolHandoffInit({ projectRoot, name }) {
   return textResult({ success: true, summary, report });
 }
 
-const TOPIC_RE = /^[a-z0-9]+(-[a-z0-9]+)+$/;
-
-function validateDecisionRows(rows) {
-  const errors = [];
-  if (!Array.isArray(rows) || rows.length === 0) {
-    errors.push('rows must be a non-empty array.');
-    return errors;
-  }
-  rows.forEach((row, i) => {
-    if (typeof row !== 'object' || row === null || Array.isArray(row)) {
-      errors.push(`rows[${i}]: must be an object.`);
-      return;
-    }
-    if (typeof row.topic !== 'string' || !TOPIC_RE.test(row.topic)) {
-      errors.push(`rows[${i}].topic: required, must be a lowercase kebab-case string with at least one hyphen (e.g. "ppm-monolith-foo"); got ${JSON.stringify(row.topic)}.`);
-    }
-    if (typeof row.decision !== 'string' || row.decision.trim() === '') {
-      errors.push(`rows[${i}].decision: required non-empty string.`);
-    }
-    if (typeof row.reason !== 'string' || row.reason.trim() === '') {
-      errors.push(`rows[${i}].reason: required non-empty string.`);
-    }
-    if (row.session_num !== undefined && row.session_num !== null && typeof row.session_num !== 'number') {
-      errors.push(`rows[${i}].session_num: must be a number or null if present.`);
-    }
-  });
-  return errors;
-}
+// cm#230: TOPIC_RE/validateDecisionRows now live in decisions-writer.js
+// (byte-identical regex/error-strings — see that file). Kept as a local
+// alias so nothing else in this file needs to change its call sites.
+const { validateDecisionRows } = decisionsWriterLib;
 
 // §7.2/§8 M-1/M-2/M-3 repoint (declared response-shape break — see the PR
 // body): persist_decisions no longer writes claude_policy_framework via
@@ -422,24 +403,13 @@ async function toolPersistDecisions({ projectRoot, rows, verifyQuery }) {
     return await withProjectDb(projectRoot, async (db, projectId) => {
       const written = [];
       const warnings = [];
+      // cm#230: persistDecisionRow is the SAME write function
+      // scripts/handoff.js's writeExtraction now calls for payload.decisions[]
+      // — moved out of this loop body verbatim, byte-identical behavior.
       for (const row of rows) {
-        const embedText = memoryUpsertLib.buildEmbedText('decisions', {
-          topic: row.topic, decision: row.decision, reason: row.reason,
-        });
-        // cm#201: threads providerId alongside the vector (both-or-neither)
-        // and classifies a race-window FK 23503 on embedded_by_provider_id
-        // (re-resolve once, retry; degrade to neither on persistent failure).
-        const { written: written_row, warning } = await writeRowWithProvenanceRetry(db, embedText, (opts) =>
-          memoryUpsertLib.upsertDecisionRow(db, {
-            project_id: projectId,
-            topic: row.topic,
-            decision: row.decision,
-            reason: row.reason,
-            session_num: row.session_num ?? null,
-          }, opts)
-        );
+        const { written: written_row, warning } = await decisionsWriterLib.persistDecisionRow(db, projectId, row);
         if (warning) warnings.push({ topic: row.topic, warning });
-        written.push({ id: written_row.id, topic: written_row.topic, inserted: written_row.inserted });
+        written.push(written_row);
       }
 
       let topHits = null;
@@ -847,7 +817,16 @@ const EXTRACTION_PAYLOAD_FIELD_CONTRACT =
   '- edges: array of { from_entity: string, edge_type: "depends_on"|"implements"|"blocks"|"owns"|"calls"|"produces", ' +
   'to_entity: string }.\n' +
   '- contract: { queries: [...] } — a next-session retrieval contract; supported query types are entity/assertion/' +
-  'recency/vector (see commands/handoff/close.md §4 for the exact shape of each).\n\n' +
+  'recency/vector (see commands/handoff/close.md §5 for the exact shape of each).\n' +
+  '- decisions: array of { topic: string (REQUIRED, lowercase kebab-case with >=1 hyphen, e.g. "vllm-embedding-default", ' +
+  '<=2000 bytes UTF-8), decision: string (REQUIRED, non-empty), reason: string (REQUIRED, non-empty), ' +
+  'session_num: number (optional) }, array length <=200. cm#230: persisted through the SAME write path the ' +
+  'standalone persist_decisions tool uses — ON CONFLICT (project_id, topic) DO UPDATE (re-closing with the same ' +
+  'topic UPDATES that row, never a duplicate), inline-embedded at write time (fail-soft: a down embedding provider ' +
+  'never blocks the write — the row is still persisted with embedding=NULL, surfaced as a non-fatal ' +
+  '`DIVERGENCE: decision:<topic> EMBEDDING DEGRADED` line). A row that fails validation (bad topic shape, missing ' +
+  'decision/reason) or hits a genuine write error is skipped (non-fatal) and surfaced as ' +
+  '`DIVERGENCE: decision:<topic> NOT PERSISTED` — one bad row never blocks the rest of the close.\n\n' +
   'Caveman/telegraphic authoring is MANDATORY for tldr, open_threads, and quick_references: strip function words ' +
   '(a/an/the, is/are/was/were, of/to/in/for/and/or/but, with/that/this/it/as/at/on/by/be) while keeping every ' +
   'load-bearing token verbatim — identifiers, file paths, line refs, PR numbers, commit SHAs, names, numbers, ' +
