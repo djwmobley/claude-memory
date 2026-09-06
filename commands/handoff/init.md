@@ -87,6 +87,8 @@ PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" init "my-project" -y
 |---|---|---|
 | `<name>` | directory basename | Optional project name positional. Sets the human-readable project label written to `project_settings`. |
 | `-y` / `--yes` / `--force` | off | Bypass the confirmation prompt and auto-create the database if absent. Required for non-interactive / agent / CI use. |
+| `--routing` | off | Run ONLY the §17.1.2 routing configuration Q&A (see below) against an already-initialized project — skips schema apply and every other init step. Fails fast if the project has never run plain `init`. |
+| `--routing-reconfigure` | off | Same as `--routing`, but also re-asks the capability tier for any role that already carries an active `routing_profiles` row (provenance-blind — it does not check who set the existing row or why). |
 
 ## Confirmation gate
 
@@ -124,6 +126,71 @@ Running: handoff:init
   [OK]    project marker written: uuid=<uuid>
 
 Done: handoff:init — project <uuid> provisioned
+```
+
+## Routing configuration Q&A (§17.1.2)
+
+After the `retrieval_contract_history` baseline step, plain `init` runs an
+OPTIONAL, interactive-only routing configuration Q&A (`scripts/lib/routing-init-qa.js`).
+It never fails `init` as a whole — it only prints a `[NOTE]` and skips when it
+cannot run, and any answered-so-far state is discarded (never partially
+written) if the sequence is interrupted.
+
+**Gate** — runs only when stdin is a TTY AND none of `-y` / `--yes` /
+`--force` was passed. Otherwise:
+
+```
+[NOTE] routing Q&A skipped (non-interactive) — run: handoff init --routing
+```
+
+`--routing` does **not** re-enable prompting under `-y` — a non-interactive
+`handoff init --routing -y` still prints the same skip note and writes
+nothing.
+
+**Precondition** — the `routing_profiles` / `model_registry` tables must
+already be provisioned (via `scripts/migrations/migrate-schema-addenda.js`).
+If either is missing:
+
+```
+[NOTE] routing tables not provisioned — run scripts/migrations/migrate-schema-addenda.js
+```
+
+**Flow**, when the gate and precondition both pass:
+
+1. `Configure model routing now? [y/N]` — anything but `y`/`yes` skips
+   quietly; the rest is never asked.
+2. Roles to configure (comma-separated, case-sensitive — never folded).
+   Pressing Enter with no input accepts the default set:
+   `orchestrate,spec,draft,write,read,index,bookkeep,review`. A role that
+   only differs in case from a default role name (e.g. `Draft`) is
+   rejected with the canonical spelling named, and re-asked. Roles that
+   already carry an active `routing_profiles` row are listed and skipped
+   (not re-asked) unless `--routing-reconfigure` was passed.
+3. For each remaining role: `Capability tier for '<role>' (high|mid|low)
+   [suggested: <tier>]` — the suggestion is display-only, never applied;
+   blank or any value outside `high|mid|low` re-asks.
+4. A model-registration loop: label / provider / capability tier / cost-in
+   per Mtok / cost-out per Mtok, then `Add another model? [y/N]`. Leaving
+   the label blank at the start of a round ends the loop (zero or more
+   models may be registered). Cost fields are parsed with `Number(...)` —
+   a non-finite, negative, out-of-range, or more-than-4-fractional-digit
+   value is rejected and re-asked (**never silently rounded**).
+
+Every answer is buffered in memory; nothing is written to
+`routing_profiles` / `model_registry` until the ENTIRE sequence completes.
+If the input stream closes (Ctrl+D) at any point — including the very
+first question — nothing is written:
+
+```
+[NOTE] routing configuration incomplete — no changes written
+```
+
+`init` still exits `0` in every one of the cases above; this step is
+always optional. To run the Q&A later (or answer differently), use:
+
+```bash
+PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" init --routing
+PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" init --routing-reconfigure
 ```
 
 > Done: handoff:init — project initialized

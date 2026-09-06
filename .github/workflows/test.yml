@@ -279,6 +279,31 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run routing init-time Q&A tests
+        # §17.1.2 (CONSOLIDATION-RUNBOOK.md, owner decision 2026-09-06):
+        # scripts/lib/routing-init-qa.js — the init-time routing configuration
+        # Q&A that closes docs/notes/2026-09-06-s17-routing-gap-audit.md's row
+        # 38/38 ("run routing init Q&A" pointed at a flow that did not exist).
+        # Driven entirely through an injectable `ask` seam — no readline, no
+        # real stdin. Two groups: pure validator totality tests (role-list
+        # defaulting/whitespace/duplicate/case-near-match, tier exact-match,
+        # cost parsing incl. scientific notation/NaN/negative/too-many-
+        # fractional-digits/locale-comma/the NUMERIC(10,4) boundary, and label
+        # blank/whitespace/case-near-match/exact-match) plus live-DB
+        # integration tests (non-interactive gate, tables-absent precondition,
+        # EOF at the first question and mid-sequence — both proving zero rows
+        # written, the all-or-nothing buffering contract — a quiet decline,
+        # the full happy path verified end to end, the idempotency skip of an
+        # already-configured role, --routing-reconfigure re-asking that same
+        # role, and a Q3 label case-near-match rejected then retried).
+        # Creates/drops its own _staging-suffixed scratch DBs (one full-schema,
+        # one base-schema-only for the tables-absent fixture); never touches
+        # claude_memory_eval_test.
+        run: node test/migrations/test-routing-init-qa.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run usage-telemetry + verify-18 usage smoke tests
         # Tests scripts/lib/usage-telemetry.js (usageRecord/sessionUsageRollup/
         # usageQuery) and scripts/migrations/verify-18-usage-smoke.js, the §18

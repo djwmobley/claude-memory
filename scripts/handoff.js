@@ -80,6 +80,9 @@ const { REALITY_CHECKS, runVerifyDispatch }        = require('./lib/reality-chec
 // (and, before this fix, only-validated-never-written) entry point onto
 // this one write path.
 const { validateDecisionRows, persistDecisionRow } = require('./lib/decisions-writer');
+// §17.1.2: init-time routing configuration Q&A (cmdInit step 9.5 below, plus
+// the standalone --routing / --routing-reconfigure path).
+const { runRoutingInitQA }                         = require('./lib/routing-init-qa.js');
 
 process.on('exit', () => {
   const ms = Number(process.hrtime.bigint() - __startNs) / 1e6;
@@ -2351,6 +2354,80 @@ function printPreflightLine(result, stepDesc) {
 
 // ── init ─────────────────────────────────────────────────────────────────────
 
+/**
+ * Wraps a single shared readline.Interface into the injectable `ask`
+ * contract scripts/lib/routing-init-qa.js expects: `(promptText) =>
+ * Promise<string|null>`, where `null` means the input stream closed
+ * (EOF, e.g. Ctrl+D) before an answer was given — routing-init-qa.js
+ * treats that as "incomplete", never as "declined". A 'close' listener
+ * races against each individual rl.question() call so a close mid-question
+ * resolves that pending prompt with null instead of hanging forever.
+ */
+function makeReadlineAsk(rl) {
+  let closed = false;
+  rl.on('close', () => { closed = true; });
+  return function ask(promptText) {
+    return new Promise((resolve) => {
+      if (closed) { resolve(null); return; }
+      let settled = false;
+      const onClose = () => {
+        if (!settled) { settled = true; resolve(null); }
+      };
+      rl.once('close', onClose);
+      rl.question(promptText, (answer) => {
+        if (!settled) {
+          settled = true;
+          rl.removeListener('close', onClose);
+          resolve(answer);
+        }
+      });
+    });
+  };
+}
+
+/**
+ * §17.1.2 standalone path: `handoff init --routing` / `--routing-reconfigure`
+ * run ONLY the routing Q&A against an ALREADY-INITIALIZED project — none of
+ * cmdInit's schema-apply/preflight/FS-write steps run. Requires an existing
+ * project marker; a project that has never run `handoff init` gets a clear
+ * fail-fast message rather than silently minting a new, unrelated project.
+ *
+ * `--routing` does NOT re-enable prompting under -y/--yes/--force (item 2):
+ * the same `interactive = stdin.isTTY && !autoCreate` gate applies here as
+ * in cmdInit's step 9.5 — a non-interactive `--routing` invocation still
+ * prints the skip NOTE and writes nothing.
+ *
+ * Caller (cmdInit) has already verified `root` carries a real project
+ * marker and resolved `projectId` from it before calling this function.
+ */
+async function cmdInitRoutingOnly({ projectId, autoCreate, reconfigure }) {
+  let db;
+  try {
+    db = await connectHandoff();
+  } catch (err) {
+    console.log(`  [FAIL]  DB connection failed — ${err.message}`);
+    process.exit(1);
+  }
+
+  const interactive = Boolean(process.stdin.isTTY) && !autoCreate;
+  let rl = null;
+  try {
+    let result;
+    if (interactive) {
+      rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      result = await runRoutingInitQA(db, { projectId, interactive: true, reconfigure, ask: makeReadlineAsk(rl) });
+    } else {
+      // No readline needed — runRoutingInitQA(interactive:false) prints the
+      // skip NOTE and returns immediately without touching `ask`.
+      result = await runRoutingInitQA(db, { projectId, interactive: false, reconfigure, ask: async () => null });
+    }
+    console.log(`\nDone: handoff:init --routing — project ${projectId}${result.skipped ? ` (skipped: ${result.reason})` : ` (${result.rolesWritten.length} role(s), ${result.modelsWritten.length} model(s))`}`);
+  } finally {
+    if (rl) rl.close();
+    await db.end();
+  }
+}
+
 async function cmdInit(args) {
   console.log('Running: handoff:init\n');
 
@@ -2361,6 +2438,31 @@ async function cmdInit(args) {
   const initCwd    = process.env.PROJECT_ROOT || process.cwd();
   const markerRoot = findProjectRootByMarker(initCwd);
   const root       = markerRoot || findProjectRoot();
+
+  // ── §17.1.2 standalone path: --routing / --routing-reconfigure ──────────
+  // Runs ONLY the routing Q&A against an already-initialized project — none
+  // of the schema-apply/preflight/FS-write steps below execute. Dispatched
+  // here, BEFORE the UUID-minting block, so a never-initialized project
+  // never gets a (deferred, in-memory-only) UUID minted on its behalf by
+  // this path — cmdInitRoutingOnly requires a REAL existing marker and
+  // fails fast otherwise.
+  {
+    const routingReconfigureFlag = args.includes('--routing-reconfigure');
+    const routingOnlyFlag = args.includes('--routing') || routingReconfigureFlag;
+    if (routingOnlyFlag) {
+      const existingMarkerForRouting = readMarker(root);
+      if (!existingMarkerForRouting) {
+        console.log(`  [FAIL]  project not initialized — run: handoff init (this project has no marker at ${root})`);
+        process.exit(1);
+      }
+      const autoCreateForRouting = args.includes('-y') || args.includes('--yes') || args.includes('--force');
+      return cmdInitRoutingOnly({
+        projectId: existingMarkerForRouting.uuid,
+        autoCreate: autoCreateForRouting,
+        reconfigure: routingReconfigureFlag,
+      });
+    }
+  }
 
   // ── Resolve or mint the project UUID (FS-deferred for atomicity) ──────────
   //
@@ -2714,6 +2816,39 @@ async function cmdInit(args) {
     console.log(`  [OK]    retrieval_contract_history baseline ensured (idempotent)`);
   } catch (histErr) {
     console.log(`  [WARN]  retrieval_contract_history baseline failed (non-fatal): ${histErr.message}`);
+  }
+
+  // Step 9.5: §17.1.2 init-time routing configuration Q&A. Runs AFTER the
+  // retrieval_contract baseline above and BEFORE db.end()/the FS-write phase
+  // below, so an unexpected failure here still unwinds cleanly via
+  // unwindFsLedger() — the ledger is empty at this point, since no FS writes
+  // have happened yet. runRoutingInitQA's own GRACEFUL paths (non-interactive
+  // gate, tables-absent precondition, Q0 decline, EOF/close mid-sequence)
+  // never throw and never fail init — only a genuine unexpected error (e.g.
+  // a DB error during its own final all-or-nothing write phase) reaches this
+  // catch. `--routing`/`--routing-reconfigure` are handled by the standalone
+  // cmdInitRoutingOnly path above and never reach ordinary `init` here, so
+  // `reconfigure` is always false on this call.
+  {
+    const routingInteractive = Boolean(process.stdin.isTTY) && !autoCreate;
+    let routingRl = null;
+    let routingAsk;
+    if (routingInteractive) {
+      routingRl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      routingAsk = makeReadlineAsk(routingRl);
+    } else {
+      routingAsk = async () => null;
+    }
+    try {
+      await runRoutingInitQA(db, { projectId, interactive: routingInteractive, reconfigure: false, ask: routingAsk });
+    } catch (routingErr) {
+      if (routingRl) routingRl.close();
+      await db.end();
+      console.log(`  [FAIL]  routing Q&A failed — ${routingErr.message}`);
+      unwindFsLedger();  // ledger is empty at this point — prints accurate status
+      process.exit(1);
+    }
+    if (routingRl) routingRl.close();
   }
 
   await db.end();

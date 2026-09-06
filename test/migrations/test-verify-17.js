@@ -352,6 +352,10 @@ async function testRequiredTierOrder(client) {
   assert(hintErr !== null, 'expected resolveRequiredTier to throw for an unconfigured role');
   assert(!/init Q&A/.test(hintErr.message), `unconfigured-role hint must not name the nonexistent "init Q&A" flow: "${hintErr.message}"`);
   assert(/routing_profile_set/.test(hintErr.message), `unconfigured-role hint must name the real routing_profile_set tool: "${hintErr.message}"`);
+  // §17.1.2 (2026-09-06): the init-time routing Q&A now exists
+  // (scripts/lib/routing-init-qa.js) — the hint must point operators at the
+  // real, now-implemented `handoff init --routing` flow.
+  assert(/handoff init --routing/.test(hintErr.message), `unconfigured-role hint must name the real "handoff init --routing" flow: "${hintErr.message}"`);
 
   await insertProfile(client, { projectId: '*', role, tier: 'low', version: 1 });
   await insertProfile(client, { projectId, role, tier: 'mid', version: 1 });

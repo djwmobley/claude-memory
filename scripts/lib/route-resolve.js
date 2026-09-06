@@ -223,13 +223,14 @@ async function resolveRequiredTier(pg, { projectId, role, capabilityTier } = {})
   throw new Error(
     `unconfigured routing for role '${role}' — no active routing_profiles row sets a ` +
     "capability_tier for this role (checked project-scoped, then the '*' global default). " +
-    'Configure one via the routing_profile_set MCP tool (routingProfileSet in ' +
-    'scripts/lib/routing-profile.js), e.g. { projectId, role, capabilityTier }. Suggested ' +
-    'per-role defaults exist only as prose (orchestrate/spec=high, draft/write=mid, ' +
-    'read/index/bookkeep=low, review=high) and are never applied automatically — an ' +
-    'operator must call routing_profile_set explicitly to confirm one. Candidate models ' +
-    'must also be registered in model_registry before they can be recommended or pinned — ' +
-    'use the model_registry_set MCP tool (§17 B1) rather than raw SQL.'
+    'Configure routing with: handoff init --routing (or the routing_profile_set MCP tool, ' +
+    'routingProfileSet in scripts/lib/routing-profile.js), e.g. { projectId, role, ' +
+    'capabilityTier }. Suggested per-role defaults exist only as prose (orchestrate/spec=high, ' +
+    'draft/write=mid, read/index/bookkeep=low, review=high) and are never applied ' +
+    'automatically — an operator must run handoff init --routing or call routing_profile_set ' +
+    'explicitly to confirm one. Candidate models must also be registered in model_registry ' +
+    'before they can be recommended or pinned — use the model_registry_set MCP tool (§17 B1) ' +
+    'rather than raw SQL.'
   );
 }
 

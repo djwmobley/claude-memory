@@ -259,6 +259,17 @@ not silently ignore the new value nor error: the response carries
 `override_ignored: true` and the ignored value, so a caller can tell its
 new intent was seen but not applied.
 
+`resolveRequiredTier` (the tier half of `route_resolve`'s resolution) hard-
+errors on an "unconfigured routing" role — no active `routing_profiles` row
+sets a `capability_tier` for it, checked project-scoped then the `'*'`
+global default. The remediation text points at the §17.1.2 init-time
+routing Q&A first: `handoff init --routing` (interactive-only; see
+`commands/handoff/init.md`), or calling `routing_profile_set` directly.
+Nothing is ever applied automatically — the §17.1.1 role→tier suggestion
+table (orchestrate/spec=high, draft/write=mid, read/index/bookkeep=low,
+review=high) exists only as a display-time suggestion inside that Q&A and
+inside the hard-error hint's prose, never as a silent fallback.
+
 `routing_profile_set` writes a new versioned, active row and deactivates
 the previous one — never an in-place edit of an existing pin's tier or
 model. Concurrent calls for the same `(project_id, role)` serialize on a
