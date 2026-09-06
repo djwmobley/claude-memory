@@ -72,6 +72,7 @@ const {
   resolvePromotionFilePath,
 } = require('./lib/handoff-paths');
 const { embedQuery }                               = require('./lib/embed');
+const { seedLocalEmbeddingProvider }               = require('./lib/embedding-provider');
 const { execFileSync }                             = require('child_process');
 const crypto                                       = require('crypto');
 const { REALITY_CHECKS, runVerifyDispatch }        = require('./lib/reality-checks');
@@ -2354,6 +2355,33 @@ function printPreflightLine(result, stepDesc) {
 async function cmdInit(args) {
   console.log('Running: handoff:init\n');
 
+  // ── --seed-provider: standalone backfill path ────────────────────────────
+  // Runs ONLY the local-embedding-provider seeding step (see
+  // seedLocalEmbeddingProvider / scripts/lib/embedding-provider.js) against
+  // an ALREADY-INITIALIZED project's DB — no confirmation gate, no schema
+  // apply, no marker/handoff.md/CLAUDE.md provisioning. This is the backfill
+  // path for existing local projects that ran `init` before this seeding
+  // step existed; a fresh `init` (below) seeds inline as part of its own
+  // sequence and never needs this flag. embedding_providers is a global,
+  // non-project-scoped table (see its own DDL comment), so no project
+  // marker/UUID resolution is needed here at all.
+  if (args.includes('--seed-provider')) {
+    const seedCwd  = process.env.PROJECT_ROOT || process.cwd();
+    const seedRoot = findProjectRootByMarker(seedCwd) || findProjectRoot();
+    let seedDb;
+    try {
+      seedDb = await connectHandoff();
+    } catch (err) {
+      console.log(`  [FAIL]  DB connection failed — ${err.message}`);
+      process.exit(1);
+    }
+    const result = await seedLocalEmbeddingProvider({ db: seedDb, projectRoot: seedRoot });
+    for (const line of result.lines) console.log(line);
+    await seedDb.end();
+    console.log(`\nDone: handoff:init --seed-provider`);
+    return;
+  }
+
   // Determine project root: prefer the project marker (new name, or legacy
   // .claude-memory) if present, else fall back to the .git walk (same as
   // legacy behavior for the init case).
@@ -2609,6 +2637,20 @@ async function cmdInit(args) {
     `(${expectedObjects.tables.length} tables, ${expectedObjects.columns.length} columns, ${expectedObjects.indexes.length} indexes checked)`
   );
   await db.releaseSchemaApplyLock(initLockKey);
+
+  // Step 7.5: seed a default embedding_providers row IFF the operator's
+  // configured embed endpoint is unambiguously local (see
+  // seedLocalEmbeddingProvider / scripts/lib/embedding-provider.js for the
+  // full NONE/INVALID/REMOTE/LOCAL classification and its rationale).
+  // Deliberately lives HERE — inside cmdInit only, never inside
+  // ensureSchemaCurrent's drift-apply path — so it runs exactly once per
+  // fresh init (idempotent re-init is a DO-NOTHING no-op) and never as a
+  // side effect of an unrelated drift-detection check. Init never fails
+  // because of this step (seedLocalEmbeddingProvider never throws).
+  {
+    const seedResult = await seedLocalEmbeddingProvider({ db, projectRoot: root });
+    for (const line of seedResult.lines) console.log(line);
+  }
 
   // Step 8: Insert default project_settings rows (idempotent)
   const defaults = {

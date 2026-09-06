@@ -2234,6 +2234,82 @@ async function runSection19() {
   });
 }
 
+async function runSection20() {
+  console.log('\n=== Section 20: embedding_providers local-seed INSERT via SQLite dialect (init-seed-local-provider) ===');
+
+  const { seedLocalEmbeddingProvider, LOCAL_PROVIDER_NAME } = require('./lib/embedding-provider');
+
+  async function makeSchemaDb() {
+    const db = new SQLiteAdapter(':memory:');
+    await db.connect();
+    const schemaSql = fs.readFileSync(SCHEMA_FILE, 'utf8');
+    await db.runSchema(schemaSql);
+    return db;
+  }
+
+  await test('seedLocalEmbeddingProvider: LOCAL classification inserts exactly one row on SQLite (is_default/data_egress_approved stored as integer 1)', async () => {
+    const db = await makeSchemaDb();
+    try {
+      const result = await seedLocalEmbeddingProvider({
+        db, dialect: 'sqlite', env: { VLLM_EMBED_URL: 'http://localhost:8800' },
+      });
+      assertTrue(result.seeded, 'expected seeded=true');
+      assertEqual(result.classification, 'LOCAL');
+      const { rows } = await db.query('SELECT * FROM embedding_providers WHERE name = ?', [LOCAL_PROVIDER_NAME]);
+      assertEqual(rows.length, 1, 'exactly one row expected');
+      assertEqual(rows[0].is_default, 1, 'is_default must be stored as integer 1 on SQLite');
+      assertEqual(rows[0].data_egress_approved, 1, 'data_egress_approved must be stored as integer 1 on SQLite');
+    } finally { await db.end(); }
+  });
+
+  await test('seedLocalEmbeddingProvider: a second call is a no-op (rowCount 0, no duplicate row)', async () => {
+    const db = await makeSchemaDb();
+    try {
+      await seedLocalEmbeddingProvider({ db, dialect: 'sqlite', env: { VLLM_EMBED_URL: 'http://localhost:8800' } });
+      const second = await seedLocalEmbeddingProvider({ db, dialect: 'sqlite', env: { VLLM_EMBED_URL: 'http://localhost:8800' } });
+      assertFalse(second.seeded, 'second call must not seed again');
+      const { rows } = await db.query('SELECT * FROM embedding_providers WHERE name = ?', [LOCAL_PROVIDER_NAME]);
+      assertEqual(rows.length, 1, 'still exactly one row after second call');
+    } finally { await db.end(); }
+  });
+
+  await test('seedLocalEmbeddingProvider: a pre-existing different default row blocks the insert (untargeted DO NOTHING, no throw)', async () => {
+    const db = await makeSchemaDb();
+    try {
+      await db.query(
+        `INSERT INTO embedding_providers (name, model_label, native_dims, stored_dims, endpoint, is_default) VALUES (?,?,?,?,?,1)`,
+        ['other-provider', 'Other/Model', 1024, 1024, 'http://localhost:9999']
+      );
+      const result = await seedLocalEmbeddingProvider({ db, dialect: 'sqlite', env: { VLLM_EMBED_URL: 'http://localhost:8800' } });
+      assertFalse(result.seeded, 'insert should be blocked by the existing default row');
+      const { rows } = await db.query('SELECT * FROM embedding_providers WHERE name = ?', [LOCAL_PROVIDER_NAME]);
+      assertEqual(rows.length, 0, 'vllm-local row must not have been inserted');
+    } finally { await db.end(); }
+  });
+
+  await test('seedLocalEmbeddingProvider: NONE (unconfigured) endpoint writes nothing', async () => {
+    const db = await makeSchemaDb();
+    try {
+      const result = await seedLocalEmbeddingProvider({ db, dialect: 'sqlite', env: {} });
+      assertEqual(result.classification, 'NONE');
+      assertFalse(result.seeded);
+      const { rows } = await db.query('SELECT * FROM embedding_providers');
+      assertEqual(rows.length, 0, 'no row should be written for an unconfigured endpoint');
+    } finally { await db.end(); }
+  });
+
+  await test('seedLocalEmbeddingProvider: REMOTE endpoint writes nothing', async () => {
+    const db = await makeSchemaDb();
+    try {
+      const result = await seedLocalEmbeddingProvider({ db, dialect: 'sqlite', env: { VLLM_EMBED_URL: 'http://0.0.0.0:8800' } });
+      assertEqual(result.classification, 'REMOTE');
+      assertFalse(result.seeded);
+      const { rows } = await db.query('SELECT * FROM embedding_providers');
+      assertEqual(rows.length, 0, 'no row should be written for a REMOTE endpoint');
+    } finally { await db.end(); }
+  });
+}
+
 // ── Run all sections ──────────────────────────────────────────────────────────
 (async () => {
   console.log(`\ntest-sqlite-seam.js (Node ${process.versions.node})\n`);
@@ -2257,6 +2333,7 @@ async function runSection19() {
   await runSection17();
   await runSection18();
   await runSection19();
+  await runSection20();
 
   console.log(`\n─── Results ──────────────────────────────────────`);
   console.log(`PASS ${passed}  FAIL ${failed}`);

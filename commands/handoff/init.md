@@ -7,10 +7,54 @@ First-run setup. Creates the database tables, writes a project-level durable-fac
 ## What this does
 
 1. Applies Phase 2 schema migrations to `claude_memory_eval_test` (idempotent DDL).
-2. Inserts default `project_settings` rows (staleness_days, loader_token_budget, etc.) if absent.
-3. Creates `~/.claude/projects/{project_id}/handoff.md` from the template if absent (base directory configurable via `HANDOFF_BASE_DIR`; default `~/.claude`).
-4. Creates the durable-facts promotion file at the project root if absent (should be git-committed). Default filename `CLAUDE.md`; configurable via `HANDOFF_PROMOTION_FILE`.
-5. Inserts a default `retrieval_contract` row for this project if absent.
+2. Seeds a default local embedding provider row IFF the configured embed endpoint is
+   unambiguously local (see "Local embedding provider seeding" below) — never for a
+   remote or unconfigured endpoint.
+3. Inserts default `project_settings` rows (staleness_days, loader_token_budget, etc.) if absent.
+4. Creates `~/.claude/projects/{project_id}/handoff.md` from the template if absent (base directory configurable via `HANDOFF_BASE_DIR`; default `~/.claude`).
+5. Creates the durable-facts promotion file at the project root if absent (should be git-committed). Default filename `CLAUDE.md`; configurable via `HANDOFF_PROMOTION_FILE`.
+6. Inserts a default `retrieval_contract` row for this project if absent.
+
+## Local embedding provider seeding
+
+`embedding_providers` is a global, non-project-scoped table (see its DDL comment in
+`scripts/sql/handoff-core-schema.sql`) — the row it holds with `is_default = true` is
+what every embedding write path (decisions, assertions, resurrect, etc.) resolves
+against. `init` seeds ONE fixed row — name `vllm-local`, model label
+`Qwen/Qwen3-Embedding-8B`, 4096 native / 4000 stored dims — the first time it finds a
+usable local endpoint, and never touches this table on any other path (never inside
+the drift-detection/`ensureSchemaCurrent` apply, only inside `init`).
+
+The endpoint is resolved with a single, fixed precedence:
+
+1. `.claude/pipeline.yml` → `knowledge.vllm_embed_url`, if set.
+2. env `VLLM_EMBED_URL`, if set.
+3. Otherwise: unconfigured. `init` never falls back to the `http://localhost:8800`
+   convenience default the runtime embed path (`shared.js`/`embed.js`) uses — for
+   seeding purposes an unconfigured endpoint is treated as invalid, not "assume local".
+
+The resolved endpoint (if any) is then classified as exactly one of:
+
+| Classification | Meaning | `init` behavior |
+|---|---|---|
+| **NONE / INVALID** | Not configured, or not a parseable `http(s)://` URL with a hostname. | No write. `[NOTE] embedding endpoint not configured/invalid — no default provider seeded; set knowledge.vllm_embed_url in .claude/pipeline.yml` |
+| **REMOTE** | A parseable endpoint whose host is not `localhost`/`127.0.0.0/8`/`::1`, OR carries userinfo, OR is a `*.localhost` subdomain, OR is `0.0.0.0`. | No write — a remote endpoint requires a human data-egress decision. `[NOTE] embedding endpoint <host> is not local — default provider requires explicit owner attestation; insert an embedding_providers row with data_egress_approved set by hand` |
+| **LOCAL** | Host is exactly `localhost`, starts with `127.`, or is `::1`, with no userinfo. | One `INSERT ... ON CONFLICT DO NOTHING` (never check-then-insert; also silently no-ops if a DIFFERENT row already holds `is_default = true`). `[OK] seeded default provider vllm-local (<endpoint>)` on a fresh insert, or `[NOTE] provider vllm-local already present — left untouched` if the row (or a competing default) already exists. |
+
+This step never fails `init` — any unexpected error seeding the row is caught and
+reported as a non-fatal `[NOTE]` line.
+
+### Backfilling an existing project — `--seed-provider`
+
+A project that ran `init` before this seeding step existed can backfill it without
+re-running full provisioning:
+
+```bash
+PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" init --seed-provider
+```
+
+This runs ONLY the seeding step above against the already-initialized project's DB —
+no confirmation gate, no schema apply, no marker/handoff.md/CLAUDE.md writes.
 
 ## Preferred path — MCP
 
@@ -87,6 +131,7 @@ PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" init "my-project" -y
 |---|---|---|
 | `<name>` | directory basename | Optional project name positional. Sets the human-readable project label written to `project_settings`. |
 | `-y` / `--yes` / `--force` | off | Bypass the confirmation prompt and auto-create the database if absent. Required for non-interactive / agent / CI use. |
+| `--seed-provider` | off | Run ONLY the local-embedding-provider seeding step against an already-initialized project (backfill path) — see "Local embedding provider seeding" above. Skips the confirmation gate, schema apply, and all other provisioning. |
 
 ## Confirmation gate
 
@@ -115,6 +160,7 @@ Running: handoff:init
   [OK]    Database 'claude_memory_eval_test' present
   [OK]    Schema file present: handoff-core-schema.sql
   [OK]    Schema applied: handoff-core-schema.sql
+  [OK]    seeded default provider vllm-local (http://localhost:8800)
   [OK]    project_settings defaults ensured (27 keys, idempotent)
   [OK]    retrieval_contract 'default' row ensured
   [OK]    retrieval_contract_history baseline ensured (idempotent)
