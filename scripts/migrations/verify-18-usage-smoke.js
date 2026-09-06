@@ -55,7 +55,7 @@ const smokeHarness = require('./lib/smoke-harness');
 // ─── Prerequisite tables (A-14) -- every table this run transitively
 // touches, not only the two usage-telemetry.js itself writes. ────────────
 
-const PREREQUISITE_TABLES = ['turn_usage', 'session_usage', 'model_registry', 'routing_profiles', 'routing_session_overrides'];
+const PREREQUISITE_TABLES = ['turn_usage', 'session_usage', 'model_registry', 'routing_profiles', 'routing_session_overrides', 'feature_usage'];
 
 // Only model_registry is ever wiped (A-15).
 const WIPE_TABLES = ['model_registry'];
@@ -68,6 +68,7 @@ const RESIDUE_SPECS = [
   { table: 'model_registry', where: 'label LIKE $1' },
   { table: 'turn_usage', where: 'project_id LIKE $1' },
   { table: 'session_usage', where: 'project_id LIKE $1' },
+  { table: 'feature_usage', where: 'project_id LIKE $1' },
 ];
 
 // ─── CLI ARGS ──────────────────────────────────────────────────────────────
@@ -499,6 +500,74 @@ async function checkCostRangeGuard(client, PREFIX) {
   assertEq(rollupRowCount, 0, 'no session_usage row may exist when the rollup aggregate overflows');
 }
 
+// CHECK 10: FEATURE GRAIN (§18.3) -- usageQuery(..., {granularity:'feature'})
+// reads feature_usage directly (never turn_usage/session_usage); groupBy
+// branch/pr/model/day all resolve; sessionId + granularity='feature' hard-
+// errors BEFORE any query runs (no fixture row visible even transiently).
+// feature_usage rows are inserted directly here (this smoke test's job is
+// usageQuery's read path, not migrate-12-feature-usage.js's write path,
+// which has its own dedicated test suite).
+async function checkFeatureGrainQuery(client, PREFIX) {
+  const projectId = `${PREFIX}-proj-c10`;
+  const branchA = `${PREFIX}-branch-c10-a`;
+  const branchB = `${PREFIX}-branch-c10-b`;
+  const modelA = `${PREFIX}-model-c10-a`;
+
+  async function insertFeature({ branch, prNumber, modelId, tokensIn, tokensOut, startedAt }) {
+    await client.query(
+      `INSERT INTO feature_usage (project_id, branch, pr_number, started_at, model_id, tokens_in, tokens_out)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [projectId, branch, prNumber, startedAt, modelId, tokensIn, tokensOut]
+    );
+  }
+
+  const now = new Date();
+  await insertFeature({ branch: branchA, prNumber: 101, modelId: modelA, tokensIn: 1000, tokensOut: 500, startedAt: now });
+  await insertFeature({ branch: branchA, prNumber: 102, modelId: modelA, tokensIn: 2000, tokensOut: 900, startedAt: now });
+  await insertFeature({ branch: branchB, prNumber: 103, modelId: null, tokensIn: 300, tokensOut: 100, startedAt: now });
+
+  const byBranch = await usageQuery(client, { projectId, granularity: 'feature', groupBy: 'branch' });
+  const branchAGroup = byBranch.find((r) => r.key === branchA);
+  assert(branchAGroup, 'expected a branch group for branchA');
+  assertEq(branchAGroup.tokens_in, 3000, 'branch group tokens_in must sum both branchA rows');
+  assertEq(branchAGroup.turns, 2, 'branch group turns must count both branchA rows');
+
+  const byPr = await usageQuery(client, { projectId, granularity: 'feature', groupBy: 'pr' });
+  assertEq(byPr.length, 3, 'pr-grouped feature query must yield one group per distinct pr_number');
+
+  const byModel = await usageQuery(client, { projectId, granularity: 'feature', groupBy: 'model' });
+  const noneGroup = byModel.find((r) => r.key === '(none)');
+  assert(noneGroup, 'expected a "(none)" group for the NULL-model feature row');
+  assertEq(noneGroup.tokens_in, 300, 'NULL-model feature group tokens_in must match its one contributing row');
+
+  const byDay = await usageQuery(client, { projectId, granularity: 'feature', groupBy: 'day' });
+  assertEq(byDay.length, 1, 'expected exactly 1 day-group for fixtures all inserted "now"');
+  assert(/^\d{4}-\d{2}-\d{2}$/.test(byDay[0].key), `expected an ISO date string day key, got ${JSON.stringify(byDay[0].key)}`);
+  assertEq(byDay[0].tokens_in, 3300, 'day-group tokens_in must sum the whole feature fixture set');
+
+  // sessionId + granularity='feature' hard-errors before any query.
+  await assertThrows(
+    () => usageQuery(client, { projectId, sessionId: `${PREFIX}-sess-c10`, granularity: 'feature', groupBy: 'branch' }),
+    /sessionId.*granularity="feature"|granularity="feature".*sessionId/,
+    'sessionId + granularity="feature" must hard-error before any query runs'
+  );
+
+  // Bad groupBy for feature grain (e.g. 'role', valid for turn grain, is NOT
+  // valid for feature grain) -- total classification, never silently ignored.
+  await assertThrows(
+    () => usageQuery(client, { projectId, granularity: 'feature', groupBy: 'role' }),
+    /groupBy/,
+    'feature-grain groupBy must be validated against its own total-classification list, not turn-grain\'s'
+  );
+
+  // Bad granularity value hard-errors.
+  await assertThrows(
+    () => usageQuery(client, { projectId, granularity: 'bogus' }),
+    /granularity/,
+    'bad granularity value rejected'
+  );
+}
+
 // ─── Runner ────────────────────────────────────────────────────────────────
 
 async function checkPrerequisites(client) {
@@ -577,6 +646,7 @@ async function main() {
       results.push(await smokeHarness.runCheck(client, '18', 7, 'VALIDATION + TOTAL CLASSIFICATION', () => checkValidationAndTotalClassification(client, PREFIX)));
       results.push(await smokeHarness.runCheck(client, '18', 8, 'ALL-NULL-COST GROUP', () => checkAllNullCostGroup(client, PREFIX)));
       results.push(await smokeHarness.runCheck(client, '18', 9, 'COST RANGE GUARD', () => checkCostRangeGuard(client, PREFIX)));
+      results.push(await smokeHarness.runCheck(client, '18', 10, 'FEATURE GRAIN', () => checkFeatureGrainQuery(client, PREFIX)));
       return results.every(Boolean);
     });
 

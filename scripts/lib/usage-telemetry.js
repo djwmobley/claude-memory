@@ -131,10 +131,24 @@
  *   than silently merging that population with the genuinely-NULL-model
  *   population under the same "(none)" breakdown key.
  *
- * usageQuery(pg, { projectId, sessionId?, groupBy? })
+ * usageQuery(pg, { projectId, sessionId?, groupBy?, granularity? })
+ *
+ *   granularity in ('turn','feature'), default 'turn'; anything else hard-
+ *   errors. 'turn' is every behavior documented below, unchanged.
+ *   granularity='feature' (§18.3) reads feature_usage instead of turn_usage/
+ *   session_usage -- a separate per-feature/per-PR provenance table
+ *   (migrate-12-feature-usage.sql), project-scoped only: sessionId given
+ *   together with granularity='feature' hard-errors BEFORE any query runs
+ *   (feature_usage carries no session_id column to scope by at all -- this
+ *   is a refused combination, not a silently-ignored parameter). groupBy
+ *   for granularity='feature' is its OWN total classification, in
+ *   ('branch','pr','model','day') -- distinct from turn-grain's groupBy
+ *   list below; passing a turn-grain-only value (e.g. 'role') with
+ *   granularity='feature' hard-errors.
  *
  *   groupBy in ('model','role','provider','day'), default 'model'; anything
- *   else hard-errors (total classification, never a silent fallback).
+ *   else hard-errors (total classification, never a silent fallback). This
+ *   list, and everything below, applies to granularity='turn' only.
  *
  *   SESSION-SCOPED (sessionId given): aggregates turn_usage directly for
  *   that session, grouped by the requested dimension. 'day' is computed
@@ -184,6 +198,14 @@
 
 const VALID_OUTCOMES = Object.freeze(['success', 'failure', 'downgraded', 'unknown']);
 const VALID_GROUP_BY = Object.freeze(['model', 'role', 'provider', 'day']);
+// §18.3: usageQuery's granularity dimension. 'turn' (default) is every
+// pre-existing behavior above, unchanged. 'feature' reads feature_usage
+// (migrate-12-feature-usage.sql) instead of turn_usage/session_usage --
+// a wholly separate per-feature/per-PR provenance table with its own
+// column set, written only by migrate-12-feature-usage.js's data migration
+// (usageRecord/sessionUsageRollup never touch it).
+const VALID_GRANULARITY = Object.freeze(['turn', 'feature']);
+const VALID_FEATURE_GROUP_BY = Object.freeze(['branch', 'pr', 'model', 'day']);
 const RESERVED_MODEL_SENTINEL = '(none)';
 
 /**
@@ -687,15 +709,86 @@ async function usageQueryProjectScoped(pg, { projectId, groupBy }) {
   return result;
 }
 
+// §18.3 feature-grain groupBy columns. 'day' buckets on started_at (the
+// feature/PR's own start time, feature_usage's analog of turn_usage.ts),
+// same UTC to_char pattern as GROUP_BY_COLUMN.day (A-12) -- no driver-side
+// re-derivation. branch is TEXT NOT NULL on feature_usage, so it needs no
+// COALESCE; pr_number is nullable INTEGER and is cast to text before the
+// COALESCE (a bare integer COALESCE against a text sentinel would fail to
+// parse in Postgres).
+const FEATURE_GROUP_BY_COLUMN = Object.freeze({
+  branch: 'branch',
+  pr: `COALESCE(pr_number::text, '${RESERVED_MODEL_SENTINEL}')`,
+  model: `COALESCE(model_id, '${RESERVED_MODEL_SENTINEL}')`,
+  day: `to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')`,
+});
+
+/**
+ * §18.3 feature-grain query: reads feature_usage directly, project-scoped
+ * only (feature_usage carries no session_id column to scope by -- callers
+ * asking for granularity='feature' with a sessionId are refused earlier, in
+ * usageQuery itself, before this function is ever reached). Same row shape
+ * as the turn-grain queries ({ key, tokens_in, tokens_out, cost_usd, turns })
+ * so callers can treat both grains uniformly; `turns` here counts
+ * feature_usage rows, not agent turns.
+ */
+async function usageQueryFeatureScoped(pg, { projectId, groupBy }) {
+  const keyExpr = FEATURE_GROUP_BY_COLUMN[groupBy];
+  const { rows } = await pg.query(
+    `SELECT ${keyExpr} AS key,
+            SUM(tokens_in)  AS tokens_in,
+            SUM(tokens_out) AS tokens_out,
+            SUM(cost_usd)   AS cost_usd,
+            COUNT(*)        AS turns
+       FROM feature_usage
+      WHERE project_id = $1
+      GROUP BY ${keyExpr}
+      ORDER BY SUM(cost_usd) DESC NULLS LAST, key ASC`,
+    [projectId]
+  );
+
+  return rows.map((row) => ({
+    key: row.key,
+    tokens_in: coerceNumeric(row.tokens_in),
+    tokens_out: coerceNumeric(row.tokens_out),
+    cost_usd: coerceNumeric(row.cost_usd),
+    turns: coerceNumeric(row.turns),
+  }));
+}
+
 /**
  * @param {import('pg').Client|import('pg').Pool} pg
- * @param {{ projectId: string, sessionId?: string|null, groupBy?: string|null }} args
+ * @param {{ projectId: string, sessionId?: string|null, groupBy?: string|null, granularity?: string|null }} args
  * @returns {Promise<Array<{ key: string, tokens_in: number|null, tokens_out: number|null, cost_usd: number|null, turns: number }>>}
  */
 async function usageQuery(pg, args = {}) {
   const projectId = requireNonEmptyString(args.projectId, 'projectId');
   const sessionId = args.sessionId === undefined || args.sessionId === null ? null : requireNonEmptyString(args.sessionId, 'sessionId');
+  const granularity = args.granularity === undefined || args.granularity === null ? 'turn' : args.granularity;
   const groupBy = args.groupBy === undefined || args.groupBy === null ? 'model' : args.groupBy;
+
+  if (!VALID_GRANULARITY.includes(granularity)) {
+    throw new Error(`usage-telemetry: "granularity" must be one of ${JSON.stringify(VALID_GRANULARITY)} (got ${JSON.stringify(granularity)})`);
+  }
+
+  // §18.3: granularity='feature' + sessionId is a hard error, checked here
+  // BEFORE any query runs (feature_usage has no session scoping at all --
+  // this is not "sessionId is ignored", it is a refused combination).
+  if (granularity === 'feature') {
+    if (sessionId !== null) {
+      throw new Error(
+        'usage-telemetry: "sessionId" is not supported with granularity="feature" -- feature_usage carries no ' +
+        'session_id column to scope by; omit sessionId for a feature-grain query.'
+      );
+    }
+    if (!VALID_FEATURE_GROUP_BY.includes(groupBy)) {
+      throw new Error(
+        `usage-telemetry: granularity="feature" "groupBy" must be one of ${JSON.stringify(VALID_FEATURE_GROUP_BY)} ` +
+        `(got ${JSON.stringify(groupBy)}) -- feature_usage's own dimensions, distinct from turn-grain's groupBy list.`
+      );
+    }
+    return usageQueryFeatureScoped(pg, { projectId, groupBy });
+  }
 
   if (!VALID_GROUP_BY.includes(groupBy)) {
     throw new Error(`usage-telemetry: "groupBy" must be one of ${JSON.stringify(VALID_GROUP_BY)} (got ${JSON.stringify(groupBy)})`);
@@ -713,6 +806,8 @@ module.exports = {
   usageQuery,
   VALID_OUTCOMES,
   VALID_GROUP_BY,
+  VALID_GRANULARITY,
+  VALID_FEATURE_GROUP_BY,
   RESERVED_MODEL_SENTINEL,
   coerceNumeric,
   round6,

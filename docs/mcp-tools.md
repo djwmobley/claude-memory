@@ -2,10 +2,12 @@
 
 `scripts/handoff-mcp.mjs` is the one MCP server this repo ships (stdio
 transport, registered via `claude mcp add`). It started with 5 tools
-(session-lifecycle + a decisions-persistence tool) and now exposes 31: the
+(session-lifecycle + a decisions-persistence tool) and now exposes 35: the
 original 5 plus `handoff_resume` (added later, same child-process transport
-shape — see below) plus 25 new direct-Postgres tools that generalize the
-store's write/read surface outside the checkpoint/close batch-payload flow.
+shape — see below) plus 29 new direct-Postgres tools that generalize the
+store's write/read surface outside the checkpoint/close batch-payload flow
+(memory/entity/assertion/edge CRUD, the agent-exchange log, the §17 routing
+harness, and §18/§18.3 usage telemetry).
 
 Every table and tool named on this page exists on `main` as of this
 writing; if you find a mismatch, the code is authoritative — start at
@@ -329,6 +331,30 @@ for a turn that never went through `route_resolve` at all. Cost, when not
 supplied, is computed server-side from the model registry's per-token
 rates and fails soft to `NULL` (never a guessed price) when the model or
 its rates are unregistered.
+
+`usage_query` reads two distinct grains, selected via `granularity`
+(default `"turn"`):
+
+- `granularity: "turn"` (unchanged pre-§18.3 behavior) — `sessionId` given
+  aggregates `turn_usage` directly, any `groupBy` in `model`/`role`/
+  `provider`/`day`; `sessionId` omitted aggregates `session_usage`
+  ROLLUPS only (staleness-by-design — a session whose rollup has not been
+  recomputed via `sessionUsageRollup` is invisible), `groupBy` must be
+  `"model"`.
+- `granularity: "feature"` (§18.3) — reads `feature_usage` (per-feature/
+  per-PR token+cost provenance, populated by the one-time
+  `migrate-12-feature-usage.js` data migration from
+  `pipeline_pipeline.feature_token_usage`, never by `usage_record`),
+  project-scoped only. `groupBy` is one of `branch`/`pr`/`model`/`day` — a
+  **separate, total classification from turn-grain's `groupBy` list**;
+  passing a turn-grain-only value (e.g. `role`) hard-errors.
+  **`sessionId` given together with `granularity: "feature"` is a hard
+  error, raised before any query runs** — `feature_usage` carries no
+  `session_id` column to scope by at all.
+
+Both grains return the same row shape: `{ key, tokens_in, tokens_out,
+cost_usd, turns }` — for `granularity: "feature"`, `turns` counts
+`feature_usage` rows, not agent turns.
 
 ## `persist_decisions` — repointed
 
