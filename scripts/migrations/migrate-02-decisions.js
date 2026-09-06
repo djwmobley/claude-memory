@@ -16,9 +16,14 @@
  * WHAT THIS SCRIPT DOES (normal / MIGRATE mode):
  *   1. Resolves + validates the TARGET database exactly like migrate-01/
  *      migrate-13/migrate-14 (--db flag, then MIGRATE_TARGET_DB env, then
- *      memory_manager_staging; refuses anything migrate-01's classifyTarget
- *      refuses -- claude_memory_eval_test, pipeline_*, claude_policy_
- *      framework itself, or any unrecognized name). Never reads HANDOFF_DB.
+ *      memory_manager_staging), via migrate-01's classifyTarget (async,
+ *      reused by reference) called with projectId left undefined -- this
+ *      script has no --project-id flag and only ever targets CANON
+ *      (memory_manager) or STAGING (*_staging); the classification result's
+ *      branch is asserted to be one of those two, so a name that resolves
+ *      to PER_PROJECT_ENGINE, SOURCE_ONLY, or UNKNOWN (claude_memory_eval_
+ *      test, pipeline_*, claude_policy_framework itself, or any other
+ *      unrecognized/unmarked name) is refused. Never reads HANDOFF_DB.
  *   2. Resolves the SOURCE database (--source-db flag, else SOURCE_DB env,
  *      else "claude_policy_framework"). The source connection is used
  *      SELECT-only -- every query issued against it is guarded by
@@ -722,10 +727,26 @@ async function main() {
     console.error(`Invalid database name "${target}" (from ${targetSource}) — must match /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/.`);
     process.exit(1);
   }
-  const classification = migrateOne.classifyTarget(target);
+  // migrate-02 only ever targets CANON/STAGING (memory_manager or a
+  // *_staging name) — it has no --project-id flag and never will, so
+  // projectId is deliberately left undefined. A PER_PROJECT_ENGINE result
+  // here would mean this script's target resolution regressed into naming
+  // something that isn't CANON/STAGING, which is a bug, not a valid mode.
+  const classification = await migrateOne.classifyTarget({ dbName: target, projectId: undefined });
   if (!classification.allowed) {
     console.error(`Refused: ${classification.reason}`);
-    console.error(`(resolved from ${targetSource} — no database connection was opened.)`);
+    console.error(
+      classification.connectionOpened
+        ? '(read-only probe opened and closed.)'
+        : `(resolved from ${targetSource} — no database connection was opened.)`
+    );
+    process.exit(1);
+  }
+  if (classification.branch !== 'CANON' && classification.branch !== 'STAGING') {
+    console.error(
+      `Refused: migrate-02 only targets CANON/STAGING databases, got branch=${classification.branch} ` +
+      `for "${target}" (resolved from ${targetSource}).`
+    );
     process.exit(1);
   }
   if (!migrateOne.DB_NAME_RE.test(parsed.sourceDb)) {

@@ -48,12 +48,39 @@
  *   3. memory_manager_staging built-in default
  * The resolved name must match /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/ (same identifier
  * regex handoff.js uses — a database name cannot be a parameterized query
- * placeholder in DDL). It must then classify as an allowed consolidation
- * target: exactly `memory_manager`, exactly `memory_manager_staging`, or any
- * name ending in `_staging`. Every other name — including, but not limited
- * to, `claude_memory_eval_test`, anything matching /^pipeline_/, and
- * `claude_policy_framework` — is refused. The refusal check runs BEFORE any
- * database connection is opened, so a refused target is never connected to.
+ * placeholder in DDL). It is then classified into exactly one branch —
+ * CANON | STAGING | PER_PROJECT_ENGINE | SOURCE_ONLY | UNKNOWN — by
+ * classifyTarget() (see that function for the full contract):
+ *   - CANON:             name is exactly `memory_manager`.
+ *   - STAGING:           name is exactly `memory_manager_staging`, or ends
+ *                        in `_staging`.
+ *   - PER_PROJECT_ENGINE: any other name whose live database corroborates a
+ *                        caller-supplied `--project-id` — a positive marker
+ *                        probe (project_settings.project_id matches, and
+ *                        schema_fingerprint is at or ahead of SCHEMA_EPOCH),
+ *                        not a name-prefix allow-list. This is how a
+ *                        `pipeline_*` (or any other) live per-project engine
+ *                        database can become a legitimate migration target:
+ *                        it is no longer refused BY NAME ALONE. Absent
+ *                        `--project-id`, this branch is never reached.
+ *   - SOURCE_ONLY:       the marker probe ran and failed for a concrete,
+ *                        reported reason (no --project-id, invalid UUID,
+ *                        cannot connect, no engine schema, no/ambiguous
+ *                        project rows, marker mismatch, missing/stale/future
+ *                        schema epoch) — includes the three historical named
+ *                        refusals (`claude_memory_eval_test`, `pipeline_*`,
+ *                        `claude_policy_framework`), which keep their
+ *                        original reason text verbatim as the fallthrough
+ *                        result when the probe fails for them.
+ *   - UNKNOWN:           defensive-only default (e.g. no name supplied);
+ *                        not reachable via any documented CLI usage.
+ * The refusal check runs BEFORE any WRITE connection is opened. A refused
+ * name-only branch (CANON/STAGING never refuse; the three historical
+ * SOURCE_ONLY names refuse without a --project-id) never opens a
+ * connection at all. A PER_PROJECT_ENGINE / marker-probed SOURCE_ONLY
+ * outcome opens exactly one READ-ONLY connection (to the candidate target
+ * itself, never a write), always closed before main() proceeds — see the
+ * PER-PROJECT MARKER PROBE section below.
  *
  * CREATE DATABASE RACE:
  *   Two concurrent invocations targeting the same not-yet-existing database
@@ -101,6 +128,15 @@
 const fs   = require('fs');
 const path = require('path');
 const { Client } = require('pg');
+// Reused by reference, never reimplemented (feedback_general_fix_not_narrow_
+// pointfix): the marker-probe's UUID validation and schema-epoch parsing are
+// the SAME functions the live engine (project-marker.js, handoff.js) uses to
+// mint/validate project identity and schema currency.
+const { isValidUUID } = require('../lib/project-marker');
+const {
+  _parseSchemaFingerprint: parseSchemaFingerprint,
+  SCHEMA_EPOCH,
+} = require('../handoff');
 
 // ─── PATHS ────────────────────────────────────────────────────────────────────
 
@@ -137,59 +173,261 @@ function resolveTargetDb(parsed) {
   return { name: 'memory_manager_staging', source: 'built-in default' };
 }
 
+// ─── PER-PROJECT MARKER PROBE (migration-target-per-project-marker) ────────
+
 /**
- * Total classification of a resolved target name into allowed / refused.
- * Default branch (anything not explicitly recognized as an allowed
- * consolidation target) is REFUSE — never a silent proceed. This is an
- * allow-list whose unmatched default is fail-closed, which is the opposite
- * failure mode of a blocklist (whose unmatched default would silently pass
- * an unlisted dangerous name through).
+ * Normalize a raw --project-id value the same way for every comparison in
+ * the marker probe: trim whitespace, strip one layer of surrounding curly
+ * braces (the "{xxxxxxxx-xxxx-...}" GUID-literal convention some tooling
+ * emits), lowercase. Exported so callers (e.g. migrate-08's PER_PROJECT_
+ * ENGINE cross-check) can reproduce the same comparison without
+ * reimplementing it.
  *
- * @param {string} name
- * @returns {{ allowed: boolean, reason?: string }}
+ * @param {string} raw
+ * @returns {string}
  */
-function classifyTarget(name) {
+function normalizeProjectId(raw) {
+  let s = String(raw).trim();
+  if (s.startsWith('{') && s.endsWith('}')) s = s.slice(1, -1).trim();
+  return s.toLowerCase();
+}
+
+/**
+ * Redact anything that looks like embedded connection-string credentials
+ * out of a driver error message before it is ever logged. node-postgres
+ * error messages do not normally embed a password, but a DSN-style
+ * misconfiguration could produce one; this is a defensive redaction, not a
+ * claim that the input was actually dangerous.
+ *
+ * @param {unknown} err
+ * @returns {string}
+ */
+function sanitizeConnectError(err) {
+  const msg = err && err.message ? err.message : String(err);
+  return msg.replace(/(postgres(?:ql)?:\/\/)[^@\s]+@/gi, '$1<redacted>@');
+}
+
+/** Default `connect` for the marker probe: a plain pg-client connect to the candidate target. */
+async function defaultProbeConnect(dbName) {
+  const client = new Client(pgConfig(dbName));
+  await client.connect();
+  return client;
+}
+
+/**
+ * The per-project marker probe. Determines whether `dbName` is a legitimate
+ * PER_PROJECT_ENGINE migration target for the caller-asserted `projectId`.
+ * Opens AT MOST ONE connection, issues ONLY SELECTs (never a write), and
+ * NEVER THROWS — every failure mode maps to a SOURCE_ONLY result instead of
+ * propagating an exception. The connection (if any was opened) is always
+ * closed before returning (`finally`).
+ *
+ * `connectionOpened` on the returned object tells the caller whether a real
+ * connection attempt was made, so refusal logging can say "no database
+ * connection was opened" only when that is literally true (the projectId-
+ * absent and bad-UUID-shape checks below both return before ever calling
+ * `connect`).
+ *
+ * @param {{ dbName: string, projectId?: string|null, connect?: (dbName: string) => Promise<{query: Function, end: Function}> }} args
+ * @returns {Promise<{ branch: 'PER_PROJECT_ENGINE'|'SOURCE_ONLY', allowed: boolean, reason: string|null, connectionOpened: boolean, projectId?: string }>}
+ */
+async function probeProjectMarker({ dbName, projectId, connect }) {
+  if (!projectId) {
+    return {
+      branch: 'SOURCE_ONLY', allowed: false,
+      reason: 'no --project-id supplied; per-project engine targets require it',
+      connectionOpened: false,
+    };
+  }
+
+  const normalized = normalizeProjectId(projectId);
+  if (!isValidUUID(normalized)) {
+    return {
+      branch: 'SOURCE_ONLY', allowed: false,
+      reason: 'project-id is not a UUID',
+      connectionOpened: false,
+    };
+  }
+
+  const makeConnection = connect || defaultProbeConnect;
+  let client = null;
+  try {
+    client = await makeConnection(dbName);
+  } catch (err) {
+    return {
+      branch: 'SOURCE_ONLY', allowed: false,
+      reason: `cannot connect: ${sanitizeConnectError(err)}`,
+      connectionOpened: false,
+    };
+  }
+
+  try {
+    const regclassRes = await client.query(`SELECT to_regclass('project_settings') AS oid`);
+    if (!regclassRes.rows[0] || regclassRes.rows[0].oid === null) {
+      return {
+        branch: 'SOURCE_ONLY', allowed: false,
+        reason: 'no engine schema (project_settings absent)',
+        connectionOpened: true,
+      };
+    }
+
+    const idsRes = await client.query('SELECT DISTINCT project_id FROM project_settings');
+    if (idsRes.rows.length === 0) {
+      return { branch: 'SOURCE_ONLY', allowed: false, reason: 'no project rows', connectionOpened: true };
+    }
+    if (idsRes.rows.length > 1) {
+      return {
+        branch: 'SOURCE_ONLY', allowed: false,
+        reason: 'multiple project_ids present: refusing ambiguous target',
+        connectionOpened: true,
+      };
+    }
+
+    const dbProjectId = String(idsRes.rows[0].project_id);
+    if (normalized !== dbProjectId.toLowerCase()) {
+      return {
+        branch: 'SOURCE_ONLY', allowed: false,
+        reason: `marker mismatch: db has ${dbProjectId}`,
+        connectionOpened: true,
+      };
+    }
+
+    const fpRes = await client.query(
+      `SELECT value FROM project_settings WHERE project_id = $1 AND key = 'schema_fingerprint'`,
+      [dbProjectId]
+    );
+    if (fpRes.rows.length === 0) {
+      return { branch: 'SOURCE_ONLY', allowed: false, reason: 'schema_fingerprint absent', connectionOpened: true };
+    }
+
+    const { epoch } = parseSchemaFingerprint(fpRes.rows[0].value);
+    if (epoch === null) {
+      // Not in scope's explicit reason list (absent/behind/ahead) but a real
+      // possible corruption state — fail closed rather than guess an epoch.
+      return {
+        branch: 'SOURCE_ONLY', allowed: false,
+        reason: 'schema_fingerprint unparseable',
+        connectionOpened: true,
+      };
+    }
+    if (epoch < SCHEMA_EPOCH) {
+      return {
+        branch: 'SOURCE_ONLY', allowed: false,
+        reason: `schema epoch ${epoch} behind ${SCHEMA_EPOCH}; run the engine once against this project first`,
+        connectionOpened: true,
+      };
+    }
+    if (epoch > SCHEMA_EPOCH) {
+      return {
+        branch: 'SOURCE_ONLY', allowed: false,
+        reason: `schema epoch ahead of this code (db epoch ${epoch}, code epoch ${SCHEMA_EPOCH})`,
+        connectionOpened: true,
+      };
+    }
+
+    return {
+      branch: 'PER_PROJECT_ENGINE', allowed: true, reason: null,
+      projectId: dbProjectId, connectionOpened: true,
+    };
+  } catch (err) {
+    // Defensive: an unexpected query-level failure (permission denied, a
+    // dropped connection mid-probe, etc.) must never propagate out of
+    // classifyTarget as a thrown exception.
+    return {
+      branch: 'SOURCE_ONLY', allowed: false,
+      reason: `probe query failed: ${sanitizeConnectError(err)}`,
+      connectionOpened: true,
+    };
+  } finally {
+    if (client) {
+      try { await client.end(); } catch (_) { /* best-effort close */ }
+    }
+  }
+}
+
+/**
+ * Total classification of a resolved target name (+ optional caller-
+ * asserted --project-id) into exactly one branch: CANON | STAGING |
+ * PER_PROJECT_ENGINE | SOURCE_ONLY | UNKNOWN. Never a silent pass-through —
+ * every (dbName, projectId) pair maps to a branch, and the unmatched
+ * default is refuse (UNKNOWN), not proceed.
+ *
+ * Order: CANON, then STAGING (both name-only, never open a connection);
+ * then the marker probe (probeProjectMarker, above) for any other name —
+ * PER_PROJECT_ENGINE on a positive probe, SOURCE_ONLY on a negative one.
+ * The three historical named refusals (claude_memory_eval_test, pipeline_*,
+ * claude_policy_framework) keep their ORIGINAL reason text verbatim as the
+ * fallthrough result whenever the probe fails for one of those names — this
+ * is what keeps every pre-existing caller that never passes --project-id
+ * (migrate-02 and every verify-15-*.js battery script, which only ever
+ * target CANON/STAGING, plus ad hoc CLI use against a known source name)
+ * seeing the exact same message it always has. Any OTHER name for which the
+ * probe fails surfaces the probe's own diagnostic reason directly, which is
+ * more actionable than a generic "not recognized" message.
+ *
+ * @param {{ dbName: string, projectId?: string|null, connect?: Function }} args
+ * @returns {Promise<{ branch: string, allowed: boolean, reason: string|null, connectionOpened: boolean, projectId?: string }>}
+ */
+async function classifyTarget({ dbName, projectId, connect } = {}) {
+  const name = dbName;
+  if (typeof name !== 'string' || name.length === 0) {
+    // Defensive-only branch — not reachable via any documented CLI usage
+    // (DB_NAME_RE + parseArgs/resolveTargetDb always produce a non-empty
+    // string before classifyTarget is ever called).
+    return { branch: 'UNKNOWN', allowed: false, reason: 'no database name supplied', connectionOpened: false };
+  }
+
   if (name === 'memory_manager' || name === 'memory_manager_staging') {
-    return { allowed: true };
+    return { branch: 'CANON', allowed: true, reason: null, connectionOpened: false };
   }
   if (/_staging$/.test(name)) {
-    return { allowed: true };
+    return { branch: 'STAGING', allowed: true, reason: null, connectionOpened: false };
   }
+
+  const probe = await probeProjectMarker({ dbName: name, projectId, connect });
+  if (probe.allowed) return probe; // PER_PROJECT_ENGINE
+
   if (name === 'claude_memory_eval_test') {
     return {
-      allowed: false,
+      branch: 'SOURCE_ONLY', allowed: false,
       reason: 'claude_memory_eval_test is the handoff.js resolver test-suite database, not a migration target.',
+      connectionOpened: probe.connectionOpened,
     };
   }
   if (/^pipeline_/.test(name)) {
     return {
-      allowed: false,
+      branch: 'SOURCE_ONLY', allowed: false,
       reason: `"${name}" matches the pipeline_ source-database naming convention, not a migration target.`,
+      connectionOpened: probe.connectionOpened,
     };
   }
   if (name === 'claude_policy_framework') {
     return {
-      allowed: false,
+      branch: 'SOURCE_ONLY', allowed: false,
       reason: 'claude_policy_framework is not a consolidation target.',
+      connectionOpened: probe.connectionOpened,
     };
   }
-  return {
-    allowed: false,
-    reason: `"${name}" is not a recognized consolidation target. Allowed: memory_manager, ` +
-      'memory_manager_staging, or a name ending in "_staging".',
-  };
+
+  // Any other name: the probe already ran and produced a concrete reason —
+  // surface it as-is (branch SOURCE_ONLY, from probeProjectMarker above).
+  return probe;
 }
 
 // ─── CLI ARGS ─────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const parsed = { db: null, allowExisting: false, help: false };
+  const parsed = { db: null, projectId: null, allowExisting: false, help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--db') {
       parsed.db = argv[++i];
     } else if (a.startsWith('--db=')) {
       parsed.db = a.slice('--db='.length);
+    } else if (a === '--project-id') {
+      parsed.projectId = argv[++i];
+    } else if (a.startsWith('--project-id=')) {
+      parsed.projectId = a.slice('--project-id='.length);
     } else if (a === '--allow-existing') {
       parsed.allowExisting = true;
     } else if (a === '--help' || a === '-h') {
@@ -208,10 +446,14 @@ class UsageError extends Error {}
 
 function printUsage() {
   console.log([
-    'Usage: node scripts/migrations/migrate-01-canonical-db.js [--db <name>] [--allow-existing]',
+    'Usage: node scripts/migrations/migrate-01-canonical-db.js [--db <name>] [--project-id <id>] [--allow-existing]',
     '',
     '  --db <name>       Target database name (else MIGRATE_TARGET_DB env, else',
     '                     memory_manager_staging). Never reads HANDOFF_DB.',
+    '  --project-id <id> Required only when --db names a candidate PER_PROJECT_ENGINE',
+    '                     target (any name that is not memory_manager/*_staging) — a',
+    '                     live marker probe against the target must corroborate it.',
+    '                     Ignored (and unnecessary) for memory_manager/*_staging targets.',
     '  --allow-existing  Permit applying schema to a pre-existing target that',
     '                     already contains user tables (schema files are additive',
     '                     and idempotent). Without this flag, a pre-existing',
@@ -519,14 +761,18 @@ async function main() {
     process.exit(1);
   }
 
-  const classification = classifyTarget(target);
+  const classification = await classifyTarget({ dbName: target, projectId: parsed.projectId });
   if (!classification.allowed) {
     console.error(`Refused: ${classification.reason}`);
-    console.error(`(resolved from ${source} — no database connection was opened.)`);
+    console.error(
+      classification.connectionOpened
+        ? '(read-only probe opened and closed.)'
+        : `(resolved from ${source} — no database connection was opened.)`
+    );
     process.exit(1);
   }
 
-  console.log(`migrate-01-canonical-db: target="${target}" (resolved from ${source})`);
+  console.log(`migrate-01-canonical-db: target="${target}" (resolved from ${source}, branch=${classification.branch})`);
 
   // ── Step 1/2: connect to maintenance DB, create target if absent (race-safe) ──
 
@@ -635,6 +881,8 @@ if (require.main === module) {
 module.exports = {
   resolveTargetDb,
   classifyTarget,
+  probeProjectMarker,
+  normalizeProjectId,
   parseArgs,
   UsageError,
   deriveExpectedObjects,

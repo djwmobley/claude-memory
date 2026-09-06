@@ -452,7 +452,7 @@ async function runStep4Resnapshot(tgtClient, srcClient, dryRun, log) {
 
 async function main() {
   const argv = process.argv.slice(2);
-  const { name: target, source } = shared.resolveAndClassifyTargetDb(argv);
+  const { name: target, source } = await shared.resolveAndClassifyTargetDb(argv);
   const parsed = parseArgs(argv);
   console.log(`cure-migration-manifest-retirement: target="${target}" (resolved from ${source}), source-db="${parsed.sourceDb}", dry-run=${parsed.dryRun}`);
 

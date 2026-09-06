@@ -167,7 +167,7 @@ async function totalRowcountReconciliation(client, roster, columnCache) {
 
 async function main() {
   const argv = process.argv.slice(2);
-  const { name: target, source } = shared.resolveAndClassifyTargetDb(argv);
+  const { name: target, source } = await shared.resolveAndClassifyTargetDb(argv);
   console.log(`verify-15-t3b-reverse-containment: target="${target}" (resolved from ${source})`);
 
   const roster = shared.loadRoster();

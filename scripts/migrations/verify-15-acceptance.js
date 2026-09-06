@@ -98,7 +98,7 @@ async function checkRecordedByIndependence(target) {
 
 async function main() {
   const argv = process.argv.slice(2);
-  const { name: target, source } = shared.resolveAndClassifyTargetDb(argv);
+  const { name: target, source } = await shared.resolveAndClassifyTargetDb(argv);
   const { recordedBy, t8RerunModule } = parseFlags(argv);
   console.log(`verify-15-acceptance: target="${target}" (resolved from ${source})`);
 

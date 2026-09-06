@@ -124,7 +124,7 @@ function peekRawSourceDb(argv) {
 async function main() {
   const argv = process.argv.slice(2);
   const { excludedReason } = parseArgs(argv);
-  const { name: target, source: targetSource } = shared.resolveAndClassifyTargetDb(argv);
+  const { name: target, source: targetSource } = await shared.resolveAndClassifyTargetDb(argv);
 
   const rawSourceDb = peekRawSourceDb(argv);
   if (rawSourceDb && rawSourceDb.startsWith(shared.NET_NEW_PREFIX)) {

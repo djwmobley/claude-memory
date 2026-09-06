@@ -714,7 +714,7 @@ async function main() {
     console.error(`Invalid database name "${target}" (from ${source})`);
     process.exit(1);
   }
-  const classification = migrateOne.classifyTarget(target);
+  const classification = await migrateOne.classifyTarget({ dbName: target });
   if (!classification.allowed) {
     console.error(`Refused: ${classification.reason}`);
     process.exit(1);

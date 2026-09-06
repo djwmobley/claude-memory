@@ -917,7 +917,7 @@ async function main() {
     console.error(`Invalid database name "${target}" (from ${targetSource}) — must match /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/.`);
     process.exit(1);
   }
-  const classification = migrateOne.classifyTarget(target);
+  const classification = await migrateOne.classifyTarget({ dbName: target });
   if (!classification.allowed) {
     console.error(`Refused: ${classification.reason}`);
     console.error(`(resolved from ${targetSource} — no database connection was opened.)`);

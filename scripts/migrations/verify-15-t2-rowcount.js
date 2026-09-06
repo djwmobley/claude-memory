@@ -241,7 +241,7 @@ async function reconcileBranchAGroup(client, group, dupOfResolved) {
 
 async function main() {
   const argv = process.argv.slice(2);
-  const { name: target, source } = shared.resolveAndClassifyTargetDb(argv);
+  const { name: target, source } = await shared.resolveAndClassifyTargetDb(argv);
   console.log(`verify-15-t2-rowcount: target="${target}" (resolved from ${source})`);
 
   const roster = shared.loadRoster();

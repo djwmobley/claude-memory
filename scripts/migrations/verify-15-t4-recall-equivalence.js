@@ -166,7 +166,7 @@ function parseRecordedBy(argv) {
 
 async function main() {
   const argv = process.argv.slice(2);
-  const { name: target, source } = shared.resolveAndClassifyTargetDb(argv);
+  const { name: target, source } = await shared.resolveAndClassifyTargetDb(argv);
   const recordedBy = parseRecordedBy(argv);
   console.log(`verify-15-t4-recall-equivalence: target="${target}" (resolved from ${source})`);
 

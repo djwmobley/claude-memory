@@ -237,8 +237,14 @@ async function testRefusedTargetNames(runFn, label) {
   assert(r2.status === 1 && /pipeline_/.test(r2.stderr),
     `${label}: expected refusal of pipeline_ names. status=${r2.status} stderr=${r2.stderr}`);
 
+  // migration-target-per-project-marker (owner decision item G, 2026-09-06):
+  // an unrecognized name now goes through migrate-01's marker probe; neither
+  // caller here ever passes --project-id, so the probe's "absent"
+  // precondition is the reason that actually surfaces (still pre-connect).
   const r3 = runFn(['--db', `verify13_unrecognized_${TS}_scratch`]);
-  assert(r3.status === 1 && /not a recognized consolidation target/.test(r3.stderr),
+  assert(r3.status === 1 &&
+    /no --project-id supplied; per-project engine targets require it/.test(r3.stderr) &&
+    /no database connection was opened/.test(r3.stderr),
     `${label}: expected refusal of an unrecognized name (total-classification default branch). status=${r3.status} stderr=${r3.stderr}`);
 }
 

@@ -107,7 +107,7 @@ async function main() {
     process.exit(1);
   }
 
-  const { name: target, source } = shared.resolveAndClassifyTargetDb(argv);
+  const { name: target, source } = await shared.resolveAndClassifyTargetDb(argv);
   console.log(`verify-15-t8-idempotency: target="${target}" (resolved from ${source})`);
 
   let rerunModule;

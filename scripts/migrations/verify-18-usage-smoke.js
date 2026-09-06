@@ -536,7 +536,7 @@ async function main() {
     process.exit(1);
   }
 
-  const classification = migrateOne.classifyTarget(target);
+  const classification = await migrateOne.classifyTarget({ dbName: target });
   if (!classification.allowed) {
     console.error(`Refused: ${classification.reason}`);
     console.error(`(resolved from ${source} — no database connection was opened.)`);

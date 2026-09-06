@@ -214,7 +214,7 @@ async function main() {
   if (noConnect) {
     console.log('[audit] --no-connect mode: classes 1 and 2, and class 4\'s missing-column check, are SKIPPED (they require live source/target connections). Only class 3 and class 4\'s name-difference list ran.');
   } else {
-    const { name: target, source } = shared.resolveAndClassifyTargetDb(argv);
+    const { name: target, source } = await shared.resolveAndClassifyTargetDb(argv);
     console.log(`[audit] target="${target}" (resolved from ${source})`);
     full = await runFullChecks(roster, target);
   }
