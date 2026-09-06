@@ -228,9 +228,8 @@ async function resolveRequiredTier(pg, { projectId, role, capabilityTier } = {})
     'per-role defaults exist only as prose (orchestrate/spec=high, draft/write=mid, ' +
     'read/index/bookkeep=low, review=high) and are never applied automatically — an ' +
     'operator must call routing_profile_set explicitly to confirm one. Candidate models ' +
-    'must also be registered in model_registry before they can be recommended or pinned; ' +
-    'until a model-registration MCP tool ships, that requires a raw SQL INSERT into ' +
-    'model_registry (see docs/notes/2026-09-06-s17-routing-gap-audit.md).'
+    'must also be registered in model_registry before they can be recommended or pinned — ' +
+    'use the model_registry_set MCP tool (§17 B1) rather than raw SQL.'
   );
 }
 
@@ -292,11 +291,10 @@ async function recommendLeastCost(pg, requiredTier) {
     throw new Error(
       `route-resolve: model(s) at/above required tier '${requiredTier}' exist but ALL lack cost figures ` +
       `(cost_in_per_mtok/cost_out_per_mtok) — least-cost ranking stays inert for: ${names}. ` +
-      'No MCP tool registers cost figures today; until a model-registration tool ships, ' +
-      'set model_registry.cost_in_per_mtok/cost_out_per_mtok for these models via a raw ' +
-      'SQL UPDATE (see docs/notes/2026-09-06-s17-routing-gap-audit.md). A directive can ' +
-      'still route to one of these models via the routing_profile_set MCP tool ' +
-      '(preferred_model), bypassing the recommendation ranking entirely.'
+      'Set cost_in_per_mtok/cost_out_per_mtok for these models via the model_registry_set MCP ' +
+      'tool (§17 B1). A directive can still route to one of these models via the ' +
+      'routing_profile_set or routing_session_override_set MCP tools, bypassing the ' +
+      'recommendation ranking entirely.'
     );
   }
 
