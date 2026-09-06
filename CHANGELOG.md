@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Agent-interaction guard hooks moved to the public judge repo** —
+  `hooks/agent-adversary-floor.js`/`.test.js` and
+  `hooks/pr-independence.js`/`.test.js` are removed from claude-memory now
+  that they ship from [djwmobley/judge](https://github.com/djwmobley/judge)
+  (PR #1, `b8657b8`), installed there by that repo's install-guards script.
+  claude-memory's `hooks/` now carries only the memory-contract `SessionStart`
+  loader-hook wiring. `hooks/README.md`, `MANIFEST.md`, `CONTRIBUTING.md`, and
+  `.github/workflows/test.yml` updated to drop references to the removed
+  files; `scripts/test-host-agnostic-naming.js`'s S1 sweep exemption list
+  entry for `agent-adversary-floor.js` removed as dead (the file no longer
+  exists to sweep).
+
 ### Fixed
 
 - **cm#222: migrate-08 handoff-markdown parser hardening** — a real-file

@@ -101,15 +101,6 @@ PGHOST=localhost PGUSER=postgres PGPASSWORD=postgres node scripts/test-both-back
 Runs 10 adversarial invariants against both Postgres and SQLite backends. The SQLite half
 requires Node 22 (built-in `node:sqlite`). Both halves gate in CI.
 
-### Step 10 — PR-independence hook tests
-
-```sh
-node hooks/pr-independence.test.js
-```
-
-Pure Node — no Postgres or Ollama required. Covers the zero-false-negative scrubbing
-guarantee and detection logic.
-
 ### Step 11 — Plugin packaging tests
 
 ```sh
