@@ -8,7 +8,17 @@
  * model/provider that turn should use and records the decision exactly
  * once in `turn_usage`. CommonJS, plain `pg` client (Client or Pool)
  * passed in by the caller — this library never opens, owns, or closes a
- * database connection.
+ * database connection. NOTE (2026-09-06, §17.1.1): when `agentId` is
+ * supplied, routeResolve issues `BEGIN`/`pg_advisory_xact_lock`/`COMMIT`/
+ * `ROLLBACK` on the SAME `pg` argument (matching routing-profile.js's M-18
+ * pattern) — this requires a single persistent connection (a `Client`, or a
+ * `PostgresAdapter`-style single-connection wrapper, as every caller in this
+ * repo already passes); a raw `pg.Pool` would checkout a different
+ * connection per query and silently break the transaction. Every existing
+ * caller (handoff-mcp.mjs's `withProjectDb`, every verify- and test-
+ * harness under scripts/migrations and test/migrations) already passes a
+ * single-connection object, so this is a documented constraint, not a
+ * behavior change.
  *
  * RESOLUTION PRECEDENCE (routeResolve), first hit wins:
  *   1. Idempotent replay — a turn_usage row already exists for this exact
@@ -89,20 +99,67 @@
  * differ from what the table holds. This is the entire idempotency
  * mechanism; no advisory locks are used.
  *
- * OUT OF SCOPE (caller responsibility): the §17.1.1 review-role/agent-
- * identity separation note ("review never resolves to the drafting
- * agent_id") is an orchestration-layer concern this resolver has no
- * artifact context to enforce — callers routing a 'review' role are
- * responsible for ensuring the reviewing agent differs from the drafting
- * agent. This resolver never mutates schema and never inserts into
+ * §17.1.1 REVIEW-IDENTITY ENFORCEMENT (2026-09-06, closes G4,
+ * docs/notes/2026-09-06-s17-routing-gap-audit.md): an OPTIONAL `agentId`
+ * argument lets a caller identify WHICH agent is making this turn's call.
+ * When supplied, routeResolve enforces — session-scoped, bidirectional,
+ * case-folded — that a 'review' turn never shares an agent identity with
+ * any non-review turn in the SAME (project_id, session_id), and vice versa;
+ * same-role repeats (review-after-review, draft-after-draft, ...) never
+ * collide. A collision is a hard REVIEW_IDENTITY_COLLISION error, thrown
+ * after the idempotent-replay check and before the turn_usage INSERT — it
+ * never silently downgrades or flags-only. `agentId` omitted resolves
+ * exactly as before (agent_id written NULL, no enforcement, response
+ * carries identity_enforced:false / identity_reason:'agentId not
+ * supplied') — this is a strictly additive, opt-in capability; every
+ * existing caller that never passes agentId observes byte-identical
+ * behavior to before this fix.
+ *
+ * DOCUMENTED EVASION VECTOR: enforcement is CASE-FOLDED (foldForComparison
+ * = normLabel(s).toLowerCase(), plain toLowerCase, never
+ * toLocaleLowerCase) but NOT homoglyph- or hyphen-variant-aware — 'Agent-1'
+ * (U+002D hyphen-minus) and 'Agent‐1' (U+2010 hyphen) fold to two DIFFERENT
+ * strings and will NOT be unified, so an agent that varies its own
+ * identity string by such substitution can defeat this check. This is a
+ * known, accepted gap (matching normLabel/normRole's own case-preserving,
+ * non-Unicode-confusable-aware design), not an oversight — see
+ * test/migrations/test-route-resolve-contract.js's documented-non-collision
+ * case. `agentId` is capped at 256 characters (after normLabel) and must
+ * not contain U+0000; both are hard errors, never silently truncated.
+ * Enforcement is scoped to ONE session — it does not, and is not intended
+ * to, unify identity across different session_id values or across
+ * projects.
+ *
+ * CONCURRENCY: when `agentId` is supplied, the prior-identity SELECT and
+ * the turn_usage INSERT run inside ONE transaction guarded by a
+ * `pg_advisory_xact_lock(hashtext(project_id||session_id||foldedAgentId))`
+ * transaction-scoped advisory lock — the SAME hashtext-keyed pattern
+ * routing-profile.js's M-18 fix already uses — so two concurrent calls
+ * carrying the SAME folded identity in the SAME session serialize instead
+ * of racing the collision check. This lock is scoped to (project_id,
+ * session_id, foldedAgentId); it does NOT serialize across different
+ * sessions or projects, by design (§17's routing state is already
+ * project/session-partitioned everywhere else in this file).
+ *
+ * This resolver still never mutates schema and never inserts into
  * model_registry / routing_profiles / routing_session_overrides.
- * NOT ENFORCED (G4, docs/notes/2026-09-06-s17-routing-gap-audit.md): a 'review' resolution matching a 'draft' resolution's model is neither rejected nor flagged — see test/migrations/test-route-resolve-contract.js for the pinned current behavior.
  */
 
 const routingIdentity = require('./routing-identity.js');
 
 const TIER_RANK = Object.freeze({ low: 0, mid: 1, high: 2 });
 const VALID_TIERS = Object.freeze(['high', 'mid', 'low']);
+
+/** §17.1.1 review-identity enforcement (2026-09-06). */
+const MAX_AGENT_ID_LENGTH = 256;
+
+class RouteResolveError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = 'RouteResolveError';
+    this.code = code;
+  }
+}
 
 // ─── INPUT VALIDATION ────────────────────────────────────────────────────
 
@@ -144,6 +201,49 @@ function normalizeCapabilityTier(capabilityTier) {
     throw new Error(`route-resolve: "capabilityTier" must be one of ${JSON.stringify(VALID_TIERS)} (got ${JSON.stringify(capabilityTier)})`);
   }
   return capabilityTier;
+}
+
+/**
+ * §17.1.1 review-identity enforcement (2026-09-06) — total classification:
+ *   - undefined/null                              -> {supplied:false}, no enforcement.
+ *   - non-string, empty, or whitespace-only        -> hard error (requireNormalizedNonEmpty).
+ *   - contains U+0000                              -> hard error.
+ *   - > MAX_AGENT_ID_LENGTH chars AFTER normLabel  -> hard error.
+ *   - otherwise                                    -> {supplied:true, stored: normLabel(agentId)
+ *     (case preserved), folded: stored.toLowerCase() (plain toLowerCase, never
+ *     toLocaleLowerCase)}.
+ * Never coerced — every non-undefined/null value either fully validates or throws.
+ */
+function normalizeAgentId(agentId) {
+  if (agentId === undefined || agentId === null) {
+    return { supplied: false, stored: null, folded: null };
+  }
+  if (typeof agentId !== 'string' || agentId.length === 0) {
+    throw new RouteResolveError(
+      'validation',
+      `route-resolve: "agentId" must be a non-empty string when given (got ${JSON.stringify(agentId)})`
+    );
+  }
+  if (agentId.indexOf('\u0000') !== -1) {
+    throw new RouteResolveError(
+      'validation',
+      'route-resolve: "agentId" must not contain a NUL character (U+0000)'
+    );
+  }
+  let stored;
+  try {
+    stored = routingIdentity.requireNormalizedNonEmpty(agentId, 'agentId', routingIdentity.normLabel);
+  } catch (err) {
+    throw new RouteResolveError('validation', `route-resolve: ${err.message}`);
+  }
+  if (stored.length > MAX_AGENT_ID_LENGTH) {
+    throw new RouteResolveError(
+      'validation',
+      `route-resolve: "agentId" must be at most ${MAX_AGENT_ID_LENGTH} characters after normalization ` +
+      `(got ${stored.length} characters). Dispatch the agent with a shorter identity string.`
+    );
+  }
+  return { supplied: true, stored, folded: stored.toLowerCase() };
 }
 
 // ─── NUMERIC COERCION (3-1, load-bearing) ────────────────────────────────
@@ -393,7 +493,7 @@ async function resolveDirective(pg, { projectId, sessionId, role, overrideModel 
 
 // ─── turn_usage replay/persistence (2-2) ──────────────────────────────────
 
-/** Same aliased shape used by both the step-1 replay SELECT and the race-loser re-SELECT (2-2). */
+/** Same aliased shape used by both the step-1 replay SELECT and the race-loser re-SELECT (2-2). Now also carries agent_id (§17.1.1) for replay-time identity_conflict recomputation. */
 async function selectTurnUsage(pg, projectId, sessionId, turnIdx, role) {
   // F-1: normalize — belt-and-suspenders with routeResolve's top-of-function
   // normalization (exported test seam, callable directly).
@@ -401,7 +501,7 @@ async function selectTurnUsage(pg, projectId, sessionId, turnIdx, role) {
   const normSessionId = routingIdentity.normId(sessionId);
   const normRole = routingIdentity.normRole(role);
   const { rows } = await pg.query(
-    `SELECT model_id AS model, provider, resolved_via, recommended_model, cost_delta_usd
+    `SELECT model_id AS model, provider, resolved_via, recommended_model, cost_delta_usd, agent_id
        FROM turn_usage
       WHERE project_id = $1 AND session_id = $2 AND turn_idx = $3 AND agent_role = $4`,
     [normProjectId, normSessionId, turnIdx, normRole]
@@ -409,12 +509,74 @@ async function selectTurnUsage(pg, projectId, sessionId, turnIdx, role) {
   return rows[0] || null;
 }
 
+// ─── §17.1.1 review-identity enforcement helpers ──────────────────────────
+
+/**
+ * Every turn_usage row in this (project_id, session_id) that carries a
+ * non-NULL agent_id — the full pool a collision check draws from.
+ * ORDER BY turn_idx ASC so a collision message deterministically names the
+ * EARLIEST colliding turn, and so `identity_enforced`'s empty-vs-non-empty
+ * classification (item 4) is computed from a stable set. Exported as a test
+ * seam, matching selectTurnUsage/fetchActiveProfile/fetchActivePin's own
+ * exported-for-direct-exercise convention.
+ */
+async function fetchPriorAgentIds(pg, projectId, sessionId) {
+  const normProjectId = routingIdentity.normId(projectId);
+  const normSessionId = routingIdentity.normId(sessionId);
+  const { rows } = await pg.query(
+    `SELECT agent_role, agent_id, turn_idx
+       FROM turn_usage
+      WHERE project_id = $1 AND session_id = $2 AND agent_id IS NOT NULL
+      ORDER BY turn_idx ASC`,
+    [normProjectId, normSessionId]
+  );
+  return rows;
+}
+
+/**
+ * Bidirectional, insertion-order-independent, case-folded collision check
+ * (item 3). `currentRoleFolded`/`currentAgentIdFolded` are already
+ * case-folded via routingIdentity.foldForComparison. Same-role repeats
+ * (review-review, draft-draft, ...) never collide — the explicit
+ * `rowRoleFolded === currentRoleFolded` skip below is belt-and-suspenders
+ * with the review/non-review branch that would already exclude them.
+ * Returns the first (lowest turn_idx, per fetchPriorAgentIds' ORDER BY)
+ * colliding row, or null.
+ */
+function findIdentityCollision(priorRows, currentRoleFolded, currentAgentIdFolded) {
+  const currentIsReview = currentRoleFolded === 'review';
+  for (const row of priorRows) {
+    const rowRoleFolded = routingIdentity.foldForComparison(row.agent_role);
+    if (rowRoleFolded === currentRoleFolded) continue; // same-role repeats never collide
+    const rowAgentIdFolded = routingIdentity.foldForComparison(row.agent_id);
+    if (rowAgentIdFolded !== currentAgentIdFolded) continue;
+    const rowIsReview = rowRoleFolded === 'review';
+    if (currentIsReview && !rowIsReview) return row;
+    if (!currentIsReview && rowIsReview) return row;
+  }
+  return null;
+}
+
+/** Replay-path identity_conflict recomputation (item 6) — shared by the
+ * step-1 replay branch and the race-loser re-select branch. Runs the SAME
+ * bidirectional predicate against the RECORDED row's own stored agent_id
+ * (never the current call's agentId argument, mirroring how the replay
+ * branch already ignores the current call's overrideModel). A recorded row
+ * with no agent_id (NULL) never conflicts — nothing to check. */
+async function computeReplayIdentityConflict(pg, projectId, sessionId, recordedRole, recordedAgentId) {
+  if (!recordedAgentId) return false;
+  const priorRows = await fetchPriorAgentIds(pg, projectId, sessionId);
+  const roleFolded = routingIdentity.foldForComparison(recordedRole);
+  const agentFolded = routingIdentity.foldForComparison(recordedAgentId);
+  return findIdentityCollision(priorRows, roleFolded, agentFolded) !== null;
+}
+
 // ─── routeResolve ──────────────────────────────────────────────────────────
 
 /**
  * @param {import('pg').Client|import('pg').Pool} pg
- * @param {{ projectId: string, sessionId: string, turnIdx: number, role: string, overrideModel?: string|null, capabilityTier?: string|null }} args
- * @returns {Promise<{ model: string|null, provider: string|null, resolved_via: string, recommended_model: string|null, cost_delta_usd: number|null, rationale: string, replayed: boolean }>}
+ * @param {{ projectId: string, sessionId: string, turnIdx: number, role: string, overrideModel?: string|null, capabilityTier?: string|null, agentId?: string|null }} args
+ * @returns {Promise<{ model: string|null, provider: string|null, resolved_via: string, recommended_model: string|null, cost_delta_usd: number|null, rationale: string, replayed: boolean, identity_enforced?: boolean, identity_reason?: string, identity_conflict?: boolean }>}
  */
 async function routeResolve(pg, args = {}) {
   const projectIdRaw = requireNonEmptyString(args.projectId, 'projectId');
@@ -423,6 +585,9 @@ async function routeResolve(pg, args = {}) {
   const roleRaw = requireNonEmptyString(args.role, 'role');
   const overrideModel = normalizeOverrideModel(args.overrideModel);
   const capabilityTier = normalizeCapabilityTier(args.capabilityTier);
+  // §17.1.1 (item 1): total classification — undefined/null -> no
+  // enforcement; present-but-invalid -> hard error, never coerced.
+  const agentIdInfo = normalizeAgentId(args.agentId);
 
   // F-1: normalize ONCE, immediately after presence validation, and thread
   // the normalized identity through every downstream query in this function
@@ -436,6 +601,10 @@ async function routeResolve(pg, args = {}) {
   // re-resolves. ──────────────────────────────────────────────────────────
   const existing = await selectTurnUsage(pg, projectId, sessionId, turnIdx, role);
   if (existing) {
+    // §17.1.1 item 6: a replayed call never throws — re-run the collision
+    // predicate against the RECORDED row's own stored agent_id (never this
+    // call's agentId argument) and annotate, mirroring override_ignored.
+    const identityConflict = await computeReplayIdentityConflict(pg, projectId, sessionId, role, existing.agent_id);
     return {
       model: existing.model,
       provider: existing.provider,
@@ -444,6 +613,7 @@ async function routeResolve(pg, args = {}) {
       cost_delta_usd: coerceCost(existing.cost_delta_usd),
       rationale: 'replay: turn already resolved',
       replayed: true,
+      identity_conflict: identityConflict,
     };
   }
 
@@ -536,39 +706,127 @@ async function routeResolve(pg, args = {}) {
   // literal and would silently corrupt telemetry).
   const costForWrite = (costDeltaUsd !== null && Number.isFinite(costDeltaUsd)) ? costDeltaUsd : null;
 
-  const insertResult = await pg.query(
+  const insertSql =
     `INSERT INTO turn_usage
-       (project_id, session_id, turn_idx, agent_role, model_id, provider, resolved_via, recommended_model, cost_delta_usd)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-     ON CONFLICT (project_id, session_id, turn_idx, agent_role) DO NOTHING`,
-    [projectId, sessionId, turnIdx, role, model, provider, resolvedVia, recommendedModel, costForWrite]
-  );
+       (project_id, session_id, turn_idx, agent_role, model_id, provider, resolved_via, recommended_model, cost_delta_usd, agent_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT (project_id, session_id, turn_idx, agent_role) DO NOTHING`;
+  const insertParams = [projectId, sessionId, turnIdx, role, model, provider, resolvedVia, recommendedModel, costForWrite, agentIdInfo.stored];
 
-  if (insertResult.rowCount === 0) {
-    // RACE RULE: a concurrent resolver won the key. Re-select and return
-    // the WINNER's values — the caller must never receive values that
-    // differ from what the table holds.
-    const winner = await selectTurnUsage(pg, projectId, sessionId, turnIdx, role);
+  // §17.1.1 items 3/4/7: agentId absent -> byte-identical to pre-existing
+  // behavior (no lock, no collision check, identity_enforced:false with the
+  // "not supplied" reason). agentId present -> the prior-identity SELECT
+  // and this INSERT run inside ONE transaction guarded by a
+  // pg_advisory_xact_lock keyed on (project_id, session_id, foldedAgentId)
+  // — the M-18 hashtext-keyed pattern (routing-profile.js) — so two
+  // concurrent calls carrying the SAME folded identity in the SAME session
+  // serialize instead of racing the collision check. Documented blind spot:
+  // this lock namespace does not, and is not intended to, serialize across
+  // different sessions or projects.
+  if (!agentIdInfo.supplied) {
+    const insertResult = await pg.query(insertSql, insertParams);
+
+    if (insertResult.rowCount === 0) {
+      // RACE RULE: a concurrent resolver won the key. Re-select and return
+      // the WINNER's values — the caller must never receive values that
+      // differ from what the table holds.
+      const winner = await selectTurnUsage(pg, projectId, sessionId, turnIdx, role);
+      const identityConflict = await computeReplayIdentityConflict(pg, projectId, sessionId, role, winner.agent_id);
+      return {
+        model: winner.model,
+        provider: winner.provider,
+        resolved_via: winner.resolved_via,
+        recommended_model: winner.recommended_model,
+        cost_delta_usd: coerceCost(winner.cost_delta_usd),
+        rationale: 'replay: lost insert race, returning winner',
+        replayed: true,
+        identity_conflict: identityConflict,
+      };
+    }
+
     return {
-      model: winner.model,
-      provider: winner.provider,
-      resolved_via: winner.resolved_via,
-      recommended_model: winner.recommended_model,
-      cost_delta_usd: coerceCost(winner.cost_delta_usd),
-      rationale: 'replay: lost insert race, returning winner',
-      replayed: true,
+      model,
+      provider,
+      resolved_via: resolvedVia,
+      recommended_model: recommendedModel,
+      cost_delta_usd: costForWrite,
+      rationale,
+      replayed: false,
+      identity_enforced: false,
+      identity_reason: 'agentId not supplied',
     };
   }
 
-  return {
-    model,
-    provider,
-    resolved_via: resolvedVia,
-    recommended_model: recommendedModel,
-    cost_delta_usd: costForWrite,
-    rationale,
-    replayed: false,
-  };
+  // ── agentId supplied: transaction-scoped advisory lock + bidirectional
+  // collision check + INSERT, all one transaction. ────────────────────────
+  await pg.query('BEGIN');
+  try {
+    await pg.query(
+      `SELECT pg_advisory_xact_lock(hashtext($1))`,
+      [`route_resolve_identity:${projectId}:${sessionId}:${agentIdInfo.folded}`]
+    );
+
+    const priorRows = await fetchPriorAgentIds(pg, projectId, sessionId);
+    const currentRoleFolded = routingIdentity.foldForComparison(role);
+    const collision = findIdentityCollision(priorRows, currentRoleFolded, agentIdInfo.folded);
+
+    if (collision) {
+      // Rolled back uniformly by the outer catch below. Item 5: named code
+      // REVIEW_IDENTITY_COLLISION, message names the
+      // folded agentId + the colliding turn_idx/agent_role, remediation is
+      // "dispatch a fresh agent" — no alternative-tier suggestion (this is
+      // an identity problem, not a routing-tier problem).
+      throw new RouteResolveError(
+        'REVIEW_IDENTITY_COLLISION',
+        `route-resolve: agentId '${agentIdInfo.folded}' (case-folded) already appears as turn_idx=${collision.turn_idx} ` +
+        `agent_role='${collision.agent_role}' in this session (project_id='${projectId}', session_id='${sessionId}') — ` +
+        `a 'review' turn must use a different agent identity than the turn(s) it reviews, and vice versa. ` +
+        `Remediation: dispatch a fresh agent with a distinct agentId.`
+      );
+    }
+
+    const identityEnforced = priorRows.length > 0;
+    const identityReason = identityEnforced ? undefined : 'no prior identified turns in session';
+
+    const insertResult = await pg.query(insertSql, insertParams);
+
+    if (insertResult.rowCount === 0) {
+      // Per-turn race (a DIFFERENT concurrent resolver won the exact
+      // (project_id, session_id, turn_idx, agent_role) key) — orthogonal to
+      // the identity lock above (that lock is keyed on identity, this
+      // conflict is keyed on turn). Nothing to roll back; commit cleanly
+      // and re-select the winner, same as the no-agentId path.
+      await pg.query('COMMIT');
+      const winner = await selectTurnUsage(pg, projectId, sessionId, turnIdx, role);
+      const identityConflict = await computeReplayIdentityConflict(pg, projectId, sessionId, role, winner.agent_id);
+      return {
+        model: winner.model,
+        provider: winner.provider,
+        resolved_via: winner.resolved_via,
+        recommended_model: winner.recommended_model,
+        cost_delta_usd: coerceCost(winner.cost_delta_usd),
+        rationale: 'replay: lost insert race, returning winner',
+        replayed: true,
+        identity_conflict: identityConflict,
+      };
+    }
+
+    await pg.query('COMMIT');
+    return {
+      model,
+      provider,
+      resolved_via: resolvedVia,
+      recommended_model: recommendedModel,
+      cost_delta_usd: costForWrite,
+      rationale,
+      replayed: false,
+      identity_enforced: identityEnforced,
+      ...(identityReason !== undefined ? { identity_reason: identityReason } : {}),
+    };
+  } catch (err) {
+    try { await pg.query('ROLLBACK'); } catch (_rollbackErr) { /* best-effort */ }
+    throw err;
+  }
 }
 
 module.exports = {
@@ -578,6 +836,7 @@ module.exports = {
   TIER_RANK,
   VALID_TIERS,
   coerceCost,
+  RouteResolveError,
   // Exported test seams (not part of the "public" three-function surface,
   // but useful for direct unit exercise without a full routeResolve call).
   resolveDirective,
@@ -585,4 +844,5 @@ module.exports = {
   selectTurnUsage,
   fetchActiveProfile,
   fetchActivePin,
+  fetchPriorAgentIds,
 };

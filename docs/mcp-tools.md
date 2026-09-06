@@ -273,6 +273,47 @@ tool, `model_registry_set`, `routing_session_override_set`) and at every
 `route-resolve.js` read site, so a value written with e.g. trailing
 whitespace or a combining-character accent is never unfindable later.
 
+### `route_resolve` §17.1.1 review-identity enforcement (2026-09-06)
+
+An optional `agentId` argument identifies which agent is making a turn's
+call. Enforcement is **session-scoped** (per `project_id` + `session_id`
+only — never across sessions or projects) and **bidirectional**: a
+`'review'` turn is rejected with a `REVIEW_IDENTITY_COLLISION` error if its
+`agentId` already appears (case-folded) on a non-review turn recorded
+earlier in the same session, and a non-review turn is equally rejected if
+its `agentId` already appears on a recorded `'review'` turn — same-role
+repeats (review-after-review, draft-after-draft, ...) never collide. The
+check is fired after the idempotent-replay check and before the
+`turn_usage` INSERT; a collision is a hard error, never a silent flag or
+downgrade.
+
+Comparison is **case-folded** (`foldForComparison` = `normLabel(s)
+.toLowerCase()` — plain `toLowerCase`, never `toLocaleLowerCase`) but is
+**not** homoglyph- or hyphen-variant-aware: an identity that differs only
+by a Unicode confusable (e.g. `U+2010` HYPHEN vs `U+002D` HYPHEN-MINUS) is
+treated as a DIFFERENT identity and will not collide. This is a documented
+evasion vector, not a bug — it matches `normLabel`/`normRole`'s own
+case-preserving, non-confusable-aware design. `agentId` is capped at 256
+characters (measured after `normLabel`) and must not contain `U+0000`;
+either is a hard, non-coercing error.
+
+The response carries a three-state `identity_enforced` field:
+`true` when a check ran against a non-empty set of prior identified turns
+in the session and passed; `false` with `identity_reason: 'no prior
+identified turns in session'` when that set was empty; `false` with
+`identity_reason: 'agentId not supplied'` when `agentId` was omitted
+entirely (the pre-2026-09-06 behavior — `agent_id` is stored `NULL`, no
+enforcement runs). A replayed call never throws for identity reasons: it
+re-runs the same bidirectional check against the RECORDED row's own stored
+`agent_id` and annotates the response with `identity_conflict: true|false`
+(mirroring `override_ignored`) rather than rejecting a call that already
+succeeded once. Concurrency: when `agentId` is supplied, the prior-identity
+read and the INSERT run inside one transaction guarded by a
+`pg_advisory_xact_lock` keyed on `(project_id, session_id, foldedAgentId)`
+— the same hashtext-keyed pattern `routing_profile_set`'s M-18 fix uses —
+so this is scoped per identity per session and does not serialize across
+different sessions or projects.
+
 ## `model_registry_set` / `routing_session_override_set` / `routing_session_override_get` / `routing_session_override_clear`
 
 2026-09-06 (§17 B1): closes the two gaps the §17 routing gap-audit found —

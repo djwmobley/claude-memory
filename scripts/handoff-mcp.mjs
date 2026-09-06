@@ -209,7 +209,8 @@ async function withProjectDb(projectRoot, fn) {
 /** Maps every §8 lib error class's `.code` to a stable MCP-tool error
  * response. Named library errors (MemoryUpsertError, MemorySearchError,
  * EntityGraphCrudError, MemoryViewError, ExchangeLogError,
- * RoutingProfileError, EmbeddingColumnAbsentError — cm#224 follow-up) are
+ * RoutingProfileError, EmbeddingColumnAbsentError — cm#224 follow-up,
+ * RouteResolveError — §17.1.1 review-identity enforcement, 2026-09-06) are
  * reported with their code + message; anything else falls through to
  * errorResult's generic stack-trace formatting. Either way, if
  * withProjectDb attached a `.schemaApplyDegraded` record (a gated-column
@@ -220,7 +221,7 @@ function libToolError(err) {
   const namedCodes = new Set([
     'MemoryUpsertError', 'MemorySearchError', 'EntityGraphCrudError',
     'MemoryViewError', 'ExchangeLogError', 'RoutingProfileError',
-    'EmbeddingColumnAbsentError', 'RoutingWriteSurfaceError',
+    'EmbeddingColumnAbsentError', 'RoutingWriteSurfaceError', 'RouteResolveError',
   ]);
   const result = (err && namedCodes.has(err.name))
     ? toolError(`${err.name} [${err.code}]: ${err.message}`)
@@ -666,11 +667,11 @@ async function toolExchangeRead({ projectRoot, toAgent, afterCreatedAt, afterId,
 // overrideModel this call passed — this wrapper simply compares the two and
 // annotates the response, without touching route-resolve.js's proven
 // idempotency/race-handling logic.
-async function toolRouteResolve({ projectRoot, sessionId, turnIdx, role, capabilityTier, overrideModel }) {
+async function toolRouteResolve({ projectRoot, sessionId, turnIdx, role, capabilityTier, overrideModel, agentId }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
       const result = await routeResolveLib.routeResolve(db, {
-        projectId, sessionId, turnIdx, role, capabilityTier, overrideModel,
+        projectId, sessionId, turnIdx, role, capabilityTier, overrideModel, agentId,
       });
       const overrideIgnored = Boolean(
         result.replayed && overrideModel !== undefined && overrideModel !== null && result.model !== overrideModel
@@ -1431,7 +1432,16 @@ function buildServer() {
         'cost-aware recommendation. Idempotent: a second call for the SAME (project_id, session_id, turn_idx, ' +
         'role) key returns the recorded row unchanged, never re-resolving. M-10: a replay called with a ' +
         'DIFFERENT override_model than what was recorded returns the recorded row PLUS ' +
-        'override_ignored:true and ignored_override_model — never silently, never an error.',
+        'override_ignored:true and ignored_override_model — never silently, never an error. ' +
+        '§17.1.1 (2026-09-06): an optional `agentId` identifies which agent is making this call. When supplied, ' +
+        'enforcement is session-scoped, bidirectional, and case-folded — a \'review\' turn is rejected ' +
+        '(REVIEW_IDENTITY_COLLISION) if its agentId already appears on a non-review turn in this ' +
+        '(project_id, session_id), and vice versa; same-role repeats never collide. The response then carries ' +
+        'identity_enforced (true when a check ran against a non-empty prior-identity set and passed; false with ' +
+        'identity_reason otherwise) and, on replay, identity_conflict. Homoglyph and hyphen-variant identities ' +
+        '(e.g. U+2010 vs U+002D) are NOT unified — a documented evasion vector, not a bug. agentId is capped at ' +
+        '256 characters after normalization and must not contain U+0000; either is a hard error. `agentId` ' +
+        'omitted resolves exactly as before this fix (agent_id stored NULL, identity_enforced:false).',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         sessionId: z.string(),
@@ -1439,6 +1449,10 @@ function buildServer() {
         role: z.string(),
         capabilityTier: z.enum(routeResolveLib.VALID_TIERS).optional(),
         overrideModel: z.string().optional(),
+        agentId: z.string().optional().describe(
+          '§17.1.1: identifies the calling agent for review<->non-review identity-collision enforcement ' +
+          '(session-scoped, bidirectional, case-folded). Omit for no enforcement.'
+        ),
       },
     },
     async (args) => toolRouteResolve(args)

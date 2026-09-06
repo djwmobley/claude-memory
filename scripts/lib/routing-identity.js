@@ -82,9 +82,28 @@ function requireNormalizedNonEmpty(rawValue, name, normalizeFn) {
   return normalized;
 }
 
+/**
+ * foldForComparison (2026-09-06, §17.1.1 review-identity enforcement):
+ * normLabel(s).toLowerCase() — plain (ASCII/simple) .toLowerCase(), NEVER
+ * .toLocaleLowerCase() (locale-dependent casing, e.g. Turkish dotless-i,
+ * would make the same two byte-identical strings fold differently across
+ * machines). Used ONLY where two identities must be compared as
+ * case-insensitively "the same agent" (route-resolve.js's review<->draft
+ * identity-collision check) — every EXISTING equality in this module
+ * (label/role/session_id/project_id lookups) stays case-preserving; this is
+ * a new, narrower comparison, not a relaxation of normLabel/normRole's
+ * documented case-preserving contract.
+ * @param {*} s
+ * @returns {string}
+ */
+function foldForComparison(s) {
+  return normLabel(s).toLowerCase();
+}
+
 module.exports = {
   normLabel,
   normRole,
   normId,
   requireNormalizedNonEmpty,
+  foldForComparison,
 };
