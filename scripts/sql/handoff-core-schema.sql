@@ -506,8 +506,32 @@ END $$;
 -- 1:N exact-duplicate index: at most one live row per (project_id, subject, predicate, object).
 -- Registry-independent: applies to all predicates equally, preventing exact-duplicate 1:N rows
 -- regardless of cardinality class.
-CREATE UNIQUE INDEX IF NOT EXISTS assertions_1ton_exact_unique
-  ON assertions (project_id, subject, predicate, object)
+--
+-- cm#227: keyed on md5(object), NOT the raw object column. A plain btree index
+-- over (project_id, subject, predicate, object) fails at INSERT time once the
+-- combined indexed row exceeds Postgres's per-version btree row-size cap
+-- (observed: "index row size 2936 exceeds btree version 4 maximum 2704") --
+-- object alone is allowed up to 4000 chars by the payload schema (tldr/
+-- quick_reference persisted verbatim as an assertion object via
+-- persistSessionIntent), so a long TL;DR silently failed to persist
+-- (non-fatal catch swallowed the error). md5(object) is a fixed 32-byte hex
+-- digest regardless of the input's length, so the index row size is bounded
+-- no matter how long object grows. Identity is over the RAW stored bytes --
+-- no trim/case-fold — callers that need canonicalization already do so
+-- before insert (see writeAssertionWithSupersession's callers). A same-
+-- prefix, different-tail object pair (identical first N bytes, diverging
+-- after) hashes to two different digests and is correctly treated as
+-- distinct, non-colliding rows; genuine md5 collisions are astronomically
+-- unlikely and are an accepted, standard trade-off of hash-keyed uniqueness.
+-- Paired with an explicit DROP (mirroring assertions_1to1_unique above) so
+-- scripts/handoff.js's _extractIntegrityIndexOps() runs the DROP+CREATE as
+-- one atomic non-fatal pair (runIntegrityIndexPair) on every schema-bring-
+-- forward touch of an already-provisioned DB — see SCHEMA_EPOCH bump in
+-- scripts/handoff.js (this file's content hash changed, which alone forces
+-- a re-apply; the epoch bump is the explicit, human-readable signal).
+DROP INDEX IF EXISTS assertions_1ton_exact_unique;
+CREATE UNIQUE INDEX assertions_1ton_exact_unique
+  ON assertions (project_id, subject, predicate, md5(object))
   WHERE suppressed = false;
 
 

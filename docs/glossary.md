@@ -158,7 +158,7 @@ The central identity distinction for this system. claude-memory is a **relay bat
 
 ### session_tldr
 
-A predicate (cardinality 1:1) that persists the session TL;DR as a queryable Postgres assertion row; one live row per project (subject = project basename), latest supersedes prior. Written at `/handoff:close` through the gated write path. See also: **open_thread**, **quick_reference**, **session intent section**.
+A predicate (cardinality 1:1) that persists the session TL;DR as a queryable Postgres assertion row; one live row per project (subject = project basename), latest supersedes prior. Written at `/handoff:close` through the gated write path. The write-path uniqueness guard (`assertions_1ton_exact_unique`, a partial unique index on `(project_id, subject, predicate, object)`) is keyed on `md5(object)` rather than the raw `object` column — a plain-column index hits Postgres's per-btree-version row-size cap once `object` (which is allowed up to 4000 chars, same as `tldr` in the close payload) gets long, and the resulting write failure used to be silently swallowed. Any persistence failure for `session_tldr`/`open_thread`/`quick_reference` now surfaces as a `DIVERGENCE: <predicate> NOT PERSISTED — <error>` line in the close/checkpoint summary and in `handoff.md`'s `## Degraded` section; the close operation still succeeds (non-fatal, exit code unchanged). See also: **open_thread**, **quick_reference**, **session intent section**.
 
 ### Session intent section
 

@@ -133,7 +133,21 @@ function buildPayloadSchema() {
       decisions: {
         type: 'array',
         maxItems: 200,
-        items: { type: 'object' },
+        items: {
+          type: 'object',
+          properties: {
+            // cm#227: topic is the conflict-target column of the plain btree
+            // `decisions_project_topic_unique (project_id, topic)` index — no
+            // md5() wrap on that index (unlike assertions_1ton_exact_unique).
+            // JSON-Schema's maxLength counts UTF-16 code units, not bytes, so
+            // it cannot express the real physical (UTF-8 byte) limit exactly;
+            // this maxLength is a conservative upper bound only. The
+            // authoritative byte-length check (2000 bytes, Buffer.byteLength)
+            // lives in validatePayload() below and in readStdin()
+            // (scripts/handoff.js) — both real enforcement points.
+            topic: { type: 'string', maxLength: 2000 },
+          },
+        },
       },
       contract: {
         type: 'object',
@@ -175,10 +189,33 @@ function validatePayload(payload, mode) {
     return { ok: false, warnings, errors };
   }
 
+  // cm#227: decisions[].topic byte-length cap — checked here (in addition to
+  // readStdin() in scripts/handoff.js, which is the primary gate for the CLI/
+  // MCP --json - path) so callers that construct a payload object directly
+  // (e.g. queue-drain re-validating an already-enqueued row) still reject a
+  // too-long topic before it reaches the decisions table's plain btree
+  // `decisions_project_topic_unique (project_id, topic)` index. Checked
+  // BEFORE the assertions-array early-return below so a decisions-only
+  // payload (no assertions) is still validated.
+  const DECISIONS_TOPIC_BYTE_MAX = 2000;
+  if (Array.isArray(payload.decisions)) {
+    for (let i = 0; i < payload.decisions.length; i++) {
+      const dec = payload.decisions[i];
+      if (dec && typeof dec === 'object' && typeof dec.topic === 'string') {
+        const topicBytes = Buffer.byteLength(dec.topic, 'utf8');
+        if (topicBytes > DECISIONS_TOPIC_BYTE_MAX) {
+          errors.push(
+            `decisions[${i}].topic exceeds max byte length (${topicBytes} > ${DECISIONS_TOPIC_BYTE_MAX} bytes)`
+          );
+        }
+      }
+    }
+  }
+
   const assertions = payload.assertions;
   if (!assertions) {
-    // No assertions array — nothing to validate; payload is structurally valid.
-    return { ok: true, warnings, errors };
+    // No assertions array — nothing further to validate.
+    return { ok: errors.length === 0, warnings, errors };
   }
 
   if (!Array.isArray(assertions)) {

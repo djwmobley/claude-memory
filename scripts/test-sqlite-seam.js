@@ -2145,6 +2145,95 @@ async function runSection18() {
   });
 }
 
+// ── SECTION 19: cm#227 — md5(col) -> col rewrite (assertions_1ton_exact_unique) ──
+//
+// handoff-sqlite-schema.sql writes assertions_1ton_exact_unique's CREATE UNIQUE
+// INDEX with the SAME md5(object) text as handoff-core-schema.sql (Postgres),
+// for structural parity between the two dialect files. SQLite has no md5()
+// builtin, so rewriteForSQLite() must strip it back to the bare column before
+// better-sqlite3 ever sees the DDL. Proves: (a) the rewrite rule fires — the
+// stored SQLite DDL text contains no "md5(" — and (b) the index still enforces
+// the SAME uniqueness semantics it always did on SQLite: one live row per
+// (project_id, subject, predicate, object).
+async function runSection19() {
+  console.log('\n=== Section 19: cm#227 md5(col) -> col rewrite (assertions_1ton_exact_unique) ===');
+
+  async function makeSchemaDb() {
+    const db = new SQLiteAdapter(':memory:');
+    await db.connect();
+    const schemaSql = fs.readFileSync(SCHEMA_FILE, 'utf8');
+    await db.runSchema(schemaSql);
+    return db;
+  }
+
+  const PID = 'test-cm227-md5-rewrite';
+
+  await test('cm#227: rewriteForSQLite strips md5(col) -> col', () => {
+    const { rewriteForSQLite } = require('./lib/db-seam');
+    const out = rewriteForSQLite(
+      'CREATE UNIQUE INDEX assertions_1ton_exact_unique ON assertions (project_id, subject, predicate, md5(object)) WHERE suppressed = 0'
+    );
+    assertFalse(/md5\(/i.test(out), 'md5( must not appear in the rewritten SQL');
+    assertTrue(/,\s*object\s*\)/.test(out), 'bare "object" column must remain as the 4th index key');
+  });
+
+  await test('cm#227: assertions_1ton_exact_unique creates on SQLite with no md5( in stored DDL', async () => {
+    const db = await makeSchemaDb();
+    try {
+      const { rows } = await db.query(
+        `SELECT sql FROM sqlite_master WHERE type='index' AND name='assertions_1ton_exact_unique'`
+      );
+      assertEqual(rows.length, 1, 'index must exist');
+      assertFalse(/md5\(/i.test(rows[0].sql || ''), `stored index DDL must not contain md5(: ${rows[0].sql}`);
+    } finally { await db.end(); }
+  });
+
+  await test('cm#227: index enforces uniqueness on the raw object column (exact duplicate rejected)', async () => {
+    const db = await makeSchemaDb();
+    try {
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+         VALUES (?,?,?,?,7,'user_stated',0)`,
+        [PID, 'dup-subject', 'has', 'same-object-value']
+      );
+      let threw = false;
+      try {
+        await db.query(
+          `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+           VALUES (?,?,?,?,7,'user_stated',0)`,
+          [PID, 'dup-subject', 'has', 'same-object-value']
+        );
+      } catch (e) {
+        threw = true;
+        assertTrue(/unique/i.test(e.message), `expected a UNIQUE constraint error, got: ${e.message}`);
+      }
+      assertTrue(threw, 'exact (project_id, subject, predicate, object) duplicate must be rejected');
+    } finally { await db.end(); }
+  });
+
+  await test('cm#227: two long, same-prefix, diverging-tail objects both insert (no false collision)', async () => {
+    const db = await makeSchemaDb();
+    try {
+      const prefix = 'p'.repeat(2800);
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+         VALUES (?,?,?,?,7,'user_stated',0)`,
+        [PID, 'collision-subject', 'has', prefix + 'TAIL-A']
+      );
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+         VALUES (?,?,?,?,7,'user_stated',0)`,
+        [PID, 'collision-subject', 'has', prefix + 'TAIL-B']
+      );
+      const { rows } = await db.query(
+        `SELECT object FROM assertions WHERE project_id=? AND subject='collision-subject'`,
+        [PID]
+      );
+      assertEqual(rows.length, 2, 'both distinct-tail rows must be stored');
+    } finally { await db.end(); }
+  });
+}
+
 // ── Run all sections ──────────────────────────────────────────────────────────
 (async () => {
   console.log(`\ntest-sqlite-seam.js (Node ${process.versions.node})\n`);
@@ -2167,6 +2256,7 @@ async function runSection18() {
   await runSection16();
   await runSection17();
   await runSection18();
+  await runSection19();
 
   console.log(`\n─── Results ──────────────────────────────────────`);
   console.log(`PASS ${passed}  FAIL ${failed}`);

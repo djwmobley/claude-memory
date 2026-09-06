@@ -1105,6 +1105,16 @@ function readStdin() {
       const ARRAY_FIELDS  = ['entities', 'assertions', 'edges', 'decisions'];
       const ARRAY_MAX     = 200;
       const RECORD_STR_MAX = 1000;
+      // cm#227: decisions[].topic is the conflict-target column of the plain
+      // btree `decisions_project_topic_unique (project_id, topic)` index — the
+      // SAME physical-row-size class of defect that motivated re-keying
+      // assertions_1ton_exact_unique on md5(object) (see handoff-core-schema.sql).
+      // Capped by UTF-8 BYTE length (not char length): a multi-byte character
+      // (e.g. CJK, emoji) can push a string well under RECORD_STR_MAX (1000)
+      // chars past this physical limit. Checked up front, before any DB
+      // mutation, in addition to (and independent of) the generic
+      // RECORD_STR_MAX char-length check below.
+      const DECISIONS_TOPIC_BYTE_MAX = 2000;
       for (const field of ARRAY_FIELDS) {
         if (field in parsed) {
           if (!Array.isArray(parsed[field])) {
@@ -1119,6 +1129,15 @@ function readStdin() {
             const rec = parsed[field][i];
             if (typeof rec !== 'object' || rec === null || Array.isArray(rec)) {
               return reject(new Error(`stdin JSON: "${field}[${i}]" must be a plain object`));
+            }
+            if (field === 'decisions' && typeof rec.topic === 'string') {
+              const topicBytes = Buffer.byteLength(rec.topic, 'utf8');
+              if (topicBytes > DECISIONS_TOPIC_BYTE_MAX) {
+                return reject(new Error(
+                  `stdin JSON: "decisions[${i}].topic" exceeds max byte length ` +
+                  `(${topicBytes} > ${DECISIONS_TOPIC_BYTE_MAX} bytes)`
+                ));
+              }
             }
             for (const [k, v] of Object.entries(rec)) {
               if (typeof v === 'string' && v.length > RECORD_STR_MAX) {
@@ -1454,7 +1473,13 @@ const { classifySchemaFiles, normalizeContent } = require('./lib/schema-classify
 // Bumped to 2 (cm#224): decisions-base.sql added to the postgres unit set --
 // every already-current live project DB must re-apply once to pick up
 // `decisions`/`audit_log`/the decisions_audit trigger.
-const SCHEMA_EPOCH = 2;
+// Bumped to 3 (cm#227): assertions_1ton_exact_unique re-keyed on md5(object)
+// instead of the raw object column (fixes a live btree-row-size failure on
+// long TL;DR/quick_reference intent rows) -- every already-current live
+// project DB must re-apply once to pick up the DROP+CREATE pair for this
+// index (see handoff-core-schema.sql's comment on the index for the full
+// rationale; _extractIntegrityIndexOps pairs the DROP+CREATE atomically).
+const SCHEMA_EPOCH = 3;
 
 // Module-level cache: maps schemaFilePath → { mtimeMs, size, hash } so repeated
 // calls in one process don't re-read or re-hash the SQL files. Keyed on
@@ -4454,12 +4479,26 @@ const PINNED_EXCLUSION_SQL = '(pinned = false OR pinned IS NULL)';
  * corroborator exists — reality_check='verified' OR pinned), NOT an auto-forge. A changed
  * thread on the same subject supersedes the prior via the 1:1 path.
  *
+ * cm#227: returns the list of intents that FAILED to persist (previously
+ * only logged to stderr and swallowed — a long TL;DR could silently vanish
+ * while close still printed "Done"). Callers surface this list as
+ * `DIVERGENCE: <predicate> NOT PERSISTED — <db error first line>` lines in
+ * both the close/checkpoint console summary and the handoff.md thin
+ * pointer's Degraded section — see writeExtraction's return shape and
+ * cmdClose/cmdCheckpoint below. This is DELIBERATELY a separate channel
+ * from the `_degradedSubsystems` array cmdClose uses for its strict-mode
+ * exit-code gate: a session-intent persistence failure stays non-fatal
+ * (exit code unchanged) even under close_degraded_exit_mode='strict' — only
+ * VISIBILITY changes, not the exit contract.
+ *
  * @param {object} db         - StoragePort adapter (Postgres or SQLite).
  * @param {string} projectId  - project UUID.
  * @param {object} payload    - close payload (tldr, open_threads, quick_references, session_id).
  * @param {string} [projectBasename] - path.basename(root) for tldr/quick_reference subjects.
+ * @returns {Promise<Array<{predicate: string, subject: string, message: string}>>}
  */
 async function persistSessionIntent(db, projectId, payload, projectBasename) {
+  const divergences = [];
   const sessionId = (typeof payload.session_id === 'string' && payload.session_id.length > 0)
     ? payload.session_id
     : null;
@@ -4550,8 +4589,15 @@ async function persistSessionIntent(db, projectId, payload, projectBasename) {
       process.stderr.write(
         `[handoff] persistSessionIntent failed for predicate "${intent.predicate}" (non-fatal): ${err.message}\n`
       );
+      divergences.push({
+        predicate: intent.predicate,
+        subject: intent.subject,
+        message: err.message,
+      });
     }
   }
+
+  return divergences;
 }
 
 /**
@@ -4685,14 +4731,32 @@ async function writeExtraction(db, projectId, payload, opts) {
 
   // Persist session-driving intent (open_threads, tldr, quick_references) as queryable PG rows.
   // Non-fatal: any error inside persistSessionIntent is caught and logged per-row.
+  // cm#227: per-row failures are also collected and surfaced to the caller as
+  // intentDivergences — see persistSessionIntent's own header comment.
+  let intentDivergences = [];
   try {
     const projectBasename = (opts && opts.projectBasename) ? opts.projectBasename : null;
-    await persistSessionIntent(db, projectId, payload, projectBasename);
+    intentDivergences = await persistSessionIntent(db, projectId, payload, projectBasename);
   } catch (intentErr) {
     process.stderr.write(`[handoff] persistSessionIntent outer error (non-fatal): ${intentErr.message}\n`);
+    intentDivergences = [{ predicate: '(unknown)', subject: '(unknown)', message: intentErr.message }];
   }
 
-  return { entitiesWritten, assertionsWritten, edgesWritten };
+  return { entitiesWritten, assertionsWritten, edgesWritten, intentDivergences };
+}
+
+/**
+ * cm#227: build the `DIVERGENCE: <predicate> NOT PERSISTED — <first line>` lines
+ * for a list of persistSessionIntent divergences, shared by the close/checkpoint
+ * console summary and the handoff.md Degraded section.
+ * @param {Array<{predicate:string, subject:string, message:string}>} divergences
+ * @returns {string[]}
+ */
+function formatIntentDivergenceLines(divergences) {
+  return (divergences || []).map((d) => {
+    const firstLine = String(d.message || '').split('\n')[0];
+    return `DIVERGENCE: ${d.predicate} NOT PERSISTED — ${firstLine}`;
+  });
 }
 
 /** Run reranker precision@5 gate check. Informational — never blocking. */
@@ -4945,6 +5009,15 @@ async function cmdCheckpoint(args) {
   assertionsWritten = extraction.assertionsWritten;
   edgesWritten      = extraction.edgesWritten;
 
+  // cm#227: surface any session-intent (session_tldr/open_thread/quick_reference)
+  // persistence failure as a DIVERGENCE line — both in the console summary below
+  // and in handoff.md's Degraded section. Non-fatal: exit code is unchanged.
+  const intentDivergences     = extraction.intentDivergences || [];
+  const divergenceLines       = formatIntentDivergenceLines(intentDivergences);
+  const checkpointDegradedSection = divergenceLines.length > 0
+    ? '\n\n## Degraded\n' + divergenceLines.map((l) => `- ${l}`).join('\n')
+    : '';
+
   // Update handoff.md
   const stamp = new Date().toISOString();
   writeHandoffMd(handoffPath, {
@@ -4958,7 +5031,7 @@ async function cmdCheckpoint(args) {
     TLDR:                payload.tldr || '(checkpoint)',
     OPEN_THREADS:        (payload.open_threads || []).map((t) => `- ${t}`).join('\n') || '- (none)',
     QUICK_REFERENCES:    payload.quick_references || '(none)',
-    DEGRADED_SECTION:    '',
+    DEGRADED_SECTION:    checkpointDegradedSection,
     RECONCILIATION_SECTION: '',
   });
 
@@ -4975,6 +5048,9 @@ async function cmdCheckpoint(args) {
   console.log(`\n  entities written:    ${entitiesWritten}`);
   console.log(`  assertions written:  ${assertionsWritten}`);
   console.log(`  edges written:       ${edgesWritten}`);
+  for (const line of divergenceLines) {
+    console.log(`  ${line}`);
+  }
   console.log(`\nDone: handoff:checkpoint — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written (session marker preserved for continued attribution)`);
 }
 
@@ -5592,8 +5668,14 @@ async function cmdClose(args) {
   }
 
   // ── Synchronous path (default) — unchanged behavior ──────────────────────────
-  const { entitiesWritten, assertionsWritten, edgesWritten } =
+  const { entitiesWritten, assertionsWritten, edgesWritten, intentDivergences } =
     await writeExtraction(db, projectId, payload, { projectBasename: path.basename(root) });
+  // cm#227: DIVERGENCE lines for any session_tldr/open_thread/quick_reference
+  // persistence failure — surfaced below in the Done summary AND rendered into
+  // handoff.md's Degraded section. Kept separate from _degradedSubsystems (below)
+  // on purpose: this must never affect close_degraded_exit_mode='strict' — only
+  // visibility changes, never the exit code.
+  const intentDivergenceLines = formatIntentDivergenceLines(intentDivergences);
 
   // Surface CLAUDE.md promotion candidates (conf >= 9, user_stated, multi-session).
   // Hole A fix: col-minus-col epoch difference now goes through a port method so both
@@ -6157,10 +6239,17 @@ async function cmdClose(args) {
   // When no contradictions are detected, RECONCILIATION_SECTION is '' and the
   // rendered output is byte-identical to what it would be without the gate.
   {
-    const degradedSection = _degradedSubsystems.length > 0
-      ? '\n\n## Degraded\n' + _degradedSubsystems.map(
-          (d) => `- ${d.subsystem} ${d.reason}`
-        ).join('\n')
+    // cm#227: intentDivergenceLines are appended to the SAME rendered ## Degraded
+    // section text but are deliberately NOT added to _degradedSubsystems itself —
+    // _degradedSubsystems drives the close_degraded_exit_mode='strict' exit-code
+    // gate below, and a session-intent persistence failure must remain non-fatal
+    // (visibility only, exit code unchanged) regardless of exit mode.
+    const degradedLines = [
+      ..._degradedSubsystems.map((d) => `- ${d.subsystem} ${d.reason}`),
+      ...intentDivergenceLines.map((l) => `- ${l}`),
+    ];
+    const degradedSection = degradedLines.length > 0
+      ? '\n\n## Degraded\n' + degradedLines.join('\n')
       : '';
 
     // Contradiction gate — soft-inject only; never blocks close.
@@ -6300,6 +6389,13 @@ async function cmdClose(args) {
   console.log(`  assertions written:  ${assertionsWritten}`);
   console.log(`  edges written:       ${edgesWritten}`);
   console.log(`  contract:            updated`);
+
+  // cm#227: any session_tldr/open_thread/quick_reference persistence failure —
+  // non-fatal (exit code unchanged), but must never be silently invisible in
+  // the close summary (see also the ## Degraded section in handoff.md above).
+  for (const line of intentDivergenceLines) {
+    console.log(`  ${line}`);
+  }
 
   // Extraction-empty warning (non-fatal, does not block the close or change
   // the exit code). Detection uses extractionEmptyAtEntry — the snapshot
@@ -7044,7 +7140,7 @@ async function cmdQueueDrain(args) {
     }
 
     try {
-      const { entitiesWritten, assertionsWritten, edgesWritten } =
+      const { entitiesWritten, assertionsWritten, edgesWritten, intentDivergences } =
         await writeExtraction(db, projectId, payloadToWrite, {
           projectBasename: path.basename(findProjectRoot()),
         });
@@ -7063,6 +7159,12 @@ async function cmdQueueDrain(args) {
         `  [done] row ${rowId} (source=${row.source_ref || 'null'}): ` +
         `${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written${skipNote}`
       );
+      // cm#227: surface session-intent persistence failures here too — this row's
+      // close/checkpoint already reported "done" via queue-drain, so this is the
+      // only place its DIVERGENCE would otherwise be visible.
+      for (const line of formatIntentDivergenceLines(intentDivergences)) {
+        console.log(`    ${line}`);
+      }
       doneCount++;
     } catch (writeErr) {
       // Mark error; do not rethrow — one bad row never blocks the queue.

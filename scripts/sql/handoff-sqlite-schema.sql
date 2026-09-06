@@ -225,8 +225,19 @@ UPDATE assertions
   WHERE predicate = 'are_safe_outside_claude-memory';
 
 -- 1:N exact-duplicate index
+--
+-- cm#227: written as md5(object), matching handoff-core-schema.sql's
+-- text verbatim, for structural parity between the two dialect files.
+-- SQLite has neither a built-in md5() function nor Postgres's btree
+-- row-size cap that motivated the md5() wrap on the Postgres side (SQLite
+-- has no analogous index-key-size ceiling for this shape), so
+-- scripts/lib/db-seam.js's rewriteForSQLite() strips the md5(...) wrapper
+-- back down to the bare column before this DDL ever reaches better-sqlite3
+-- — see the "md5(col) -> col" rewrite rule there. The index therefore
+-- enforces uniqueness on the raw object column on SQLite, unchanged from
+-- pre-cm#227 behavior (SQLite was never affected by the defect this closes).
 CREATE UNIQUE INDEX IF NOT EXISTS assertions_1ton_exact_unique
-  ON assertions (project_id, subject, predicate, object)
+  ON assertions (project_id, subject, predicate, md5(object))
   WHERE suppressed = 0;
 
 
