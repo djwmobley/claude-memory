@@ -48,6 +48,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 const { createRequire } = require('module');
 
@@ -55,11 +56,13 @@ const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
 const MIGRATE_ONE_PATH = path.join(PROJECT_ROOT, 'scripts', 'migrations', 'migrate-01-canonical-db.js');
 const ADDENDA_PATH = path.join(PROJECT_ROOT, 'scripts', 'migrations', 'migrate-schema-addenda.js');
 const MIGRATE08_PATH = path.join(PROJECT_ROOT, 'scripts', 'migrations', 'migrate-08-handoff-markdown.js');
+const CORE_SCHEMA_SQL_PATH = path.join(PROJECT_ROOT, 'scripts', 'sql', 'handoff-core-schema.sql');
 
 const scriptsRequire = createRequire(require.resolve('../../scripts/package.json'));
 const { Client } = scriptsRequire('pg');
 
 const { normalizeFsPath } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'fs-path-normalize.js'));
+const handoffModule = require(path.join(PROJECT_ROOT, 'scripts', 'handoff.js'));
 
 const TS = Date.now();
 
@@ -117,8 +120,51 @@ async function setupTargetSchema(dbName) {
   if (r2.status !== 0) throw new Error(`schema-addenda fixture setup failed: status=${r2.status} stderr=${r2.stderr}`);
 }
 
+// ── PER_PROJECT_ENGINE fixture (item B / #251 follow-up) ──────────────────────────
+//
+// Provisions a scratch DB carrying ONLY scripts/sql/handoff-core-schema.sql
+// (ENGINE_CANON) — deliberately NEVER migrate-schema-addenda.js, so
+// carryover_status (ADDENDA_ONLY) never lands here — plus a project_settings
+// marker row at the current SCHEMA_EPOCH, mirroring what classifyTarget()'s
+// probeProjectMarker() requires to return PER_PROJECT_ENGINE, allowed:true
+// (see probeProjectMarker in migrate-01-canonical-db.js and its own
+// test-migrate-01.js T16-T24 for the identical fixture-construction
+// pattern this reuses). The fingerprint's hash half is never validated by
+// the probe — only the epoch — so a placeholder hash is used here exactly
+// as test-migrate-01.js's own T21-T23 do.
+async function setupPerProjectEngineTarget(dbName, projectId) {
+  const schemaSql = fs.readFileSync(CORE_SCHEMA_SQL_PATH, 'utf8');
+  const client = await pgConnect(dbName);
+  try {
+    await client.query(schemaSql);
+    await client.query(
+      `INSERT INTO project_settings (project_id, key, value) VALUES ($1, 'schema_fingerprint', $2)
+         ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
+      [projectId, `${handoffModule.SCHEMA_EPOCH}:${'0'.repeat(64)}`]
+    );
+  } finally {
+    await client.end();
+  }
+}
+
+async function assertionColumnExists(dbName, columnName) {
+  const client = await pgConnect(dbName);
+  try {
+    const { rows } = await client.query(
+      `SELECT 1 FROM information_schema.columns WHERE table_name='assertions' AND column_name=$1`,
+      [columnName]
+    );
+    return rows.length > 0;
+  } finally {
+    await client.end();
+  }
+}
+
 const DB_TARGET = `verify08_target_${TS}_staging`;
-const CREATED_DBS = [DB_TARGET];
+// Deliberately does NOT end in "_staging" and is not "memory_manager" — must
+// fall through classifyTarget()'s name-only branches into the marker probe.
+const DB_ENGINE = `verify08_engine_${TS}`;
+const CREATED_DBS = [DB_TARGET, DB_ENGINE];
 
 const SCRATCH_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'migrate08-fixtures-'));
 
@@ -525,7 +571,10 @@ async function main() {
     const sysB = await pgConnect('postgres');
     await sysB.query(`CREATE DATABASE "${dbBare}"`);
     await sysB.end();
-    const r1 = runMigrateOne(['--db', dbBare]); // migrate-01 ONLY — no schema-addenda, so source_model/carryover_status are missing
+    // migrate-01 ONLY — no schema-addenda. handoff-core-schema.sql (applied
+    // by migrate-01 itself) already carries source_model; carryover_status
+    // is migrate-06-carryover-status.sql, ADDENDA_ONLY, never applied here.
+    const r1 = runMigrateOne(['--db', dbBare]);
     if (r1.status !== 0) throw new Error(`migrate-01 bare fixture setup failed: status=${r1.status} stderr=${r1.stderr}`);
 
     const projectG = `example-project-eta-${TS}`;
@@ -537,6 +586,131 @@ async function main() {
     const report = readReportFile(reportScratchDir, projectG);
     assertEq(report.precondition_checks.assertions_table, 'pass', 'assertions table itself exists after migrate-01');
     assertEq(report.precondition_checks.required_columns, 'fail', 'required_columns should FAIL on a migrate-01-only target, never silently pass');
+    // item B / #251 follow-up: a STAGING (CANON-like) target's required-columns set
+    // is NEVER loosened by the PER_PROJECT_ENGINE branch-awareness fix —
+    // carryover_status is still required here, and is exactly what's missing.
+    assertEq(report.precondition_checks.required_columns_list.slice().sort().join(','), 'carryover_status,source_model', 'CANON/STAGING required_columns_list must remain [source_model, carryover_status] — unchanged by this fix');
+    assertEq(report.precondition_checks.missing_columns.join(','), 'carryover_status', 'expected ONLY carryover_status missing on a migrate-01-only STAGING target (source_model is ENGINE_CANON, already present)');
+  });
+
+  // ── T9d-T9h: item B / #251 follow-up — PER_PROJECT_ENGINE branch-aware preconditions ──
+  //
+  // A scratch DB provisioned from scripts/sql/handoff-core-schema.sql ONLY
+  // (never migrate-schema-addenda.js) plus a positive project_settings
+  // marker at the current SCHEMA_EPOCH — exactly the shape of a real
+  // pipeline_pwa_etl-style per-project engine DB post-#251. This is the
+  // scenario the ground-truth diagnosis found migrate-08 always refused
+  // before this fix (carryover_status required unconditionally).
+  const PROJECT_ENGINE = crypto.randomUUID();
+
+  await run('T9d', 'item B / #251 follow-up: PER_PROJECT_ENGINE target provisioned from scripts/sql ONLY — dry-run precondition PASSES (previously always FAILed here)', async () => {
+    await dropDb(DB_ENGINE);
+    const sys = await pgConnect('postgres');
+    await sys.query(`CREATE DATABASE "${DB_ENGINE}"`);
+    await sys.end();
+    await setupPerProjectEngineTarget(DB_ENGINE, PROJECT_ENGINE);
+
+    // Ground truth: carryover_status must genuinely be absent from this
+    // fixture, or this test would not be exercising the bug it targets.
+    assert(!(await assertionColumnExists(DB_ENGINE, 'carryover_status')), 'fixture bug: carryover_status must be absent from a scripts/sql-only engine DB');
+    assert(await assertionColumnExists(DB_ENGINE, 'source_model'), 'fixture bug: source_model (ENGINE_CANON) must be present after handoff-core-schema.sql alone');
+
+    const reportScratchDir = path.join(SCRATCH_DIR, 'reports-t9d');
+    const r = runMigrate08(['--db', DB_ENGINE, '--project-id', PROJECT_ENGINE, '--file', activeFilePath, '--dry-run', '--report-dir', reportScratchDir]);
+    if (r.status !== 0) throw new Error(`PER_PROJECT_ENGINE dry-run failed: status=${r.status}\nstdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert(/DRY_RUN_RESULT: PASS/.test(r.stdout), `expected DRY_RUN_RESULT: PASS; got:\n${r.stdout}`);
+    assert(/branch=PER_PROJECT_ENGINE/.test(r.stdout), 'expected the resolved branch to be logged as PER_PROJECT_ENGINE');
+
+    const report = readReportFile(reportScratchDir, PROJECT_ENGINE);
+    assertEq(report.precondition_checks.assertions_table, 'pass', 'assertions table exists');
+    assertEq(report.precondition_checks.required_columns, 'pass', 'PER_PROJECT_ENGINE required_columns must PASS without carryover_status');
+    assert(!report.precondition_checks.required_columns_list.includes('carryover_status'), 'PER_PROJECT_ENGINE required_columns_list must never include carryover_status (ADDENDA_ONLY)');
+    assertEq(report.omitted_columns.join(','), 'carryover_status', 'report should name carryover_status as the omitted ADDENDA_ONLY column');
+  });
+
+  await run('T9e', 'item B / #251 follow-up: PER_PROJECT_ENGINE write succeeds; carryover_status is omitted from the INSERT (never NULL-padded, never ALTERed into existence)', async () => {
+    const r = runMigrate08(['--db', DB_ENGINE, '--project-id', PROJECT_ENGINE, '--file', activeFilePath, '--history-file', historyFilePath]);
+    if (r.status !== 0) throw new Error(`PER_PROJECT_ENGINE write failed: status=${r.status}\nstdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert(/MIGRATION_RESULT: PASS/.test(r.stdout), 'expected MIGRATION_RESULT: PASS');
+    assert(/branch=PER_PROJECT_ENGINE omitted_columns=\[carryover_status\]/.test(r.stdout), 'expected the omitted_columns log line naming carryover_status');
+
+    assert(!(await assertionColumnExists(DB_ENGINE, 'carryover_status')), 'the write path must never ALTER carryover_status into existence on a PER_PROJECT_ENGINE target');
+
+    const client = await pgConnect(DB_ENGINE);
+    try {
+      const { rows } = await client.query(
+        `SELECT subject, predicate, object, pinned, seq, authoring_mode, source_model, tier, created_at FROM assertions WHERE project_id=$1`,
+        [PROJECT_ENGINE]
+      );
+      assert(rows.length > 0, 'no rows were written to the PER_PROJECT_ENGINE target');
+      assert(rows.every((r2) => r2.source_model === 'markdown-migration-h'), 'ENGINE_CANON column source_model must still be written correctly');
+      assert(rows.some((r2) => r2.predicate === 'open_thread'), 'expected at least one open_thread row (the row whose carryoverStatus value is now dropped, not NULL-padded)');
+    } finally {
+      await client.end();
+    }
+  });
+
+  await run('T9f', 'item B / #251 follow-up: PER_PROJECT_ENGINE re-run is idempotent (delete-and-reinsert, no accretion)', async () => {
+    const client = await pgConnect(DB_ENGINE);
+    let before;
+    try {
+      before = (await client.query(`SELECT COUNT(*)::int AS n FROM assertions WHERE project_id=$1`, [PROJECT_ENGINE])).rows[0].n;
+    } finally {
+      await client.end();
+    }
+    const r = runMigrate08(['--db', DB_ENGINE, '--project-id', PROJECT_ENGINE, '--file', activeFilePath, '--history-file', historyFilePath]);
+    if (r.status !== 0) throw new Error(`PER_PROJECT_ENGINE re-run failed: status=${r.status}\nstderr=${r.stderr}`);
+    const client2 = await pgConnect(DB_ENGINE);
+    try {
+      const after = (await client2.query(`SELECT COUNT(*)::int AS n FROM assertions WHERE project_id=$1`, [PROJECT_ENGINE])).rows[0].n;
+      assertEq(after, before, 'PER_PROJECT_ENGINE re-run with unchanged content changed the row count (accretion bug)');
+    } finally {
+      await client2.end();
+    }
+  });
+
+  await run('T9g', 'item B / #251 follow-up: PER_PROJECT_ENGINE target missing an ENGINE_CANON column (source_model) fails, naming it', async () => {
+    const dbDrifted = `verify08_drifted_${TS}`;
+    CREATED_DBS.push(dbDrifted);
+    await dropDb(dbDrifted);
+    const sys = await pgConnect('postgres');
+    await sys.query(`CREATE DATABASE "${dbDrifted}"`);
+    await sys.end();
+    const projectDrifted = crypto.randomUUID();
+    await setupPerProjectEngineTarget(dbDrifted, projectDrifted);
+    // Simulate schema drift: a per-project engine DB whose schema_fingerprint
+    // marker claims "current" but is actually missing an ENGINE_CANON column
+    // (see the PR body's "pass-but-shouldn't" construction for why the
+    // fingerprint marker alone is not a content guarantee).
+    const client = await pgConnect(dbDrifted);
+    try {
+      await client.query('ALTER TABLE assertions DROP COLUMN source_model');
+    } finally {
+      await client.end();
+    }
+
+    const reportScratchDir = path.join(SCRATCH_DIR, 'reports-t9g');
+    const r = runMigrate08(['--db', dbDrifted, '--project-id', projectDrifted, '--file', activeFilePath, '--dry-run', '--report-dir', reportScratchDir]);
+    assertEq(r.status, 1, 'dry-run against a PER_PROJECT_ENGINE target missing an ENGINE_CANON column should exit 1 (FAIL)');
+    assert(/DRY_RUN_RESULT: FAIL/.test(r.stdout + r.stderr), 'expected DRY_RUN_RESULT: FAIL');
+
+    const report = readReportFile(reportScratchDir, projectDrifted);
+    assertEq(report.precondition_checks.required_columns, 'fail', 'required_columns must FAIL when an ENGINE_CANON column is missing');
+    assertEq(report.precondition_checks.missing_columns.join(','), 'source_model', 'missing_columns must name source_model specifically');
+  });
+
+  await run('T9h', 'item B / #251 follow-up: requiredColumnsForBranch() throws a hard error for any branch other than CANON/STAGING/PER_PROJECT_ENGINE', () => {
+    const migrate08 = require(MIGRATE08_PATH);
+    for (const bogusBranch of ['SOURCE_ONLY', 'UNKNOWN', 'NOT_A_REAL_BRANCH', undefined, null]) {
+      let threw = false;
+      try {
+        migrate08.requiredColumnsForBranch(bogusBranch);
+      } catch (err) {
+        threw = true;
+        assert(/unreachable branch/.test(err.message), `expected an "unreachable branch" error message for ${JSON.stringify(bogusBranch)}, got: ${err.message}`);
+      }
+      assert(threw, `requiredColumnsForBranch(${JSON.stringify(bogusBranch)}) should have thrown — SOURCE_ONLY/UNKNOWN are refused upstream and must never reach this function silently`);
+    }
   });
 
   // ── T10: cm#222 A5 — NEXT SESSION explicit states ────────────────────

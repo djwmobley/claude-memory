@@ -11,7 +11,45 @@
  * rows on a memory-manager consolidation target — the markdown-source
  * PEER of the SQL-source migrations (migrate-02 etc.), not an afterthought.
  *
- * cm#222 FIXES (this pass):
+ * PER-BRANCH PRECONDITION FIX (this pass, item B / #251 follow-up — the pwa-etl
+ * HANDOFF-HISTORY.md write, #251 having just made pipeline_pwa_etl classify
+ * PER_PROJECT_ENGINE instead of being name-refused):
+ *   checkSchemaPreconditions() is now BRANCH-AWARE. Every column this
+ *   script's INSERT writes into `assertions` falls into exactly one of
+ *   three buckets (see ENGINE_CANON_COLUMNS / ADDENDA_ONLY_COLUMNS /
+ *   SELF_BOOTSTRAPPED_COLUMNS below for the authoritative lists):
+ *     - ENGINE_CANON:      defined in scripts/sql/handoff-core-schema.sql —
+ *                          applied to every engine DB (CANON, STAGING, and
+ *                          every PER_PROJECT_ENGINE target) by ensureSchemaCurrent.
+ *     - ADDENDA_ONLY:      defined only under scripts/migrations/sql/ (here:
+ *                          carryover_status, migrate-06-carryover-status.sql)
+ *                          — applied by migrate-schema-addenda.js to CANON/
+ *                          STAGING consolidation targets ONLY. A per-project
+ *                          engine DB (schema = handoff-core-schema.sql alone)
+ *                          never carries this column, and never will just by
+ *                          running the engine — so requiring it there was a
+ *                          precondition bug, not a real prerequisite.
+ *     - SELF_BOOTSTRAPPED: seq, authoring_mode — present in NEITHER schema
+ *                          root; this script bundles its own idempotent
+ *                          `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` for
+ *                          both (DDL_PREAMBLE_SQL, below) and runs it before
+ *                          every write, on every branch. Never a precondition
+ *                          (was not one before this fix either).
+ *   CANON/STAGING preconditions are UNCHANGED (require source_model AND
+ *   carryover_status, exactly as before this fix — no loosening).
+ *   PER_PROJECT_ENGINE now requires exactly the ENGINE_CANON columns this
+ *   script writes (not ADDENDA_ONLY) — see requiredColumnsForBranch().
+ *   The write path (writeProjectMigration) is likewise branch-aware: on
+ *   PER_PROJECT_ENGINE it omits ADDENDA_ONLY columns (carryover_status) from
+ *   the INSERT's column list entirely — never written, never NULL-padded —
+ *   and both --dry-run and MIGRATE mode report the omission plus the
+ *   required-columns set that was actually checked, per branch.
+ *   Any classifyTarget() branch other than CANON/STAGING/PER_PROJECT_ENGINE
+ *   reaching checkSchemaPreconditions() is a hard internal error (SOURCE_ONLY
+ *   and UNKNOWN are already refused upstream, before a connection to run
+ *   this check is even opened) — see the throw in requiredColumnsForBranch().
+ *
+ * cm#222 FIXES (prior pass):
  *   A1 — a TRUE `--dry-run`: zero DDL/INSERT/UPDATE/DELETE. With `--db`,
  *        runs ONLY the two read-only schema-precondition SELECTs and
  *        reports PASS/FAIL for each (never silently "assumed OK" — F-9).
@@ -147,6 +185,86 @@ const DDL_PREAMBLE_SQL = [
   "ALTER TABLE assertions ADD COLUMN IF NOT EXISTS authoring_mode TEXT CHECK (authoring_mode IN ('caveman','verbose'))",
 ];
 
+// ─── COLUMN CLASSIFICATION (this migration's own INSERT column list) ─────
+//
+// Every column writeProjectMigration() inserts into `assertions` falls into
+// exactly one of these three buckets — see the header comment above for the
+// full rationale. This is a closed, hand-verified enumeration (not derived
+// by introspection) because it must stay in lockstep with the literal
+// column list in writeProjectMigration()'s INSERT statement below; a
+// column added there without being added here would silently escape both
+// the branch-aware precondition check and the omission logic below —
+// test-migrate-08-handoff-markdown.js's PER_PROJECT_ENGINE tests exercise
+// the full round trip (precondition pass, write, and re-read) against a
+// scratch DB carrying ONLY ENGINE_CANON columns to catch that drift.
+//
+// ENGINE_CANON — defined in scripts/sql/handoff-core-schema.sql, present on
+// every engine DB regardless of branch (CANON, STAGING, PER_PROJECT_ENGINE).
+const ENGINE_CANON_COLUMNS = [
+  'project_id', 'subject', 'predicate', 'object', 'confidence',
+  'source', 'tier', 'pinned', 'source_model', 'created_at',
+];
+// ADDENDA_ONLY — defined ONLY under scripts/migrations/sql/ (here:
+// migrate-06-carryover-status.sql), applied by migrate-schema-addenda.js to
+// CANON/STAGING consolidation targets only. Never present on a bare
+// PER_PROJECT_ENGINE schema (handoff-core-schema.sql alone).
+const ADDENDA_ONLY_COLUMNS = ['carryover_status'];
+// SELF_BOOTSTRAPPED — present in NEITHER schema root; this script's own
+// DDL_PREAMBLE_SQL (above) idempotently adds both before every write, on
+// every branch. Never a schema precondition (unaffected by this fix).
+const SELF_BOOTSTRAPPED_COLUMNS = ['seq', 'authoring_mode'];
+
+/**
+ * requiredColumnsForBranch — the total classification (spec item 2): every
+ * classifyTarget() branch that can reach this function maps to exactly one
+ * required-columns list.
+ *   - CANON | STAGING        -> ENGINE_CANON ∪ ADDENDA_ONLY's subset this
+ *                               script actually checked before this fix
+ *                               (source_model, carryover_status) — UNCHANGED,
+ *                               never loosened.
+ *   - PER_PROJECT_ENGINE     -> exactly the ENGINE_CANON columns this
+ *                               migration writes. ADDENDA_ONLY is NOT
+ *                               required (carryover_status is a
+ *                               consolidation-only column; a per-project
+ *                               engine target never gets it just by running
+ *                               the engine, so requiring it here was a
+ *                               precondition bug, not a real prerequisite).
+ *   - anything else          -> hard error. SOURCE_ONLY and UNKNOWN are
+ *                               already refused by classifyTarget() before a
+ *                               connection is ever opened to run this check
+ *                               — reaching this branch here means an
+ *                               upstream refusal was skipped, which must
+ *                               never happen silently.
+ *
+ * @param {string} branch
+ * @returns {string[]}
+ */
+function requiredColumnsForBranch(branch) {
+  if (branch === 'CANON' || branch === 'STAGING') {
+    return ['source_model', 'carryover_status'];
+  }
+  if (branch === 'PER_PROJECT_ENGINE') {
+    return ENGINE_CANON_COLUMNS.slice();
+  }
+  throw new Error(
+    `requiredColumnsForBranch: unreachable branch "${branch}" — SOURCE_ONLY/UNKNOWN ` +
+    'are refused by classifyTarget() upstream, before checkSchemaPreconditions() is ever called.'
+  );
+}
+
+/**
+ * omittedColumnsForBranch — the ADDENDA_ONLY columns this migration's write
+ * path leaves out of the INSERT column list entirely on PER_PROJECT_ENGINE
+ * (never written, never NULL-padded). Empty on CANON/STAGING (unchanged
+ * write behavior there).
+ *
+ * @param {string} branch
+ * @returns {string[]}
+ */
+function omittedColumnsForBranch(branch) {
+  return branch === 'PER_PROJECT_ENGINE' ? ADDENDA_ONLY_COLUMNS.slice() : [];
+}
+
 // Logical manifest slice names (source_table).
 const SLICE_NAMES = {
   ACTIVE_SESSION_SUMMARY: 'handoff_active_session_summary',
@@ -209,7 +327,9 @@ function printUsage() {
     '  --headings-config <p>  Durable-section headings config (default: handoff-section-headings.json).',
     '  --authoring-mode <m>   "caveman" or "verbose" — tags every row this run writes (default: verbose).',
     '  --dry-run              Parse + report only. Zero DDL/INSERT/UPDATE/DELETE. With --db, runs only',
-    '                         the two read-only schema-precondition checks. Mutually exclusive with --rollback.',
+    '                         the read-only schema-precondition checks (branch-aware — CANON/STAGING require',
+    '                         source_model+carryover_status; PER_PROJECT_ENGINE requires only the ENGINE_CANON',
+    '                         columns this script writes, never carryover_status). Mutually exclusive with --rollback.',
     '  --rollback             Delete this project\'s migrated rows + manifest slices instead of migrating.',
     '  --report-dir <path>    Directory for the per-project fail-soft parse report (default: ./reports).',
   ].join('\n'));
@@ -541,9 +661,22 @@ function computeContentFingerprint(rowsOrderedForHash) {
 /**
  * writeProjectMigration — the H-6 whole-project delete-and-reinsert.
  *
+ * branch-aware (spec item 3): on PER_PROJECT_ENGINE, ADDENDA_ONLY columns
+ * (carryover_status) are omitted from the INSERT's column list entirely —
+ * never written, never NULL-padded as a placeholder — because that column
+ * does not exist on a bare per-project engine schema. This is the ONLY
+ * caller that hard-codes the assertions column list for this migration; it
+ * is not routed through any shared writer (writeAssertionWithSupersession
+ * in handoff.js is a live runtime writer used by close/checkpoint, never
+ * called by this script), so the branch-aware column list lives here, not
+ * behind a shared-writer option flag.
+ *
  * @param {Array<{sourceDb, sourceTable, rows}>} slices
+ * @param {string} branch - classifyTarget() branch ('CANON'|'STAGING'|'PER_PROJECT_ENGINE')
  */
-async function writeProjectMigration(tgtClient, { projectId, authoringMode, slices }) {
+async function writeProjectMigration(tgtClient, { projectId, authoringMode, slices, branch }) {
+  const includeCarryoverStatus = !omittedColumnsForBranch(branch).includes('carryover_status');
+
   await tgtClient.query('BEGIN');
   let totalWritten = 0;
   try {
@@ -554,16 +687,24 @@ async function writeProjectMigration(tgtClient, { projectId, authoringMode, slic
 
     for (const slice of slices) {
       for (const row of slice.rows) {
+        const cols = ['project_id', 'subject', 'predicate', 'object', 'confidence', 'source', 'tier', 'pinned'];
+        const vals = [
+          projectId, row.subject, row.predicate, row.object, DEFAULT_CONFIDENCE, SOURCE_VALUE, TIER_VALUE, !!row.pinned,
+        ];
+        if (includeCarryoverStatus) {
+          cols.push('carryover_status');
+          vals.push(row.carryoverStatus || null);
+        }
+        cols.push('seq', 'source_model', 'authoring_mode', 'created_at');
+        vals.push(row.seq ?? null, SOURCE_MODEL_TAG, authoringMode, row.createdAt || null);
+        // cols[] and vals[] are built in lockstep above, so index i in one is
+        // always index i in the other — the last column (created_at) is the
+        // one exception, COALESCE'd to now() rather than bound raw.
+        const lastIdx = vals.length; // 1-indexed position of created_at's placeholder
+        const placeholders = cols.map((c, i) => (c === 'created_at' ? `COALESCE($${lastIdx}, now())` : `$${i + 1}`));
         await tgtClient.query(
-          `INSERT INTO assertions
-             (project_id, subject, predicate, object, confidence, source, tier,
-              pinned, carryover_status, seq, source_model, authoring_mode, created_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, COALESCE($13, now()))`,
-          [
-            projectId, row.subject, row.predicate, row.object, DEFAULT_CONFIDENCE, SOURCE_VALUE, TIER_VALUE,
-            !!row.pinned, row.carryoverStatus || null, row.seq ?? null, SOURCE_MODEL_TAG, authoringMode,
-            row.createdAt || null,
-          ]
+          `INSERT INTO assertions (${cols.join(', ')}) VALUES (${placeholders.join(',')})`,
+          vals
         );
         totalWritten += 1;
       }
@@ -639,31 +780,61 @@ async function runRollback(tgtClient, projectId) {
 
 /**
  * checkSchemaPreconditions — the two read-only SELECTs both MIGRATE mode
- * and --dry-run mode (with --db) run: the "assertions" table exists, and
- * it carries source_model + carryover_status. Never mutates anything.
+ * and --dry-run mode (with --db) run: the "assertions" table exists, and it
+ * carries this branch's required columns (requiredColumnsForBranch(branch)).
+ * Never mutates anything.
  *
- * @returns {{assertionsTable:'pass'|'fail', requiredColumns:'pass'|'fail'|'not_checked'}}
+ * Branch-aware (item B / #251 follow-up, spec item 2): CANON/STAGING keep the
+ * original two-column check (source_model, carryover_status) unchanged —
+ * never loosened. PER_PROJECT_ENGINE checks the full ENGINE_CANON list this
+ * migration writes, and does NOT require carryover_status (an ADDENDA_ONLY
+ * column that a bare per-project engine schema never has). Any other branch
+ * throws — requiredColumnsForBranch() is the single source of truth for
+ * that total classification.
+ *
+ * @param {object} tgtClient
+ * @param {string} branch - classifyTarget() branch
+ * @returns {{assertionsTable:'pass'|'fail', requiredColumns:'pass'|'fail'|'not_checked', requiredColumnsList:string[], missingColumns:string[]}}
  */
-async function checkSchemaPreconditions(tgtClient) {
+async function checkSchemaPreconditions(tgtClient, branch) {
+  const requiredColumnsList = requiredColumnsForBranch(branch); // throws on an unreachable branch (spec item 2)
+
   const { rows: tblRows } = await tgtClient.query(
     `SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'assertions' AND table_type = 'BASE TABLE'`
   );
   if (tblRows.length === 0) {
-    return { assertionsTable: 'fail', requiredColumns: 'not_checked' };
+    return { assertionsTable: 'fail', requiredColumns: 'not_checked', requiredColumnsList, missingColumns: requiredColumnsList.slice() };
   }
-  const { rows: reqCols } = await tgtClient.query(
-    `SELECT column_name FROM information_schema.columns WHERE table_name='assertions' AND column_name IN ('source_model','carryover_status')`
+  const { rows: presentCols } = await tgtClient.query(
+    `SELECT column_name FROM information_schema.columns WHERE table_name='assertions' AND column_name = ANY($1::text[])`,
+    [requiredColumnsList]
   );
-  return { assertionsTable: 'pass', requiredColumns: reqCols.length >= 2 ? 'pass' : 'fail' };
+  const presentSet = new Set(presentCols.map((r) => r.column_name));
+  const missingColumns = requiredColumnsList.filter((c) => !presentSet.has(c));
+  return {
+    assertionsTable: 'pass',
+    requiredColumns: missingColumns.length === 0 ? 'pass' : 'fail',
+    requiredColumnsList,
+    missingColumns,
+  };
 }
 
 // ─── HUMAN-READABLE SUMMARY (cm#222 A1: dry-run emits this + the JSON) ────
 
-function printHumanSummary({ parsed, activeParsed, historyParsed, preconditionChecks }) {
+function printHumanSummary({ parsed, activeParsed, historyParsed, preconditionChecks, branch }) {
   console.log('--- handoff-markdown parse summary ---');
   console.log(`  mode: ${parsed.dryRun ? 'DRY-RUN' : (parsed.rollback ? 'ROLLBACK' : 'MIGRATE')}`);
   if (preconditionChecks) {
     console.log(`  schema preconditions: assertions_table=${preconditionChecks.assertionsTable} required_columns=${preconditionChecks.requiredColumns}`);
+    console.log(`  required_columns=[${preconditionChecks.requiredColumnsList.join(',')}] (branch=${branch})`);
+    if (preconditionChecks.missingColumns.length) {
+      console.log(`  missing_columns=[${preconditionChecks.missingColumns.join(',')}]`);
+    }
+    const omitted = omittedColumnsForBranch(branch);
+    if (omitted.length) {
+      console.log(`  branch=${branch} omitted_columns=[${omitted.join(',')}]`);
+      console.log('  (consolidation-only column(s); carryover rendering is not part of engine canon — omitted from the write on PER_PROJECT_ENGINE targets, never written as NULL)');
+    }
   } else {
     console.log('  schema preconditions: not_checked (no --db)');
   }
@@ -718,6 +889,7 @@ async function main() {
   // ── cm#222 A1: TRUE dry-run — parse + report, zero DDL/writes. ─────────
   if (parsed.dryRun) {
     let preconditionChecks = null;
+    let dbBranch = null;
     if (parsed.db) {
       const { name: target, source: targetSource } = migrateOne.resolveTargetDb({ db: parsed.db });
       if (!migrateOne.DB_NAME_RE.test(target)) {
@@ -749,11 +921,12 @@ async function main() {
           process.exit(1);
         }
       }
+      dbBranch = classification.branch;
       console.log(`migrate-08-handoff-markdown: DRY-RUN target="${target}" (resolved from ${targetSource}, branch=${classification.branch}) — read-only precondition checks only, zero writes`);
       const tgtClient = new Client(migrateOne.pgConfig(target));
       try {
         await tgtClient.connect();
-        preconditionChecks = await checkSchemaPreconditions(tgtClient);
+        preconditionChecks = await checkSchemaPreconditions(tgtClient, dbBranch);
       } catch (err) {
         console.error(`Could not connect to target database "${target}" for read-only precondition checks: ${err.message}`);
         process.exit(1);
@@ -787,9 +960,9 @@ async function main() {
     const historyParsed = historyFile.present ? parseFileIntoRows(historyFile.normalized.text, headingsConfig.headings, 'history', historyFile.normalized.flags) : null;
     const crossFileCollisions = computeCrossFileCollisions(activeParsed, historyParsed);
 
-    printHumanSummary({ parsed, activeParsed, historyParsed, preconditionChecks });
+    printHumanSummary({ parsed, activeParsed, historyParsed, preconditionChecks, branch: dbBranch });
 
-    const report = buildReport({ parsed, activeParsed, historyParsed, totalWritten: 0, crossFileCollisions, preconditionChecks, mode: 'dry_run' });
+    const report = buildReport({ parsed, activeParsed, historyParsed, totalWritten: 0, crossFileCollisions, preconditionChecks, mode: 'dry_run', branch: dbBranch });
     const reportPath = writeReport(parsed.reportDir, parsed.projectId, report);
     console.log(`  [REPORT] ${reportPath}`);
 
@@ -847,7 +1020,9 @@ async function main() {
 
   let exitCode = 0;
   try {
-    const preconditionChecks = await checkSchemaPreconditions(tgtClient);
+    const branch = classification.branch;
+    const preconditionChecks = await checkSchemaPreconditions(tgtClient, branch);
+    console.log(`  required_columns=[${preconditionChecks.requiredColumnsList.join(',')}] (branch=${branch})`);
     if (preconditionChecks.assertionsTable === 'fail') {
       console.error(`Refused: target "${target}" is missing the "assertions" table.`);
       console.error('Run migrate-01-canonical-db.js against this target first. Nothing was applied.');
@@ -855,10 +1030,20 @@ async function main() {
       return;
     }
     if (preconditionChecks.requiredColumns === 'fail') {
-      console.error(`Refused: target "${target}"'s "assertions" table is missing source_model and/or carryover_status.`);
-      console.error('Run migrate-schema-addenda.js against this target first (attribution-columns.sql + migrate-06-carryover-status.sql). Nothing was applied.');
+      console.error(`Refused: target "${target}"'s "assertions" table is missing required column(s): ${preconditionChecks.missingColumns.join(', ')}.`);
+      if (branch === 'PER_PROJECT_ENGINE') {
+        console.error('Run migrate-01-canonical-db.js (or let the engine\'s own ensureSchemaCurrent run) against this target first to bring the engine schema current. Nothing was applied.');
+      } else {
+        console.error('Run migrate-schema-addenda.js against this target first (attribution-columns.sql + migrate-06-carryover-status.sql). Nothing was applied.');
+      }
       process.exitCode = 1;
       return;
+    }
+
+    const omitted = omittedColumnsForBranch(branch);
+    if (omitted.length) {
+      console.log(`  branch=${branch} omitted_columns=[${omitted.join(',')}]`);
+      console.log('  (consolidation-only column(s); carryover rendering is not part of engine canon — omitted from the write on PER_PROJECT_ENGINE targets, never written as NULL)');
     }
 
     await shared.applyDdl(tgtClient); // migration_manifest + siblings, idempotent
@@ -918,7 +1103,7 @@ async function main() {
     }
 
     const { totalWritten } = await writeProjectMigration(tgtClient, {
-      projectId: parsed.projectId, authoringMode: parsed.authoringMode, slices,
+      projectId: parsed.projectId, authoringMode: parsed.authoringMode, slices, branch,
     });
     for (const slice of slices) {
       console.log(`  [OK] slice source_db="${slice.sourceDb}" source_table="${slice.sourceTable}": ${slice.rows.length} row(s)`);
@@ -947,7 +1132,7 @@ async function main() {
       }
     }
 
-    const report = buildReport({ parsed, activeParsed, historyParsed, totalWritten, crossFileCollisions, preconditionChecks, mode: 'migrate' });
+    const report = buildReport({ parsed, activeParsed, historyParsed, totalWritten, crossFileCollisions, preconditionChecks, mode: 'migrate', branch });
     const reportPath = writeReport(parsed.reportDir, parsed.projectId, report);
     console.log(`  [REPORT] ${reportPath}`);
 
@@ -1009,7 +1194,7 @@ function loadHeadingsConfig(configPath) {
 
 // ─── REPORT (base spec point 5, fail-soft; cm#222 A6 extension) ──────────
 
-function buildReport({ parsed, activeParsed, historyParsed, totalWritten, crossFileCollisions, preconditionChecks, mode }) {
+function buildReport({ parsed, activeParsed, historyParsed, totalWritten, crossFileCollisions, preconditionChecks, mode, branch }) {
   return {
     mode: mode || (parsed.dryRun ? 'dry_run' : (parsed.rollback ? 'rollback' : 'migrate')),
     project_id: parsed.projectId,
@@ -1018,9 +1203,18 @@ function buildReport({ parsed, activeParsed, historyParsed, totalWritten, crossF
     history_file: parsed.historyFile || null,
     authoring_mode: parsed.authoringMode,
     total_assertions_written: totalWritten,
+    branch: branch || null,
     precondition_checks: preconditionChecks
-      ? { assertions_table: preconditionChecks.assertionsTable, required_columns: preconditionChecks.requiredColumns }
-      : { assertions_table: 'not_checked', required_columns: 'not_checked' },
+      ? {
+        assertions_table: preconditionChecks.assertionsTable,
+        required_columns: preconditionChecks.requiredColumns,
+        required_columns_list: preconditionChecks.requiredColumnsList,
+        missing_columns: preconditionChecks.missingColumns,
+      }
+      : { assertions_table: 'not_checked', required_columns: 'not_checked', required_columns_list: [], missing_columns: [] },
+    // ADDENDA_ONLY columns this migration's write path omits from the
+    // INSERT column list on this branch (empty on CANON/STAGING).
+    omitted_columns: branch ? omittedColumnsForBranch(branch) : [],
     active: activeParsed ? activeParsed.report : null,
     history: historyParsed ? historyParsed.report : null,
     // H-6 cross-file collision events — null when either file was absent.
@@ -1058,6 +1252,8 @@ module.exports = {
   writeProjectMigration,
   runRollback,
   checkSchemaPreconditions,
+  requiredColumnsForBranch,
+  omittedColumnsForBranch,
   loadHeadingsConfig,
   buildReport,
   toSessionAssertionRows,
@@ -1069,4 +1265,7 @@ module.exports = {
   DDL_PREAMBLE_SQL,
   DEFAULT_HEADINGS_CONFIG_PATH,
   LOAD_BEARING_COLS,
+  ENGINE_CANON_COLUMNS,
+  ADDENDA_ONLY_COLUMNS,
+  SELF_BOOTSTRAPPED_COLUMNS,
 };
