@@ -223,8 +223,14 @@ async function testSmokeRefusedNames() {
   assert(r2.status === 1 && /pipeline_/.test(r2.stderr),
     `expected refusal of pipeline_ names. status=${r2.status} stderr=${r2.stderr}`);
 
+  // migration-target-per-project-marker (owner decision item G, 2026-09-06):
+  // an unrecognized name now goes through migrate-01's marker probe; this
+  // caller never passes --project-id, so the probe's "absent" precondition
+  // is the reason that surfaces (still pre-connect).
   const r3 = runSmoke(['--db', `verify17_unrecognized_${TS}_scratch`]);
-  assert(r3.status === 1 && /not a recognized consolidation target/.test(r3.stderr),
+  assert(r3.status === 1 &&
+    /no --project-id supplied; per-project engine targets require it/.test(r3.stderr) &&
+    /no database connection was opened/.test(r3.stderr),
     `expected refusal of an unrecognized name (total-classification default branch). status=${r3.status} stderr=${r3.stderr}`);
 }
 

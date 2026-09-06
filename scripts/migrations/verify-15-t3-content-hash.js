@@ -584,7 +584,7 @@ function groupRosterBySourceDb(roster) {
 async function main() {
   const argv = process.argv.slice(2);
   const allowLiveDrift = argv.includes('--allow-live-drift');
-  const { name: target, source } = shared.resolveAndClassifyTargetDb(argv);
+  const { name: target, source } = await shared.resolveAndClassifyTargetDb(argv);
   console.log(`verify-15-t3-content-hash: target="${target}" (resolved from ${source})${allowLiveDrift ? ' [--allow-live-drift ACKNOWLEDGED]' : ''}`);
 
   const roster = shared.loadRoster();

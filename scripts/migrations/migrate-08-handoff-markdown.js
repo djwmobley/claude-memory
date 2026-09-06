@@ -37,8 +37,15 @@
  *        artifact).
  *
  * WHAT THIS SCRIPT DOES (normal / MIGRATE mode, unchanged from H-1..H-14):
- *   1. Resolves + validates the TARGET database exactly like migrate-02
- *      (via migrate-01's classifyTarget, reused by reference).
+ *   1. Resolves + validates the TARGET database (via migrate-01's
+ *      classifyTarget, reused by reference — now async; see migrate-01's
+ *      header for the full CANON/STAGING/PER_PROJECT_ENGINE/SOURCE_ONLY/
+ *      UNKNOWN contract). This is the ONE script in the suite that already
+ *      always carries a --project-id (required since H-1), so it is also
+ *      the primary real-world caller of the PER_PROJECT_ENGINE branch: a
+ *      live pipeline_* (or other) per-project engine database whose
+ *      project_settings marker corroborates --project-id is a legitimate
+ *      target here, not refused by name alone.
  *   2. Bundles its own additive schema preamble (mirrors migrate-03's own
  *      bundled ALTER pattern, §6.1(d)):
  *        ALTER TABLE assertions ADD COLUMN IF NOT EXISTS seq INTEGER;
@@ -717,13 +724,32 @@ async function main() {
         console.error(`Invalid database name "${target}" (from ${targetSource}) — must match /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/.`);
         process.exit(1);
       }
-      const classification = migrateOne.classifyTarget(target);
+      const classification = await migrateOne.classifyTarget({ dbName: target, projectId: parsed.projectId });
       if (!classification.allowed) {
         console.error(`Refused: ${classification.reason}`);
-        console.error(`(resolved from ${targetSource} — no database connection was opened.)`);
+        console.error(
+          classification.connectionOpened
+            ? '(read-only probe opened and closed.)'
+            : `(resolved from ${targetSource} — no database connection was opened.)`
+        );
         process.exit(1);
       }
-      console.log(`migrate-08-handoff-markdown: DRY-RUN target="${target}" (resolved from ${targetSource}) — read-only precondition checks only, zero writes`);
+      if (classification.branch === 'PER_PROJECT_ENGINE') {
+        // Defensive cross-check (spec item 3): the probe already verified the
+        // DB's project_id equals --project-id before returning this branch,
+        // so this can never actually fire — but the write path below uses
+        // parsed.projectId directly, so assert equality rather than trust it.
+        const normalizedParsed = migrateOne.normalizeProjectId(parsed.projectId);
+        const normalizedProbe = migrateOne.normalizeProjectId(classification.projectId);
+        if (normalizedParsed !== normalizedProbe) {
+          console.error(
+            `Refused: probed project_id "${classification.projectId}" does not match ` +
+            `--project-id "${parsed.projectId}" (should be unreachable).`
+          );
+          process.exit(1);
+        }
+      }
+      console.log(`migrate-08-handoff-markdown: DRY-RUN target="${target}" (resolved from ${targetSource}, branch=${classification.branch}) — read-only precondition checks only, zero writes`);
       const tgtClient = new Client(migrateOne.pgConfig(target));
       try {
         await tgtClient.connect();
@@ -784,14 +810,32 @@ async function main() {
     console.error(`Invalid database name "${target}" (from ${targetSource}) — must match /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/.`);
     process.exit(1);
   }
-  const classification = migrateOne.classifyTarget(target);
+  const classification = await migrateOne.classifyTarget({ dbName: target, projectId: parsed.projectId });
   if (!classification.allowed) {
     console.error(`Refused: ${classification.reason}`);
-    console.error(`(resolved from ${targetSource} — no database connection was opened.)`);
+    console.error(
+      classification.connectionOpened
+        ? '(read-only probe opened and closed.)'
+        : `(resolved from ${targetSource} — no database connection was opened.)`
+    );
     process.exit(1);
   }
+  if (classification.branch === 'PER_PROJECT_ENGINE') {
+    // Defensive cross-check (spec item 3) — see the dry-run branch above for
+    // the identical rationale; the write path below uses parsed.projectId
+    // directly for every INSERT, so this assertion must hold.
+    const normalizedParsed = migrateOne.normalizeProjectId(parsed.projectId);
+    const normalizedProbe = migrateOne.normalizeProjectId(classification.projectId);
+    if (normalizedParsed !== normalizedProbe) {
+      console.error(
+        `Refused: probed project_id "${classification.projectId}" does not match ` +
+        `--project-id "${parsed.projectId}" (should be unreachable).`
+      );
+      process.exit(1);
+    }
+  }
 
-  console.log(`migrate-08-handoff-markdown: target="${target}" (resolved from ${targetSource}) project_id="${parsed.projectId}" mode=${parsed.rollback ? 'ROLLBACK' : 'MIGRATE'}`);
+  console.log(`migrate-08-handoff-markdown: target="${target}" (resolved from ${targetSource}, branch=${classification.branch}) project_id="${parsed.projectId}" mode=${parsed.rollback ? 'ROLLBACK' : 'MIGRATE'}`);
 
   const tgtClient = new Client(migrateOne.pgConfig(target));
   try {

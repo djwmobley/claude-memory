@@ -89,17 +89,23 @@ function parseDbFlag(argv) {
  * Exits the process with a clear refusal message on a disallowed name;
  * returns { name, source } on success.
  */
-function resolveAndClassifyTargetDb(argv) {
+async function resolveAndClassifyTargetDb(argv) {
   const dbFlag = parseDbFlag(argv);
   const { name, source } = migrateOne.resolveTargetDb({ db: dbFlag });
   if (!migrateOne.DB_NAME_RE.test(name)) {
     console.error(`Invalid database name "${name}" (from ${source}) — must match /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/.`);
     process.exit(1);
   }
-  const classification = migrateOne.classifyTarget(name);
+  // The verify-15-*.js battery only ever targets CANON/STAGING (it has no
+  // --project-id flag) — projectId is deliberately left undefined.
+  const classification = await migrateOne.classifyTarget({ dbName: name, projectId: undefined });
   if (!classification.allowed) {
     console.error(`Refused: ${classification.reason}`);
-    console.error(`(resolved from ${source} — no database connection was opened.)`);
+    console.error(
+      classification.connectionOpened
+        ? '(read-only probe opened and closed.)'
+        : `(resolved from ${source} — no database connection was opened.)`
+    );
     process.exit(1);
   }
   return { name, source };

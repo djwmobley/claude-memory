@@ -252,8 +252,15 @@ async function testRefusedTargetNames() {
     pass('T4b', 'refuses names matching /^pipeline_/');
   }
 
+  // migration-target-per-project-marker (owner decision item G, 2026-09-06):
+  // an unrecognized/unlisted name no longer refuses with a static "not
+  // recognized" message — it goes through migrate-01's marker probe, and
+  // since this script never passes --project-id, the probe's own "absent"
+  // precondition is what actually fires (still before any connection).
   const r3 = runAddenda(['--db', `msa_unrecognized_${TS}_scratch`]);
-  const ok3 = r3.status === 1 && /not a recognized consolidation target/.test(r3.stderr);
+  const ok3 = r3.status === 1 &&
+    /no --project-id supplied; per-project engine targets require it/.test(r3.stderr) &&
+    /no database connection was opened/.test(r3.stderr);
   if (!ok3) {
     fail('T4c', 'refuses an unrecognized/unlisted name (total-classification default branch)', `status=${r3.status} stderr=${r3.stderr}`);
   } else {

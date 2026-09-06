@@ -158,7 +158,7 @@ async function checkExclusion(client, roster, exclusion, sourceDb, hasProjectIdO
 
 async function main() {
   const argv = process.argv.slice(2);
-  const { name: target, source } = shared.resolveAndClassifyTargetDb(argv);
+  const { name: target, source } = await shared.resolveAndClassifyTargetDb(argv);
   console.log(`verify-15-t9-negative: target="${target}" (resolved from ${source})`);
 
   const roster = shared.loadRoster();

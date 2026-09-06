@@ -28,7 +28,7 @@ const shared = require('./lib/verify15-shared');
 
 async function main() {
   const argv = process.argv.slice(2);
-  const { name: target, source } = shared.resolveAndClassifyTargetDb(argv);
+  const { name: target, source } = await shared.resolveAndClassifyTargetDb(argv);
   console.log(`verify-15-t2-5-dualwrite: target="${target}" (resolved from ${source})`);
 
   const client = await shared.connect(target);
