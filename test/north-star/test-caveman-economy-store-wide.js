@@ -126,6 +126,25 @@ function loadManifest(manifestPath = MANIFEST_PATH) {
     );
   }
 
+  // §17.5(1) owner decision (2026-09-06): every out_of_scope_tables entry
+  // must carry a non-empty reason string — same total-classification
+  // discipline as the `class` enum above. A table sitting in
+  // out_of_scope_tables with no stated reason (missing key, or a blank/
+  // whitespace-only string) is a loud fail, never a silently-accepted "this
+  // table is excluded for no stated reason."
+  const missingReasons = [];
+  for (const [table, reason] of Object.entries(manifest.out_of_scope_tables || {})) {
+    if (typeof reason !== 'string' || reason.trim() === '') {
+      missingReasons.push(table);
+    }
+  }
+  if (missingReasons.length > 0) {
+    throw new Error(
+      `${manifestPath}: ${missingReasons.length} out_of_scope_tables entr${missingReasons.length === 1 ? 'y is' : 'ies are'} ` +
+      `missing a non-empty reason string: ${missingReasons.join(', ')}`
+    );
+  }
+
   return manifest;
 }
 

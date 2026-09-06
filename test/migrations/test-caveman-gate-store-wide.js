@@ -123,6 +123,7 @@ async function main() {
 
   const client = await connect();
   let cavemanId, verboseId, nullModeAssertionId, truncatedTaskId;
+  let verboseRoutingNotesId, whitespaceRoutingNotesId;
 
   try {
     // ── Seed fixtures ──────────────────────────────────────────────────────
@@ -163,6 +164,30 @@ async function main() {
         ['gate-test-proj', truncatedTitle]
       );
       truncatedTaskId = r.rows[0].id;
+    }
+    {
+      // §17.5(1) owner decision (amended 2026-09-06: `notes`, not
+      // `rationale`, is the checked routing_profiles column — `rationale` is
+      // an in-memory response field from scripts/lib/route-resolve.js,
+      // never persisted). routing_profiles has NO authoring_mode column
+      // (K-9: always-caveman, same shape as tasks.title) -- verbose prose in
+      // `notes` MUST fail economy.
+      const verboseNotes = 'The reason this profile was configured this way is that it was the simplest option available at the time and nobody had a better alternative to suggest for this particular routing role.';
+      const r = await client.query(
+        `INSERT INTO routing_profiles (project_id, role, capability_tier, notes) VALUES ($1,$2,$3,$4) RETURNING id`,
+        ['gate-test-proj', 'gate-check-role', 'mid', verboseNotes]
+      );
+      verboseRoutingNotesId = r.rows[0].id;
+    }
+    {
+      // Whitespace-only notes must be treated as empty (checkCell trims
+      // before the emptiness test) -- exercised end-to-end through a real
+      // row, not just unit-tested against the raw string in isolation.
+      const r = await client.query(
+        `INSERT INTO routing_profiles (project_id, role, capability_tier, notes) VALUES ($1,$2,$3,$4) RETURNING id`,
+        ['gate-test-proj', 'gate-check-role-ws', 'mid', '   \t  ']
+      );
+      whitespaceRoutingNotesId = r.rows[0].id;
     }
 
     // ── T1: passing caveman row ─────────────────────────────────────────────
@@ -215,6 +240,30 @@ async function main() {
       const fidelityFailures = r.failures.filter((f) => f.row === `tasks#${truncatedTaskId}` && f.check === 'fidelity');
       assert.strictEqual(fidelityFailures.length, 1, `expected exactly one fidelity failure for tasks#${truncatedTaskId}, got ${JSON.stringify(fidelityFailures)}`);
       assert.ok(/dangling_path/.test(fidelityFailures[0].reason), `expected dangling_path smell, got: ${fidelityFailures[0].reason}`);
+    });
+
+    // ── §17.5(1): routing_profiles.notes (not `rationale`) is checked-caveman ──
+    await runCase('T7', 'routing_profiles.notes verbose prose fails economy (§17.5(1) amended 2026-09-06: notes, not rationale, is checked)', async () => {
+      const r = await gate.scanTable(client, gate.loadManifest(), 'routing_profiles');
+      const economyFailures = r.failures.filter((f) => f.row === `routing_profiles#${verboseRoutingNotesId}` && f.check === 'economy');
+      assert.strictEqual(economyFailures.length, 1, `expected exactly one economy failure for routing_profiles#${verboseRoutingNotesId}, got ${JSON.stringify(economyFailures)}`);
+    });
+    await runCase('T8', 'whitespace-only routing_profiles.notes is skipped (trim-before-emptiness, never silently scanned)', async () => {
+      const r = await gate.scanTable(client, gate.loadManifest(), 'routing_profiles');
+      const failuresForRow = r.failures.filter((f) => f.row === `routing_profiles#${whitespaceRoutingNotesId}`);
+      assert.strictEqual(failuresForRow.length, 0, `expected zero failures (cell is empty after trim) for routing_profiles#${whitespaceRoutingNotesId}, got ${JSON.stringify(failuresForRow)}`);
+    });
+    await runCase('K-JSONB', '§17.5(1): known_unscanned_types documents the jsonb gap (session_usage.model_breakdown) rather than silently widening the K-8 scan', () => {
+      const manifest = gate.loadManifest();
+      assert.ok(
+        Array.isArray(manifest.known_unscanned_types) && manifest.known_unscanned_types.includes('jsonb'),
+        `expected known_unscanned_types to include "jsonb", got ${JSON.stringify(manifest.known_unscanned_types)}`
+      );
+      assert.ok(
+        typeof manifest.known_unscanned_types_reason === 'string' && manifest.known_unscanned_types_reason.trim() !== '',
+        'expected a non-empty known_unscanned_types_reason'
+      );
+      console.log(`    known_unscanned_types: ${JSON.stringify(manifest.known_unscanned_types)} — ${manifest.known_unscanned_types_reason}`);
     });
 
     // ── T5: unclassified column / manifest drift, BOTH directions (K-8) ────
@@ -276,6 +325,41 @@ async function main() {
       // Cross-check: the real, uncorrupted manifest loads clean (every class
       // value IS in the enum) — proves T5d exercises the validator's FAIL
       // path specifically, not a validator that always throws.
+      assert.doesNotThrow(() => gate.loadManifest(), 'the real, uncorrupted manifest must load without throwing');
+    });
+
+    // ── T5e: §17.5(1) — a missing/blank out_of_scope_tables reason is a LOUD
+    // FAIL, never silently accepted, on a corrupted manifest COPY (never the
+    // real committed file, same fixture discipline as T5d) ──────────────────
+    await runCase('T5e', '§17.5(1): a missing/blank out_of_scope_tables reason is a LOUD FAIL', () => {
+      const real = JSON.parse(fs.readFileSync(gate.MANIFEST_PATH, 'utf8'));
+      assert.ok(
+        typeof real.out_of_scope_tables.turn_usage === 'string' && real.out_of_scope_tables.turn_usage.trim() !== '',
+        'fixture sanity: turn_usage must currently carry a real reason'
+      );
+      real.out_of_scope_tables.turn_usage = '   '; // whitespace-only -- must be treated as "missing"
+
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'caveman-manifest-oos-reason-'));
+      const corruptedPath = path.join(tmpDir, 'caveman-columns.json');
+      fs.writeFileSync(corruptedPath, JSON.stringify(real, null, 2), 'utf8');
+      try {
+        assert.throws(
+          () => gate.loadManifest(corruptedPath),
+          (err) => {
+            assert.ok(err instanceof Error, 'expected an Error to be thrown');
+            assert.ok(err.message.includes('turn_usage'), `expected the table named in the error: ${err.message}`);
+            assert.ok(/reason/i.test(err.message), `expected "reason" named in the error: ${err.message}`);
+            return true;
+          },
+          'loadManifest() must throw loud on a missing/blank out_of_scope_tables reason'
+        );
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+
+      // Sanity: the REAL committed manifest was never touched.
+      const realFileText = fs.readFileSync(gate.MANIFEST_PATH, 'utf8');
+      assert.ok(realFileText.includes('turn_usage'), 'fixture sanity: real manifest still names turn_usage');
       assert.doesNotThrow(() => gate.loadManifest(), 'the real, uncorrupted manifest must load without throwing');
     });
 
