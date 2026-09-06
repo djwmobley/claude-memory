@@ -694,6 +694,22 @@ class SQLiteAdapter {
     }
   }
 
+  /**
+   * SQLite counterpart to PostgresAdapter.acquireNamedXactLock — no
+   * cross-connection advisory-lock primitive exists, and this codebase's
+   * SQLite seam is a single-process/test-only backend, so this is a
+   * documented no-op (lockKey ignored). Callers already hold whatever
+   * serialization a plain BEGIN provides on this connection; see
+   * acquireMigrationLock's own header comment for why BEGIN IMMEDIATE would
+   * be the real fix if SQLite ever needed genuine cross-connection locking.
+   *
+   * @param {string} _lockKey — ignored.
+   * @returns {Promise<void>}
+   */
+  async acquireNamedXactLock(_lockKey) {
+    // No-op by design.
+  }
+
   async query(sql, params) {
     const db = this._db;
     if (!db) throw new Error('SQLiteAdapter: not connected');
@@ -1307,6 +1323,28 @@ class PostgresAdapter {
     // The lock is held until the transaction ends.
     await this._client.query(
       `SELECT pg_advisory_xact_lock(hashtext($1), 42)`,
+      [lockKey]
+    );
+  }
+
+  /**
+   * Take a transaction-scoped named advisory lock WITHOUT starting the
+   * transaction itself (unlike acquireMigrationLock, which is namespaced to
+   * migrations via the two-int4 overload and IS the BEGIN). Callers issue
+   * their own BEGIN first, then call this, then COMMIT/ROLLBACK — same
+   * calling convention scripts/lib/routing-profile.js's routingProfileSet
+   * uses inline (BEGIN, then `pg_advisory_xact_lock(hashtext($1))`, do the
+   * work, COMMIT). Exists so engine code (handoff.js) never branches on
+   * db.dialect directly (S8 abstraction invariant) — the dialect-specific
+   * mechanism lives here, one call site per adapter.
+   *
+   * @param {string} lockKey — arbitrary namespaced string, e.g.
+   *   `session_in_progress:<project_id>`.
+   * @returns {Promise<void>}
+   */
+  async acquireNamedXactLock(lockKey) {
+    await this._client.query(
+      `SELECT pg_advisory_xact_lock(hashtext($1))`,
       [lockKey]
     );
   }

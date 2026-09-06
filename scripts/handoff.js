@@ -30,6 +30,7 @@ const __startNs = process.hrtime.bigint();
  *                           At least one criterion required. Manual/operator-invoked only.
  *   loader-load             Same inline load as resume; used directly or by tests.
  *   loader-hook             SessionStart hook entry point (outputs JSON to stdout).
+ *   loader-stop             SessionEnd hook entry point (implicit close if unclosed).
  *   queue-drain [--max=N]   Drain pending async extraction queue rows (background worker).
  *
  * Environment:
@@ -259,11 +260,21 @@ function renderTemplate(tplPath, vars) {
   return text;
 }
 
-/** Write handoff.md from the template. Creates parent dir if needed. */
+/**
+ * Write handoff.md from the template. Creates parent dir if needed.
+ *
+ * S5: atomic write — render to a sibling `<path>.tmp-<pid>` file, then
+ * fs.renameSync into place. A process killed mid-write (hook timeout,
+ * SIGKILL) leaves the temp file behind and the real handoff.md untouched
+ * rather than a truncated/corrupt file; rename is a single filesystem
+ * operation (atomic on both POSIX and NTFS for same-volume renames).
+ */
 function writeHandoffMd(handoffPath, vars) {
   fs.mkdirSync(path.dirname(handoffPath), { recursive: true });
   const content = renderTemplate(HANDOFF_TEMPLATE, vars);
-  fs.writeFileSync(handoffPath, content, 'utf8');
+  const tmpPath = `${handoffPath}.tmp-${process.pid}`;
+  fs.writeFileSync(tmpPath, content, 'utf8');
+  fs.renameSync(tmpPath, handoffPath);
 }
 
 /**
@@ -1185,6 +1196,313 @@ async function setSetting(db, projectId, key, value) {
      ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
     [projectId, key, String(value)]
   );
+}
+
+// ── session_in_progress marker — per-session aware (S3) ─────────────────────
+//
+// Stored under the single project_settings key 'session_in_progress' (PK is
+// (project_id, key) — one row per key, so multiple concurrently-live sessions
+// share ONE row whose value is a JSON array of {session_id, ts} objects).
+// Pre-existing rows written by code that predates this fix (a bare ISO-8601
+// timestamp string) are read back as ONE legacy marker with session_id: null
+// — legacy markers carry no identity and are treated as matching ANY current
+// session (see findMatchingMarkerIndex), so an upgrade never orphans a marker
+// written by the old code.
+//
+// Total classification of the raw stored value (parseSessionMarkers):
+//   - absent / null / ''                    -> []
+//   - valid JSON, an array                  -> each element normalized to {session_id, ts};
+//                                               a malformed element (no string .ts) is dropped
+//   - valid JSON, not an array               -> [] (never produced by this code; fail open)
+//   - not valid JSON, non-empty string       -> [{session_id: null, ts: raw}]  (legacy format —
+//                                               see note below; ANY opaque string counts, not
+//                                               only an ISO timestamp)
+//   - not valid JSON, empty/non-string       -> [] (garbage — fail open, never crash)
+//
+// Note on the legacy branch: pre-S3 code (cmdLoaderHook/cmdResume) always wrote
+// new Date().toISOString(), but the pre-S3 READ side (writeExtraction's session-id
+// fallback, resolveSessionId) never actually required that shape — an opaque,
+// non-date-parseable string was explicitly used as-is "for backward compat"
+// (and test fixtures rely on exactly that: an arbitrary marker string standing
+// in for "a session is in progress"). Preserving that same total classification
+// here — legacy = "not JSON", full stop — is what keeps those callers correct
+// after this fix; see latestSessionMarker's handling of an unparseable ts.
+
+function parseSessionMarkers(raw) {
+  if (raw === null || raw === undefined || raw === '') return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return parsed
+        .filter((e) => e && typeof e === 'object' && typeof e.ts === 'string')
+        .map((e) => ({
+          session_id: (typeof e.session_id === 'string' && e.session_id.length > 0) ? e.session_id : null,
+          ts: e.ts,
+        }));
+    }
+    return [];
+  } catch (_) {
+    // Not JSON — legacy marker (pre-S3 format). Accepted as-is regardless of
+    // whether it happens to be a parseable date (see note above).
+    if (typeof raw === 'string' && raw.length > 0) {
+      return [{ session_id: null, ts: raw }];
+    }
+    return [];
+  }
+}
+
+/** Read all in-flight session markers for a project. See parseSessionMarkers. */
+async function getSessionMarkers(db, projectId) {
+  const raw = await getSetting(db, projectId, 'session_in_progress', null);
+  return parseSessionMarkers(raw);
+}
+
+/**
+ * Write the full marker list back. An empty list DELETEs the row entirely —
+ * this matches the legacy "absent key = no session in progress" semantics
+ * every existing caller of getSetting(..., 'session_in_progress', null) relies on.
+ */
+async function setSessionMarkers(db, projectId, list) {
+  if (!list || list.length === 0) {
+    await db.query(
+      `DELETE FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'`,
+      [projectId]
+    );
+    return;
+  }
+  await setSetting(db, projectId, 'session_in_progress', JSON.stringify(list));
+}
+
+/**
+ * Concurrency hardening: run `fn()` inside a transaction holding a per-
+ * project advisory lock on the session_in_progress marker row, closing the
+ * read-modify-write race between two concurrent hook invocations for the
+ * same project (e.g. two SessionStart hooks, or a SessionStart racing a
+ * SessionEnd) that would otherwise lose one side's marker addition/removal.
+ *
+ * Style matches scripts/lib/routing-profile.js's routingProfileSet: caller-
+ * side BEGIN, then a `pg_advisory_xact_lock(hashtext(key))` transaction-
+ * scoped lock taken BEFORE the read, then COMMIT (ROLLBACK on error) —
+ * reused here as its own helper (rather than re-inlined per call site)
+ * because every marker mutation site needs the identical BEGIN/lock/COMMIT
+ * wrapper, unlike routing-profile.js's single call site.
+ *
+ * The lock itself is taken via db.acquireNamedXactLock(lockKey) — a port
+ * method on both db-seam.js adapters (S8 abstraction invariant: the engine
+ * never branches on the adapter's backend/dialect; the dialect-specific
+ * mechanism lives in db-seam.js, one call site per adapter). SQLite has no
+ * cross-connection
+ * advisory-lock primitive and this codebase's SQLite seam is a single-
+ * process/test-only backend, so SQLiteAdapter.acquireNamedXactLock is a
+ * documented no-op there.
+ *
+ * Callers must NOT already be inside a transaction on this `db` connection.
+ */
+async function withSessionMarkerLock(db, projectId, fn) {
+  await db.query('BEGIN');
+  try {
+    await db.acquireNamedXactLock(`session_in_progress:${projectId}`);
+    const result = await fn();
+    await db.query('COMMIT');
+    return result;
+  } catch (err) {
+    await db.query('ROLLBACK');
+    throw err;
+  }
+}
+
+/**
+ * Upsert this session's own marker into the list (dedupe by session_id —
+ * re-writing the SAME session's marker, e.g. on /clear or /compact, refreshes
+ * its ts rather than accumulating a duplicate entry). Lock-guarded — see
+ * withSessionMarkerLock.
+ */
+async function addSessionMarker(db, projectId, sessionId, ts) {
+  return withSessionMarkerLock(db, projectId, async () => {
+    const list = await getSessionMarkers(db, projectId);
+    const filtered = sessionId ? list.filter((m) => m.session_id !== sessionId) : list;
+    filtered.push({ session_id: sessionId || null, ts });
+    await setSessionMarkers(db, projectId, filtered);
+  });
+}
+
+/**
+ * Find the index of the marker matching currentSessionId: an exact
+ * session_id match, OR (S4) a legacy bare marker (session_id === null),
+ * which carries no identity and is therefore treated as matching any
+ * session. Returns -1 when no marker belongs to the current session —
+ * sibling sessions' own markers are never matched.
+ */
+function findMatchingMarkerIndex(list, currentSessionId) {
+  if (currentSessionId) {
+    const exact = list.findIndex((m) => m.session_id === currentSessionId);
+    if (exact !== -1) return exact;
+  }
+  return list.findIndex((m) => m.session_id === null);
+}
+
+/**
+ * The single most-recently-written marker across all sessions for this
+ * project — a compatibility shim for callers that predate S3 and only ever
+ * expected ONE global session_in_progress value (C2 bias-attribution
+ * session-id resolution in writeExtraction/resolveSessionId, retrieval_events
+ * logging in cmdLoaderLoad). Under S3's true multi-session model these
+ * callers cannot disambiguate between concurrent sibling sessions; picking
+ * the most recent write reproduces the pre-S3 last-writer-wins behavior
+ * exactly for the single-session case (still the overwhelming majority).
+ *
+ * ts is not guaranteed to be a parseable date — a legacy opaque marker
+ * carries whatever string was originally written (see parseSessionMarkers).
+ * Total classification of the pairwise comparison: both parseable -> later
+ * date wins; one parseable -> the parseable one wins (a real timestamp is
+ * always preferred over an opaque legacy string); neither parseable -> the
+ * later array entry wins (addSessionMarker always appends, so "later in the
+ * array" already means "more recently written").
+ */
+function latestSessionMarker(list) {
+  if (!list || list.length === 0) return null;
+  return list.reduce((latest, m) => {
+    if (!latest) return m;
+    const mMs = Date.parse(m.ts);
+    const lMs = Date.parse(latest.ts);
+    if (Number.isNaN(mMs) && Number.isNaN(lMs)) return m;
+    if (Number.isNaN(lMs)) return m;
+    if (Number.isNaN(mMs)) return latest;
+    return mMs > lMs ? m : latest;
+  }, null);
+}
+
+/**
+ * Human-readable summary of the per-session session_in_progress markers for
+ * /handoff:status display. A single legacy bare-string marker (session_id:
+ * null) renders byte-identically to the pre-S3 single-value display; a real
+ * (or multiple) per-session marker(s) render with a count + the latest
+ * session-id prefix + timestamp, so an operator sees there's more than one
+ * session in flight without decoding the raw JSON array by hand.
+ * Returns { active: boolean, id: string|null, prose: string } — `id` is the
+ * same representative value (real session_id, or legacy ts) every other
+ * single-value consumer uses (see latestSessionMarker), kept for the
+ * --json session_id field's existing string|null contract.
+ */
+function formatSessionMarkersForStatus(markers) {
+  if (!markers || markers.length === 0) {
+    return { active: false, id: null, prose: 'no' };
+  }
+  if (markers.length === 1 && markers[0].session_id === null) {
+    // Legacy bare-string marker — byte-identical to the pre-S3 display.
+    return { active: true, id: markers[0].ts, prose: `YES (session_id=${markers[0].ts})` };
+  }
+  const latest   = latestSessionMarker(markers);
+  const idPrefix = latest.session_id ? latest.session_id.slice(0, 8) : '(legacy)';
+  const id       = latest.session_id || latest.ts;
+  const prose    = `YES (${markers.length} marker${markers.length === 1 ? '' : 's'} — latest ${idPrefix} at ${latest.ts})`;
+  return { active: true, id, prose };
+}
+
+/**
+ * Resolve the current session id from a Claude Code hook stdin payload
+ * (already parsed — see readHookStdinPermissive), falling back to the
+ * CLAUDE_CODE_SESSION_ID env var. Returns null when neither is available
+ * (never fabricates an id here — loader-hook's fresh-marker write is the
+ * only place a random fallback id is appropriate; see cmdLoaderHook).
+ */
+function resolveHookSessionId(hookPayload) {
+  if (hookPayload && typeof hookPayload.session_id === 'string' && hookPayload.session_id.length > 0) {
+    return hookPayload.session_id;
+  }
+  const envId = process.env.CLAUDE_CODE_SESSION_ID;
+  if (typeof envId === 'string' && envId.length > 0) return envId;
+  return null;
+}
+
+/**
+ * S1: read Claude Code hook JSON from stdin with a permissive, fail-open
+ * parser — total classification, evaluated with ZERO prior I/O beyond the
+ * stdin read itself. Mirrors the proven pattern in
+ * ~/.claude/hooks/handoff-close-worktree-gate.js's handleHookStdin(): any
+ * failure (unreadable stdin, empty stdin, malformed JSON, non-object JSON)
+ * returns null rather than throwing. Callers treat null as "nothing to act
+ * on" and exit 0 immediately — this function itself never exits the process
+ * so it can be reused by both the Stop-turned-SessionEnd gate (cmdLoaderStop)
+ * and the SessionStart hook (cmdLoaderHook), which have different classification
+ * rules for what a null/absent payload means.
+ */
+function readHookStdinPermissive() {
+  let raw;
+  try {
+    raw = fs.readFileSync(0, 'utf8');
+  } catch (_) {
+    return null;
+  }
+  if (!raw) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (_) {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  return parsed;
+}
+
+/**
+ * Shared implicit-close writer used by cmdLoaderStop (this session ended
+ * without an explicit close) AND cmdLoaderHook's late-close sweep (a sibling
+ * session's marker went stale without ever being explicitly closed or
+ * SessionEnd-triggered — e.g. the process was killed before teardown).
+ * Re-renders handoff.md from the current frontmatter/body, preserving every
+ * field except last_close and tldr.
+ *
+ * Design note on handoff.md body preservation: writeHandoffMd() re-renders
+ * from the full template, which would overwrite the body (tldr, open_threads,
+ * quick_references) with whatever we pass. For an implicit close we do NOT
+ * have a fresh extraction payload, so we preserve the existing body by
+ * reading the current frontmatter and passing its values back. The only
+ * fields we override are last_close (set to now) and tldr (set to the
+ * implicit-close notice). This matches the pattern used by cmdCheckpoint —
+ * read current fm, then call writeHandoffMd with merged values — which is
+ * cleaner than trying to surgically edit the raw file.
+ */
+function writeImplicitClose(handoffPath, projectId, root) {
+  const fm    = readHandoffFrontmatter(handoffPath);
+  const stamp = new Date().toISOString();
+
+  const ss = fm.session_summary || {};
+  const entitiesWritten   = ss.entities_written   || '0';
+  const assertionsWritten = ss.assertions_written || '0';
+  const edgesWritten      = ss.edges_written      || '0';
+  const contractName      = fm.contract           || 'default';
+  const projectName       = fm.project_name       || path.basename(root);
+
+  // Reconstruct open_threads and quick_references from the handoff.md body
+  // (they live in the body section, not in YAML frontmatter).
+  let openThreads = '- (none)';
+  let quickRefs   = '(none)';
+  try {
+    const raw  = fs.readFileSync(handoffPath, 'utf8');
+    const body = raw.replace(/^---[\s\S]*?---\r?\n/, '');
+    const otMatch = body.match(/##\s+Open threads\r?\n([\s\S]*?)(?=\r?\n##|\r?\n$|$)/);
+    if (otMatch) openThreads = otMatch[1].trim() || '- (none)';
+    const qrMatch = body.match(/##\s+Quick references\r?\n([\s\S]*?)(?=\r?\n##|\r?\n$|$)/);
+    if (qrMatch) quickRefs = qrMatch[1].trim() || '(none)';
+  } catch (_) {
+    // Body parse failed — fall back to safe defaults.
+  }
+
+  writeHandoffMd(handoffPath, {
+    PROJECT_ID:          projectId,
+    LAST_CLOSE:          stamp,
+    CONTRACT:            contractName,
+    ENTITIES_WRITTEN:    entitiesWritten,
+    ASSERTIONS_WRITTEN:  assertionsWritten,
+    EDGES_WRITTEN:       edgesWritten,
+    PROJECT_NAME:        projectName,
+    TLDR:                '(implicit close — session ended without explicit /handoff:close)',
+    OPEN_THREADS:        openThreads,
+    QUICK_REFERENCES:    quickRefs,
+    DEGRADED_SECTION:    '',
+    RECONCILIATION_SECTION: '',
+  });
 }
 
 /**
@@ -2309,6 +2627,12 @@ async function cmdInit(args) {
     // a candidate. Lowering increases recall; raising increases precision.
     resurrect_cosine_threshold:       '0.75',
     implicit_close:                   'enabled',
+    // S3: SessionStart late-close sweep liveness threshold — a sibling session's
+    // marker older than this is judged abandoned (process killed before its own
+    // SessionEnd could fire) and gets a late implicit close + a DIVERGENCE note.
+    // A marker younger than this is assumed to belong to a still-live sibling
+    // session and is left untouched.
+    implicit_close_stale_hours:       '24',
     decay_rate_default:               '0.05',
     retrieval_outcome_timeout_days:   '14',
     cluster_aware_retrieval:          'enabled',
@@ -2577,11 +2901,8 @@ async function cmdStatus(args = []) {
   const liveCounts = await getLiveCounts(db, projectId);
   const rcRes  = await db.query('SELECT name        FROM retrieval_contract  WHERE project_id = $1 ORDER BY name', [projectId]);
 
-  // Session-in-progress marker
-  const sipRes = await db.query(
-    "SELECT value FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'",
-    [projectId]
-  );
+  // Session-in-progress marker(s) — S3 per-session format; see getSessionMarkers.
+  const sessionMarkers = await getSessionMarkers(db, projectId);
 
   // ── --breakdown: counts by tier and suppression ──────────────────────────
   let breakdown = null;
@@ -2692,7 +3013,7 @@ async function cmdStatus(args = []) {
   const days      = daysSince(fm.last_close);
   const daysStr   = days !== null ? `${days} day(s) ago` : 'N/A';
   const contracts = rcRes.rows.map((r) => r.name).join(', ') || '(none)';
-  const sip       = sipRes.rows.length > 0 ? sipRes.rows[0].value : null;
+  const sipDisplay = formatSessionMarkersForStatus(sessionMarkers);
 
   // Packaging-honesty probe (read-only — no DB writes).
   let packagingState = null;
@@ -2724,8 +3045,8 @@ async function cmdStatus(args = []) {
       assertions_total: liveCounts.assertionsTotal,
       edges:          liveCounts.edges,
       contracts:      rcRes.rows.map((r) => r.name),
-      session_active: sip ? true : false,
-      session_id:     sip || null,
+      session_active: sipDisplay.active,
+      session_id:     sipDisplay.id,
       packaging:      packagingState,
       schema_apply_degraded: schemaDegraded,
     };
@@ -2750,7 +3071,7 @@ async function cmdStatus(args = []) {
   console.log(`  assertions:       ${liveCounts.assertionsLive} (suppressed: ${liveCounts.assertionsSuppressed}, invalidated: ${liveCounts.assertionsInvalidatedOnly})`);
   console.log(`  edges:            ${liveCounts.edges}`);
   console.log(`  contracts:        ${contracts}`);
-  console.log(`  session_active:   ${sip ? `YES (session_id=${sip})` : 'no'}`);
+  console.log(`  session_active:   ${sipDisplay.prose}`);
   if (packagingLine) console.log(packagingLine);
   if (schemaDegraded) {
     console.log(`  schema_apply:     DEGRADED (${schemaDegraded.reason || 'unknown'}) — see detail: ${JSON.stringify(schemaDegraded.detail)}`);
@@ -3644,7 +3965,11 @@ async function cmdLoaderLoad(opts = {}) {
   try {
     const kinds = [...new Set(queries.map((q) => q.kind || q.type || 'unknown'))].join(',');
     const queryText = `loader:contract=${contractName};kinds=${kinds};sections=${sections.length}`.slice(0, 1000);
-    const sessionId = await getSetting(db, projectId, 'session_in_progress', null);
+    // S3: session_in_progress is now a JSON array of per-session markers — resolve
+    // to the single most-recently-written one (see latestSessionMarker's header comment).
+    const _loaderMarkers = await getSessionMarkers(db, projectId);
+    const _loaderLatest   = latestSessionMarker(_loaderMarkers);
+    const sessionId = _loaderLatest ? (_loaderLatest.session_id || _loaderLatest.ts) : null;
     const notes = `entities=${entitiesCount};assertions=${assertionsCount};vector=${vectorCount};tokens=${tokensUsed}`.slice(0, 1000);
     const evtRes = await db.query(
       `INSERT INTO retrieval_events (project_id, query_text, session_id, notes)
@@ -3921,6 +4246,13 @@ async function cmdLoaderLoad(opts = {}) {
 
 async function cmdLoaderHook() {
   // All errors are swallowed and exit 0 — the hook must never break session start.
+  // S3: read the SessionStart hook JSON (source / session_id) up front. This is
+  // read-only and side-effect-free — safe to do before the handoff.md-existence
+  // no-op check below. A missing/malformed payload (e.g. a manual invocation
+  // with no stdin, as the plugin-packaging tests do) degrades to the pre-S3
+  // default: source is treated as unset (never 'clear'/'compact'), so the
+  // late-close sweep still runs exactly as it would today.
+  const hookPayload = readHookStdinPermissive();
   let db = null;
   try {
     const projectId   = resolveProjectId();
@@ -4001,21 +4333,89 @@ async function cmdLoaderHook() {
       }
     }
 
-    // Set session_in_progress marker so the Stop hook knows a close is still needed.
-    // Not set on the stale path — stale means the user is not in an auto-loaded session.
+    // ── S3: per-session marker — late-close sweep, then write the fresh marker ──
+    //
+    // Skipped entirely on /clear and /compact: those SessionStart events fire
+    // for the SAME logical session continuing (not a new one whose siblings'
+    // markers should be judged stale). Running the sweep there risks a
+    // false-positive DIVERGENCE banner on ordinary /clear.
+    //
+    // The sweep AND the fresh-marker write are folded into ONE
+    // withSessionMarkerLock-guarded transaction (rather than two separate
+    // calls) — folding them avoids a nested BEGIN (addSessionMarker takes
+    // its own lock) and closes the race window between "sweep decided which
+    // markers are stale" and "fresh marker written" that two separate locked
+    // transactions would otherwise leave open.
+    const hookSource       = (hookPayload && typeof hookPayload.source === 'string') ? hookPayload.source : null;
+    const currentSessionId = resolveHookSessionId(hookPayload) || crypto.randomUUID();
+    let lateCloseDivergenceLines = [];
+
     if (markerDb) {
-      await setSetting(markerDb, projectId, 'session_in_progress', new Date().toISOString());
+      try {
+        await withSessionMarkerLock(markerDb, projectId, async () => {
+          let markers = await getSessionMarkers(markerDb, projectId);
+
+          if (hookSource !== 'clear' && hookSource !== 'compact') {
+            const implicitCloseLate = await getSetting(markerDb, projectId, 'implicit_close', 'enabled');
+            if (implicitCloseLate === 'enabled') {
+              const staleHoursRaw = parseInt(
+                await getSetting(markerDb, projectId, 'implicit_close_stale_hours', '24'),
+                10
+              );
+              const staleHours = (Number.isFinite(staleHoursRaw) && staleHoursRaw > 0) ? staleHoursRaw : 24;
+              const staleMs    = staleHours * 60 * 60 * 1000;
+
+              const staleForeign = [];
+              const kept         = [];
+              for (const m of markers) {
+                const isForeign = m.session_id !== currentSessionId;
+                if (!isForeign) { kept.push(m); continue; }
+                const ageMs = Date.now() - Date.parse(m.ts);
+                // NaN age (unparseable ts) is treated as stale — a garbage marker
+                // must eventually be cleaned up, never left orphaned forever.
+                const isStale = Number.isNaN(ageMs) || ageMs > staleMs;
+                if (isStale) staleForeign.push(m); else kept.push(m);
+              }
+
+              if (staleForeign.length > 0) {
+                // ONE implicit close for the project — not one per stale marker
+                // (there is only one handoff.md).
+                writeImplicitClose(handoffPath, projectId, findProjectRoot());
+                markers = kept;
+                lateCloseDivergenceLines = staleForeign.map(
+                  (m) => `DIVERGENCE: late implicit close for session ${m.session_id || '(legacy marker)'} (marker ts ${m.ts})`
+                );
+              }
+            }
+          }
+
+          // Write the fresh marker for THIS session so a true SessionEnd
+          // (loader-stop) knows a close is still needed — inline rather than
+          // via addSessionMarker (which would attempt a nested BEGIN here).
+          const filtered = currentSessionId
+            ? markers.filter((m) => m.session_id !== currentSessionId)
+            : markers;
+          filtered.push({ session_id: currentSessionId || null, ts: new Date().toISOString() });
+          await setSessionMarkers(markerDb, projectId, filtered);
+        });
+      } catch (markerErr) {
+        process.stderr.write(`[handoff] loader-hook: late-close sweep / marker write failed (non-fatal): ${markerErr.message}\n`);
+      }
     }
 
     if (markerDbOwned && markerDb) await markerDb.end();
     else if (!markerDbOwned && db) await db.end();
+
+    const finalOutputText = lateCloseDivergenceLines.length > 0
+      ? `${result.outputText}\n\n${lateCloseDivergenceLines.join('\n')}`
+      : result.outputText;
 
     // Single-line JSON on stdout.
     process.stdout.write(
       JSON.stringify({
         hookSpecificOutput: {
           hookEventName: 'SessionStart',
-          additionalContext: result.outputText,
+          additionalContext: finalOutputText,
         },
       }) + '\n'
     );
@@ -4042,12 +4442,12 @@ async function cmdResume() {
   console.log('Running: handoff:resume');
   const result = await cmdLoaderLoad();
 
-  // Seed session_in_progress so the Stop hook and cmdClose can resolve session_id
-  // for C2 bias attribution.  The SessionStart auto-loader hook seeds this same
-  // marker on hook-triggered sessions; manual /handoff:resume must do the same.
-  // cmdLoaderLoad opens and closes its own db connection (ownDb path), so we
-  // open a fresh connection here for the marker write — identical defensive pattern
-  // to the loader-hook block at :2014-2031.
+  // Seed session_in_progress so the SessionEnd hook and cmdClose can resolve
+  // session_id for C2 bias attribution.  The SessionStart auto-loader hook seeds
+  // this same marker on hook-triggered sessions; manual /handoff:resume must do
+  // the same. cmdLoaderLoad opens and closes its own db connection (ownDb path),
+  // so we open a fresh connection here for the marker write — identical
+  // defensive pattern to the loader-hook block above.
   try {
     const projectId = resolveProjectId();
     let markerDb = null;
@@ -4059,7 +4459,8 @@ async function cmdResume() {
       markerDb = null;
     }
     if (markerDb) {
-      await setSetting(markerDb, projectId, 'session_in_progress', new Date().toISOString());
+      const resumeSessionId = resolveHookSessionId(null) || crypto.randomUUID();
+      await addSessionMarker(markerDb, projectId, resumeSessionId, new Date().toISOString());
       if (markerDbOwned) await markerDb.end();
     }
   } catch (markerErr) {
@@ -4746,9 +5147,12 @@ async function writeExtraction(db, projectId, payload, opts) {
     ? payload.session_id
     : null;
   if (!sessionId) {
-    const sipRaw = await getSetting(db, projectId, 'session_in_progress', null);
-    if (sipRaw) {
-      const sipMs = Date.parse(sipRaw);
+    // S3: session_in_progress is now a JSON array of per-session markers — resolve
+    // to the single most-recently-written one (see latestSessionMarker's header comment).
+    const markers = await getSessionMarkers(db, projectId);
+    const latest  = latestSessionMarker(markers);
+    if (latest) {
+      const sipMs = Date.parse(latest.ts);
       if (!Number.isNaN(sipMs)) {
         const stalenessDays = parseInt(
           await getSetting(db, projectId, 'staleness_days', '7'),
@@ -4757,12 +5161,12 @@ async function writeExtraction(db, projectId, payload, opts) {
         const staleMs = (Number.isFinite(stalenessDays) && stalenessDays > 0 ? stalenessDays : 7)
           * 24 * 60 * 60 * 1000;
         if (Date.now() - sipMs <= staleMs) {
-          sessionId = sipRaw; // marker is fresh — use it
+          sessionId = latest.session_id || latest.ts; // marker is fresh — use it (real id when available)
         }
         // else: marker is stale (abnormally-ended prior session) — leave sessionId=null
       } else {
-        // Stored value is not a parseable timestamp — use it as-is for backward compat.
-        sessionId = sipRaw;
+        // Not a parseable timestamp — legacy opaque marker, used as-is for backward compat.
+        sessionId = latest.session_id || latest.ts;
       }
     }
   }
@@ -5181,7 +5585,7 @@ async function cmdCheckpoint(args) {
       RECONCILIATION_SECTION: '',
     });
 
-    // Do NOT clear session_in_progress here.  The Stop hook's implicit close
+    // Do NOT clear session_in_progress here.  The SessionEnd hook's implicit close
     // (loader-stop path) is responsible for clearing the marker at true session end.
     // Clearing it at checkpoint time kills C2 attribution for any work done after
     // the checkpoint, defeating the entire purpose of mid-session saves.
@@ -5225,7 +5629,7 @@ async function cmdCheckpoint(args) {
     RECONCILIATION_SECTION: '',
   });
 
-  // Do NOT clear session_in_progress here.  The Stop hook's implicit close
+  // Do NOT clear session_in_progress here.  The SessionEnd hook's implicit close
   // (loader-stop path) is responsible for clearing the marker at true session end.
   // Clearing it at checkpoint time kills C2 attribution for any work done after
   // the checkpoint, defeating the entire purpose of mid-session saves.
@@ -5265,7 +5669,39 @@ async function resolveSessionId(db, projectId, payload) {
   if (typeof envSessionId === 'string' && envSessionId.length > 0) {
     return envSessionId;
   }
-  return await getSetting(db, projectId, 'session_in_progress', null);
+  // S3: session_in_progress is now a JSON array of per-session markers — resolve
+  // to the single most-recently-written one (see latestSessionMarker's header comment).
+  const markers = await getSessionMarkers(db, projectId);
+  const latest  = latestSessionMarker(markers);
+  return latest ? (latest.session_id || latest.ts) : null;
+}
+
+/**
+ * S4: clear THIS session's own marker on an explicit /handoff:close — never a
+ * sibling session's. Uses the TRUE session identity (payload.session_id, then
+ * CLAUDE_CODE_SESSION_ID) rather than resolveSessionId's marker-fallback tier
+ * (which would be circular here — matching a marker against content read from
+ * that same marker proves nothing about identity). A legacy bare marker
+ * (session_id: null) still matches, per findMatchingMarkerIndex/S4. If no
+ * marker belongs to this session, nothing is cleared — a sibling session's
+ * marker is left for the SessionEnd/late-close paths to reconcile.
+ * Lock-guarded (withSessionMarkerLock) — same read-modify-write race as
+ * every other marker mutation site.
+ */
+async function clearSessionMarkerForClose(db, projectId, payload) {
+  const currentSessionId =
+    (typeof payload.session_id === 'string' && payload.session_id.length > 0)
+      ? payload.session_id
+      : (typeof process.env.CLAUDE_CODE_SESSION_ID === 'string' && process.env.CLAUDE_CODE_SESSION_ID.length > 0)
+        ? process.env.CLAUDE_CODE_SESSION_ID
+        : null;
+  await withSessionMarkerLock(db, projectId, async () => {
+    const markers = await getSessionMarkers(db, projectId);
+    const idx = findMatchingMarkerIndex(markers, currentSessionId);
+    if (idx === -1) return;
+    const remaining = markers.filter((_, i) => i !== idx);
+    await setSessionMarkers(db, projectId, remaining);
+  });
 }
 
 // ── close ─────────────────────────────────────────────────────────────────────
@@ -5533,11 +5969,10 @@ async function cmdClose(args) {
       RECONCILIATION_SECTION: '',
     });
 
-    // Clear session_in_progress marker
-    await db.query(
-      `DELETE FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'`,
-      [projectId]
-    );
+    // Clear this session's session_in_progress marker (S4). No divergence signal
+    // exists at enqueue time (the payload's own persistence happens later, in
+    // queue-drain) — always safe to clear here.
+    await clearSessionMarkerForClose(db, projectId, payload);
 
     await db.end();
 
@@ -6578,11 +7013,20 @@ async function cmdClose(args) {
     process.stderr.write(`[handoff] packaging-honesty probe failed (non-fatal): ${packErr.message}\n`);
   }
 
-  // Clear session_in_progress marker
-  await db.query(
-    `DELETE FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'`,
-    [projectId]
-  );
+  // S4/F-6: clear this session's session_in_progress marker (never a sibling
+  // session's — see clearSessionMarkerForClose) ONLY on a clean close. A close
+  // that surfaced a DIVERGENCE (cm#227/#229 — a session_tldr/open_thread/
+  // quick_reference persistence failure) leaves the marker in place as a
+  // safety net: this session's work was not fully persisted, so the implicit-
+  // close paths (SessionEnd / late-close) get a chance to catch it later
+  // rather than the close silently declaring itself done.
+  if (intentDivergenceLines.length === 0) {
+    await clearSessionMarkerForClose(db, projectId, payload);
+  } else {
+    process.stderr.write(
+      `[handoff] close: session_in_progress marker NOT cleared — ${intentDivergenceLines.length} DIVERGENCE line(s) present\n`
+    );
+  }
 
   // Run reranker gate (informational)
   await runRerankerGate(db, projectId, root);
@@ -6708,30 +7152,45 @@ async function cmdPurge(args) {
   console.log(`\nDone: handoff:purge — all project memory permanently deleted`);
 }
 
-// ── loader-stop (Stop hook entry point) ──────────────────────────────────────
+// ── loader-stop (SessionEnd hook entry point) ────────────────────────────────
 
 /**
- * Stop hook for implicit session close.
+ * SessionEnd hook for implicit session close.
  *
- * Fires when Claude Code ends a session. Checks whether /handoff:close or
- * /handoff:checkpoint ran during this session (via the session_in_progress
- * marker set by cmdLoaderHook). If not, writes an implicit close record to
- * handoff.md and clears the marker.
+ * Historically wired under the Claude Code Stop hook, which fires at EVERY
+ * turn end — that fired an implicit close at the first turn end of every
+ * session, clobbering the session TLDR and leaving the rest of the session
+ * unprotected. Wired under SessionEnd instead (fires once, at true session
+ * end): checks whether /handoff:close or /handoff:checkpoint ran during this
+ * session (via this session's own session_in_progress marker, set by
+ * cmdLoaderHook). If not, writes an implicit close record to handoff.md and
+ * clears the marker.
+ *
+ * S1 (total classification, zero I/O before it): hook_event_name is read from
+ * stdin with a permissive, fail-open parser (readHookStdinPermissive) BEFORE
+ * any file or DB I/O. Anything other than hook_event_name === 'SessionEnd' —
+ * 'Stop', any other value, missing, empty, or malformed stdin — exits 0
+ * immediately with no I/O at all. This is the entire point of the fix: a
+ * Stop-shaped invocation (or any leftover wiring from before this PR) must
+ * never pay a DB round trip.
+ *
+ * S4: clears only the CURRENT session's own marker (an exact session_id
+ * match, or a legacy bare marker — see findMatchingMarkerIndex). A sibling
+ * session's marker is left untouched; cmdLoaderHook's late-close sweep is
+ * responsible for eventually reconciling an abandoned sibling marker.
  *
  * Defensive contract: ALWAYS exits 0. Any error is logged to stderr and the
  * hook exits silently — we must never break session teardown.
- *
- * Design note on handoff.md body preservation:
- *   writeHandoffMd() re-renders from the full template, which would overwrite
- *   the body (tldr, open_threads, quick_references) with whatever we pass.
- *   For an implicit close we do NOT have a fresh extraction payload, so we
- *   preserve the existing body by reading the current frontmatter and passing
- *   its values back. The only fields we override are last_close (set to now)
- *   and tldr (set to the implicit-close notice). This matches the pattern used
- *   by cmdCheckpoint — read current fm, then call writeHandoffMd with merged
- *   values — which is cleaner than trying to surgically edit the raw file.
  */
 async function cmdLoaderStop() {
+  // S1 — total classification BEFORE any file or DB I/O.
+  const hookPayload = readHookStdinPermissive();
+  if (!hookPayload || hookPayload.hook_event_name !== 'SessionEnd') {
+    process.exit(0);
+  }
+
+  const currentSessionId = resolveHookSessionId(hookPayload);
+
   let db = null;
   try {
     const projectId   = resolveProjectId();
@@ -6749,88 +7208,45 @@ async function cmdLoaderStop() {
       process.exit(0);
     }
 
-    // Check project-level implicit_close gate (default enabled).
+    // Check project-level implicit_close gate (default enabled). S6: 'disabled' is
+    // a full no-op here.
     const implicitClose = await getSetting(db, projectId, 'implicit_close', 'enabled');
     if (implicitClose === 'disabled') {
       await db.end();
       process.exit(0);
     }
 
-    // Check session_in_progress marker.
-    //   Absent → close already ran (or loader hook never fired). No-op.
-    //   Present → no explicit close ran this session. Run implicit close.
-    const sip = await getSetting(db, projectId, 'session_in_progress', null);
-    if (!sip) {
+    // Check for THIS session's own marker, and — if matched — write the
+    // implicit close and clear it, all under one advisory-locked transaction
+    // (see withSessionMarkerLock) so a concurrent SessionStart/SessionEnd for
+    // the same project cannot race the read-modify-write and lose a marker.
+    //   No match → close already ran (or loader hook never fired for this
+    //              session). No-op — a sibling session's marker is not ours
+    //              to act on here.
+    //   Match    → no explicit close ran this session. Run implicit close.
+    const acted = await withSessionMarkerLock(db, projectId, async () => {
+      const markers = await getSessionMarkers(db, projectId);
+      const matchIdx = findMatchingMarkerIndex(markers, currentSessionId);
+      if (matchIdx === -1) return false;
+
+      process.stderr.write('Running: handoff SessionEnd hook — implicit close...\n');
+      writeImplicitClose(handoffPath, projectId, findProjectRoot());
+
+      // Clear only the matched marker — leave any sibling session's marker alone.
+      const remaining = markers.filter((_, i) => i !== matchIdx);
+      await setSessionMarkers(db, projectId, remaining);
+      return true;
+    });
+
+    if (!acted) {
       await db.end();
       process.exit(0);
     }
 
-    // session_in_progress is set — implicit close needed.
-    process.stderr.write('Running: handoff stop hook — implicit close...\n');
-
-    // Read current frontmatter to preserve all existing fields.
-    const fm   = readHandoffFrontmatter(handoffPath);
-    const root = findProjectRoot();
-
-    const stamp = new Date().toISOString();
-
-    // Preserve existing body-level values; override last_close and tldr only.
-    // open_threads and quick_references are preserved from prior close/checkpoint.
-    // session_summary sub-keys live nested in fm.session_summary (parsed by
-    // readHandoffFrontmatter), NOT at the top level of fm.
-    const ss = fm.session_summary || {};
-    const entitiesWritten   = ss.entities_written   || '0';
-    const assertionsWritten = ss.assertions_written || '0';
-    const edgesWritten      = ss.edges_written      || '0';
-    const contractName      = fm.contract           || 'default';
-    const projectName       = fm.project_name       || path.basename(root);
-
-    // Reconstruct open_threads and quick_references from the handoff.md body.
-    // writeHandoffMd expects OPEN_THREADS as bullet-prefixed lines and
-    // QUICK_REFERENCES as a plain string. We read them from the raw body rather
-    // than frontmatter (they live in the body section, not in YAML).
-    // Safest fallback: preserve the prior close values via the template.
-    // The template uses {{OPEN_THREADS}} and {{QUICK_REFERENCES}}, so we need
-    // to supply them explicitly. Read the existing file body to extract them.
-    let openThreads    = '- (none)';
-    let quickRefs      = '(none)';
-    try {
-      const raw  = fs.readFileSync(handoffPath, 'utf8');
-      const body = raw.replace(/^---[\s\S]*?---\r?\n/, '');
-      // Extract open threads block
-      const otMatch = body.match(/##\s+Open threads\r?\n([\s\S]*?)(?=\r?\n##|\r?\n$|$)/);
-      if (otMatch) openThreads = otMatch[1].trim() || '- (none)';
-      // Extract quick references block
-      const qrMatch = body.match(/##\s+Quick references\r?\n([\s\S]*?)(?=\r?\n##|\r?\n$|$)/);
-      if (qrMatch) quickRefs = qrMatch[1].trim() || '(none)';
-    } catch (_) {
-      // Body parse failed — fall back to safe defaults
-    }
-
-    writeHandoffMd(handoffPath, {
-      PROJECT_ID:          projectId,
-      LAST_CLOSE:          stamp,
-      CONTRACT:            contractName,
-      ENTITIES_WRITTEN:    entitiesWritten,
-      ASSERTIONS_WRITTEN:  assertionsWritten,
-      EDGES_WRITTEN:       edgesWritten,
-      PROJECT_NAME:        projectName,
-      TLDR:                '(implicit close — session ended without explicit /handoff:close)',
-      OPEN_THREADS:        openThreads,
-      QUICK_REFERENCES:    quickRefs,
-      DEGRADED_SECTION:    '',
-      RECONCILIATION_SECTION: '',
-    });
-
-    // Clear the session_in_progress marker.
-    await db.query(
-      `DELETE FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'`,
-      [projectId]
-    );
-
     await db.end();
 
-    process.stderr.write(`Done: handoff stop hook — project=${projectName} marker=${projectId} — implicit close written, session marker cleared\n`);
+    const projectName = path.basename(findProjectRoot());
+    process.stderr.write(`Done: handoff SessionEnd hook — project=${projectName} marker=${projectId} — implicit close written, session marker cleared\n`);
     process.exit(0);
 
   } catch (err) {
@@ -7879,5 +8295,14 @@ if (require.main === module) {
     resolveSessionId,
     ASSERTION_TIER_PROBATIONARY,
     ASSERTION_TIER_CONSOLIDATED,
+    // Session-marker concurrency hardening — exposed for
+    // scripts/test-loader-stop-gate.js-adjacent concurrency coverage (no
+    // test-side reimplementation of the advisory-lock read-modify-write).
+    getSessionMarkers,
+    setSessionMarkers,
+    addSessionMarker,
+    withSessionMarkerLock,
+    findMatchingMarkerIndex,
+    latestSessionMarker,
   };
 }

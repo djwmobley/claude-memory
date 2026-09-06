@@ -646,7 +646,8 @@ CREATE TABLE IF NOT EXISTS project_settings (
 -- Known settings keys and their hardcoded defaults (used when row is absent):
 --   staleness_days             default: '7'         (days before loader triggers staleness prompt)
 --   loader_token_budget        default: '4000'      (total tokens the SessionStart loader may inject)
---   implicit_close             default: 'enabled'   ('enabled'|'disabled' — Stop-hook behavior)
+--   implicit_close             default: 'enabled'   ('enabled'|'disabled' — SessionEnd-hook implicit-close behavior)
+--   implicit_close_stale_hours default: '24'        (SessionStart late-close sweep liveness threshold, hours)
 --   decay_rate_default         default: '0.05'      (per-day decay for new assertions lacking row-level override)
 --   cluster_aware_retrieval    default: 'enabled'   ('enabled'|any other value — W3 cluster-aware expansion)
 --   cluster_max_siblings       default: '10'        (max same-community sibling entities added per load)

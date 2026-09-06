@@ -181,7 +181,7 @@ Correct example (Mac/Linux):
     "SessionStart": [
       { "command": "node /absolute/path/to/claude-memory/scripts/handoff.js loader-hook" }
     ],
-    "Stop": [
+    "SessionEnd": [
       { "command": "node /absolute/path/to/claude-memory/scripts/handoff.js loader-stop" }
     ]
   }

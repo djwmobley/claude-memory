@@ -14,7 +14,7 @@ debugging, and recovery.
 Run this at the end of a working session. Claude reads back over the conversation, pulls
 out decisions, facts, and context worth keeping, and writes them to the database. It also
 rewrites the `handoff.md` summary file so the next session can find what matters quickly.
-If you skip it, the Stop hook does an automatic save — but the explicit close lets Claude
+If you skip it, the SessionEnd hook does an automatic save — but the explicit close lets Claude
 write a richer, better-organized summary. See [docs/how-memory-works.md](../../docs/how-memory-works.md)
 for what gets saved and how.
 

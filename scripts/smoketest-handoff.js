@@ -1264,12 +1264,16 @@ async function hooksStep2_safetyOutsideProject() {
       return false;
     }
 
-    // loader-stop
+    // loader-stop — SessionEnd-shaped stdin (loader-stop's real invocation
+    // contract as of the Stop->SessionEnd gate fix; a Stop-shaped or missing
+    // payload would now no-op via the S1 gate before even reaching this
+    // "no handoff.md" check, which would defeat the point of this test).
     const rStop = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'loader-stop'], {
       cwd:      PROJECT_ROOT,
       env:      envSafe,
       encoding: 'utf8',
       timeout:  15000,
+      input:    JSON.stringify({ hook_event_name: 'SessionEnd', session_id: 'hooks-safety-session' }),
     });
 
     if (rStop.status !== 0) {
@@ -1294,13 +1298,16 @@ async function hooksStep2_safetyOutsideProject() {
 }
 
 /**
- * HOOKS 3/3: Stop hook honors implicit_close=false / =enabled.
+ * HOOKS 3/3: SessionEnd hook (loader-stop) honors implicit_close=false / =enabled.
  *
- * When implicit_close is 'disabled', Stop hook must leave session_in_progress alone.
- * When implicit_close is 'enabled', Stop hook must clear session_in_progress.
+ * When implicit_close is 'disabled', the SessionEnd hook must leave
+ * session_in_progress alone. When implicit_close is 'enabled', it must clear
+ * session_in_progress. loader-stop only acts on a hook_event_name==='SessionEnd'
+ * stdin payload (S1 gate) — both invocations below supply one.
  */
 async function hooksStep3_stopHookImplicitClose() {
-  const label = 'Stop hook: respects implicit_close=disabled / implicit_close=enabled';
+  const label = 'SessionEnd hook: respects implicit_close=disabled / implicit_close=enabled';
+  const sessionEndStdin = JSON.stringify({ hook_event_name: 'SessionEnd', session_id: 'hooks_test_session' });
   try {
     // Write a fresh handoff.md so loader-stop finds the project provisioned.
     writeHandoffMdDirect(HANDOFF_PATH_HOOKS, new Date().toISOString());
@@ -1320,7 +1327,7 @@ async function hooksStep3_stopHookImplicitClose() {
     );
     await db.end();
 
-    const rDisabled = runHandoff('loader-stop', [], null, HOOKS_DB, TEMP_PROJECT_DIR_HOOKS);
+    const rDisabled = runHandoff('loader-stop', [], sessionEndStdin, HOOKS_DB, TEMP_PROJECT_DIR_HOOKS);
     if (rDisabled.status !== 0) {
       hkFail(3, label, `loader-stop (implicit_close=disabled) exited ${rDisabled.status}`);
       return false;
@@ -1334,7 +1341,7 @@ async function hooksStep3_stopHookImplicitClose() {
     await db2.end();
 
     if (sipAfterDisabled.rows.length === 0) {
-      hkFail(3, label, 'session_in_progress was cleared when implicit_close=disabled — Stop hook should have bailed out');
+      hkFail(3, label, 'session_in_progress was cleared when implicit_close=disabled — SessionEnd hook should have bailed out');
       return false;
     }
 
@@ -1348,7 +1355,7 @@ async function hooksStep3_stopHookImplicitClose() {
     // session_in_progress is still set from sub-test A.
     await db3.end();
 
-    const rEnabled = runHandoff('loader-stop', [], null, HOOKS_DB, TEMP_PROJECT_DIR_HOOKS);
+    const rEnabled = runHandoff('loader-stop', [], sessionEndStdin, HOOKS_DB, TEMP_PROJECT_DIR_HOOKS);
     if (rEnabled.status !== 0) {
       hkFail(3, label, `loader-stop (implicit_close=enabled) exited ${rEnabled.status}`);
       return false;
