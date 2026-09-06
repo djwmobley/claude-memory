@@ -1274,15 +1274,56 @@ async function setSessionMarkers(db, projectId, list) {
 }
 
 /**
+ * Concurrency hardening: run `fn()` inside a transaction holding a per-
+ * project advisory lock on the session_in_progress marker row, closing the
+ * read-modify-write race between two concurrent hook invocations for the
+ * same project (e.g. two SessionStart hooks, or a SessionStart racing a
+ * SessionEnd) that would otherwise lose one side's marker addition/removal.
+ *
+ * Style matches scripts/lib/routing-profile.js's routingProfileSet: caller-
+ * side BEGIN, then a `pg_advisory_xact_lock(hashtext(key))` transaction-
+ * scoped lock taken BEFORE the read, then COMMIT (ROLLBACK on error) —
+ * reused here as its own helper (rather than re-inlined per call site)
+ * because every marker mutation site needs the identical BEGIN/lock/COMMIT
+ * wrapper, unlike routing-profile.js's single call site.
+ *
+ * The lock itself is taken via db.acquireNamedXactLock(lockKey) — a port
+ * method on both db-seam.js adapters (S8 abstraction invariant: the engine
+ * never branches on the adapter's backend/dialect; the dialect-specific
+ * mechanism lives in db-seam.js, one call site per adapter). SQLite has no
+ * cross-connection
+ * advisory-lock primitive and this codebase's SQLite seam is a single-
+ * process/test-only backend, so SQLiteAdapter.acquireNamedXactLock is a
+ * documented no-op there.
+ *
+ * Callers must NOT already be inside a transaction on this `db` connection.
+ */
+async function withSessionMarkerLock(db, projectId, fn) {
+  await db.query('BEGIN');
+  try {
+    await db.acquireNamedXactLock(`session_in_progress:${projectId}`);
+    const result = await fn();
+    await db.query('COMMIT');
+    return result;
+  } catch (err) {
+    await db.query('ROLLBACK');
+    throw err;
+  }
+}
+
+/**
  * Upsert this session's own marker into the list (dedupe by session_id —
  * re-writing the SAME session's marker, e.g. on /clear or /compact, refreshes
- * its ts rather than accumulating a duplicate entry).
+ * its ts rather than accumulating a duplicate entry). Lock-guarded — see
+ * withSessionMarkerLock.
  */
 async function addSessionMarker(db, projectId, sessionId, ts) {
-  const list = await getSessionMarkers(db, projectId);
-  const filtered = sessionId ? list.filter((m) => m.session_id !== sessionId) : list;
-  filtered.push({ session_id: sessionId || null, ts });
-  await setSessionMarkers(db, projectId, filtered);
+  return withSessionMarkerLock(db, projectId, async () => {
+    const list = await getSessionMarkers(db, projectId);
+    const filtered = sessionId ? list.filter((m) => m.session_id !== sessionId) : list;
+    filtered.push({ session_id: sessionId || null, ts });
+    await setSessionMarkers(db, projectId, filtered);
+  });
 }
 
 /**
@@ -1329,6 +1370,33 @@ function latestSessionMarker(list) {
     if (Number.isNaN(mMs)) return latest;
     return mMs > lMs ? m : latest;
   }, null);
+}
+
+/**
+ * Human-readable summary of the per-session session_in_progress markers for
+ * /handoff:status display. A single legacy bare-string marker (session_id:
+ * null) renders byte-identically to the pre-S3 single-value display; a real
+ * (or multiple) per-session marker(s) render with a count + the latest
+ * session-id prefix + timestamp, so an operator sees there's more than one
+ * session in flight without decoding the raw JSON array by hand.
+ * Returns { active: boolean, id: string|null, prose: string } — `id` is the
+ * same representative value (real session_id, or legacy ts) every other
+ * single-value consumer uses (see latestSessionMarker), kept for the
+ * --json session_id field's existing string|null contract.
+ */
+function formatSessionMarkersForStatus(markers) {
+  if (!markers || markers.length === 0) {
+    return { active: false, id: null, prose: 'no' };
+  }
+  if (markers.length === 1 && markers[0].session_id === null) {
+    // Legacy bare-string marker — byte-identical to the pre-S3 display.
+    return { active: true, id: markers[0].ts, prose: `YES (session_id=${markers[0].ts})` };
+  }
+  const latest   = latestSessionMarker(markers);
+  const idPrefix = latest.session_id ? latest.session_id.slice(0, 8) : '(legacy)';
+  const id       = latest.session_id || latest.ts;
+  const prose    = `YES (${markers.length} marker${markers.length === 1 ? '' : 's'} — latest ${idPrefix} at ${latest.ts})`;
+  return { active: true, id, prose };
 }
 
 /**
@@ -2833,11 +2901,8 @@ async function cmdStatus(args = []) {
   const liveCounts = await getLiveCounts(db, projectId);
   const rcRes  = await db.query('SELECT name        FROM retrieval_contract  WHERE project_id = $1 ORDER BY name', [projectId]);
 
-  // Session-in-progress marker
-  const sipRes = await db.query(
-    "SELECT value FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'",
-    [projectId]
-  );
+  // Session-in-progress marker(s) — S3 per-session format; see getSessionMarkers.
+  const sessionMarkers = await getSessionMarkers(db, projectId);
 
   // ── --breakdown: counts by tier and suppression ──────────────────────────
   let breakdown = null;
@@ -2948,7 +3013,7 @@ async function cmdStatus(args = []) {
   const days      = daysSince(fm.last_close);
   const daysStr   = days !== null ? `${days} day(s) ago` : 'N/A';
   const contracts = rcRes.rows.map((r) => r.name).join(', ') || '(none)';
-  const sip       = sipRes.rows.length > 0 ? sipRes.rows[0].value : null;
+  const sipDisplay = formatSessionMarkersForStatus(sessionMarkers);
 
   // Packaging-honesty probe (read-only — no DB writes).
   let packagingState = null;
@@ -2980,8 +3045,8 @@ async function cmdStatus(args = []) {
       assertions_total: liveCounts.assertionsTotal,
       edges:          liveCounts.edges,
       contracts:      rcRes.rows.map((r) => r.name),
-      session_active: sip ? true : false,
-      session_id:     sip || null,
+      session_active: sipDisplay.active,
+      session_id:     sipDisplay.id,
       packaging:      packagingState,
       schema_apply_degraded: schemaDegraded,
     };
@@ -3006,7 +3071,7 @@ async function cmdStatus(args = []) {
   console.log(`  assertions:       ${liveCounts.assertionsLive} (suppressed: ${liveCounts.assertionsSuppressed}, invalidated: ${liveCounts.assertionsInvalidatedOnly})`);
   console.log(`  edges:            ${liveCounts.edges}`);
   console.log(`  contracts:        ${contracts}`);
-  console.log(`  session_active:   ${sip ? `YES (session_id=${sip})` : 'no'}`);
+  console.log(`  session_active:   ${sipDisplay.prose}`);
   if (packagingLine) console.log(packagingLine);
   if (schemaDegraded) {
     console.log(`  schema_apply:     DEGRADED (${schemaDegraded.reason || 'unknown'}) — see detail: ${JSON.stringify(schemaDegraded.detail)}`);
@@ -4274,57 +4339,67 @@ async function cmdLoaderHook() {
     // for the SAME logical session continuing (not a new one whose siblings'
     // markers should be judged stale). Running the sweep there risks a
     // false-positive DIVERGENCE banner on ordinary /clear.
+    //
+    // The sweep AND the fresh-marker write are folded into ONE
+    // withSessionMarkerLock-guarded transaction (rather than two separate
+    // calls) — folding them avoids a nested BEGIN (addSessionMarker takes
+    // its own lock) and closes the race window between "sweep decided which
+    // markers are stale" and "fresh marker written" that two separate locked
+    // transactions would otherwise leave open.
     const hookSource       = (hookPayload && typeof hookPayload.source === 'string') ? hookPayload.source : null;
     const currentSessionId = resolveHookSessionId(hookPayload) || crypto.randomUUID();
     let lateCloseDivergenceLines = [];
 
-    if (markerDb && hookSource !== 'clear' && hookSource !== 'compact') {
-      try {
-        const implicitCloseLate = await getSetting(markerDb, projectId, 'implicit_close', 'enabled');
-        if (implicitCloseLate === 'enabled') {
-          const staleHoursRaw = parseInt(
-            await getSetting(markerDb, projectId, 'implicit_close_stale_hours', '24'),
-            10
-          );
-          const staleHours = (Number.isFinite(staleHoursRaw) && staleHoursRaw > 0) ? staleHoursRaw : 24;
-          const staleMs    = staleHours * 60 * 60 * 1000;
-
-          const markers      = await getSessionMarkers(markerDb, projectId);
-          const staleForeign = [];
-          const kept          = [];
-          for (const m of markers) {
-            const isForeign = m.session_id !== currentSessionId;
-            if (!isForeign) { kept.push(m); continue; }
-            const ageMs = Date.now() - Date.parse(m.ts);
-            // NaN age (unparseable ts) is treated as stale — a garbage marker
-            // must eventually be cleaned up, never left orphaned forever.
-            const isStale = Number.isNaN(ageMs) || ageMs > staleMs;
-            if (isStale) staleForeign.push(m); else kept.push(m);
-          }
-
-          if (staleForeign.length > 0) {
-            // ONE implicit close for the project — not one per stale marker
-            // (there is only one handoff.md).
-            writeImplicitClose(handoffPath, projectId, findProjectRoot());
-            await setSessionMarkers(markerDb, projectId, kept);
-            lateCloseDivergenceLines = staleForeign.map(
-              (m) => `DIVERGENCE: late implicit close for session ${m.session_id || '(legacy marker)'} (marker ts ${m.ts})`
-            );
-          }
-        }
-      } catch (lateCloseErr) {
-        process.stderr.write(`[handoff] loader-hook late-close sweep failed (non-fatal): ${lateCloseErr.message}\n`);
-      }
-    }
-
-    // Write the fresh marker for THIS session so a true SessionEnd (loader-stop)
-    // knows a close is still needed. Not set on the stale path (handled by the
-    // early-return above) — stale means the user is not in an auto-loaded session.
     if (markerDb) {
       try {
-        await addSessionMarker(markerDb, projectId, currentSessionId, new Date().toISOString());
+        await withSessionMarkerLock(markerDb, projectId, async () => {
+          let markers = await getSessionMarkers(markerDb, projectId);
+
+          if (hookSource !== 'clear' && hookSource !== 'compact') {
+            const implicitCloseLate = await getSetting(markerDb, projectId, 'implicit_close', 'enabled');
+            if (implicitCloseLate === 'enabled') {
+              const staleHoursRaw = parseInt(
+                await getSetting(markerDb, projectId, 'implicit_close_stale_hours', '24'),
+                10
+              );
+              const staleHours = (Number.isFinite(staleHoursRaw) && staleHoursRaw > 0) ? staleHoursRaw : 24;
+              const staleMs    = staleHours * 60 * 60 * 1000;
+
+              const staleForeign = [];
+              const kept         = [];
+              for (const m of markers) {
+                const isForeign = m.session_id !== currentSessionId;
+                if (!isForeign) { kept.push(m); continue; }
+                const ageMs = Date.now() - Date.parse(m.ts);
+                // NaN age (unparseable ts) is treated as stale — a garbage marker
+                // must eventually be cleaned up, never left orphaned forever.
+                const isStale = Number.isNaN(ageMs) || ageMs > staleMs;
+                if (isStale) staleForeign.push(m); else kept.push(m);
+              }
+
+              if (staleForeign.length > 0) {
+                // ONE implicit close for the project — not one per stale marker
+                // (there is only one handoff.md).
+                writeImplicitClose(handoffPath, projectId, findProjectRoot());
+                markers = kept;
+                lateCloseDivergenceLines = staleForeign.map(
+                  (m) => `DIVERGENCE: late implicit close for session ${m.session_id || '(legacy marker)'} (marker ts ${m.ts})`
+                );
+              }
+            }
+          }
+
+          // Write the fresh marker for THIS session so a true SessionEnd
+          // (loader-stop) knows a close is still needed — inline rather than
+          // via addSessionMarker (which would attempt a nested BEGIN here).
+          const filtered = currentSessionId
+            ? markers.filter((m) => m.session_id !== currentSessionId)
+            : markers;
+          filtered.push({ session_id: currentSessionId || null, ts: new Date().toISOString() });
+          await setSessionMarkers(markerDb, projectId, filtered);
+        });
       } catch (markerErr) {
-        process.stderr.write(`[handoff] loader-hook: marker write failed (non-fatal): ${markerErr.message}\n`);
+        process.stderr.write(`[handoff] loader-hook: late-close sweep / marker write failed (non-fatal): ${markerErr.message}\n`);
       }
     }
 
@@ -5606,6 +5681,8 @@ async function resolveSessionId(db, projectId, payload) {
  * (session_id: null) still matches, per findMatchingMarkerIndex/S4. If no
  * marker belongs to this session, nothing is cleared — a sibling session's
  * marker is left for the SessionEnd/late-close paths to reconcile.
+ * Lock-guarded (withSessionMarkerLock) — same read-modify-write race as
+ * every other marker mutation site.
  */
 async function clearSessionMarkerForClose(db, projectId, payload) {
   const currentSessionId =
@@ -5614,11 +5691,13 @@ async function clearSessionMarkerForClose(db, projectId, payload) {
       : (typeof process.env.CLAUDE_CODE_SESSION_ID === 'string' && process.env.CLAUDE_CODE_SESSION_ID.length > 0)
         ? process.env.CLAUDE_CODE_SESSION_ID
         : null;
-  const markers = await getSessionMarkers(db, projectId);
-  const idx = findMatchingMarkerIndex(markers, currentSessionId);
-  if (idx === -1) return;
-  const remaining = markers.filter((_, i) => i !== idx);
-  await setSessionMarkers(db, projectId, remaining);
+  await withSessionMarkerLock(db, projectId, async () => {
+    const markers = await getSessionMarkers(db, projectId);
+    const idx = findMatchingMarkerIndex(markers, currentSessionId);
+    if (idx === -1) return;
+    const remaining = markers.filter((_, i) => i !== idx);
+    await setSessionMarkers(db, projectId, remaining);
+  });
 }
 
 // ── close ─────────────────────────────────────────────────────────────────────
@@ -7115,26 +7194,32 @@ async function cmdLoaderStop() {
       process.exit(0);
     }
 
-    // Check for THIS session's own marker.
+    // Check for THIS session's own marker, and — if matched — write the
+    // implicit close and clear it, all under one advisory-locked transaction
+    // (see withSessionMarkerLock) so a concurrent SessionStart/SessionEnd for
+    // the same project cannot race the read-modify-write and lose a marker.
     //   No match → close already ran (or loader hook never fired for this
     //              session). No-op — a sibling session's marker is not ours
     //              to act on here.
     //   Match    → no explicit close ran this session. Run implicit close.
-    const markers = await getSessionMarkers(db, projectId);
-    const matchIdx = findMatchingMarkerIndex(markers, currentSessionId);
-    if (matchIdx === -1) {
+    const acted = await withSessionMarkerLock(db, projectId, async () => {
+      const markers = await getSessionMarkers(db, projectId);
+      const matchIdx = findMatchingMarkerIndex(markers, currentSessionId);
+      if (matchIdx === -1) return false;
+
+      process.stderr.write('Running: handoff SessionEnd hook — implicit close...\n');
+      writeImplicitClose(handoffPath, projectId, findProjectRoot());
+
+      // Clear only the matched marker — leave any sibling session's marker alone.
+      const remaining = markers.filter((_, i) => i !== matchIdx);
+      await setSessionMarkers(db, projectId, remaining);
+      return true;
+    });
+
+    if (!acted) {
       await db.end();
       process.exit(0);
     }
-
-    // Marker matched — implicit close needed.
-    process.stderr.write('Running: handoff SessionEnd hook — implicit close...\n');
-
-    writeImplicitClose(handoffPath, projectId, findProjectRoot());
-
-    // Clear only the matched marker — leave any sibling session's marker alone.
-    const remaining = markers.filter((_, i) => i !== matchIdx);
-    await setSessionMarkers(db, projectId, remaining);
 
     await db.end();
 
@@ -8188,5 +8273,14 @@ if (require.main === module) {
     resolveSessionId,
     ASSERTION_TIER_PROBATIONARY,
     ASSERTION_TIER_CONSOLIDATED,
+    // Session-marker concurrency hardening — exposed for
+    // scripts/test-loader-stop-gate.js-adjacent concurrency coverage (no
+    // test-side reimplementation of the advisory-lock read-modify-write).
+    getSessionMarkers,
+    setSessionMarkers,
+    addSessionMarker,
+    withSessionMarkerLock,
+    findMatchingMarkerIndex,
+    latestSessionMarker,
   };
 }
