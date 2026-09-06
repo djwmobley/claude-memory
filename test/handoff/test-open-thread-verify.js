@@ -404,6 +404,21 @@ async function runTests() {
     try {
       // Skip runInit (uses writeMarker in setupWithGit already).
 
+      // cm#233 fix-round (round 3): SCHEMA_EPOCH 3->4 means a brand-new
+      // project's FIRST ensureSchemaCurrent touch also runs migrate-17's
+      // one-time open_thread re-key (by design). Without this pre-touch,
+      // the row seeded below would be superseded by migrate-17 during the
+      // close a few lines down (its subject is an arbitrary placeholder —
+      // path.basename(fakeRoot), not modeling the intentKey/legacy
+      // derivation convention — so it is not "deliberately legacy-shaped"
+      // and is not rewritten to intentKey(object) here; the fix is to run
+      // the SAME ensureSchemaCurrent path the engine uses BEFORE seeding,
+      // so this project's cutover gate is already recorded done and the
+      // thread-less close cannot touch the row via migrate-17).
+      const { PostgresAdapter } = require('../../scripts/lib/db-seam.js');
+      const handoffModule = require('../../scripts/handoff.js');
+      await handoffModule.ensureSchemaCurrent(new PostgresAdapter(db), projectId, { silent: true });
+
       // Seed the open_thread row.
       const { rows: inserted } = await db.query(
         `INSERT INTO assertions

@@ -187,7 +187,48 @@ does not compress it. Shorter threads = fewer bootstrap tokens on the next resum
 `test/north-star/test-caveman-economy.js` enforces caveman compression with no
 fidelity regression (leaner cannot be bought with lost load-bearing tokens).
 
-### 8. CLAUDE.md promotion
+### 8. Resolved threads
+
+Bullet list of open-thread text (matching the ORIGINAL thread text, not a
+paraphrase) that is now done. Optional payload key: `resolved_threads`.
+
+**cm#233 classification (never silent).** Each entry is normalized via
+`intentKey` (Unicode-NFC, whitespace-collapsed, 1000-byte-capped — see
+`scripts/lib/intent-key.js`) and classified against the project's live
+`open_thread` rows, both in `--dry-run` and a real close.
+
+**`KEY: description` authoring convention.** If the normalized text
+contains a `:` at index <60 with a SPACE immediately after it (and
+non-empty text before it), the key is just the text before that colon —
+this is how a session supersedes its own earlier thread by key even when
+the description changes completely (e.g. `SHIP-DECISION: ship this
+cycle` later restated as `SHIP-DECISION: defer to next cycle` — same key,
+new row supersedes the old). A colon with no space after it (a URL's
+`https://...` scheme colon, for example) never matches this rule, so a
+URL-led thread keys on its full text instead of colliding every URL-led
+thread onto the literal key `https`. **Accepted trade-off:** a generic
+lead-in collides too — `TODO: buy milk` and `TODO: file taxes` both key to
+`TODO` and supersede each other — so use a distinctive key (an issue
+number, a named thread) before `: `.
+
+
+
+- **MATCHED-AND-RESOLVED** — a live `open_thread` row's key matches. That row
+  is auto-retired (suppressed, `suppression_kind='superseded'`) BEFORE the
+  close's `open_threads` are persisted, so a thread that is both resolved and
+  re-stated in the SAME close resolves, then re-opens as a fresh row.
+- **UNMATCHED-REPORTED** — no live row matches. Printed as
+  `UNMATCHED resolved_thread: "<first 80 chars>"` — never silently dropped.
+- **INVALID-REJECTED** — the entry normalizes to an empty key (blank/
+  whitespace-only text). Printed and skipped.
+
+`open_threads` entries get their own classification: two entries in the SAME
+close that normalize to the identical key (case-insensitively) collapse to a
+single written row — **DUPLICATE-COLLAPSED**, printed as
+`DUPLICATE-COLLAPSED open_thread: "<first 80 chars>"` — rather than writing
+two rows or racing the 1:1 supersession path against itself.
+
+### 9. CLAUDE.md promotion
 
 The helper will automatically identify assertions with `confidence >= 9` AND
 `source = 'user_stated'` that have been reinforced across multiple sessions.
@@ -427,7 +468,11 @@ Running: handoff:close
   decisions that WOULD be written:
     - vllm-embedding-default
 
+  UNMATCHED resolved_thread: "fix the thing that was already fixed last week"
+
+  resolved_threads:   would suppress 1 open_thread row(s): [NS-THREAD-ALPHA: finish the migration]
   session_tldr:       would write (subject=my-project)
+  DUPLICATE-COLLAPSED open_thread: "ship the release" (same key as an earlier entry this close — one row would be written)
   open_thread rows:   would write 2 row(s)
 
   CLAUDE.md promotion candidates (would be surfaced — NOT written in dry-run):

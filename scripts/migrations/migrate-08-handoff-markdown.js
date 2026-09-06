@@ -165,7 +165,7 @@ const { Client } = require('pg');
 
 const migrateOne = require('./migrate-01-canonical-db'); // reused by reference, never forked
 const shared = require('./lib/verify15-shared'); // reused by reference: connect config, rowHash, applyDdl
-const { deriveIntentSubject } = require('../handoff.js'); // reused by reference (H-3/H-7), never reimplemented
+const { intentKey } = require('../handoff.js'); // reused by reference (H-3/H-7, cm#233), never reimplemented
 const { AUTHORING_MODE_VALUES } = require('../lib/memory-upsert.js'); // reused by reference, never a second Set
 const mdParse = require('../lib/handoff-markdown-parse.js');
 const { filesystemSourceDb } = require('../lib/fs-path-normalize.js'); // H-14: same normalizer roster entries use
@@ -446,7 +446,7 @@ function parseFileIntoRows(normalizedText, durableHeadings, fileKind, normalizeF
       tablesParsedCount += 1;
       for (const row of table.rows) {
         openThreadRows.push({
-          subject: deriveIntentSubject(row.itemRaw),
+          subject: intentKey(row.itemRaw),
           object: row.notesRaw,
           statusRaw: row.statusRaw,
           statusClass: row.statusClass,
@@ -502,7 +502,7 @@ function parseFileIntoRows(normalizedText, durableHeadings, fileKind, normalizeF
       for (const itemText of items) {
         nextSeq += 1;
         nextStepRows.push({
-          subject: deriveIntentSubject(itemText),
+          subject: intentKey(itemText),
           object: itemText,
           seq: nextSeq,
           headingLineNo: section.headingLineNo,

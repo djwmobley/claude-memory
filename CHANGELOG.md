@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **cm#233: `open_thread` subject derivation replaced (`intentKey`) + resolved_threads/open_threads matcher classification, migrated together** —
+  `deriveIntentSubject` (colon-split-before-char-60-else-truncate-to-80, no
+  Unicode normalization, no whitespace collapse) is REMOVED, not aliased,
+  replaced everywhere by `intentKey` (`scripts/lib/intent-key.js`: NFC
+  normalize, collapse every whitespace run to one space, cap at 1000 UTF-8
+  bytes at a whitespace boundary). Every caller (`scripts/handoff.js`,
+  `scripts/lib/carryover-render.js`, `scripts/migrations/migrate-08-handoff-markdown.js`,
+  `scripts/migrations/verify-19-seams-smoke.js`) moved in this same change.
+  `resolved_threads`/`open_threads` processing is now a total classification,
+  never silent: MATCHED-AND-RESOLVED, UNMATCHED-REPORTED, INVALID-REJECTED
+  (resolved_threads), and DUPLICATE-COLLAPSED (open_threads) — the SAME
+  classification/print functions (`classifyResolvedThreads`,
+  `dedupOpenThreadIntents`) drive both a real close and `--dry-run`, so the
+  two paths can never disagree. `scripts/migrations/migrate-17-intent-key.js`
+  (numbered 17, not 13 — `migrate-13-agent-exchange.js` already exists)
+  re-keys every live `open_thread` row exactly once, with pre-existing-
+  collision detection (latest `last_reinforced` wins, ties broken by
+  highest id); `SCHEMA_EPOCH` bumped 3→4 so `ensureSchemaCurrent` runs it
+  automatically on the next touch of every live project DB (cutover
+  atomicity — no DB is left in a mixed old/new-subject state).
+  **Fix-round (independent review REQUEST CHANGES, addressed same PR):**
+  (1) the auto-run gate was printing migrate-17's full per-row plan to
+  STDOUT on every touch, breaking `scripts/smoketest-handoff.js`'s C2/C5
+  exact-output checks — the gate now always runs `silent`, and even
+  non-silent CLI mode collapses a zero-change plan to one summary line.
+  (2) `intentKey` had dropped the `KEY: description` colon-split
+  convention entirely, breaking `test/north-star/test-provenance.js`'s
+  P2/P3 pin (a session restating `KEY: <new text>` must supersede
+  `KEY: <old text>` by key) — restored as a total rule: a colon at
+  index <60 followed by a SPACE keys on the prefix (a URL's
+  `https://...` scheme colon never matches, since nothing follows it
+  with a space). (3) long strings sharing a >=996-byte common prefix
+  collided onto the same truncated key — truncation now appends
+  ` …#<8-hex sha256 of the full text>` so differing tails always produce
+  different keys.
+
 - **cm#222: migrate-08 handoff-markdown parser hardening** — a real-file
   dry run (H-13's own stated acceptance gate) against a live project's
   `HANDOFF.md`/`HANDOFF-HISTORY.md` surfaced 4 defects in the H-1..H-14

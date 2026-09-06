@@ -23,10 +23,11 @@
  *   - S-12c: this file's exact deliverable shape (see exports below).
  *
  * MATCHING — reused BY REFERENCE, never reimplemented:
- *   - deriveIntentSubject(text) — imported from scripts/handoff.js (the
- *     SAME function handoff.js's own resolved_threads auto-retire path
- *     uses), so subject derivation can never drift out of sync between the
- *     close-time path and this renderer.
+ *   - intentKey(text) — imported from scripts/handoff.js (re-exported from
+ *     scripts/lib/intent-key.js — the SAME function handoff.js's own
+ *     resolved_threads auto-retire path uses), so subject derivation can
+ *     never drift out of sync between the close-time path and this
+ *     renderer.
  *   - PINNED_EXCLUSION_SQL — imported from scripts/handoff.js (the SAME SQL
  *     fragment `(pinned = false OR pinned IS NULL)` handoff.js's own
  *     auto-retire query uses), so "does a pinned row ever match" can never
@@ -38,7 +39,7 @@
  * §7.1's amendment specifies the RESULT semantics, not exact field names):
  *   resolved: string[]              — raw open-thread text, as originally
  *                                      authored (subject is DERIVED from it
- *                                      via deriveIntentSubject, exactly like
+ *                                      via intentKey, exactly like
  *                                      handoff.js's own resolved_threads
  *                                      handling — NOT a markdown substring
  *                                      match).
@@ -54,7 +55,7 @@
  */
 
 const path = require('path');
-const { deriveIntentSubject, PINNED_EXCLUSION_SQL } = require(path.join('..', 'handoff.js'));
+const { intentKey, PINNED_EXCLUSION_SQL } = require(path.join('..', 'handoff.js'));
 
 /** Thrown when a delta item matches 2+ live open_thread rows (§7.1/S-12c:
  * "possible only if the 1:1 index is somehow bypassed" — a hard error,
@@ -146,7 +147,7 @@ async function applyCarryoverDeltas(client, projectId, deltas) {
   for (const text of resolved) {
     const raw = String(text || '').trim();
     if (!raw) continue;
-    const subject = deriveIntentSubject(raw);
+    const subject = intentKey(raw);
     const ids = await findLiveOpenThreadRows(client, projectId, subject);
     if (ids.length === 0) {
       zeroMatch.push({ kind: 'resolved', matchText: raw, subject });
@@ -169,7 +170,7 @@ async function applyCarryoverDeltas(client, projectId, deltas) {
   for (const text of added) {
     const raw = String(text || '').trim();
     if (!raw) continue;
-    const subject = deriveIntentSubject(raw);
+    const subject = intentKey(raw);
     const { rows } = await client.query(
       `INSERT INTO assertions
          (project_id, subject, predicate, object, confidence, source, tier, carryover_status)
@@ -185,7 +186,7 @@ async function applyCarryoverDeltas(client, projectId, deltas) {
     const matchRaw = String((item && item.match) || '').trim();
     const newRaw = String((item && item.text) || '').trim();
     if (!matchRaw || !newRaw) continue;
-    const oldSubject = deriveIntentSubject(matchRaw);
+    const oldSubject = intentKey(matchRaw);
     const ids = await findLiveOpenThreadRows(client, projectId, oldSubject);
     if (ids.length === 0) {
       zeroMatch.push({ kind: 'updated', matchText: matchRaw, subject: oldSubject });
@@ -200,7 +201,7 @@ async function applyCarryoverDeltas(client, projectId, deltas) {
         WHERE id = $1`,
       [ids[0]]
     );
-    const newSubject = deriveIntentSubject(newRaw);
+    const newSubject = intentKey(newRaw);
     const { rows } = await client.query(
       `INSERT INTO assertions
          (project_id, subject, predicate, object, confidence, source, tier, carryover_status)

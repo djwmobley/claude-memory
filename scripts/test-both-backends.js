@@ -5392,15 +5392,11 @@ async function runS19() {
 //   I-11 Static: resolved_threads key is in ALLOWED_KEYS
 //   I-12 Static: resolved_threads validation block is present (array check, length cap)
 
-// Helper: inline deriveIntentSubject (mirrors handoff.js:3831-3838)
-function _deriveIntentSubject(threadText) {
-  const text = String(threadText || '').trim();
-  const colonIdx = text.indexOf(':');
-  if (colonIdx >= 0 && colonIdx < 60) {
-    return text.slice(0, colonIdx).trim();
-  }
-  return text.slice(0, 80);
-}
+// cm#233: deriveIntentSubject was removed from handoff.js (replaced by
+// intentKey, scripts/lib/intent-key.js). This suite requires the REAL
+// exported function rather than an inline mirror — matching S-18's own
+// "no test-side reimplementation of the engine's own functions" convention.
+const _deriveIntentSubject = handoffModule.intentKey;
 
 // Helper: inline auto-retire UPDATE (mirrors the logic in writeExtraction)
 async function _autoRetire(db, projectId, subject) {
@@ -5438,13 +5434,16 @@ async function runS20() {
     async (db) => {
       const pid = freshPid('s20-i1');
       const { suppFalse } = dialectHelpers(db);
+      // cm#233 fix-round: the `KEY: description` colon convention is
+      // intentionally RESTORED (test-provenance.js P2/P3 pin it) — a colon
+      // at index<60 followed by a space keys on the prefix alone.
       await db.query(
         `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
          VALUES ($1,'MY-THREAD','open_thread','do the thing',7,'user_stated',${suppFalse})`,
         [pid]
       );
       const subject = _deriveIntentSubject('MY-THREAD: do the thing');
-      assertEqual(subject, 'MY-THREAD', 'S20-I1: derived subject should be MY-THREAD');
+      assertEqual(subject, 'MY-THREAD', 'S20-I1: intentKey should key on the prefix before "KEY: "');
       const n = await _autoRetire(db, pid, subject);
       assertTrue(n >= 1, `S20-I1: expected at least 1 row suppressed, got ${n}`);
       const { rows } = await db.query(
@@ -5606,6 +5605,157 @@ async function runS20() {
       );
       assertTrue(isActive(liveRows[0]), 'S20-I7-dryrun: row must remain live after preview SELECT');
       assertEqual(liveRows[0].invalid_at, null, 'S20-I7-dryrun: invalid_at must remain NULL after dry-run preview');
+    }
+  );
+
+  // ── cm#233: four-way resolved_threads/open_threads classification ─────────
+  // I-13 MATCHED-AND-RESOLVED, I-14 UNMATCHED-REPORTED, I-15 INVALID-REJECTED,
+  // I-16 DUPLICATE-COLLAPSED — exercised via the REAL exported
+  // classifyResolvedThreads/printResolvedThreadsClassification/
+  // dedupOpenThreadIntents/printOpenThreadDuplicates functions (no test-side
+  // reimplementation), both as a direct call (== what the --dry-run preview
+  // calls) and through the real writeExtraction live-close path (with
+  // console.log captured), so both dry-run and live output are covered by
+  // the SAME shared classification/print functions per the spec's
+  // "UNMATCHED and DUPLICATE visible in captured output for both dry-run
+  // and live" requirement.
+
+  /** Temporarily capture console.log lines during fn(); returns {result, lines}. */
+  async function captureLogs(fn) {
+    const lines = [];
+    const orig = console.log;
+    console.log = (...args) => { lines.push(args.join(' ')); };
+    try {
+      const result = await fn();
+      return { result, lines };
+    } finally {
+      console.log = orig;
+    }
+  }
+
+  // I-13: MATCHED-AND-RESOLVED — classification + real live suppression via writeExtraction
+  await bothBackends(
+    'S20-I13: cm#233 MATCHED-AND-RESOLVED — classifyResolvedThreads verdict + writeExtraction actually suppresses',
+    async (db) => {
+      const pid = freshPid('s20-i13');
+      const { suppFalse } = dialectHelpers(db);
+      const threadText = 'MATCH-THREAD: finish the thing';
+      const key = handoffModule.intentKey(threadText);
+      await db.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+         VALUES ($1,$2,'open_thread','finish the thing',7,'user_stated',${suppFalse})`,
+        [pid, key]
+      );
+      const results = await handoffModule.classifyResolvedThreads(db, pid, [threadText]);
+      assertEqual(results.length, 1, 'S20-I13: one classification result');
+      assertEqual(results[0].verdict, 'MATCHED-AND-RESOLVED', 'S20-I13: verdict must be MATCHED-AND-RESOLVED');
+      assertTrue(results[0].matchedIds.length === 1, 'S20-I13: exactly one matched id');
+
+      // Live path: writeExtraction should actually suppress the row.
+      await handoffModule.writeExtraction(db, pid, { resolved_threads: [threadText] }, {});
+      const { rows } = await db.query(
+        `SELECT suppressed, suppression_kind FROM assertions WHERE project_id=$1`, [pid]
+      );
+      assertTrue(isSuppressed(rows[0]), 'S20-I13: live close must suppress the matched row');
+      assertEqual(rows[0].suppression_kind, 'superseded', 'S20-I13: suppression_kind must be superseded');
+    }
+  );
+
+  // I-14: UNMATCHED-REPORTED — never silent, in both direct classification and live close output
+  await bothBackends(
+    'S20-I14: cm#233 UNMATCHED-REPORTED — printed (never silent) in both dry-run-shaped and live-close output',
+    async (db) => {
+      const pid = freshPid('s20-i14');
+      const threadText = 'NEVER-EXISTED-THREAD: nothing to match';
+      const results = await handoffModule.classifyResolvedThreads(db, pid, [threadText]);
+      assertEqual(results[0].verdict, 'UNMATCHED-REPORTED', 'S20-I14: verdict must be UNMATCHED-REPORTED');
+
+      // "dry-run"-shaped: direct classify + print (identical to what cmdClose's
+      // --dry-run preview calls).
+      const dryLines = handoffModule.printResolvedThreadsClassification(results);
+      assertTrue(
+        dryLines.some((l) => l.includes('UNMATCHED resolved_thread:') && l.includes(threadText.slice(0, 80))),
+        'S20-I14: dry-run-shaped output must contain an UNMATCHED resolved_thread line'
+      );
+
+      // Live path: writeExtraction (no matching live row exists) must ALSO print it.
+      const { lines: liveLines } = await captureLogs(() =>
+        handoffModule.writeExtraction(db, pid, { resolved_threads: [threadText] }, {})
+      );
+      assertTrue(
+        liveLines.some((l) => l.includes('UNMATCHED resolved_thread:') && l.includes(threadText.slice(0, 80))),
+        'S20-I14: live close output must contain an UNMATCHED resolved_thread line'
+      );
+    }
+  );
+
+  // I-15: INVALID-REJECTED — empty-after-normalization entries are printed and skipped
+  await bothBackends(
+    'S20-I15: cm#233 INVALID-REJECTED — whitespace-only resolved_thread entry printed and skipped, both shapes',
+    async (db) => {
+      const pid = freshPid('s20-i15');
+      const blank = '   \n\t  ';
+      const results = await handoffModule.classifyResolvedThreads(db, pid, [blank]);
+      assertEqual(results[0].verdict, 'INVALID-REJECTED', 'S20-I15: verdict must be INVALID-REJECTED');
+      assertEqual(results[0].key, '', 'S20-I15: key must normalize to empty');
+
+      const dryLines = handoffModule.printResolvedThreadsClassification(results);
+      assertTrue(
+        dryLines.some((l) => l.includes('INVALID resolved_thread')),
+        'S20-I15: dry-run-shaped output must contain an INVALID resolved_thread line'
+      );
+
+      const { lines: liveLines } = await captureLogs(() =>
+        handoffModule.writeExtraction(db, pid, { resolved_threads: [blank] }, {})
+      );
+      assertTrue(
+        liveLines.some((l) => l.includes('INVALID resolved_thread')),
+        'S20-I15: live close output must contain an INVALID resolved_thread line'
+      );
+    }
+  );
+
+  // I-16: DUPLICATE-COLLAPSED — two open_threads keying identically (case-insensitive) collapse to one row
+  {
+    const label = 'S20-I16: cm#233 DUPLICATE-COLLAPSED — two case-different open_threads with the same key collapse to one row, printed';
+    try {
+      const textA = 'Ship the migration';
+      const textB = 'ship   the migration'; // different case + extra interior whitespace, SAME key case-insensitively
+      const { kept, duplicates } = handoffModule.dedupOpenThreadIntents([textA, textB]);
+      assertTrue(kept.length === 1, 'S20-I16: exactly one kept entry');
+      assertTrue(duplicates.length === 1, 'S20-I16: exactly one duplicate reported');
+      assertEqual(kept[0].text, textA, 'S20-I16: first occurrence is kept verbatim');
+      assertEqual(duplicates[0].text, textB, 'S20-I16: second occurrence reported as the duplicate');
+
+      const dryLines = handoffModule.printOpenThreadDuplicates(duplicates);
+      assertTrue(
+        dryLines.some((l) => l.includes('DUPLICATE-COLLAPSED open_thread:') && l.includes(textB)),
+        'S20-I16: dry-run-shaped output must contain a DUPLICATE-COLLAPSED line'
+      );
+      pass(label);
+    } catch (err) {
+      fail(label, err.message);
+    }
+  }
+
+  // I-16b: same collapse, exercised through the real live-close path (persistSessionIntent)
+  await bothBackends(
+    'S20-I16b: cm#233 DUPLICATE-COLLAPSED — live close writes exactly one open_thread row and prints the duplicate',
+    async (db) => {
+      const pid = freshPid('s20-i16b');
+      const textA = 'Ship the migration';
+      const textB = 'ship   the migration';
+      const { lines: liveLines } = await captureLogs(() =>
+        handoffModule.writeExtraction(db, pid, { open_threads: [textA, textB] }, {})
+      );
+      assertTrue(
+        liveLines.some((l) => l.includes('DUPLICATE-COLLAPSED open_thread:') && l.includes(textB)),
+        'S20-I16b: live close output must contain a DUPLICATE-COLLAPSED line'
+      );
+      const { rows } = await db.query(
+        `SELECT COUNT(*) AS n FROM assertions WHERE project_id=$1 AND predicate='open_thread'`, [pid]
+      );
+      assertEqual(parseInt(rows[0].n, 10), 1, 'S20-I16b: exactly one open_thread row written, not two');
     }
   );
 

@@ -142,11 +142,23 @@ Search by meaning, not exact words. If you ask "find me anything about login fai
 
 ### open_thread
 
-A predicate (cardinality 1:1) that persists a session-driving next-action as a queryable Postgres assertion row. One live row exists per thread-key (the subject, derived from the thread text). When a thread changes, the new row supersedes the prior one via the 1:1 uniqueness path. Written at `/handoff:close` through the gated assertion write path. Surfaced on resume in the `### Session intent` section.
+A predicate (cardinality 1:1) that persists a session-driving next-action as a queryable Postgres assertion row. One live row exists per thread-key (the subject, derived from the thread text via `intentKey` — Unicode-NFC normalized, whitespace-collapsed, capped at 1000 UTF-8 bytes; see `scripts/lib/intent-key.js`). **`KEY: description` authoring convention:** if the normalized text has a `:` at index <60 with a space immediately after it, the key is just the text before that colon — this is how a session supersedes its own earlier thread by key even when the description changes completely; a colon with no following space (a URL scheme colon, e.g. `https://...`) never matches, so a URL-led thread keys on its full text instead of colliding onto the literal key `https`. **Accepted trade-off:** a generic lead-in collides — `TODO: buy milk` and `TODO: file taxes` both key to `TODO` and supersede each other — so use a distinctive key (an issue number, a named thread) before `: `. When a thread changes, the new row supersedes the prior one via the 1:1 uniqueness path. Written at `/handoff:close` through the gated assertion write path. Surfaced on resume in the `### Session intent` section.
 
 **Serve-time staleness gate:** at resume time the system checks whether any PR numbers cited in the thread's subject or object (e.g. `#106`, `#119`) appear in the local git log as squash-merged commit subjects of the form `(#NNN)`. If any cited PR is found merged, the served line is annotated `[STALE: now "merged: #NNN — verify thread is still open"]` — a nudge to verify the thread, not an assertion of resolution. This uses the `annotateOnly` flag in the L3 registry: open_thread rows are **never** suppressed, superseded, reconciled, or degraded at close time, because a merged base PR does not imply the follow-up work is complete. The annotation fires only at serve time. If no PR number is cited, or git log is unavailable, no annotation is added.
 
-See also: **[STALE: now "…"] annotation**, **annotateOnly**, **serve-time reality re-probe**, **session_tldr**, **quick_reference**, **session intent section**.
+See also: **[STALE: now "…"] annotation**, **annotateOnly**, **serve-time reality re-probe**, **session_tldr**, **quick_reference**, **session intent section**, **resolved_threads (auto-retire)**.
+
+### resolved_threads (auto-retire)
+
+The optional `resolved_threads` close-payload key: a list of ORIGINAL open-thread text strings that are now done. Each entry is normalized via `intentKey` and classified against the project's live `open_thread` rows, identically at a real close and under `--dry-run` (see `classifyResolvedThreads`/`printResolvedThreadsClassification` in `scripts/handoff.js`) — total classification, never silent:
+
+- **MATCHED-AND-RESOLVED** — a live row's key matches; that row is auto-retired (`suppressed=true`, `suppression_kind='superseded'`) BEFORE the same close's `open_threads` are persisted, so a thread resolved and re-stated in one close resolves, then re-opens.
+- **UNMATCHED-REPORTED** — no live row matches; printed as `UNMATCHED resolved_thread: "<first 80 chars>"`.
+- **INVALID-REJECTED** — the entry normalizes to an empty key; printed and skipped.
+
+A related classification, **DUPLICATE-COLLAPSED**, applies to the SAME close's `open_threads` entries (not `resolved_threads`): two entries that normalize to the identical key (case-insensitively) collapse to one written row, printed as `DUPLICATE-COLLAPSED open_thread: "<first 80 chars>"` (see `dedupOpenThreadIntents`/`printOpenThreadDuplicates`).
+
+See also: **open_thread**, **session intent section**.
 
 ### quick_reference
 
