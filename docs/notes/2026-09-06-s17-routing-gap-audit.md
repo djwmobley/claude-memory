@@ -1,0 +1,75 @@
+# §17 routing gap-audit — route_resolve / routing_profile_* / usage_* vs runbook §17/§18
+
+Runbook §17 ("Agnostic model-routing harness") carries a CEILING note claiming
+"ZERO implementation exists yet." That note is **stale**: `route_resolve`,
+`routing_profile_set`, `routing_profile_get`, `usage_record`, and
+`usage_query` are fully implemented, schema-complete, and covered by
+dedicated smoke tests — not stubs. The real gaps are at the edges: no way to
+register a model or set a session override through the MCP surface, and the
+§17.1.2 init-time Q&A (V7/V8/V9) does not exist anywhere in the codebase.
+
+Method: every table/column/tool/behavior named in §17 (lines 2489–2645 of
+`CONSOLIDATION-RUNBOOK.md`, live-grepped — the index's stale 2392–2548 range
+was ignored per its own staleness warning) and §18.1/§18.2 (lines 2658–2716,
+read because `route_resolve` persists into `turn_usage`) was checked against
+`scripts/handoff-mcp.mjs`, `scripts/lib/route-resolve.js`,
+`scripts/lib/routing-profile.js`, `scripts/lib/usage-telemetry.js`, the DDL
+in `scripts/migrations/sql/migrate-10-routing-harness.sql` and
+`migrate-11-usage-telemetry.sql`, `scripts/migrations/sql/model-registry-base.sql`,
+tests under `test/migrations/test-verify-17.js` / `test-verify-18.js` /
+`test-verify-20.js`, and `docs/mcp-tools.md`.
+
+## Spec element | Status | Evidence | Gap
+
+| Spec element (§17/§18) | Status | Evidence | Gap |
+|---|---|---|---|
+| `model_registry` ALTERs (provider, model_id, capability_tier, cost_in/out_per_mtok, context_window, headless_cli_cmd, available) | IMPLEMENTED | `scripts/migrations/sql/migrate-10-routing-harness.sql` lines 11–18 — column-for-column match to runbook §17.1's SQL block, including the `capability_tier` CHECK and `available BOOLEAN NOT NULL DEFAULT true` | `model_id` column exists but is never read/written by the resolver — `scripts/lib/route-resolve.js` header comment ("REGISTRY JOIN KEY") states the join is on `label` only, `model_id` is "UNUSED by this resolver" |
+| `routing_profiles` table (project_id, role, capability_tier, preferred_model/_provider, version, active, source_model, agent_id, notes, UNIQUE(project_id,role,version)) | IMPLEMENTED | `scripts/migrations/sql/migrate-10-routing-harness.sql` lines 20–34 — exact column/type/constraint match to spec | none found |
+| `routing_session_overrides` table (project_id, session_id, role, model_id, provider, set_by, set_at, UNIQUE(project_id,session_id,role)) | PARTIAL | Table DDL exists verbatim, `scripts/migrations/sql/migrate-10-routing-harness.sql` lines 36–44; **read path** exists in `scripts/lib/route-resolve.js` `resolveDirective()` (lines 303–319, precedence step "b") | No write path anywhere in the repo — grep for `INSERT INTO routing_session_overrides` across `scripts/` returns zero hits, and no MCP tool exposes it. §17.3's own tool-signature list also never defines a setter, so this is partly a spec gap, not just an implementation one: precedence step 2 is unreachable except by hand-written SQL |
+| §17.1 precedence order (override_model > session override > project pin > global default > cost recommendation) | IMPLEMENTED | `scripts/lib/route-resolve.js` `resolveDirective()` lines 303–340 implements exactly this 4-step directive chain, then `routeResolve()` lines 453–467 falls through to `recommendLeastCost` | none found |
+| §17.1 precedence step 4 "Global default ... pick one at Phase 17 entry, not decided here" | IMPLEMENTED (open design question resolved in code) | `scripts/lib/route-resolve.js` header comment ("THE ACTIVE ROW") + `fetchActiveProfile`/`fetchActivePin` called with literal `'*'` project_id (lines 191, 330) | The runbook itself never records that this choice was made — worth folding back into §17.1 as a closing note, not a functional gap |
+| `route_resolve` idempotency (turn_usage upsert, replay-on-conflict) | IMPLEMENTED | `scripts/lib/route-resolve.js` lines 362–507; race-loser re-select at lines 482–496 | none found |
+| M-10 replay with a different `override_model` → `override_ignored:true` | IMPLEMENTED | `scripts/handoff-mcp.mjs` `toolRouteResolve()` lines 695–712; exercised by `scripts/migrations/verify-20-mcp-surface.js` line 484 | none found |
+| §17.2 least-cost recommender (tier-fit before cost, cost ascending tiebreak) | IMPLEMENTED | `scripts/lib/route-resolve.js` `recommendLeastCost()` lines 224–282, sorts by tier rank then summed cost then label | none found |
+| §17.2 step 4: empty candidate pool → hard error, never silent downgrade | IMPLEMENTED | `scripts/lib/route-resolve.js` lines 238–244 (no model at/above tier) and 256–263 (models exist but lack cost figures) — **two distinct error messages**, exceeding the spec's single "hard error" requirement | none found |
+| §17.2 step 5: `recommended_model`/`cost_delta_usd` always recorded, even on directive win | IMPLEMENTED | `scripts/lib/route-resolve.js` lines 395–452 (directive branch computes recommendation best-effort in a try/catch) | none found |
+| §17.1.1 role taxonomy (7 roles, free-text column, no hardcoded model names) | IMPLEMENTED (as documentation-only) | `routing_profiles.role` is `TEXT NOT NULL` with no CHECK/enum (`migrate-10-routing-harness.sql` line 22); the 7-role suggestion table appears only as prose in `route-resolve.js`'s hard-error remediation hint (lines 194–200), never as an applied default — matches spec's "never applied automatically" requirement | none found |
+| §17.1.1 "review must never resolve to the same agent_id as draft" | PARTIAL | `scripts/lib/route-resolve.js` header, "OUT OF SCOPE" section (lines 75–81), explicitly states this is a caller responsibility — the resolver has no artifact/agent-history context to enforce it | Unenforced anywhere in code; this is a documented design choice, not an oversight, but no test exercises "review never equals draft's agent_id" |
+| §17.1.2 init-time Q&A (V7 role set, V8 capability tier, V9 cost figures; unanswered = hard error, never silent) | MISSING | grep for `capability_tier`, `cost_in_per_mtok`, "init Q&A" across `commands/`, `scripts/handoff.js`, and `scripts/handoff-mcp.mjs` outside the three known lib files returns zero hits; `toolHandoffInit()` (`scripts/handoff-mcp.mjs` lines 359–370) only shells out to `handoff.js init` with no routing-related prompts | No interactive Q&A exists at all. The "unconfigured — run routing init Q&A" hard-error text in `resolveRequiredTier()` (route-resolve.js line 195) refers to a flow that does not exist yet — a caller following that hint has nothing to run |
+| §17.1.2 persistence: `configured_by`/`configured_at` on `model_registry` | IMPLEMENTED (schema only) | `scripts/migrations/sql/model-registry-base.sql` lines 19–20 | No MCP tool or script writes these columns — see next row |
+| A way to register/configure a model (label, provider, capability_tier, cost figures) via the MCP surface | MISSING | grep for `model_registry` writes in `scripts/handoff-mcp.mjs` returns zero hits — no `model_registry_set`-shaped tool exists; every test (`verify-17-routing-smoke.js`, `verify-18-usage-smoke.js`, `test-migrate-schema-addenda.js`) populates `model_registry` via direct SQL `INSERT` | §17.3's own tool-signature list never names a model-registration tool either, so this is both a spec gap and an implementation gap — until it's closed, `model_registry` (and therefore all routing) can only be populated by hand-written SQL, which is exactly the "silent seeding" posture §17.1.2 was written to prevent |
+| `route_resolve(project_id, role, capability_tier?, override_model?)` signature | IMPLEMENTED | `scripts/handoff-mcp.mjs` lines 1369–1389 (`inputSchema`); note `sessionId`/`turnIdx` are additional required params not named in §17.3's abbreviated signature, but are load-bearing per §17.1/§18.1's turn-identity key — DIVERGENT from the literal signature text, consistent with its documented behavior | Cosmetic: §17.3's tool-signature line omits `sessionId`/`turnIdx` from the argument list even though every other part of §17 requires them |
+| `routing_profile_set(...)` — new version, deactivate previous, one transaction | IMPLEMENTED, with a documented spec deviation | `scripts/lib/routing-profile.js` lines 70–121; header comment lines 12–29 explains `SELECT MAX(version) ... FOR UPDATE` from the runbook's own pseudocode is invalid Postgres (`FOR UPDATE` + aggregate = error 0A000) and substitutes `pg_advisory_xact_lock` | DIVERGENT in mechanism only, not in observable behavior — flagged in-code per M-18, not a functional gap |
+| `routing_profile_get(project_id, role?)` | IMPLEMENTED | `scripts/lib/routing-profile.js` lines 127–136 | none found |
+| `turn_usage` schema (all columns, UNIQUE key, 3 indexes) | IMPLEMENTED | `scripts/migrations/sql/migrate-11-usage-telemetry.sql` lines 8–31 — exact match to §18.1's SQL block | none found |
+| `session_usage` schema (rollup, UNIQUE(project_id,session_id)) | IMPLEMENTED | `scripts/migrations/sql/migrate-11-usage-telemetry.sql` lines 33–43 | none found |
+| `usage_record(...)` incl. cost 3-way state machine, DDL-default discipline for `outcome`, never touching resolved_via/recommended_model/cost_delta_usd | IMPLEMENTED | `scripts/lib/usage-telemetry.js` lines 390–491 | none found |
+| `usage_query(...)` groupBy model/role/provider/day, session-scoped vs project-scoped (rollup-only, staleness-by-design) | IMPLEMENTED | `scripts/lib/usage-telemetry.js` lines 614–708 | none found |
+| §18.3 `feature_token_usage` one-time backfill (`migrate-12-backfill-feature-token-usage.js`) | MISSING | `find . -iname "*migrate-12*"` returns nothing | Spec itself marks this blocked on reading `dev/pipeline/scripts/setup-knowledge-db.sql`'s real DDL (§18.3, "field mapping ... UNCONFIRMED") — an acknowledged, not surprising, gap |
+| §17.4 smoke test items 1–5 (idempotency, override recording, least-cost, no-silent-downgrade, cross-project isolation) | IMPLEMENTED | `scripts/migrations/verify-17-routing-smoke.js` — `checkIdempotency` (line 170), `checkDirectiveAndRecommendationRecording` (188), `checkLeastCost` (214), `checkNoSilentDowngrade` (239), `checkCrossProjectIsolation` (279) | none found |
+| §18.5 `usage_record`/`usage_query` companion smoke test | IMPLEMENTED | `scripts/migrations/verify-18-usage-smoke.js` — 9 check functions incl. `checkRecordAfterResolve`, `checkServerSideCost`, `checkRollupAndProjectScopedQuery`, `checkAllNullCostGroup` | none found |
+| §3/L7 caveman invariant applies to `rationale` (per §17.3's explicit text) | DIVERGENT | §17.3 states "§3 invariant applies to this field like any other model-authored text"; `scripts/migrations/caveman-columns.json` `out_of_scope_tables` (lines 1080–1084) explicitly excludes `routing_profiles`, `routing_session_overrides`, `session_usage`, `turn_usage` from the store-wide caveman gate with the reason "not part of §5's graph/corpus/seam schema" | The exclusion looks like reasonable scoping (the T7 gate is built around §5's schema) but it contradicts §17.3's specific sentence — nothing enforces caveman style on `rationale`, `routing_profiles.notes`, or `turn_usage`'s free-text columns |
+| §17's own CEILING note ("ZERO implementation exists yet") | DIVERGENT (stale) | Everything above | The note should be corrected or superseded — it is actively misleading given the depth of what exists |
+
+## Extras not in §17
+
+- **Two distinct empty-recommendation-pool errors** (no model at tier vs. models exist but lack cost figures) — §17.2 step 4 only asks for "a hard error," the implementation gives a more diagnosable total classification (`scripts/lib/route-resolve.js` lines 238–263).
+- **`pg_advisory_xact_lock`-based concurrency control** for `routing_profile_set`, reusing the same `hashtext`-keyed pattern as `scripts/lib/db-seam.js`'s `PostgresAdapter.acquireMigrationLock` — not specified in §17 at all, added to make M-18's literal (invalid) pseudocode actually work under concurrency.
+- **`xmax = 0` `created` flag** on `usage_record`'s return value, distinguishing insert from update — not requested by §18.2, added for caller convenience/race-observability.
+- **`CostOutOfRangeError`** — a NUMERIC(12,6)-overflow guard on both `usage_record` and `sessionUsageRollup`, not mentioned anywhere in §18.
+
+## Recommended next step
+
+- Decide who owns registering models into `model_registry` — build a minimal `model_registry_set`-shaped MCP tool, or explicitly declare direct-SQL registration the intended path and update §17.3 to say so.
+- Either build the §17.1.2 init-time Q&A or strike/rewrite the "run routing init Q&A" hard-error text in `route-resolve.js` so it doesn't point callers at a nonexistent flow.
+- Decide whether `routing_session_overrides` needs a setter tool at all, given precedence step 2 is currently unreachable through the MCP surface.
+- Correct or remove §17's "ZERO implementation exists yet" ceiling note — it is stale and will mislead the next reader.
+- Resolve the caveman-invariant contradiction between §17.3's prose and `caveman-columns.json`'s `out_of_scope_tables` exclusion — either narrow §17.3's claim or extend the T7 gate.
+
+## Blind spots
+
+- This audit is static (code, SQL, and test-source reading only) — no test suite was run and no live database was queried, per this task's own instructions. Whether `migrate-schema-addenda.js` has actually been applied to any live `memory_manager`/`memory_manager_staging` database, and whether `route_resolve`/`usage_record` have ever been exercised against real data, is unverified.
+- The 7 role taxonomy's suggested tier defaults, the review/draft agent-identity separation, and the §18.4 "dogfood" per-project usage-recording requirement are process/operational expectations that cannot be verified from source code alone.
+- Only §17 and the parts of §18.1/§18.2 that §17 directly depends on (turn_usage/session_usage schema, usage_record/usage_query) were read in the private runbook. §18.3's reconciliation footnotes in §1.2/§1.7/§2, and §19's packaging implications for a fresh `model_registry`, were not re-read for this pass.
+- `test/migrations/test-verify-17.js`, `test-verify-18.js`, and `test-verify-20.js` were confirmed to exist and reference the right symbols by grep; their assertions were not fully read line-by-line, and none were executed.
+- No private machine names, credentials, or client names were checked against an exhaustive list — this note quotes only short phrases from the runbook and cites public repo file paths, per this task's scope constraints.
