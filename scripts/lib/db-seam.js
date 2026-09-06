@@ -114,6 +114,9 @@
 //   9. now():               -> datetime('now')
 //  10. Interval subtraction: col < now()-($n||' days')::interval
 //                            -> col < datetime('now', '-' || ? || ' days')
+//  11. md5(col) in index DDL: -> col (SQLite has no md5() builtin and no
+//                            equivalent btree row-size cap; see
+//                            assertions_1ton_exact_unique, cm#227)
 //
 // The 86400 constants at handoff.js lines 273/2193/2280 are JS-level; NOT in SQL path.
 // SQL decay: EXTRACT(EPOCH...)/86400 == (julianday('now')-julianday(col)) (both = fractional days).
@@ -161,6 +164,18 @@ function rewriteForSQLite(sql) {
   s = s.replace(/::interval/gi,  '');
   // TIMESTAMPTZ -> TEXT in DDL
   s = s.replace(/TIMESTAMPTZ/gi, 'TEXT');
+  // md5(col) -> col — cm#227: assertions_1ton_exact_unique is keyed on
+  // md5(object) on Postgres solely to bound the indexed key's physical size
+  // under Postgres's per-btree-version row-size cap (observed: "index row
+  // size 2936 exceeds btree version 4 maximum 2704" once a 4000-char TL;DR
+  // was persisted verbatim as an assertion object). SQLite has no md5()
+  // builtin and no equivalent index-key-size ceiling for this shape, so the
+  // wrapper is unwrapped back to the raw column here — the index still
+  // enforces uniqueness, just directly on object's bytes instead of its
+  // digest. Scoped to a bare single-identifier argument (the only shape
+  // this schema ever uses); no other md5(...) call appears in any SQL this
+  // adapter executes.
+  s = s.replace(/\bmd5\(\s*(\w+)\s*\)/gi, '$1');
   return s;
 }
 

@@ -262,11 +262,17 @@ function parseWriteSummary(stdout) {
   const assertions = /assertions written:\s*(\d+)/.exec(stdout);
   const edges = /edges written:\s*(\d+)/.exec(stdout);
   const done = /Done:\s*handoff:\S+\s*—\s*(.+)/.exec(stdout);
+  // cm#227: surface any "DIVERGENCE: <predicate> NOT PERSISTED — ..." line the
+  // engine printed (session_tldr/open_thread/quick_reference persistence
+  // failure) — same text that lands in handoff.md's Degraded section. Never
+  // affects `code` / exit status; this is visibility only.
+  const divergences = [...stdout.matchAll(/^\s*(DIVERGENCE:.+)$/gm)].map((m) => m[1].trim());
   return {
     entitiesWritten: entities ? Number(entities[1]) : null,
     assertionsWritten: assertions ? Number(assertions[1]) : null,
     edgesWritten: edges ? Number(edges[1]) : null,
     summary: done ? done[1].trim() : null,
+    divergences,
   };
 }
 
@@ -1181,7 +1187,10 @@ function buildServer() {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         subject: z.string(),
         predicate: z.string(),
-        object: z.string(),
+        // cm#227: same 4000-char cap as the checkpoint/close payload schema's
+        // tldr/object fields — a bare INSERT via this tool bypasses readStdin's
+        // structural caps entirely, so this is the only gate on this path.
+        object: z.string().max(4000, 'object exceeds max length (4000 chars)'),
         confidence: z.number().int().min(1).max(10),
         source: z.enum(['user_stated', 'model_extracted', 'doc_quoted', 'retrieved_from_prior']),
         sourceModel: z.string().optional(),
@@ -1222,7 +1231,8 @@ function buildServer() {
         id: z.number().int().optional().describe('Explicit target row id — required for non-1:1 predicates.'),
         subject: z.string().optional().describe('Used to infer the target id for a 1:1 predicate when id is omitted.'),
         predicate: z.string(),
-        newObject: z.string(),
+        // cm#227: same 4000-char cap as assertion_create's object field.
+        newObject: z.string().max(4000, 'newObject exceeds max length (4000 chars)'),
         confidence: z.number().int().min(1).max(10).optional(),
         source: z.enum(['user_stated', 'model_extracted', 'doc_quoted', 'retrieved_from_prior']).optional(),
         sourceModel: z.string().optional(),

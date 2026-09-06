@@ -20,6 +20,10 @@
  *   T6  Resume after degraded close: loud RESUME WARNING banner fires.
  *   T7  Resume after clean close: no banner.
  *   T8  close_degraded_exit_mode='strict' → exit 3 on degraded; 'warn' → exit 0.
+ *   T9  (cm#227) Forced session_tldr persistSessionIntent failure (DB trigger
+ *       fault-injection) → DIVERGENCE line in stdout + handoff.md's ##
+ *       Degraded section; exit 0 even under close_degraded_exit_mode='strict'
+ *       (a separate, always-non-fatal channel from C2/C3's exit-code gate).
  *
  * Strategy: exercise cmdClose via spawnSync subprocesses with a throwaway Postgres
  * DB, injecting session state via direct SQL to create the unresolvable-session
@@ -629,6 +633,126 @@ async function testT8ExitCodeGate() {
   }
 }
 
+// ── T9: forced persistSessionIntent failure (cm#227) ──────────────────────────
+//
+// Fault-injects a real Postgres-level failure for the session_tldr INSERT
+// specifically (a BEFORE INSERT trigger that raises for that one predicate —
+// a DB-layer stub standing in for a JS-layer monkeypatch, since this harness
+// drives handoff.js via subprocess, not require()). Proves: (a) close still
+// exits 0 (non-fatal, unaffected by close_degraded_exit_mode='strict' — this
+// is a SEPARATE channel from the C2/C3 _degradedSubsystems exit-code gate
+// tested by T8), (b) stdout carries a DIVERGENCE line naming the predicate
+// and the underlying error, (c) handoff.md's ## Degraded section carries the
+// same line, (d) entities/assertions/edges counts are unaffected (the
+// failure is scoped to the intent-persistence phase only).
+async function testT9ForcedIntentDivergence() {
+  const label = 'T9: forced session_tldr persistSessionIntent failure — DIVERGENCE line in stdout + handoff.md, exit 0';
+  const dbName = `claude_memory_l4_t9_${TS}`;
+  const projectDir = path.join(os.tmpdir(), `l4_t9_${TS}`);
+  let db = null;
+  let projectId;
+  try {
+    await createL4Db(dbName, projectDir);
+    projectId = await setupProject(dbName, projectDir);
+
+    db = await pgConnect(dbName);
+    // Fault injection: a BEFORE INSERT trigger that raises only for
+    // predicate='session_tldr', reproducing the shape of the real defect
+    // (a DB-level error during persistSessionIntent's write) without
+    // depending on the now-fixed btree-row-size path.
+    await db.query(`
+      CREATE OR REPLACE FUNCTION cm227_fail_session_tldr() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.predicate = 'session_tldr' THEN
+          RAISE EXCEPTION 'cm227 simulated persistSessionIntent failure for testing';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+    `);
+    await db.query(`
+      CREATE TRIGGER cm227_fail_session_tldr_trigger
+      BEFORE INSERT ON assertions
+      FOR EACH ROW EXECUTE FUNCTION cm227_fail_session_tldr();
+    `);
+    // Isolate the invariant this test guards (a session-intent-persist
+    // divergence must never trip the strict-mode exit-code gate) from the
+    // PRE-EXISTING, unrelated C2/C3 degraded-subsystem gate T2/T3/T4/T8
+    // already cover: feedback_loop_enabled defaults to 'enabled'
+    // (scripts/handoff.js:5895), and this payload supplies no session_id
+    // and no session_in_progress marker exists, so C2 would otherwise
+    // itself push a genuine 'C2' entry onto _degradedSubsystems
+    // (scripts/handoff.js:5906) and legitimately trip strict mode — a CI-
+    // reproducible false failure this test hit in PR #229 (a local ambient
+    // session-id env var masked it in that sandbox; CI has no such var, so
+    // resolveSessionId() genuinely returns null there). Disabling both here
+    // guarantees the ONLY possible degraded-subsystem source in this test
+    // is the session_tldr fault injection itself, which — per this PR's
+    // fix — deliberately does NOT populate _degradedSubsystems.
+    await setSetting(db, projectId, 'feedback_loop_enabled', 'disabled');
+    await setSetting(db, projectId, 'contract_evolution_enabled', 'disabled');
+    // Also force close_degraded_exit_mode='strict' to prove the exit-code gate
+    // is unaffected by this divergence (T8 already covers strict-mode exit 3
+    // for genuine C2/C3 degradation; this proves the two channels don't cross).
+    await setSetting(db, projectId, 'close_degraded_exit_mode', 'strict');
+    await db.end(); db = null;
+
+    const payload = {
+      tldr: 'T9 forced divergence test tldr',
+      open_threads: ['harmless open thread'],
+      assertions: [{ subject: 'x', predicate: 'is_status', object: 'y', confidence: 8, source: 'user_stated' }],
+    };
+    const r = runClose(payload, dbName, projectDir);
+
+    if (r.status !== 0) {
+      fail(label, `expected exit 0 (non-fatal, strict-mode-unaffected), got ${r.status}. stderr: ${r.stderr}`);
+      return;
+    }
+
+    const stdout = r.stdout || '';
+    if (!/DIVERGENCE:\s*session_tldr\s+NOT PERSISTED\s*—\s*cm227 simulated persistSessionIntent failure/.test(stdout)) {
+      fail(label, `stdout missing expected DIVERGENCE line. stdout:\n${stdout}`);
+      return;
+    }
+
+    const handoffPath = resolveHandoffMdPath(projectId);
+    if (!fs.existsSync(handoffPath)) {
+      fail(label, 'handoff.md not found after close');
+      return;
+    }
+    const content = fs.readFileSync(handoffPath, 'utf8');
+    if (!content.includes('## Degraded')) {
+      fail(label, 'handoff.md missing ## Degraded section');
+      return;
+    }
+    if (!/DIVERGENCE:\s*session_tldr\s+NOT PERSISTED/.test(content)) {
+      fail(label, `handoff.md ## Degraded section missing DIVERGENCE line. content:\n${content}`);
+      return;
+    }
+
+    // The unrelated payload.assertions[] write must still have succeeded
+    // (assertionsWritten counts only payload.assertions[], not intent rows —
+    // open_thread/session_tldr/quick_reference are written separately by
+    // persistSessionIntent and never contribute to this counter, so this
+    // proves the fault injection did not abort the surrounding writeExtraction
+    // call — only the session_tldr row itself failed). Expect 2: the payload's
+    // own is_status assertion PLUS the code-injected has_unpackaged_state
+    // authoritative assertion (always added regardless of payload content).
+    if (!/assertions written:\s*2/.test(stdout)) {
+      fail(label, `expected 2 assertions written (is_status + auto has_unpackaged_state; session_tldr intent-row failure is separate), got:\n${stdout}`);
+      return;
+    }
+
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    if (db) { try { await db.end(); } catch (_) {} }
+    if (projectId) cleanupHandoffMd(projectId);
+    await dropL4Db(dbName, projectDir);
+  }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -660,6 +784,7 @@ async function main() {
   await testT6ResumeAfterDegradedClose();
   await testT7ResumeAfterCleanClose();
   await testT8ExitCodeGate();
+  await testT9ForcedIntentDivergence();
 
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
   if (failures.length > 0) {

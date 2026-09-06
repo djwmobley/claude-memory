@@ -790,6 +790,33 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run index-cap regression tests (cm#227)
+        # Tests the fix for a live defect: assertions_1ton_exact_unique (a
+        # plain btree partial-unique index on (project_id, subject, predicate,
+        # object)) could exceed Postgres's per-btree-version row-size cap once
+        # `object` got long (e.g. a 4000-char TL;DR persisted verbatim via
+        # persistSessionIntent), silently failing to persist. Fixed by
+        # re-keying the index on md5(object) (fixed-size digest). Covers: a
+        # long tldr persists and is served by resume; bring-forward from a
+        # live DB carrying the OLD (raw-object) index definition is a one-time
+        # re-apply and then a no-op; two 1:N assertions sharing a long common
+        # object prefix but diverging tails both survive (no false md5-
+        # collision handling bug); supersession of a >2704-byte object works;
+        # the MCP assertion_create tool rejects an oversized object up front
+        # (before any row is written), naming the 4000-char cap; and a
+        # decisions[].topic over 2000 UTF-8 bytes is rejected up front by
+        # handoff.js close --json -, before any DB mutation. The SQLite-side
+        # translation proof (md5(col) -> col, uniqueness still enforced on the
+        # raw column) lives in the "Run SQLite seam tests" step below (Section
+        # 19); the forced persistSessionIntent-failure -> DIVERGENCE-line proof
+        # lives in the "Run L4 degraded-close tests" step below (T9).
+        # Creates/drops its own claude_memory_idx_*-prefixed scratch databases;
+        # never touches claude_memory_eval_test/memory_manager_staging.
+        run: node test/test-index-cap-md5.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run smoketest (all sections)
         # Runs the full smoketest suite — all 13 sections including collision (OQ-5
         # supersession invariant) and registry (SQL-1:1-index-vs-registry-JSON drift).
@@ -805,7 +832,9 @@ jobs:
         # Guards: resolveDialect, rewriteForSQLite, schema application, JSONB round-trip,
         # graph CTE, abstraction invariant (Section 13), PR-B bi-temporal columns,
         # canonicalization (Section 15), manual prune (Section 16), cmdInit resilience
-        # (Section 17), and L5 buildRetirementUpdate SQLite-arm (Section 18).
+        # (Section 17), L5 buildRetirementUpdate SQLite-arm (Section 18), and the
+        # cm#227 md5(col) -> col index-DDL rewrite for assertions_1ton_exact_unique
+        # (Section 19).
         # Requires Node >= 22 for node:sqlite built-in; CI now runs Node 22 so both halves gate.
         run: node scripts/test-sqlite-seam.js
       - name: Run both-backend behavioral parity + adversarial-invariant sweep
@@ -865,7 +894,11 @@ jobs:
         # session id at close time. Covers: clean-close byte-equivalence, C2/C3
         # degraded_close row persistence, ## Degraded section in handoff.md,
         # summary-line surfacing, resume RESUME WARNING banner, and exit-code gate
-        # (warn=exit 0, strict=exit 3).
+        # (warn=exit 0, strict=exit 3). T9 (cm#227): a forced session_tldr
+        # persistSessionIntent failure (DB trigger fault-injection) surfaces a
+        # DIVERGENCE line in both the close summary and handoff.md's ## Degraded
+        # section, and remains non-fatal (exit 0) even under strict mode — a
+        # channel deliberately separate from C2/C3's exit-code gate.
         run: node scripts/test-l4-degraded-close.js
         env:
           PGHOST: localhost
