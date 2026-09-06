@@ -250,6 +250,35 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run route-resolve review/draft identity contract test
+        # §17 gap-audit G4 (docs/notes/2026-09-06-s17-routing-gap-audit.md):
+        # route-resolve.js documents that a 'review' resolution matching a
+        # 'draft' resolution's model/identity is a caller responsibility, not
+        # enforced by the resolver. This pins that CURRENT (unenforced)
+        # behavior so a future change to add enforcement requires a
+        # deliberate edit to this test, never a silent regression either
+        # way. Creates/drops its own _staging-suffixed scratch DB.
+        run: node test/migrations/test-route-resolve-contract.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: Run routing_profile_set concurrency test
+        # §17 gap-audit G6 (docs/notes/2026-09-06-s17-routing-gap-audit.md):
+        # exercises TWO CONCURRENT first-ever routing_profile_set calls for
+        # the same brand-new (project_id, role) pair -- the case the
+        # runbook's literal "SELECT MAX(version) ... FOR UPDATE" pseudocode
+        # cannot serialize (no existing row for a row-level lock to hold),
+        # which is why routing-profile.js uses pg_advisory_xact_lock
+        # instead. Asserts both calls succeed with no unique-constraint
+        # violation, versions 1 and 2 are assigned, and exactly one row is
+        # left active=true afterward. Creates/drops its own
+        # _staging-suffixed scratch DB.
+        run: node test/migrations/test-routing-profile-concurrency.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run usage-telemetry + verify-18 usage smoke tests
         # Tests scripts/lib/usage-telemetry.js (usageRecord/sessionUsageRollup/
         # usageQuery) and scripts/migrations/verify-18-usage-smoke.js, the §18

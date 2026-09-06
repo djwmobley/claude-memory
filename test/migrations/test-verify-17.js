@@ -32,6 +32,7 @@
  * Exit 0 = all pass; nonzero = any failure.
  */
 
+const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const { createRequire } = require('module');
@@ -305,6 +306,20 @@ async function testPrecedenceOrder(client) {
   }
 }
 
+// ── B2a: source-wide "init Q&A" ban (G3) ────────────────────────────────
+
+/**
+ * route-resolve.js must name NO nonexistent "init Q&A" flow anywhere in
+ * its source, not just at the one hard-error call site exercised above —
+ * a source-level grep so any future re-introduction (e.g. a new error
+ * message) fails this test rather than shipping silently.
+ */
+function testNoInitQaAnywhereInSource() {
+  const src = fs.readFileSync(ROUTE_RESOLVE_PATH, 'utf8');
+  const hits = src.split('\n').filter((line) => /init Q&A/.test(line));
+  assert(hits.length === 0, `route-resolve.js must not name the nonexistent "init Q&A" flow anywhere; found ${hits.length} line(s): ${JSON.stringify(hits)}`);
+}
+
 // ── B2: resolveRequiredTier order + unconfigured hard error ──────────────
 
 async function testRequiredTierOrder(client) {
@@ -316,9 +331,22 @@ async function testRequiredTierOrder(client) {
 
   await assertThrows(
     () => resolveRequiredTier(client, { projectId, role }),
-    new RegExp(`unconfigured routing for role '${role}'.*run routing init Q&A`),
-    'unconfigured role must hard-error naming the role and pointing at the init Q&A'
+    new RegExp(`unconfigured routing for role '${role}'`),
+    'unconfigured role must hard-error naming the role'
   );
+
+  // B2b (G3): the hard-error hint must name only tools that exist today —
+  // routing_profile_set — and must never point the operator at the
+  // nonexistent "init Q&A" flow (docs/notes/2026-09-06-s17-routing-gap-audit.md).
+  let hintErr = null;
+  try {
+    await resolveRequiredTier(client, { projectId, role });
+  } catch (err) {
+    hintErr = err;
+  }
+  assert(hintErr !== null, 'expected resolveRequiredTier to throw for an unconfigured role');
+  assert(!/init Q&A/.test(hintErr.message), `unconfigured-role hint must not name the nonexistent "init Q&A" flow: "${hintErr.message}"`);
+  assert(/routing_profile_set/.test(hintErr.message), `unconfigured-role hint must name the real routing_profile_set tool: "${hintErr.message}"`);
 
   await insertProfile(client, { projectId: '*', role, tier: 'low', version: 1 });
   await insertProfile(client, { projectId, role, tier: 'mid', version: 1 });
@@ -384,6 +412,9 @@ async function testEmptyPoolVsCostUnconfigured(client) {
     }
     assert(err2 !== null && /lack cost figures/i.test(err2.message), `expected the cost-unconfigured error, got: ${err2 && err2.message}`);
     assert(err2.message !== err1.message, 'the cost-unconfigured error must be DISTINCT from the empty-pool error');
+    // G3: this hint must also name only real tools — no nonexistent "init Q&A" flow.
+    assert(!/init Q&A/.test(err2.message), `cost-unconfigured hint must not name the nonexistent "init Q&A" flow: "${err2.message}"`);
+    assert(/model_registry/.test(err2.message), `cost-unconfigured hint must name the real model_registry table: "${err2.message}"`);
   } finally {
     await deleteModels(client, [costless]);
   }
@@ -550,6 +581,7 @@ async function main() {
     const concurrentClient = await pgConnect(DB_UNIT);
     try {
       await run('B12', 'coerceCost: pure unit cases (NULL-preserving NUMERIC-string coercion)', async () => testCoerceCostPure());
+      await run('B2a', 'route-resolve.js source: never names the nonexistent "init Q&A" flow anywhere (G3, source-wide grep)', async () => testNoInitQaAnywhereInSource());
       await run('B1', 'precedence order: override > session override > project pin > global pin > recommendation', () => testPrecedenceOrder(client));
       await run('B2', 'resolveRequiredTier: explicit arg > project tier > global tier; unconfigured -> hard error', () => testRequiredTierOrder(client));
       await run('B3', 'recommendLeastCost: NULL-cost models excluded from the recommendation pool', () => testNullCostExclusion(client));
