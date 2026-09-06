@@ -222,6 +222,22 @@ function loadAndNormalizeFile(filePath) {
   return { present: true, path: filePath, normalized, readError: null };
 }
 
+// ─── cm#222: normalizeMarkdown() flag console logging ─────────────────────
+
+/**
+ * logNormalizeFlag — H-10's unrecognized-dash flag and cm#222's
+ * mid-document bom-midfile flag share one console line format, keyed off
+ * `flag.type` (a total switch, not an assumed shape — a flag missing a
+ * `char` field, like bom-midfile, never prints "undefined").
+ */
+function logNormalizeFlag(flag) {
+  if (flag.type === 'bom-midfile') {
+    console.log(`  [FLAG] bom-midfile at line ${flag.line}: a stray U+FEFF was found mid-document (not the file's leading byte) — not silently relied upon`);
+  } else {
+    console.log(`  [FLAG] unrecognized-dash at line ${flag.line}: "${flag.char}" (H-10 — not silently coerced)`);
+  }
+}
+
 // ─── NEXT SESSION per-file state (cm#222 A5) ──────────────────────────────
 
 /**
@@ -272,7 +288,7 @@ function computeNextSessionState(sections) {
  *   report: object,
  * }}
  */
-function parseFileIntoRows(normalizedText, durableHeadings, fileKind) {
+function parseFileIntoRows(normalizedText, durableHeadings, fileKind, normalizeFlags) {
   const sections = mdParse.splitDocumentIntoSections(normalizedText, durableHeadings);
   const sessionHeadingLevel = mdParse.detectSessionHeadingLevel(normalizedText);
 
@@ -284,6 +300,7 @@ function parseFileIntoRows(normalizedText, durableHeadings, fileKind) {
   const otherHeadings = [];
   const sessionShapedUnparsedHeadings = [];
   const nextSessionVariantHeadings = [];
+  const carryoverHeadingVariants = [];
   const flaggedTableRows = [];
   const orphanTableRows = [];
   let tablesParsedCount = 0;
@@ -297,8 +314,8 @@ function parseFileIntoRows(normalizedText, durableHeadings, fileKind) {
     // "### Open carry-overs" tables can appear inside ANY section's body
     // (active preamble OR an archived session block) — extracted uniformly
     // regardless of the enclosing section's type (H-4/base-point-3).
-    const tables = mdParse.findOpenCarryoverTables(section.bodyText, section.bodyStartLine);
-    for (const table of tables) {
+    const carryoverResult = mdParse.findOpenCarryoverTables(section.bodyText, section.bodyStartLine);
+    for (const table of carryoverResult.tables) {
       tablesParsedCount += 1;
       for (const row of table.rows) {
         openThreadRows.push({
@@ -319,6 +336,13 @@ function parseFileIntoRows(normalizedText, durableHeadings, fileKind) {
       for (const orphan of table.orphanRows) {
         orphanTableRows.push({ ...orphan, enclosingHeadingLineNo: section.headingLineNo });
       }
+    }
+    // cm#222 follow-up: a "### Open carry-overs"-shaped heading that isn't
+    // the canonical form (e.g. a trailing "(snapshot at S68 close ...)"
+    // parenthetical this exact real-file case was found with) — reported,
+    // never silently un-extracted.
+    for (const variant of carryoverResult.carryoverHeadingVariants) {
+      carryoverHeadingVariants.push({ ...variant, enclosingHeadingLineNo: section.headingLineNo });
     }
 
     if (SESSION_TYPES.has(section.type)) {
@@ -390,6 +414,13 @@ function parseFileIntoRows(normalizedText, durableHeadings, fileKind) {
 
   const sectionTypeCounts = countByType(sections);
 
+  // cm#222 follow-up: surface normalizeMarkdown()'s flags in the report
+  // itself (previously console-only for unrecognized-dash, and the
+  // mid-document BOM case wasn't tracked anywhere at all).
+  const allFlags = normalizeFlags || [];
+  const unrecognizedDashFlags = allFlags.filter((f) => f.type === 'unrecognized-dash');
+  const bomMidfileFlags = allFlags.filter((f) => f.type === 'bom-midfile');
+
   return {
     sessionTldrRows,
     openThreadRows,
@@ -403,6 +434,7 @@ function parseFileIntoRows(normalizedText, durableHeadings, fileKind) {
       otherHeadings,
       sessionShapedUnparsedHeadings,
       nextSessionVariantHeadings,
+      carryoverHeadingVariants,
       nextSessionState,
       flaggedTableRows,
       orphanTableRows,
@@ -410,6 +442,8 @@ function parseFileIntoRows(normalizedText, durableHeadings, fileKind) {
       statusClassCounts,
       dualSignalStatusCells,
       bodyLengthDeltaFlags,
+      unrecognizedDashFlags,
+      bomMidfileFlags,
       collisions,
       totalRawLines,
       parsedRowCount,
@@ -632,8 +666,9 @@ function printHumanSummary({ parsed, activeParsed, historyParsed, preconditionCh
     console.log(`  ${label}: sections=${r.sectionsFound} types=${JSON.stringify(r.sectionTypeCounts)} sessionHeadingLevel=${r.sessionHeadingLevelDetected}`);
     console.log(`    session_shaped_unparsed=${r.sessionShapedUnparsedHeadings.length} other=${r.otherHeadings.length} next_session_variant=${r.nextSessionVariantHeadings.length}`);
     console.log(`    next_session_state=${r.nextSessionState.state} (items=${r.nextSessionState.itemCount})`);
-    console.log(`    tables_parsed=${r.tablesParsedCount} flagged_rows=${r.flaggedTableRows.length} orphan_rows=${r.orphanTableRows.length}`);
+    console.log(`    tables_parsed=${r.tablesParsedCount} flagged_rows=${r.flaggedTableRows.length} orphan_rows=${r.orphanTableRows.length} carryover_heading_variant=${r.carryoverHeadingVariants.length}`);
     console.log(`    status_classes=${JSON.stringify(r.statusClassCounts)} dual_signal_examples=${r.dualSignalStatusCells.length}`);
+    console.log(`    unrecognized_dash=${r.unrecognizedDashFlags.length} bom_midfile=${r.bomMidfileFlags.length}`);
   }
   console.log('--- end summary ---');
 }
@@ -719,11 +754,11 @@ async function main() {
     }
 
     for (const flag of [...(activeFile.normalized ? activeFile.normalized.flags : []), ...(historyFile.normalized ? historyFile.normalized.flags : [])]) {
-      console.log(`  [FLAG] unrecognized-dash at line ${flag.line}: "${flag.char}" (H-10 — not silently coerced)`);
+      logNormalizeFlag(flag);
     }
 
-    const activeParsed = activeFile.present ? parseFileIntoRows(activeFile.normalized.text, headingsConfig.headings, 'active') : null;
-    const historyParsed = historyFile.present ? parseFileIntoRows(historyFile.normalized.text, headingsConfig.headings, 'history') : null;
+    const activeParsed = activeFile.present ? parseFileIntoRows(activeFile.normalized.text, headingsConfig.headings, 'active', activeFile.normalized.flags) : null;
+    const historyParsed = historyFile.present ? parseFileIntoRows(historyFile.normalized.text, headingsConfig.headings, 'history', historyFile.normalized.flags) : null;
     const crossFileCollisions = computeCrossFileCollisions(activeParsed, historyParsed);
 
     printHumanSummary({ parsed, activeParsed, historyParsed, preconditionChecks });
@@ -812,14 +847,14 @@ async function main() {
     }
 
     for (const flag of [...(activeFile.normalized ? activeFile.normalized.flags : []), ...(historyFile.normalized ? historyFile.normalized.flags : [])]) {
-      console.log(`  [FLAG] unrecognized-dash at line ${flag.line}: "${flag.char}" (H-10 — not silently coerced)`);
+      logNormalizeFlag(flag);
     }
 
     const activeParsed = activeFile.present
-      ? parseFileIntoRows(activeFile.normalized.text, headingsConfig.headings, 'active')
+      ? parseFileIntoRows(activeFile.normalized.text, headingsConfig.headings, 'active', activeFile.normalized.flags)
       : null;
     const historyParsed = historyFile.present
-      ? parseFileIntoRows(historyFile.normalized.text, headingsConfig.headings, 'history')
+      ? parseFileIntoRows(historyFile.normalized.text, headingsConfig.headings, 'history', historyFile.normalized.flags)
       : null;
 
     const slices = [];

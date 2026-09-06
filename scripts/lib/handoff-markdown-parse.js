@@ -145,6 +145,24 @@ const UNRECOGNIZED_DASH_RE = /[‐‑‒―﹘﹣⸺⸻⁓−]/g;
 const NEXT_SESSION_CANONICAL_RE = /^next\s+session(?:\s*\([^)]*\))?$/i;
 const NEXT_WORD_RE = /\bnext\b/i;
 
+// cm#222 follow-up (coordinator-directed, same PR): the `### Open
+// carry-overs` sub-heading match was an exact anchor, not a total
+// classification — a real heading variant
+// ("### Open carry-overs (snapshot at S68 close; ...)") matched neither
+// the old exact regex nor anything else, so its table was silently
+// un-extracted entirely (an H-13 real-file acceptance failure, not a
+// synthetic edge case). Canonical: "Open carry-overs" optionally followed
+// by a parenthetical OR a "--"/em-dash/en-dash-suffixed clause. Anything
+// else containing both "carry" and "over" (case-insensitive substrings —
+// covers "carryovers", "carry-overs", "carry over") is a
+// `carryover_heading_variant` — reported with its line number, its table
+// NEVER guessed/parsed. A `###` heading matching neither (e.g. "### Done")
+// is simply not carryover-shaped at all and is ignored by this
+// classifier (it is not this classifier's total-classification domain).
+const CARRYOVER_CANONICAL_RE = /^open\s+carry-?overs(?:\s*(?:\([^)]*\)|(?:--|[—–-])\s*.+))?$/i;
+const CARRYOVER_WORD_RE_1 = /carry/i;
+const CARRYOVER_WORD_RE_2 = /over/i;
+
 // ─── ONE NORMALIZATION ENGINE ────────────────────────────────────────────
 
 /**
@@ -164,12 +182,24 @@ function canonicalizeWhitespace(s) {
 // ─── H-10: NORMALIZATION ────────────────────────────────────────────────
 
 /**
- * normalizeMarkdown — BOM strip, CRLF -> LF, per-line trailing-whitespace
- * trim, unrecognized-dash flagging (never silent coercion). Must be run
+ * normalizeMarkdown — BOM strip (file-leading occurrence ONLY), CRLF -> LF,
+ * per-line trailing-whitespace trim, unrecognized-dash flagging, and
+ * cm#222 mid-document BOM flagging (never silent coercion). Must be run
  * BEFORE any other function in this module sees the file's raw content.
  *
+ * cm#222 follow-up (coordinator-directed, same PR): a real file was found
+ * to carry a STRAY U+FEFF mid-document (not at byte 0) — e.g. immediately
+ * before a `##` heading, hundreds of lines in, almost certainly a paste/
+ * concatenation artifact. The file-leading BOM is still stripped once,
+ * here, as before. A mid-document BOM is deliberately NOT stripped by
+ * this function — it is left in place and reported as a `bom-midfile`
+ * flag with its line number, so its effect (previously an invisible
+ * accident of JS's `String.prototype.trim()` also treating U+FEFF as
+ * whitespace, which is what let a BOM-prefixed heading still parse) is
+ * now visible in the report rather than a silent, undocumented behavior.
+ *
  * @param {string} raw
- * @returns {{ text: string, bomStripped: boolean, flags: Array<{type:string, line:number, char:string}> }}
+ * @returns {{ text: string, bomStripped: boolean, flags: Array<{type:string, line:number, char?:string}> }}
  */
 function normalizeMarkdown(raw) {
   let s = String(raw == null ? '' : raw);
@@ -187,6 +217,13 @@ function normalizeMarkdown(raw) {
     UNRECOGNIZED_DASH_RE.lastIndex = 0;
     while ((m = UNRECOGNIZED_DASH_RE.exec(trimmed))) {
       flags.push({ type: 'unrecognized-dash', line: idx + 1, char: m[0] });
+    }
+    // cm#222: every U+FEFF found HERE is by construction not the file's
+    // leading byte (that one was already sliced off above) — a genuine
+    // mid-document stray BOM. Flagged, never silently relied upon.
+    let bomIdx = -1;
+    while ((bomIdx = trimmed.indexOf('﻿', bomIdx + 1)) !== -1) {
+      flags.push({ type: 'bom-midfile', line: idx + 1 });
     }
     return trimmed;
   });
@@ -655,6 +692,24 @@ function classifyStatusCell(raw) {
 }
 
 /**
+ * classifyCarryoverHeading — total classification of one `###`-level
+ * heading's text against the carry-over-table convention. Returns
+ * `'canonical'` (parse its table), `'variant'` (carry-over-shaped but not
+ * the canonical form — report with a line number, table never guessed/
+ * parsed), or `null` (not carry-over-shaped at all, e.g. "### Done" —
+ * outside this classifier's domain, ignored).
+ *
+ * @param {string} headingText - text AFTER the leading `### `
+ * @returns {'canonical'|'variant'|null}
+ */
+function classifyCarryoverHeading(headingText) {
+  const canon = canonicalizeWhitespace(headingText);
+  if (CARRYOVER_CANONICAL_RE.test(canon)) return 'canonical';
+  if (CARRYOVER_WORD_RE_1.test(canon) && CARRYOVER_WORD_RE_2.test(canon)) return 'variant';
+  return null;
+}
+
+/**
  * findOpenCarryoverTables — cm#222 A3 rewrite: scans a section's body text
  * for every `### Open carry-overs` sub-heading (H-8-aware, same as
  * top-level headings) and parses the HEADER-DRIVEN table that follows —
@@ -691,27 +746,43 @@ function classifyStatusCell(raw) {
  * F-6) — never silently dropped. Multiple `### Open carry-overs` headings
  * in one section body are all parsed independently.
  *
+ * cm#222 follow-up: the heading match itself is now a total classification
+ * (`classifyCarryoverHeading`) rather than an exact anchor — a variant
+ * heading (contains "carry" and "over" but isn't the canonical form) is
+ * reported in `carryoverHeadingVariants`, never silently un-extracted.
+ *
  * @param {string} bodyText
  * @param {number} bodyStartLineNo - 1-based line number bodyText's line 0 corresponds to, for report accuracy
- * @returns {Array<{
- *   headingLineNo: number,
- *   columns: string[]|null,
- *   rows: Array<{itemRaw:string, statusRaw:string, statusClass:string, statusDualSignal:boolean, notesRaw:string, lineNo:number, subjectRaw:string, objectRaw:string}>,
- *   flaggedRows: Array<{raw:string, reason:string, lineNo:number}>,
- *   orphanRows: Array<{raw:string, lineNo:number}>,
- * }>}
+ * @returns {{
+ *   tables: Array<{
+ *     headingLineNo: number,
+ *     columns: string[]|null,
+ *     rows: Array<{itemRaw:string, statusRaw:string, statusClass:string, statusDualSignal:boolean, notesRaw:string, lineNo:number, subjectRaw:string, objectRaw:string}>,
+ *     flaggedRows: Array<{raw:string, reason:string, lineNo:number}>,
+ *     orphanRows: Array<{raw:string, lineNo:number}>,
+ *   }>,
+ *   carryoverHeadingVariants: Array<{headingLine:string, headingLineNo:number}>,
+ * }}
  */
 function findOpenCarryoverTables(bodyText, bodyStartLineNo) {
   const lines = bodyText.split('\n');
   const ctx = classifyLineContexts(bodyText);
   const results = [];
+  const carryoverHeadingVariants = [];
 
   const isHeadingBoundary = (idx) => idx >= lines.length || /^#{2,3}(?!#)\s+/.test(lines[idx].trim());
 
   for (let i = 0; i < lines.length; i++) {
     if (!isRealContentLine(ctx[i])) continue;
     const trimmed = lines[i].trim();
-    if (!/^###(?!#)\s+open\s+carry-?overs\s*$/i.test(trimmed)) continue;
+    const headingMatch = /^###(?!#)\s+(.*)$/.exec(trimmed);
+    if (!headingMatch) continue;
+    const carryoverKind = classifyCarryoverHeading(headingMatch[1]);
+    if (carryoverKind === null) continue; // not carry-over-shaped at all — outside this classifier's domain
+    if (carryoverKind === 'variant') {
+      carryoverHeadingVariants.push({ headingLine: lines[i], headingLineNo: bodyStartLineNo + i });
+      continue; // reported, never guessed/parsed as a table
+    }
 
     const headingLineNo = bodyStartLineNo + i;
     const rows = [];
@@ -799,7 +870,7 @@ function findOpenCarryoverTables(bodyText, bodyStartLineNo) {
     results.push({ headingLineNo, columns: columns ? columns.names : null, rows, flaggedRows, orphanRows });
   }
 
-  return results;
+  return { tables: results, carryoverHeadingVariants };
 }
 
 function buildRowFromColumns(cells, columns, lineNo) {
@@ -951,6 +1022,8 @@ module.exports = {
   buildColumnMap,
   resolveColumnRole,
   classifyStatusCell,
+  CARRYOVER_CANONICAL_RE,
+  classifyCarryoverHeading,
   findOpenCarryoverTables,
   parseNextSessionItems,
   computeBodyLengthDeltaFlags,

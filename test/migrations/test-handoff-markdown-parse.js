@@ -98,6 +98,31 @@ run('H10-5', 'unrecognized Unicode dash is flagged, never silently coerced', () 
   assertEq(r.flags[0].type, 'unrecognized-dash', 'wrong flag type');
 });
 
+run('H10-6', 'coordinator follow-up: a file-leading BOM is stripped once and NOT reported as bom-midfile', () => {
+  const r = mdParse.normalizeMarkdown('﻿## Session 1 — 2026-01-01 — Title\n');
+  assertEq(r.bomStripped, true, 'file-leading BOM should be stripped');
+  assert(!r.flags.some((f) => f.type === 'bom-midfile'), 'the file-leading BOM must not ALSO be reported as bom-midfile');
+});
+
+run('H10-7', 'coordinator follow-up: a mid-document stray BOM is NOT stripped but IS flagged as bom-midfile with a line number', () => {
+  const raw = ['## Session 1 — 2026-01-01 — Title', '', 'body', '', '﻿## Session 2 — 2026-01-02 — Later heading with a stray embedded BOM', ''].join('\n');
+  const r = mdParse.normalizeMarkdown(raw);
+  const bomFlags = r.flags.filter((f) => f.type === 'bom-midfile');
+  assertEq(bomFlags.length, 1, 'expected exactly one bom-midfile flag');
+  assertEq(bomFlags[0].line, 5, 'bom-midfile flag should carry the correct line number');
+  assert(r.text.includes('﻿'), 'a mid-document BOM should NOT be silently stripped, only flagged');
+});
+
+run('H10-8', 'coordinator follow-up: a heading immediately after a mid-document stray BOM still classifies correctly (trim() absorption still works, now WITH visibility)', () => {
+  const raw = ['## Session 1 — 2026-01-01 — Title', '', 'body', '', '﻿## Session 2 — 2026-01-02 — Later heading', ''].join('\n');
+  const r = mdParse.normalizeMarkdown(raw);
+  const sections = mdParse.splitDocumentIntoSections(r.text, DURABLE);
+  assertEq(sections.length, 2, 'expected two sections despite the stray mid-document BOM');
+  assertEq(sections[1].type, 'session_numbered', 'the BOM-prefixed heading should still classify correctly');
+  const bomFlags = r.flags.filter((f) => f.type === 'bom-midfile');
+  assertEq(bomFlags.length, 1, 'the BOM should still be reported even though parsing succeeded');
+});
+
 // ─── cm#222 A2/F-2: session_numbered — the widened separator TOKEN ──────
 
 run('A2-1', 'session_numbered matches the "--" two-hyphen token (F-2: was previously unmatchable)', () => {
@@ -293,7 +318,7 @@ run('H8-5', 'a REAL heading immediately after a closed fence is still detected',
 
 run('H8-6', 'a fake "### Open carry-overs" heading inside a fence, in an otherwise real section, is not extracted', () => {
   const body = ['```', '### Open carry-overs', '| Item | Status | Notes |', '|---|---|---|', '| a | Open | b |', '```', ''].join('\n');
-  const tables = mdParse.findOpenCarryoverTables(body, 1);
+  const { tables } = mdParse.findOpenCarryoverTables(body, 1);
   assertEq(tables.length, 0, 'fenced fake Open carry-overs heading was incorrectly extracted');
 });
 
@@ -363,7 +388,7 @@ run('A3-3', 'F-1: a 3-column (Item/Status/Notes) table — the real-world shape 
     '| Doc update | DONE -- merged | shipped same day |',
     '',
   ].join('\n');
-  const tables = mdParse.findOpenCarryoverTables(body, 1);
+  const { tables } = mdParse.findOpenCarryoverTables(body, 1);
   assertEq(tables.length, 1, 'expected exactly one table');
   assertEq(tables[0].rows.length, 2, 'both 3-column rows should parse (this is the F-1 regression: a hardcoded 2-cell assumption failed on every real row)');
   assertEq(tables[0].flaggedRows.length, 0, 'well-formed 3-column rows should not be flagged');
@@ -382,7 +407,7 @@ run('A3-4', 'F-7: extra unrecognized column is folded into notes as name=value, 
     '| Widget parser | Open | needs review | Jordan |',
     '',
   ].join('\n');
-  const tables = mdParse.findOpenCarryoverTables(body, 1);
+  const { tables } = mdParse.findOpenCarryoverTables(body, 1);
   assertEq(tables[0].rows.length, 1, 'expected one row');
   assert(tables[0].rows[0].notesRaw.includes('needs review'), 'original notes text lost');
   assert(tables[0].rows[0].notesRaw.includes('Owner=Jordan'), 'extra column was not folded into notes as name=value');
@@ -398,7 +423,7 @@ run('A3-5', 'F-7: a missing status column yields status "unknown" for every row'
     '| Widget parser | needs review |',
     '',
   ].join('\n');
-  const tables = mdParse.findOpenCarryoverTables(body, 1);
+  const { tables } = mdParse.findOpenCarryoverTables(body, 1);
   assertEq(tables[0].rows[0].statusClass, 'unknown', 'missing status column should yield status=unknown, never a guess');
   assertEq(tables[0].rows[0].statusRaw, '', 'statusRaw should be empty when there is no status column at all');
 });
@@ -413,7 +438,7 @@ run('A3-6', 'F-7: a header with no identifiable item column flags the WHOLE tabl
     '| Open | something |',
     '',
   ].join('\n');
-  const tables = mdParse.findOpenCarryoverTables(body, 1);
+  const { tables } = mdParse.findOpenCarryoverTables(body, 1);
   assertEq(tables[0].rows.length, 0, 'no rows should be parsed when the item column cannot be identified');
   assertEq(tables[0].flaggedRows.length, 1, 'the data row should be flagged, not silently dropped');
   assert(/no item\/subject column/i.test(tables[0].flaggedRows[0].reason), 'flag reason should name the missing item column');
@@ -428,7 +453,7 @@ run('A3-7', 'headerless table: column 0 is always item, status is unknown, other
     '| EXAMPLE-THREAD-BETA: other | do the beta thing |',
     '',
   ].join('\n');
-  const tables = mdParse.findOpenCarryoverTables(body, 1);
+  const { tables } = mdParse.findOpenCarryoverTables(body, 1);
   assertEq(tables[0].rows.length, 2, 'both headerless rows should parse');
   assertEq(tables[0].rows[0].itemRaw, 'EXAMPLE-THREAD-ALPHA: something', 'first row item mismatch');
   assertEq(tables[0].rows[0].statusClass, 'unknown', 'headerless table should never guess a status class');
@@ -444,7 +469,7 @@ run('A3-8', 'F-8: structural header check composes with name-matching — a head
     '| Widget parser | Open | first real row, no separator present |',
     '',
   ].join('\n');
-  const tables = mdParse.findOpenCarryoverTables(body, 1);
+  const { tables } = mdParse.findOpenCarryoverTables(body, 1);
   assertEq(tables[0].rows.length, 2, 'without a separator row, BOTH lines are data — the literal header-shaped line must not be consumed as a header');
   assertEq(tables[0].rows[0].itemRaw, 'Item', 'the header-shaped line should parse as ordinary (headerless) data, not be swallowed as a header');
 });
@@ -462,7 +487,7 @@ run('A3-9', 'F-6: a table split by a stray blank line reports the trailing pipe-
     '',
     '## Next heading',
   ].join('\n');
-  const tables = mdParse.findOpenCarryoverTables(body, 1);
+  const { tables } = mdParse.findOpenCarryoverTables(body, 1);
   assertEq(tables[0].rows.length, 1, 'only the row before the blank line should be a normal row');
   assertEq(tables[0].orphanRows.length, 1, 'the pipe-shaped line after the blank line should be reported as an orphan row, not silently dropped');
   assert(tables[0].orphanRows[0].raw.includes('Doc update'), 'orphan row content mismatch');
@@ -485,7 +510,7 @@ run('A3-10', 'multiple "### Open carry-overs" headings in one body are all parse
     '| Second table row | Open | b |',
     '',
   ].join('\n');
-  const tables = mdParse.findOpenCarryoverTables(body, 1);
+  const { tables } = mdParse.findOpenCarryoverTables(body, 1);
   assertEq(tables.length, 2, 'expected two independently-parsed tables');
   assertEq(tables[0].rows[0].itemRaw, 'First table row', 'first table mismatch');
   assertEq(tables[1].rows[0].itemRaw, 'Second table row', 'second table mismatch');
@@ -501,14 +526,14 @@ run('A3-11', 'escaped pipe inside a cell does not split the row (F-9 carried for
     '| pipes\\|in\\|item | Open | pipes\\|in\\|notes |',
     '',
   ].join('\n');
-  const tables = mdParse.findOpenCarryoverTables(body, 1);
+  const { tables } = mdParse.findOpenCarryoverTables(body, 1);
   assertEq(tables[0].rows.length, 1, 'escaped-pipe row should parse as exactly one well-formed row');
   assertEq(tables[0].rows[0].itemRaw, 'pipes|in|item', 'escaped pipe in item cell did not round-trip');
 });
 
 run('A3-12', 'renderer empty-state placeholder is zero rows, not an error', () => {
   const body = ['', '### Open carry-overs', '', '_(no open carry-overs)_', ''].join('\n');
-  const tables = mdParse.findOpenCarryoverTables(body, 1);
+  const { tables } = mdParse.findOpenCarryoverTables(body, 1);
   assertEq(tables.length, 1, 'expected one table entry for the heading');
   assertEq(tables[0].rows.length, 0, 'empty-state placeholder should yield zero rows');
   assertEq(tables[0].flaggedRows.length, 0, 'empty-state placeholder should not be flagged');
@@ -516,7 +541,7 @@ run('A3-12', 'renderer empty-state placeholder is zero rows, not an error', () =
 
 run('A3-13', 'header-only table (header + separator, zero data rows) is flagged, never silently indistinguishable from empty', () => {
   const body = ['', '### Open carry-overs', '', '| Item | Status | Notes |', '|---|---|---|', ''].join('\n');
-  const tables = mdParse.findOpenCarryoverTables(body, 1);
+  const { tables } = mdParse.findOpenCarryoverTables(body, 1);
   assertEq(tables[0].rows.length, 0, 'header-only table should yield zero data rows');
   assertEq(tables[0].flaggedRows.length, 1, 'header-only table must be flagged');
   assert(/header-only/i.test(tables[0].flaggedRows[0].reason), 'flag reason should identify the header-only condition');
@@ -532,12 +557,83 @@ run('A3-14', 'a separator row whose cell count does not match the header is trea
     '| a | b | c |',
     '',
   ].join('\n');
-  const tables = mdParse.findOpenCarryoverTables(body, 1);
+  const { tables } = mdParse.findOpenCarryoverTables(body, 1);
   // Mismatched separator -> headerless path -> EVERY line from here is
   // ordinary data (never guessed to be a header or skipped), including
   // the separator-shaped line itself.
   assertEq(tables[0].rows.length, 3, 'all three lines should be treated as headerless data when the separator cell count does not match the header');
   assertEq(tables[0].rows[0].itemRaw, 'Item', 'the header-shaped line should parse as ordinary headerless data');
+});
+
+// ─── coordinator follow-up: carry-over heading total classification ────
+
+run('A3-15', 'classifyCarryoverHeading: bare canonical form', () => {
+  assertEq(mdParse.classifyCarryoverHeading('Open carry-overs'), 'canonical', 'bare canonical heading should classify as canonical');
+});
+
+run('A3-16', 'classifyCarryoverHeading: canonical with a trailing parenthetical suffix', () => {
+  assertEq(
+    mdParse.classifyCarryoverHeading('Open carry-overs (snapshot at S68 close; superseded rows updated in later sessions)'),
+    'canonical',
+    'a real-world parenthetical-suffixed heading should still classify as canonical'
+  );
+});
+
+run('A3-17', 'classifyCarryoverHeading: canonical with a trailing "--" suffix clause', () => {
+  assertEq(mdParse.classifyCarryoverHeading('Open carry-overs -- carried from last rotation'), 'canonical', 'a "--"-suffixed heading should classify as canonical');
+});
+
+run('A3-18', 'classifyCarryoverHeading: canonical with a trailing em-dash suffix clause', () => {
+  assertEq(mdParse.classifyCarryoverHeading('Open carry-overs — carried from last rotation'), 'canonical', 'an em-dash-suffixed heading should classify as canonical');
+});
+
+run('A3-19', 'classifyCarryoverHeading: an unrelated "###" heading (no "carry"/"over") is neither canonical nor variant', () => {
+  assertEq(mdParse.classifyCarryoverHeading('Done'), null, '"### Done" is not carry-over-shaped at all');
+  assertEq(mdParse.classifyCarryoverHeading('Smoke run -- some tenant'), null, 'an unrelated heading must not be misclassified as a carry-over variant');
+});
+
+run('A3-20', 'findOpenCarryoverTables: a genuinely non-canonical carry-over-shaped heading is reported as a variant, never silently un-extracted', () => {
+  const body = [
+    '',
+    '### Carryover items from last sprint',
+    '',
+    '| Item | Status | Notes |',
+    '|---|---|---|',
+    '| Widget parser | Open | should be extracted from a canonical heading, not this variant one |',
+    '',
+  ].join('\n');
+  const result = mdParse.findOpenCarryoverTables(body, 1);
+  assertEq(result.tables.length, 0, 'a variant heading\'s table must never be guessed/parsed');
+  assertEq(result.carryoverHeadingVariants.length, 1, 'the variant heading must be reported, not silently dropped');
+  assertEq(result.carryoverHeadingVariants[0].headingLineNo, 2, 'wrong line number for the reported variant heading');
+});
+
+run('A3-21', 'findOpenCarryoverTables: canonical (incl. real-world parenthetical suffix) and a genuine variant heading in the same body are both correctly bucketed', () => {
+  const body = [
+    '### Open carry-overs',
+    '',
+    '| Item | Status | Notes |',
+    '|---|---|---|',
+    '| Real row | Open | this table must be parsed |',
+    '',
+    '### Open carry-overs (snapshot at S68 close; superseded rows updated in later sessions)',
+    '',
+    '| Item | Status | Notes |',
+    '|---|---|---|',
+    '| Also real | Open | a real-world parenthetical suffix is still canonical, per the coordinator spec |',
+    '',
+    '### Carryover backlog (not the canonical heading shape)',
+    '',
+    '| Item | Status | Notes |',
+    '|---|---|---|',
+    '| Never parsed | Open | this table must NOT be parsed, only reported |',
+    '',
+  ].join('\n');
+  const result = mdParse.findOpenCarryoverTables(body, 1);
+  assertEq(result.tables.length, 2, 'both canonical headings (bare and parenthetical-suffixed) should be parsed');
+  assertEq(result.tables[0].rows[0].itemRaw, 'Real row', 'wrong table parsed for the bare canonical heading');
+  assertEq(result.tables[1].rows[0].itemRaw, 'Also real', 'wrong table parsed for the parenthetical-suffixed canonical heading');
+  assertEq(result.carryoverHeadingVariants.length, 1, 'exactly one heading should be reported as a variant');
 });
 
 // ─── cm#222 A4/F-4: status-cell total classification ────────────────────

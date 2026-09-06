@@ -45,7 +45,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `present_with_items` / `present_variant`, the last for a heading
   containing both "next" and "session" without matching the canonical
   form). New/changed: `scripts/lib/handoff-markdown-parse.js`,
-  `scripts/migrations/migrate-08-handoff-markdown.js`.
+  `scripts/migrations/migrate-08-handoff-markdown.js`. Follow-up in the
+  same PR: the `### Open carry-overs` sub-heading match was itself an
+  exact anchor, not a total classification — a real heading variant
+  (a trailing parenthetical, e.g. "(snapshot at S68 close ...)") matched
+  nothing and its table was entirely un-extracted; now canonical (bare, or
+  with a trailing parenthetical / `--`/em-dash-suffixed clause) is parsed,
+  and anything else containing both "carry" and "over" is a
+  `carryover_heading_variant`, reported with a line number, never guessed.
+  A mid-document stray BOM (not the file's leading byte) is now flagged as
+  `bom-midfile` with its line number instead of silently relying on
+  `String.prototype.trim()` to absorb it during heading detection.
 
 ### Added
 

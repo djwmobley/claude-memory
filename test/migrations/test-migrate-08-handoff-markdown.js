@@ -599,6 +599,47 @@ async function main() {
     }
   });
 
+  // ── T11: coordinator follow-up — carry-over heading variant + a real
+  //    canonical table with a parenthetical suffix, both end-to-end ─────
+  await run('T11', 'coordinator follow-up: a non-canonical carry-over-shaped heading is reported end-to-end; its table is never written, while a parenthetical-suffixed CANONICAL heading\'s table IS written', async () => {
+    const fixturePath = writeFixture(
+      'HANDOFF-carryover-variant.md',
+      [
+        '## Session 6 — 2026-03-05 — Carry-over heading variant coverage',
+        '',
+        '### Open carry-overs (rotated forward from a prior close)',
+        '',
+        '| Item | Status | Notes |',
+        '|---|---|---|',
+        '| Real carryover row | Open | this table is canonical (parenthetical suffix) and MUST be written |',
+        '',
+        '### Carryover backlog (not the canonical heading shape)',
+        '',
+        '| Item | Status | Notes |',
+        '|---|---|---|',
+        '| Should never be written | Open | this heading is a variant, not canonical |',
+        '',
+      ].join('\n')
+    );
+    const reportScratchDir = path.join(SCRATCH_DIR, 'reports-t11');
+    const projectI = `example-project-iota-${TS}`;
+    const r = runMigrate08(['--db', DB_TARGET, '--project-id', projectI, '--file', fixturePath, '--report-dir', reportScratchDir]);
+    if (r.status !== 0) throw new Error(`run failed: status=${r.status}\nstdout=${r.stdout}\nstderr=${r.stderr}`);
+
+    const report = readReportFile(reportScratchDir, projectI);
+    assertEq(report.active.carryoverHeadingVariants.length, 1, 'expected exactly one reported carry-over heading variant');
+    assert(/Carryover backlog/.test(report.active.carryoverHeadingVariants[0].headingLine), 'wrong heading reported as the variant');
+
+    const client = await pgConnect(DB_TARGET);
+    try {
+      const { rows } = await client.query(`SELECT object FROM assertions WHERE project_id=$1 AND predicate='open_thread'`, [projectI]);
+      assertEq(rows.length, 1, 'exactly one open_thread row should be written — from the canonical (parenthetical-suffixed) heading only');
+      assert(rows[0].object.includes('this table is canonical'), 'the wrong table\'s row was written, or the variant table\'s row leaked through');
+    } finally {
+      await client.end();
+    }
+  });
+
   console.log(`\nResults: ${passed} passed, ${failed} failed`);
   for (const db of CREATED_DBS) await dropDb(db);
   try { fs.rmSync(SCRATCH_DIR, { recursive: true, force: true }); } catch (_) { /* best-effort */ }
