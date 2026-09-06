@@ -14,7 +14,8 @@
  *
  * Two groups:
  *   A. Subprocess tests of verify-18-usage-smoke.js itself (fresh-apply
- *      PASS with all 9 checks, prerequisite-missing FAIL naming the addenda
+ *      PASS with all 10 checks (§18.3: check 10 is the feature-grain query
+ *      added to usage-telemetry.js), prerequisite-missing FAIL naming the addenda
  *      runner, refused target names).
  *   B. Direct unit tests of scripts/lib/usage-telemetry.js against a live
  *      scratch database, covering every ADVERSARY-PASS AMENDMENT semantic
@@ -195,7 +196,7 @@ async function testSmokeFreshPass() {
   const r = runSmoke(['--db', DB_MAIN]);
   assert(r.status === 0, `expected exit 0, got ${r.status}. stdout=${r.stdout} stderr=${r.stderr}`);
   assert(/SMOKE18_RESULT: PASS/.test(r.stdout), `expected the PASS summary line. stdout=${r.stdout}`);
-  for (const n of [1, 2, 3, 4, 5, 6, 7, 8, 9]) {
+  for (const n of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) {
     assert(new RegExp(`\\[SMOKE-18\\]\\[${n}\\] PASS`).test(r.stdout), `expected check ${n} to print a PASS line. stdout=${r.stdout}`);
   }
 }
@@ -522,6 +523,74 @@ async function testGroupByTotalClassification(client) {
   assert(Array.isArray(defaulted), 'omitted groupBy must default to model, not error');
 }
 
+// ── B18: §18.3 feature-grain usageQuery ─────────────────────────────────────
+//
+// feature_usage is written only by migrate-12-feature-usage.js (never by
+// usageRecord), so fixtures here are plain direct INSERTs against
+// feature_usage, exercising usageQuery's READ path only.
+
+async function testFeatureGrainQuery(client) {
+  const projectId = `b18-proj-${TS}`;
+  const branchA = `b18-branch-a-${TS}`;
+  const branchB = `b18-branch-b-${TS}`;
+  const modelA = `b18-model-a-${TS}`;
+
+  async function insertFeature({ branch, prNumber, modelId, tokensIn, tokensOut, startedAt }) {
+    await client.query(
+      `INSERT INTO feature_usage (project_id, branch, pr_number, started_at, model_id, tokens_in, tokens_out)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [projectId, branch, prNumber, startedAt, modelId, tokensIn, tokensOut]
+    );
+  }
+
+  // UTC DAY BOUNDARY (A-12 pattern, §18.3): one row 1 second before UTC
+  // midnight, one row exactly AT UTC midnight, one row 1 second after --
+  // must land in exactly 2 distinct day buckets (the first two share a day,
+  // "just after midnight" starts the next day), computed once in SQL, never
+  // re-derived from a session-local TimeZone.
+  await insertFeature({ branch: branchA, prNumber: 1, modelId: modelA, tokensIn: 100, tokensOut: 10, startedAt: '2026-05-14T23:59:59Z' });
+  await insertFeature({ branch: branchA, prNumber: 2, modelId: modelA, tokensIn: 200, tokensOut: 20, startedAt: '2026-05-15T00:00:00Z' });
+  await insertFeature({ branch: branchB, prNumber: 3, modelId: null, tokensIn: 300, tokensOut: 30, startedAt: '2026-05-15T00:00:01Z' });
+
+  const byDay = await usageQuery(client, { projectId, granularity: 'feature', groupBy: 'day' });
+  const dayKeys = byDay.map((r) => r.key).sort();
+  assertEq(JSON.stringify(dayKeys), JSON.stringify(['2026-05-14', '2026-05-15']), 'UTC day boundary: 23:59:59 -> previous day, 00:00:00/00:00:01 -> next day, never re-derived driver-side');
+  const may15 = byDay.find((r) => r.key === '2026-05-15');
+  assertEq(may15.tokens_in, 500, 'the 00:00:00 and 00:00:01 rows both bucket into 2026-05-15');
+
+  const byBranch = await usageQuery(client, { projectId, granularity: 'feature', groupBy: 'branch' });
+  const branchARow = byBranch.find((r) => r.key === branchA);
+  assertEq(branchARow.tokens_in, 300, 'branch grouping sums both branchA rows');
+  assertEq(branchARow.turns, 2, 'branch grouping counts both branchA rows');
+
+  const byPr = await usageQuery(client, { projectId, granularity: 'feature', groupBy: 'pr' });
+  assertEq(byPr.length, 3, 'pr grouping yields one group per distinct pr_number');
+
+  const byModel = await usageQuery(client, { granularity: 'feature', projectId, groupBy: 'model' });
+  const noneGroup = byModel.find((r) => r.key === '(none)');
+  assert(noneGroup && noneGroup.tokens_in === 300, 'NULL model_id groups under the "(none)" sentinel, same as turn-grain');
+
+  // sessionId + granularity='feature' is a hard error, before any query.
+  await assertThrows(
+    () => usageQuery(client, { projectId, sessionId: `b18-sess-${TS}`, granularity: 'feature', groupBy: 'branch' }),
+    /sessionId.*not supported.*granularity="feature"|granularity="feature"/,
+    'sessionId + granularity="feature" hard-errors'
+  );
+
+  // A turn-grain-only groupBy value under granularity='feature' hard-errors
+  // (its own total classification, distinct from turn-grain's list).
+  await assertThrows(
+    () => usageQuery(client, { projectId, granularity: 'feature', groupBy: 'role' }),
+    /groupBy/,
+    "feature-grain groupBy='role' (valid only for turn-grain) hard-errors"
+  );
+
+  // Bad granularity value hard-errors; granularity omitted defaults to 'turn'.
+  await assertThrows(() => usageQuery(client, { projectId, granularity: 'bogus' }), /granularity/, 'bad granularity value hard-errors');
+  const defaultedTurn = await usageQuery(client, { projectId: `b18-empty-${TS}` });
+  assert(Array.isArray(defaultedTurn), 'granularity omitted defaults to "turn" (unchanged pre-§18.3 behavior)');
+}
+
 // ── B13: coerceNumeric / round6 pure unit cases (no DB) ────────────────────
 
 function testCoerceNumericPure() {
@@ -671,7 +740,7 @@ async function testCostRangeGuardRollupPath(client) {
 
 async function main() {
   try {
-    await run('A1', 'verify-18-usage-smoke.js: fresh apply -> exit 0, SMOKE18_RESULT: PASS, all 9 checks PASS', testSmokeFreshPass);
+    await run('A1', 'verify-18-usage-smoke.js: fresh apply -> exit 0, SMOKE18_RESULT: PASS, all 10 checks PASS', testSmokeFreshPass);
     await run('A2', 'verify-18-usage-smoke.js: session_usage dropped -> prerequisite check FAILs loudly, names the addenda runner', testSmokePrereqFail);
     await run('A3', 'verify-18-usage-smoke.js: refused target names (total-classification default branch)', testSmokeRefusedNames);
 
@@ -696,6 +765,7 @@ async function main() {
       await run('B15', 'usageRecord: cost-range guard — caller-supplied costUsd at/above NUMERIC(12,6) bound (named CostOutOfRangeError, no row written)', () => testCostRangeGuardCallerSupplied(client));
       await run('B16', 'usageRecord: cost-range guard — server-computed cost overflow (reviewer repro: near-MAX_SAFE_INTEGER tokens x priced model); fresh key and existing-row-unchanged cases', () => testCostRangeGuardServerComputed(client));
       await run('B17', 'sessionUsageRollup: cost-range guard — in-range costs whose SUM overflows total_cost_usd rethrows the same named error, no partial row', () => testCostRangeGuardRollupPath(client));
+      await run('B18', 'usageQuery: §18.3 granularity="feature" — branch/pr/model/day grouping, UTC day boundary, sessionId+feature hard error, feature-grain groupBy total classification', () => testFeatureGrainQuery(client));
     } finally {
       await client.end();
       await concurrentClient.end();

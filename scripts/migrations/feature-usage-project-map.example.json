@@ -1,0 +1,15 @@
+{
+  "_comment": "SYNTHETIC EXAMPLE ONLY -- obviously-fake project names and branch prefixes throughout. This file documents the required SHAPE for migrate-12-feature-usage.js's optional --project-map flag and is what test/migrations/test-migrate-12-feature-usage.js exercises, so the suite runs green with no private data present, in CI or anywhere else. Mapping rule (see migrate-12-feature-usage.js's own header comment for the full contract): each source row's RAW, UNTRIMMED branch string is matched against every branch_prefixes[].prefix via a plain startsWith; the LONGEST matching prefix wins; ties (identical-length matching prefixes) are broken by earliest array position; the top-level \"default\" project_id applies ONLY when ZERO prefixes match (never as a second-choice tiebreak); a branch matching zero prefixes with no \"default\" configured maps to nothing and is reported with verdict unmapped-branch-<raw branch> for owner review -- never guessed, never silently dropped.",
+  "branch_prefixes": [
+    { "prefix": "feat/proj-alpha-", "project_id": "proj-alpha",
+      "note": "example row 1 -- literal feature-branch prefix for proj-alpha" },
+    { "prefix": "feat/", "project_id": "proj-fallback-feat",
+      "note": "example row 2 -- a shorter, more general prefix; row 1's longer prefix wins for any branch matching BOTH (longest-prefix-wins)" },
+    { "prefix": "release/proj-beta", "project_id": "proj-beta-monolith",
+      "note": "example row 3 -- release-branch prefix, unrelated project" },
+    { "prefix": "hotfix/", "project_id": "proj-beta-monolith",
+      "note": "example row 4 -- a distinct prefix can map to the same project_id as another row" }
+  ],
+  "default": "proj-fallback-unmapped",
+  "_default_note": "OPTIONAL. When present, applies only to a branch matching zero prefixes above -- e.g. 'main' or 'chore/cleanup' in this example map. Omit this key entirely to route zero-prefix-match branches to the unmapped-branch-<raw> verdict instead (owner-review bucket, never auto-assigned)."
+}

@@ -3,12 +3,15 @@
 /**
  * migrate-schema-addenda.js
  *
- * Second migration in scripts/migrations/. Applies six net-new, schema-only
+ * Second migration in scripts/migrations/. Applies seven net-new, schema-only
  * SQL pieces that are prerequisites for later routing/telemetry/interop work
  * but belong to no single migration phase: attribution columns on the
  * engine-core tables, a carryover_status column, a model registry base
- * table, an embedding-providers base table (with one seed row), and the
- * routing-harness and usage-telemetry table groups. See scripts/migrations/
+ * table, an embedding-providers base table (with one seed row), the
+ * routing-harness and usage-telemetry table groups, and (§18.3) the
+ * feature_usage table (per-feature/per-PR token-and-cost provenance, keyed
+ * by (project_id, source_db, source_feature_token_usage_id) — populated by
+ * migrate-12-feature-usage.js, not by this script). See scripts/migrations/
  * sql/*.sql for the DDL itself and each file's own header comment for its
  * origin section.
  *
@@ -24,7 +27,7 @@
  *   3. Confirms the engine-core tables this addendum ALTERs (entities,
  *      assertions, edges) already exist in the target (see PREREQUISITE
  *      CHECK below), before applying anything.
- *   4. Applies the six SQL files, in the explicit order below (NOT filename
+ *   4. Applies the seven SQL files, in the explicit order below (NOT filename
  *      lexicographic order — see the ORDER note), via the imported
  *      applySqlFile (no psql/pg_dump shell-outs, same plain pg-client apply
  *      pattern as migrate-01).
@@ -70,7 +73,7 @@
  * PREREQUISITE CHECK: even once the target database exists, its schema may
  * not yet include the engine-core tables (entities/assertions/edges) this
  * addendum's ALTER TABLE statements target. That check runs BEFORE any of
- * the six SQL files are applied — not as an afterthought once an ALTER
+ * the seven SQL files are applied — not as an afterthought once an ALTER
  * fails, but as an up-front, self-explanatory refusal so the predictable
  * total-failure case (an addendum run against a target migrate-01 has never
  * touched) never silently attempts partial DDL. A missing prerequisite
@@ -82,11 +85,14 @@
  *
  * ORDER: attribution-columns -> migrate-06-carryover-status ->
  * model-registry-base -> embedding-providers-base ->
- * migrate-10-routing-harness -> migrate-11-usage-telemetry. This is the
- * runner's own explicit SQL_FILES array, never filename lexicographic
- * order — model_registry's base CREATE TABLE must precede migrate-10's
- * ALTERs onto it, and entities/assertions/edges (migrate-01's tables) are a
- * hard prerequisite for the very first file.
+ * migrate-10-routing-harness -> migrate-11-usage-telemetry ->
+ * migrate-12-feature-usage. This is the runner's own explicit SQL_FILES
+ * array, never filename lexicographic order — model_registry's base CREATE
+ * TABLE must precede migrate-10's ALTERs onto it, entities/assertions/edges
+ * (migrate-01's tables) are a hard prerequisite for the very first file, and
+ * migrate-12-feature-usage's feature_usage table is a freestanding CREATE
+ * TABLE with no FK onto any of the other six files' tables, so it is placed
+ * last purely by arrival order, not by any dependency requirement.
  *
  * CONCURRENCY SCOPE (read before running this against a shared target):
  * identical posture to migrate-01-canonical-db.js — this is an operator-run,
@@ -128,6 +134,7 @@ const SQL_FILES = [
   path.join(SQL_DIR, 'embedding-providers-base.sql'),
   path.join(SQL_DIR, 'migrate-10-routing-harness.sql'),
   path.join(SQL_DIR, 'migrate-11-usage-telemetry.sql'),
+  path.join(SQL_DIR, 'migrate-12-feature-usage.sql'),
 ];
 
 // Engine-core tables this addendum's ALTER TABLE statements target. Must
@@ -180,7 +187,7 @@ function printUsage() {
 // migrate-01, not re-implemented) so `--`/`/* */` comments and quoted-string
 // contents can never be mistaken for statement structure. None of this is a
 // general SQL parser — it is deliberately scoped to the statement shapes the
-// six shipped addendum files actually use (plain CREATE TABLE / ALTER TABLE
+// seven shipped addendum files actually use (plain CREATE TABLE / ALTER TABLE
 // ADD COLUMN / CREATE INDEX / INSERT ... ON CONFLICT), the same scoping
 // migrate-01's own TABLE_RE/VIEW_RE regex scan uses.
 
@@ -299,6 +306,7 @@ const TYPE_NORMALIZE = {
   NUMERIC: 'numeric',
   BIGINT: 'bigint',
   INTEGER: 'integer',
+  INT: 'integer',
   BOOLEAN: 'boolean',
   JSONB: 'jsonb',
 };
@@ -306,6 +314,26 @@ const TYPE_NORMALIZE = {
 function normalizeType(typeToken) {
   if (!typeToken) return null;
   return TYPE_NORMALIZE[typeToken.toUpperCase()] || null;
+}
+
+/**
+ * Parse a column's declared-type token PLUS whether it carries a trailing
+ * `[]` array suffix (e.g. `TEXT[]`) — migrate-12-feature-usage.sql's
+ * session_ids TEXT[] is the first array-typed column any addendum-family
+ * SQL file has declared. An array-suffixed column's live
+ * information_schema.columns.data_type is the literal string 'ARRAY'
+ * (Postgres's own reporting convention — the element type is NOT reported
+ * in `data_type` at all, only in `udt_name`), never the element type's own
+ * normalized name — so this is captured as a separate `isArray` flag rather
+ * than folded into `typeToken`, and verifyAddenda's column-type check below
+ * branches on it explicitly instead of trying to teach normalizeType() a
+ * pseudo-type that would collide with a genuinely-scalar column of the same
+ * base type name.
+ */
+function parseTypeToken(rest) {
+  const m = /^([A-Za-z_]+)(\([^)]*\))?(\s*\[\s*\])?/.exec(rest.trim());
+  if (!m) return { typeToken: null, isArray: false };
+  return { typeToken: m[1].toUpperCase(), isArray: Boolean(m[3]) };
 }
 
 // ─── INDEX-STATEMENT GRAMMAR + IDENTIFIER NORMALIZATION (cm#208 S-1/S-4) ────
@@ -396,12 +424,12 @@ class DerivationError extends Error {
 }
 
 // ─── DERIVED SCHEMA-ADDENDA OBJECT SET (A-1/A-2/A-3/A-5 — never a
-// hand-maintained list; derived from the six SQL files' own text at verify
+// hand-maintained list; derived from the seven SQL files' own text at verify
 // time, mirroring migrate-01's D-4 rule and deriveExpectedObjects style) ────
 
 /**
  * Derive every column (+ declared type token), CHECK constraint, index, and
- * UNIQUE constraint the six addendum SQL files declare — from BOTH
+ * UNIQUE constraint the seven addendum SQL files declare — from BOTH
  * `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` statements AND the column lists
  * inside `CREATE TABLE IF NOT EXISTS` bodies (A-1). Table names themselves
  * are derived via migrate-01's own exported deriveExpectedObjects (reused,
@@ -450,9 +478,8 @@ function deriveSchemaAddenda(sqlFiles) {
           if (!colMatch) continue;
           const colName = colMatch[1].toLowerCase();
           const rest = colMatch[2];
-          const typeMatch = /^([A-Za-z_]+)(\([^)]*\))?/.exec(rest.trim());
-          const typeToken = typeMatch ? typeMatch[1].toUpperCase() : null;
-          columns.push({ table, column: colName, typeToken, source: 'CREATE TABLE' });
+          const { typeToken, isArray } = parseTypeToken(rest);
+          columns.push({ table, column: colName, typeToken, isArray, source: 'CREATE TABLE' });
           if (/\bUNIQUE\b/i.test(rest)) {
             uniques.push({ table, columns: [colName] });
           }
@@ -469,9 +496,8 @@ function deriveSchemaAddenda(sqlFiles) {
         const table = m[1].toLowerCase();
         const colName = m[2].toLowerCase();
         const rest = m[3];
-        const typeMatch = /^([A-Za-z_]+)(\([^)]*\))?/.exec(rest.trim());
-        const typeToken = typeMatch ? typeMatch[1].toUpperCase() : null;
-        columns.push({ table, column: colName, typeToken, source: 'ALTER' });
+        const { typeToken, isArray } = parseTypeToken(rest);
+        columns.push({ table, column: colName, typeToken, isArray, source: 'ALTER' });
         const checkInner = extractCheckClause(rest);
         if (checkInner) {
           checks.push({ table, column: colName, literals: extractQuotedLiterals(checkInner) });
@@ -623,7 +649,7 @@ async function verifySeedRow(client, seed) {
  * gap — the same seam migrate-01's verifyTarget establishes.
  *
  * @param {import('pg').Client} client — connected to the target database
- * @param {string[]} sqlFiles — absolute paths to the six addendum files
+ * @param {string[]} sqlFiles — absolute paths to the seven addendum files
  */
 async function verifyAddenda(client, sqlFiles) {
   const derived = deriveSchemaAddenda(sqlFiles);
@@ -650,7 +676,13 @@ async function verifyAddenda(client, sqlFiles) {
       missingColumns.push(col);
       continue;
     }
-    const expectedType = normalizeType(col.typeToken);
+    // A `[]` array-suffixed declared type (e.g. TEXT[]) reports as the
+    // literal string 'ARRAY' in information_schema.columns.data_type —
+    // Postgres never reports the element type there for an array column —
+    // so an array column's expected type is the fixed sentinel 'ARRAY',
+    // never normalizeType(col.typeToken) (which would resolve to the
+    // element type's own scalar name, e.g. 'text', and always mismatch).
+    const expectedType = col.isArray ? 'ARRAY' : normalizeType(col.typeToken);
     if (expectedType && rows[0].data_type !== expectedType) {
       wrongTypeColumns.push({ ...col, expectedType, actualType: rows[0].data_type });
     }
@@ -881,7 +913,7 @@ async function main() {
       return;
     }
 
-    // ── Apply the six SQL files, in explicit order ──────────────────────────
+    // ── Apply the seven SQL files, in explicit order ────────────────────────
 
     const fileResults = [];
     for (const file of SQL_FILES) {
@@ -951,6 +983,7 @@ module.exports = {
   verifySeedRow,
   TYPE_NORMALIZE,
   normalizeType,
+  parseTypeToken,
   normalizeIdent,
   DerivationError,
   INDEX_STMT_RE,

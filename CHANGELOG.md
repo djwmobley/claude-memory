@@ -59,6 +59,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **§18.3 `feature_usage` table + `migrate-12-feature-usage.js` backfill**
+  (owner decision item F, 2026-09-06) — a per-feature/per-PR token+cost
+  provenance table (`scripts/migrations/sql/migrate-12-feature-usage.sql`,
+  applied by `migrate-schema-addenda.js`), distinct from `turn_usage`'s
+  per-turn grain: one row per feature/PR-shaped unit of work, keyed by
+  `(project_id, source_db, source_feature_token_usage_id)`, carrying a
+  `model_breakdown` JSONB and a `session_ids` `TEXT[]`. The one-time data
+  migration (`migrate-12-feature-usage.js`) backfills from
+  `pipeline_pipeline.feature_token_usage`: defaults to a dry-run (nothing
+  written unless `--write`), an optional `--project-map` file for
+  longest-prefix branch-to-project routing (see
+  `feature-usage-project-map.example.json`), a bidirectional column-shape
+  precondition against the live source table, per-row verdicts
+  (`insert`/`update-identical`/`refuse-conflict`/`unmapped-branch-<raw>`)
+  never a whole-run failure on one row's conflict, `--allow-update-on-
+  conflict`, and `--rollback <report.json>` scoped strictly to the pairs a
+  prior run actually wrote (never by `project_id`). `usage_query`
+  (`scripts/lib/usage-telemetry.js`, and the MCP tool of the same name)
+  gains a `granularity` parameter (`turn` default / `feature`) reading this
+  new table with its own `groupBy` total classification
+  (`branch`/`pr`/`model`/`day`); `sessionId` given together with
+  `granularity: "feature"` hard-errors before any query runs.
+  `migrate-schema-addenda.js`'s `deriveSchemaAddenda` also gained two small
+  fixes surfaced while authoring this: `INT` added to `TYPE_NORMALIZE`, and
+  a `[]` array-type suffix (e.g. `TEXT[]`) is now recognized and checked
+  against the live `information_schema.columns.data_type` sentinel
+  `'ARRAY'` rather than the element type's own scalar name.
+
 - **cm#185 schema bring-forward** — generalizes the handoff engine's schema
   auto-apply from a hardcoded two-file set to a total classification of every
   `scripts/sql/*.sql` file, driven by a tracked manifest

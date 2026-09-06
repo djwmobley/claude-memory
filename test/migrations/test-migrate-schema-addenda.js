@@ -3,10 +3,10 @@
 /**
  * test-migrate-schema-addenda.js — Test harness for
  * scripts/migrations/migrate-schema-addenda.js, the schema-only-addenda
- * runner that applies six net-new SQL pieces (attribution columns,
+ * runner that applies seven net-new SQL pieces (attribution columns,
  * carryover_status, model_registry, embedding_providers, the routing
- * harness tables, and the usage-telemetry tables) on top of a
- * migrate-01-canonical-db.js target.
+ * harness tables, the usage-telemetry tables, and (§18.3) the feature_usage
+ * table) on top of a migrate-01-canonical-db.js target.
  *
  * Mirrors test-migrate-01.js's conventions exactly: self-contained scratch
  * databases (all named to satisfy the runner's own classifyTarget — reused
@@ -189,7 +189,7 @@ async function testFreshApply() {
   try {
     const v = await addenda.verifyAddenda(client, addenda.SQL_FILES);
     const ok = v.pass &&
-      v.expectedTables.length === 6 &&
+      v.expectedTables.length === 7 &&
       v.missingColumns.length === 0 &&
       v.wrongTypeColumns.length === 0 &&
       v.missingChecks.length === 0 &&
@@ -412,18 +412,18 @@ function testSqlTextInvariants() {
 
   // No INSERT INTO model_registry anywhere.
   if (!/INSERT\s+INTO\s+model_registry/i.test(combined)) {
-    pass('T6a', 'no INSERT INTO model_registry in any of the six files (no-seed invariant)');
+    pass('T6a', 'no INSERT INTO model_registry in any of the seven files (no-seed invariant)');
   } else {
-    fail('T6a', 'no INSERT INTO model_registry in any of the six files (no-seed invariant)', 'found a match');
+    fail('T6a', 'no INSERT INTO model_registry in any of the seven files (no-seed invariant)', 'found a match');
   }
 
   // The only INSERT anywhere is embedding_providers' seed.
   const insertMatches = combined.match(/INSERT\s+INTO\s+"?([a-zA-Z_][a-zA-Z0-9_]*)"?/gi) || [];
   const insertTables = insertMatches.map((m) => /INSERT\s+INTO\s+"?([a-zA-Z_][a-zA-Z0-9_]*)"?/i.exec(m)[1].toLowerCase());
   if (insertTables.length === 1 && insertTables[0] === 'embedding_providers') {
-    pass('T6b', 'the only INSERT anywhere across the six files targets embedding_providers');
+    pass('T6b', 'the only INSERT anywhere across the seven files targets embedding_providers');
   } else {
-    fail('T6b', 'the only INSERT anywhere across the six files targets embedding_providers', JSON.stringify(insertTables));
+    fail('T6b', 'the only INSERT anywhere across the seven files targets embedding_providers', JSON.stringify(insertTables));
   }
 
   // Every CREATE TABLE uses IF NOT EXISTS.
@@ -442,11 +442,11 @@ function testSqlTextInvariants() {
     fail('T6d', 'every ADD COLUMN uses IF NOT EXISTS', 'found an ADD COLUMN without IF NOT EXISTS');
   }
 
-  // No DROP statement appears in any of the six files.
+  // No DROP statement appears in any of the seven files.
   if (!/\bDROP\b/i.test(combined)) {
-    pass('T6e', 'no DROP statement appears in any of the six files');
+    pass('T6e', 'no DROP statement appears in any of the seven files');
   } else {
-    fail('T6e', 'no DROP statement appears in any of the six files', 'found a DROP token');
+    fail('T6e', 'no DROP statement appears in any of the seven files', 'found a DROP token');
   }
 
   // No ALTER statement adds a CHECK to a pre-existing column — every
@@ -582,6 +582,47 @@ CREATE INDEX IF NOT EXISTS synth_trgm_idx ON synth_table USING gin(tier gin_trgm
     fs.unlinkSync(tmpFile);
   }
 
+  // §18.3 fix 1: INT added to TYPE_NORMALIZE (bare "INT" as a type token
+  // must normalize the same as "INTEGER").
+  if (addenda.normalizeType('INT') === 'integer' && addenda.normalizeType('int') === 'integer') {
+    pass('T7r', 'TYPE_NORMALIZE: bare INT normalizes to "integer" (case-insensitive)');
+  } else {
+    fail('T7r', 'TYPE_NORMALIZE: bare INT normalizes to "integer"', `normalizeType('INT')=${JSON.stringify(addenda.normalizeType('INT'))}`);
+  }
+
+  // §18.3 fix 2: a `[]` array-type suffix (e.g. TEXT[], migrate-12-feature-
+  // usage.sql's session_ids) is captured as a separate isArray flag by
+  // parseTypeToken/deriveSchemaAddenda -- verifyAddenda's expected type for
+  // such a column is the fixed sentinel 'ARRAY' (Postgres's own
+  // information_schema.columns.data_type reporting for any array column),
+  // never normalizeType() of the element type.
+  const arrayFile = path.join(os.tmpdir(), `msa-derive-array-${TS}.sql`);
+  fs.writeFileSync(arrayFile, `
+CREATE TABLE IF NOT EXISTS synth_array_table (
+  id SERIAL PRIMARY KEY,
+  tags TEXT[]
+);
+ALTER TABLE synth_array_table ADD COLUMN IF NOT EXISTS more_tags TEXT [];
+`, 'utf8');
+  try {
+    const dArr = addenda.deriveSchemaAddenda([arrayFile]);
+    const tagsCol = dArr.columns.find((c) => c.table === 'synth_array_table' && c.column === 'tags');
+    const moreTagsCol = dArr.columns.find((c) => c.table === 'synth_array_table' && c.column === 'more_tags');
+    const idCol2 = dArr.columns.find((c) => c.table === 'synth_array_table' && c.column === 'id');
+    const parsed = addenda.parseTypeToken('TEXT[]');
+    const ok = tagsCol && tagsCol.isArray === true && tagsCol.typeToken === 'TEXT' &&
+      moreTagsCol && moreTagsCol.isArray === true && // ALTER form, with a space before "[]"
+      idCol2 && idCol2.isArray === false &&           // a non-array column must never be flagged isArray
+      parsed.typeToken === 'TEXT' && parsed.isArray === true;
+    if (ok) {
+      pass('T7s', 'derivation: `[]` array-type suffix captured as isArray:true (CREATE TABLE and ALTER forms), non-array columns unaffected (§18.3)');
+    } else {
+      fail('T7s', 'derivation: `[]` array-type suffix captured as isArray:true', JSON.stringify({ tagsCol, moreTagsCol, idCol2, parsed }));
+    }
+  } finally {
+    fs.unlinkSync(arrayFile);
+  }
+
   // cm#208 S-5 negative (loud) cases: each shape below is CREATE-INDEX-shaped
   // but NOT recognized by the grammar, so deriveSchemaAddenda must throw a
   // DerivationError naming the tempfile and the offending statement -- never
@@ -641,17 +682,20 @@ CREATE INDEX IF NOT EXISTS synth_trgm_idx ON synth_table USING gin(tier gin_trgm
   // Exact expected sets for the shipped files (computed once, pinned here).
   const shipped = addenda.deriveSchemaAddenda(addenda.SQL_FILES);
   const shippedTables = [...migrateOne.deriveExpectedObjects(addenda.SQL_FILES).tables].sort();
-  const expectedShippedTables = ['embedding_providers', 'model_registry', 'routing_profiles', 'routing_session_overrides', 'session_usage', 'turn_usage'];
+  // §18.3: migrate-12-feature-usage.sql added a 7th file (feature_usage) --
+  // adds 1 table, 23 columns, 0 CHECKs, 4 indexes (project/branch/pr/GIN
+  // session_ids), 1 table-level UNIQUE, 0 seeds.
+  const expectedShippedTables = ['embedding_providers', 'feature_usage', 'model_registry', 'routing_profiles', 'routing_session_overrides', 'session_usage', 'turn_usage'];
   const tablesOk = JSON.stringify(shippedTables) === JSON.stringify(expectedShippedTables);
-  const countsOk = shipped.columns.length === 82 &&
+  const countsOk = shipped.columns.length === 105 &&
     shipped.checks.length === 5 &&
-    shipped.indexes.length === 6 &&
-    shipped.uniques.length === 6 &&
+    shipped.indexes.length === 10 &&
+    shipped.uniques.length === 7 &&
     shipped.seeds.length === 1;
   if (tablesOk && countsOk) {
-    pass('T7g', 'derivation yields exactly the expected sets for the shipped six files (6 tables, 82 columns, 5 CHECKs, 6 indexes, 6 UNIQUEs, 1 seed)');
+    pass('T7g', 'derivation yields exactly the expected sets for the shipped seven files (7 tables, 105 columns, 5 CHECKs, 10 indexes, 7 UNIQUEs, 1 seed)');
   } else {
-    fail('T7g', 'derivation yields exactly the expected sets for the shipped six files', `tables=${JSON.stringify(shippedTables)} columns=${shipped.columns.length} checks=${shipped.checks.length} indexes=${shipped.indexes.length} uniques=${shipped.uniques.length} seeds=${shipped.seeds.length}`);
+    fail('T7g', 'derivation yields exactly the expected sets for the shipped seven files', `tables=${JSON.stringify(shippedTables)} columns=${shipped.columns.length} checks=${shipped.checks.length} indexes=${shipped.indexes.length} uniques=${shipped.uniques.length} seeds=${shipped.seeds.length}`);
   }
 
   // cm#208 F-7 repin: the pinned COUNT alone is flag-blind (an author could
@@ -670,13 +714,18 @@ CREATE INDEX IF NOT EXISTS synth_trgm_idx ON synth_table USING gin(tier gin_trgm
     hasWhere: true,
     unique: true,
   };
+  // uniques.length is 7, not 6, as of §18.3's feature_usage table-level
+  // UNIQUE(project_id, source_db, source_feature_token_usage_id) -- this
+  // repin still guards the ORIGINAL cm#208 F-5 misrouting concern (exactly
+  // one unique-flagged INDEX, deep-equal to the exact pinned tuple) plus
+  // the new count.
   const providerIdxOk = uniqueFlaggedIndexes.length === 1 &&
     JSON.stringify(uniqueFlaggedIndexes[0]) === JSON.stringify(expectedProviderIdx) &&
-    shipped.uniques.length === 6;
+    shipped.uniques.length === 7;
   if (providerIdxOk) {
-    pass('T7q', 'cm#208 F-7 repin: exactly one derived index has unique===true, deep-equal to the exact embedding_providers_is_default_unique_idx tuple, uniques.length unchanged at 6 (F-5 misrouting guard)');
+    pass('T7q', 'cm#208 F-7 repin: exactly one derived index has unique===true, deep-equal to the exact embedding_providers_is_default_unique_idx tuple, uniques.length unchanged at 7 post-§18.3 (F-5 misrouting guard)');
   } else {
-    fail('T7q', 'cm#208 F-7 repin: exactly one derived index has unique===true, deep-equal to the exact embedding_providers_is_default_unique_idx tuple, uniques.length unchanged at 6 (F-5 misrouting guard)', `uniqueFlaggedIndexes=${JSON.stringify(uniqueFlaggedIndexes)} uniques.length=${shipped.uniques.length}`);
+    fail('T7q', 'cm#208 F-7 repin: exactly one derived index has unique===true, deep-equal to the exact embedding_providers_is_default_unique_idx tuple, uniques.length unchanged at 7 post-§18.3 (F-5 misrouting guard)', `uniqueFlaggedIndexes=${JSON.stringify(uniqueFlaggedIndexes)} uniques.length=${shipped.uniques.length}`);
   }
 }
 

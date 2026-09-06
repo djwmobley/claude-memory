@@ -186,12 +186,13 @@ jobs:
           SOURCE_TABLE_ROSTER: scripts/migrations/source-table-roster.example.json
       - name: Run migrate-schema-addenda tests
         # Tests scripts/migrations/migrate-schema-addenda.js, the schema-only
-        # addenda runner that applies six net-new SQL pieces on top of a
+        # addenda runner that applies seven net-new SQL pieces on top of a
         # migrate-01-canonical-db.js target: attribution columns
         # (source_model/agent_id on entities/assertions/edges),
         # carryover_status, model_registry, embedding_providers (+ its
-        # vllm-local seed row), the routing-harness tables, and the
-        # usage-telemetry tables. No data migration.
+        # vllm-local seed row), the routing-harness tables, the
+        # usage-telemetry tables, and (§18.3) the feature_usage table. No
+        # data migration.
         # Covers: prerequisite-table refusal on an empty (but existing)
         # target vs. a target that was never created at all (two distinct
         # code paths), fresh apply + full derived verification (tables,
@@ -282,12 +283,13 @@ jobs:
       - name: Run usage-telemetry + verify-18 usage smoke tests
         # Tests scripts/lib/usage-telemetry.js (usageRecord/sessionUsageRollup/
         # usageQuery) and scripts/migrations/verify-18-usage-smoke.js, the §18
-        # usage-telemetry smoke test (9 checks: record-after-resolve composing
-        # with route-resolve.js, record-without-resolve, server-side cost both
-        # ways, update-not-duplicate, session-scoped query across model/role/day,
-        # rollup + project-scoped query including the staleness contract, input
-        # validation + total classification, the all-NULL-cost group, and the
-        # cost-range guard). Also covers the shared transaction+rollback/
+        # usage-telemetry smoke test (10 checks, cm#18.3: was 9 -- record-after-
+        # resolve composing with route-resolve.js, record-without-resolve,
+        # server-side cost both ways, update-not-duplicate, session-scoped
+        # query across model/role/day, rollup + project-scoped query including
+        # the staleness contract, input validation + total classification, the
+        # all-NULL-cost group, the cost-range guard, and the new §18.3
+        # feature-grain query against feature_usage). Also covers the shared transaction+rollback/
         # run-prefix/residue-scan harness extracted into
         # scripts/migrations/lib/smoke-harness.js and reused by
         # verify-17-routing-smoke.js (test-verify-17.js passes unmodified against
@@ -300,7 +302,7 @@ jobs:
         # lifecycle inside one transaction that is always rolled back -- safe
         # to run against a live staging database; turn_usage/session_usage are
         # never wiped, only prefix-residue-scanned.
-        # Covers: fresh apply -> exit 0 + all 9 checks PASS; session_usage
+        # Covers: fresh apply -> exit 0 + all 10 checks PASS; session_usage
         # dropped -> prerequisite refusal naming migrate-schema-addenda.js;
         # refused target names; direct lib unit tests for the universal
         # field-preservation matrix, the costUsd three-state machine, every
@@ -309,13 +311,47 @@ jobs:
         # the reserved "(none)" sentinel defense on both write and read paths,
         # rollup NULL-SUM semantics, the zero-turn rollup, "(none)" grouping
         # keys, project-scope staleness, groupBy total classification, pure
-        # coercion cases, a genuine concurrent rollup, and the cost-range
+        # coercion cases, a genuine concurrent rollup, the cost-range
         # guard (caller-supplied path, server-computed path -- including the
         # originally-reported near-MAX_SAFE_INTEGER-tokens repro -- and the
-        # rollup aggregate path).
+        # rollup aggregate path), and (§18.3) usageQuery's new
+        # granularity="feature" grouping by branch/pr/model/day including a
+        # UTC day-boundary fixture and the sessionId+feature hard error.
         # Creates/drops its own _staging-suffixed scratch DBs; never touches
         # claude_memory_eval_test beyond the connection-avoidance assertion.
         run: node test/migrations/test-verify-18.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: Run feature-usage migration tests (§18.3 owner decision item F, 2026-09-06)
+        # Tests scripts/migrations/migrate-12-feature-usage.js -- the one-time
+        # data migration from pipeline_pipeline.feature_token_usage into the
+        # feature_usage table (migrate-schema-addenda.js's 7th SQL file,
+        # scripts/migrations/sql/migrate-12-feature-usage.sql).
+        # Covers: pure unit tests for resolveProjectId (longest-prefix-wins,
+        # ties broken by array order, map-level default applying ONLY on
+        # zero-prefix-match, unmapped-branch-<raw> with a possible-trim-
+        # collision hint, --project-id as the whole-run default when
+        # --project-map is omitted), loadProjectMap (duplicate-prefix and
+        # malformed-entry refusal at load time), arraysEqualOrdered/
+        # deepEqualJsonb/modelBreakdownMatches, and compareRow (notes-only
+        # difference is a conflict, NULL/0/'{}' kept distinct, JSONB
+        # key-order-insensitive); DB-backed end-to-end: a 1:1 fresh migration
+        # proving a BIGINT above 2^53 survives exactly as the driver's own
+        # string (never Number()), an idempotent re-run yielding
+        # update-identical with zero duplication, the default (no --write)
+        # dry-run writing zero rows and --dry-run/--write mutual exclusion,
+        # refuse-conflict vs. --allow-update-on-conflict, the unmapped bucket
+        # when a project-map has no default, the bidirectional column-shape
+        # precondition's four refusal branches (missing column, unknown live
+        # column, declared-type mismatch, target feature_usage table absent),
+        # and --rollback deleting ONLY the given report's (source_db,
+        # source_feature_token_usage_id) pairs -- proven against two source
+        # databases with colliding row ids, never scoped by project_id.
+        # Creates/drops its own _staging-suffixed scratch DBs; never touches
+        # claude_memory_eval_test/pipeline_pipeline.
+        run: node test/migrations/test-migrate-12-feature-usage.js
         env:
           PGHOST: localhost
           PGUSER: postgres
@@ -335,7 +371,7 @@ jobs:
         # verifyAddenda, called with this migration's own SQL file list —
         # verifyAddenda/deriveSchemaAddenda are a SHARED derivation/
         # verification layer (cm#208), not private to migrate-schema-
-        # addenda.js's own six files; this file's DO-block-wrapped
+        # addenda.js's own seven files; this file's DO-block-wrapped
         # agent_exchange_embedding_idx (graceful pgvector-absent degradation)
         # stays out of that shared derivation layer's reach by documented
         # design (cm#208 F-3) — a fragment beginning "DO $$ BEGIN" is never

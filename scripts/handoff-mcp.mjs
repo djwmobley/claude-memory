@@ -780,10 +780,10 @@ async function toolUsageRecord(args) {
   }
 }
 
-async function toolUsageQuery({ projectRoot, sessionId, groupBy }) {
+async function toolUsageQuery({ projectRoot, sessionId, groupBy, granularity }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const rows = await usageTelemetryLib.usageQuery(db, { projectId, sessionId, groupBy });
+      const rows = await usageTelemetryLib.usageQuery(db, { projectId, sessionId, groupBy, granularity });
       return textResult({ rows });
     });
   } catch (err) {
@@ -1618,15 +1618,21 @@ function buildServer() {
   server.registerTool(
     'usage_query',
     {
-      title: 'Roll up token/cost usage by model, role, provider, or day',
+      title: 'Roll up token/cost usage by model, role, provider, day, branch, or PR',
       description:
-        'sessionId given: aggregates turn_usage directly, any groupBy. sessionId omitted: aggregates ' +
-        'session_usage ROLLUPS only (staleness-by-design — a session whose rollup has not been recomputed is ' +
-        'invisible), groupBy must be "model".',
+        'granularity="turn" (default): sessionId given aggregates turn_usage directly, any of ' +
+        `${JSON.stringify(usageTelemetryLib.VALID_GROUP_BY)}; sessionId omitted aggregates session_usage ` +
+        'ROLLUPS only (staleness-by-design — a session whose rollup has not been recomputed is invisible), ' +
+        'groupBy must be "model". granularity="feature" (§18.3): reads feature_usage (per-feature/per-PR ' +
+        `provenance), project-scoped only, groupBy one of ${JSON.stringify(usageTelemetryLib.VALID_FEATURE_GROUP_BY)} ` +
+        '— sessionId given together with granularity="feature" is a hard error before any query runs.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
-        sessionId: z.string().optional(),
-        groupBy: z.enum(usageTelemetryLib.VALID_GROUP_BY).optional().describe('Default "model".'),
+        sessionId: z.string().optional().describe('Not supported with granularity="feature".'),
+        granularity: z.enum(usageTelemetryLib.VALID_GRANULARITY).optional().describe('Default "turn".'),
+        groupBy: z.enum([...new Set([...usageTelemetryLib.VALID_GROUP_BY, ...usageTelemetryLib.VALID_FEATURE_GROUP_BY])])
+          .optional()
+          .describe('Default "model". Valid values depend on granularity — see description.'),
       },
     },
     async (args) => toolUsageQuery(args)
