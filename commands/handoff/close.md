@@ -195,7 +195,20 @@ paraphrase) that is now done. Optional payload key: `resolved_threads`.
 **cm#233 classification (never silent).** Each entry is normalized via
 `intentKey` (Unicode-NFC, whitespace-collapsed, 1000-byte-capped — see
 `scripts/lib/intent-key.js`) and classified against the project's live
-`open_thread` rows, both in `--dry-run` and a real close:
+`open_thread` rows, both in `--dry-run` and a real close.
+
+**`KEY: description` authoring convention.** If the normalized text
+contains a `:` at index <60 with a SPACE immediately after it (and
+non-empty text before it), the key is just the text before that colon —
+this is how a session supersedes its own earlier thread by key even when
+the description changes completely (e.g. `SHIP-DECISION: ship this
+cycle` later restated as `SHIP-DECISION: defer to next cycle` — same key,
+new row supersedes the old). A colon with no space after it (a URL's
+`https://...` scheme colon, for example) never matches this rule, so a
+URL-led thread keys on its full text instead of colliding every URL-led
+thread onto the literal key `https`.
+
+
 
 - **MATCHED-AND-RESOLVED** — a live `open_thread` row's key matches. That row
   is auto-retired (suppressed, `suppression_kind='superseded'`) BEFORE the

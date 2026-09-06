@@ -2374,8 +2374,17 @@ async function runIntentKeyMigrationIfNeeded(db, projectId, { silent } = {}) {
     // migrate-17-intent-key.js's migrateIntentKeys header comment for the
     // full rationale.
     const { migrateIntentKeys } = require('./migrations/migrate-17-intent-key.js');
+    // cm#233 fix-round: silent:true UNCONDITIONALLY — this auto-run gate
+    // NEVER emits migrate-17's own console.log plan output (that was
+    // polluting stdout on every project's first post-upgrade touch,
+    // breaking scripts/smoketest-handoff.js's C2/C5 exact-stdout checks).
+    // The one summary line below (gated on the OUTER `silent` — the same
+    // flag ensureSchemaCurrent's other apply-time messages respect) is the
+    // ONLY output this gate ever produces, and it goes to stderr, never
+    // stdout.
     const result = await migrateIntentKeys(db, projectId, {
       dryRun: false,
+      silent: true,
       getSetting,
       writeAssertionWithSupersession,
     });

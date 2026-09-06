@@ -108,8 +108,11 @@ async function main() {
     // ── T1: --dry-run (default) — no mutation ────────────────────────────
     await run('T1', '--dry-run (default): plan computed, zero mutation', async () => {
       const pid = freshPid('t1');
-      const oldSubject = 'OLD-STYLE-SUBJECT'; // deliberately NOT equal to intentKey(object)
-      const objectText = 'OLD-STYLE-SUBJECT: finish the thing\nwith a newline';
+      // NO colon anywhere -- exercises the actual cm#233 regression (the old
+      // 80-char-truncation-style subject vs. the new whitespace-collapsed
+      // full-text key), not the (now correctly preserved) colon-key path.
+      const oldSubject = 'OLD-STYLE-80-CHAR-TRUNCATED-SUBJECT-FROM-BEFORE-THIS-MIGRATION-EVER-RAN-XY';
+      const objectText = 'finish the thing\nwith a newline that the old truncation style never normalized';
       await insertOpenThread(db, pid, { subject: oldSubject, object: objectText });
 
       const result = await migrateIntentKeys(db, pid, { dryRun: true });
@@ -127,8 +130,10 @@ async function main() {
     let t2Pid;
     await run('T2', '--write (no collision): old row superseded by id, one successor inserted with subject=intentKey(object)', async () => {
       t2Pid = freshPid('t2');
-      const oldSubject = 'LEGACY-SUBJECT';
-      const objectText = 'LEGACY-SUBJECT: finish   the   thing'; // extra interior whitespace — intentKey collapses it
+      // NO colon -- see T1's comment for why the fixture avoids the (now
+      // correctly preserved) colon-key path.
+      const oldSubject = 'LEGACY-80-CHAR-TRUNCATED-SUBJECT-NO-COLON-HERE-JUST-A-LONG-OLD-STYLE-KEY-ZZ';
+      const objectText = 'finish   the   thing'; // extra interior whitespace — intentKey collapses it
       const oldId = await insertOpenThread(db, t2Pid, { subject: oldSubject, object: objectText });
 
       const result = await migrateIntentKeys(db, t2Pid, { dryRun: false });
@@ -199,6 +204,39 @@ async function main() {
       assertFalseVal(successor.suppressed, 'T4: successor row must be live');
       // Winner is the row with the LATEST last_reinforced (idNewer, object "ship   the   migration").
       assertEqual(successor.object, 'ship   the   migration', 'T4: successor object must come from the winner (latest last_reinforced)');
+    });
+
+    // ── T5: silent:true suppresses ALL console.log, even when rows change ──
+    await run('T5', 'silent:true suppresses ALL stdout, even with a non-empty plan (fix-round stdout-pollution finding)', async () => {
+      const pid = freshPid('t5');
+      await insertOpenThread(db, pid, { subject: 'OLD-NO-COLON-XYZ', object: 'a fresh unkeyed thread with no colon at all' });
+      const origLog = console.log;
+      const captured = [];
+      console.log = (...args) => { captured.push(args.join(' ')); };
+      let result;
+      try {
+        result = await migrateIntentKeys(db, pid, { dryRun: false, silent: true });
+      } finally {
+        console.log = origLog;
+      }
+      assertEqual(captured.length, 0, `T5: silent:true must produce ZERO console.log calls, got ${captured.length}: ${JSON.stringify(captured)}`);
+      assertEqual(result.changed, 1, 'T5: the migration still actually ran (silent only affects stdout, not behavior)');
+    });
+
+    // ── T6: a zero-change plan collapses to ONE summary line even when NOT silent ──
+    await run('T6', 'non-silent CLI mode: a zero-change plan prints exactly ONE summary line, never the full per-row report', async () => {
+      const pid = freshPid('t6');
+      // No rows at all for this project -- guaranteed zero-change plan.
+      const origLog = console.log;
+      const captured = [];
+      console.log = (...args) => { captured.push(args.join(' ')); };
+      try {
+        await migrateIntentKeys(db, pid, { dryRun: true }); // silent NOT passed (default false)
+      } finally {
+        console.log = origLog;
+      }
+      assertEqual(captured.length, 1, `T6: expected exactly one summary line, got ${captured.length}: ${JSON.stringify(captured)}`);
+      assert(captured[0].includes('0 need rekeying'), `T6: summary line must say "0 need rekeying", got: ${captured[0]}`);
     });
 
   } finally {

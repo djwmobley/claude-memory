@@ -29,6 +29,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   highest id); `SCHEMA_EPOCH` bumped 3→4 so `ensureSchemaCurrent` runs it
   automatically on the next touch of every live project DB (cutover
   atomicity — no DB is left in a mixed old/new-subject state).
+  **Fix-round (independent review REQUEST CHANGES, addressed same PR):**
+  (1) the auto-run gate was printing migrate-17's full per-row plan to
+  STDOUT on every touch, breaking `scripts/smoketest-handoff.js`'s C2/C5
+  exact-output checks — the gate now always runs `silent`, and even
+  non-silent CLI mode collapses a zero-change plan to one summary line.
+  (2) `intentKey` had dropped the `KEY: description` colon-split
+  convention entirely, breaking `test/north-star/test-provenance.js`'s
+  P2/P3 pin (a session restating `KEY: <new text>` must supersede
+  `KEY: <old text>` by key) — restored as a total rule: a colon at
+  index <60 followed by a SPACE keys on the prefix (a URL's
+  `https://...` scheme colon never matches, since nothing follows it
+  with a space). (3) long strings sharing a >=996-byte common prefix
+  collided onto the same truncated key — truncation now appends
+  ` …#<8-hex sha256 of the full text>` so differing tails always produce
+  different keys.
 
 - **cm#222: migrate-08 handoff-markdown parser hardening** — a real-file
   dry run (H-13's own stated acceptance gate) against a live project's

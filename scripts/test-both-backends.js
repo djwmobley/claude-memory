@@ -5434,16 +5434,16 @@ async function runS20() {
     async (db) => {
       const pid = freshPid('s20-i1');
       const { suppFalse } = dialectHelpers(db);
-      // cm#233: intentKey preserves the colon (no colon-split, unlike the
-      // removed deriveIntentSubject) — the stored subject and the derived
-      // key are both the full, whitespace-collapsed text.
+      // cm#233 fix-round: the `KEY: description` colon convention is
+      // intentionally RESTORED (test-provenance.js P2/P3 pin it) — a colon
+      // at index<60 followed by a space keys on the prefix alone.
       await db.query(
         `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
-         VALUES ($1,'MY-THREAD: do the thing','open_thread','do the thing',7,'user_stated',${suppFalse})`,
+         VALUES ($1,'MY-THREAD','open_thread','do the thing',7,'user_stated',${suppFalse})`,
         [pid]
       );
       const subject = _deriveIntentSubject('MY-THREAD: do the thing');
-      assertEqual(subject, 'MY-THREAD: do the thing', 'S20-I1: intentKey should preserve the colon, no split');
+      assertEqual(subject, 'MY-THREAD', 'S20-I1: intentKey should key on the prefix before "KEY: "');
       const n = await _autoRetire(db, pid, subject);
       assertTrue(n >= 1, `S20-I1: expected at least 1 row suppressed, got ${n}`);
       const { rows } = await db.query(

@@ -160,12 +160,40 @@ async function planIntentKeyMigration(db, projectId) {
 
 /**
  * Print the plan (dry-run or pre-write report — same format either way).
- * @returns {string[]} lines printed, for test assertions.
+ *
+ * cm#233 fix-round finding: the auto-run gate (runIntentKeyMigrationIfNeeded,
+ * wired into ensureSchemaCurrent) was calling this unconditionally, so a
+ * real close/checkpoint/resume printed the FULL per-row plan to STDOUT on
+ * every project's first post-upgrade touch — polluting exact-stdout
+ * consumers like scripts/smoketest-handoff.js's C2/C5 checks.
+ *
+ * @param {object} plan
+ * @param {{dryRun: boolean, silent?: boolean}} opts
+ *   silent=true: NO console.log at all (the auto-run path always passes
+ *   this — it decides its own, separate one-line stderr summary). This
+ *   mirrors how PR #225's decisions schema bring-forward silences its own
+ *   apply-time logging via the SAME { silent } convention ensureSchema-
+ *   Current itself already uses everywhere else in this file.
+ *   silent=false (CLI default): a zero-change plan prints EXACTLY ONE
+ *   summary line, never the full per-row report — only a non-empty plan
+ *   gets the full breakdown.
+ * @returns {string[]} lines that WOULD be/were printed, for test assertions
+ *   (populated even when silent=true, so callers/tests can still inspect
+ *   the plan's rendering without stdout noise).
  */
-function printPlan(plan, { dryRun }) {
+function printPlan(plan, { dryRun, silent } = {}) {
   const verb = dryRun ? 'would' : 'will';
   const lines = [];
-  const log = (l) => { console.log(l); lines.push(l); };
+  const log = (l) => {
+    lines.push(l);
+    if (!silent) console.log(l);
+  };
+
+  const changeCount = plan.singles.length + plan.collisionGroups.length;
+  if (changeCount === 0) {
+    log(`  intent-key migration: ${plan.totalLiveCount} open_thread row(s) scanned, 0 need rekeying.`);
+    return lines;
+  }
 
   log(`  intent-key migration plan (${dryRun ? 'DRY-RUN' : 'WRITE'}):`);
   log(`    live open_thread rows scanned: ${plan.totalLiveCount}`);
@@ -249,9 +277,18 @@ async function applyIntentKeyMigration(db, projectId, plan, registryMode, writeA
  *
  * @param {object} db          - StoragePort adapter (Postgres or SQLite).
  * @param {string} projectId
- * @param {{dryRun?: boolean, getSetting?: Function, writeAssertionWithSupersession?: Function}} [opts]
+ * @param {{dryRun?: boolean, silent?: boolean, getSetting?: Function, writeAssertionWithSupersession?: Function}} [opts]
  *   dryRun defaults to TRUE (spec: "with --dry-run default"). Callers that
  *   want to actually apply must pass { dryRun: false } explicitly.
+ *
+ *   silent (default false): suppresses ALL of this function's own
+ *   console.log output (see printPlan's header comment for the stdout-
+ *   pollution finding this fixes). handoff.js's runIntentKeyMigrationIfNeeded
+ *   (the auto-run-on-next-touch gate) ALWAYS passes silent:true — it never
+ *   wants this function's stdout, and prints its own single stderr line
+ *   only when rows actually changed. The CLI wrapper below never passes
+ *   this (defaults to false: full/verbose plan output, except a zero-
+ *   change plan still collapses to one summary line regardless of silent).
  *
  *   getSetting/writeAssertionWithSupersession — OPTIONAL direct function
  *   injection. handoff.js's OWN runIntentKeyMigrationIfNeeded (the cm#233
@@ -272,8 +309,9 @@ async function applyIntentKeyMigration(db, projectId, plan, registryMode, writeA
  */
 async function migrateIntentKeys(db, projectId, opts = {}) {
   const dryRun = opts.dryRun !== false; // default true unless explicitly false
+  const silent = opts.silent === true;  // default false
   const plan = await planIntentKeyMigration(db, projectId);
-  printPlan(plan, { dryRun });
+  printPlan(plan, { dryRun, silent });
 
   if (dryRun) {
     return { changed: 0, collisions: plan.collisionGroups.length, dryRun: true, plan };
