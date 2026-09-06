@@ -214,12 +214,6 @@ const SWEEP_EXEMPTIONS = [
     reason: "Comment-only mention describing install.js's os.homedir() usage; no path " +
             'is actually constructed here.',
   },
-  {
-    file: path.join(PROJECT_ROOT, 'hooks', 'agent-adversary-floor.js'),
-    reason: 'Comment-only mention ("not a hardcoded personal path, and not an ' +
-            'os.homedir()") describing what the code does NOT do; no path is ' +
-            'actually constructed here.',
-  },
 ];
 
 function collectJsFilesForSweep(dir) {
