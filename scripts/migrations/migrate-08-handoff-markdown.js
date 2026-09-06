@@ -185,6 +185,7 @@ const { PostgresAdapter } = require('../lib/db-seam.js'); // S1: wraps this file
 const { AUTHORING_MODE_VALUES } = require('../lib/memory-upsert.js'); // reused by reference, never a second Set
 const mdParse = require('../lib/handoff-markdown-parse.js');
 const { filesystemSourceDb } = require('../lib/fs-path-normalize.js'); // H-14: same normalizer roster entries use
+const constraintPreflight = require('./lib/constraint-preflight.js'); // P1-P3 catalog-driven unique-constraint preflight (item B / cm#233 successor)
 
 const MIGRATIONS_DIR = __dirname;
 const DEFAULT_HEADINGS_CONFIG_PATH = path.join(MIGRATIONS_DIR, 'handoff-section-headings.json');
@@ -303,11 +304,19 @@ const SESSION_TYPES = new Set(['session_numbered', 'session_dated']);
 
 class UsageError extends Error {}
 
+// P2: --on-duplicate policy values. 'fail' (default) is the conservative
+// total classification's floor -- any non-insert bucket refuses the write.
+// 'keep-newest' resolves in_batch_duplicate groups by session recency (see
+// constraint-preflight.js) but NEVER rescues collides_existing/unclassified.
+const ON_DUPLICATE_VALUES = new Set(['fail', 'keep-newest']);
+const DEFAULT_ON_DUPLICATE = 'fail';
+
 function parseArgs(argv) {
   const parsed = {
     db: null, projectId: null, file: null, historyFile: null,
     headingsConfig: DEFAULT_HEADINGS_CONFIG_PATH, authoringMode: 'verbose',
     rollback: false, dryRun: false, reportDir: DEFAULT_REPORT_DIR, help: false,
+    onDuplicate: DEFAULT_ON_DUPLICATE,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -327,6 +336,8 @@ function parseArgs(argv) {
     else if (a === '--dry-run') parsed.dryRun = true;
     else if (a === '--report-dir') parsed.reportDir = argv[++i];
     else if (a.startsWith('--report-dir=')) parsed.reportDir = a.slice('--report-dir='.length);
+    else if (a === '--on-duplicate') parsed.onDuplicate = argv[++i];
+    else if (a.startsWith('--on-duplicate=')) parsed.onDuplicate = a.slice('--on-duplicate='.length);
     else if (a === '--help' || a === '-h') parsed.help = true;
     else throw new UsageError(`Unknown argument: ${a}`);
   }
@@ -352,6 +363,11 @@ function printUsage() {
     '                         columns this script writes, never carryover_status). Mutually exclusive with --rollback.',
     '  --rollback             Delete this project\'s migrated rows + manifest slices instead of migrating.',
     '  --report-dir <path>    Directory for the per-project fail-soft parse report (default: ./reports).',
+    '  --on-duplicate <mode>  "fail" (default) or "keep-newest" -- catalog-driven unique-constraint preflight',
+    '                         policy (P1/P2). "fail": any collides_existing/in_batch_duplicate/unclassified row',
+    '                         refuses the write. "keep-newest": in_batch_duplicate groups keep their newest',
+    '                         member live (by parsed session recency, never document position) and suppress the',
+    '                         rest (suppression_kind=\'superseded\'); collides_existing/unclassified still ALWAYS fail.',
   ].join('\n'));
 }
 
@@ -458,6 +474,18 @@ function parseFileIntoRows(normalizedText, durableHeadings, fileKind, normalizeF
   const MAX_DUAL_SIGNAL_EXAMPLES = 20;
 
   for (const section of sections) {
+    // item B / constraint-preflight (2026-09-06): the enclosing section's own
+    // session identity (sessionNum/date), when this section IS a session
+    // block — null for a non-session section (preamble, durable heading,
+    // etc.). Threaded onto every row this section produces so
+    // constraint-preflight.js's session_rank can order rows by the SECTION
+    // HEADING's own parsed identity, never by document position (a real
+    // HANDOFF-HISTORY.md is newest-first — position-as-recency would rank
+    // backwards).
+    const enclosingSession = SESSION_TYPES.has(section.type)
+      ? { sessionNum: section.classification.sessionNum || null, date: section.classification.date || null }
+      : null;
+
     // "### Open carry-overs" tables can appear inside ANY section's body
     // (active preamble OR an archived session block) — extracted uniformly
     // regardless of the enclosing section's type (H-4/base-point-3).
@@ -471,6 +499,8 @@ function parseFileIntoRows(normalizedText, durableHeadings, fileKind, normalizeF
           statusRaw: row.statusRaw,
           statusClass: row.statusClass,
           sourceLineNo: row.lineNo,
+          fileKind,
+          enclosingSession,
         });
         statusClassCounts[row.statusClass] = (statusClassCounts[row.statusClass] || 0) + 1;
         if (row.statusDualSignal && dualSignalStatusCells.length < MAX_DUAL_SIGNAL_EXAMPLES) {
@@ -505,6 +535,8 @@ function parseFileIntoRows(normalizedText, durableHeadings, fileKind, normalizeF
         headingLineNo: section.headingLineNo,
         rawLineSpan: section.rawLineSpan,
         sessionHeadingType: section.type,
+        fileKind,
+        enclosingSession,
       });
     } else if (section.type === 'session_shaped_unparsed') {
       // cm#222 F-3: never silently merged into the generic "other" list —
@@ -516,6 +548,8 @@ function parseFileIntoRows(normalizedText, durableHeadings, fileKind, normalizeF
         predicate: section.classification.predicate,
         object: section.bodyText.trim(),
         headingLineNo: section.headingLineNo,
+        fileKind,
+        enclosingSession: null, // a durable heading is its own top-level section, never nested in a session
       });
     } else if (section.type === 'next_session') {
       const items = mdParse.parseNextSessionItems(section.bodyText);
@@ -526,6 +560,8 @@ function parseFileIntoRows(normalizedText, durableHeadings, fileKind, normalizeF
           object: itemText,
           seq: nextSeq,
           headingLineNo: section.headingLineNo,
+          fileKind,
+          enclosingSession: null, // NEXT SESSION is its own top-level section, never nested in a session
         });
       }
     } else if (section.type === 'next_session_variant') {
@@ -676,6 +712,150 @@ function computeContentFingerprint(rowsOrderedForHash) {
   return crypto.createHash('md5').update(concatenated).digest('hex');
 }
 
+// ─── SLICE / BATCH ASSEMBLY (shared by dry-run and write paths) ───────────
+
+/**
+ * buildSlices — the same 4-category-per-file slice list dry-run and write
+ * mode both need (dry-run needs it to run the constraint preflight for
+ * reporting; write mode needs it for both the preflight AND the actual
+ * INSERT). Pure (no I/O beyond the already-parsed inputs).
+ */
+function buildSlices({ activeParsed, historyParsed, filePath, historyFilePath }) {
+  const slices = [];
+  if (activeParsed) {
+    const activeSourceDb = filesystemSourceDb(filePath);
+    slices.push({ sourceDb: activeSourceDb, sourceTable: SLICE_NAMES.ACTIVE_SESSION_SUMMARY, rows: toSessionAssertionRows(activeParsed.sessionTldrRows) });
+    slices.push({ sourceDb: activeSourceDb, sourceTable: SLICE_NAMES.ACTIVE_OPEN_CARRYOVERS, rows: toOpenThreadAssertionRows(activeParsed.openThreadRows) });
+    slices.push({ sourceDb: activeSourceDb, sourceTable: SLICE_NAMES.ACTIVE_DURABLE_SECTIONS, rows: toDurableAssertionRows(activeParsed.durableRows) });
+    slices.push({ sourceDb: activeSourceDb, sourceTable: SLICE_NAMES.ACTIVE_NEXT_SESSION_ITEMS, rows: toNextStepAssertionRows(activeParsed.nextStepRows) });
+  }
+  if (historyParsed) {
+    const historySourceDb = filesystemSourceDb(historyFilePath);
+    slices.push({ sourceDb: historySourceDb, sourceTable: SLICE_NAMES.HISTORY_SESSION_BLOCKS, rows: toSessionAssertionRows(historyParsed.sessionTldrRows) });
+    slices.push({ sourceDb: historySourceDb, sourceTable: SLICE_NAMES.HISTORY_OPEN_CARRYOVERS, rows: toOpenThreadAssertionRows(historyParsed.openThreadRows) });
+    slices.push({ sourceDb: historySourceDb, sourceTable: SLICE_NAMES.HISTORY_DURABLE_SECTIONS, rows: toDurableAssertionRows(historyParsed.durableRows) });
+    slices.push({ sourceDb: historySourceDb, sourceTable: SLICE_NAMES.HISTORY_NEXT_SESSION_ITEMS, rows: toNextStepAssertionRows(historyParsed.nextStepRows) });
+  }
+  return slices;
+}
+
+/**
+ * flattenSlices — every slice's rows, in slice/row order, as ONE flat array.
+ * Stamps `row.__batchOrd` (1-indexed, matching array position) directly
+ * onto each row object — the SAME object references writeProjectMigration
+ * later iterates via `slices`, so a per-row preflight decision keyed by
+ * `__batchOrd` can never drift out of alignment with a reordering of one
+ * loop but not the other (there is only one loop's worth of ordering,
+ * stamped once, read by reference everywhere else).
+ */
+function flattenSlices(slices) {
+  const flat = [];
+  for (const slice of slices) {
+    for (const row of slice.rows) flat.push(row);
+  }
+  flat.forEach((row, i) => { row.__batchOrd = i + 1; });
+  return flat;
+}
+
+/** buildPreflightValues — the exact column/value shape writeProjectMigration
+ * would INSERT for this row, as a plain dict keyed by real assertions
+ * column names (constraint-preflight.js's temp table reads whichever of
+ * these keys the LIVE target's catalog actually has — a column this dict
+ * supplies that the target lacks, e.g. carryover_status on a
+ * PER_PROJECT_ENGINE target, is simply never selected; no branch-awareness
+ * needed here). suppressed:false/suppression_kind:null is the pre-policy
+ * "as if inserted live" candidate state the preflight simulates against.
+ */
+function buildPreflightValues(row, projectId, authoringMode) {
+  return {
+    project_id: projectId,
+    subject: row.subject,
+    predicate: row.predicate,
+    object: row.object,
+    confidence: DEFAULT_CONFIDENCE,
+    source: SOURCE_VALUE,
+    tier: TIER_VALUE,
+    pinned: !!row.pinned,
+    carryover_status: row.carryoverStatus || null,
+    seq: row.seq ?? null,
+    source_model: SOURCE_MODEL_TAG,
+    authoring_mode: authoringMode,
+    created_at: row.createdAt || null,
+    suppressed: false,
+    suppression_kind: null,
+  };
+}
+
+/** runConstraintPreflight — thin adapter from this file's row shape to
+ * constraint-preflight.js's runPreflight() input shape. See that module's
+ * header comment for the full P1/P2/P3 algorithm.
+ */
+async function runConstraintPreflight(tgtClient, { projectId, authoringMode, onDuplicate, flatBatchRows }) {
+  const rows = flatBatchRows.map((row) => ({
+    values: buildPreflightValues(row, projectId, authoringMode),
+    fileKind: row.fileKind,
+    enclosingSession: row.enclosingSession || null,
+    sourceLineNo: row.sourceLineNo ?? null,
+    headingLineNo: row.headingLineNo ?? null,
+  }));
+  return constraintPreflight.runPreflight(tgtClient, { projectId, sourceModelTag: SOURCE_MODEL_TAG, rows, onDuplicate });
+}
+
+function printPreflightSummary(result) {
+  const b = result.buckets;
+  console.log(`  [PREFLIGHT] policy=${result.policy} insert=${b.insert} in_batch_duplicate=${b.in_batch_duplicate} collides_existing=${b.collides_existing} unclassified=${b.unclassified}`);
+  if (result.notApplicableIndexes.length) {
+    console.log(`  [PREFLIGHT] not_applicable_indexes=${result.notApplicableIndexes.map((i) => `${i.name}(missing:${i.missingColumns.join(',')})`).join(', ')}`);
+  }
+  if (result.applicableIndexNames.length) {
+    console.log(`  [PREFLIGHT] applicable_indexes=${result.applicableIndexNames.join(', ')}`);
+  }
+  for (const e of result.perIndexErrors) {
+    console.log(`  [PREFLIGHT] index_error index=${e.index} error=${e.error}`);
+  }
+  for (const r of result.recheckGroups) {
+    console.log(`  [PREFLIGHT] recheck_violation index=${r.index} groups=${r.groups || 0}${r.error ? ` error=${r.error}` : ''}`);
+  }
+  for (const g of result.topGroups) {
+    console.log(`  [PREFLIGHT] top_group index=${g.index} member_count=${g.memberCount} has_existing=${g.hasExisting}`);
+  }
+}
+
+/**
+ * evaluatePreflightFailure — P3's PASS/FAIL rule, both dry-run and write:
+ * collides_existing and unclassified ALWAYS fail regardless of policy;
+ * in_batch_duplicate only fails under the (default) 'fail' policy —
+ * 'keep-newest' resolves it (or, if the post-policy recheck finds it
+ * couldn't, those rows already became 'unclassified' by the time this
+ * runs, so the unclassified check above already covers that path).
+ *
+ * @returns {string|null} a human-readable reason, or null (PASS).
+ */
+function evaluatePreflightFailure(result) {
+  const b = result.buckets;
+  if (b.collides_existing > 0) return `collides_existing=${b.collides_existing}`;
+  if (b.unclassified > 0) return `unclassified=${b.unclassified}`;
+  if (result.policy === 'fail' && b.in_batch_duplicate > 0) return `in_batch_duplicate=${b.in_batch_duplicate} (policy=fail)`;
+  return null;
+}
+
+/** applyPreflightDecisions — stamps each batch row with the preflight's
+ * per-row suppressed/suppression_kind decision (keyed by __batchOrd, see
+ * flattenSlices()), for writeProjectMigration to write verbatim.
+ */
+function applyPreflightDecisions(flatBatchRows, preflightResult) {
+  const byOrd = new Map(preflightResult.perRow.map((d) => [d.batchOrd, d]));
+  for (const row of flatBatchRows) {
+    const d = byOrd.get(row.__batchOrd);
+    row.__suppressed = d ? d.suppressed : false;
+    row.__suppressionKind = d ? d.suppressionKind : null;
+  }
+}
+
+function countLive(flatBatchRows) {
+  return flatBatchRows.filter((r) => !r.__suppressed).length;
+}
+
 // ─── WHOLE-PROJECT WRITE (H-6) ─────────────────────────────────────────────
 
 /**
@@ -691,10 +871,22 @@ function computeContentFingerprint(rowsOrderedForHash) {
  * called by this script), so the branch-aware column list lives here, not
  * behind a shared-writer option flag.
  *
+ * item B / constraint-preflight (P3): every row is expected to already carry
+ * `__suppressed`/`__suppressionKind` (stamped by applyPreflightDecisions()
+ * from the SAME preflight result this write's caller already gated on —
+ * see main()). Both default to false/null when absent (rollback/legacy
+ * caller safety), never fatal on their own — the preflight gate upstream is
+ * what refuses a bad batch; this function trusts whatever decision it is
+ * handed and verifies the OUTCOME via the post-insert assertion below.
+ *
  * @param {Array<{sourceDb, sourceTable, rows}>} slices
  * @param {string} branch - classifyTarget() branch ('CANON'|'STAGING'|'PER_PROJECT_ENGINE')
+ * @param {number} [policyLiveCount] - expected count of non-suppressed rows
+ *   after this write (P3 post-insert assertion); defaults to the full batch
+ *   size when omitted (i.e. "every row is expected live" — the --on-
+ *   duplicate=fail default's shape).
  */
-async function writeProjectMigration(tgtClient, { projectId, authoringMode, slices, branch }) {
+async function writeProjectMigration(tgtClient, { projectId, authoringMode, slices, branch, policyLiveCount }) {
   const includeCarryoverStatus = !omittedColumnsForBranch(branch).includes('carryover_status');
 
   await tgtClient.query('BEGIN');
@@ -715,8 +907,12 @@ async function writeProjectMigration(tgtClient, { projectId, authoringMode, slic
           cols.push('carryover_status');
           vals.push(row.carryoverStatus || null);
         }
-        cols.push('seq', 'source_model', 'authoring_mode', 'created_at');
-        vals.push(row.seq ?? null, SOURCE_MODEL_TAG, authoringMode, row.createdAt || null);
+        cols.push('seq', 'source_model', 'authoring_mode', 'suppressed', 'suppression_kind', 'created_at');
+        vals.push(
+          row.seq ?? null, SOURCE_MODEL_TAG, authoringMode,
+          !!row.__suppressed, row.__suppressionKind || null,
+          row.createdAt || null
+        );
         // cols[] and vals[] are built in lockstep above, so index i in one is
         // always index i in the other — the last column (created_at) is the
         // one exception, COALESCE'd to now() rather than bound raw.
@@ -753,6 +949,34 @@ async function writeProjectMigration(tgtClient, { projectId, authoringMode, slic
           [slice.sourceDb, slice.sourceTable, projectId, `row:${idx}`, h]
         );
       }
+    }
+
+    // ── P3 post-insert assertion ─────────────────────────────────────────
+    // Never trust the loop's own totalWritten counter as proof of what
+    // actually landed — verify the live catalog directly, inside the same
+    // transaction, before COMMIT. A mismatch throws (caught below -> the
+    // whole transaction rolls back, exactly like any other failure here).
+    const expectedLive = policyLiveCount != null ? policyLiveCount : totalWritten;
+    const { rows: countRows } = await tgtClient.query(
+      `SELECT
+         count(*) FILTER (WHERE true) AS inserted,
+         count(*) FILTER (WHERE suppressed = false) AS live
+       FROM assertions WHERE project_id = $1 AND source_model = $2`,
+      [projectId, SOURCE_MODEL_TAG]
+    );
+    const actualInserted = Number(countRows[0].inserted);
+    const actualLive = Number(countRows[0].live);
+    if (actualInserted !== totalWritten) {
+      throw new Error(
+        `post-insert assertion failed: expected ${totalWritten} inserted row(s) tagged ` +
+        `source_model='${SOURCE_MODEL_TAG}', found ${actualInserted}.`
+      );
+    }
+    if (actualLive !== expectedLive) {
+      throw new Error(
+        `post-insert assertion failed: expected ${expectedLive} live (suppressed=false) row(s) ` +
+        `per the constraint-preflight policy decision, found ${actualLive}.`
+      );
     }
 
     await tgtClient.query('COMMIT');
@@ -1123,12 +1347,43 @@ async function main() {
     console.error(`Invalid --authoring-mode "${parsed.authoringMode}" — must be "caveman" or "verbose".`);
     process.exit(2);
   }
+  if (!ON_DUPLICATE_VALUES.has(parsed.onDuplicate)) {
+    console.error(`Invalid --on-duplicate "${parsed.onDuplicate}" — must be "fail" or "keep-newest".`);
+    process.exit(2);
+  }
 
   // ── cm#222 A1: TRUE dry-run — parse + report, zero DDL/writes. ─────────
   if (parsed.dryRun) {
     let preconditionChecks = null;
     let dbBranch = null;
     let integrityIndexResult = null;
+    let preflightResult = null;
+
+    // Parsing never needs a DB connection — done up front so the constraint
+    // preflight (P1, which DOES need one) can run in the SAME connection
+    // window as the precondition/integrity-index checks below, rather than
+    // opening a second connection.
+    const headingsConfigEarly = loadHeadingsConfig(parsed.headingsConfig);
+    const activeFileEarly = loadAndNormalizeFile(parsed.file);
+    const historyFileEarly = loadAndNormalizeFile(parsed.historyFile);
+    if (parsed.file && !activeFileEarly.present) {
+      console.log(`  [FAIL-SOFT] could not read --file "${parsed.file}": ${activeFileEarly.readError}`);
+    }
+    if (parsed.historyFile && !historyFileEarly.present) {
+      console.log(`  [FAIL-SOFT] could not read --history-file "${parsed.historyFile}": ${historyFileEarly.readError}`);
+    }
+    if (!activeFileEarly.present && !historyFileEarly.present) {
+      console.error('Refused: neither --file nor --history-file could be read. Nothing to report.');
+      process.exit(1);
+    }
+    for (const flag of [...(activeFileEarly.normalized ? activeFileEarly.normalized.flags : []), ...(historyFileEarly.normalized ? historyFileEarly.normalized.flags : [])]) {
+      logNormalizeFlag(flag);
+    }
+    const activeParsedEarly = activeFileEarly.present ? parseFileIntoRows(activeFileEarly.normalized.text, headingsConfigEarly.headings, 'active', activeFileEarly.normalized.flags) : null;
+    const historyParsedEarly = historyFileEarly.present ? parseFileIntoRows(historyFileEarly.normalized.text, headingsConfigEarly.headings, 'history', historyFileEarly.normalized.flags) : null;
+    const slicesEarly = buildSlices({ activeParsed: activeParsedEarly, historyParsed: historyParsedEarly, filePath: parsed.file, historyFilePath: parsed.historyFile });
+    const flatBatchRowsEarly = flattenSlices(slicesEarly);
+
     if (parsed.db) {
       const { name: target, source: targetSource } = migrateOne.resolveTargetDb({ db: parsed.db });
       if (!migrateOne.DB_NAME_RE.test(target)) {
@@ -1172,6 +1427,14 @@ async function main() {
         // column-precondition result above: independent checks, both
         // reported.
         integrityIndexResult = await classifyIntegrityIndex(tgtClient);
+        // P1 (dry-run branch, item B / cm#233 successor): read-only,
+        // self-rolled-back constraint preflight — runs regardless of the
+        // column-precondition/integrity-index results above (independent
+        // checks, all three reported).
+        preflightResult = await runConstraintPreflight(tgtClient, {
+          projectId: parsed.projectId, authoringMode: parsed.authoringMode,
+          onDuplicate: parsed.onDuplicate, flatBatchRows: flatBatchRowsEarly,
+        });
       } catch (err) {
         console.error(`Could not complete read-only precondition checks against target "${target}": ${err.message}`);
         process.exit(1);
@@ -1187,36 +1450,22 @@ async function main() {
       } else if (integrityIndexResult.class === 'UNRECOGNIZED') {
         console.log('  note: UNRECOGNIZED integrity index shape — write mode will refuse (S3); manual investigation required');
       }
+      printPreflightSummary(preflightResult);
     } else {
       console.log('migrate-08-handoff-markdown: DRY-RUN (no --db) — schema preconditions not checked, parse-only');
+      console.log('  [PREFLIGHT] not_checked (no --db) — constraint preflight requires a live catalog connection');
     }
 
-    const headingsConfig = loadHeadingsConfig(parsed.headingsConfig);
-    const activeFile = loadAndNormalizeFile(parsed.file);
-    const historyFile = loadAndNormalizeFile(parsed.historyFile);
-
-    if (parsed.file && !activeFile.present) {
-      console.log(`  [FAIL-SOFT] could not read --file "${parsed.file}": ${activeFile.readError}`);
-    }
-    if (parsed.historyFile && !historyFile.present) {
-      console.log(`  [FAIL-SOFT] could not read --history-file "${parsed.historyFile}": ${historyFile.readError}`);
-    }
-    if (!activeFile.present && !historyFile.present) {
-      console.error('Refused: neither --file nor --history-file could be read. Nothing to report.');
-      process.exit(1);
-    }
-
-    for (const flag of [...(activeFile.normalized ? activeFile.normalized.flags : []), ...(historyFile.normalized ? historyFile.normalized.flags : [])]) {
-      logNormalizeFlag(flag);
-    }
-
-    const activeParsed = activeFile.present ? parseFileIntoRows(activeFile.normalized.text, headingsConfig.headings, 'active', activeFile.normalized.flags) : null;
-    const historyParsed = historyFile.present ? parseFileIntoRows(historyFile.normalized.text, headingsConfig.headings, 'history', historyFile.normalized.flags) : null;
+    const activeParsed = activeParsedEarly;
+    const historyParsed = historyParsedEarly;
     const crossFileCollisions = computeCrossFileCollisions(activeParsed, historyParsed);
 
     printHumanSummary({ parsed, activeParsed, historyParsed, preconditionChecks, branch: dbBranch });
 
-    const report = buildReport({ parsed, activeParsed, historyParsed, totalWritten: 0, crossFileCollisions, preconditionChecks, integrityIndexResult, mode: 'dry_run', branch: dbBranch });
+    const report = buildReport({
+      parsed, activeParsed, historyParsed, totalWritten: 0, crossFileCollisions,
+      preconditionChecks, integrityIndexResult, preflightResult, mode: 'dry_run', branch: dbBranch,
+    });
     const reportPath = writeReport(parsed.reportDir, parsed.projectId, report);
     console.log(`  [REPORT] ${reportPath}`);
 
@@ -1225,8 +1474,14 @@ async function main() {
     // S3: UNRECOGNIZED makes the dry-run report FAIL — CURRENT/STALE_RAW_OBJECT/
     // MISSING (and 'not checked', no --db) never fail the dry-run on their own.
     const integrityIndexUnrecognized = integrityIndexResult && integrityIndexResult.class === 'UNRECOGNIZED';
-    if (preconditionsFailed || integrityIndexUnrecognized) {
-      console.error('DRY_RUN_RESULT: FAIL (schema preconditions not met, or integrity index class is UNRECOGNIZED — see report)');
+    // P3: constraint-preflight failure (collides_existing/unclassified always;
+    // in_batch_duplicate under --on-duplicate=fail) also fails the dry-run.
+    const preflightFailureReason = preflightResult ? evaluatePreflightFailure(preflightResult) : null;
+    if (preconditionsFailed || integrityIndexUnrecognized || preflightFailureReason) {
+      if (preflightFailureReason) {
+        console.error(`  constraint preflight: FAIL (${preflightFailureReason})`);
+      }
+      console.error('DRY_RUN_RESULT: FAIL (schema preconditions not met, integrity index class is UNRECOGNIZED, or constraint preflight failed — see report)');
       process.exitCode = 1;
       return;
     }
@@ -1388,24 +1643,30 @@ async function main() {
       ? parseFileIntoRows(historyFile.normalized.text, headingsConfig.headings, 'history', historyFile.normalized.flags)
       : null;
 
-    const slices = [];
-    if (activeParsed) {
-      const activeSourceDb = filesystemSourceDb(parsed.file);
-      slices.push({ sourceDb: activeSourceDb, sourceTable: SLICE_NAMES.ACTIVE_SESSION_SUMMARY, rows: toSessionAssertionRows(activeParsed.sessionTldrRows) });
-      slices.push({ sourceDb: activeSourceDb, sourceTable: SLICE_NAMES.ACTIVE_OPEN_CARRYOVERS, rows: toOpenThreadAssertionRows(activeParsed.openThreadRows) });
-      slices.push({ sourceDb: activeSourceDb, sourceTable: SLICE_NAMES.ACTIVE_DURABLE_SECTIONS, rows: toDurableAssertionRows(activeParsed.durableRows) });
-      slices.push({ sourceDb: activeSourceDb, sourceTable: SLICE_NAMES.ACTIVE_NEXT_SESSION_ITEMS, rows: toNextStepAssertionRows(activeParsed.nextStepRows) });
+    const slices = buildSlices({ activeParsed, historyParsed, filePath: parsed.file, historyFilePath: parsed.historyFile });
+
+    // ── constraint preflight (P1/P2/P3, item B / cm#233 successor) ────────
+    // Read-only, self-rolled-back (see constraint-preflight.js's own header
+    // for the full algorithm). Runs BEFORE any DELETE/INSERT — a
+    // collides_existing or unclassified row (or an in_batch_duplicate row
+    // under --on-duplicate=fail, the default) refuses the whole write,
+    // nothing applied.
+    const flatBatchRows = flattenSlices(slices);
+    const preflightResult = await runConstraintPreflight(tgtClient, {
+      projectId: parsed.projectId, authoringMode: parsed.authoringMode, onDuplicate: parsed.onDuplicate, flatBatchRows,
+    });
+    printPreflightSummary(preflightResult);
+    const preflightFailure = evaluatePreflightFailure(preflightResult);
+    if (preflightFailure) {
+      console.error(`Refused: constraint preflight failed (${preflightFailure}). Nothing was applied.`);
+      process.exitCode = 1;
+      return;
     }
-    if (historyParsed) {
-      const historySourceDb = filesystemSourceDb(parsed.historyFile);
-      slices.push({ sourceDb: historySourceDb, sourceTable: SLICE_NAMES.HISTORY_SESSION_BLOCKS, rows: toSessionAssertionRows(historyParsed.sessionTldrRows) });
-      slices.push({ sourceDb: historySourceDb, sourceTable: SLICE_NAMES.HISTORY_OPEN_CARRYOVERS, rows: toOpenThreadAssertionRows(historyParsed.openThreadRows) });
-      slices.push({ sourceDb: historySourceDb, sourceTable: SLICE_NAMES.HISTORY_DURABLE_SECTIONS, rows: toDurableAssertionRows(historyParsed.durableRows) });
-      slices.push({ sourceDb: historySourceDb, sourceTable: SLICE_NAMES.HISTORY_NEXT_SESSION_ITEMS, rows: toNextStepAssertionRows(historyParsed.nextStepRows) });
-    }
+    applyPreflightDecisions(flatBatchRows, preflightResult);
 
     const { totalWritten } = await writeProjectMigration(tgtClient, {
       projectId: parsed.projectId, authoringMode: parsed.authoringMode, slices, branch,
+      policyLiveCount: countLive(flatBatchRows),
     });
     for (const slice of slices) {
       console.log(`  [OK] slice source_db="${slice.sourceDb}" source_table="${slice.sourceTable}": ${slice.rows.length} row(s)`);
@@ -1434,7 +1695,7 @@ async function main() {
       }
     }
 
-    const report = buildReport({ parsed, activeParsed, historyParsed, totalWritten, crossFileCollisions, preconditionChecks, integrityIndexResult, mode: 'migrate', branch });
+    const report = buildReport({ parsed, activeParsed, historyParsed, totalWritten, crossFileCollisions, preconditionChecks, integrityIndexResult, preflightResult, mode: 'migrate', branch });
     const reportPath = writeReport(parsed.reportDir, parsed.projectId, report);
     console.log(`  [REPORT] ${reportPath}`);
 
@@ -1448,28 +1709,36 @@ async function main() {
 
 // ─── ROW SHAPING (predicate + fixed flags per category) ──────────────────
 
+// item B / constraint-preflight: every shaped row carries fileKind +
+// enclosingSession (+ its own line-position field) forward from the parsed
+// row — constraint-preflight.js's session_rank computation needs these to
+// decide recency (P2); nothing else downstream reads them.
 function toSessionAssertionRows(rows) {
   return rows.map((r) => ({
     subject: r.subject, predicate: 'session_tldr_archived', object: r.object,
     pinned: false, carryoverStatus: null, seq: null, createdAt: r.createdAt,
+    fileKind: r.fileKind, enclosingSession: r.enclosingSession || null, headingLineNo: r.headingLineNo ?? null,
   }));
 }
 function toOpenThreadAssertionRows(rows) {
   return rows.map((r) => ({
     subject: r.subject, predicate: 'open_thread', object: r.object,
     pinned: false, carryoverStatus: 'open', seq: null, createdAt: null,
+    fileKind: r.fileKind, enclosingSession: r.enclosingSession || null, sourceLineNo: r.sourceLineNo ?? null,
   }));
 }
 function toDurableAssertionRows(rows) {
   return rows.map((r) => ({
     subject: r.subject, predicate: r.predicate, object: r.object,
     pinned: true, carryoverStatus: null, seq: null, createdAt: null,
+    fileKind: r.fileKind, enclosingSession: r.enclosingSession || null, headingLineNo: r.headingLineNo ?? null,
   }));
 }
 function toNextStepAssertionRows(rows) {
   return rows.map((r) => ({
     subject: r.subject, predicate: 'next_step', object: r.object,
     pinned: false, carryoverStatus: null, seq: r.seq, createdAt: null,
+    fileKind: r.fileKind, enclosingSession: r.enclosingSession || null, headingLineNo: r.headingLineNo ?? null,
   }));
 }
 
@@ -1496,7 +1765,7 @@ function loadHeadingsConfig(configPath) {
 
 // ─── REPORT (base spec point 5, fail-soft; cm#222 A6 extension) ──────────
 
-function buildReport({ parsed, activeParsed, historyParsed, totalWritten, crossFileCollisions, preconditionChecks, integrityIndexResult, mode, branch }) {
+function buildReport({ parsed, activeParsed, historyParsed, totalWritten, crossFileCollisions, preconditionChecks, integrityIndexResult, preflightResult, mode, branch }) {
   return {
     mode: mode || (parsed.dryRun ? 'dry_run' : (parsed.rollback ? 'rollback' : 'migrate')),
     project_id: parsed.projectId,
@@ -1527,6 +1796,19 @@ function buildReport({ parsed, activeParsed, historyParsed, totalWritten, crossF
     // ADDENDA_ONLY columns this migration's write path omits from the
     // INSERT column list on this branch (empty on CANON/STAGING).
     omitted_columns: branch ? omittedColumnsForBranch(branch) : [],
+    // P1-P3: catalog-driven unique-constraint preflight (item B / cm#233
+    // successor). 'not_checked' only when no --db was given in dry-run mode.
+    preflight: preflightResult
+      ? {
+        policy: preflightResult.policy,
+        buckets: preflightResult.buckets,
+        not_applicable_indexes: preflightResult.notApplicableIndexes,
+        applicable_indexes: preflightResult.applicableIndexNames,
+        top_groups: preflightResult.topGroups,
+        per_index_errors: preflightResult.perIndexErrors,
+        recheck_groups: preflightResult.recheckGroups,
+      }
+      : { policy: parsed.onDuplicate, buckets: null, not_applicable_indexes: [], applicable_indexes: [], top_groups: [], per_index_errors: [], recheck_groups: [] },
     active: activeParsed ? activeParsed.report : null,
     history: historyParsed ? historyParsed.report : null,
     // H-6 cross-file collision events — null when either file was absent.
@@ -1592,4 +1874,15 @@ module.exports = {
   INTEGRITY_INDEX_NAME,
   STALE_RAW_OBJECT_CREATE_SQL,
   CORE_SCHEMA_SQL_PATH,
+  // P1-P4 — catalog-driven unique-constraint preflight (item B / cm#233
+  // successor; exposed for test-migrate-08-handoff-markdown.js).
+  buildSlices,
+  flattenSlices,
+  buildPreflightValues,
+  runConstraintPreflight,
+  evaluatePreflightFailure,
+  applyPreflightDecisions,
+  countLive,
+  ON_DUPLICATE_VALUES,
+  DEFAULT_ON_DUPLICATE,
 };

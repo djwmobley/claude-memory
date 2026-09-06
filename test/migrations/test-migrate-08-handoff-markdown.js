@@ -227,7 +227,15 @@ const DB_TARGET = `verify08_target_${TS}_staging`;
 // Deliberately does NOT end in "_staging" and is not "memory_manager" — must
 // fall through classifyTarget()'s name-only branches into the marker probe.
 const DB_ENGINE = `verify08_engine_${TS}`;
-const CREATED_DBS = [DB_TARGET, DB_ENGINE];
+// Dedicated, otherwise-empty target for constraint-preflight scratch-index
+// tests (T23/T25) whose CREATE UNIQUE INDEX would otherwise fail against
+// DB_TARGET's own accumulated cross-test data (T6b/T6c deliberately leave
+// real subject collisions live — "both rows survive" is their whole point
+// — so a subject-keyed scratch index created against DB_TARGET would
+// legitimately fail with "could not create unique index" over pre-existing
+// violations that have nothing to do with the test being run).
+const DB_IDX = `verify08_idx_${TS}_staging`;
+const CREATED_DBS = [DB_TARGET, DB_ENGINE, DB_IDX];
 
 const SCRATCH_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'migrate08-fixtures-'));
 
@@ -1163,6 +1171,413 @@ async function main() {
       await after.end();
     }
     assertEq(countAfter, countBefore, 'dry-run must leave zero persistent catalog objects (temp tables must be rolled back, never committed)');
+  });
+
+  // ── T19-T27: catalog-driven unique-constraint preflight (P1-P4, item B /
+  //    cm#233 successor) ───────────────────────────────────────────────────
+
+  async function queryAssertions(projectId, extraWhere = '', dbName = DB_TARGET) {
+    const client = await pgConnect(dbName);
+    try {
+      const { rows } = await client.query(
+        `SELECT * FROM assertions WHERE project_id = $1 ${extraWhere} ORDER BY id`,
+        [projectId]
+      );
+      return rows;
+    } finally {
+      await client.end();
+    }
+  }
+
+  async function createScratchIndex(sql, dbName = DB_TARGET) {
+    const client = await pgConnect(dbName);
+    try { await client.query(sql); } finally { await client.end(); }
+  }
+  async function dropScratchIndex(name, dbName = DB_TARGET) {
+    const client = await pgConnect(dbName);
+    try { await client.query(`DROP INDEX IF EXISTS ${name}`); } finally { await client.end(); }
+  }
+
+  // Dedicated empty target for T23/T25 (see DB_IDX's own comment above).
+  await createFreshStagingDb(DB_IDX);
+
+  // T19: in_batch_duplicate under the default --on-duplicate=fail refuses
+  // the whole write; nothing is applied.
+  await run('T19', 'in_batch_duplicate: default --on-duplicate=fail refuses the write, zero rows applied', async () => {
+    const projectId = `example-project-t19-${TS}`;
+    const historyPath = writeFixture('t19-history.md', [
+      '## Session 5 — 2026-02-01 — Later in file, lower session number',
+      '',
+      '### Open carry-overs',
+      '',
+      '| Item | Status | Notes |',
+      '|------|--------|-------|',
+      '| DUPLICATE-THREAD: shared item | Open | shared notes text |',
+      '',
+      '## Session 4 — 2026-01-20 — Earlier in file, still duplicates the same item',
+      '',
+      '### Open carry-overs',
+      '',
+      '| Item | Status | Notes |',
+      '|------|--------|-------|',
+      '| DUPLICATE-THREAD: shared item | Open | shared notes text |',
+      '',
+    ].join('\n'));
+    const r = runMigrate08(['--db', DB_TARGET, '--project-id', projectId, '--history-file', historyPath]);
+    assertEq(r.status, 1, `expected refusal (status 1); stdout=${r.stdout} stderr=${r.stderr}`);
+    assert(/Refused: constraint preflight failed \(in_batch_duplicate=2/.test(r.stderr), `expected in_batch_duplicate=2 refusal, got stderr=${r.stderr}`);
+    const rows = await queryAssertions(projectId);
+    assertEq(rows.length, 0, 'nothing should have been applied for this project');
+  });
+
+  // T20: --on-duplicate=keep-newest resolves in_batch_duplicate by the
+  // section heading's parsed Session N / date, NEVER document position. The
+  // fixture places the highest-numbered (truly newest) session in the
+  // MIDDLE of the file -- both a naive "first row wins" AND a naive "last
+  // row wins" position heuristic pick the WRONG session; only a correct
+  // session_rank (keyed off the parsed number/date) picks Session 10.
+  await run('T20', 'keep-newest: newest SESSION (by parsed number/date) survives live, others suppressed with suppression_kind=superseded -- must fail if implemented by document position', async () => {
+    const projectId = `example-project-t20-${TS}`;
+    const historyPath = writeFixture('t20-history.md', [
+      '## Session 2 — 2026-01-01 — Earliest by number, FIRST in file',
+      '',
+      '### Open carry-overs',
+      '',
+      '| Item | Status | Notes |',
+      '|------|--------|-------|',
+      '| DUP-ITEM: shared | Open | shared notes text |',
+      '',
+      '## Session 10 — 2026-03-01 — Truly newest by number/date, MIDDLE of file',
+      '',
+      '### Open carry-overs',
+      '',
+      '| Item | Status | Notes |',
+      '|------|--------|-------|',
+      '| DUP-ITEM: shared | Open | shared notes text |',
+      '',
+      '## Session 7 — 2026-02-01 — Middle by number, LAST in file',
+      '',
+      '### Open carry-overs',
+      '',
+      '| Item | Status | Notes |',
+      '|------|--------|-------|',
+      '| DUP-ITEM: shared | Open | shared notes text |',
+      '',
+    ].join('\n'));
+    const r = runMigrate08(['--db', DB_TARGET, '--project-id', projectId, '--history-file', historyPath, '--on-duplicate', 'keep-newest']);
+    if (r.status !== 0) throw new Error(`migrate-08 failed: status=${r.status}\nstdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert(/MIGRATION_RESULT: PASS/.test(r.stdout), 'expected MIGRATION_RESULT: PASS');
+    const rows = await queryAssertions(projectId, `AND predicate = 'open_thread'`);
+    assertEq(rows.length, 3, 'all 3 duplicate rows should be inserted (live + suppressed)');
+    const live = rows.filter((row) => row.suppressed === false);
+    const suppressed = rows.filter((row) => row.suppressed === true);
+    assertEq(live.length, 1, 'exactly one row must survive live');
+    assertEq(suppressed.length, 2, 'exactly two rows must be suppressed');
+    assertEq(live[0].object, 'shared notes text', 'sanity: the live row is one of the duplicate set');
+    // Which SESSION the surviving row came from is not distinguishable from
+    // the live-row content alone (all 3 duplicate rows share identical
+    // subject/object text by construction) -- T20b's dry-run report
+    // asserts the session-identity-level claim (Session 10, not first/last
+    // document position) via session_rank in the preflight report.
+    for (const row of suppressed) {
+      assertEq(row.suppression_kind, 'superseded', 'every suppressed loser must carry suppression_kind=superseded');
+    }
+  });
+
+  // T20b: same fixture as T20, via --dry-run, whose report's preflight
+  // top_groups/sessions carry enough detail to confirm the SURVIVING member
+  // is the one sourced from Session 10 (the highest session_rank), not
+  // whichever the naive first/last document position would pick.
+  await run('T20b', 'keep-newest dry-run report identifies Session 10 (highest session_rank) as the sole survivor', async () => {
+    const projectId = `example-project-t20b-${TS}`;
+    const historyPath = writeFixture('t20b-history.md', [
+      '## Session 2 — 2026-01-01 — Earliest by number, FIRST in file',
+      '',
+      '### Open carry-overs',
+      '',
+      '| Item | Status | Notes |',
+      '|------|--------|-------|',
+      '| DUP-ITEM: shared | Open | shared notes text |',
+      '',
+      '## Session 10 — 2026-03-01 — Truly newest by number/date, MIDDLE of file',
+      '',
+      '### Open carry-overs',
+      '',
+      '| Item | Status | Notes |',
+      '|------|--------|-------|',
+      '| DUP-ITEM: shared | Open | shared notes text |',
+      '',
+      '## Session 7 — 2026-02-01 — Middle by number, LAST in file',
+      '',
+      '### Open carry-overs',
+      '',
+      '| Item | Status | Notes |',
+      '|------|--------|-------|',
+      '| DUP-ITEM: shared | Open | shared notes text |',
+      '',
+    ].join('\n'));
+    const reportScratchDir = path.join(SCRATCH_DIR, 'reports-t20b');
+    const r = runMigrate08(['--db', DB_TARGET, '--project-id', projectId, '--history-file', historyPath, '--on-duplicate', 'keep-newest', '--dry-run', '--report-dir', reportScratchDir]);
+    if (r.status !== 0) throw new Error(`dry-run failed: status=${r.status}\nstderr=${r.stderr}`);
+    assert(/DRY_RUN_RESULT: PASS/.test(r.stdout), 'expected DRY_RUN_RESULT: PASS');
+    const report = readReportFile(reportScratchDir, projectId);
+    assertEq(report.preflight.buckets.in_batch_duplicate, 3, 'all 3 duplicate rows classified in_batch_duplicate');
+    // flattenSlices() order (history-only batch): the 3 session_tldr_archived
+    // rows (batch_ord 1-3, one per session, distinct subjects -- never
+    // grouped) precede the 3 open_thread carry-over rows (batch_ord 4-6, in
+    // FILE order: Session 2->4, Session 10->5, Session 7->6). Session 10
+    // (highest session_rank) must be the survivor even though it is
+    // batch_ord 5 -- neither the first (4) nor the last (6) of the group.
+    const group = report.preflight.top_groups.find((g) => g.memberCount === 3);
+    assert(group, 'expected one top_group with 3 members');
+    const sessionRanks = group.sessions.map((s) => s.sessionRank);
+    const maxRankBatchOrd = group.sessions.find((s) => s.sessionRank === Math.max(...sessionRanks)).batchOrd;
+    assertEq(maxRankBatchOrd, 5, 'the highest session_rank must belong to batch_ord 5 (Session 10\'s open_thread row, neither first nor last in the group)');
+  });
+
+  // T21: collides_existing ALWAYS fails, regardless of --on-duplicate, and
+  // leaves the pre-existing row byte-identical.
+  await run('T21', 'collides_existing: a batch row colliding with a pre-existing (non-migration-tagged) row ALWAYS refuses, existing row untouched, under BOTH policies', async () => {
+    const projectId = `example-project-t21-${TS}`;
+    // subject === object (both the already-intentKey'd, colon-free form):
+    // deliberately avoids cm#233's own runIntentKeyMigrationIfNeeded S1 step
+    // (which recomputes newKey=intentKey(object) for every LIVE open_thread
+    // row on first touch and re-keys/supersedes any row where subject
+    // doesn't already match -- an orthogonal migration this test must not
+    // trip, since it would rewrite the very row this test is trying to
+    // hold fixed). With subject===intentKey(object) already true, that
+    // migration is correctly a no-op for this row.
+    const existingText = 'existing note text';
+    const client = await pgConnect(DB_TARGET);
+    let before;
+    try {
+      const ins = await client.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, tier, pinned, source_model, suppressed)
+         VALUES ($1, $2, 'open_thread', $2, 8, 'user_stated', 'consolidated', false, 'some-other-writer', false)
+         RETURNING *`,
+        [projectId, existingText]
+      );
+      before = ins.rows[0];
+    } finally {
+      await client.end();
+    }
+
+    const historyPath = writeFixture('t21-history.md', [
+      '## Session 1 — 2026-01-10 — Restates the same existing item',
+      '',
+      '### Open carry-overs',
+      '',
+      '| Item | Status | Notes |',
+      '|------|--------|-------|',
+      `| ${existingText} | Open | a fresh restatement |`,
+      '',
+    ].join('\n'));
+
+    for (const policy of ['fail', 'keep-newest']) {
+      const r = runMigrate08(['--db', DB_TARGET, '--project-id', projectId, '--history-file', historyPath, '--on-duplicate', policy]);
+      assertEq(r.status, 1, `policy=${policy}: expected refusal; stdout=${r.stdout} stderr=${r.stderr}`);
+      assert(/Refused: constraint preflight failed \(collides_existing=1/.test(r.stderr), `policy=${policy}: expected collides_existing=1 refusal, got stderr=${r.stderr}`);
+    }
+
+    const after = await queryAssertions(projectId, `AND source_model = 'some-other-writer'`);
+    assertEq(after.length, 1, 'the pre-existing row must still be present');
+    for (const col of Object.keys(before)) {
+      assertEq(JSON.stringify(after[0][col]), JSON.stringify(before[col]), `pre-existing row's column "${col}" must be byte-identical after the refused run`);
+    }
+    const migrated = await queryAssertions(projectId, `AND source_model = 'markdown-migration-h'`);
+    assertEq(migrated.length, 0, 'nothing from this migration should have been applied');
+  });
+
+  // T22: unclassified is the default for a NULL key component -- proven via
+  // a scratch unique index on a column (session_id) this migration never
+  // populates, so EVERY batch row's key for that index is NULL. Postgres
+  // itself would never reject multiple NULL-keyed rows, but this preflight
+  // deliberately treats "we cannot reliably tell" as a failure, never a
+  // silent PASS (see constraint-preflight.js's header comment).
+  await run('T22', 'unclassified: a NULL key component (scratch index on a column the migration never populates) refuses the write, never silently PASSes', async () => {
+    await createScratchIndex(`CREATE UNIQUE INDEX cm_test_nullkey_idx ON assertions (project_id, session_id) WHERE suppressed = false`);
+    try {
+      const projectId = `example-project-t22-${TS}`;
+      const filePath = writeFixture('t22-handoff.md', [
+        '## NEXT SESSION',
+        '',
+        '1. A single unrelated next-session item',
+        '',
+      ].join('\n'));
+      const r = runMigrate08(['--db', DB_TARGET, '--project-id', projectId, '--file', filePath]);
+      assertEq(r.status, 1, `expected refusal; stdout=${r.stdout} stderr=${r.stderr}`);
+      assert(/Refused: constraint preflight failed \(unclassified=1/.test(r.stderr), `expected unclassified=1 refusal, got stderr=${r.stderr}`);
+      const rows = await queryAssertions(projectId);
+      assertEq(rows.length, 0, 'nothing should have been applied');
+    } finally {
+      await dropScratchIndex('cm_test_nullkey_idx');
+    }
+  });
+
+  // T23: a brand-new unique index (never referenced by this file's code)
+  // is discovered and enforced with ZERO code change. Keyed on
+  // (project_id, source_model, subject) -- no predicate component -- so it
+  // catches a same-subject collision ACROSS two different predicates
+  // (next_step vs open_thread) that neither pre-existing index would catch
+  // (both require predicate/object to also match).
+  await run('T23', 'a NEW unique index (scratch-created) is enumerated and enforced with zero code change', async () => {
+    await createScratchIndex(`CREATE UNIQUE INDEX cm_test_newidx ON assertions (project_id, source_model, subject) WHERE suppressed = false`, DB_IDX);
+    try {
+      const projectId = `example-project-t23-${TS}`;
+      const filePath = writeFixture('t23-handoff.md', [
+        '## NEXT SESSION',
+        '',
+        '1. Ping demo widget owner',
+        '',
+        '## Session 1 — 2026-01-15 — Has a matching carry-over',
+        '',
+        '### Open carry-overs',
+        '',
+        '| Item | Status | Notes |',
+        '|------|--------|-------|',
+        '| Ping demo widget owner | Open | different notes text entirely |',
+        '',
+      ].join('\n'));
+      const reportScratchDir = path.join(SCRATCH_DIR, 'reports-t23');
+      // --on-duplicate keep-newest so the dry-run PASSes cleanly (proving
+      // the new index was discovered AND resolved) rather than exercising
+      // the --fail refusal path again (already covered by T19/T20).
+      const r = runMigrate08(['--db', DB_IDX, '--project-id', projectId, '--file', filePath, '--dry-run', '--on-duplicate', 'keep-newest', '--report-dir', reportScratchDir]);
+      if (r.status !== 0) throw new Error(`dry-run failed: status=${r.status}\nstdout=${r.stdout}\nstderr=${r.stderr}`);
+      const report = readReportFile(reportScratchDir, projectId);
+      assert(report.preflight.applicable_indexes.includes('cm_test_newidx'), 'the new scratch index must be discovered and classified APPLICABLE');
+      assertEq(report.preflight.buckets.in_batch_duplicate, 2, 'the next_step + open_thread rows sharing one subject must collide under the new index');
+      const group = report.preflight.top_groups.find((g) => g.index === 'cm_test_newidx');
+      assert(group, 'expected a top_group reported under cm_test_newidx');
+    } finally {
+      await dropScratchIndex('cm_test_newidx', DB_IDX);
+    }
+  });
+
+  // T24: the serial PK (assertions_pkey, keyed on `id`) is NOT_APPLICABLE --
+  // `id` is never a batch-supplied column -- and produces no false grouping.
+  await run('T24', 'assertions_pkey is reported NOT_APPLICABLE (missing column: id), never evaluated, never a false group', async () => {
+    const projectId = `example-project-t24-${TS}`;
+    const filePath = writeFixture('t24-handoff.md', [
+      '## NEXT SESSION',
+      '',
+      '1. A totally unique next-session item for T24',
+      '',
+    ].join('\n'));
+    const reportScratchDir = path.join(SCRATCH_DIR, 'reports-t24');
+    const r = runMigrate08(['--db', DB_TARGET, '--project-id', projectId, '--file', filePath, '--dry-run', '--report-dir', reportScratchDir]);
+    if (r.status !== 0) throw new Error(`dry-run failed: status=${r.status}\nstderr=${r.stderr}`);
+    const report = readReportFile(reportScratchDir, projectId);
+    const pkEntry = report.preflight.not_applicable_indexes.find((e) => e.name === 'assertions_pkey');
+    assert(pkEntry, 'expected assertions_pkey in not_applicable_indexes');
+    assertEq(JSON.stringify(pkEntry.missingColumns), JSON.stringify(['id']), 'assertions_pkey\'s only missing column must be "id"');
+    assertEq(report.preflight.buckets.collides_existing, 0, 'the PK must never contribute a false collides_existing');
+    assertEq(report.preflight.buckets.in_batch_duplicate, 0, 'the PK must never contribute a false in_batch_duplicate');
+  });
+
+  // T25: an INCLUDE column is never part of the index's KEY -- proven via
+  // the constraint-preflight module's own enumerateUniqueIndexes(), called
+  // directly against a scratch index with an INCLUDE clause.
+  await run('T25', 'enumerateUniqueIndexes() keys an INCLUDE-clause index WITHOUT the INCLUDE column', async () => {
+    const constraintPreflight = require(path.join(PROJECT_ROOT, 'scripts', 'migrations', 'lib', 'constraint-preflight.js'));
+    await createScratchIndex(`CREATE UNIQUE INDEX cm_test_include_idx ON assertions (project_id, subject) INCLUDE (object) WHERE suppressed = false`, DB_IDX);
+    try {
+      const client = await pgConnect(DB_IDX);
+      try {
+        const indexes = await constraintPreflight.enumerateUniqueIndexes(client);
+        const idx = indexes.find((i) => i.name === 'cm_test_include_idx');
+        assert(idx, 'expected cm_test_include_idx to be enumerated');
+        assertEq(idx.indnkeyatts, 2, 'the KEY must be exactly 2 columns (project_id, subject) -- INCLUDE (object) excluded');
+        assert(!idx.keyTexts.some((t) => /\bobject\b/.test(t)), `keyTexts must never reference the INCLUDE column "object"; got ${JSON.stringify(idx.keyTexts)}`);
+      } finally {
+        await client.end();
+      }
+    } finally {
+      await dropScratchIndex('cm_test_include_idx', DB_IDX);
+    }
+  });
+
+  // T26: gate -> preflight -> insert ordering. Reuses T12's "ahead" schema
+  // fingerprint scenario (S1 refuses before checkSchemaPreconditions/any
+  // INSERT) with a batch that WOULD otherwise trip the constraint
+  // preflight -- the failure must be the SCHEMA gate's, and the preflight
+  // must never have run (no [PREFLIGHT] lines in stdout).
+  await run('T26', 'ordering: the #258 schema/integrity-index gate refuses BEFORE the constraint preflight ever runs', async () => {
+    const projectId = `example-project-t26-${TS}`;
+    const client = await pgConnect(DB_TARGET);
+    try {
+      // Same deterministic "ahead" trigger T12 uses: a stored fingerprint
+      // epoch far newer than this engine build's own SCHEMA_EPOCH.
+      await client.query(
+        `INSERT INTO project_settings (project_id, key, value) VALUES ($1, 'schema_fingerprint', $2)
+           ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
+        [projectId, `9999:${'0'.repeat(64)}`]
+      );
+    } finally {
+      await client.end();
+    }
+    const historyPath = writeFixture('t26-history.md', [
+      '## Session 1 — 2026-01-01 — dup A',
+      '',
+      '### Open carry-overs',
+      '',
+      '| Item | Status | Notes |',
+      '|------|--------|-------|',
+      '| T26-DUP: shared | Open | shared notes |',
+      '',
+      '## Session 2 — 2026-01-02 — dup B',
+      '',
+      '### Open carry-overs',
+      '',
+      '| Item | Status | Notes |',
+      '|------|--------|-------|',
+      '| T26-DUP: shared | Open | shared notes |',
+      '',
+    ].join('\n'));
+    const r = runMigrate08(['--db', DB_TARGET, '--project-id', projectId, '--history-file', historyPath]);
+    assertEq(r.status, 1, `expected refusal; stdout=${r.stdout} stderr=${r.stderr}`);
+    assert(/reason=ahead/.test(r.stdout), `expected reason=ahead in stdout, got: ${r.stdout}`);
+    assert(/Refused: schema bring-forward/.test(r.stdout + r.stderr), `expected the S1 schema-gate refusal, got stdout=${r.stdout} stderr=${r.stderr}`);
+    assert(!/\[PREFLIGHT\]/.test(r.stdout), 'constraint preflight must never have run when the schema gate refuses first');
+
+    // cleanup: restore so this project_id doesn't linger ahead for anyone else
+    const client2 = await pgConnect(DB_TARGET);
+    try {
+      await client2.query(`DELETE FROM project_settings WHERE project_id = $1 AND key = 'schema_fingerprint'`, [projectId]);
+    } finally {
+      await client2.end();
+    }
+  });
+
+  // T27: post-insert assertion trips on a forced mismatch -- calls
+  // writeProjectMigration() directly (unit-level, bypassing the CLI) with a
+  // policyLiveCount that deliberately does not match reality, and confirms
+  // the whole transaction rolls back (zero rows persisted).
+  await run('T27', 'writeProjectMigration: a forced policyLiveCount mismatch throws and rolls back the whole transaction', async () => {
+    const projectId = `example-project-t27-${TS}`;
+    const client = await pgConnect(DB_TARGET);
+    try {
+      const slices = [{
+        sourceDb: 'filesystem:test:t27',
+        sourceTable: 'handoff_next_session_items',
+        rows: [{ subject: 'T27-ITEM', predicate: 'next_step', object: 'T27 body text', pinned: false, carryoverStatus: null, seq: 1, createdAt: null, __suppressed: false, __suppressionKind: null }],
+      }];
+      let threw = null;
+      try {
+        await migrate08Module.writeProjectMigration(client, {
+          projectId, authoringMode: 'verbose', slices, branch: 'STAGING',
+          policyLiveCount: 999, // deliberately wrong -- only 1 row will actually be live
+        });
+      } catch (err) {
+        threw = err;
+      }
+      assert(threw, 'expected writeProjectMigration to throw on a forced post-insert assertion mismatch');
+      assert(/post-insert assertion failed/.test(threw.message), `expected a post-insert assertion error, got: ${threw.message}`);
+      const { rows } = await client.query(`SELECT * FROM assertions WHERE project_id = $1`, [projectId]);
+      assertEq(rows.length, 0, 'the failed write must have rolled back completely -- zero rows persisted');
+    } finally {
+      await client.end();
+    }
   });
 
   console.log(`\nResults: ${passed} passed, ${failed} failed`);
