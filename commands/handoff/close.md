@@ -206,7 +206,10 @@ cycle` later restated as `SHIP-DECISION: defer to next cycle` — same key,
 new row supersedes the old). A colon with no space after it (a URL's
 `https://...` scheme colon, for example) never matches this rule, so a
 URL-led thread keys on its full text instead of colliding every URL-led
-thread onto the literal key `https`.
+thread onto the literal key `https`. **Accepted trade-off:** a generic
+lead-in collides too — `TODO: buy milk` and `TODO: file taxes` both key to
+`TODO` and supersede each other — so use a distinctive key (an issue
+number, a named thread) before `: `.
 
 
 
