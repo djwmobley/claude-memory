@@ -63,6 +63,8 @@ const { Client } = scriptsRequire('pg');
 
 const { normalizeFsPath } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'fs-path-normalize.js'));
 const handoffModule = require(path.join(PROJECT_ROOT, 'scripts', 'handoff.js'));
+const { PostgresAdapter } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'db-seam.js'));
+const migrate08Module = require(path.join(PROJECT_ROOT, 'scripts', 'migrations', 'migrate-08-handoff-markdown.js'));
 
 const TS = Date.now();
 
@@ -136,6 +138,18 @@ async function setupPerProjectEngineTarget(dbName, projectId) {
   const schemaSql = fs.readFileSync(CORE_SCHEMA_SQL_PATH, 'utf8');
   const client = await pgConnect(dbName);
   try {
+    // Real per-project engine DBs are always provisioned via /handoff:init
+    // (or migrate-01, which pre-creates these extensions before applying
+    // any schema file — see migrate-01-canonical-db.js's own ensureExtensions()
+    // doc comment for why order matters: handoff-core-schema.sql's
+    // assertions.embedding column is wrapped in a DO block that silently
+    // skips the ALTER TABLE if pgvector isn't installed YET in this
+    // database). Mirrored here so this hand-built fixture doesn't manufacture
+    // a "degraded" schema-apply outcome that a real per-project engine DB
+    // would never actually have.
+    for (const ext of ['vector', 'pg_trgm']) {
+      try { await client.query(`CREATE EXTENSION IF NOT EXISTS ${ext}`); } catch (_) { /* best-effort, mirrors migrate-01 */ }
+    }
     await client.query(schemaSql);
     await client.query(
       `INSERT INTO project_settings (project_id, key, value) VALUES ($1, 'schema_fingerprint', $2)
@@ -158,6 +172,55 @@ async function assertionColumnExists(dbName, columnName) {
   } finally {
     await client.end();
   }
+}
+
+// ── S1/S2/S3 fixture helpers (engine index bring-forward + integrity-index
+// gate, 2026-09-06 pass) ─────────────────────────────────────────────────
+
+/**
+ * Revert a fully-provisioned target's assertions_1ton_exact_unique index
+ * back to the KNOWN pre-cm#227 raw form (DROP the canonical md5(object)
+ * index, CREATE the raw-object one) — reproduces the live DEFECT this pass
+ * closes (memory_manager_staging's actual observed shape).
+ */
+async function revertIndexToStaleRawForm(dbName) {
+  const client = await pgConnect(dbName);
+  try {
+    await client.query('DROP INDEX IF EXISTS assertions_1ton_exact_unique');
+    await client.query(
+      'CREATE UNIQUE INDEX assertions_1ton_exact_unique ON assertions (project_id, subject, predicate, object) WHERE suppressed = false'
+    );
+  } finally {
+    await client.end();
+  }
+}
+
+/** Read back the live index's pg_get_indexdef/indisvalid, or null if absent. */
+async function getLiveIndexInfo(dbName) {
+  const client = await pgConnect(dbName);
+  try {
+    const { rows } = await client.query(
+      `SELECT pg_get_indexdef(i.indexrelid) AS indexdef, i.indisvalid, i.indisunique
+         FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+        WHERE i.indrelid = 'assertions'::regclass AND c.relname = 'assertions_1ton_exact_unique'`
+    );
+    return rows.length > 0 ? rows[0] : null;
+  } finally {
+    await client.end();
+  }
+}
+
+// Full STAGING-shaped fixture (migrate-01 + schema-addenda), matching
+// setupTargetSchema()'s own two-step sequence exactly — a STAGING target's
+// requiredColumnsForBranch() includes carryover_status (ADDENDA_ONLY), so a
+// migrate-01-only fixture would always fail checkSchemaPreconditions here,
+// unrelated to anything S1/S2/S3 classify.
+async function createFreshStagingDb(name) {
+  await dropDb(name);
+  const sys = await pgConnect('postgres');
+  await sys.query(`CREATE DATABASE "${name}"`);
+  await sys.end();
+  await setupTargetSchema(name);
 }
 
 const DB_TARGET = `verify08_target_${TS}_staging`;
@@ -812,6 +875,294 @@ async function main() {
     } finally {
       await client.end();
     }
+  });
+
+  // ── T12-T18: engine index bring-forward (S1) + total-classified
+  // integrity-index gate (S2/S3), 2026-09-06 pass — the memory_manager_
+  // staging DEFECT reproduction and its fix. ────────────────────────────
+
+  await run('T12', 'S1: a non-success ensureSchemaCurrent reason ("ahead") aborts the write BEFORE checkSchemaPreconditions / any INSERT, zero writes', async () => {
+    const projectAhead = `example-project-s1-ahead-${TS}`;
+    // A stored fingerprint epoch far newer than this engine build's own
+    // SCHEMA_EPOCH -> ensureSchemaCurrentCore's cmp === 'ahead' branch ->
+    // {applied:false, reason:'ahead'} -- a controllable, deterministic
+    // non-success reason (S1 aborts on ANY non-'current'/'applied' reason,
+    // not only 'integrity_index_failed').
+    const client = await pgConnect(DB_TARGET);
+    try {
+      await client.query(
+        `INSERT INTO project_settings (project_id, key, value) VALUES ($1, 'schema_fingerprint', $2)
+           ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
+        [projectAhead, `9999:${'0'.repeat(64)}`]
+      );
+    } finally {
+      await client.end();
+    }
+
+    const r = runMigrate08(['--db', DB_TARGET, '--project-id', projectAhead, '--file', activeFilePath]);
+    assertEq(r.status, 1, 'S1 abort on a non-success ensureSchemaCurrent reason should exit 1');
+    assert(/SCHEMA-BRING-FORWARD/.test(r.stdout), 'expected the S1 bring-forward log line');
+    assert(/reason=ahead/.test(r.stdout), 'expected reason=ahead in the S1 log line');
+    assert(/Refused: schema bring-forward/.test(r.stdout + r.stderr), 'expected the S1 refusal message');
+
+    const after = await pgConnect(DB_TARGET);
+    try {
+      const { rows } = await after.query(`SELECT COUNT(*)::int AS n FROM assertions WHERE project_id=$1`, [projectAhead]);
+      assertEq(rows[0].n, 0, 'S1 abort must happen before any INSERT for this project_id');
+    } finally {
+      await after.end();
+    }
+  });
+
+  await run('T13', 'S4(a)/DEFECT REPRO: a target whose index is the stale pre-cm#227 raw form has it brought forward to md5(object) BEFORE the write, and a >2704-byte object row inserts successfully (previously: btree row-size failure)', async () => {
+    const dbDefect = `verify08_defect_${TS}_staging`;
+    CREATED_DBS.push(dbDefect);
+    await createFreshStagingDb(dbDefect);
+    await revertIndexToStaleRawForm(dbDefect);
+    const before = await getLiveIndexInfo(dbDefect);
+    assert(before && /\(project_id, subject, predicate, object\)/.test(before.indexdef), 'fixture bug: index must be reverted to the raw (non-md5) form before this test runs');
+
+    // A durable-section body over 2704 bytes -- this is the exact shape
+    // that failed against a live STALE_RAW_OBJECT index ("index row size
+    // 3552 exceeds btree version 4 maximum 2704"). 3000 'X' characters,
+    // well past the limit, comfortably under the payload schema's 4000-char
+    // cap for this kind of content.
+    const giantNote = 'X'.repeat(3000);
+    const giantFixturePath = writeFixture(
+      'HANDOFF-giant-object.md',
+      ['## Critical operational notes', '', giantNote, ''].join('\n')
+    );
+
+    const projectDefect = `example-project-defect-${TS}`;
+    const r = runMigrate08(['--db', dbDefect, '--project-id', projectDefect, '--file', giantFixturePath]);
+    if (r.status !== 0) throw new Error(`DEFECT-REPRO write should now succeed: status=${r.status}\nstdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert(/MIGRATION_RESULT: PASS/.test(r.stdout), 'expected MIGRATION_RESULT: PASS');
+    assert(/integrity_index_class=CURRENT/.test(r.stdout), 'expected the post-bring-forward index class to be logged as CURRENT');
+
+    const after = await getLiveIndexInfo(dbDefect);
+    assert(after && /md5\(object\)/.test(after.indexdef), 'the index must have been brought forward to the md5(object) canonical form');
+    assertEq(after.indisvalid, true, 'the brought-forward index must be valid');
+
+    const client = await pgConnect(dbDefect);
+    try {
+      const { rows } = await client.query(
+        `SELECT length(object) AS len FROM assertions WHERE project_id=$1 AND predicate='critical_operational_notes'`,
+        [projectDefect]
+      );
+      assertEq(rows.length, 1, 'expected exactly one critical_operational_notes row');
+      assert(rows[0].len > 2704, `expected the giant object row to actually persist (>2704 bytes), got length=${rows[0].len}`);
+    } finally {
+      await client.end();
+    }
+  });
+
+  // ── T14: S2 total classification, one sub-case per class (+ the
+  // same-name-on-another-table MISSING variant) ────────────────────────
+  const DB_CLASSIFY = `verify08_classify_${TS}_staging`;
+  await run('T14a', 'S2: CURRENT -- freshly-provisioned canonical schema classifies CURRENT', async () => {
+    CREATED_DBS.push(DB_CLASSIFY);
+    await createFreshStagingDb(DB_CLASSIFY);
+    const client = await pgConnect(DB_CLASSIFY);
+    try {
+      const result = await migrate08Module.classifyIntegrityIndex(client);
+      assertEq(result.class, 'CURRENT', 'expected CURRENT on a freshly-provisioned canonical schema');
+      assertEq(result.indisvalid, true, 'CURRENT requires indisvalid=true');
+      assertEq(result.indisunique, true, 'CURRENT requires indisunique=true');
+    } finally {
+      await client.end();
+    }
+  });
+
+  await run('T14b', 'S2: STALE_RAW_OBJECT -- the known pre-cm#227 raw form classifies STALE_RAW_OBJECT', async () => {
+    await revertIndexToStaleRawForm(DB_CLASSIFY);
+    const client = await pgConnect(DB_CLASSIFY);
+    try {
+      const result = await migrate08Module.classifyIntegrityIndex(client);
+      assertEq(result.class, 'STALE_RAW_OBJECT', 'expected STALE_RAW_OBJECT on the reverted raw-form index');
+    } finally {
+      await client.end();
+    }
+  });
+
+  await run('T14c', 'S2: MISSING -- no index at all on assertions', async () => {
+    const client = await pgConnect(DB_CLASSIFY);
+    try {
+      await client.query('DROP INDEX IF EXISTS assertions_1ton_exact_unique');
+      const result = await migrate08Module.classifyIntegrityIndex(client);
+      assertEq(result.class, 'MISSING', 'expected MISSING when no such index exists on assertions');
+      assertEq(result.indexdef, null, 'MISSING must carry a null indexdef');
+    } finally {
+      await client.end();
+    }
+  });
+
+  await run('T14d', 'S2: MISSING -- a same-named index exists, but on a DIFFERENT table (indrelid-scoped, never a bare relname match)', async () => {
+    const client = await pgConnect(DB_CLASSIFY);
+    try {
+      await client.query('CREATE TABLE other_table_test_t14d (project_id text, subject text, predicate text, object text, suppressed boolean)');
+      await client.query('CREATE UNIQUE INDEX assertions_1ton_exact_unique ON other_table_test_t14d (project_id, subject, predicate, object) WHERE suppressed = false');
+      const result = await migrate08Module.classifyIntegrityIndex(client);
+      assertEq(result.class, 'MISSING', 'a same-named index on a different table must still classify MISSING for assertions');
+      await client.query('DROP TABLE other_table_test_t14d');
+    } finally {
+      await client.end();
+    }
+  });
+
+  await run('T14e', 'S2: UNRECOGNIZED -- a valid index whose shape matches neither canonical nor the known stale-raw form', async () => {
+    const client = await pgConnect(DB_CLASSIFY);
+    try {
+      await client.query('CREATE UNIQUE INDEX assertions_1ton_exact_unique ON assertions (project_id, subject, predicate) WHERE suppressed = false');
+      const result = await migrate08Module.classifyIntegrityIndex(client);
+      assertEq(result.class, 'UNRECOGNIZED', 'expected UNRECOGNIZED for an unrecognized valid shape');
+      assertEq(result.indisvalid, true, 'this fixture is deliberately VALID -- proves UNRECOGNIZED is not only reached via the invalid path');
+      await client.query('DROP INDEX assertions_1ton_exact_unique');
+    } finally {
+      await client.end();
+    }
+  });
+
+  await run('T14f', 'S2: UNRECOGNIZED -- an INVALID index of the CANONICAL shape is still UNRECOGNIZED, never CURRENT (indisvalid checked before any shape comparison)', async () => {
+    const client = await pgConnect(DB_CLASSIFY);
+    try {
+      await client.query('CREATE UNIQUE INDEX assertions_1ton_exact_unique ON assertions (project_id, subject, predicate, md5(object)) WHERE suppressed = false');
+      await client.query(`UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'assertions_1ton_exact_unique'::regclass`);
+      const result = await migrate08Module.classifyIntegrityIndex(client);
+      assertEq(result.class, 'UNRECOGNIZED', 'an INVALID index of the canonical shape must classify UNRECOGNIZED, never CURRENT');
+      assertEq(result.indisvalid, false, 'sanity: the fixture is genuinely marked invalid');
+    } finally {
+      await client.end();
+    }
+  });
+
+  // ── T15: S3 dry-run reporting per class ───────────────────────────────
+  const DB_DRYCLASS = `verify08_dryclass_${TS}_staging`;
+  await run('T15a', 'S3: dry-run against STALE_RAW_OBJECT is PASS-with-note ("write mode will bring forward"), never FAIL', async () => {
+    CREATED_DBS.push(DB_DRYCLASS);
+    await createFreshStagingDb(DB_DRYCLASS);
+    await revertIndexToStaleRawForm(DB_DRYCLASS);
+    const reportScratchDir = path.join(SCRATCH_DIR, 'reports-t15a');
+    const projectDry = `example-project-dry-stale-${TS}`;
+    const r = runMigrate08(['--db', DB_DRYCLASS, '--project-id', projectDry, '--file', activeFilePath, '--dry-run', '--report-dir', reportScratchDir]);
+    if (r.status !== 0) throw new Error(`dry-run against STALE_RAW_OBJECT should PASS: status=${r.status}\nstdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert(/DRY_RUN_RESULT: PASS/.test(r.stdout), 'expected DRY_RUN_RESULT: PASS for STALE_RAW_OBJECT');
+    assert(/write mode will bring forward/.test(r.stdout), 'expected the "write mode will bring forward" note');
+    const report = readReportFile(reportScratchDir, projectDry);
+    assertEq(report.integrity_index_class, 'STALE_RAW_OBJECT', 'report should carry integrity_index_class=STALE_RAW_OBJECT');
+  });
+
+  await run('T15b', 'S3: dry-run against MISSING is PASS-with-note ("write mode will bring forward"), never FAIL', async () => {
+    const client = await pgConnect(DB_DRYCLASS);
+    try {
+      await client.query('DROP INDEX IF EXISTS assertions_1ton_exact_unique');
+    } finally {
+      await client.end();
+    }
+    const reportScratchDir = path.join(SCRATCH_DIR, 'reports-t15b');
+    const projectDry = `example-project-dry-missing-${TS}`;
+    const r = runMigrate08(['--db', DB_DRYCLASS, '--project-id', projectDry, '--file', activeFilePath, '--dry-run', '--report-dir', reportScratchDir]);
+    if (r.status !== 0) throw new Error(`dry-run against MISSING should PASS: status=${r.status}\nstdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert(/DRY_RUN_RESULT: PASS/.test(r.stdout), 'expected DRY_RUN_RESULT: PASS for MISSING');
+    assert(/write mode will bring forward/.test(r.stdout), 'expected the "write mode will bring forward" note');
+    const report = readReportFile(reportScratchDir, projectDry);
+    assertEq(report.integrity_index_class, 'MISSING', 'report should carry integrity_index_class=MISSING');
+  });
+
+  await run('T15c', 'S3: dry-run against UNRECOGNIZED FAILs the dry-run report (never silently PASS)', async () => {
+    const client = await pgConnect(DB_DRYCLASS);
+    try {
+      await client.query('CREATE UNIQUE INDEX assertions_1ton_exact_unique ON assertions (project_id, subject, predicate) WHERE suppressed = false');
+    } finally {
+      await client.end();
+    }
+    const reportScratchDir = path.join(SCRATCH_DIR, 'reports-t15c');
+    const projectDry = `example-project-dry-unrecognized-${TS}`;
+    const r = runMigrate08(['--db', DB_DRYCLASS, '--project-id', projectDry, '--file', activeFilePath, '--dry-run', '--report-dir', reportScratchDir]);
+    assertEq(r.status, 1, 'dry-run against UNRECOGNIZED must exit 1 (FAIL)');
+    assert(/DRY_RUN_RESULT: FAIL/.test(r.stdout + r.stderr), 'expected DRY_RUN_RESULT: FAIL for UNRECOGNIZED');
+    const report = readReportFile(reportScratchDir, projectDry);
+    assertEq(report.integrity_index_class, 'UNRECOGNIZED', 'report should carry integrity_index_class=UNRECOGNIZED');
+  });
+
+  await run('T16', 'S1 doc / S4(c): a failed CREATE in the DROP+CREATE pair leaves the pre-existing (stale) index intact -- db-seam.js runIntegrityIndexPair rolls the paired DROP back too', async () => {
+    const dbPair = `verify08_pairfail_${TS}`;
+    CREATED_DBS.push(dbPair);
+    await dropDb(dbPair);
+    const sys = await pgConnect('postgres');
+    await sys.query(`CREATE DATABASE "${dbPair}"`);
+    await sys.end();
+
+    const client = await pgConnect(dbPair);
+    try {
+      await client.query('CREATE TABLE assertions (project_id text, subject text, predicate text, object text, suppressed boolean)');
+      const rawCreate = 'CREATE UNIQUE INDEX assertions_1ton_exact_unique ON assertions (project_id, subject, predicate, object) WHERE suppressed = false';
+      await client.query(rawCreate);
+
+      const adapter = new PostgresAdapter(client);
+      // Deliberately-broken createSql (references a nonexistent column) --
+      // a deterministic, reproducible CREATE failure that exercises the
+      // SAME atomic DROP+CREATE pairing S1's bring-forward relies on,
+      // without depending on an unconstructable genuine md5-collision
+      // scenario (see this PR's BLIND SPOTS).
+      const dropSql = 'DROP INDEX IF EXISTS assertions_1ton_exact_unique';
+      const badCreate = 'CREATE UNIQUE INDEX assertions_1ton_exact_unique ON assertions (project_id, subject, predicate, md5(does_not_exist)) WHERE suppressed = false';
+
+      const result = await adapter.runIntegrityIndexPair(dropSql, badCreate);
+      assertEq(result.ok, false, 'the deliberately-broken CREATE must fail');
+
+      const { rows } = await client.query(
+        `SELECT pg_get_indexdef(i.indexrelid) AS def, i.indisvalid
+           FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+          WHERE i.indrelid = 'assertions'::regclass AND c.relname = 'assertions_1ton_exact_unique'`
+      );
+      assertEq(rows.length, 1, 'the pre-existing index must still be present after the failed CREATE (DROP was rolled back too)');
+      assertEq(rows[0].indisvalid, true, 'the surviving index must still be valid');
+      assert(/, object\)/.test(rows[0].def), 'the surviving index must be the untouched RAW form, not partially rebuilt into the canonical shape');
+    } finally {
+      await client.end();
+    }
+  });
+
+  await run('T17', 'S4(d): S1 bring-forward on a shared STAGING target is idempotent across two DISTINCT project_ids', async () => {
+    const projectS1a = `example-project-s1-shared-a-${TS}`;
+    const projectS1b = `example-project-s1-shared-b-${TS}`;
+    const r1 = runMigrate08(['--db', DB_TARGET, '--project-id', projectS1a, '--file', activeFilePath]);
+    if (r1.status !== 0) throw new Error(`first project_id write failed: status=${r1.status}\nstderr=${r1.stderr}`);
+    assert(/MIGRATION_RESULT: PASS/.test(r1.stdout), 'expected PASS for the first project_id');
+    assert(/integrity_index_class=CURRENT/.test(r1.stdout), 'expected CURRENT for the first project_id');
+
+    const r2 = runMigrate08(['--db', DB_TARGET, '--project-id', projectS1b, '--file', activeFilePath]);
+    if (r2.status !== 0) throw new Error(`second (distinct) project_id write failed: status=${r2.status}\nstderr=${r2.stderr}`);
+    assert(/MIGRATION_RESULT: PASS/.test(r2.stdout), 'expected PASS for the second, distinct project_id');
+    assert(/integrity_index_class=CURRENT/.test(r2.stdout), 'expected CURRENT for the second project_id');
+
+    const after = await getLiveIndexInfo(DB_TARGET);
+    assert(after && /md5\(object\)/.test(after.indexdef) && after.indisvalid === true, 'the shared target\'s index must remain the valid canonical form after both runs');
+  });
+
+  await run('T18', 'S4(e)/S2: dry-run leaves ZERO persistent objects on the target (pg_class row count unchanged before/after)', async () => {
+    const before = await pgConnect(DB_TARGET);
+    let countBefore;
+    try {
+      countBefore = (await before.query(`SELECT COUNT(*)::int AS n FROM pg_class`)).rows[0].n;
+    } finally {
+      await before.end();
+    }
+
+    const projectDry = `example-project-dry-nopersist-${TS}`;
+    const reportScratchDir = path.join(SCRATCH_DIR, 'reports-t18');
+    const r = runMigrate08(['--db', DB_TARGET, '--project-id', projectDry, '--file', activeFilePath, '--dry-run', '--report-dir', reportScratchDir]);
+    if (r.status !== 0) throw new Error(`dry-run failed: status=${r.status}\nstderr=${r.stderr}`);
+    assert(/DRY_RUN_RESULT: PASS/.test(r.stdout), 'expected DRY_RUN_RESULT: PASS');
+
+    const after = await pgConnect(DB_TARGET);
+    let countAfter;
+    try {
+      countAfter = (await after.query(`SELECT COUNT(*)::int AS n FROM pg_class`)).rows[0].n;
+    } finally {
+      await after.end();
+    }
+    assertEq(countAfter, countBefore, 'dry-run must leave zero persistent catalog objects (temp tables must be rolled back, never committed)');
   });
 
   console.log(`\nResults: ${passed} passed, ${failed} failed`);
