@@ -35,6 +35,8 @@
  * row.
  */
 
+const routingIdentity = require('./routing-identity.js');
+
 class RoutingProfileError extends Error {
   constructor(code, message) {
     super(message);
@@ -68,11 +70,22 @@ const VALID_TIERS = Object.freeze(['high', 'mid', 'low']);
  * @returns {Promise<{id:number, version:number}>}
  */
 async function routingProfileSet(client, args) {
-  const { projectId, role, capabilityTier } = args || {};
-  requireNonEmptyString(projectId, 'projectId');
-  requireNonEmptyString(role, 'role');
+  const { projectId: projectIdRaw, role: roleRaw, capabilityTier } = args || {};
+  requireNonEmptyString(projectIdRaw, 'projectId');
+  requireNonEmptyString(roleRaw, 'role');
   if (!VALID_TIERS.includes(capabilityTier)) {
     throw new RoutingProfileError('validation', `routing-profile: capabilityTier must be one of ${JSON.stringify(VALID_TIERS)} (got ${JSON.stringify(capabilityTier)})`);
+  }
+  // F-1 (§17 B1 spec-adversary): normalize project_id/role identically to
+  // route-resolve.js's read sites — an un-normalized pin written here (e.g.
+  // trailing whitespace) would otherwise be unfindable by routeResolve's
+  // now-normalized routing_profiles lookups.
+  let projectId, role;
+  try {
+    projectId = routingIdentity.requireNormalizedNonEmpty(projectIdRaw, 'projectId', routingIdentity.normId);
+    role = routingIdentity.requireNormalizedNonEmpty(roleRaw, 'role', routingIdentity.normRole);
+  } catch (err) {
+    throw new RoutingProfileError('validation', `routing-profile: ${err.message}`);
   }
 
   await client.query('BEGIN');
@@ -124,13 +137,24 @@ async function routingProfileSet(client, args) {
  * routing_profile_get(project_id, role?) -> [routing_profiles rows]. `role`
  * omitted returns every ACTIVE profile for the project (§17.3).
  */
-async function routingProfileGet(client, { projectId, role }) {
-  requireNonEmptyString(projectId, 'projectId');
+async function routingProfileGet(client, { projectId: projectIdRaw, role: roleRaw }) {
+  requireNonEmptyString(projectIdRaw, 'projectId');
+  // F-1: normalize — matches routingProfileSet's write-time normalization
+  // above and route-resolve.js's read-site normalization.
+  let projectId, role;
+  try {
+    projectId = routingIdentity.requireNormalizedNonEmpty(projectIdRaw, 'projectId', routingIdentity.normId);
+    role = (roleRaw === undefined || roleRaw === null || roleRaw === '')
+      ? null
+      : routingIdentity.requireNormalizedNonEmpty(roleRaw, 'role', routingIdentity.normRole);
+  } catch (err) {
+    throw new RoutingProfileError('validation', `routing-profile: ${err.message}`);
+  }
   const { rows } = await client.query(
     `SELECT * FROM routing_profiles
       WHERE project_id = $1 AND active = true AND ($2::text IS NULL OR role = $2)
       ORDER BY role, version DESC`,
-    [projectId, role || null]
+    [projectId, role]
   );
   return rows;
 }

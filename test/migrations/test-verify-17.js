@@ -45,6 +45,11 @@ const ROUTE_RESOLVE_PATH = path.join(PROJECT_ROOT, 'scripts', 'lib', 'route-reso
 
 const routeResolveLib = require(ROUTE_RESOLVE_PATH);
 const { routeResolve, recommendLeastCost, resolveRequiredTier } = routeResolveLib;
+const routingWriteSurfaceLib = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'routing-write-surface.js'));
+const {
+  modelRegistrySet, routingSessionOverrideSet, routingSessionOverrideGet, routingSessionOverrideClear,
+} = routingWriteSurfaceLib;
+const routingIdentity = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'routing-identity.js'));
 
 // scripts/ has its own node_modules (pg, etc.) — this test lives under
 // test/, outside that tree, so resolve 'pg' the same way the sibling
@@ -568,6 +573,329 @@ function testCoerceCostPure() {
   assertEq(routeResolveLib.coerceCost('0'), 0, "'0' coerced to 0, not mistaken for null");
 }
 
+// ── Group C: §17 B1 routing write surface (model_registry_set,
+// routing_session_override_set/get/clear) — CONSOLIDATION-RUNBOOK.md §17,
+// 2026-09-06 spec-adversary + amended spec. ─────────────────────────────
+
+async function assertRejects(fn, msgRegex, label) {
+  let threw = null;
+  try {
+    await fn();
+  } catch (err) {
+    threw = err;
+  }
+  assert(threw !== null, `${label || 'expected a rejection'} — nothing was thrown`);
+  assert(msgRegex.test(threw.message), `${label || 'error message mismatch'}: "${threw.message}" did not match ${msgRegex}`);
+}
+
+// ── C1: session override beats project pin ─────────────────────────────
+
+async function testOverrideBeatsProjectPin(client) {
+  const projectId = `c1-proj-${TS}`;
+  const sessionId = `c1-sess-${TS}`;
+  const role = `c1-role-${TS}`;
+  const pinLabel = `c1-model-pin-${TS}`;
+  const overrideLabel = `c1-model-override-${TS}`;
+
+  try {
+    await modelRegistrySet(client, { label: pinLabel, capabilityTier: 'low', costInPerMtok: 1, costOutPerMtok: 1 });
+    await modelRegistrySet(client, { label: overrideLabel, capabilityTier: 'low', costInPerMtok: 2, costOutPerMtok: 2 });
+    await insertProfile(client, { projectId, role, tier: 'low', preferredModel: pinLabel, version: 1 });
+
+    await routingSessionOverrideSet(client, { projectId, sessionId, role, label: overrideLabel });
+
+    const r = await routeResolve(client, { projectId, sessionId, turnIdx: 0, role });
+    assertEq(r.resolved_via, 'directive');
+    assertEq(r.model, overrideLabel, 'session override must win over the project pin');
+    assert(/session override/.test(r.rationale), `expected rationale to name the session override, got: ${r.rationale}`);
+  } finally {
+    await deleteModels(client, [pinLabel, overrideLabel]);
+  }
+}
+
+// ── C2: session override loses to the explicit overrideModel argument ───
+
+async function testOverrideModelArgBeatsSessionOverride(client) {
+  const projectId = `c2-proj-${TS}`;
+  const sessionId = `c2-sess-${TS}`;
+  const role = `c2-role-${TS}`;
+  const sessionLabel = `c2-model-session-${TS}`;
+  const argOverrideModel = `c2-model-argoverride-${TS}`;
+
+  try {
+    await modelRegistrySet(client, { label: sessionLabel, capabilityTier: 'low', costInPerMtok: 1, costOutPerMtok: 1 });
+    await routingSessionOverrideSet(client, { projectId, sessionId, role, label: sessionLabel });
+
+    // argOverrideModel is deliberately NOT registered — the per-turn
+    // overrideModel argument wins outright regardless of registry state
+    // (route-resolve.js's directive chain, step (a)).
+    const r = await routeResolve(client, { projectId, sessionId, turnIdx: 0, role, overrideModel: argOverrideModel });
+    assertEq(r.model, argOverrideModel, 'the per-turn overrideModel arg must win over a session override');
+    assertEq(r.resolved_via, 'directive');
+  } finally {
+    await deleteModels(client, [sessionLabel]);
+  }
+}
+
+// ── C3: cross-session isolation for session overrides ───────────────────
+
+async function testSessionOverrideCrossSessionIsolation(client) {
+  const projectId = `c3-proj-${TS}`;
+  const role = `c3-role-${TS}`;
+  const sessionA = `c3-sess-a-${TS}`;
+  const sessionB = `c3-sess-b-${TS}`;
+  const overrideLabel = `c3-model-override-${TS}`;
+  const cheapLabel = `c3-model-cheap-${TS}`;
+
+  try {
+    await insertProfile(client, { projectId, role, tier: 'low' }); // tier baseline only, non-directive
+    await modelRegistrySet(client, { label: overrideLabel, capabilityTier: 'low', costInPerMtok: 5, costOutPerMtok: 5 });
+    await modelRegistrySet(client, { label: cheapLabel, capabilityTier: 'low', costInPerMtok: 1, costOutPerMtok: 1 });
+    await routingSessionOverrideSet(client, { projectId, sessionId: sessionA, role, label: overrideLabel });
+
+    const rA = await routeResolve(client, { projectId, sessionId: sessionA, turnIdx: 0, role });
+    assertEq(rA.model, overrideLabel, 'session A must see its own override');
+
+    const rB = await routeResolve(client, { projectId, sessionId: sessionB, turnIdx: 0, role });
+    assert(rB.model !== overrideLabel, "session B must NEVER see session A's override");
+    assertEq(rB.resolved_via, 'recommendation', 'session B has no override/pin of its own and must fall through to recommendation');
+  } finally {
+    await deleteModels(client, [overrideLabel, cheapLabel]);
+  }
+}
+
+// ── C4: clear -> fallback ────────────────────────────────────────────────
+
+async function testClearFallsBackToPin(client) {
+  const projectId = `c4-proj-${TS}`;
+  const sessionId = `c4-sess-${TS}`;
+  const role = `c4-role-${TS}`;
+  const pinLabel = `c4-model-pin-${TS}`;
+  const overrideLabel = `c4-model-override-${TS}`;
+
+  try {
+    await modelRegistrySet(client, { label: pinLabel, capabilityTier: 'low', costInPerMtok: 1, costOutPerMtok: 1 });
+    await modelRegistrySet(client, { label: overrideLabel, capabilityTier: 'low', costInPerMtok: 2, costOutPerMtok: 2 });
+    await insertProfile(client, { projectId, role, tier: 'low', preferredModel: pinLabel, version: 1 });
+    await routingSessionOverrideSet(client, { projectId, sessionId, role, label: overrideLabel });
+
+    const r0 = await routeResolve(client, { projectId, sessionId, turnIdx: 0, role });
+    assertEq(r0.model, overrideLabel);
+
+    const clearResult = await routingSessionOverrideClear(client, { projectId, sessionId, role });
+    assertEq(clearResult.cleared, true, 'clearing an existing override must report cleared:true');
+
+    const r1 = await routeResolve(client, { projectId, sessionId, turnIdx: 1, role });
+    assertEq(r1.model, pinLabel, 'after clear, resolution must fall back to the project pin');
+    assertEq(r1.resolved_via, 'directive');
+  } finally {
+    await deleteModels(client, [pinLabel, overrideLabel]);
+  }
+}
+
+// ── C5: clear on a nonexistent row -> {cleared:false}, not an error ─────
+
+async function testClearOnMissingIsFalseNotError(client) {
+  const projectId = `c5-proj-${TS}`;
+  const sessionId = `c5-sess-${TS}`;
+  const role = `c5-role-${TS}`;
+
+  const result = await routingSessionOverrideClear(client, { projectId, sessionId, role });
+  assertEq(result.cleared, false, 'clearing a key with no row must return cleared:false, never throw');
+}
+
+// ── C6: get lists without side effects ──────────────────────────────────
+
+async function testGetListsWithoutSideEffects(client) {
+  const projectId = `c6-proj-${TS}`;
+  const sessionId = `c6-sess-${TS}`;
+  const roleA = `c6-role-a-${TS}`;
+  const roleB = `c6-role-b-${TS}`;
+  const labelA = `c6-model-a-${TS}`;
+  const labelB = `c6-model-b-${TS}`;
+
+  try {
+    await modelRegistrySet(client, { label: labelA, capabilityTier: 'low', costInPerMtok: 1, costOutPerMtok: 1 });
+    await modelRegistrySet(client, { label: labelB, capabilityTier: 'low', costInPerMtok: 1, costOutPerMtok: 1 });
+    await routingSessionOverrideSet(client, { projectId, sessionId, role: roleA, label: labelA });
+    await routingSessionOverrideSet(client, { projectId, sessionId, role: roleB, label: labelB });
+
+    const allRows = await routingSessionOverrideGet(client, { projectId, sessionId });
+    assertEq(allRows.length, 2, 'role omitted must list every override for the session');
+
+    const scopedRows = await routingSessionOverrideGet(client, { projectId, sessionId, role: roleA });
+    assertEq(scopedRows.length, 1, 'role given must scope to exactly one row');
+    assertEq(scopedRows[0].model_id, labelA);
+
+    // Side-effect check: calling get again must return the SAME set —
+    // never mutate set_at, never write turn_usage, never consume anything.
+    const n = await countTurnUsage(client, projectId, sessionId, 0, roleA);
+    assertEq(n, 0, 'routing_session_override_get must never write to turn_usage');
+    const allRowsAgain = await routingSessionOverrideGet(client, { projectId, sessionId });
+    assertEq(allRowsAgain.length, 2, 'a second get call must return the identical row count (no side effects)');
+  } finally {
+    await deleteModels(client, [labelA, labelB]);
+  }
+}
+
+// ── C7: register -> route_resolve recommends the newly-registered model ─
+
+async function testRegisterThenRecommend(client) {
+  const projectId = `c7-proj-${TS}`;
+  const sessionId = `c7-sess-${TS}`;
+  const role = `c7-role-${TS}`;
+  const label = `c7-model-new-${TS}`;
+
+  try {
+    await modelRegistrySet(client, { label, capabilityTier: 'low', costInPerMtok: 0.5, costOutPerMtok: 0.5 });
+    await insertProfile(client, { projectId, role, tier: 'low' }); // tier baseline only, no pin
+
+    const r = await routeResolve(client, { projectId, sessionId, turnIdx: 0, role });
+    assertEq(r.resolved_via, 'recommendation');
+    assertEq(r.model, label, 'the just-registered model must be recommended (sole low-tier candidate)');
+  } finally {
+    await deleteModels(client, [label]);
+  }
+}
+
+// ── C8: partial-cost row excluded from the pool but directive-selectable ─
+
+async function testPartialCostExcludedButDirectiveSelectable(client) {
+  const projectId = `c8-proj-${TS}`;
+  const sessionId = `c8-sess-${TS}`;
+  const role = `c8-role-${TS}`;
+  const partialLabel = `c8-model-partial-${TS}`;
+  const fullLabel = `c8-model-full-${TS}`;
+
+  try {
+    // Only costInPerMtok set — costOutPerMtok stays NULL (never registered).
+    await modelRegistrySet(client, { label: partialLabel, capabilityTier: 'low', costInPerMtok: 1 });
+    await modelRegistrySet(client, { label: fullLabel, capabilityTier: 'low', costInPerMtok: 9, costOutPerMtok: 9 });
+
+    const rec = await recommendLeastCost(client, 'low');
+    assert(rec.label !== partialLabel, 'a partial-cost row must be excluded from the recommendation pool even though it is cheaper');
+    assertEq(rec.label, fullLabel);
+
+    // But directly overriding to the partial-cost model must still succeed —
+    // directive selection performs NO cost/tier gate.
+    await routingSessionOverrideSet(client, { projectId, sessionId, role, label: partialLabel });
+    const r = await routeResolve(client, { projectId, sessionId, turnIdx: 0, role });
+    assertEq(r.model, partialLabel, 'a partial-cost model must remain directive-selectable via a session override');
+    assertEq(r.resolved_via, 'directive');
+  } finally {
+    await deleteModels(client, [partialLabel, fullLabel]);
+  }
+}
+
+// ── C9: model_id re-point rejected without force ─────────────────────────
+
+async function testModelIdRepointRejectedWithoutForce(client) {
+  const label = `c9-model-${TS}`;
+  try {
+    await modelRegistrySet(client, { label, modelId: 'provider-model-v1' });
+
+    await assertRejects(
+      () => modelRegistrySet(client, { label, modelId: 'provider-model-v2' }),
+      /already points to model_id/,
+      'a re-point to a different modelId without force must reject'
+    );
+
+    // force:true must allow it, and record the new value.
+    const forced = await modelRegistrySet(client, { label, modelId: 'provider-model-v2', force: true });
+    assertEq(forced.model_id, 'provider-model-v2', 'force:true must actually apply the re-point');
+  } finally {
+    await deleteModels(client, [label]);
+  }
+}
+
+// ── C10: duplicate model_id (two labels, same model_id) rejected ────────
+
+async function testDuplicateModelIdRejectedWithoutForce(client) {
+  const labelA = `c10-model-a-${TS}`;
+  const labelB = `c10-model-b-${TS}`;
+  try {
+    await modelRegistrySet(client, { label: labelA, modelId: 'shared-provider-id' });
+
+    await assertRejects(
+      () => modelRegistrySet(client, { label: labelB, modelId: 'shared-provider-id' }),
+      /already used by label/,
+      'a second label claiming the same modelId without force must reject'
+    );
+
+    const forced = await modelRegistrySet(client, { label: labelB, modelId: 'shared-provider-id', force: true });
+    assertEq(forced.model_id, 'shared-provider-id', 'force:true must allow the alias');
+  } finally {
+    await deleteModels(client, [labelA, labelB]);
+  }
+}
+
+// ── C11: '*' rejected for session-override project/session ids ─────────
+
+async function testStarRejectedForSessionOverrides(client) {
+  const role = `c11-role-${TS}`;
+  await assertRejects(
+    () => routingSessionOverrideSet(client, { projectId: '*', sessionId: `c11-sess-${TS}`, role, label: `c11-model-${TS}` }),
+    /projectId cannot be '\*'/,
+    "projectId:'*' must reject on set"
+  );
+  await assertRejects(
+    () => routingSessionOverrideSet(client, { projectId: `c11-proj-${TS}`, sessionId: '*', role, label: `c11-model-${TS}` }),
+    /sessionId cannot be '\*'/,
+    "sessionId:'*' must reject on set"
+  );
+  await assertRejects(
+    () => routingSessionOverrideGet(client, { projectId: '*', sessionId: `c11-sess-${TS}` }),
+    /projectId cannot be '\*'/,
+    "projectId:'*' must reject on get"
+  );
+  await assertRejects(
+    () => routingSessionOverrideClear(client, { projectId: '*', sessionId: `c11-sess-${TS}`, role }),
+    /projectId cannot be '\*'/,
+    "projectId:'*' must reject on clear"
+  );
+}
+
+// ── C12: NFC/trailing-space label written then found by route_resolve ───
+
+async function testNormalizedLabelWrittenThenFoundByRouteResolve(client) {
+  const projectId = `c12-proj-${TS}`;
+  const sessionId = `c12-sess-${TS}`;
+  const role = `c12-role-${TS}`;
+  const providerName = `c12-provider-${TS}`;
+
+  // NFD form of "cafe" + a combining acute accent (U+0301) placed right
+  // after the 'e' -- visually "café", byte-distinct from the NFC
+  // precomposed form built below via String.fromCharCode. Written WITH
+  // leading/trailing whitespace and an internal double space.
+  const nfdWord = 'cafe' + String.fromCharCode(0x0301);
+  const rawLabel = `  c12-${TS}  ${nfdWord}-model  `;
+
+  // NFC precomposed form (byte-distinct from nfdWord above, same visual
+  // string) built via String.fromCharCode(0x00e9), with no extra
+  // whitespace -- what a route_resolve caller might reasonably type as an
+  // overrideModel argument, unaware of exactly how the label was
+  // originally registered.
+  const nfcWord = 'caf' + String.fromCharCode(0x00e9);
+  const lookupForm = `c12-${TS} ${nfcWord}-model`;
+
+  const normalizedLabel = routingIdentity.normLabel(rawLabel);
+  assertEq(normalizedLabel, routingIdentity.normLabel(lookupForm), 'the raw write form and the lookup form must normalize to the SAME canonical label (sanity check on the fixture itself)');
+
+  try {
+    const written = await modelRegistrySet(client, { label: rawLabel, provider: providerName, capabilityTier: 'low', costInPerMtok: 1, costOutPerMtok: 1 });
+    assertEq(written.label, normalizedLabel, 'model_registry_set must store the NORMALIZED label, not the raw messy input');
+
+    // route_resolve must find the registry row (and its provider) via a
+    // directive using the DIFFERENT-but-equivalent lookup form -- proving
+    // the write-time and read-time normalization agree.
+    const r = await routeResolve(client, { projectId, sessionId, turnIdx: 0, role, overrideModel: lookupForm });
+    assertEq(r.model, lookupForm, "the directive's model field echoes the caller's overrideModel verbatim (only the REGISTRY LOOKUP is normalized, not what's echoed back)");
+    assertEq(r.provider, providerName, 'route_resolve must resolve the provider from model_registry despite the NFD/whitespace form the label was originally written with');
+  } finally {
+    await deleteModels(client, [normalizedLabel]);
+  }
+}
+
 // ── Main ───────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -593,6 +921,19 @@ async function main() {
       await run('B9', 'routeResolve: directive present + totally unconfigured role -> succeeds, recommendation fields degrade to NULL', () => testDirectivePresentUnconfiguredRole(client));
       await run('B10', 'routeResolve: a registered pin below the required tier is flagged in rationale (tier-fit bypass is intentional)', () => testPinTierMismatchRationale(client));
       await run('B11', 'recommendLeastCost: string-vs-numeric cost boundary (rate-sums 9 vs 10) resolves numerically correct', () => testStringVsNumericBoundary(client));
+
+      await run('C1', '§17 B1: session override beats project pin', () => testOverrideBeatsProjectPin(client));
+      await run('C2', '§17 B1: the per-turn overrideModel argument beats a session override', () => testOverrideModelArgBeatsSessionOverride(client));
+      await run('C3', '§17 B1: session overrides are isolated per session (never leak to a different session)', () => testSessionOverrideCrossSessionIsolation(client));
+      await run('C4', '§17 B1: clearing a session override falls back to the project pin', () => testClearFallsBackToPin(client));
+      await run('C5', '§17 B1: clearing a nonexistent override returns {cleared:false}, never throws', () => testClearOnMissingIsFalseNotError(client));
+      await run('C6', '§17 B1: routing_session_override_get lists without side effects', () => testGetListsWithoutSideEffects(client));
+      await run('C7', '§17 B1: a newly-registered model is recommended by route_resolve with no directive', () => testRegisterThenRecommend(client));
+      await run('C8', '§17 B1: a partial-cost model is excluded from the recommendation pool but stays directive-selectable', () => testPartialCostExcludedButDirectiveSelectable(client));
+      await run('C9', '§17 B1: re-pointing an existing non-NULL model_id is rejected without force:true', () => testModelIdRepointRejectedWithoutForce(client));
+      await run('C10', '§17 B1: a duplicate model_id (two labels) is rejected without force:true', () => testDuplicateModelIdRejectedWithoutForce(client));
+      await run('C11', "§17 B1: '*' is rejected for session-override project_id/session_id on set/get/clear", () => testStarRejectedForSessionOverrides(client));
+      await run('C12', '§17 B1: an NFC/trailing-space-normalized label written via model_registry_set is found by route_resolve under a differently-formatted equivalent form', () => testNormalizedLabelWrittenThenFoundByRouteResolve(client));
     } finally {
       await client.end();
       await concurrentClient.end();

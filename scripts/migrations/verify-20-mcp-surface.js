@@ -8,9 +8,11 @@
  * against a live target — the SAME "exercise the lib, not the stdio
  * transport" convention verify-13/17/18/19 already use. A separate,
  * lightweight stdio round-trip (runMcpRegistrationCheck, invoked from
- * main()) proves handoff-mcp.mjs actually REGISTERS all 31 tools (5
+ * main()) proves handoff-mcp.mjs actually REGISTERS all 35 tools (5
  * pre-existing + 25 new + handoff_resume, added later on the same
- * child-process transport as the 5 pre-existing tools) and that at least
+ * child-process transport as the 5 pre-existing tools, + 4 more from the
+ * §17 B1 routing write surface — model_registry_set,
+ * routing_session_override_set/_get/_clear, 2026-09-06) and that at least
  * one new direct-pg tool is
  * independently callable end-to-end through the real MCP protocol via
  * mcp-db-connect.js + ensureProjectIdentity (M-19) against a disposable
@@ -510,8 +512,9 @@ async function runSelfTransactioningChecks(client2, prefix) {
 
 /**
  * runMcpRegistrationCheck — spawns the REAL handoff-mcp.mjs over stdio,
- * lists tools (asserts all 31 names present — 5 pre-existing + 25 new +
- * handoff_resume),
+ * lists tools (asserts all 35 names present — 5 pre-existing + 25 new +
+ * handoff_resume + 4 more from the §17 B1 routing write surface,
+ * 2026-09-06),
  * then calls entity_create through the real protocol against a disposable
  * scratch tmpdir project root (its own `.git` + a fresh marker minted by
  * `node handoff.js init -y`) — NEVER the real claude-memory dogfood
@@ -553,6 +556,7 @@ async function runMcpRegistrationCheck(dbName, cleanupClient) {
       'edge_create', 'edge_read', 'edge_update', 'edge_suppress',
       'exchange_append', 'exchange_read',
       'route_resolve', 'routing_profile_set', 'routing_profile_get',
+      'model_registry_set', 'routing_session_override_set', 'routing_session_override_get', 'routing_session_override_clear',
       'usage_record', 'usage_query',
     ];
     const missing = expected.filter((n) => !actualNames.has(n));
@@ -587,7 +591,7 @@ async function runMcpRegistrationCheck(dbName, cleanupClient) {
     try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}
   }
 
-  console.log(`[SMOKE-${LABEL}][mcp-registration] ${ok ? 'PASS' : 'FAIL'} 31-tool registration + entity_create through the real stdio MCP transport`);
+  console.log(`[SMOKE-${LABEL}][mcp-registration] ${ok ? 'PASS' : 'FAIL'} 35-tool registration + entity_create through the real stdio MCP transport`);
   for (const f of failures) console.log(`    ${f}`);
   return ok;
 }
