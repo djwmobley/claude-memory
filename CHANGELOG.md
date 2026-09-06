@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **cm#233: `open_thread` subject derivation replaced (`intentKey`) + resolved_threads/open_threads matcher classification, migrated together** —
+  `deriveIntentSubject` (colon-split-before-char-60-else-truncate-to-80, no
+  Unicode normalization, no whitespace collapse) is REMOVED, not aliased,
+  replaced everywhere by `intentKey` (`scripts/lib/intent-key.js`: NFC
+  normalize, collapse every whitespace run to one space, cap at 1000 UTF-8
+  bytes at a whitespace boundary). Every caller (`scripts/handoff.js`,
+  `scripts/lib/carryover-render.js`, `scripts/migrations/migrate-08-handoff-markdown.js`,
+  `scripts/migrations/verify-19-seams-smoke.js`) moved in this same change.
+  `resolved_threads`/`open_threads` processing is now a total classification,
+  never silent: MATCHED-AND-RESOLVED, UNMATCHED-REPORTED, INVALID-REJECTED
+  (resolved_threads), and DUPLICATE-COLLAPSED (open_threads) — the SAME
+  classification/print functions (`classifyResolvedThreads`,
+  `dedupOpenThreadIntents`) drive both a real close and `--dry-run`, so the
+  two paths can never disagree. `scripts/migrations/migrate-17-intent-key.js`
+  (numbered 17, not 13 — `migrate-13-agent-exchange.js` already exists)
+  re-keys every live `open_thread` row exactly once, with pre-existing-
+  collision detection (latest `last_reinforced` wins, ties broken by
+  highest id); `SCHEMA_EPOCH` bumped 3→4 so `ensureSchemaCurrent` runs it
+  automatically on the next touch of every live project DB (cutover
+  atomicity — no DB is left in a mixed old/new-subject state).
+
 - **cm#222: migrate-08 handoff-markdown parser hardening** — a real-file
   dry run (H-13's own stated acceptance gate) against a live project's
   `HANDOFF.md`/`HANDOFF-HISTORY.md` surfaced 4 defects in the H-1..H-14

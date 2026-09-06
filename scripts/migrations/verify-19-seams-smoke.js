@@ -47,7 +47,7 @@ const realityChecks = require('../lib/reality-checks.js');
 const renderHandoffCard = require('../lib/render-handoff-card.js');
 const exchangeLog = require('../lib/exchange-log.js');
 const memoryLint = require('../lib/memory-lint.js');
-const { deriveIntentSubject } = require('../handoff.js');
+const { intentKey } = require('../handoff.js'); // cm#233: reused by reference, never reimplemented
 
 const LABEL = '19';
 
@@ -251,7 +251,7 @@ async function runChecks(client, prefix) {
     await client.query(
       `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, carryover_status)
        VALUES ($1, $2, 'open_thread', $3, 8, 'user_stated', 'open')`,
-      [projectA, deriveIntentSubject(oldText), oldText]
+      [projectA, intentKey(oldText), oldText]
     );
     const newText = `${prefix}-upd-thread: revised`;
     const result = await carryoverRender.applyCarryoverDeltas(client, projectA, {

@@ -54,6 +54,7 @@ const {
   resolveSQLiteDbPath,
 } = require('./lib/db-seam');
 const { canonicalize }                             = require('./lib/subject-canon');
+const { intentKey, intentKeyEquals }                = require('./lib/intent-key');
 const {
   MARKER_FILENAME,
   LEGACY_MARKER_FILENAME,
@@ -1802,7 +1803,19 @@ const { classifySchemaFiles, normalizeContent } = require('./lib/schema-classify
 // project DB must re-apply once to pick up the DROP+CREATE pair for this
 // index (see handoff-core-schema.sql's comment on the index for the full
 // rationale; _extractIntegrityIndexOps pairs the DROP+CREATE atomically).
-const SCHEMA_EPOCH = 3;
+// Bumped to 4 (cm#233): open_thread subject derivation moved from
+// deriveIntentSubject to intentKey (scripts/lib/intent-key.js) -- no DDL
+// shape changed, but every already-current live project DB must run
+// scripts/migrations/migrate-17-intent-key.js's one-time re-key ONCE so no
+// DB is left with a mix of old-style (colon-split/80-char) and new-style
+// (NFC/whitespace-collapsed/1000-byte) open_thread subjects. The epoch bump
+// is the trigger ensureSchemaCurrent's wrapper (see runIntentKeyMigration-
+// IfNeeded below) uses to know a re-touch is owed; applyAdditiveSchema
+// itself is a pure no-op re-apply here (every unit's own DDL is IF NOT
+// EXISTS / DROP+CREATE-idempotent) -- the epoch bump exists purely to force
+// the migration gate to run at least once on every live DB, matching the
+// PR #225 (cm#224) precedent for a non-DDL-shape reason to bump.
+const SCHEMA_EPOCH = 4;
 
 // Module-level cache: maps schemaFilePath → { mtimeMs, size, hash } so repeated
 // calls in one process don't re-read or re-hash the SQL files. Keyed on
@@ -2160,7 +2173,7 @@ async function reportPgvectorGatedDegradation(db, projectId, classification, uni
  * @param {boolean} [opts.silent=false] — suppress informational stderr output
  * @returns {Promise<{applied:boolean, reason:string, detail?:object}>}
  */
-async function ensureSchemaCurrent(db, projectId, { silent } = {}) {
+async function ensureSchemaCurrentCore(db, projectId, { silent } = {}) {
   // cm#185 review N5: classification (a non-recursive readdir, a `git
   // ls-files` spawn, and reading+parsing all ~5 small scripts/sql/*.sql files
   // for their header directives) now runs on EVERY call, including the
@@ -2318,6 +2331,87 @@ async function ensureSchemaCurrent(db, projectId, { silent } = {}) {
   } finally {
     await db.releaseSchemaApplyLock(lockKey);
   }
+}
+
+const INTENT_KEY_MIGRATION_SETTING_KEY = 'intent_key_migration_epoch';
+
+/**
+ * cm#233 cutover atomicity: run scripts/migrations/migrate-17-intent-key.js's
+ * one-time re-key of live open_thread rows automatically on the first
+ * ensureSchemaCurrent touch of a DB that has not yet run it AT this
+ * SCHEMA_EPOCH (bumped to 4 for exactly this purpose — see SCHEMA_EPOCH's
+ * own comment). Gate is a single cheap SELECT on project_settings when
+ * already migrated (the common case after the first touch), matching the
+ * schema_fingerprint gate's own cost shape. Non-fatal on any error — a
+ * project DB is never left unusable because this data-quality migration
+ * could not run; it is retried on the next touch.
+ *
+ * Deliberately NOT folded into ensureSchemaCurrentCore's own return value:
+ * this never changes ensureSchemaCurrent's {applied, reason, detail}
+ * contract (the S12 c-series/d-series tests pin those return shapes
+ * byte-for-byte) — it only runs as an additional, purely side-effecting
+ * step after a touch that confirms the DB is reachable and
+ * schema-current/just-applied.
+ */
+async function runIntentKeyMigrationIfNeeded(db, projectId, { silent } = {}) {
+  try {
+    const { rows } = await db.query(
+      `SELECT value FROM project_settings WHERE project_id = $1 AND key = $2`,
+      [projectId, INTENT_KEY_MIGRATION_SETTING_KEY]
+    );
+    const stored = rows.length > 0 ? parseInt(rows[0].value, 10) : 0;
+    if (Number.isFinite(stored) && stored >= SCHEMA_EPOCH) return; // already migrated at/after this epoch
+
+    // Lazy require: avoids a require-cycle at module load. getSetting/
+    // writeAssertionWithSupersession are passed DIRECTLY (both are already
+    // local functions in this file) rather than left for migrate-17 to
+    // require handoff.js itself — when handoff.js runs as the CLI entry
+    // point (require.main === module, the normal `handoff.js close` path
+    // that drives this auto-run-on-next-touch gate), handoff.js's own
+    // `main()`-vs-`module.exports` guard means a require() of handoff.js
+    // from inside migrate-17 would see an UNPOPULATED module.exports (the
+    // `else` branch below never runs when this file is main) — see
+    // migrate-17-intent-key.js's migrateIntentKeys header comment for the
+    // full rationale.
+    const { migrateIntentKeys } = require('./migrations/migrate-17-intent-key.js');
+    const result = await migrateIntentKeys(db, projectId, {
+      dryRun: false,
+      getSetting,
+      writeAssertionWithSupersession,
+    });
+
+    await db.query(
+      `INSERT INTO project_settings (project_id, key, value) VALUES ($1, $2, $3)
+       ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
+      [projectId, INTENT_KEY_MIGRATION_SETTING_KEY, String(SCHEMA_EPOCH)]
+    );
+
+    if (!silent && result && (result.changed > 0 || result.collisions > 0)) {
+      process.stderr.write(
+        `[handoff] intent-key migration (cm#233 cutover): rekeyed ${result.changed} open_thread row(s), ` +
+        `${result.collisions} collision group(s) resolved\n`
+      );
+    }
+  } catch (err) {
+    process.stderr.write(`[handoff] intent-key migration check failed (non-fatal): ${err.message}\n`);
+  }
+}
+
+/**
+ * Public ensureSchemaCurrent — thin wrapper around ensureSchemaCurrentCore
+ * that additionally runs the cm#233 intent-key migration gate exactly once
+ * per touch, after a 'current' or freshly-'applied' result (i.e. only when
+ * the DB is confirmed reachable and schema-current). The wrapper NEVER
+ * alters the core function's return value — callers and tests see the
+ * identical {applied, reason, detail} contract as before this wrapper
+ * existed.
+ */
+async function ensureSchemaCurrent(db, projectId, opts = {}) {
+  const result = await ensureSchemaCurrentCore(db, projectId, opts);
+  if (result && (result.reason === 'current' || result.reason === 'applied')) {
+    await runIntentKeyMigrationIfNeeded(db, projectId, opts);
+  }
+  return result;
 }
 
 // ─── INIT PRE-FLIGHT HELPERS ──────────────────────────────────────────────────
@@ -4947,29 +5041,6 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
   return true;
 }
 
-/**
- * Derive a stable subject key from an open-thread text string.
- * If a ':' occurs within the first 60 chars, subject = text before the first ':' (trimmed).
- * Otherwise, subject = trimmed text capped at 80 chars.
- *
- * Examples:
- *   "NS-THREAD-ALPHA: finish…" → "NS-THREAD-ALPHA"
- *   "SHIP-DECISION: ship…"    → "SHIP-DECISION"
- *   "open thread 0: yyy…"     → "open thread 0"
- *   "OPEN-THREAD-ALPHA finish the decay-rank backfill migration" → "OPEN-THREAD-ALPHA finish the decay-rank backfill migration" (capped at 80)
- *
- * @param {string} threadText
- * @returns {string}
- */
-function deriveIntentSubject(threadText) {
-  const text = String(threadText || '').trim();
-  const colonIdx = text.indexOf(':');
-  if (colonIdx >= 0 && colonIdx < 60) {
-    return text.slice(0, colonIdx).trim();
-  }
-  return text.slice(0, 80);
-}
-
 // Shared SQL fragment: excludes pinned rows from a match (pinned=false OR
 // pinned IS NULL passes; pinned=true is excluded). Used by the auto-retire
 // query below AND by scripts/lib/carryover-render.js's applyCarryoverDeltas
@@ -4977,6 +5048,136 @@ function deriveIntentSubject(threadText) {
 // sites can never drift out of sync on what "pinned" means for matching
 // purposes. Pure string constant: exporting it changes no behavior here.
 const PINNED_EXCLUSION_SQL = '(pinned = false OR pinned IS NULL)';
+
+/**
+ * cm#233: classify every entry of a `resolved_threads` payload array against
+ * the project's currently-live `open_thread` rows. Read-only (one SELECT) —
+ * used identically by writeExtraction's real auto-retire (which additionally
+ * performs the suppression UPDATE for MATCHED-AND-RESOLVED entries) and by
+ * cmdClose's --dry-run preview (which never mutates), so the two code paths
+ * can never classify the same payload differently.
+ *
+ * Total classification, one verdict per entry:
+ *   MATCHED-AND-RESOLVED — the entry's intentKey matches (intentKeyEquals)
+ *     at least one live, non-pinned open_thread row's subject.
+ *   UNMATCHED-REPORTED   — a valid key with no live-row match. Never silent
+ *     — the caller must print it (see printResolvedThreadsClassification).
+ *   INVALID-REJECTED     — the entry normalizes to an empty intentKey
+ *     (blank/whitespace-only text). Never silent — printed and skipped.
+ *
+ * @param {object} db
+ * @param {string} projectId
+ * @param {Array<string>} resolvedThreads - raw payload.resolved_threads
+ * @returns {Promise<Array<{text:string, key:string, verdict:string, matchedIds:number[]}>>}
+ */
+async function classifyResolvedThreads(db, projectId, resolvedThreads) {
+  const { rows: liveRows } = await db.query(
+    `SELECT id, subject FROM assertions
+     WHERE project_id = $1 AND predicate = 'open_thread'
+       AND suppressed = false AND invalid_at IS NULL
+       AND ${PINNED_EXCLUSION_SQL}`,
+    [projectId]
+  );
+  const results = [];
+  for (const raw of (resolvedThreads || [])) {
+    const text = String(raw == null ? '' : raw).trim();
+    const key = intentKey(text);
+    if (!key) {
+      results.push({ text, key, verdict: 'INVALID-REJECTED', matchedIds: [] });
+      continue;
+    }
+    const matchedIds = liveRows
+      .filter((r) => intentKeyEquals(r.subject, key))
+      .map((r) => r.id);
+    results.push({
+      text,
+      key,
+      matchedIds,
+      verdict: matchedIds.length > 0 ? 'MATCHED-AND-RESOLVED' : 'UNMATCHED-REPORTED',
+    });
+  }
+  return results;
+}
+
+/**
+ * Print (console.log) the non-silent verdicts from classifyResolvedThreads —
+ * UNMATCHED-REPORTED and INVALID-REJECTED (cm#233 spec: "never silent").
+ * MATCHED-AND-RESOLVED entries are not printed here; the auto-retire UPDATE
+ * site logs its own suppression count via stderr, and the dry-run preview
+ * prints its own "would suppress N" summary line.
+ *
+ * @returns {string[]} the lines printed, in entry order (for tests — avoids
+ *   needing to intercept console.log to assert on classification output).
+ */
+function printResolvedThreadsClassification(results) {
+  const lines = [];
+  for (const r of (results || [])) {
+    let line = null;
+    if (r.verdict === 'UNMATCHED-REPORTED') {
+      line = `  UNMATCHED resolved_thread: "${r.text.slice(0, 80)}"`;
+    } else if (r.verdict === 'INVALID-REJECTED') {
+      line = `  INVALID resolved_thread (empty after normalization, skipped): "${r.text.slice(0, 80)}"`;
+    }
+    if (line) {
+      console.log(line);
+      lines.push(line);
+    }
+  }
+  return lines;
+}
+
+/**
+ * cm#233: collapse `open_thread` entries that normalize to the SAME
+ * intentKey within one payload (DUPLICATE-COLLAPSED) — the FIRST occurrence
+ * of a key is kept, later ones are reported and dropped rather than each
+ * racing writeAssertionWithSupersession's own suppress-then-reinsert for an
+ * identical subject (which would waste a row and muddy last_reinforced/
+ * corroboration bookkeeping). Pure/read-only (no DB access) so BOTH the
+ * real close write path (persistSessionIntent) and the --dry-run preview
+ * share this SAME classification, never two independently-maintained
+ * dedup implementations.
+ *
+ * @param {Array<string>} rawTexts - payload.open_threads, unfiltered.
+ * @returns {{ kept: Array<{key:string, text:string}>, duplicates: Array<{key:string, text:string}> }}
+ */
+function dedupOpenThreadIntents(rawTexts) {
+  const kept = [];
+  const duplicates = [];
+  for (const raw of (rawTexts || [])) {
+    const text = String(raw == null ? '' : raw).trim();
+    if (!text) continue; // blank entries: silently dropped (unchanged pre-cm#233 behavior)
+    const key = intentKey(text);
+    if (!key) continue; // normalizes to empty (should not happen once text is non-blank)
+    // intentKeyEquals (case-insensitive), matching the SAME equality every
+    // other cm#233 matcher uses — NOT a strict/case-sensitive Set lookup.
+    // payload.open_threads is capped at 200 entries elsewhere (payload-
+    // schema.js), so an O(n^2) scan here is negligible.
+    const isDup = kept.some((k) => intentKeyEquals(k.key, key));
+    if (isDup) {
+      duplicates.push({ key, text });
+      continue;
+    }
+    kept.push({ key, text });
+  }
+  return { kept, duplicates };
+}
+
+/**
+ * Print (console.log) DUPLICATE-COLLAPSED entries from dedupOpenThreadIntents.
+ * Never silent (cm#233 spec item 5: "DUPLICATE visible in captured output
+ * for both dry-run and live").
+ *
+ * @returns {string[]} the lines printed, in entry order.
+ */
+function printOpenThreadDuplicates(duplicates) {
+  const lines = [];
+  for (const dup of (duplicates || [])) {
+    const line = `  DUPLICATE-COLLAPSED open_thread: "${dup.text.slice(0, 80)}" (same key as an earlier entry this close — one row written)`;
+    console.log(line);
+    lines.push(line);
+  }
+  return lines;
+}
 
 /**
  * Persist session-driving intent (open_threads, tldr, quick_references) as
@@ -5022,12 +5223,16 @@ async function persistSessionIntent(db, projectId, payload, projectBasename) {
   const basename = projectBasename || 'project';
   const intents = [];
 
-  // open_threads — one row per thread, subject derived from thread text
-  for (const thread of (payload.open_threads || [])) {
-    const text = String(thread || '').trim();
-    if (!text) continue;
+  // open_threads — one row per thread, subject = intentKey(text) (cm#233).
+  // Two entries that normalize to the SAME key within this one payload
+  // collapse to a single written row (DUPLICATE-COLLAPSED) — see
+  // dedupOpenThreadIntents's header comment.
+  const { kept: openThreadIntents, duplicates: openThreadDuplicates } =
+    dedupOpenThreadIntents(payload.open_threads || []);
+  printOpenThreadDuplicates(openThreadDuplicates);
+  for (const { key, text } of openThreadIntents) {
     intents.push({
-      subject: deriveIntentSubject(text),
+      subject: key,
       predicate: 'open_thread',
       object: text,
     });
@@ -5278,9 +5483,15 @@ async function writeExtraction(db, projectId, payload, opts) {
 
   // Auto-retire resolved open_thread rows BEFORE persistSessionIntent so the re-author
   // guard in persistSessionIntent sees the freshly-suppressed rows in this same close.
-  for (const text of (payload.resolved_threads || [])) {
-    const subject = deriveIntentSubject(String(text || '').trim());
-    if (!subject) continue;
+  // cm#233: classified via classifyResolvedThreads (intentKey/intentKeyEquals) —
+  // MATCHED-AND-RESOLVED entries are suppressed here; UNMATCHED-REPORTED and
+  // INVALID-REJECTED are printed (never silent) via
+  // printResolvedThreadsClassification, the SAME function the --dry-run
+  // preview below uses on the identical classification shape.
+  const resolvedClassifications = await classifyResolvedThreads(db, projectId, payload.resolved_threads || []);
+  printResolvedThreadsClassification(resolvedClassifications);
+  for (const rc of resolvedClassifications) {
+    if (rc.verdict !== 'MATCHED-AND-RESOLVED') continue;
     try {
       const { rowCount } = await db.query(
         `UPDATE assertions
@@ -5289,14 +5500,14 @@ async function writeExtraction(db, projectId, payload, opts) {
            AND LOWER(TRIM(subject)) = LOWER(TRIM($2))
            AND suppressed = false AND invalid_at IS NULL
            AND ${PINNED_EXCLUSION_SQL}`,
-        [projectId, subject]
+        [projectId, rc.key]
       );
       const n = rowCount != null ? Number(rowCount) : 0;
       if (n > 0) {
-        process.stderr.write(`[handoff] auto-retire: suppressed ${n} open_thread row(s) for resolved subject "${subject}"\n`);
+        process.stderr.write(`[handoff] auto-retire: suppressed ${n} open_thread row(s) for resolved subject "${rc.key}"\n`);
       }
     } catch (retireErr) {
-      process.stderr.write(`[handoff] auto-retire failed for subject "${subject}" (non-fatal): ${retireErr.message}\n`);
+      process.stderr.write(`[handoff] auto-retire failed for subject "${rc.key}" (non-fatal): ${retireErr.message}\n`);
     }
   }
 
@@ -6229,33 +6440,33 @@ async function cmdClose(args) {
       }
     }
 
-    // Preview resolved_threads suppressions (read-only — no mutations in dry-run).
+    // Preview resolved_threads classification (read-only — no mutations in
+    // dry-run). cm#233: SAME classifyResolvedThreads + printResolvedThreads-
+    // Classification the real close's auto-retire block uses above — the
+    // two paths can never classify the same payload differently.
     if ((payload.resolved_threads || []).length > 0) {
-      const resolvedSubjects = [];
+      const previewClassifications = await classifyResolvedThreads(db, projectId, payload.resolved_threads);
+      printResolvedThreadsClassification(previewClassifications);
       let totalWouldSuppress = 0;
-      for (const text of payload.resolved_threads) {
-        const subject = deriveIntentSubject(String(text || '').trim());
-        if (!subject) continue;
-        resolvedSubjects.push(subject);
-        try {
-          const { rows: liveRows } = await db.query(
-            `SELECT id FROM assertions
-             WHERE project_id = $1 AND predicate = 'open_thread'
-               AND LOWER(TRIM(subject)) = LOWER(TRIM($2))
-               AND suppressed = false AND invalid_at IS NULL
-               AND (pinned = false OR pinned IS NULL)`,
-            [projectId, subject]
-          );
-          totalWouldSuppress += liveRows.length;
-        } catch (_) {}
+      const matchedKeys = [];
+      for (const rc of previewClassifications) {
+        if (rc.verdict === 'MATCHED-AND-RESOLVED') {
+          totalWouldSuppress += rc.matchedIds.length;
+          matchedKeys.push(rc.key);
+        }
       }
-      console.log(`\n  resolved_threads:   would suppress ${totalWouldSuppress} open_thread row(s): [${resolvedSubjects.join(', ')}]`);
+      console.log(`\n  resolved_threads:   would suppress ${totalWouldSuppress} open_thread row(s): [${matchedKeys.join(', ')}]`);
     }
 
     // Session-intent rows that would be written.
     if (payload.tldr)            console.log(`\n  session_tldr:       would write (subject=${path.basename(root)})`);
-    if ((payload.open_threads || []).length > 0)
-                                 console.log(`  open_thread rows:   would write ${payload.open_threads.length} row(s)`);
+    if ((payload.open_threads || []).length > 0) {
+      // cm#233: SAME dedupOpenThreadIntents the real close's persistSessionIntent
+      // uses — DUPLICATE-COLLAPSED entries are printed here too (never silent).
+      const { kept: previewKept, duplicates: previewDuplicates } = dedupOpenThreadIntents(payload.open_threads);
+      printOpenThreadDuplicates(previewDuplicates);
+      console.log(`  open_thread rows:   would write ${previewKept.length} row(s)`);
+    }
     if (payload.quick_references) console.log(`  quick_reference:    would write (subject=${path.basename(root)})`);
 
     // Durable-facts promotion candidates (same query as real close — read-only).
@@ -8252,8 +8463,17 @@ if (require.main === module) {
     // §7.1/S-12c shared exports (reused by reference, never reimplemented,
     // by scripts/lib/carryover-render.js). Pure additions -- no existing
     // export changed, no behavior change to any existing call site.
-    deriveIntentSubject,
+    // cm#233: deriveIntentSubject REMOVED (not aliased) — replaced by
+    // intentKey/intentKeyEquals (scripts/lib/intent-key.js, re-exported here
+    // for convenience) plus the classification helpers below.
+    intentKey,
+    intentKeyEquals,
+    classifyResolvedThreads,
+    printResolvedThreadsClassification,
+    dedupOpenThreadIntents,
+    printOpenThreadDuplicates,
     PINNED_EXCLUSION_SQL,
+    connectHandoff,
     // Pointer-staleness gate internals (exposed for test-pointer-gate.js)
     _extractPointers,
     _deriveAnchor,
@@ -8281,6 +8501,13 @@ if (require.main === module) {
     checkPgvectorGatedObjects,
     reportPgvectorGatedDegradation,
     SCHEMA_EPOCH,
+    // cm#233: exposed for test coverage of the intent-key migration cutover
+    // gate (ensureSchemaCurrentCore is the pre-wrapper core, for tests that
+    // need to assert the wrapper's added side effect never changes the
+    // core's own return contract).
+    ensureSchemaCurrentCore,
+    runIntentKeyMigrationIfNeeded,
+    INTENT_KEY_MIGRATION_SETTING_KEY,
     // cm#230: exposed for test/lib/test-decisions-writer.js — no test-side
     // reimplementation of writeExtraction's decisions[] handling or the
     // DIVERGENCE-line formatter.

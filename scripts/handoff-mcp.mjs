@@ -806,7 +806,16 @@ const EXTRACTION_PAYLOAD_FIELD_CONTRACT =
   'resolved_threads.\n\n' +
   'Field types (engine-enforced; a violation surfaces as a tool error with the engine\'s stderr tail):\n' +
   '- tldr: string, <=4000 chars.\n' +
-  '- open_threads: array of strings, each <=4000 chars, array length <=200.\n' +
+  '- open_threads: array of strings, each <=4000 chars, array length <=200. cm#233: subject key = intentKey(text) ' +
+  '(Unicode-NFC normalized, whitespace-collapsed, capped at 1000 UTF-8 bytes). Two entries in the SAME close that ' +
+  'key identically (case-insensitively) collapse to ONE written row (DUPLICATE-COLLAPSED, printed) rather than ' +
+  'racing the 1:1 supersession path against itself.\n' +
+  '- resolved_threads: array of strings (ORIGINAL open-thread text, not a paraphrase), each <=4000 chars, array ' +
+  'length <=200. cm#233: each entry is classified against the project\'s live open_thread rows and is NEVER ' +
+  'silent — MATCHED-AND-RESOLVED (a live row\'s key matches: auto-retired BEFORE this close\'s open_threads are ' +
+  'persisted, so a thread resolved and re-stated in the same close resolves then re-opens), UNMATCHED-REPORTED ' +
+  '(no live row matches: printed as `UNMATCHED resolved_thread: "<first 80 chars>"`), or INVALID-REJECTED (the ' +
+  'entry normalizes to an empty key: printed and skipped).\n' +
   '- quick_references: a SINGLE STRING, NOT an array. Sending an array fails with ' +
   '`stdin JSON: "quick_references" must be a string` — join multiple references into one string.\n' +
   '- entities: array of { name: string, entity_type: "person"|"system"|"concept"|"decision"|"file", description: string }.\n' +

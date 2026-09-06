@@ -32,10 +32,10 @@
  * file's `unescapeTableCell`/`splitOnUnescapedPipe` implement its EXACT
  * INVERSE (backslash-doubling then pipe-escaping on write; pipe-first
  * then backslash on read, since read must undo write in reverse order).
- * `deriveIntentSubject`/`PINNED_EXCLUSION_SQL` are NOT re-implemented here
- * either — migrate-08-handoff-markdown.js imports `deriveIntentSubject`
- * directly from scripts/handoff.js for subject derivation (H-7/H-11); this
- * file only produces raw text for the caller to run through it.
+ * `intentKey`/`PINNED_EXCLUSION_SQL` are NOT re-implemented here
+ * either — migrate-08-handoff-markdown.js imports `intentKey`
+ * directly from scripts/handoff.js for subject derivation (H-7/H-11, cm#233);
+ * this file only produces raw text for the caller to run through it.
  *
  * TOTAL CLASSIFICATION (H-5, widened by cm#222 A2): every real
  * (non-fenced/blockquoted/commented) `##`-level heading in the document is
