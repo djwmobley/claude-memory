@@ -12,7 +12,7 @@
  * (no live vLLM in CI — verify-20-mcp-surface.js injects a deterministic
  * mock embedder under that env var, mirroring verify-19-seams-smoke.js's
  * own mockEmbedder() precedent): fresh full-stack apply -> exit 0 +
- * SMOKE20_RESULT: PASS with all 27 checks + the MCP-registration check
+ * SMOKE20_RESULT: PASS with all 28 checks (cm#231: was 27) + the MCP-registration check
  * green; prerequisite-missing (migrate-15 not yet applied) -> FAIL naming
  * migrate-15-mcp-addenda.js.
  *
@@ -154,7 +154,13 @@ async function testFreshApplyAllGreen() {
   const failLines = (r20.stdout.match(/\[SMOKE-20\]\[[^\]]+\] FAIL.*/g) || []);
   assert(failLines.length === 0, `expected zero FAIL lines, got: ${failLines.join(' | ')}`);
   const passCount = (r20.stdout.match(/\[SMOKE-20\]\[\d+\] PASS/g) || []).length;
-  assert(passCount === 27, `expected all 27 numbered checks to PASS, got ${passCount}`);
+  // cm#231: 28 (was 27) — the former check 14 (assertionCreate) moved to the
+  // self-transactioning group (assertionCreate now routes through
+  // writeAssertionWithSupersession, which owns its own BEGIN/COMMIT) and two
+  // new cm#231 regression checks were added there (assertionCreate's
+  // supersession + tier/valid_at defaults, and assertionSuppress's
+  // invalid_at/suppression_kind defaults): net -1 (moved) + 2 (new) = +1.
+  assert(passCount === 28, `expected all 28 numbered checks to PASS, got ${passCount}`);
   assert(/mcp-registration\] PASS/.test(r20.stdout), 'expected the MCP-registration check to PASS');
   assert(/residue scan: clean \(0 rows\)/.test(r20.stdout), `expected a clean residue scan. stdout=${r20.stdout}`);
 }
@@ -232,7 +238,7 @@ function testNormalizeTextNfcFirst() {
 // ── Main ─────────────────────────────────────────────────────────────────
 
 async function main() {
-  await run('A1', 'Fresh full-stack apply through migrate-15 -> verify-20-mcp-surface all-green (27 checks + MCP registration)', testFreshApplyAllGreen);
+  await run('A1', 'Fresh full-stack apply through migrate-15 -> verify-20-mcp-surface all-green (28 checks + MCP registration)', testFreshApplyAllGreen);
   await run('A2', 'verify-20-mcp-surface refuses when migrate-15-mcp-addenda has not been applied, naming it as the fix', testPrereqMissing);
   await run('A3', 'migrate-15-mcp-addenda.js is idempotent on re-apply', testMigrate15IdempotentReapply);
 
