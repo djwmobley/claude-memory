@@ -675,6 +675,22 @@ async function testT9ForcedIntentDivergence() {
       BEFORE INSERT ON assertions
       FOR EACH ROW EXECUTE FUNCTION cm227_fail_session_tldr();
     `);
+    // Isolate the invariant this test guards (a session-intent-persist
+    // divergence must never trip the strict-mode exit-code gate) from the
+    // PRE-EXISTING, unrelated C2/C3 degraded-subsystem gate T2/T3/T4/T8
+    // already cover: feedback_loop_enabled defaults to 'enabled'
+    // (scripts/handoff.js:5895), and this payload supplies no session_id
+    // and no session_in_progress marker exists, so C2 would otherwise
+    // itself push a genuine 'C2' entry onto _degradedSubsystems
+    // (scripts/handoff.js:5906) and legitimately trip strict mode — a CI-
+    // reproducible false failure this test hit in PR #229 (a local ambient
+    // session-id env var masked it in that sandbox; CI has no such var, so
+    // resolveSessionId() genuinely returns null there). Disabling both here
+    // guarantees the ONLY possible degraded-subsystem source in this test
+    // is the session_tldr fault injection itself, which — per this PR's
+    // fix — deliberately does NOT populate _degradedSubsystems.
+    await setSetting(db, projectId, 'feedback_loop_enabled', 'disabled');
+    await setSetting(db, projectId, 'contract_evolution_enabled', 'disabled');
     // Also force close_degraded_exit_mode='strict' to prove the exit-code gate
     // is unaffected by this divergence (T8 already covers strict-mode exit 3
     // for genuine C2/C3 degradation; this proves the two channels don't cross).
