@@ -64,6 +64,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `UNRECOGNIZED` fails the dry-run report. Existing dry-run counts
   (sections/tables_parsed/orphan_rows/unrecognized_dash) are unchanged.
 
+- **migrate-08: catalog-driven unique-constraint preflight + `--on-duplicate keep-newest` (unblocks pwa-etl item B write mode)** —
+  `writeProjectMigration()` did one plain `INSERT` per row with no
+  `ON CONFLICT` and no in-batch dedup, so a real `HANDOFF-HISTORY.md` batch
+  (every session re-lists its own unresolved carry-overs) violated
+  `assertions_1to1_unique` and `assertions_1ton_exact_unique` at INSERT
+  time — 188 in-batch groups / 4467 `open_thread` rows and 242 groups on
+  pwa-etl's actual history file. `--dry-run` never caught this because it
+  never simulated the batch against either index. Fixed with a new,
+  Postgres-only module, `scripts/migrations/lib/constraint-preflight.js`,
+  run before every WRITE (and every `--dry-run` given `--db`), inside a
+  transaction that is ALWAYS rolled back (read-only on the target
+  regardless of mode): **(1)** every VALID unique index on
+  `'assertions'::regclass` is enumerated from `pg_index`/`pg_get_indexdef`/
+  `pg_get_expr` at run time — no predicate list, column name, or index name
+  is hard-coded, so a brand-new unique index is picked up with zero code
+  change; **(2)** an index is `APPLICABLE` iff every column its key
+  expressions reference is a batch-supplied column (every non-`id`
+  assertions column) — `assertions_pkey` (keyed on the serial `id`) is
+  correctly `NOT_APPLICABLE`, reported by name, never evaluated; an
+  `INCLUDE` column is never part of an index's key (`indnkeyatts`-scoped);
+  **(3)** the batch loads into a TEMP table (assertions columns minus `id`,
+  plus `batch_ord`/`session_rank`) and simulates the post-DELETE state
+  (existing non-suppressed rows for this `project_id` NOT tagged by this
+  migration, UNION ALL every batch row as a live candidate); each
+  APPLICABLE index's own partial predicate and key expressions are
+  evaluated generically (never hard-coded) via `GROUP BY`, with any NULL
+  key component excluded from grouping and flagged instead (Postgres
+  treats each NULL as distinct under a unique index, unlike SQL `GROUP
+  BY`). **Key equality is DB byte-equality, deliberately NOT
+  `intentKeyEquals()`'s runtime case-insensitivity** — this preflight
+  simulates what the live index actually enforces, and disagreeing with
+  it (in either direction) would make the preflight useless. Every batch
+  row lands in exactly one bucket, priority `collides_existing >
+  in_batch_duplicate > unclassified > insert` (`unclassified` is the floor
+  for a NULL key component or a per-index evaluation error; it can only
+  override `insert`, never downgrade a definitive finding from a
+  different, successfully-evaluated index). New CLI flag
+  `--on-duplicate fail|keep-newest` (default `fail`, unchanged behavior for
+  existing callers): under `fail`, any non-`insert` bucket refuses the
+  whole write (nothing applied). Under `keep-newest`, `in_batch_duplicate`
+  groups are resolved by a union-find over ALL applicable indexes
+  (transitive — a chain of duplicates collapses into one connected
+  component, not resolved index-by-index independently); the newest member
+  by `session_rank` (parsed from the section heading's `Session N` / date —
+  **never document position**, since a real `HANDOFF-HISTORY.md` is
+  newest-first and a naive "first/last in file" heuristic picks the wrong
+  session) survives live, every other member is inserted
+  `suppressed=true, suppression_kind='superseded'`; the grouping is then
+  re-run over (existing ∪ only the now-live batch rows) and must find zero
+  groups, or the affected rows degrade to `unclassified`.
+  `collides_existing` and `unclassified` ALWAYS fail regardless of policy.
+  Write-mode ordering is now `#258 gate → preflight → policy → inserts
+  (live and suppressed) → post-insert assertion`: the post-insert assertion
+  (inside the same transaction, before COMMIT) verifies the live catalog
+  directly — inserted-row count must equal the batch size, and the
+  non-suppressed row count must equal the policy's expected live count —
+  aborting (rollback) on any mismatch rather than trusting the insert
+  loop's own counters. Dry-run reports per-bucket counts,
+  `NOT_APPLICABLE` index names, the policy in effect, and the top 10
+  colliding groups (index name, member count, sessions) in both the human
+  summary and the JSON report's new `preflight` key.
+
 - **cm#233: `open_thread` subject derivation replaced (`intentKey`) + resolved_threads/open_threads matcher classification, migrated together** —
   `deriveIntentSubject` (colon-split-before-char-60-else-truncate-to-80, no
   Unicode normalization, no whitespace collapse) is REMOVED, not aliased,
