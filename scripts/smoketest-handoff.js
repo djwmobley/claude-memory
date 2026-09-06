@@ -606,7 +606,14 @@ async function step4_inject_test_data() {
 }
 
 async function step5_cmdStatus(ids) {
-  const label = 'cmdStatus — assertion counts';
+  // cm#232: step4 inserts 3 rows, one of them (idSupp) suppressed=true.
+  // handoff:status's "assertions" figure is now the LIVE count
+  // (suppressed=false AND invalid_at IS NULL) — it must report 2, not the
+  // raw row total of 3 — with the suppressed row surfaced separately via
+  // "(suppressed: 1, invalidated: 0)". This is a direct regression test for
+  // the pwa-etl evidence in cm#232 (status reported an inflated total that
+  // included suppressed rows).
+  const label = 'cmdStatus — assertion counts exclude suppressed rows (cm#232)';
   try {
     const r = runHandoff('status');
     if (r.status !== 0) {
@@ -615,14 +622,19 @@ async function step5_cmdStatus(ids) {
     }
 
     const out = r.stdout || '';
-    const match = out.match(/assertions:\s*(\d+)/);
+    const match = out.match(/assertions:\s*(\d+) \(suppressed: (\d+), invalidated: (\d+)\)/);
     if (!match) {
-      lcFail(5, label, `Could not find assertions count in output:\n${out}`);
+      lcFail(5, label, `Could not find "assertions: N (suppressed: N, invalidated: N)" in output:\n${out}`);
       return false;
     }
-    const count = parseInt(match[1], 10);
-    if (count !== 3) {
-      lcFail(5, label, `assertions count = ${count}, expected 3`);
+    const live       = parseInt(match[1], 10);
+    const suppressed = parseInt(match[2], 10);
+    if (live !== 2) {
+      lcFail(5, label, `live assertions count = ${live}, expected 2 (1 suppressed row must be excluded)`);
+      return false;
+    }
+    if (suppressed !== 1) {
+      lcFail(5, label, `suppressed assertions count = ${suppressed}, expected 1`);
       return false;
     }
 

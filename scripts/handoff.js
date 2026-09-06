@@ -2487,6 +2487,60 @@ async function cmdInit(args) {
   console.log(`\nDone: handoff:init — project ${projectId} provisioned`);
 }
 
+// ── live-row count helper (cm#232) ──────────────────────────────────────────
+//
+// Single source of truth for what "live" means per table, so status/close/
+// checkpoint can never report divergent numbers for the same underlying data.
+// entities/edges carry only `suppressed` (no bi-temporal column); assertions
+// additionally carry `invalid_at` (bi-temporal supersession — see
+// handoff-core-schema.sql). The live predicate mirrors the one already used
+// throughout writeAssertionWithSupersession/persistSessionIntent/the resurrect
+// engine: `suppressed = false AND invalid_at IS NULL`.
+//
+// Before this fix, handoff:status's `assertions` count was a raw
+// `COUNT(*) FROM assertions` with no suppressed/invalid_at filter at all —
+// it counted every row ever written for the project, suppressed or not,
+// inflating the reported live count (evidence: pwa-etl reported 30 after
+// 4 suppressions + 3 adds when the live count was 26). entities/edges had
+// the identical unfiltered-COUNT(*) bug (no `suppressed = false` filter).
+const ASSERTIONS_LIVE_SQL = 'suppressed = false AND invalid_at IS NULL';
+
+async function getLiveCounts(db, projectId) {
+  const entRes = await db.query(
+    'SELECT COUNT(*) AS n FROM entities WHERE project_id = $1 AND suppressed = false',
+    [projectId]
+  );
+  const edgRes = await db.query(
+    'SELECT COUNT(*) AS n FROM edges WHERE project_id = $1 AND suppressed = false',
+    [projectId]
+  );
+  const assLiveRes = await db.query(
+    `SELECT COUNT(*) AS n FROM assertions WHERE project_id = $1 AND ${ASSERTIONS_LIVE_SQL}`,
+    [projectId]
+  );
+  const assSuppRes = await db.query(
+    'SELECT COUNT(*) AS n FROM assertions WHERE project_id = $1 AND suppressed = true',
+    [projectId]
+  );
+  const assInvOnlyRes = await db.query(
+    'SELECT COUNT(*) AS n FROM assertions WHERE project_id = $1 AND suppressed = false AND invalid_at IS NOT NULL',
+    [projectId]
+  );
+  const assTotalRes = await db.query(
+    'SELECT COUNT(*) AS n FROM assertions WHERE project_id = $1',
+    [projectId]
+  );
+
+  return {
+    entities:                  parseInt(entRes.rows[0].n, 10),
+    edges:                     parseInt(edgRes.rows[0].n, 10),
+    assertionsLive:            parseInt(assLiveRes.rows[0].n, 10),
+    assertionsSuppressed:      parseInt(assSuppRes.rows[0].n, 10),
+    assertionsInvalidatedOnly: parseInt(assInvOnlyRes.rows[0].n, 10),
+    assertionsTotal:           parseInt(assTotalRes.rows[0].n, 10),
+  };
+}
+
 // ── status ────────────────────────────────────────────────────────────────────
 
 async function cmdStatus(args = []) {
@@ -2499,6 +2553,10 @@ async function cmdStatus(args = []) {
   const projectId   = resolveProjectId();
   const handoffPath = resolveHandoffMdPath(projectId);
   const fm          = readHandoffFrontmatter(handoffPath);
+  // cm#232: human-readable project name, distinct from the marker uuid
+  // (projectId) — surfaced so a status/close summary read out of context
+  // (e.g. pasted into chat) can't be misread as belonging to another project.
+  const projectName = path.basename(findProjectRoot());
 
   let db;
   try {
@@ -2508,13 +2566,10 @@ async function cmdStatus(args = []) {
     process.exit(1);
   }
 
-  // Counts — sequential awaits because pg.Client is single-connection and rejects
-  // concurrent queries on pg@9 (deprecation warning on pg@8). Pool would allow
-  // concurrency, but these are four trivial COUNT/SELECT round-trips and serial
-  // is plenty fast.
-  const entRes = await db.query('SELECT COUNT(*) AS n FROM entities           WHERE project_id = $1', [projectId]);
-  const assRes = await db.query('SELECT COUNT(*) AS n FROM assertions         WHERE project_id = $1', [projectId]);
-  const edgRes = await db.query('SELECT COUNT(*) AS n FROM edges              WHERE project_id = $1', [projectId]);
+  // Counts — cm#232: getLiveCounts is the single shared query behind every
+  // entity/assertion/edge count status reports (prose, --json, and the Done
+  // line all derive from this one call — see getLiveCounts above).
+  const liveCounts = await getLiveCounts(db, projectId);
   const rcRes  = await db.query('SELECT name        FROM retrieval_contract  WHERE project_id = $1 ORDER BY name', [projectId]);
 
   // Session-in-progress marker
@@ -2547,9 +2602,11 @@ async function cmdStatus(args = []) {
     );
 
     // Top-10 predicate distribution across LIVE assertions only.
+    // cm#232: was suppressed=false only, missing invalid_at IS NULL — now uses
+    // the same ASSERTIONS_LIVE_SQL predicate as getLiveCounts above.
     const predRes = await db.query(
       `SELECT predicate, COUNT(*) AS n
-         FROM assertions WHERE project_id = $1 AND suppressed = false
+         FROM assertions WHERE project_id = $1 AND ${ASSERTIONS_LIVE_SQL}
          GROUP BY predicate
          ORDER BY n DESC
          LIMIT 10`,
@@ -2650,13 +2707,17 @@ async function cmdStatus(args = []) {
   if (jsonFlag) {
     const out = {
       project_id:     projectId,
+      project_name:   projectName,
       db:             'connected',
       handoff_md:     fs.existsSync(handoffPath) ? handoffPath : null,
       last_close:     lastClose,
       days_since:     days,
-      entities:       parseInt(entRes.rows[0].n, 10),
-      assertions:     parseInt(assRes.rows[0].n, 10),
-      edges:          parseInt(edgRes.rows[0].n, 10),
+      entities:       liveCounts.entities,
+      assertions:     liveCounts.assertionsLive,
+      assertions_suppressed: liveCounts.assertionsSuppressed,
+      assertions_invalidated: liveCounts.assertionsInvalidatedOnly,
+      assertions_total: liveCounts.assertionsTotal,
+      edges:          liveCounts.edges,
       contracts:      rcRes.rows.map((r) => r.name),
       session_active: sip ? true : false,
       session_id:     sip || null,
@@ -2670,18 +2731,19 @@ async function cmdStatus(args = []) {
       out.stale_pointer_count = stalePointerCount;
     }
     console.log(JSON.stringify(out, null, 2));
-    console.log(`\nDone: handoff:status — ${out.entities} entities, ${out.assertions} assertions, ${out.edges} edges`);
+    console.log(`\nDone: handoff:status — project=${projectName} marker=${projectId} — ${out.entities} entities, ${out.assertions} assertions (suppressed: ${out.assertions_suppressed}, invalidated: ${out.assertions_invalidated}), ${out.edges} edges`);
     return;
   }
 
   // ── Prose output path (default) ─────────────────────────────────────────
   console.log('\n  === handoff status ===');
+  console.log(`  project_name:     ${projectName}`);
   console.log(`  project_id:       ${projectId}`);
   console.log(`  last_close:       ${lastClose} (${daysStr})`);
   console.log(`  handoff.md:       ${fs.existsSync(handoffPath) ? handoffPath : '(missing)'}`);
-  console.log(`  entities:         ${entRes.rows[0].n}`);
-  console.log(`  assertions:       ${assRes.rows[0].n}`);
-  console.log(`  edges:            ${edgRes.rows[0].n}`);
+  console.log(`  entities:         ${liveCounts.entities}`);
+  console.log(`  assertions:       ${liveCounts.assertionsLive} (suppressed: ${liveCounts.assertionsSuppressed}, invalidated: ${liveCounts.assertionsInvalidatedOnly})`);
+  console.log(`  edges:            ${liveCounts.edges}`);
   console.log(`  contracts:        ${contracts}`);
   console.log(`  session_active:   ${sip ? `YES (session_id=${sip})` : 'no'}`);
   if (packagingLine) console.log(packagingLine);
@@ -2713,7 +2775,7 @@ async function cmdStatus(args = []) {
     }
   }
 
-  console.log(`\nDone: handoff:status — ${entRes.rows[0].n} entities, ${assRes.rows[0].n} assertions, ${edgRes.rows[0].n} edges`);
+  console.log(`\nDone: handoff:status — project=${projectName} marker=${projectId} — ${liveCounts.entities} entities, ${liveCounts.assertionsLive} assertions (suppressed: ${liveCounts.assertionsSuppressed}, invalidated: ${liveCounts.assertionsInvalidatedOnly}), ${liveCounts.edges} edges`);
 }
 
 // ── runResurrectQuery — shared resurrect engine ───────────────────────────────
@@ -4894,10 +4956,10 @@ async function cmdCheckpoint(args) {
 
     if (written) {
       console.log(`\n  note captured: ${noteText}`);
-      console.log(`\nDone: handoff:checkpoint --note — session_note written (session marker preserved)`);
+      console.log(`\nDone: handoff:checkpoint --note — project=${basename} marker=${projectId} — session_note written (session marker preserved)`);
     } else {
       console.log(`\n  note skipped (predicate not recognized in strict mode): ${noteText}`);
-      console.log(`\nDone: handoff:checkpoint --note — session_note skipped`);
+      console.log(`\nDone: handoff:checkpoint --note — project=${basename} marker=${projectId} — session_note skipped`);
     }
     return;
   }
@@ -4999,7 +5061,7 @@ async function cmdCheckpoint(args) {
 
     await db.end();
 
-    console.log(`\nDone: handoff:checkpoint — payload queued for async extraction (session marker preserved for continued attribution)`);
+    console.log(`\nDone: handoff:checkpoint — project=${path.basename(root)} marker=${projectId} — payload queued for async extraction (session marker preserved for continued attribution)`);
     return;
   }
 
@@ -5051,7 +5113,7 @@ async function cmdCheckpoint(args) {
   for (const line of divergenceLines) {
     console.log(`  ${line}`);
   }
-  console.log(`\nDone: handoff:checkpoint — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written (session marker preserved for continued attribution)`);
+  console.log(`\nDone: handoff:checkpoint — project=${path.basename(root)} marker=${projectId} — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written (session marker preserved for continued attribution)`);
 }
 
 // ── resolveSessionId ──────────────────────────────────────────────────────────
@@ -5364,7 +5426,7 @@ async function cmdClose(args) {
       );
     }
 
-    console.log(`\nDone: handoff:close — payload queued for async extraction, session marker cleared`);
+    console.log(`\nDone: handoff:close — project=${path.basename(root)} marker=${projectId} — payload queued for async extraction, session marker cleared`);
     return;
   }
 
@@ -5663,7 +5725,7 @@ async function cmdClose(args) {
     console.log('\n  skipped in dry-run: writeExtraction, handoff.md render, session_in_progress clear, C2, C3, L4 degraded record');
 
     await db.end();
-    console.log('\nDone: handoff:close --dry-run — no mutations performed');
+    console.log(`\nDone: handoff:close --dry-run — project=${path.basename(root)} marker=${projectId} — no mutations performed`);
     return;
   }
 
@@ -6410,7 +6472,7 @@ async function cmdClose(args) {
     );
   }
 
-  console.log(`\nDone: handoff:close — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written, session marker cleared`);
+  console.log(`\nDone: handoff:close — project=${path.basename(root)} marker=${projectId} — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written, session marker cleared`);
 
   // L4: Exit-code gate — 'strict' mode exits 3 when any subsystem ran degraded.
   if (_degradedSubsystems.length > 0 && closeDegradedExitMode === 'strict') {
@@ -6621,7 +6683,7 @@ async function cmdLoaderStop() {
 
     await db.end();
 
-    process.stderr.write('Done: handoff stop hook — implicit close written, session marker cleared\n');
+    process.stderr.write(`Done: handoff stop hook — project=${projectName} marker=${projectId} — implicit close written, session marker cleared\n`);
     process.exit(0);
 
   } catch (err) {
