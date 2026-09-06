@@ -47,3 +47,4 @@ These rules are canon. They override convenience, time pressure, and apparent co
 - Verified CLOSED on GitHub: issues 222, 230, 231, 232, 167. cm#224 still OPEN despite PR #225 claiming the fix — recheck before assuming done. cm#233 OPEN by design (not shipped).
 - NEXT: (1) verify SessionEnd hook — after real exit, session_in_progress marker cleared, implicit close recorded only if no explicit close ran; (2) private-runbook §17.5(i)-(iv) owner decisions pending; (3) cm#233 design call: cosmetic fix vs migrate subject+matcher together.
 - (4) cm#224 state check — PR #225 claimed the fix but issue is still open; (5) pwa-etl HANDOFF-HISTORY.md migrate-08 write mode unblocked (H-13 passed) — owner go required before writing to pipeline_pwa_etl.
+- install.js now migrates matcher-wrapped user-scope hooks (`--hooks-scope`, dry-run diff, backup+atomic write); live SessionEnd wiring applied by orchestrator after merge — verify it landed.

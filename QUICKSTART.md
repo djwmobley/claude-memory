@@ -124,7 +124,9 @@ node <path-to-this-repo>/scripts/install.js
 Replace `<path-to-this-repo>` with the absolute path where you cloned `claude-memory`. The script will:
 
 - Copy the nine `/handoff:*` slash command files to `~/.claude/commands/handoff/`
-- Add SessionStart and Stop hooks to `.claude/settings.local.json` in your current project (creating the file if it doesn't exist, or merging with what's already there)
+- Add SessionStart and SessionEnd hooks to a Claude Code settings file (creating it if it doesn't exist, or merging with whatever hooks are already there — it never touches anyone else's hooks, and only re-points its own if the engine path moved)
+
+By default (`--hooks-scope auto`) the installer writes to `~/.claude/settings.json` (user scope) if it already has a loader-hook/loader-stop entry there, otherwise to `.claude/settings.local.json` in your current project (project scope). Pass `--hooks-scope user` or `--hooks-scope project` to force one or the other. Add `--dry-run` to see a diff of exactly what would change before writing anything — nothing is written in dry-run mode, not even a backup.
 
 **You should see** a short summary listing what was copied and wired, then "Done. Restart Claude Code or open a fresh session to pick up the changes."
 

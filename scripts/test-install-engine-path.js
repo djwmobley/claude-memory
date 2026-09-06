@@ -37,8 +37,33 @@ const path          = require('path');
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const REPO_ROOT      = path.resolve(__dirname, '..');
-const INSTALL_SCRIPT = path.join(REPO_ROOT, 'scripts', 'install.js');
 const COMMANDS_DIR   = path.join(REPO_ROOT, 'commands', 'handoff');
+
+// install.js refuses to run (exit 2) when its own resolved location sits
+// inside a `.claude/worktrees/` directory — a worktree checkout's engine
+// path is disposable, and wiring hooks against it would point a real config
+// at a path that gets pruned (see scripts/install.js's worktree guard).
+// Part A's spawnSync calls exercise the real write path, so from within a
+// worktree checkout they must run a copy of install.js + its command files
+// placed in a plain temp directory — exactly what a normal clone or CI
+// checkout looks like — rather than the worktree original.
+const IS_WORKTREE_CHECKOUT = /[\\/]\.claude[\\/]worktrees[\\/]/i.test(REPO_ROOT);
+
+function resolveInstallScript() {
+  if (!IS_WORKTREE_CHECKOUT) {
+    return path.join(REPO_ROOT, 'scripts', 'install.js');
+  }
+  const engineRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'install-engine-path-copy-'));
+  fs.mkdirSync(path.join(engineRoot, 'scripts'), { recursive: true });
+  fs.mkdirSync(path.join(engineRoot, 'commands', 'handoff'), { recursive: true });
+  fs.copyFileSync(path.join(REPO_ROOT, 'scripts', 'install.js'), path.join(engineRoot, 'scripts', 'install.js'));
+  for (const f of fs.readdirSync(COMMANDS_DIR)) {
+    if (f.endsWith('.md')) fs.copyFileSync(path.join(COMMANDS_DIR, f), path.join(engineRoot, 'commands', 'handoff', f));
+  }
+  return path.join(engineRoot, 'scripts', 'install.js');
+}
+
+const INSTALL_SCRIPT = resolveInstallScript();
 
 // ── Tracking ──────────────────────────────────────────────────────────────────
 
