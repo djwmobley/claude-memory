@@ -737,8 +737,8 @@ jobs:
         # to the shared verifyAddenda derivation layer entirely — cm#208 — and
         # are now derived + verified there too, decisions_project_topic_unique
         # with a unique:true flag; migrate-15's own checkIndexByName calls stay,
-        # belt-and-braces) and scripts/migrations/verify-20-mcp-surface.js (27
-        # checks covering every new §8 direct-pg tool's underlying library
+        # belt-and-braces) and scripts/migrations/verify-20-mcp-surface.js (28
+        # checks (cm#231: was 27) covering every new §8 direct-pg tool's underlying library
         # function, plus a real stdio MCP round-trip proving all 30
         # handoff-mcp.mjs tools register and one is independently callable
         # end-to-end through mcp-db-connect.js + ensureProjectIdentity against a
@@ -751,7 +751,7 @@ jobs:
         # live vLLM (Qwen3-Embedding-8B) locally before authoring this fallback.
         # Covers: fresh full-stack apply (migrate-01 -> addenda -> migrate-13 ->
         # migrate-14 -> migrate-13 re-apply -> migrate-15) -> verify-20 exit 0 +
-        # SMOKE20_RESULT: PASS with all 27 numbered checks + the MCP-registration
+        # SMOKE20_RESULT: PASS with all 28 numbered checks (cm#231: was 27) + the MCP-registration
         # check green, clean residue scan; migrate-15 not yet applied -> verify-20
         # refusal naming migrate-15-mcp-addenda.js; migrate-15 idempotent
         # re-apply; plus 6 DB-free pure-unit Group B checks (memory_search's

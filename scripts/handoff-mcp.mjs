@@ -574,10 +574,10 @@ async function toolEntitySuppress({ projectRoot, id }) {
   }
 }
 
-async function toolAssertionCreate({ projectRoot, subject, predicate, object, confidence, source, sourceModel, agentId }) {
+async function toolAssertionCreate({ projectRoot, subject, predicate, object, confidence, source, sourceModel, agentId, sessionId }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const result = await entityCrudLib.assertionCreate(db, { projectId, subject, predicate, object, confidence, source, sourceModel, agentId });
+      const result = await entityCrudLib.assertionCreate(db, { projectId, subject, predicate, object, confidence, source, sourceModel, agentId, sessionId });
       return textResult(result);
     });
   } catch (err) {
@@ -596,10 +596,10 @@ async function toolAssertionRead({ projectRoot, id, subject, predicate }) {
   }
 }
 
-async function toolAssertionUpdate({ projectRoot, id, subject, predicate, newObject, confidence, source, sourceModel, agentId }) {
+async function toolAssertionUpdate({ projectRoot, id, subject, predicate, newObject, confidence, source, sourceModel, agentId, sessionId }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const result = await entityCrudLib.assertionUpdate(db, { projectId, id, subject, predicate, newObject, confidence, source, sourceModel, agentId });
+      const result = await entityCrudLib.assertionUpdate(db, { projectId, id, subject, predicate, newObject, confidence, source, sourceModel, agentId, sessionId });
       return textResult(result);
     });
   } catch (err) {
@@ -1180,8 +1180,15 @@ function buildServer() {
       title: 'Create one assertion, outside the checkpoint/close batch flow',
       description:
         'Runs the §7.3 ingest-time contradiction check (same (project_id, subject, predicate) with a ' +
-        'materially different object) before writing — still writes either way (append-only), but the result ' +
-        'carries a contradictionWarning when a conflict is found. predicate MUST be a value from ' +
+        'materially different object) before writing, and the result carries a contradictionWarning when a ' +
+        'conflict is found — but the write itself (cm#231) now routes through the SAME supersession engine ' +
+        '(writeAssertionWithSupersession) the /handoff:close and /handoff:checkpoint payload path uses: a prior ' +
+        'live row for the same (subject, predicate) [1:1 predicates] or an exact (subject, predicate, object) ' +
+        'duplicate [1:N predicates] is superseded (suppressed=true, invalid_at=now(), suppression_kind=' +
+        '\'superseded\') rather than left live alongside a second row, and an exact same-session repeat is a ' +
+        'no-op touch (last_reinforced bumped only — see the touchOnly field on the result). tier, valid_at, ' +
+        'session_id, and last_reinforced are set with the same defaults the close/seed path uses (cm#231 — ' +
+        'previously tier and valid_at were left NULL on this path). predicate MUST be a value from ' +
         'scripts/lib/predicate-registry.json.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
@@ -1195,6 +1202,11 @@ function buildServer() {
         source: z.enum(['user_stated', 'model_extracted', 'doc_quoted', 'retrieved_from_prior']),
         sourceModel: z.string().optional(),
         agentId: z.string().optional(),
+        sessionId: z.string().optional().describe(
+          'cm#231: explicit session id for attribution/corroboration matching. Defaults to ' +
+          'handoff.js\'s own resolveSessionId (CLAUDE_CODE_SESSION_ID env var, then the DB\'s ' +
+          'session_in_progress marker) when omitted.'
+        ),
       },
     },
     async (args) => toolAssertionCreate(args)
@@ -1220,12 +1232,15 @@ function buildServer() {
     {
       title: 'Supersede an assertion (suppress-old + insert-new, one transaction, optimistic guard)',
       description:
-        'M-5/M-6: supersede = suppress the old row (suppressed=true, invalid_at=now()) THEN insert a new row ' +
-        'with the corrected object, inside ONE transaction with an optimistic row-count guard (a stale/already-' +
-        'superseded target rolls the whole call back, never a partial write). `id` is the explicit target row ' +
-        '— REQUIRED for any predicate whose registry cardinality is NOT 1:1 (an omitted id on a 1:N or ' +
-        'unregistered predicate is a hard error, never a guess). For a 1:1 predicate, `id` may be omitted and ' +
-        'is inferred from (subject, predicate).',
+        'M-5/M-6: supersede = suppress the old row (suppressed=true, invalid_at=now(), suppression_kind=' +
+        '\'superseded\') THEN insert a new row with the corrected object, inside ONE transaction with an ' +
+        'optimistic row-count guard (a stale/already-superseded target rolls the whole call back, never a ' +
+        'partial write). `id` is the explicit target row — REQUIRED for any predicate whose registry ' +
+        'cardinality is NOT 1:1 (an omitted id on a 1:N or unregistered predicate is a hard error, never a ' +
+        'guess). For a 1:1 predicate, `id` may be omitted and is inferred from (subject, predicate). cm#231: ' +
+        'the new row is written with tier=\'probationary\' (never auto-consolidated — this call has no cross-' +
+        'session corroboration evidence to gate on), valid_at=now(), and session_id resolved the same way ' +
+        'assertion_create does — previously all three were left unset/NULL on this path.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         id: z.number().int().optional().describe('Explicit target row id — required for non-1:1 predicates.'),
@@ -1237,6 +1252,10 @@ function buildServer() {
         source: z.enum(['user_stated', 'model_extracted', 'doc_quoted', 'retrieved_from_prior']).optional(),
         sourceModel: z.string().optional(),
         agentId: z.string().optional(),
+        sessionId: z.string().optional().describe(
+          'cm#231: explicit session id for the new row. Defaults to handoff.js\'s own resolveSessionId ' +
+          '(CLAUDE_CODE_SESSION_ID env var, then the DB\'s session_in_progress marker) when omitted.'
+        ),
       },
     },
     async (args) => toolAssertionUpdate(args)
@@ -1246,7 +1265,9 @@ function buildServer() {
     'assertion_suppress',
     {
       title: 'Suppress an assertion (retract, no supersession)',
-      description: 'Sets suppressed=true without inserting a replacement — use assertion_update to supersede-with-a-correction instead.',
+      description: 'Sets suppressed=true, invalid_at=now(), suppression_kind=\'retired\' (cm#231 — matches the ' +
+        'seed/close path\'s own operator-retirement vocabulary) without inserting a replacement — use ' +
+        'assertion_update to supersede-with-a-correction instead.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         id: z.number().int().describe('Target assertion id.'),

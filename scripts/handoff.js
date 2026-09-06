@@ -4081,9 +4081,35 @@ async function cmdDrop() {
  * @param {object} ass           — assertion object: {subject, predicate, object, confidence, source}
  * @param {string} sessionId     — session_id (may be null)
  * @param {string} registryMode  — 'permissive'|'strict'
- * @returns {boolean} true if the row was inserted; false if skipped (strict unrecognized)
+ * @param {object} [opts]        — cm#231: opts.returnRow (boolean, default false).
+ *   When false/omitted, the return contract is BYTE-IDENTICAL to every existing
+ *   call site (a plain boolean — true if a row was inserted, false if skipped/
+ *   touch-only). When true (used by the MCP assertion_create/assertion_update
+ *   write path, cm#231), returns a richer object instead:
+ *     { inserted: true,  row: <the newly-inserted row> }
+ *     { inserted: false, row: <the touch-only-bumped row>, touchOnly: true }
+ *     { inserted: false, row: null, skipped: true, reason: <string> }  — strict-mode
+ *       registry rejection (unrecognized predicate); the caller decides whether
+ *       that is a hard error (MCP single-call API) or a swallowed skip (close
+ *       payload batch).
+ * @returns {boolean|object} see opts.returnRow above.
  */
-async function writeAssertionWithSupersession(db, projectId, ass, sessionId, registryMode) {
+// cm#231: named tier constants — the assertions.tier CHECK constraint's own
+// authoritative vocabulary (handoff-core-schema.sql:
+// CHECK (tier IN ('probationary', 'consolidated'))). writeAssertionWithSupersession's
+// own L0/L2 gate branches below keep their pre-existing inline literals unchanged
+// (this function's tier-decision logic is unchanged by cm#231 — touching it risks
+// the very consolidation-gate invariants L0/L2's test suites pin byte-for-byte).
+// These constants exist so that OTHER write paths that need to mint a fresh,
+// never-corroborated assertion row (entity-graph-crud.js's assertionCreate/
+// assertionUpdate, cm#231) reference the SAME string values by name instead of
+// re-typing the literal — never a second, independently-typo-able copy of the
+// vocabulary.
+const ASSERTION_TIER_PROBATIONARY = 'probationary';
+const ASSERTION_TIER_CONSOLIDATED = 'consolidated';
+
+async function writeAssertionWithSupersession(db, projectId, ass, sessionId, registryMode, opts) {
+  opts = opts || {};
   // Classify predicate cardinality.  strict throws for unrecognized; permissive returns 1:N.
   let cardinality;
   try {
@@ -4099,6 +4125,7 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
     process.stderr.write(
       `[handoff] skipping assertion (predicate="${ass.predicate}"): ${regErr.message}\n`
     );
+    if (opts.returnRow) return { inserted: false, row: null, skipped: true, reason: regErr.message };
     return false;
   }
 
@@ -4284,6 +4311,13 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
     if (touchOnlyIds.length > 0 && storedSubjectsToSuppress.size === 0) {
       const bumpStmt = db.buildBumpAssertions(touchOnlyIds);
       if (bumpStmt) await db.query(bumpStmt.sql, bumpStmt.params);
+      if (opts.returnRow) {
+        const { rows: touched } = await db.query(
+          `SELECT * FROM assertions WHERE id = $1`, [touchOnlyIds[0]]
+        );
+        await db.query('COMMIT');
+        return { inserted: false, row: touched[0] || null, touchOnly: true };
+      }
       await db.query('COMMIT');
       return false; // no new row; caller must NOT increment assertionsWritten
     }
@@ -4413,14 +4447,28 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
       ? (maxPriorCorrob + 1)
       : 1;
 
-    await db.query(
+    // RETURNING id: harmless addition for every existing caller (none of them
+    // destructure the query result today) — cm#231's opts.returnRow path uses
+    // it to fetch the full row below, inside the same transaction, before COMMIT.
+    const insertResult = await db.query(
       `INSERT INTO assertions
          (project_id, subject, predicate, object, confidence, source, session_id,
           last_reinforced, valid_at, tier, consolidated_at, corroboration_count)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now(), $8, ${consolidatedAtSql}, $9)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now(), $8, ${consolidatedAtSql}, $9)
+       RETURNING id`,
       [projectId, canonSubject, ass.predicate, ass.object, conf, source, sessionId,
        newTier, newCorrob]
     );
+
+    if (opts.returnRow) {
+      const insertedId = insertResult && insertResult.rows && insertResult.rows[0]
+        ? insertResult.rows[0].id : null;
+      const { rows: inserted } = await db.query(
+        `SELECT * FROM assertions WHERE id = $1`, [insertedId]
+      );
+      await db.query('COMMIT');
+      return { inserted: true, row: inserted[0] || null };
+    }
 
     await db.query('COMMIT');
   } catch (err) {
@@ -7656,5 +7704,14 @@ if (require.main === module) {
     checkPgvectorGatedObjects,
     reportPgvectorGatedDegradation,
     SCHEMA_EPOCH,
+    // cm#231: shared write-path exports — entity-graph-crud.js's assertionCreate/
+    // assertionUpdate route through these so the MCP write path applies the SAME
+    // tier/valid_at/session_id defaults as the seed/close path, instead of
+    // duplicating default-setting logic per entry point.
+    writeAssertionWithSupersession,
+    getSetting,
+    resolveSessionId,
+    ASSERTION_TIER_PROBATIONARY,
+    ASSERTION_TIER_CONSOLIDATED,
   };
 }
