@@ -615,13 +615,13 @@ async function runTests() {
   // Own payload/topic, isolated from closePayload above — writes to the
   // project-scoped `decisions` table are NOT covered by the entities/
   // assertions/edges cleanup in teardown(), so this uses a topic unique to
-  // this test run (PROJECT_ID is Date.now()-suffixed) and the test DB
-  // (claude_memory_eval_test) has NO default embedding_providers row at the
-  // time this suite runs — verified independently — so this ALSO exercises
-  // the embedding-provider-down fail-soft path end to end (deterministic
-  // unit coverage for the same scenario lives in
-  // test/lib/test-decisions-writer.js's DW-8, which does not depend on this
-  // DB's provider configuration).
+  // this test run (PROJECT_ID is Date.now()-suffixed). The embedding-
+  // provider-down fail-soft path (below) no longer assumes anything about
+  // claude_memory_eval_test's live embedding_providers.is_default state —
+  // see that test's own comment (shared-DB invariant vs seeded default,
+  // cm#250). Deterministic unit coverage for the same fail-soft scenario
+  // also lives in test/lib/test-decisions-writer.js's DW-8, which is fully
+  // mocked and never touches a live DB or provider row.
   // TOPIC_RE (decisions-writer.js) requires kebab-case with NO run of two+
   // hyphens (each hyphen must be immediately followed by [a-z0-9]) — collapse
   // every run of non-alnum chars (PROJECT_ID's own "test--handoff--<ts>"
@@ -647,19 +647,60 @@ async function runTests() {
     assert.strictEqual(rows[0].reason, 'initial reason');
   });
 
-  await test('close: decisions[] embedding-provider-down is non-fatal and surfaces a DIVERGENCE line (this DB has no default embedding_providers row)', () => {
-    const out = runHelper('close', ['--json', '-'], {
-      fakeRoot,
-      stdin: JSON.stringify({
-        tldr: 'cm#230 embed-degraded probe.',
-        decisions: [{ topic: `${decisionTopic}-probe`, decision: 'probe decision', reason: 'probe reason' }],
-      }),
-    });
-    assert.ok(out.includes('Done: handoff:close'), 'a degraded embedding must never fail the close (non-fatal contract)');
-    assert.ok(
-      out.includes(`DIVERGENCE: decision:${decisionTopic}-probe EMBEDDING DEGRADED`),
-      `expected an EMBEDDING DEGRADED divergence line for a DB with no default provider, got:\n${out}`
+  await test('close: decisions[] embedding-provider-down is non-fatal and surfaces a DIVERGENCE line (no default embedding_providers row)', async () => {
+    // SHARED-DB INVARIANT vs SEEDED DEFAULT (cm#250): this assertion needs
+    // zero embedding_providers rows with is_default=true at the moment
+    // runHelper's subprocess calls resolveDefaultProvider(). CI's fresh DB
+    // has none, but claude_memory_eval_test is a shared live DB other
+    // legitimate work is allowed to seed a default row into (cm#250 does
+    // exactly that, for decisions[] embeds to succeed elsewhere) — a test
+    // must not assert a property of shared live state it doesn't own. A
+    // same-connection BEGIN/UPDATE/ROLLBACK can't establish this precondition
+    // because runHelper spawns handoff.js as a SEPARATE process with its own
+    // DB connection (uncommitted work on `db` here is invisible to it), so
+    // instead: snapshot whichever id(s) are currently default, commit a flip
+    // to false, run the subprocess assertion, then commit the flip back and
+    // verify via a fresh SELECT that the live row(s) are provably restored
+    // to their exact prior state — never left changed, pass or fail.
+    const { rows: defaultRows } = await db.query(
+      'SELECT id FROM embedding_providers WHERE is_default = true ORDER BY id'
     );
+    const defaultIds = defaultRows.map((r) => r.id);
+    if (defaultIds.length > 0) {
+      await db.query(
+        'UPDATE embedding_providers SET is_default = false WHERE id = ANY($1::int[])',
+        [defaultIds]
+      );
+    }
+    try {
+      const out = runHelper('close', ['--json', '-'], {
+        fakeRoot,
+        stdin: JSON.stringify({
+          tldr: 'cm#230 embed-degraded probe.',
+          decisions: [{ topic: `${decisionTopic}-probe`, decision: 'probe decision', reason: 'probe reason' }],
+        }),
+      });
+      assert.ok(out.includes('Done: handoff:close'), 'a degraded embedding must never fail the close (non-fatal contract)');
+      assert.ok(
+        out.includes(`DIVERGENCE: decision:${decisionTopic}-probe EMBEDDING DEGRADED`),
+        `expected an EMBEDDING DEGRADED divergence line for a DB with no default provider, got:\n${out}`
+      );
+    } finally {
+      if (defaultIds.length > 0) {
+        await db.query(
+          'UPDATE embedding_providers SET is_default = true WHERE id = ANY($1::int[])',
+          [defaultIds]
+        );
+      }
+      const { rows: afterRows } = await db.query(
+        'SELECT id FROM embedding_providers WHERE is_default = true ORDER BY id'
+      );
+      assert.deepStrictEqual(
+        afterRows.map((r) => r.id),
+        defaultIds,
+        'expected the live embedding_providers is_default row(s) to be restored to their exact pre-test state'
+      );
+    }
   });
 
   await test('close: re-closing with the SAME decision topic UPDATES the row, never duplicates it', async () => {
