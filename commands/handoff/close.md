@@ -399,8 +399,13 @@ Running: handoff:close
   edges written:       3
   contract:            updated
 
-Done: handoff:close — 5e/12a/3ed written, session marker cleared
+Done: handoff:close — project=my-project marker=C--Users-username-dev-my-project — 5e/12a/3ed written, session marker cleared
 ```
+
+The Done line (and the async-queued and `--dry-run` variants below) names the project
+(`project=<name>`) and its marker uuid (`marker=<uuid>`) so a close summary read out of
+context — pasted into chat, logged unattended — can't be misread as belonging to another
+project (cm#232).
 
 **With `--dry-run`:**
 ```
@@ -425,7 +430,7 @@ Running: handoff:close
 
   skipped in dry-run: writeExtraction, handoff.md render, session_in_progress clear, C2, C3, L4 degraded record
 
-Done: handoff:close --dry-run — no mutations performed
+Done: handoff:close --dry-run — project=my-project marker=C--Users-username-dev-my-project — no mutations performed
 ```
 
 The dry-run runs these passes (read-only): payload validation, L3 authoritative probes (compute only — no DB write), CLAUDE.md promotion candidate query, pointer-staleness gate (findings only — no row updates).

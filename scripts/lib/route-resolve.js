@@ -79,6 +79,7 @@
  * responsible for ensuring the reviewing agent differs from the drafting
  * agent. This resolver never mutates schema and never inserts into
  * model_registry / routing_profiles / routing_session_overrides.
+ * NOT ENFORCED (G4, docs/notes/2026-09-06-s17-routing-gap-audit.md): a 'review' resolution matching a 'draft' resolution's model is neither rejected nor flagged — see test/migrations/test-route-resolve-contract.js for the pinned current behavior.
  */
 
 const TIER_RANK = Object.freeze({ low: 0, mid: 1, high: 2 });
@@ -192,11 +193,16 @@ async function resolveRequiredTier(pg, { projectId, role, capabilityTier } = {})
   if (globalProfile && globalProfile.capability_tier) return globalProfile.capability_tier;
 
   throw new Error(
-    `unconfigured routing for role '${role}' — run routing init Q&A ` +
-    '(install-time suggested per-role defaults exist — e.g. orchestrate/spec=high, ' +
-    'draft/write=mid, read/index/bookkeep=low, review=high — but the suggested set never ' +
-    'applies on its own; it must be explicitly confirmed via the init Q&A, never applied ' +
-    'automatically by this resolver)'
+    `unconfigured routing for role '${role}' — no active routing_profiles row sets a ` +
+    "capability_tier for this role (checked project-scoped, then the '*' global default). " +
+    'Configure one via the routing_profile_set MCP tool (routingProfileSet in ' +
+    'scripts/lib/routing-profile.js), e.g. { projectId, role, capabilityTier }. Suggested ' +
+    'per-role defaults exist only as prose (orchestrate/spec=high, draft/write=mid, ' +
+    'read/index/bookkeep=low, review=high) and are never applied automatically — an ' +
+    'operator must call routing_profile_set explicitly to confirm one. Candidate models ' +
+    'must also be registered in model_registry before they can be recommended or pinned; ' +
+    'until a model-registration MCP tool ships, that requires a raw SQL INSERT into ' +
+    'model_registry (see docs/notes/2026-09-06-s17-routing-gap-audit.md).'
   );
 }
 
@@ -258,7 +264,11 @@ async function recommendLeastCost(pg, requiredTier) {
     throw new Error(
       `route-resolve: model(s) at/above required tier '${requiredTier}' exist but ALL lack cost figures ` +
       `(cost_in_per_mtok/cost_out_per_mtok) — least-cost ranking stays inert for: ${names}. ` +
-      'Run the init Q&A to register cost figures for these models.'
+      'No MCP tool registers cost figures today; until a model-registration tool ships, ' +
+      'set model_registry.cost_in_per_mtok/cost_out_per_mtok for these models via a raw ' +
+      'SQL UPDATE (see docs/notes/2026-09-06-s17-routing-gap-audit.md). A directive can ' +
+      'still route to one of these models via the routing_profile_set MCP tool ' +
+      '(preferred_model), bypassing the recommendation ranking entirely.'
     );
   }
 

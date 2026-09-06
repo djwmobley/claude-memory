@@ -51,6 +51,16 @@ const harness = require('./lib/smoke-harness');
 const memoryUpsert = require('../lib/memory-upsert.js');
 const memorySearchLib = require('../lib/memory-search.js');
 const entityCrud = require('../lib/entity-graph-crud.js');
+// cm#231: assertionCreate/assertionUpdate now route through
+// writeAssertionWithSupersession (handoff.js), which requires the
+// StoragePort adapter shape (buildSupersessionUpdate/buildBumpAssertions) —
+// a bare `pg.Client` (what this script's own `client`/`client2` are) does
+// NOT have those methods. PostgresAdapter is a transparent wrapper around an
+// already-connected pg.Client (.query() forwards unchanged) — used ONLY at
+// the two entityCrud.assertionCreate/assertionUpdate call sites below, never
+// altering how the rest of this script talks to `client`/`client2` directly.
+const { PostgresAdapter } = require('../lib/db-seam.js');
+const { canonicalize } = require('../lib/subject-canon.js');
 const memoryView = require('../lib/memory-view.js');
 const exchangeLog = require('../lib/exchange-log.js');
 const routingProfile = require('../lib/routing-profile.js');
@@ -284,21 +294,13 @@ async function runChecks(client, prefix) {
   });
 
   // ── assertion CRUD ──────────────────────────────────────────────────
-  await check(14, 'entity-graph-crud: assertionCreate surfaces a contradiction warning (never blocks)', async () => {
-    // 'applies' is registered 1:N (predicate-registry.json) — deliberately
-    // NOT a predicate assertions_1to1_unique's partial index enforces, so 2
-    // genuinely live rows under the same (subject, predicate) are actually
-    // reachable via a normal INSERT (a 1:1-registered predicate would raise
-    // a real Postgres unique-constraint violation here instead — S-6's
-    // ingest-time contradiction check is deliberately cardinality-agnostic,
-    // but the DB schema's own 1:1 enforcement is not, so the fixture must
-    // pick a predicate the DB will actually let a second live row land
-    // under).
-    await entityCrud.assertionCreate(client, { projectId: projectA, subject: `${prefix}-CSubj`, predicate: 'applies', object: 'yes', confidence: 8, source: 'user_stated' });
-    const r2 = await entityCrud.assertionCreate(client, { projectId: projectA, subject: `${prefix}-CSubj`, predicate: 'applies', object: 'no', confidence: 8, source: 'user_stated' });
-    assert(r2.contradictionWarning !== null, 'contradiction warning present');
-    assertEq(r2.contradictionWarning.object, 'yes', 'warning names the conflicting row');
-  });
+  // cm#231: assertionCreate's check moved to runSelfTransactioningChecks
+  // (below, on its own connection) — assertionCreate now routes through
+  // writeAssertionWithSupersession, which owns its own BEGIN/COMMIT
+  // (mirroring assertionUpdate's own pre-existing reason for living there:
+  // a COMMIT issued from inside this function's outer rolled-back
+  // transaction would commit the ENTIRE outer transaction, not just this
+  // check, poisoning every check that runs after it in this group).
 
   await check(15, 'entity-graph-crud: resolveAssertionUpdateTargetId infers a 1:1 predicate target from (subject, predicate)', async () => {
     await client.query(
@@ -380,11 +382,15 @@ async function runChecks(client, prefix) {
 }
 
 /**
- * runSelfTransactioningChecks — checks 21-24, run against a SEPARATE
- * dedicated connection (appendExchange/assertionUpdate/routingProfileSet
- * each own their own BEGIN/COMMIT/ROLLBACK per §7.7/M-5/M-18 — same
- * incompatibility with the outer rolled-back transaction verify-19-seams-
- * smoke.js's own header comment documents for exchange-log.js).
+ * runSelfTransactioningChecks — checks 21-29, run against a SEPARATE
+ * dedicated connection (appendExchange/assertionCreate/assertionUpdate/
+ * routingProfileSet each own their own BEGIN/COMMIT/ROLLBACK per
+ * §7.7/M-5/M-18/cm#231 — same incompatibility with the outer rolled-back
+ * transaction verify-19-seams-smoke.js's own header comment documents for
+ * exchange-log.js). cm#231: assertionCreate joined this group when it started
+ * routing through writeAssertionWithSupersession (which owns its own
+ * BEGIN/COMMIT) — it used to be a plain single-statement INSERT, safe inside
+ * the outer rolled-back transaction/savepoint group above.
  */
 async function runSelfTransactioningChecks(client2, prefix) {
   const projectA = `${prefix}-proj-a`;
@@ -416,6 +422,54 @@ async function runSelfTransactioningChecks(client2, prefix) {
     return async () => new Array(4000).fill(0).map((_, i) => (i === 0 ? 0.1 : 0));
   }
 
+  // cm#231: moved from runChecks (formerly check 14) — assertionCreate now
+  // routes through writeAssertionWithSupersession (handoff.js), which owns
+  // its own BEGIN/COMMIT, so it must run on this dedicated connection like
+  // assertionUpdate already does, wrapped in a PostgresAdapter (the adapter
+  // shape writeAssertionWithSupersession requires — see the import comment
+  // above).
+  await check('entity-graph-crud: assertionCreate surfaces a contradiction warning, and supersedes a same-cardinality-key prior row (cm#231)', async () => {
+    const db2 = new PostgresAdapter(client2);
+    // 'applies' is registered 1:N (predicate-registry.json) — deliberately
+    // NOT a predicate assertions_1to1_unique's partial index enforces, so 2
+    // genuinely live rows under the same (subject, predicate) are actually
+    // reachable, so long as the object differs (writeAssertionWithSupersession's
+    // 1:N branch only supersedes an EXACT (subject,predicate,object) duplicate
+    // — S-6's ingest-time contradiction check is deliberately cardinality-
+    // agnostic, but the DB schema's own 1:N supersession key is not, so the
+    // fixture must pick a predicate + differing-object pair that survives as
+    // two live rows).
+    const r1 = await entityCrud.assertionCreate(db2, { projectId: projectA, subject: `${prefix}-CSubj`, predicate: 'applies', object: 'yes', confidence: 8, source: 'user_stated' });
+    const r2 = await entityCrud.assertionCreate(db2, { projectId: projectA, subject: `${prefix}-CSubj`, predicate: 'applies', object: 'no', confidence: 8, source: 'user_stated' });
+    assert(r2.contradictionWarning !== null, 'contradiction warning present');
+    assertEq(r2.contradictionWarning.object, 'yes', 'warning names the conflicting row');
+    assert(r1.row.tier !== null, 'cm#231: tier is non-null on the first row (was NULL pre-fix)');
+    assert(r1.row.valid_at !== null, 'cm#231: valid_at is non-null on the first row (was NULL pre-fix)');
+    assert(r2.row.tier !== null, 'cm#231: tier is non-null on the second row');
+    assert(r2.row.valid_at !== null, 'cm#231: valid_at is non-null on the second row');
+
+    // Exact (subject, predicate, object) repeat: superseded, not left as a 3rd live row.
+    // NOTE: writeAssertionWithSupersession stores the CANONICALIZED subject
+    // (trim+lowercase+collapse — see subject-canon.js), never the raw
+    // fixture-cased subject, so this query matches on the canonical form too.
+    const r3 = await entityCrud.assertionCreate(db2, { projectId: projectA, subject: `${prefix}-CSubj`, predicate: 'applies', object: 'no', confidence: 8, source: 'model_extracted' });
+    const { rows: liveNo } = await client2.query(
+      `SELECT id FROM assertions WHERE project_id = $1 AND subject = $2 AND predicate = 'applies' AND object = 'no' AND suppressed = false`,
+      [projectA, canonicalize(`${prefix}-CSubj`)]
+    );
+    assertEq(liveNo.length, 1, 'exact 1:N duplicate superseded — exactly one live row for object="no"');
+    assertEq(liveNo[0].id, r3.row.id, 'the live row is the newest write');
+  });
+
+  await check('entity-graph-crud: assertionSuppress sets invalid_at + suppression_kind=\'retired\' (cm#231)', async () => {
+    const db2 = new PostgresAdapter(client2);
+    const created = await entityCrud.assertionCreate(db2, { projectId: projectA, subject: `${prefix}-SuppSubj`, predicate: 'applies', object: 'retire-me', confidence: 8, source: 'user_stated' });
+    const suppressed = await entityCrud.assertionSuppress(db2, { projectId: projectA, id: created.row.id });
+    assertEq(suppressed.suppressed, true, 'suppressed flag set');
+    assert(suppressed.invalid_at !== null, 'cm#231: invalid_at set (was NULL pre-fix)');
+    assertEq(suppressed.suppression_kind, 'retired', 'cm#231: suppression_kind=\'retired\' (was NULL pre-fix)');
+  });
+
   await check('entity-graph-crud: assertionUpdate supersedes old + inserts new, one transaction, optimistic guard (M-5)', async () => {
     const ins = await client2.query(
       `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
@@ -425,9 +479,13 @@ async function runSelfTransactioningChecks(client2, prefix) {
     const oldId = ins.rows[0].id;
     const result = await entityCrud.assertionUpdate(client2, { projectId: projectA, id: oldId, predicate: 'now_uses', newObject: 'SQLite' });
     assertEq(result.oldId, oldId, 'old id returned');
-    const { rows: oldRow } = await client2.query(`SELECT suppressed, invalid_at FROM assertions WHERE id = $1`, [oldId]);
+    const { rows: oldRow } = await client2.query(`SELECT suppressed, invalid_at, suppression_kind FROM assertions WHERE id = $1`, [oldId]);
     assertEq(oldRow[0].suppressed, true, 'old row suppressed');
     assert(oldRow[0].invalid_at !== null, 'old row invalidated');
+    assertEq(oldRow[0].suppression_kind, 'superseded', 'cm#231: old row suppression_kind=\'superseded\' (was NULL pre-fix)');
+    assert(result.newRow.tier !== null, 'cm#231: new row tier is non-null (was NULL pre-fix)');
+    assertEq(result.newRow.tier, 'probationary', 'cm#231: new row is born probationary (never auto-consolidated on an explicit update)');
+    assert(result.newRow.valid_at !== null, 'cm#231: new row valid_at is non-null (was NULL pre-fix)');
   });
 
   await check('entity-graph-crud: assertionUpdate on an already-superseded target rolls back (stale optimistic guard, M-5)', async () => {

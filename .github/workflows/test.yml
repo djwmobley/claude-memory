@@ -250,6 +250,35 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run route-resolve review/draft identity contract test
+        # §17 gap-audit G4 (docs/notes/2026-09-06-s17-routing-gap-audit.md):
+        # route-resolve.js documents that a 'review' resolution matching a
+        # 'draft' resolution's model/identity is a caller responsibility, not
+        # enforced by the resolver. This pins that CURRENT (unenforced)
+        # behavior so a future change to add enforcement requires a
+        # deliberate edit to this test, never a silent regression either
+        # way. Creates/drops its own _staging-suffixed scratch DB.
+        run: node test/migrations/test-route-resolve-contract.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: Run routing_profile_set concurrency test
+        # §17 gap-audit G6 (docs/notes/2026-09-06-s17-routing-gap-audit.md):
+        # exercises TWO CONCURRENT first-ever routing_profile_set calls for
+        # the same brand-new (project_id, role) pair -- the case the
+        # runbook's literal "SELECT MAX(version) ... FOR UPDATE" pseudocode
+        # cannot serialize (no existing row for a row-level lock to hold),
+        # which is why routing-profile.js uses pg_advisory_xact_lock
+        # instead. Asserts both calls succeed with no unique-constraint
+        # violation, versions 1 and 2 are assigned, and exactly one row is
+        # left active=true afterward. Creates/drops its own
+        # _staging-suffixed scratch DB.
+        run: node test/migrations/test-routing-profile-concurrency.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run usage-telemetry + verify-18 usage smoke tests
         # Tests scripts/lib/usage-telemetry.js (usageRecord/sessionUsageRollup/
         # usageQuery) and scripts/migrations/verify-18-usage-smoke.js, the §18
@@ -737,8 +766,8 @@ jobs:
         # to the shared verifyAddenda derivation layer entirely — cm#208 — and
         # are now derived + verified there too, decisions_project_topic_unique
         # with a unique:true flag; migrate-15's own checkIndexByName calls stay,
-        # belt-and-braces) and scripts/migrations/verify-20-mcp-surface.js (27
-        # checks covering every new §8 direct-pg tool's underlying library
+        # belt-and-braces) and scripts/migrations/verify-20-mcp-surface.js (28
+        # checks (cm#231: was 27) covering every new §8 direct-pg tool's underlying library
         # function, plus a real stdio MCP round-trip proving all 30
         # handoff-mcp.mjs tools register and one is independently callable
         # end-to-end through mcp-db-connect.js + ensureProjectIdentity against a
@@ -751,7 +780,7 @@ jobs:
         # live vLLM (Qwen3-Embedding-8B) locally before authoring this fallback.
         # Covers: fresh full-stack apply (migrate-01 -> addenda -> migrate-13 ->
         # migrate-14 -> migrate-13 re-apply -> migrate-15) -> verify-20 exit 0 +
-        # SMOKE20_RESULT: PASS with all 27 numbered checks + the MCP-registration
+        # SMOKE20_RESULT: PASS with all 28 numbered checks (cm#231: was 27) + the MCP-registration
         # check green, clean residue scan; migrate-15 not yet applied -> verify-20
         # refusal naming migrate-15-mcp-addenda.js; migrate-15 idempotent
         # re-apply; plus 6 DB-free pure-unit Group B checks (memory_search's

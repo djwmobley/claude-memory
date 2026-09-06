@@ -2,12 +2,13 @@
 
 > Running: handoff:status
 
-Quick health check. Shows when the last session closed, how many entities, assertions, and edges are in the database, and warns you if the data is stale. It makes no writes — safe to run any time.
+Quick health check. Shows the project name and marker uuid, when the last session closed, how many entities, assertions, and edges are live in the database, and warns you if the data is stale. It makes no writes — safe to run any time.
 
 ## What this shows
 
+- `project_name` (human-readable, `path.basename` of the project root) and `project_id` (marker uuid) — shown together so a status summary read out of context can't be misread as belonging to another project (cm#232).
 - `last_close` timestamp from `handoff.md` frontmatter and days since close.
-- `COUNT(*)` from `entities`, `assertions`, `edges` scoped to this project.
+- Live-row counts for `entities`, `assertions`, `edges`, scoped to this project. **Live** means `suppressed = false` (entities/edges) or `suppressed = false AND invalid_at IS NULL` (assertions — the bi-temporal predicate). The `assertions` figure also breaks out `suppressed` and `invalidated` counts alongside it so nothing is silently folded in (cm#232 — before this fix, `assertions` was a raw `COUNT(*)` that included suppressed rows).
 - Current retrieval contract names stored in `retrieval_contract`.
 - Whether a `session_in_progress` marker is present in `project_settings`.
 
@@ -23,7 +24,7 @@ Flags may be combined freely: `--json --breakdown --stale-pointers` emits a sing
 
 ## Preferred path — MCP
 
-If the `mcp__handoff__handoff_status` tool is available in this session, call it directly — it returns the same structured fields as `status --json` (project_id, entity/assertion/edge counts, handoff.md path, last_close/days_since, contracts, session_active, session_id, packaging) without a shell round-trip. Read-only — makes no writes.
+If the `mcp__handoff__handoff_status` tool is available in this session, call it directly — it returns the same structured fields as `status --json` (project_id, project_name, live entity/assertion/edge counts plus assertions_suppressed/assertions_invalidated/assertions_total, handoff.md path, last_close/days_since, contracts, session_active, session_id, packaging) without a shell round-trip. Read-only — makes no writes.
 
 ```
 ToolSearch({ query: "select:mcp__handoff__handoff_status" })
@@ -99,28 +100,33 @@ PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" status --json --breakdown --
 Running: handoff:status
 
   === handoff status ===
+  project_name:     my-project
   project_id:       C--Users-username-dev-my-project
   last_close:       2026-05-14T22:30:00Z (1 day(s) ago)
   handoff.md:       ~/.claude/projects/C--Users-username-dev-my-project/handoff.md
   entities:         23
-  assertions:       47
+  assertions:       41 (suppressed: 5, invalidated: 1)
   edges:            12
   contracts:        default
   session_active:   no
 
-Done: handoff:status — 23 entities, 47 assertions, 12 edges
+Done: handoff:status — project=my-project marker=C--Users-username-dev-my-project — 23 entities, 41 assertions (suppressed: 5, invalidated: 1), 12 edges
 ```
 
 **With `--json`:**
 ```json
 {
   "project_id": "C--Users-username-dev-my-project",
+  "project_name": "my-project",
   "db": "connected",
   "handoff_md": "/home/username/.claude/projects/.../handoff.md",
   "last_close": "2026-05-14T22:30:00Z",
   "days_since": 1,
   "entities": 23,
-  "assertions": 47,
+  "assertions": 41,
+  "assertions_suppressed": 5,
+  "assertions_invalidated": 1,
+  "assertions_total": 47,
   "edges": 12,
   "contracts": ["default"],
   "session_active": false,
@@ -128,6 +134,8 @@ Done: handoff:status — 23 entities, 47 assertions, 12 edges
   "packaging": "clean"
 }
 ```
+
+`assertions` is the live count (`suppressed = false AND invalid_at IS NULL`); `assertions_total` is the raw row count across all suppression states, shown for reference only — no caller should treat `assertions_total` as "how many assertions are usable."
 
 **With `--breakdown` added to prose:**
 ```
@@ -146,6 +154,8 @@ Done: handoff:status — 23 entities, 47 assertions, 12 edges
     depends_on: 7
     ...
 ```
+
+(`by suppression: live: 41` matches the top-level `assertions: 41` figure — both derive from the same live-row predicate, cm#232.)
 
 **With `--stale-pointers` added:**
 ```
