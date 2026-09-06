@@ -604,6 +604,69 @@ async function runTests() {
       `expected a NOT PERSISTED divergence line for an invalid topic, got:\n${out}`);
   });
 
+  // ── Test 3d: Done line reports decisions count (cm#230 follow-up) ─────────
+  // Own topics, isolated from decisionTopic above, so this count is not
+  // inflated by any of the earlier decisions[] tests in this same run.
+  const doneLineDecisionTopicA = `${decisionTopic}-doneline-a`;
+  const doneLineDecisionTopicB = `${decisionTopic}-doneline-b`;
+
+  await test('close: Done line reports "decisions: N" for the count of decisions[] rows written', () => {
+    const out = runHelper('close', ['--json', '-'], {
+      fakeRoot,
+      stdin: JSON.stringify({
+        tldr: 'cm#230 follow-up: Done-line decisions count probe.',
+        decisions: [
+          { topic: doneLineDecisionTopicA, decision: 'decision A', reason: 'reason A' },
+          { topic: doneLineDecisionTopicB, decision: 'decision B', reason: 'reason B' },
+        ],
+      }),
+    });
+    assert.ok(out.includes('Done: handoff:close'), 'close should still succeed');
+    assert.ok(out.includes('decisions: 2'),
+      `expected the Done line to report "decisions: 2" for 2 written decisions[] rows, got:\n${out}`);
+    assert.ok(/Done: handoff:close.*decisions: 2/.test(out),
+      `expected "decisions: 2" to appear ON the Done line itself, got:\n${out}`);
+  });
+
+  await test('checkpoint: Done line reports "decisions: N" for the count of decisions[] rows written', () => {
+    const out = runHelper('checkpoint', ['--json', '-'], {
+      fakeRoot,
+      stdin: JSON.stringify({
+        tldr: 'cm#230 follow-up: checkpoint Done-line decisions count probe.',
+        decisions: [{ topic: `${decisionTopic}-checkpoint-doneline`, decision: 'checkpoint decision', reason: 'checkpoint reason' }],
+        session_id: 'test-session-002',
+      }),
+    });
+    assert.ok(out.includes('Done: handoff:checkpoint'), 'checkpoint should still succeed');
+    assert.ok(/Done: handoff:checkpoint.*decisions: 1/.test(out),
+      `expected "decisions: 1" to appear ON the checkpoint Done line, got:\n${out}`);
+  });
+
+  // ── Test 3e: --dry-run previews decisions[] topics without writing (cm#230 follow-up) ──
+  await test('close --dry-run: previews decisions[] topics without persisting them', async () => {
+    const dryRunTopic = `${decisionTopic}-dryrun-preview`;
+    const out = runHelper('close', ['--dry-run', '--json'], {
+      fakeRoot,
+      stdin: JSON.stringify({
+        tldr: 'cm#230 follow-up: dry-run decisions preview probe.',
+        decisions: [{ topic: dryRunTopic, decision: 'would-be decision', reason: 'would-be reason' }],
+      }),
+    });
+    assert.ok(out.includes('Done: handoff:close --dry-run'), 'dry-run close should still succeed');
+    assert.ok(out.includes('decisions:  1'), `expected the dry-run "rows that WOULD be written" block to list "decisions:  1", got:\n${out}`);
+    assert.ok(out.includes('decisions that WOULD be written:'),
+      `expected a "decisions that WOULD be written:" preview header, got:\n${out}`);
+    assert.ok(out.includes(`- ${dryRunTopic}`),
+      `expected the dry-run preview to list topic "${dryRunTopic}", got:\n${out}`);
+
+    // Zero-mutation guarantee: dry-run must never actually write the row.
+    const { rows } = await db.query(
+      'SELECT id FROM decisions WHERE project_id = $1 AND topic = $2',
+      [encodedRoot, dryRunTopic]
+    );
+    assert.strictEqual(rows.length, 0, 'close --dry-run must NOT persist the previewed decision row');
+  });
+
   // ── Test 4: checkpoint writes rows but does NOT clear session_in_progress ─
   const checkpointPayload = {
     ...closePayload,

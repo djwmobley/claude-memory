@@ -397,9 +397,10 @@ Running: handoff:close
   entities written:    5
   assertions written:  12
   edges written:       3
+  decisions written:   1
   contract:            updated
 
-Done: handoff:close — project=my-project marker=C--Users-username-dev-my-project — 5e/12a/3ed written, session marker cleared
+Done: handoff:close — project=my-project marker=C--Users-username-dev-my-project — 5e/12a/3ed written, decisions: 1, session marker cleared
 ```
 
 The Done line (and the async-queued and `--dry-run` variants below) names the project
@@ -420,7 +421,11 @@ Running: handoff:close
     entities:   2
     assertions: 5
     edges:      1
+    decisions:  1
     contract:   yes
+
+  decisions that WOULD be written:
+    - vllm-embedding-default
 
   session_tldr:       would write (subject=my-project)
   open_thread rows:   would write 2 row(s)

@@ -5118,6 +5118,7 @@ async function cmdCheckpoint(args) {
   let entitiesWritten   = 0;
   let assertionsWritten = 0;
   let edgesWritten      = 0;
+  let decisionsWritten  = 0;
 
   if (asyncMode === 'true') {
     // Async path: validate then enqueue; do NOT write assertions/entities/edges now.
@@ -5152,8 +5153,9 @@ async function cmdCheckpoint(args) {
     const assertionCount = (payloadToEnqueue.assertions || []).length;
     const entityCount    = (payloadToEnqueue.entities   || []).length;
     const edgeCount      = (payloadToEnqueue.edges      || []).length;
+    const decisionCount  = (payloadToEnqueue.decisions  || []).length;
     console.log(
-      `\n  queued for async extraction: ${entityCount} entities, ${assertionCount} assertions, ${edgeCount} edges`
+      `\n  queued for async extraction: ${entityCount} entities, ${assertionCount} assertions, ${edgeCount} edges, ${decisionCount} decisions`
     );
     if (validation.warnings.length > 0) {
       console.log(`  predicate warnings: ${validation.warnings.length} (see stderr)`);
@@ -5195,6 +5197,7 @@ async function cmdCheckpoint(args) {
   entitiesWritten   = extraction.entitiesWritten;
   assertionsWritten = extraction.assertionsWritten;
   edgesWritten      = extraction.edgesWritten;
+  decisionsWritten  = extraction.decisionsWritten;
 
   // cm#227: surface any session-intent (session_tldr/open_thread/quick_reference)
   // persistence failure as a DIVERGENCE line — both in the console summary below
@@ -5235,10 +5238,11 @@ async function cmdCheckpoint(args) {
   console.log(`\n  entities written:    ${entitiesWritten}`);
   console.log(`  assertions written:  ${assertionsWritten}`);
   console.log(`  edges written:       ${edgesWritten}`);
+  console.log(`  decisions written:   ${decisionsWritten}`);
   for (const line of divergenceLines) {
     console.log(`  ${line}`);
   }
-  console.log(`\nDone: handoff:checkpoint — project=${path.basename(root)} marker=${projectId} — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written (session marker preserved for continued attribution)`);
+  console.log(`\nDone: handoff:checkpoint — project=${path.basename(root)} marker=${projectId} — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written, decisions: ${decisionsWritten} (session marker preserved for continued attribution)`);
 }
 
 // ── resolveSessionId ──────────────────────────────────────────────────────────
@@ -5501,8 +5505,9 @@ async function cmdClose(args) {
     const assertionCount = (payloadToEnqueue.assertions || []).length;
     const entityCount    = (payloadToEnqueue.entities   || []).length;
     const edgeCount      = (payloadToEnqueue.edges      || []).length;
+    const decisionCount  = (payloadToEnqueue.decisions  || []).length;
     console.log(
-      `\n  queued for async extraction: ${entityCount} entities, ${assertionCount} assertions, ${edgeCount} edges`
+      `\n  queued for async extraction: ${entityCount} entities, ${assertionCount} assertions, ${edgeCount} edges, ${decisionCount} decisions`
     );
     if (validation.warnings.length > 0) {
       console.log(`  predicate warnings: ${validation.warnings.length} (see stderr)`);
@@ -5539,6 +5544,7 @@ async function cmdClose(args) {
     console.log(`\n  entities:    0 (queued)`);
     console.log(`  assertions:  0 (queued)`);
     console.log(`  edges:       0 (queued)`);
+    console.log(`  decisions:   0 (queued)`);
     console.log(`  contract:    queued`);
 
     // Extraction-empty warning (non-fatal). Uses the pre-injection snapshot
@@ -5704,6 +5710,7 @@ async function cmdClose(args) {
     const wouldWriteEntities   = (payload.entities   || []).length;
     const wouldWriteAssertions = (payload.assertions || []).length;
     const wouldWriteEdges      = (payload.edges      || []).length;
+    const wouldWriteDecisions  = (payload.decisions  || []).length;
     const wouldWriteContract   = payload.contract ? 'yes' : 'no';
 
     console.log(`\n  payload validation:`);
@@ -5726,7 +5733,21 @@ async function cmdClose(args) {
     console.log(`    entities:   ${wouldWriteEntities}`);
     console.log(`    assertions: ${wouldWriteAssertions}`);
     console.log(`    edges:      ${wouldWriteEdges}`);
+    console.log(`    decisions:  ${wouldWriteDecisions}`);
     console.log(`    contract:   ${wouldWriteContract}`);
+
+    // Preview decision topics that WOULD be written (topic only — no full row
+    // detail; mirrors the entity/assertion/edge counts above with the same
+    // read-only, zero-mutation guarantee as the rest of dry-run).
+    if (wouldWriteDecisions > 0) {
+      console.log(`\n  decisions that WOULD be written:`);
+      for (const row of (payload.decisions || [])) {
+        const topic = (row && typeof row === 'object' && typeof row.topic === 'string' && row.topic)
+          ? row.topic
+          : '(no topic)';
+        console.log(`    - ${topic}`);
+      }
+    }
 
     // Extraction-empty warning (non-fatal, read-only — dry-run framing).
     // See the matching warning at the real-close and async-queue summary
@@ -5855,7 +5876,7 @@ async function cmdClose(args) {
   }
 
   // ── Synchronous path (default) — unchanged behavior ──────────────────────────
-  const { entitiesWritten, assertionsWritten, edgesWritten, intentDivergences } =
+  const { entitiesWritten, assertionsWritten, edgesWritten, decisionsWritten, intentDivergences } =
     await writeExtraction(db, projectId, payload, { projectBasename: path.basename(root) });
   // cm#227: DIVERGENCE lines for any session_tldr/open_thread/quick_reference
   // persistence failure — surfaced below in the Done summary AND rendered into
@@ -6575,6 +6596,7 @@ async function cmdClose(args) {
   console.log(`\n  entities written:    ${entitiesWritten}`);
   console.log(`  assertions written:  ${assertionsWritten}`);
   console.log(`  edges written:       ${edgesWritten}`);
+  console.log(`  decisions written:   ${decisionsWritten}`);
   console.log(`  contract:            updated`);
 
   // cm#227: any session_tldr/open_thread/quick_reference persistence failure —
@@ -6597,7 +6619,7 @@ async function cmdClose(args) {
     );
   }
 
-  console.log(`\nDone: handoff:close — project=${path.basename(root)} marker=${projectId} — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written, session marker cleared`);
+  console.log(`\nDone: handoff:close — project=${path.basename(root)} marker=${projectId} — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written, decisions: ${decisionsWritten}, session marker cleared`);
 
   // L4: Exit-code gate — 'strict' mode exits 3 when any subsystem ran degraded.
   if (_degradedSubsystems.length > 0 && closeDegradedExitMode === 'strict') {
@@ -7327,7 +7349,7 @@ async function cmdQueueDrain(args) {
     }
 
     try {
-      const { entitiesWritten, assertionsWritten, edgesWritten, intentDivergences } =
+      const { entitiesWritten, assertionsWritten, edgesWritten, decisionsWritten, intentDivergences } =
         await writeExtraction(db, projectId, payloadToWrite, {
           projectBasename: path.basename(findProjectRoot()),
         });
@@ -7344,7 +7366,7 @@ async function cmdQueueDrain(args) {
       const skipNote  = skipCount > 0 ? ` (${skipCount} predicate-rejected)` : '';
       console.log(
         `  [done] row ${rowId} (source=${row.source_ref || 'null'}): ` +
-        `${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written${skipNote}`
+        `${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written, decisions: ${decisionsWritten}${skipNote}`
       );
       // cm#227: surface session-intent persistence failures here too — this row's
       // close/checkpoint already reported "done" via queue-drain, so this is the

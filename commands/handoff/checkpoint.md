@@ -185,10 +185,11 @@ Running: handoff:checkpoint
   entities written:    3
   assertions written:  8
   edges written:       2
+  decisions written:   1
 
   Reranker gate: SKIPPED — corpus n=42 below threshold=1000
 
-Done: handoff:checkpoint — project=my-project marker=C--Users-username-dev-my-project — 3e/8a/2ed written (session marker preserved for continued attribution)
+Done: handoff:checkpoint — project=my-project marker=C--Users-username-dev-my-project — 3e/8a/2ed written, decisions: 1 (session marker preserved for continued attribution)
 ```
 
 The Done line names the project (`project=<name>`) and its marker uuid (`marker=<uuid>`) —
