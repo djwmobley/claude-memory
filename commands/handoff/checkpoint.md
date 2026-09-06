@@ -164,7 +164,7 @@ Running: handoff:checkpoint
 
   note captured: re-grounding: L2 corroboration gate requires non-null session_id
 
-Done: handoff:checkpoint --note — session_note written (session marker preserved)
+Done: handoff:checkpoint --note — project=my-project marker=C--Users-username-dev-my-project — session_note written (session marker preserved)
 ```
 
 **With `--json` (full payload):**
@@ -177,8 +177,12 @@ Running: handoff:checkpoint
 
   Reranker gate: SKIPPED — corpus n=42 below threshold=1000
 
-Done: handoff:checkpoint — 3e/8a/2ed written (session marker retained)
+Done: handoff:checkpoint — project=my-project marker=C--Users-username-dev-my-project — 3e/8a/2ed written (session marker preserved for continued attribution)
 ```
+
+The Done line names the project (`project=<name>`) and its marker uuid (`marker=<uuid>`) —
+same rationale as `/handoff:close` (cm#232): a checkpoint summary read out of context
+can't be misread as belonging to another project.
 
 ## Exit codes
 

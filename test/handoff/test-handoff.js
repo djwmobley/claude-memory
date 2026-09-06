@@ -88,6 +88,15 @@ async function countRows(client, table, projectId) {
   return parseInt(rows[0].n, 10);
 }
 
+/** `handoff.js status --json` prints a "Running: ..." banner before the JSON
+ * object (and a "Done: ..." summary after it) — mirrors handoff-mcp.mjs's own
+ * extractJsonBlock() so this test parses stdout the same way the MCP tool does. */
+function parseStatusJson(stdout) {
+  const start = stdout.indexOf('{');
+  const end   = stdout.lastIndexOf('}');
+  return JSON.parse(stdout.slice(start, end + 1));
+}
+
 /** Run the handoff.js helper as a subprocess with a fake project root. */
 function runHelper(sub, extraArgs = [], opts = {}) {
   // We fake the project root by pointing PROJECT_ROOT to a temp dir that has
@@ -288,6 +297,128 @@ async function runTests() {
     assert.ok(out.includes('assertions:'), 'status should show assertions count');
     assert.ok(out.includes('edges:'),      'status should show edges count');
     assert.ok(out.includes('Done: handoff:status'), 'status should emit Done line');
+  });
+
+  // ── cm#232 regression: handoff_status "assertions" count must exclude
+  // suppressed/invalidated rows (live-row predicate), and every Done line
+  // must name the project so a summary can't be misread as another
+  // project's — see cm#232/cm#233 issue text for the pwa-etl evidence
+  // (status reported 30 assertions after 4 suppressions + 3 adds when the
+  // live count was 26).
+  await test('status: assertions count excludes suppressed and invalidated rows (cm#232)', async () => {
+    // Baseline live count before injecting any extra rows.
+    const before = parseStatusJson(runHelper('status', ['--json'], { fakeRoot }));
+
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, last_reinforced)
+       VALUES ($1, 'CM232_LIVE', 'has_tag', 'live-marker', 8, 'user_stated', now())`,
+      [encodedRoot]
+    );
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, last_reinforced, suppressed)
+       VALUES ($1, 'CM232_SUPPRESSED', 'has_tag', 'suppressed-marker', 8, 'user_stated', now(), true)`,
+      [encodedRoot]
+    );
+    await db.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, last_reinforced, suppressed, invalid_at)
+       VALUES ($1, 'CM232_INVALIDATED', 'has_tag', 'invalidated-marker', 8, 'user_stated', now(), false, now())`,
+      [encodedRoot]
+    );
+
+    try {
+      const out  = parseStatusJson(runHelper('status', ['--json'], { fakeRoot }));
+      assert.strictEqual(out.assertions, before.assertions + 1,
+        `Expected live assertions count to grow by exactly 1 (the non-suppressed, non-invalidated row); before=${before.assertions}, after=${out.assertions}`);
+      assert.strictEqual(out.assertions_suppressed, (before.assertions_suppressed || 0) + 1,
+        'Expected assertions_suppressed to grow by exactly 1');
+      assert.strictEqual(out.assertions_invalidated, (before.assertions_invalidated || 0) + 1,
+        'Expected assertions_invalidated to grow by exactly 1');
+      assert.strictEqual(out.assertions_total, before.assertions_total + 3,
+        'Expected assertions_total to grow by 3 (all rows written, regardless of live-ness)');
+
+      // Prose output must show the same three numbers in the documented shape.
+      const prose = runHelper('status', [], { fakeRoot });
+      const proseMatch = prose.match(/assertions:\s*(\d+) \(suppressed: (\d+), invalidated: (\d+)\)/);
+      assert.ok(proseMatch, `Expected "assertions: N (suppressed: N, invalidated: N)" in prose output:\n${prose}`);
+      assert.strictEqual(parseInt(proseMatch[1], 10), out.assertions, 'prose live count should match --json live count');
+      assert.strictEqual(parseInt(proseMatch[2], 10), out.assertions_suppressed, 'prose suppressed count should match --json');
+      assert.strictEqual(parseInt(proseMatch[3], 10), out.assertions_invalidated, 'prose invalidated count should match --json');
+    } finally {
+      // Clean up so later tests' exact-count assertions are unaffected.
+      await db.query(
+        `DELETE FROM assertions WHERE project_id = $1 AND subject IN ('CM232_LIVE', 'CM232_SUPPRESSED', 'CM232_INVALIDATED')`,
+        [encodedRoot]
+      );
+    }
+  });
+
+  // ── cm#232 regression: entities/edges counts must also exclude suppressed
+  // rows — the same unfiltered-COUNT(*) bug applied to all three tables.
+  await test('status: entities/edges counts exclude suppressed rows (cm#232)', async () => {
+    const before = parseStatusJson(runHelper('status', ['--json'], { fakeRoot }));
+
+    await db.query(
+      `INSERT INTO entities (project_id, name, entity_type, description)
+       VALUES ($1, 'CM232_SUPPRESSED_ENTITY', 'system', 'test')`,
+      [encodedRoot]
+    );
+    await db.query(`UPDATE entities SET suppressed = true WHERE project_id = $1 AND name = 'CM232_SUPPRESSED_ENTITY'`, [encodedRoot]);
+    await db.query(
+      `INSERT INTO edges (project_id, from_entity, edge_type, to_entity, weight)
+       VALUES ($1, 'CM232_A', 'relates_to', 'CM232_B', 1.0)`,
+      [encodedRoot]
+    );
+    await db.query(`UPDATE edges SET suppressed = true WHERE project_id = $1 AND from_entity = 'CM232_A'`, [encodedRoot]);
+
+    try {
+      const out = parseStatusJson(runHelper('status', ['--json'], { fakeRoot }));
+      assert.strictEqual(out.entities, before.entities, 'Suppressed entity must not inflate the live entities count');
+      assert.strictEqual(out.edges, before.edges, 'Suppressed edge must not inflate the live edges count');
+    } finally {
+      await db.query(`DELETE FROM entities WHERE project_id = $1 AND name = 'CM232_SUPPRESSED_ENTITY'`, [encodedRoot]);
+      await db.query(`DELETE FROM edges WHERE project_id = $1 AND from_entity = 'CM232_A'`, [encodedRoot]);
+    }
+  });
+
+  // ── cm#232 regression: close/checkpoint Done lines must name the project
+  // (name + marker uuid) so a summary read out of context can't be misread
+  // as another project's close.
+  await test('close: Done line includes project name and marker uuid (cm#232)', () => {
+    const out = runHelper('close', ['--json', '-'], {
+      fakeRoot,
+      stdin: JSON.stringify({ session_id: 'cm232-close-naming', tldr: 'cm232 naming test', assertions: [] }),
+    });
+    const projectBasename = path.basename(fakeRoot);
+    const doneLine = out.split('\n').find((l) => l.startsWith('Done: handoff:close'));
+    assert.ok(doneLine, `Expected a "Done: handoff:close" line in output:\n${out}`);
+    assert.ok(doneLine.includes(`project=${projectBasename}`), `Expected Done line to include project=${projectBasename}, got: ${doneLine}`);
+    assert.ok(doneLine.includes(`marker=${encodedRoot}`), `Expected Done line to include marker=${encodedRoot}, got: ${doneLine}`);
+  });
+
+  await test('checkpoint: Done line includes project name and marker uuid (cm#232)', () => {
+    const out = runHelper('checkpoint', ['--json', '-'], {
+      fakeRoot,
+      stdin: JSON.stringify({ session_id: 'cm232-checkpoint-naming', tldr: 'cm232 naming test', assertions: [] }),
+    });
+    const projectBasename = path.basename(fakeRoot);
+    const doneLine = out.split('\n').find((l) => l.startsWith('Done: handoff:checkpoint'));
+    assert.ok(doneLine, `Expected a "Done: handoff:checkpoint" line in output:\n${out}`);
+    assert.ok(doneLine.includes(`project=${projectBasename}`), `Expected Done line to include project=${projectBasename}, got: ${doneLine}`);
+    assert.ok(doneLine.includes(`marker=${encodedRoot}`), `Expected Done line to include marker=${encodedRoot}, got: ${doneLine}`);
+  });
+
+  // ── cm#232 regression: handoff.md header must name the project and marker
+  // uuid. This template already carried PROJECT_NAME/PROJECT_ID (PR #92) —
+  // this test pins that invariant so it can never silently regress.
+  await test('handoff.md header includes project name and marker uuid (cm#232)', () => {
+    runHelper('close', ['--json', '-'], {
+      fakeRoot,
+      stdin: JSON.stringify({ session_id: 'cm232-handoffmd-naming', tldr: 'cm232 handoff.md naming test', assertions: [] }),
+    });
+    const handoffPath = resolveHandoffMdPath(encodedRoot);
+    const content = fs.readFileSync(handoffPath, 'utf8');
+    assert.ok(content.includes(`project_id: ${encodedRoot}`), 'handoff.md frontmatter should include the marker uuid');
+    assert.ok(content.includes(`# Handoff — ${path.basename(fakeRoot)}`), 'handoff.md heading should include the project name');
   });
 
   // ── Test 3: close writes entities/assertions/edges from JSON stdin ────────
