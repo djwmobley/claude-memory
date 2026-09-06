@@ -74,6 +74,11 @@ const { embedQuery }                               = require('./lib/embed');
 const { execFileSync }                             = require('child_process');
 const crypto                                       = require('crypto');
 const { REALITY_CHECKS, runVerifyDispatch }        = require('./lib/reality-checks');
+// cm#230: the SAME decisions-row writer scripts/handoff-mcp.mjs's
+// persist_decisions MCP tool uses — writeExtraction below is the SECOND
+// (and, before this fix, only-validated-never-written) entry point onto
+// this one write path.
+const { validateDecisionRows, persistDecisionRow } = require('./lib/decisions-writer');
 
 process.on('exit', () => {
   const ms = Number(process.hrtime.bigint() - __startNs) / 1e6;
@@ -4695,6 +4700,58 @@ async function writeExtraction(db, projectId, payload, opts) {
     edgesWritten++;
   }
 
+  // Decisions — cm#230: payload.decisions[] persisted through the SAME
+  // decisions-writer.js write path scripts/handoff-mcp.mjs's persist_decisions
+  // MCP tool uses (persistDecisionRow). Before this fix, payload.decisions[]
+  // was schema-validated (readStdin/validatePayload) but NEVER written here —
+  // the intended write path (persist_decisions) was a separate, unconnected
+  // tool. Per-row fault isolation, matching entities'/edges' own
+  // skip-malformed-item behavior above: one row that fails validation, hits
+  // a genuine write error (including a missing `decisions` table on a DB
+  // that has not yet run ensureSchemaCurrent — e.g. the async queue-drain
+  // path, which does not call it), or degrades its embedding (fail-soft,
+  // per write-time-embed.js's own header) never blocks the rest of this
+  // decisions[] array OR the rest of the close. Failures/degradations are
+  // collected into decisionDivergences and merged into the SAME
+  // intentDivergences channel cm#227 built for session-intent persistence
+  // failures below — one DIVERGENCE-line mechanism, not two.
+  let decisionsWritten = 0;
+  const decisionDivergences = [];
+  for (const row of (payload.decisions || [])) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
+    const topicForMessage = (typeof row.topic === 'string' && row.topic) ? row.topic : '(no topic)';
+    const rowErrors = validateDecisionRows([row]);
+    if (rowErrors.length > 0) {
+      decisionDivergences.push({
+        predicate: `decision:${topicForMessage}`,
+        subject: topicForMessage,
+        message: `validation failed — ${rowErrors.join('; ')}`,
+        kind: 'not_persisted',
+      });
+      continue;
+    }
+    try {
+      const { warning } = await persistDecisionRow(db, projectId, row);
+      decisionsWritten++;
+      if (warning) {
+        decisionDivergences.push({
+          predicate: `decision:${row.topic}`,
+          subject: row.topic,
+          message: warning,
+          kind: 'embed_degraded',
+        });
+      }
+    } catch (err) {
+      process.stderr.write(`[handoff] decision write failed for topic "${topicForMessage}" (non-fatal): ${err.message}\n`);
+      decisionDivergences.push({
+        predicate: `decision:${topicForMessage}`,
+        subject: topicForMessage,
+        message: err.message,
+        kind: 'not_persisted',
+      });
+    }
+  }
+
   // Retrieval contract change — versioned and history-recorded (non-fatal).
   if (payload.contract && typeof payload.contract === 'object') {
     const changeNote = `close session=${payload.session_id || 'unknown'}`;
@@ -4742,19 +4799,39 @@ async function writeExtraction(db, projectId, payload, opts) {
     intentDivergences = [{ predicate: '(unknown)', subject: '(unknown)', message: intentErr.message }];
   }
 
-  return { entitiesWritten, assertionsWritten, edgesWritten, intentDivergences };
+  // cm#230: decision-row divergences share the SAME channel session-intent
+  // divergences use (formatIntentDivergenceLines, below) — one DIVERGENCE-line
+  // mechanism for the whole close/checkpoint summary and handoff.md Degraded
+  // section, not a second parallel one. decisionsWritten is additionally
+  // returned on its own for any caller that wants the raw count.
+  return {
+    entitiesWritten, assertionsWritten, edgesWritten, decisionsWritten,
+    intentDivergences: [...intentDivergences, ...decisionDivergences],
+  };
 }
 
 /**
  * cm#227: build the `DIVERGENCE: <predicate> NOT PERSISTED — <first line>` lines
  * for a list of persistSessionIntent divergences, shared by the close/checkpoint
  * console summary and the handoff.md Degraded section.
- * @param {Array<{predicate:string, subject:string, message:string}>} divergences
+ *
+ * cm#230: also formats decisions-writer divergences (writeExtraction's
+ * decisionDivergences, merged into the same array this function receives).
+ * Those carry an explicit `d.kind` — 'embed_degraded' renders a DISTINCT
+ * line (the row WAS persisted; only its embedding degraded to NULL,
+ * fail-soft per write-time-embed.js) so it is never confused with an actual
+ * NOT-PERSISTED write failure. Any divergence with no `kind` (every existing
+ * session-intent divergence, cm#227) renders EXACTLY as before — this is a
+ * strict superset, not a behavior change for the pre-existing callers.
+ * @param {Array<{predicate:string, subject:string, message:string, kind?:string}>} divergences
  * @returns {string[]}
  */
 function formatIntentDivergenceLines(divergences) {
   return (divergences || []).map((d) => {
     const firstLine = String(d.message || '').split('\n')[0];
+    if (d.kind === 'embed_degraded') {
+      return `DIVERGENCE: ${d.predicate} EMBEDDING DEGRADED (row persisted, embedding=NULL) — ${firstLine}`;
+    }
     return `DIVERGENCE: ${d.predicate} NOT PERSISTED — ${firstLine}`;
   });
 }
@@ -7656,5 +7733,10 @@ if (require.main === module) {
     checkPgvectorGatedObjects,
     reportPgvectorGatedDegradation,
     SCHEMA_EPOCH,
+    // cm#230: exposed for test/lib/test-decisions-writer.js — no test-side
+    // reimplementation of writeExtraction's decisions[] handling or the
+    // DIVERGENCE-line formatter.
+    writeExtraction,
+    formatIntentDivergenceLines,
   };
 }

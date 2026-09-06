@@ -202,7 +202,9 @@ async function teardown() {
   let db;
   try {
     db = await connectDb();
-    const tables = ['edges', 'assertions', 'entities', 'retrieval_contract', 'project_settings'];
+    // 'decisions' cleanup added cm#230 (payload.decisions[] regression tests
+    // above write real rows here — same hygiene as the other seam tables).
+    const tables = ['edges', 'assertions', 'entities', 'retrieval_contract', 'project_settings', 'decisions'];
     // Clean rows under both the UUID (where writes go) and the legacy encoded-cwd
     // (in case any legacy code path leaked rows under the old project_id).
     const ids = [projectUuid, encodedFakeRoot].filter(Boolean);
@@ -390,6 +392,85 @@ async function runTests() {
       'close with zero entities/assertions/edges should emit the extraction-empty warning');
     assert.ok(out.includes('Done: handoff:close'),
       'the warning must be non-fatal — close should still succeed');
+  });
+
+  // ── Test 3c: close persists payload.decisions[] (cm#230) ──────────────────
+  // Own payload/topic, isolated from closePayload above — writes to the
+  // project-scoped `decisions` table are NOT covered by the entities/
+  // assertions/edges cleanup in teardown(), so this uses a topic unique to
+  // this test run (PROJECT_ID is Date.now()-suffixed) and the test DB
+  // (claude_memory_eval_test) has NO default embedding_providers row at the
+  // time this suite runs — verified independently — so this ALSO exercises
+  // the embedding-provider-down fail-soft path end to end (deterministic
+  // unit coverage for the same scenario lives in
+  // test/lib/test-decisions-writer.js's DW-8, which does not depend on this
+  // DB's provider configuration).
+  // TOPIC_RE (decisions-writer.js) requires kebab-case with NO run of two+
+  // hyphens (each hyphen must be immediately followed by [a-z0-9]) — collapse
+  // every run of non-alnum chars (PROJECT_ID's own "test--handoff--<ts>"
+  // double-dash convention included) to a SINGLE hyphen, not a 1:1 replace.
+  const decisionTopic = `cm230-test-decision-${PROJECT_ID}`
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  const decisionsClosePayload = {
+    tldr: 'cm#230 decisions[] regression payload.',
+    decisions: [{ topic: decisionTopic, decision: 'first decision text', reason: 'initial reason' }],
+  };
+
+  await test('close: writes payload.decisions[] to the decisions table', async () => {
+    const out = runHelper('close', ['--json', '-'], { fakeRoot, stdin: JSON.stringify(decisionsClosePayload) });
+    assert.ok(out.includes('Done: handoff:close'), 'close with decisions[] should still succeed (non-fatal contract)');
+    const { rows } = await db.query(
+      'SELECT topic, decision, reason FROM decisions WHERE project_id = $1 AND topic = $2',
+      [encodedRoot, decisionTopic]
+    );
+    assert.strictEqual(rows.length, 1, `Expected exactly 1 decisions row for topic "${decisionTopic}", got ${rows.length}`);
+    assert.strictEqual(rows[0].decision, 'first decision text');
+    assert.strictEqual(rows[0].reason, 'initial reason');
+  });
+
+  await test('close: decisions[] embedding-provider-down is non-fatal and surfaces a DIVERGENCE line (this DB has no default embedding_providers row)', () => {
+    const out = runHelper('close', ['--json', '-'], {
+      fakeRoot,
+      stdin: JSON.stringify({
+        tldr: 'cm#230 embed-degraded probe.',
+        decisions: [{ topic: `${decisionTopic}-probe`, decision: 'probe decision', reason: 'probe reason' }],
+      }),
+    });
+    assert.ok(out.includes('Done: handoff:close'), 'a degraded embedding must never fail the close (non-fatal contract)');
+    assert.ok(
+      out.includes(`DIVERGENCE: decision:${decisionTopic}-probe EMBEDDING DEGRADED`),
+      `expected an EMBEDDING DEGRADED divergence line for a DB with no default provider, got:\n${out}`
+    );
+  });
+
+  await test('close: re-closing with the SAME decision topic UPDATES the row, never duplicates it', async () => {
+    const revised = {
+      tldr: 'cm#230 idempotent-reclose probe.',
+      decisions: [{ topic: decisionTopic, decision: 'REVISED decision text', reason: 'revised reason' }],
+    };
+    runHelper('close', ['--json', '-'], { fakeRoot, stdin: JSON.stringify(revised) });
+    const { rows } = await db.query(
+      'SELECT decision, reason FROM decisions WHERE project_id = $1 AND topic = $2',
+      [encodedRoot, decisionTopic]
+    );
+    assert.strictEqual(rows.length, 1, `Expected the SAME single row after a re-close with the same topic (upsert, not duplicate), got ${rows.length}`);
+    assert.strictEqual(rows[0].decision, 'REVISED decision text', 'expected the row content to be UPDATED by the re-close');
+    assert.strictEqual(rows[0].reason, 'revised reason');
+  });
+
+  await test('close: a decisions[] row that fails validation is skipped (non-fatal) and surfaces NOT PERSISTED', () => {
+    const out = runHelper('close', ['--json', '-'], {
+      fakeRoot,
+      stdin: JSON.stringify({
+        tldr: 'cm#230 bad-topic probe.',
+        decisions: [{ topic: 'NoHyphenUppercase', decision: 'd', reason: 'r' }],
+      }),
+    });
+    assert.ok(out.includes('Done: handoff:close'), 'a validation-rejected decision row must never fail the close');
+    assert.ok(out.includes('DIVERGENCE: decision:NoHyphenUppercase NOT PERSISTED'),
+      `expected a NOT PERSISTED divergence line for an invalid topic, got:\n${out}`);
   });
 
   // ── Test 4: checkpoint writes rows but does NOT clear session_in_progress ─

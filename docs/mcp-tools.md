@@ -285,3 +285,15 @@ inline-embed-at-write-time, same fail-soft posture. It gained a required
 `projectRoot` parameter (the old flow had no notion of project scoping) and
 its response shape changed accordingly; the topic-format contract (kebab
 case, at least one hyphen) is unchanged.
+
+cm#230: this is now one of TWO entry points onto the same write path
+(`scripts/lib/decisions-writer.js`'s `persistDecisionRow`) — the other is
+`payload.decisions[]` on a `handoff_close`/`handoff_checkpoint` call (or the
+equivalent CLI `handoff.js close/checkpoint --json -`). Before cm#230,
+`payload.decisions[]` was schema-validated but silently never written; a
+caller had to call `persist_decisions` separately to actually persist a
+decision. Both entry points now share one row-validation function
+(`validateDecisionRows`) and one write function (`persistDecisionRow`) — see
+`commands/handoff/close.md`'s "Decisions" section for the close/checkpoint
+field contract and failure semantics (fail-soft embedding, per-row
+DIVERGENCE surfacing on validation/write failure).
