@@ -65,15 +65,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS embedding_providers_is_default_unique_idx
 -- verification FAIL in migrate-schema-addenda.js, the operator's signal to
 -- reconcile manually.
 --
--- SEED VALUES ARE UNCHANGED by this note (cm#202 S-B.6) — they stay
--- 'http://localhost:8000'/'Qwen3-Embedding-8B' exactly as before, per this
--- header's own "operator-reconciled-state" framing (the seed is a starting
--- point, not a promise it matches any given deployment). What follows is
--- comment-only, UNVERIFIED BY ANY GATE, documentation of the known-good
--- values for THIS repo's own local vLLM deployment convention, added so
--- reconciliation after a divergence is copy-paste rather than rediscovery
--- through a failed migrate-07-reembed-corpus.js apply (as happened live,
--- 2026-08-18, phase (g)):
+-- SEED VALUES CORRECTED (2026-09-06, init-seed-local-provider AUTHOR task):
+-- the cm#202 S-B.6 note below previously left this seed's literal VALUES at
+-- 'http://localhost:8000'/'Qwen3-Embedding-8B' while documenting, in the
+-- very same comment, that the known-good values are 8800 / the vLLM-prefixed
+-- 'Qwen/Qwen3-Embedding-8B' -- a self-contradictory file. The literals below
+-- now match the documented known-good values; the documentation itself is
+-- otherwise unchanged.
+--
+-- What follows is comment-only, UNVERIFIED BY ANY GATE, documentation of the
+-- known-good values for THIS repo's own local vLLM deployment convention,
+-- added so reconciliation after a divergence is copy-paste rather than
+-- rediscovery through a failed migrate-07-reembed-corpus.js apply (as
+-- happened live, 2026-08-18, phase (g)):
 --   port:              8800   (not 8000 — scripts/lib/shared.js's own
 --                               vllmEmbed() defaults VLLM_EMBED_URL to
 --                               'http://localhost:8800'; ~/start-vllm-*.sh
@@ -88,5 +92,5 @@ CREATE UNIQUE INDEX IF NOT EXISTS embedding_providers_is_default_unique_idx
 -- below, reconcile with an UPDATE against this row (or the values above,
 -- whichever is your actual deployment) rather than editing this seed.
 INSERT INTO embedding_providers (name, model_label, native_dims, stored_dims, endpoint, is_default)
-VALUES ('vllm-local', 'Qwen3-Embedding-8B', 4096, 4000, 'http://localhost:8000', true)
+VALUES ('vllm-local', 'Qwen/Qwen3-Embedding-8B', 4096, 4000, 'http://localhost:8800', true)
 ON CONFLICT (name) DO NOTHING;

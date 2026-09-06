@@ -1111,6 +1111,21 @@ jobs:
         #   T8  knowledge object has all required fields in no-config fallback
         # Pure file-system unit test — no Postgres or Ollama required.
         run: node scripts/test-config-loading.js
+      - name: Run embed-endpoint classification + local-provider seeding unit tests
+        # init-seed-local-provider AUTHOR task (2026-09-06). Tests
+        # scripts/lib/embedding-provider.js's classifyEmbedEndpoint,
+        # resolveConfiguredEmbedEndpoint, and seedLocalEmbeddingProvider:
+        #   Section 1  classifyEmbedEndpoint total classification (LOCAL/REMOTE/INVALID)
+        #              adversary case list — uppercase host, trailing dot, IPv6,
+        #              userinfo, *.localhost, scheme-less, non-http(s), etc.
+        #   Section 2  resolveConfiguredEmbedEndpoint precedence — pipeline.yml
+        #              wins over env, env wins over NONE, never the hardcoded
+        #              localhost:8800 runtime fallback.
+        #   Section 3  seedLocalEmbeddingProvider against a fake db — exactly
+        #              one INSERT on LOCAL, never check-then-insert, dialect-
+        #              correct boolean/integer params, never throws.
+        # Pure unit test with a fake db — no Postgres/SQLite/network required.
+        run: node test/test-embed-endpoint-classify.js
       - name: Run OS-portability invariant assertions
         # Static invariant sweep over the source tree — mirrors S8/S9/S10 style:
         #   P1  pg connection is OS-uniform (no platform branch in connectHandoff)

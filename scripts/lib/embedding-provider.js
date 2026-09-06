@@ -33,7 +33,7 @@
  * contract being DB-row-driven rather than env-driven.
  */
 
-const { _vllmEmbedRaw, VllmHttpError, VllmTimeoutError, VllmNetworkError } = require('./embed');
+const { _vllmEmbedRaw, VllmHttpError, VllmTimeoutError, VllmNetworkError, _readPipelineYmlKey } = require('./embed');
 
 class EmbeddingProvider {
   /**
@@ -314,6 +314,217 @@ async function probeProvider(provider, opts = {}) {
   return { ok: true, nativeDims: result.rawDims, storedDims: result.dims };
 }
 
+// ─── INIT-TIME LOCAL-PROVIDER SEEDING (2026-09-06, AUTHOR task) ────────────
+//
+// cmdInit seeds a default embedding_providers row ONLY when the operator's
+// configured embed endpoint is unambiguously local -- never on a bare env
+// fallback the operator never actually set, and never for a remote/unknown
+// endpoint without explicit owner attestation (data_egress_approved is a
+// human-set column; init only sets it true on the LOCAL path, where "local"
+// by construction cannot be a data-egress event). The two pure functions
+// below are the total-classification core of that gate; cmdInit's seeding
+// step (scripts/handoff.js, immediately after schema apply) is the only
+// caller that writes anything -- these functions never touch a DB or a
+// filesystem beyond the read-only pipeline.yml lookup.
+
+/**
+ * resolveConfiguredEmbedEndpoint — single-precedence resolution of the
+ * embed endpoint URL, for INIT-TIME SEEDING purposes only. Precedence:
+ *   (a) .claude/pipeline.yml `knowledge.vllm_embed_url`, if set (opts.projectRoot)
+ *   (b) env.VLLM_EMBED_URL, if set
+ *   (c) NONE -- returns null.
+ *
+ * Deliberately NEVER falls back to shared.js/embed.js's own runtime default
+ * ('http://localhost:8800') -- that default exists so the RUNTIME embed
+ * call path degrades to "assume local dev" when nothing is configured; for
+ * SEEDING a default provider row, an unconfigured endpoint must be treated
+ * as unconfigured/INVALID, never silently assumed local. See classifyEmbedEndpoint.
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.projectRoot] -- project root to read .claude/pipeline.yml from
+ * @param {object} [opts.env] -- env object to read VLLM_EMBED_URL from (default process.env)
+ * @returns {string|null}
+ */
+function resolveConfiguredEmbedEndpoint(opts = {}) {
+  const { projectRoot } = opts;
+  const env = opts.env || process.env;
+  if (projectRoot) {
+    const fromYml = _readPipelineYmlKey(projectRoot, 'vllm_embed_url');
+    if (fromYml) return fromYml;
+  }
+  if (env.VLLM_EMBED_URL) return env.VLLM_EMBED_URL;
+  return null;
+}
+
+/**
+ * classifyEmbedEndpoint — total classification of an embed-endpoint URL
+ * string into exactly one of 'LOCAL' | 'REMOTE' | 'INVALID'. Pure, no I/O.
+ * Every input maps to exactly one branch -- there is no allow-list and no
+ * unclassified fall-through.
+ *
+ * INVALID when:
+ *   - `url` is not a non-empty string, OR
+ *   - `new URL(url)` throws (malformed, or scheme-less like "localhost:8800"
+ *     -- WHATWG parses "localhost:8800" as protocol "localhost:" with an
+ *     opaque path, empty hostname; caught by the next check too), OR
+ *   - `protocol` is not exactly 'http:' or 'https:', OR
+ *   - `hostname` is empty.
+ *
+ * Otherwise, normalize hostname (lowercase; strip exactly one trailing dot;
+ * strip surrounding IPv6 brackets), then:
+ *   LOCAL  iff normalized hostname is 'localhost', starts with '127.', or
+ *          equals '::1', AND the URL carries no username/password.
+ *   REMOTE otherwise (0.0.0.0, LAN/public hosts, *.localhost subdomains,
+ *          host.docker.internal, and any URL with userinfo even against a
+ *          localhost hostname).
+ *
+ * @param {string} url
+ * @returns {'LOCAL'|'REMOTE'|'INVALID'}
+ */
+function classifyEmbedEndpoint(url) {
+  if (typeof url !== 'string' || url.trim() === '') return 'INVALID';
+
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch (_) {
+    return 'INVALID';
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return 'INVALID';
+  if (!parsed.hostname) return 'INVALID';
+
+  let hostname = parsed.hostname.toLowerCase();
+  if (hostname.endsWith('.')) hostname = hostname.slice(0, -1); // strip exactly one trailing dot
+  if (hostname.startsWith('[') && hostname.endsWith(']')) hostname = hostname.slice(1, -1); // IPv6 brackets
+
+  const hasUserinfo = parsed.username !== '' || parsed.password !== '';
+  const isLocalHost = hostname === 'localhost' || hostname.startsWith('127.') || hostname === '::1';
+
+  return (isLocalHost && !hasUserinfo) ? 'LOCAL' : 'REMOTE';
+}
+
+// Fixed identity of the ONE local provider row init ever seeds. Never a
+// second name, never operator-suppliable -- an operator who wants a
+// different local model/name hand-edits or hand-inserts a second row.
+const LOCAL_PROVIDER_NAME        = 'vllm-local';
+const LOCAL_PROVIDER_MODEL_LABEL = 'Qwen/Qwen3-Embedding-8B';
+const LOCAL_PROVIDER_NATIVE_DIMS = 4096;
+const LOCAL_PROVIDER_STORED_DIMS = 4000;
+const LOCAL_PROVIDER_APPROVED_BY = 'handoff-init:local-endpoint';
+
+/**
+ * seedLocalEmbeddingProvider — cmdInit's (and `init --seed-provider`'s)
+ * ONE entry point for conditionally seeding a default `embedding_providers`
+ * row. Never called from ensureSchemaCurrent or any drift-apply path --
+ * seeding is an init-only, explicitly-invoked action, never something that
+ * fires implicitly on every schema-current check.
+ *
+ * Behavior (total classification over resolveConfiguredEmbedEndpoint's
+ * result via classifyEmbedEndpoint):
+ *   NONE / INVALID -- no write; NOTE line telling the operator to configure
+ *     `knowledge.vllm_embed_url`.
+ *   REMOTE -- no write; NOTE line requiring explicit owner attestation
+ *     (an operator hand-inserts the row with data_egress_approved set).
+ *   LOCAL -- single INSERT ... ON CONFLICT DO NOTHING (untargeted -- this
+ *     also absorbs the case where a DIFFERENT row already holds
+ *     is_default=true and the partial unique index would otherwise raise a
+ *     constraint violation; see embedding_providers_is_default_unique_idx).
+ *     Never check-then-insert. rowCount 1 -> OK line; rowCount 0 -> NOTE
+ *     "already present" line (covers both "same name exists" and "a
+ *     different row is already default").
+ *
+ * Never throws -- any unexpected error (DB down, etc.) is caught and
+ * reported as a non-fatal NOTE line, per "init never fails because of this
+ * step."
+ *
+ * @param {object} opts
+ * @param {import('./db-seam').StoragePort} opts.db  -- open connection (still open;
+ *   caller closes/releases locks around this call same as any other cmdInit DB step).
+ *   Dialect is read from `db.dialect` (the port's own diagnostics getter) --
+ *   NEVER passed down from the engine as a separate branch, so cmdInit itself
+ *   stays free of dialect conditionals (see test-sqlite-seam.js Section 13's
+ *   machine-enforced "handoff.js contains ZERO db.dialect checks outside
+ *   composition root" invariant). `opts.dialect` is accepted ONLY as a
+ *   fallback for callers (tests) that pass a plain object without a real
+ *   `.dialect` getter.
+ * @param {'postgres'|'sqlite'} [opts.dialect] -- fallback, see above; ignored if `db.dialect` is set
+ * @param {string} [opts.projectRoot] -- passed through to resolveConfiguredEmbedEndpoint
+ * @param {object} [opts.env] -- passed through to resolveConfiguredEmbedEndpoint (default process.env)
+ * @returns {Promise<{classification: string, endpoint: string|null, seeded: boolean, lines: string[]}>}
+ *   `lines` are fully-formatted, ready to console.log() as-is (cmdInit's own
+ *   "  [OK]    "/"  [NOTE]  " indentation convention).
+ */
+async function seedLocalEmbeddingProvider(opts = {}) {
+  const { db, projectRoot, env } = opts;
+  const dialect = (db && db.dialect) || opts.dialect;
+  try {
+    const endpoint = resolveConfiguredEmbedEndpoint({ projectRoot, env });
+    const classification = endpoint ? classifyEmbedEndpoint(endpoint) : 'NONE';
+
+    if (classification === 'NONE' || classification === 'INVALID') {
+      return {
+        classification, endpoint, seeded: false,
+        lines: [
+          '  [NOTE]  embedding endpoint not configured/invalid — no default provider seeded; ' +
+          'set knowledge.vllm_embed_url in .claude/pipeline.yml',
+        ],
+      };
+    }
+
+    if (classification === 'REMOTE') {
+      let host = endpoint;
+      try { host = new URL(endpoint).hostname; } catch (_) { /* keep raw endpoint as fallback label */ }
+      return {
+        classification, endpoint, seeded: false,
+        lines: [
+          `  [NOTE]  embedding endpoint ${host} is not local — default provider requires explicit ` +
+          'owner attestation; insert an embedding_providers row with data_egress_approved set by hand',
+        ],
+      };
+    }
+
+    // LOCAL — one statement, no check-then-insert. Untargeted ON CONFLICT
+    // DO NOTHING covers both a same-name row already existing AND a
+    // different row already holding is_default=true (the partial unique
+    // index on is_default would otherwise raise a separate constraint
+    // violation that a name-targeted "ON CONFLICT (name)" would not catch).
+    const pg = dialect !== 'sqlite';
+    const boolTrue = pg ? true : 1;
+    const sql = `INSERT INTO embedding_providers
+        (name, model_label, native_dims, stored_dims, endpoint, is_default, data_egress_approved, data_egress_approved_by, data_egress_approved_at)
+      VALUES
+        ($1, $2, $3, $4, $5, $6, $7, $8, now())
+      ON CONFLICT DO NOTHING`;
+    const params = [
+      LOCAL_PROVIDER_NAME,
+      LOCAL_PROVIDER_MODEL_LABEL,
+      LOCAL_PROVIDER_NATIVE_DIMS,
+      LOCAL_PROVIDER_STORED_DIMS,
+      endpoint,
+      boolTrue,
+      boolTrue,
+      LOCAL_PROVIDER_APPROVED_BY,
+    ];
+    const { rowCount } = await db.query(sql, params);
+    if (rowCount === 1) {
+      return {
+        classification, endpoint, seeded: true,
+        lines: [`  [OK]    seeded default provider ${LOCAL_PROVIDER_NAME} (${endpoint})`],
+      };
+    }
+    return {
+      classification, endpoint, seeded: false,
+      lines: [`  [NOTE]  provider ${LOCAL_PROVIDER_NAME} already present — left untouched`],
+    };
+  } catch (err) {
+    return {
+      classification: 'ERROR', endpoint: null, seeded: false,
+      lines: [`  [NOTE]  default-provider seeding skipped (non-fatal): ${err.message}`],
+    };
+  }
+}
+
 module.exports = {
   EmbeddingProvider,
   VllmEmbeddingProvider,
@@ -324,4 +535,12 @@ module.exports = {
   ProviderProbeError,
   PROBE_TEXT,
   DEFAULT_PROBE_TIMEOUT_MS,
+  resolveConfiguredEmbedEndpoint,
+  classifyEmbedEndpoint,
+  seedLocalEmbeddingProvider,
+  LOCAL_PROVIDER_NAME,
+  LOCAL_PROVIDER_MODEL_LABEL,
+  LOCAL_PROVIDER_NATIVE_DIMS,
+  LOCAL_PROVIDER_STORED_DIMS,
+  LOCAL_PROVIDER_APPROVED_BY,
 };

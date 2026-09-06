@@ -277,4 +277,16 @@ async function embedQuery(text, opts = {}) {
   return _vllmEmbed(text, vllmUrl, model);
 }
 
-module.exports = { embedQuery, _vllmEmbedRaw, VllmHttpError, VllmTimeoutError, VllmNetworkError };
+module.exports = {
+  embedQuery,
+  _vllmEmbedRaw,
+  VllmHttpError,
+  VllmTimeoutError,
+  VllmNetworkError,
+  // Exported (2026-09-06, init-seed-local-provider AUTHOR task) so
+  // scripts/lib/embedding-provider.js's resolveConfiguredEmbedEndpoint can
+  // reuse the SAME pipeline.yml `knowledge.vllm_embed_url` read this file's
+  // own embedQuery() uses -- by reference, never forked -- rather than
+  // duplicating the regex.
+  _readPipelineYmlKey,
+};

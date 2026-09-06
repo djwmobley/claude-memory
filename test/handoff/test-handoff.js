@@ -292,6 +292,92 @@ async function runTests() {
     runHelper('init', ['-y'], { fakeRoot });
   });
 
+  // ── Test 1b: init-seed-local-provider (AUTHOR task, 2026-09-06) ──────────
+  //
+  // embedding_providers is a GLOBAL, non-project-scoped table (see its own
+  // DDL comment in scripts/sql/handoff-core-schema.sql), SHARED across every
+  // project/test that ever touches this same claude_memory_eval_test DB —
+  // AND `decisions.embedded_by_provider_id` (and other tables) carry a plain
+  // FK to it with no ON DELETE clause, so a pre-existing row (e.g. one an
+  // operator seeded by hand for their own local dev use, or one a previous
+  // decisions-writer test run referenced) can be un-deletable from a test's
+  // own cleanup step. These tests therefore NEVER delete/mutate a
+  // pre-existing 'vllm-local' row — they read the row count BEFORE acting
+  // and assert the CORRECT relative outcome (fresh insert vs. already-
+  // present no-op) rather than assuming an empty table. The exact "fresh
+  // insert produces exactly one row with the right columns" and "a
+  // different pre-existing default row blocks the insert via untargeted DO
+  // NOTHING" scenarios are already deterministically covered against
+  // isolated (non-shared) databases by test/test-embed-endpoint-classify.js
+  // (fake db) and scripts/test-sqlite-seam.js Section 20 (in-memory SQLite)
+  // — this block's job is CLI/wiring coverage of the real `init
+  // --seed-provider` path against a live Postgres, not a restatement of
+  // those two isolated suites' exact-shape assertions.
+  //
+  // Exercised via the standalone `init --seed-provider` backfill path (never
+  // full `init`) so each scenario is isolated from the DDL/marker/handoff.md
+  // machinery — --seed-provider runs ONLY the seeding step.
+  async function countVllmLocalRows() {
+    const { rows } = await db.query(`SELECT COUNT(*) AS n FROM embedding_providers WHERE name = 'vllm-local'`);
+    return parseInt(rows[0].n, 10);
+  }
+
+  // Local helper mirroring runHelperBoth's extraEnv/deleteEnv support (that
+  // helper is declared further down this function; kept self-contained here
+  // to avoid any ordering coupling).
+  function runSeedProvider(opts = {}) {
+    const seedFakeRoot = opts.fakeRoot || fakeRoot;
+    const env = { ...process.env, PROJECT_ROOT: seedFakeRoot, HANDOFF_TEST_PROJECT_ID: PROJECT_ID };
+    // Always start with ambient VLLM_EMBED_URL cleared so opts.extraEnv (below)
+    // is the sole source of truth for each scenario — a value inherited from
+    // the operator's own shell must never leak into these deterministic tests.
+    delete env.VLLM_EMBED_URL;
+    Object.assign(env, opts.extraEnv);
+    for (const k of (opts.deleteEnv || [])) delete env[k];
+    return execFileSync(
+      process.execPath,
+      [HELPER, 'init', '--seed-provider'],
+      { cwd: seedFakeRoot, env, encoding: 'utf8', timeout: 15000 }
+    );
+  }
+
+  await test('init --seed-provider: NONE (unconfigured) endpoint writes nothing (row count unchanged)', async () => {
+    const before = await countVllmLocalRows();
+    const out = runSeedProvider({ deleteEnv: ['VLLM_EMBED_URL'] });
+    assert.ok(out.includes('[NOTE]') && out.includes('not configured/invalid'), `expected the NONE/INVALID NOTE line, got:\n${out}`);
+    assert.ok(out.includes('Done: handoff:init --seed-provider'), `expected a successful Done line, got:\n${out}`);
+    assert.strictEqual(await countVllmLocalRows(), before, 'NONE must never change the row count');
+  });
+
+  await test('init --seed-provider: REMOTE endpoint writes nothing (row count unchanged) and names the host in the NOTE line', async () => {
+    const before = await countVllmLocalRows();
+    const out = runSeedProvider({ extraEnv: { VLLM_EMBED_URL: 'http://0.0.0.0:8800' } });
+    assert.ok(out.includes('[NOTE]') && out.includes('0.0.0.0') && out.includes('data_egress_approved'), `expected the REMOTE attestation-required NOTE line, got:\n${out}`);
+    assert.ok(out.includes('Done: handoff:init --seed-provider'), `expected a successful Done line, got:\n${out}`);
+    assert.strictEqual(await countVllmLocalRows(), before, 'REMOTE must never change the row count');
+  });
+
+  await test('init --seed-provider: LOCAL endpoint — seeds if absent, no-ops if already present, never duplicates', async () => {
+    const before = await countVllmLocalRows();
+    const out = runSeedProvider({ extraEnv: { VLLM_EMBED_URL: 'http://localhost:8800' } });
+    assert.ok(out.includes('Done: handoff:init --seed-provider'), `expected a successful Done line, got:\n${out}`);
+    if (before === 0) {
+      assert.ok(out.includes('[OK]') && out.includes('vllm-local'), `expected the OK seeded line for a fresh insert, got:\n${out}`);
+    } else {
+      assert.ok(out.includes('[NOTE]') && out.includes('already present'), `expected the "already present" NOTE line, got:\n${out}`);
+    }
+    assert.strictEqual(await countVllmLocalRows(), Math.max(before, 1), 'exactly one vllm-local row must exist afterward, never more');
+  });
+
+  await test('init --seed-provider: a guaranteed-second LOCAL call is a no-op (rowCount stays at 1, NOTE "already present")', async () => {
+    // By construction this always runs AFTER the previous test, which leaves
+    // at least one vllm-local row present — so this call is unconditionally
+    // the "already present" branch.
+    const out = runSeedProvider({ extraEnv: { VLLM_EMBED_URL: 'http://localhost:8800' } });
+    assert.ok(out.includes('[NOTE]') && out.includes('already present'), `expected the "already present" NOTE line, got:\n${out}`);
+    assert.strictEqual(await countVllmLocalRows(), 1, 'still exactly one row after a guaranteed-second call');
+  });
+
   // ── Test 2: status is read-only and outputs expected fields ──────────────
   await test('status: outputs project_id and counts', () => {
     const out = runHelper('status', [], { fakeRoot });
