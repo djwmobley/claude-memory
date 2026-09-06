@@ -265,6 +265,61 @@ model. Concurrent calls for the same `(project_id, role)` serialize on a
 transaction-scoped advisory lock (not a row-level `FOR UPDATE`, which
 cannot lock a row that does not exist yet for a brand-new role).
 
+Every label/role/session_id/project_id these tools and `route_resolve`
+touch is normalized through `scripts/lib/routing-identity.js`'s ONE engine
+(trim + Unicode NFC + internal-whitespace-collapse for label/role; trim
+only for session_id/project_id) — applied identically at write time (this
+tool, `model_registry_set`, `routing_session_override_set`) and at every
+`route-resolve.js` read site, so a value written with e.g. trailing
+whitespace or a combining-character accent is never unfindable later.
+
+## `model_registry_set` / `routing_session_override_set` / `routing_session_override_get` / `routing_session_override_clear`
+
+2026-09-06 (§17 B1): closes the two gaps the §17 routing gap-audit found —
+there was no way to register a model or write a session override through
+the MCP surface, so `route_resolve`'s directive-chain precedence step 2
+(session override) was unreachable without hand-written SQL.
+
+`model_registry_set` upserts on normalized `label`. Every other field is
+optional and "sticky" per-field: omitted leaves the existing value
+untouched (or the DB default on first insert), an explicit `null` clears
+it, a real value sets it — never a whole-row overwrite. Re-pointing an
+existing non-`NULL` `modelId` to a different value is rejected unless
+`force:true` (the prior value is not preserved anywhere once overwritten —
+any `turn_usage`/`routing_session_overrides` rows recorded under the OLD
+`model_id` will read as if this label had always pointed at the new one).
+A `modelId` already claimed by a different label is likewise rejected
+unless `force:true` (`route_resolve` joins its recommendation pool on
+`label` only, so two labels sharing one `model_id` can carry independent
+cost/tier configuration). Cost fields reuse `usage-telemetry.js`'s
+finite/non-negative validation shape plus this table's own tighter
+`NUMERIC(10,4)` range (not `turn_usage`'s `NUMERIC(12,6)`). A row with
+partial cost data is excluded from `route_resolve`'s least-cost pool but
+remains directive-selectable via an override/pin/`overrideModel`.
+
+`routing_session_override_set` upserts on `(project_id, session_id, role)`
+— the table's UNIQUE key, and the only write path for it. `projectId`/
+`sessionId` can never be `'*'` (reserved for `routing_profiles`' global-
+default pin; a `'*'` session-override row would be permanently unreadable
+by `route_resolve`, which scopes that lookup by the caller's real
+project/session). `role` accepts any non-empty string — deliberately no
+taxonomy or allow-list, matching `route-resolve.js`'s own documented
+no-hardcoded-roles design. `label` must already be registered via
+`model_registry_set`. This table has **no TTL and nothing reaps stale
+rows** — clearing an override once a session ends is the caller's
+responsibility.
+
+`routing_session_override_get` lists active overrides for a session
+without side effects (`role` omitted returns every role) — the only way to
+introspect what is active short of calling `route_resolve` itself, which
+has the side effect of finalizing that turn's resolution.
+
+`routing_session_override_clear` deletes the `(project_id, session_id,
+role)` row if present, returning `{cleared:true}` or `{cleared:false}` —
+clearing an already-clear key is success, never an error. `role` is
+required (unlike the getter): this always targets exactly one row, never a
+whole-session wildcard delete.
+
 ## `usage_record` / `usage_query`
 
 Records token/cost figures for a turn, matched on the same

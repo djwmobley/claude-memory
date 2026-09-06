@@ -52,6 +52,7 @@ const memoryLintLib = require('./lib/memory-lint.js');
 const exchangeLogLib = require('./lib/exchange-log.js');
 const routeResolveLib = require('./lib/route-resolve.js');
 const routingProfileLib = require('./lib/routing-profile.js');
+const routingWriteSurfaceLib = require('./lib/routing-write-surface.js');
 const usageTelemetryLib = require('./lib/usage-telemetry.js');
 const { writeRowWithProvenanceRetry } = require('./lib/write-time-embed.js');
 
@@ -214,7 +215,7 @@ function libToolError(err) {
   const namedCodes = new Set([
     'MemoryUpsertError', 'MemorySearchError', 'EntityGraphCrudError',
     'MemoryViewError', 'ExchangeLogError', 'RoutingProfileError',
-    'EmbeddingColumnAbsentError',
+    'EmbeddingColumnAbsentError', 'RoutingWriteSurfaceError',
   ]);
   const result = (err && namedCodes.has(err.name))
     ? toolError(`${err.name} [${err.code}]: ${err.message}`)
@@ -732,6 +733,62 @@ async function toolRoutingProfileGet({ projectRoot, role }) {
     return await withProjectDb(projectRoot, async (db, projectId) => {
       const rows = await routingProfileLib.routingProfileGet(db, { projectId, role });
       return textResult({ rows });
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+// §17 B1: model_registry_set / routing_session_override_set / _get / _clear
+// — see scripts/lib/routing-write-surface.js for the total-classification
+// tables and F-1..F-11 adversary-finding dispositions. projectRoot resolves
+// projectId via withProjectDb exactly like every other §8/§17 tool above;
+// model_registry_set still requires projectRoot (to get a DB connection)
+// even though model_registry itself carries no project_id column — see
+// routing-write-surface.js's header for why a project_id filter must never
+// be added to that table by analogy with the session-override table below.
+
+async function toolModelRegistrySet(args) {
+  const { projectRoot, ...rest } = args;
+  try {
+    return await withProjectDb(projectRoot, async (db) => {
+      const result = await routingWriteSurfaceLib.modelRegistrySet(db, rest);
+      return textResult(result);
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolRoutingSessionOverrideSet({ projectRoot, sessionId, role, label, provider, setBy }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const result = await routingWriteSurfaceLib.routingSessionOverrideSet(db, {
+        projectId, sessionId, role, label, provider, setBy,
+      });
+      return textResult(result);
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolRoutingSessionOverrideGet({ projectRoot, sessionId, role }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const rows = await routingWriteSurfaceLib.routingSessionOverrideGet(db, { projectId, sessionId, role });
+      return textResult({ rows });
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolRoutingSessionOverrideClear({ projectRoot, sessionId, role }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const result = await routingWriteSurfaceLib.routingSessionOverrideClear(db, { projectId, sessionId, role });
+      return textResult(result);
     });
   } catch (err) {
     return libToolError(err);
@@ -1443,6 +1500,109 @@ function buildServer() {
       },
     },
     async (args) => toolRoutingProfileGet(args)
+  );
+
+  // ── §17 B1: model_registry_set / routing_session_override_set / _get / _clear ──
+  // See scripts/lib/routing-write-surface.js for full total-classification
+  // tables. All four keys (label/role/session_id/project_id) are normalized
+  // via scripts/lib/routing-identity.js identically to route-resolve.js's
+  // read sites (F-1) — a value written through these tools is guaranteed
+  // findable by route_resolve.
+
+  server.registerTool(
+    'model_registry_set',
+    {
+      title: 'Register or update a model in model_registry (upsert on label)',
+      description:
+        'Upserts on normalized label (trim+NFC+internal-whitespace-collapse). Every field besides label is ' +
+        'optional and "sticky": omitted = leave the existing value untouched (or DB default on first insert), ' +
+        'explicit null = clear it, a real value = set it. Re-pointing an existing non-NULL modelId to a ' +
+        'different value is rejected unless force:true (the prior value is not preserved anywhere once ' +
+        'overwritten). A modelId already used by a different label is rejected unless force:true (route_resolve ' +
+        'joins on label only, so aliasing two labels to one modelId lets them be priced/tiered independently). ' +
+        'Cost fields reuse usage-telemetry.js\'s finite/non-negative validation plus this table\'s own tighter ' +
+        'NUMERIC(10,4) range. A model with partial cost data stays out of route_resolve\'s least-cost pool but ' +
+        'remains directive-selectable (session override / profile pin / overrideModel). configuredBy is an ' +
+        'optional caller-supplied string, nullable, never derived — no server-side agent identity exists in ' +
+        'this MCP surface to draw one from.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root (used only to obtain a DB connection — model_registry has no project_id column).'),
+        label: z.string().describe('The model label to register/update. Normalized (trim+NFC+whitespace-collapse) before the upsert key match.'),
+        modelId: z.string().optional().describe('The provider\'s own model identifier string. Omit to leave untouched; pass null to clear.'),
+        provider: z.string().optional(),
+        capabilityTier: z.enum(routingWriteSurfaceLib.CAPABILITY_TIERS).optional(),
+        costInPerMtok: z.number().nullable().optional(),
+        costOutPerMtok: z.number().nullable().optional(),
+        contextWindow: z.number().int().positive().nullable().optional(),
+        headlessCliCmd: z.string().nullable().optional(),
+        available: z.boolean().optional().describe('NOT NULL column — omit to leave untouched; cannot be explicitly nulled.'),
+        kind: z.string().nullable().optional(),
+        notes: z.string().nullable().optional(),
+        force: z.boolean().optional().describe('Required to re-point an existing non-NULL modelId, or to alias a modelId already used by a different label.'),
+        configuredBy: z.string().optional().describe('Optional caller-supplied provenance string. Never derived automatically.'),
+      },
+    },
+    async (args) => toolModelRegistrySet(args)
+  );
+
+  server.registerTool(
+    'routing_session_override_set',
+    {
+      title: 'Set a session-scoped routing directive (project_id, session_id, role)',
+      description:
+        'Upserts on (project_id, session_id, role) — the ONLY write path for this table; route_resolve never ' +
+        'mutates schema. projectId/sessionId cannot be \'*\' (reserved for routing_profiles\' global-default pin; ' +
+        'session overrides have no global scope — a \'*\' row here would be permanently unreadable by ' +
+        'route_resolve). role accepts ANY non-empty string, deliberately no taxonomy/allow-list (matches ' +
+        'route-resolve.js\'s documented no-hardcoded-roles design). label must already be registered in ' +
+        'model_registry (call model_registry_set first) and is matched in its NORMALIZED form. No TTL: this ' +
+        'table has no expiry and nothing reaps stale rows automatically — clearing an override at session end ' +
+        'is the caller\'s responsibility (use routing_session_override_clear).',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        sessionId: z.string(),
+        role: z.string(),
+        label: z.string().describe('Must already be registered via model_registry_set.'),
+        provider: z.string().optional(),
+        setBy: z.string().optional().describe('Optional caller-supplied provenance string. Never derived automatically.'),
+      },
+    },
+    async (args) => toolRoutingSessionOverrideSet(args)
+  );
+
+  server.registerTool(
+    'routing_session_override_get',
+    {
+      title: 'List active session-scoped routing directive(s) without side effects',
+      description:
+        '`role` omitted returns every override active for (project_id, session_id). Read-only — never a ' +
+        'substitute for calling route_resolve, but the only way to introspect what is active without ' +
+        'route_resolve\'s side effect of finalizing a turn\'s resolution.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        sessionId: z.string(),
+        role: z.string().optional(),
+      },
+    },
+    async (args) => toolRoutingSessionOverrideGet(args)
+  );
+
+  server.registerTool(
+    'routing_session_override_clear',
+    {
+      title: 'Clear a session-scoped routing directive (project_id, session_id, role)',
+      description:
+        'Deletes the (project_id, session_id, role) row if present. Returns {cleared:true} when a row was ' +
+        'removed, {cleared:false} when none matched — a no-op on an already-clear key is success, never an ' +
+        'error. `role` is required (unlike the getter) — this always targets exactly one row of the table\'s ' +
+        'UNIQUE key, never a whole-session wildcard delete.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        sessionId: z.string(),
+        role: z.string(),
+      },
+    },
+    async (args) => toolRoutingSessionOverrideClear(args)
   );
 
   // ── §18: usage_record / usage_query ──────────────────────────────────────

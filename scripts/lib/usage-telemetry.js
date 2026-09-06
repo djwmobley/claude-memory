@@ -724,4 +724,15 @@ module.exports = {
   assertNoReservedNoneRows,
   sumPreserveNull,
   assertCostWithinRange,
+  // Exported for reuse (2026-09-06, §17 B1 spec F-9): model_registry_set
+  // (scripts/lib/routing-write-surface.js) reuses this exact three-way
+  // undefined/null/finite-number-≥0 validation shape for cost_in_per_mtok/
+  // cost_out_per_mtok, rather than re-implementing an equivalent check that
+  // could silently drift from this one over time. It additionally applies
+  // its OWN tighter NUMERIC(10,4) range check on top (model_registry's cost
+  // columns are NUMERIC(10,4), not turn_usage's NUMERIC(12,6) — reusing
+  // MAX_NUMERIC_12_6's bound as-is would let a value through this function
+  // that Postgres then rejects with a raw, less actionable overflow error).
+  COST_MODE,
+  normalizeCostUsd,
 };

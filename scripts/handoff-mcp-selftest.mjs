@@ -71,7 +71,23 @@ async function main() {
   for (const t of toolsList.tools) {
     console.log(`- ${t.name}: ${t.description.slice(0, 80)}...`);
   }
-  const expectedNames = ['handoff_status', 'handoff_checkpoint', 'handoff_close', 'handoff_init', 'persist_decisions'];
+  // cm#167: this list was stale (only the original 5 tools) — fixed 2026-09-06
+  // (§17 B1) to the FULL current roster, kept in sync with
+  // scripts/migrations/verify-20-mcp-surface.js's own `expected` array (the
+  // authoritative source — see that file's runMcpRegistrationCheck).
+  const expectedNames = [
+    'handoff_status', 'handoff_checkpoint', 'handoff_close', 'handoff_init', 'persist_decisions',
+    'handoff_resume',
+    'memory_search', 'memory_upsert', 'memory_get', 'memory_lint',
+    'memory_view_set', 'memory_view_run',
+    'entity_create', 'entity_read', 'entity_update', 'entity_suppress',
+    'assertion_create', 'assertion_read', 'assertion_update', 'assertion_suppress',
+    'edge_create', 'edge_read', 'edge_update', 'edge_suppress',
+    'exchange_append', 'exchange_read',
+    'route_resolve', 'routing_profile_set', 'routing_profile_get',
+    'model_registry_set', 'routing_session_override_set', 'routing_session_override_get', 'routing_session_override_clear',
+    'usage_record', 'usage_query',
+  ];
   const actualNames = toolsList.tools.map((t) => t.name).sort();
   const missing = expectedNames.filter((n) => !actualNames.includes(n));
   const extra = actualNames.filter((n) => !expectedNames.includes(n));
