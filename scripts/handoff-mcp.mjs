@@ -52,8 +52,14 @@ const memoryLintLib = require('./lib/memory-lint.js');
 const exchangeLogLib = require('./lib/exchange-log.js');
 const routeResolveLib = require('./lib/route-resolve.js');
 const routingProfileLib = require('./lib/routing-profile.js');
+const routingWriteSurfaceLib = require('./lib/routing-write-surface.js');
 const usageTelemetryLib = require('./lib/usage-telemetry.js');
 const { writeRowWithProvenanceRetry } = require('./lib/write-time-embed.js');
+// cm#230: validateDecisionRows/persistDecisionRow moved to decisions-writer.js
+// so scripts/handoff.js's writeExtraction (payload.decisions[] from a close/
+// checkpoint stdin payload) can share the SAME write path — never a second
+// implementation of decisions-row validation or the embed+upsert chain.
+const decisionsWriterLib = require('./lib/decisions-writer.js');
 
 // ── Ground-truth paths (verified 2026-07-11; overridable via env for other hosts) ──
 
@@ -214,7 +220,7 @@ function libToolError(err) {
   const namedCodes = new Set([
     'MemoryUpsertError', 'MemorySearchError', 'EntityGraphCrudError',
     'MemoryViewError', 'ExchangeLogError', 'RoutingProfileError',
-    'EmbeddingColumnAbsentError',
+    'EmbeddingColumnAbsentError', 'RoutingWriteSurfaceError',
   ]);
   const result = (err && namedCodes.has(err.name))
     ? toolError(`${err.name} [${err.code}]: ${err.message}`)
@@ -370,34 +376,10 @@ async function toolHandoffInit({ projectRoot, name }) {
   return textResult({ success: true, summary, report });
 }
 
-const TOPIC_RE = /^[a-z0-9]+(-[a-z0-9]+)+$/;
-
-function validateDecisionRows(rows) {
-  const errors = [];
-  if (!Array.isArray(rows) || rows.length === 0) {
-    errors.push('rows must be a non-empty array.');
-    return errors;
-  }
-  rows.forEach((row, i) => {
-    if (typeof row !== 'object' || row === null || Array.isArray(row)) {
-      errors.push(`rows[${i}]: must be an object.`);
-      return;
-    }
-    if (typeof row.topic !== 'string' || !TOPIC_RE.test(row.topic)) {
-      errors.push(`rows[${i}].topic: required, must be a lowercase kebab-case string with at least one hyphen (e.g. "ppm-monolith-foo"); got ${JSON.stringify(row.topic)}.`);
-    }
-    if (typeof row.decision !== 'string' || row.decision.trim() === '') {
-      errors.push(`rows[${i}].decision: required non-empty string.`);
-    }
-    if (typeof row.reason !== 'string' || row.reason.trim() === '') {
-      errors.push(`rows[${i}].reason: required non-empty string.`);
-    }
-    if (row.session_num !== undefined && row.session_num !== null && typeof row.session_num !== 'number') {
-      errors.push(`rows[${i}].session_num: must be a number or null if present.`);
-    }
-  });
-  return errors;
-}
+// cm#230: TOPIC_RE/validateDecisionRows now live in decisions-writer.js
+// (byte-identical regex/error-strings — see that file). Kept as a local
+// alias so nothing else in this file needs to change its call sites.
+const { validateDecisionRows } = decisionsWriterLib;
 
 // §7.2/§8 M-1/M-2/M-3 repoint (declared response-shape break — see the PR
 // body): persist_decisions no longer writes claude_policy_framework via
@@ -421,24 +403,13 @@ async function toolPersistDecisions({ projectRoot, rows, verifyQuery }) {
     return await withProjectDb(projectRoot, async (db, projectId) => {
       const written = [];
       const warnings = [];
+      // cm#230: persistDecisionRow is the SAME write function
+      // scripts/handoff.js's writeExtraction now calls for payload.decisions[]
+      // — moved out of this loop body verbatim, byte-identical behavior.
       for (const row of rows) {
-        const embedText = memoryUpsertLib.buildEmbedText('decisions', {
-          topic: row.topic, decision: row.decision, reason: row.reason,
-        });
-        // cm#201: threads providerId alongside the vector (both-or-neither)
-        // and classifies a race-window FK 23503 on embedded_by_provider_id
-        // (re-resolve once, retry; degrade to neither on persistent failure).
-        const { written: written_row, warning } = await writeRowWithProvenanceRetry(db, embedText, (opts) =>
-          memoryUpsertLib.upsertDecisionRow(db, {
-            project_id: projectId,
-            topic: row.topic,
-            decision: row.decision,
-            reason: row.reason,
-            session_num: row.session_num ?? null,
-          }, opts)
-        );
+        const { written: written_row, warning } = await decisionsWriterLib.persistDecisionRow(db, projectId, row);
         if (warning) warnings.push({ topic: row.topic, warning });
-        written.push({ id: written_row.id, topic: written_row.topic, inserted: written_row.inserted });
+        written.push(written_row);
       }
 
       let topHits = null;
@@ -574,10 +545,10 @@ async function toolEntitySuppress({ projectRoot, id }) {
   }
 }
 
-async function toolAssertionCreate({ projectRoot, subject, predicate, object, confidence, source, sourceModel, agentId }) {
+async function toolAssertionCreate({ projectRoot, subject, predicate, object, confidence, source, sourceModel, agentId, sessionId }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const result = await entityCrudLib.assertionCreate(db, { projectId, subject, predicate, object, confidence, source, sourceModel, agentId });
+      const result = await entityCrudLib.assertionCreate(db, { projectId, subject, predicate, object, confidence, source, sourceModel, agentId, sessionId });
       return textResult(result);
     });
   } catch (err) {
@@ -596,10 +567,10 @@ async function toolAssertionRead({ projectRoot, id, subject, predicate }) {
   }
 }
 
-async function toolAssertionUpdate({ projectRoot, id, subject, predicate, newObject, confidence, source, sourceModel, agentId }) {
+async function toolAssertionUpdate({ projectRoot, id, subject, predicate, newObject, confidence, source, sourceModel, agentId, sessionId }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const result = await entityCrudLib.assertionUpdate(db, { projectId, id, subject, predicate, newObject, confidence, source, sourceModel, agentId });
+      const result = await entityCrudLib.assertionUpdate(db, { projectId, id, subject, predicate, newObject, confidence, source, sourceModel, agentId, sessionId });
       return textResult(result);
     });
   } catch (err) {
@@ -738,6 +709,62 @@ async function toolRoutingProfileGet({ projectRoot, role }) {
   }
 }
 
+// §17 B1: model_registry_set / routing_session_override_set / _get / _clear
+// — see scripts/lib/routing-write-surface.js for the total-classification
+// tables and F-1..F-11 adversary-finding dispositions. projectRoot resolves
+// projectId via withProjectDb exactly like every other §8/§17 tool above;
+// model_registry_set still requires projectRoot (to get a DB connection)
+// even though model_registry itself carries no project_id column — see
+// routing-write-surface.js's header for why a project_id filter must never
+// be added to that table by analogy with the session-override table below.
+
+async function toolModelRegistrySet(args) {
+  const { projectRoot, ...rest } = args;
+  try {
+    return await withProjectDb(projectRoot, async (db) => {
+      const result = await routingWriteSurfaceLib.modelRegistrySet(db, rest);
+      return textResult(result);
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolRoutingSessionOverrideSet({ projectRoot, sessionId, role, label, provider, setBy }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const result = await routingWriteSurfaceLib.routingSessionOverrideSet(db, {
+        projectId, sessionId, role, label, provider, setBy,
+      });
+      return textResult(result);
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolRoutingSessionOverrideGet({ projectRoot, sessionId, role }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const rows = await routingWriteSurfaceLib.routingSessionOverrideGet(db, { projectId, sessionId, role });
+      return textResult({ rows });
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
+async function toolRoutingSessionOverrideClear({ projectRoot, sessionId, role }) {
+  try {
+    return await withProjectDb(projectRoot, async (db, projectId) => {
+      const result = await routingWriteSurfaceLib.routingSessionOverrideClear(db, { projectId, sessionId, role });
+      return textResult(result);
+    });
+  } catch (err) {
+    return libToolError(err);
+  }
+}
+
 async function toolUsageRecord(args) {
   const { projectRoot, sessionId, turnIdx, agentRole, tokensIn, tokensOut, cacheReadTokens, cacheWriteTokens, costUsd, modelId, provider, outcome, sourceModel, agentId } = args;
   try {
@@ -790,7 +817,16 @@ const EXTRACTION_PAYLOAD_FIELD_CONTRACT =
   '- edges: array of { from_entity: string, edge_type: "depends_on"|"implements"|"blocks"|"owns"|"calls"|"produces", ' +
   'to_entity: string }.\n' +
   '- contract: { queries: [...] } — a next-session retrieval contract; supported query types are entity/assertion/' +
-  'recency/vector (see commands/handoff/close.md §4 for the exact shape of each).\n\n' +
+  'recency/vector (see commands/handoff/close.md §5 for the exact shape of each).\n' +
+  '- decisions: array of { topic: string (REQUIRED, lowercase kebab-case with >=1 hyphen, e.g. "vllm-embedding-default", ' +
+  '<=2000 bytes UTF-8), decision: string (REQUIRED, non-empty), reason: string (REQUIRED, non-empty), ' +
+  'session_num: number (optional) }, array length <=200. cm#230: persisted through the SAME write path the ' +
+  'standalone persist_decisions tool uses — ON CONFLICT (project_id, topic) DO UPDATE (re-closing with the same ' +
+  'topic UPDATES that row, never a duplicate), inline-embedded at write time (fail-soft: a down embedding provider ' +
+  'never blocks the write — the row is still persisted with embedding=NULL, surfaced as a non-fatal ' +
+  '`DIVERGENCE: decision:<topic> EMBEDDING DEGRADED` line). A row that fails validation (bad topic shape, missing ' +
+  'decision/reason) or hits a genuine write error is skipped (non-fatal) and surfaced as ' +
+  '`DIVERGENCE: decision:<topic> NOT PERSISTED` — one bad row never blocks the rest of the close.\n\n' +
   'Caveman/telegraphic authoring is MANDATORY for tldr, open_threads, and quick_references: strip function words ' +
   '(a/an/the, is/are/was/were, of/to/in/for/and/or/but, with/that/this/it/as/at/on/by/be) while keeping every ' +
   'load-bearing token verbatim — identifiers, file paths, line refs, PR numbers, commit SHAs, names, numbers, ' +
@@ -1180,8 +1216,15 @@ function buildServer() {
       title: 'Create one assertion, outside the checkpoint/close batch flow',
       description:
         'Runs the §7.3 ingest-time contradiction check (same (project_id, subject, predicate) with a ' +
-        'materially different object) before writing — still writes either way (append-only), but the result ' +
-        'carries a contradictionWarning when a conflict is found. predicate MUST be a value from ' +
+        'materially different object) before writing, and the result carries a contradictionWarning when a ' +
+        'conflict is found — but the write itself (cm#231) now routes through the SAME supersession engine ' +
+        '(writeAssertionWithSupersession) the /handoff:close and /handoff:checkpoint payload path uses: a prior ' +
+        'live row for the same (subject, predicate) [1:1 predicates] or an exact (subject, predicate, object) ' +
+        'duplicate [1:N predicates] is superseded (suppressed=true, invalid_at=now(), suppression_kind=' +
+        '\'superseded\') rather than left live alongside a second row, and an exact same-session repeat is a ' +
+        'no-op touch (last_reinforced bumped only — see the touchOnly field on the result). tier, valid_at, ' +
+        'session_id, and last_reinforced are set with the same defaults the close/seed path uses (cm#231 — ' +
+        'previously tier and valid_at were left NULL on this path). predicate MUST be a value from ' +
         'scripts/lib/predicate-registry.json.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
@@ -1195,6 +1238,11 @@ function buildServer() {
         source: z.enum(['user_stated', 'model_extracted', 'doc_quoted', 'retrieved_from_prior']),
         sourceModel: z.string().optional(),
         agentId: z.string().optional(),
+        sessionId: z.string().optional().describe(
+          'cm#231: explicit session id for attribution/corroboration matching. Defaults to ' +
+          'handoff.js\'s own resolveSessionId (CLAUDE_CODE_SESSION_ID env var, then the DB\'s ' +
+          'session_in_progress marker) when omitted.'
+        ),
       },
     },
     async (args) => toolAssertionCreate(args)
@@ -1220,12 +1268,15 @@ function buildServer() {
     {
       title: 'Supersede an assertion (suppress-old + insert-new, one transaction, optimistic guard)',
       description:
-        'M-5/M-6: supersede = suppress the old row (suppressed=true, invalid_at=now()) THEN insert a new row ' +
-        'with the corrected object, inside ONE transaction with an optimistic row-count guard (a stale/already-' +
-        'superseded target rolls the whole call back, never a partial write). `id` is the explicit target row ' +
-        '— REQUIRED for any predicate whose registry cardinality is NOT 1:1 (an omitted id on a 1:N or ' +
-        'unregistered predicate is a hard error, never a guess). For a 1:1 predicate, `id` may be omitted and ' +
-        'is inferred from (subject, predicate).',
+        'M-5/M-6: supersede = suppress the old row (suppressed=true, invalid_at=now(), suppression_kind=' +
+        '\'superseded\') THEN insert a new row with the corrected object, inside ONE transaction with an ' +
+        'optimistic row-count guard (a stale/already-superseded target rolls the whole call back, never a ' +
+        'partial write). `id` is the explicit target row — REQUIRED for any predicate whose registry ' +
+        'cardinality is NOT 1:1 (an omitted id on a 1:N or unregistered predicate is a hard error, never a ' +
+        'guess). For a 1:1 predicate, `id` may be omitted and is inferred from (subject, predicate). cm#231: ' +
+        'the new row is written with tier=\'probationary\' (never auto-consolidated — this call has no cross-' +
+        'session corroboration evidence to gate on), valid_at=now(), and session_id resolved the same way ' +
+        'assertion_create does — previously all three were left unset/NULL on this path.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         id: z.number().int().optional().describe('Explicit target row id — required for non-1:1 predicates.'),
@@ -1237,6 +1288,10 @@ function buildServer() {
         source: z.enum(['user_stated', 'model_extracted', 'doc_quoted', 'retrieved_from_prior']).optional(),
         sourceModel: z.string().optional(),
         agentId: z.string().optional(),
+        sessionId: z.string().optional().describe(
+          'cm#231: explicit session id for the new row. Defaults to handoff.js\'s own resolveSessionId ' +
+          '(CLAUDE_CODE_SESSION_ID env var, then the DB\'s session_in_progress marker) when omitted.'
+        ),
       },
     },
     async (args) => toolAssertionUpdate(args)
@@ -1246,7 +1301,9 @@ function buildServer() {
     'assertion_suppress',
     {
       title: 'Suppress an assertion (retract, no supersession)',
-      description: 'Sets suppressed=true without inserting a replacement — use assertion_update to supersede-with-a-correction instead.',
+      description: 'Sets suppressed=true, invalid_at=now(), suppression_kind=\'retired\' (cm#231 — matches the ' +
+        'seed/close path\'s own operator-retirement vocabulary) without inserting a replacement — use ' +
+        'assertion_update to supersede-with-a-correction instead.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         id: z.number().int().describe('Target assertion id.'),
@@ -1422,6 +1479,109 @@ function buildServer() {
       },
     },
     async (args) => toolRoutingProfileGet(args)
+  );
+
+  // ── §17 B1: model_registry_set / routing_session_override_set / _get / _clear ──
+  // See scripts/lib/routing-write-surface.js for full total-classification
+  // tables. All four keys (label/role/session_id/project_id) are normalized
+  // via scripts/lib/routing-identity.js identically to route-resolve.js's
+  // read sites (F-1) — a value written through these tools is guaranteed
+  // findable by route_resolve.
+
+  server.registerTool(
+    'model_registry_set',
+    {
+      title: 'Register or update a model in model_registry (upsert on label)',
+      description:
+        'Upserts on normalized label (trim+NFC+internal-whitespace-collapse). Every field besides label is ' +
+        'optional and "sticky": omitted = leave the existing value untouched (or DB default on first insert), ' +
+        'explicit null = clear it, a real value = set it. Re-pointing an existing non-NULL modelId to a ' +
+        'different value is rejected unless force:true (the prior value is not preserved anywhere once ' +
+        'overwritten). A modelId already used by a different label is rejected unless force:true (route_resolve ' +
+        'joins on label only, so aliasing two labels to one modelId lets them be priced/tiered independently). ' +
+        'Cost fields reuse usage-telemetry.js\'s finite/non-negative validation plus this table\'s own tighter ' +
+        'NUMERIC(10,4) range. A model with partial cost data stays out of route_resolve\'s least-cost pool but ' +
+        'remains directive-selectable (session override / profile pin / overrideModel). configuredBy is an ' +
+        'optional caller-supplied string, nullable, never derived — no server-side agent identity exists in ' +
+        'this MCP surface to draw one from.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root (used only to obtain a DB connection — model_registry has no project_id column).'),
+        label: z.string().describe('The model label to register/update. Normalized (trim+NFC+whitespace-collapse) before the upsert key match.'),
+        modelId: z.string().optional().describe('The provider\'s own model identifier string. Omit to leave untouched; pass null to clear.'),
+        provider: z.string().optional(),
+        capabilityTier: z.enum(routingWriteSurfaceLib.CAPABILITY_TIERS).optional(),
+        costInPerMtok: z.number().nullable().optional(),
+        costOutPerMtok: z.number().nullable().optional(),
+        contextWindow: z.number().int().positive().nullable().optional(),
+        headlessCliCmd: z.string().nullable().optional(),
+        available: z.boolean().optional().describe('NOT NULL column — omit to leave untouched; cannot be explicitly nulled.'),
+        kind: z.string().nullable().optional(),
+        notes: z.string().nullable().optional(),
+        force: z.boolean().optional().describe('Required to re-point an existing non-NULL modelId, or to alias a modelId already used by a different label.'),
+        configuredBy: z.string().optional().describe('Optional caller-supplied provenance string. Never derived automatically.'),
+      },
+    },
+    async (args) => toolModelRegistrySet(args)
+  );
+
+  server.registerTool(
+    'routing_session_override_set',
+    {
+      title: 'Set a session-scoped routing directive (project_id, session_id, role)',
+      description:
+        'Upserts on (project_id, session_id, role) — the ONLY write path for this table; route_resolve never ' +
+        'mutates schema. projectId/sessionId cannot be \'*\' (reserved for routing_profiles\' global-default pin; ' +
+        'session overrides have no global scope — a \'*\' row here would be permanently unreadable by ' +
+        'route_resolve). role accepts ANY non-empty string, deliberately no taxonomy/allow-list (matches ' +
+        'route-resolve.js\'s documented no-hardcoded-roles design). label must already be registered in ' +
+        'model_registry (call model_registry_set first) and is matched in its NORMALIZED form. No TTL: this ' +
+        'table has no expiry and nothing reaps stale rows automatically — clearing an override at session end ' +
+        'is the caller\'s responsibility (use routing_session_override_clear).',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        sessionId: z.string(),
+        role: z.string(),
+        label: z.string().describe('Must already be registered via model_registry_set.'),
+        provider: z.string().optional(),
+        setBy: z.string().optional().describe('Optional caller-supplied provenance string. Never derived automatically.'),
+      },
+    },
+    async (args) => toolRoutingSessionOverrideSet(args)
+  );
+
+  server.registerTool(
+    'routing_session_override_get',
+    {
+      title: 'List active session-scoped routing directive(s) without side effects',
+      description:
+        '`role` omitted returns every override active for (project_id, session_id). Read-only — never a ' +
+        'substitute for calling route_resolve, but the only way to introspect what is active without ' +
+        'route_resolve\'s side effect of finalizing a turn\'s resolution.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        sessionId: z.string(),
+        role: z.string().optional(),
+      },
+    },
+    async (args) => toolRoutingSessionOverrideGet(args)
+  );
+
+  server.registerTool(
+    'routing_session_override_clear',
+    {
+      title: 'Clear a session-scoped routing directive (project_id, session_id, role)',
+      description:
+        'Deletes the (project_id, session_id, role) row if present. Returns {cleared:true} when a row was ' +
+        'removed, {cleared:false} when none matched — a no-op on an already-clear key is success, never an ' +
+        'error. `role` is required (unlike the getter) — this always targets exactly one row of the table\'s ' +
+        'UNIQUE key, never a whole-session wildcard delete.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root.'),
+        sessionId: z.string(),
+        role: z.string(),
+      },
+    },
+    async (args) => toolRoutingSessionOverrideClear(args)
   );
 
   // ── §18: usage_record / usage_query ──────────────────────────────────────

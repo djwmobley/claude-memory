@@ -34,6 +34,7 @@ mcp__handoff__handoff_close({
     entities: [{ "name": "entity-name", "entity_type": "system", "description": "..." }],
     assertions: [{ "subject": "X", "predicate": "uses", "object": "Y", "confidence": 8, "source": "model_extracted" }],
     edges: [{ "from_entity": "X", "edge_type": "depends_on", "to_entity": "Y" }],
+    decisions: [{ "topic": "vllm-embedding-default", "decision": "use vLLM Qwen3 for embeddings", "reason": "Ollama path removed" }],
     contract: { "queries": [{ "type": "recency", "token_budget": 500 }] },
     open_threads: ["item 1", "item 2"]
   }
@@ -119,7 +120,31 @@ For each edge:
 - `edge_type` — `depends_on` | `implements` | `blocks` | `owns` | `calls` | `produces`
 - `to_entity` — target entity name
 
-### 4. Retrieval contract
+### 4. Decisions
+
+Standing decisions worth recalling by topic across sessions — distinct from `assertions`:
+a decision is looked up by `topic`, not queried by subject/predicate/object, and re-closing
+with the SAME topic **updates** that one row (`ON CONFLICT (project_id, topic) DO UPDATE`)
+instead of accumulating duplicates.
+
+For each decision:
+- `topic` — REQUIRED, lowercase kebab-case with at least one hyphen (e.g. `vllm-embedding-default`), <=2000 bytes UTF-8. This is the update key — reuse the SAME topic across sessions to revise a standing decision rather than forking a new one.
+- `decision` — REQUIRED, non-empty string: what was decided.
+- `reason` — REQUIRED, non-empty string: why.
+- `session_num` — optional number.
+
+cm#230: `decisions[]` is persisted through the SAME write path as the standalone
+`persist_decisions` MCP tool (`scripts/lib/decisions-writer.js`) — inline-embedded at write
+time, **fail-soft** on the embedding step: a down embedding provider never blocks the write,
+the row still lands with `embedding=NULL`, surfaced as a non-fatal
+`DIVERGENCE: decision:<topic> EMBEDDING DEGRADED (row persisted, embedding=NULL) — <reason>`
+line. A row that fails validation (bad `topic` shape, missing `decision`/`reason`) or hits a
+genuine write error (e.g. a stale project DB that has not yet picked up the `decisions`
+table) is skipped — non-fatal, surfaced as `DIVERGENCE: decision:<topic> NOT PERSISTED —
+<reason>` — one bad row never blocks the rest of the close. Same `DIVERGENCE:` channel and
+console/`handoff.md` surfacing as the session-intent persistence failures described above.
+
+### 5. Retrieval contract
 
 A JSONB queries array for the NEXT session. What will the user likely need to know
 immediately when they resume? Supported query types:
@@ -131,7 +156,7 @@ immediately when they resume? Supported query types:
 {"type": "vector",    "query": "<topic phrase>", "token_budget": 1000}
 ```
 
-### 5. TL;DR
+### 6. TL;DR
 
 3–5 sentences: what happened, where things stand, what's next.
 
@@ -150,7 +175,7 @@ serve-time reality re-probe, which is a feature that annotates stale assertions.
 Example — caveman (use): "Completed: serve-time reality re-probe — annotates stale
 assertions at resume. Modified: scripts/lib/reality-checks.js + runVerifyDispatch."
 
-### 6. Open threads
+### 7. Open threads
 
 Bullet list of pending decisions, blocked tasks, or deferred questions.
 
@@ -162,7 +187,7 @@ does not compress it. Shorter threads = fewer bootstrap tokens on the next resum
 `test/north-star/test-caveman-economy.js` enforces caveman compression with no
 fidelity regression (leaner cannot be bought with lost load-bearing tokens).
 
-### 7. CLAUDE.md promotion
+### 8. CLAUDE.md promotion
 
 The helper will automatically identify assertions with `confidence >= 9` AND
 `source = 'user_stated'` that have been reinforced across multiple sessions.
@@ -374,8 +399,13 @@ Running: handoff:close
   edges written:       3
   contract:            updated
 
-Done: handoff:close — 5e/12a/3ed written, session marker cleared
+Done: handoff:close — project=my-project marker=C--Users-username-dev-my-project — 5e/12a/3ed written, session marker cleared
 ```
+
+The Done line (and the async-queued and `--dry-run` variants below) names the project
+(`project=<name>`) and its marker uuid (`marker=<uuid>`) so a close summary read out of
+context — pasted into chat, logged unattended — can't be misread as belonging to another
+project (cm#232).
 
 **With `--dry-run`:**
 ```
@@ -400,7 +430,7 @@ Running: handoff:close
 
   skipped in dry-run: writeExtraction, handoff.md render, session_in_progress clear, C2, C3, L4 degraded record
 
-Done: handoff:close --dry-run — no mutations performed
+Done: handoff:close --dry-run — project=my-project marker=C--Users-username-dev-my-project — no mutations performed
 ```
 
 The dry-run runs these passes (read-only): payload validation, L3 authoritative probes (compute only — no DB write), CLAUDE.md promotion candidate query, pointer-staleness gate (findings only — no row updates).

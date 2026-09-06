@@ -133,6 +133,19 @@ function buildPayloadSchema() {
       decisions: {
         type: 'array',
         maxItems: 200,
+        // cm#230: persisted through scripts/lib/decisions-writer.js's
+        // persistDecisionRow — the SAME write path scripts/handoff-mcp.mjs's
+        // persist_decisions MCP tool uses (ON CONFLICT (project_id, topic) DO
+        // UPDATE, inline-embedded at write time, fail-soft on embed failure).
+        // Real per-row shape enforcement (topic MUST be lowercase kebab-case
+        // with >=1 hyphen; decision/reason MUST be non-empty strings) is
+        // decisions-writer.js's validateDecisionRows, run per-row at write
+        // time by writeExtraction — NOT restated here as a JSON-Schema
+        // `required`/`pattern` (this object's properties are documentation +
+        // the two structural checks readStdin/validatePayload actually run:
+        // array maxItems and topic byte-length). A row that fails
+        // validateDecisionRows is skipped (non-fatal) and surfaced as a
+        // DIVERGENCE line — see writeExtraction's header comment.
         items: {
           type: 'object',
           properties: {
@@ -146,6 +159,15 @@ function buildPayloadSchema() {
             // lives in validatePayload() below and in readStdin()
             // (scripts/handoff.js) — both real enforcement points.
             topic: { type: 'string', maxLength: 2000 },
+            // decision/reason/session_num: cm#230 addition — documents the
+            // REST of decisions-writer.js's row shape (topic alone was
+            // documented pre-cm#230, back when this array was validated but
+            // never actually written). decision/reason are REQUIRED at write
+            // time (validateDecisionRows) even though JSON-Schema `required`
+            // is intentionally not restated here (see note above).
+            decision: { type: 'string', maxLength: 1000 },
+            reason: { type: 'string', maxLength: 1000 },
+            session_num: { type: 'number' },
           },
         },
       },

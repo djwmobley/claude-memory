@@ -49,6 +49,23 @@
  * model_registry.model_id column (the provider's own identifier string, no
  * uniqueness) is UNUSED by this resolver.
  *
+ * IDENTITY NORMALIZATION (2026-09-06, §17 B1 spec-adversary F-1): every
+ * identity key this file looks up (label, role, session_id, project_id)
+ * is normalized via scripts/lib/routing-identity.js's normLabel/normRole/
+ * normId — the SAME functions routing-write-surface.js's model_registry_set
+ * / routing_session_override_set apply at write time. `routeResolve` and
+ * `resolveRequiredTier` normalize projectId/sessionId/role ONCE at entry
+ * (immediately after presence validation) and thread the normalized values
+ * through every downstream query, including the turn_usage replay/insert —
+ * so a session/project/role identity that differs only in leading/trailing
+ * whitespace resolves to the SAME turn_usage row and the SAME directive
+ * lookups. `lookupRegistryByLabel`, `fetchActiveProfile`, and
+ * `fetchActivePin` additionally normalize their own arguments directly
+ * (defense in depth — they are exported test seams that can be called
+ * without going through routeResolve/resolveRequiredTier first). Before
+ * this fix, every lookup here was a raw byte-exact `=` with nothing to
+ * "share" despite T1/T2's spec assuming a shared engine already existed.
+ *
  * PROVIDER RESOLUTION is a 3-step total classification, applied whenever a
  * directive supplies the model: (1) the directive row's own provider
  * column when non-NULL (routing_session_overrides.provider /
@@ -79,7 +96,10 @@
  * responsible for ensuring the reviewing agent differs from the drafting
  * agent. This resolver never mutates schema and never inserts into
  * model_registry / routing_profiles / routing_session_overrides.
+ * NOT ENFORCED (G4, docs/notes/2026-09-06-s17-routing-gap-audit.md): a 'review' resolution matching a 'draft' resolution's model is neither rejected nor flagged — see test/migrations/test-route-resolve-contract.js for the pinned current behavior.
  */
+
+const routingIdentity = require('./routing-identity.js');
 
 const TIER_RANK = Object.freeze({ low: 0, mid: 1, high: 2 });
 const VALID_TIERS = Object.freeze(['high', 'mid', 'low']);
@@ -141,26 +161,30 @@ function coerceCost(x) {
 
 // ─── routing_profiles LOOKUPS ("the" active row — 1-1) ───────────────────
 
-/** Active routing_profiles row for (projectId, role), highest version wins. Tier-only lookup (no preferred_model filter). */
+/** Active routing_profiles row for (projectId, role), highest version wins. Tier-only lookup (no preferred_model filter). Normalizes projectId/role (F-1) — '*' passes through normId unchanged (trim-only, already a bare sentinel). */
 async function fetchActiveProfile(pg, projectId, role) {
+  const normProjectId = routingIdentity.normId(projectId);
+  const normRole = routingIdentity.normRole(role);
   const { rows } = await pg.query(
     `SELECT capability_tier, preferred_model, preferred_provider, version
        FROM routing_profiles
       WHERE project_id = $1 AND role = $2 AND active = true
       ORDER BY version DESC LIMIT 1`,
-    [projectId, role]
+    [normProjectId, normRole]
   );
   return rows[0] || null;
 }
 
-/** Active routing_profiles row for (projectId, role) that also carries a pin (non-NULL preferred_model). */
+/** Active routing_profiles row for (projectId, role) that also carries a pin (non-NULL preferred_model). Normalizes projectId/role (F-1). */
 async function fetchActivePin(pg, projectId, role) {
+  const normProjectId = routingIdentity.normId(projectId);
+  const normRole = routingIdentity.normRole(role);
   const { rows } = await pg.query(
     `SELECT capability_tier, preferred_model, preferred_provider, version
        FROM routing_profiles
       WHERE project_id = $1 AND role = $2 AND active = true AND preferred_model IS NOT NULL
       ORDER BY version DESC LIMIT 1`,
-    [projectId, role]
+    [normProjectId, normRole]
   );
   return rows[0] || null;
 }
@@ -182,21 +206,30 @@ async function fetchActivePin(pg, projectId, role) {
 async function resolveRequiredTier(pg, { projectId, role, capabilityTier } = {}) {
   requireNonEmptyString(projectId, 'projectId');
   requireNonEmptyString(role, 'role');
+  // F-1: normalize AFTER presence validation (so numeric/empty inputs still
+  // throw the existing, tested messages) but BEFORE any lookup — a
+  // whitespace-only projectId/role is rejected here too (requireNormalizedNonEmpty).
+  const normProjectId = routingIdentity.requireNormalizedNonEmpty(projectId, 'projectId', routingIdentity.normId);
+  const normRole = routingIdentity.requireNormalizedNonEmpty(role, 'role', routingIdentity.normRole);
   const explicitTier = normalizeCapabilityTier(capabilityTier);
   if (explicitTier) return explicitTier;
 
-  const projectProfile = await fetchActiveProfile(pg, projectId, role);
+  const projectProfile = await fetchActiveProfile(pg, normProjectId, normRole);
   if (projectProfile && projectProfile.capability_tier) return projectProfile.capability_tier;
 
-  const globalProfile = await fetchActiveProfile(pg, '*', role);
+  const globalProfile = await fetchActiveProfile(pg, '*', normRole);
   if (globalProfile && globalProfile.capability_tier) return globalProfile.capability_tier;
 
   throw new Error(
-    `unconfigured routing for role '${role}' — run routing init Q&A ` +
-    '(install-time suggested per-role defaults exist — e.g. orchestrate/spec=high, ' +
-    'draft/write=mid, read/index/bookkeep=low, review=high — but the suggested set never ' +
-    'applies on its own; it must be explicitly confirmed via the init Q&A, never applied ' +
-    'automatically by this resolver)'
+    `unconfigured routing for role '${role}' — no active routing_profiles row sets a ` +
+    "capability_tier for this role (checked project-scoped, then the '*' global default). " +
+    'Configure one via the routing_profile_set MCP tool (routingProfileSet in ' +
+    'scripts/lib/routing-profile.js), e.g. { projectId, role, capabilityTier }. Suggested ' +
+    'per-role defaults exist only as prose (orchestrate/spec=high, draft/write=mid, ' +
+    'read/index/bookkeep=low, review=high) and are never applied automatically — an ' +
+    'operator must call routing_profile_set explicitly to confirm one. Candidate models ' +
+    'must also be registered in model_registry before they can be recommended or pinned — ' +
+    'use the model_registry_set MCP tool (§17 B1) rather than raw SQL.'
   );
 }
 
@@ -258,7 +291,10 @@ async function recommendLeastCost(pg, requiredTier) {
     throw new Error(
       `route-resolve: model(s) at/above required tier '${requiredTier}' exist but ALL lack cost figures ` +
       `(cost_in_per_mtok/cost_out_per_mtok) — least-cost ranking stays inert for: ${names}. ` +
-      'Run the init Q&A to register cost figures for these models.'
+      'Set cost_in_per_mtok/cost_out_per_mtok for these models via the model_registry_set MCP ' +
+      'tool (§17 B1). A directive can still route to one of these models via the ' +
+      'routing_profile_set or routing_session_override_set MCP tools, bypassing the ' +
+      'recommendation ranking entirely.'
     );
   }
 
@@ -284,10 +320,19 @@ async function recommendLeastCost(pg, requiredTier) {
 // ─── model_registry lookup by label (5-1) ─────────────────────────────────
 
 async function lookupRegistryByLabel(pg, label) {
+  // F-1: normalize the lookup key so a directive's model string (an
+  // overrideModel arg, a routing_profiles.preferred_model pin, or a
+  // routing_session_overrides.model_id) finds a model_registry row
+  // regardless of whether the ORIGINAL source of that string was itself
+  // written through the normalized model_registry_set path — this is the
+  // single point where every directive type's label converges on the
+  // registry join, so normalizing here (rather than at each of those three
+  // upstream write sites) covers all of them uniformly.
+  const normLabel = routingIdentity.normLabel(label);
   const { rows } = await pg.query(
     `SELECT label, provider, capability_tier, cost_in_per_mtok, cost_out_per_mtok
        FROM model_registry WHERE label = $1`,
-    [label]
+    [normLabel]
   );
   return rows[0] || null;
 }
@@ -305,10 +350,17 @@ async function resolveDirective(pg, { projectId, sessionId, role, overrideModel 
     return { model: overrideModel, provider: null, rationale: 'per-turn override' };
   }
 
+  // F-1: normalize before the session-override lookup — belt-and-suspenders
+  // with routeResolve's own top-of-function normalization (this function is
+  // also an exported test seam callable directly, bypassing routeResolve).
+  const normProjectId = routingIdentity.normId(projectId);
+  const normSessionId = routingIdentity.normId(sessionId);
+  const normRole = routingIdentity.normRole(role);
+
   const { rows: sessionRows } = await pg.query(
     `SELECT model_id, provider FROM routing_session_overrides
       WHERE project_id = $1 AND session_id = $2 AND role = $3`,
-    [projectId, sessionId, role]
+    [normProjectId, normSessionId, normRole]
   );
   if (sessionRows.length > 0) {
     return {
@@ -343,11 +395,16 @@ async function resolveDirective(pg, { projectId, sessionId, role, overrideModel 
 
 /** Same aliased shape used by both the step-1 replay SELECT and the race-loser re-SELECT (2-2). */
 async function selectTurnUsage(pg, projectId, sessionId, turnIdx, role) {
+  // F-1: normalize — belt-and-suspenders with routeResolve's top-of-function
+  // normalization (exported test seam, callable directly).
+  const normProjectId = routingIdentity.normId(projectId);
+  const normSessionId = routingIdentity.normId(sessionId);
+  const normRole = routingIdentity.normRole(role);
   const { rows } = await pg.query(
     `SELECT model_id AS model, provider, resolved_via, recommended_model, cost_delta_usd
        FROM turn_usage
       WHERE project_id = $1 AND session_id = $2 AND turn_idx = $3 AND agent_role = $4`,
-    [projectId, sessionId, turnIdx, role]
+    [normProjectId, normSessionId, turnIdx, normRole]
   );
   return rows[0] || null;
 }
@@ -360,12 +417,20 @@ async function selectTurnUsage(pg, projectId, sessionId, turnIdx, role) {
  * @returns {Promise<{ model: string|null, provider: string|null, resolved_via: string, recommended_model: string|null, cost_delta_usd: number|null, rationale: string, replayed: boolean }>}
  */
 async function routeResolve(pg, args = {}) {
-  const projectId = requireNonEmptyString(args.projectId, 'projectId');
-  const sessionId = requireNonEmptyString(args.sessionId, 'sessionId');
+  const projectIdRaw = requireNonEmptyString(args.projectId, 'projectId');
+  const sessionIdRaw = requireNonEmptyString(args.sessionId, 'sessionId');
   const turnIdx = requireTurnIdx(args.turnIdx);
-  const role = requireNonEmptyString(args.role, 'role');
+  const roleRaw = requireNonEmptyString(args.role, 'role');
   const overrideModel = normalizeOverrideModel(args.overrideModel);
   const capabilityTier = normalizeCapabilityTier(args.capabilityTier);
+
+  // F-1: normalize ONCE, immediately after presence validation, and thread
+  // the normalized identity through every downstream query in this function
+  // (replay SELECT, directive chain, tier resolution, the final INSERT) —
+  // never a mix of raw-here/normalized-there for the SAME call's identity.
+  const projectId = routingIdentity.requireNormalizedNonEmpty(projectIdRaw, 'projectId', routingIdentity.normId);
+  const sessionId = routingIdentity.requireNormalizedNonEmpty(sessionIdRaw, 'sessionId', routingIdentity.normId);
+  const role = routingIdentity.requireNormalizedNonEmpty(roleRaw, 'role', routingIdentity.normRole);
 
   // ── Step 1: idempotent replay — a second call for the SAME key never
   // re-resolves. ──────────────────────────────────────────────────────────

@@ -193,7 +193,29 @@ async function entitySuppress(client, { projectId, id }) {
 // Assertions — create/read/update(supersede)/suppress. M-5/M-6.
 // ─────────────────────────────────────────────────────────────────────────
 
-async function assertionCreate(client, { projectId, subject, predicate, object, confidence, source, sourceModel, agentId }) {
+/**
+ * assertionCreate — cm#231: routes the actual write through
+ * writeAssertionWithSupersession (handoff.js), the SAME write engine the
+ * seed/close path uses, so tier/valid_at/session_id/last_reinforced are set
+ * with the SAME defaults on both paths instead of a second, independently-
+ * duplicated INSERT here.
+ *
+ * BEHAVIOR CHANGE from the pre-cm#231 plain INSERT (documented, not hidden):
+ * this call now (a) canonicalizes subject the same way the close path does,
+ * (b) SUPERSEDES a prior live row for the same (subject, predicate) [1:1] or
+ * exact (subject, predicate, object) duplicate [1:N] rather than leaving it
+ * live alongside a second row, and (c) short-circuits to a last_reinforced-
+ * only "touch" (no new row) on an exact same-session repeat. This tool was
+ * previously "append-only" (see the tool's own former description) purely
+ * because the raw INSERT never checked for a prior live row — NOT because
+ * append-only was a deliberate design goal; the two other assertion write
+ * paths (seed/close, and this same engine) have always superseded. The
+ * ingest-time contradiction check below is UNCHANGED and still runs first,
+ * against the pre-write live state, so a genuinely conflicting (different-
+ * object, 1:N) prior row is still surfaced as contradictionWarning even
+ * when cardinality means it is not auto-superseded.
+ */
+async function assertionCreate(client, { projectId, subject, predicate, object, confidence, source, sourceModel, agentId, sessionId }) {
   requireNonEmptyString(projectId, 'projectId');
   requireNonEmptyString(subject, 'subject');
   requireNonEmptyString(predicate, 'predicate');
@@ -206,13 +228,49 @@ async function assertionCreate(client, { projectId, subject, predicate, object, 
   const { findContradictingAssertion } = require('./memory-upsert.js');
   const conflict = await findContradictingAssertion(client, projectId, subject, predicate, object);
 
-  const { rows } = await client.query(
-    `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, source_model, agent_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-     RETURNING *`,
-    [projectId, subject, predicate, object, confidence, source, sourceModel || null, agentId || null]
+  const handoffLib = require('../handoff.js');
+  const registryMode = await handoffLib.getSetting(client, projectId, 'predicate_registry_mode', 'permissive');
+  const resolvedSessionId = (typeof sessionId === 'string' && sessionId.length > 0)
+    ? sessionId
+    : await handoffLib.resolveSessionId(client, projectId, {});
+
+  const result = await handoffLib.writeAssertionWithSupersession(
+    client, projectId,
+    { subject, predicate, object, confidence, source },
+    resolvedSessionId, registryMode, { returnRow: true }
   );
-  return { row: rows[0], contradictionWarning: conflict };
+
+  if (result.skipped) {
+    // Predicate registry rejected this predicate under 'strict' mode. The close/
+    // seed batch path swallows this (logs + continues the batch); assertionCreate
+    // is a single-call API surface, so it surfaces the rejection as a hard error
+    // instead of silently no-op-ing (M-6's "never guess/never swallow" posture).
+    throw new EntityGraphCrudError(
+      'validation',
+      `entity-graph-crud: assertionCreate rejected — predicate "${predicate}" is not registered and predicate_registry_mode is "strict" (${result.reason})`
+    );
+  }
+
+  let row = result.row;
+  // writeAssertionWithSupersession's INSERT (shared with the seed/close path,
+  // which has no source_model/agent_id concept) does not set these §8
+  // attribution columns. Backfill them with a follow-up UPDATE so
+  // assertionCreate's existing attribution contract is preserved. This is a
+  // SEPARATE statement, outside writeAssertionWithSupersession's own already-
+  // committed transaction (see PR body's Blind spots: a narrow window exists
+  // between the two writes where a concurrent reader could see the row before
+  // attribution lands).
+  if (row && (sourceModel || agentId)) {
+    const { rows: updated } = await client.query(
+      `UPDATE assertions SET source_model = COALESCE($1, source_model), agent_id = COALESCE($2, agent_id)
+        WHERE id = $3
+        RETURNING *`,
+      [sourceModel || null, agentId || null, row.id]
+    );
+    row = updated[0] || row;
+  }
+
+  return { row, contradictionWarning: conflict, touchOnly: !!result.touchOnly };
 }
 
 async function assertionRead(client, { projectId, id, subject, predicate }) {
@@ -285,14 +343,36 @@ async function resolveAssertionUpdateTargetId(client, { projectId, id, subject, 
  * @param {string} [args.source]
  * @param {string} [args.sourceModel]
  * @param {string} [args.agentId]
+ * @param {string} [args.sessionId] — explicit session override; defaults to
+ *   handoff.js's own resolveSessionId (env var / DB marker), cm#231.
+ *
+ * cm#231: the new row born from this supersession now carries the SAME
+ * tier/valid_at/session_id/last_reinforced defaults the seed/close path
+ * applies — previously all four were left NULL/unset here. tier is
+ * deliberately ALWAYS 'probationary' on the new row (never routed through
+ * the L0/L2 corroboration gate — see PR body's "Semantics matched"): the
+ * gate's candidate-scan is keyed by canonical subject and would need to
+ * re-derive cross-session corroboration for THIS specific id-targeted
+ * update, which is a different matching shape than writeAssertionWithSupersession's
+ * subject/predicate[/object]-keyed scan (that scan cannot honor an explicit
+ * id target for a 1:N predicate the way M-6 requires). Defaulting to
+ * 'probationary' here is also the SAFE choice on its own terms: it preserves
+ * the L0 anti-forge invariant (a single explicit write, with no independently-
+ * verified cross-session evidence, must never mint 'consolidated') rather
+ * than inventing a new path that could.
  */
 async function assertionUpdate(client, args) {
-  const { projectId, subject, predicate, newObject, confidence, source, sourceModel, agentId } = args || {};
+  const { projectId, subject, predicate, newObject, confidence, source, sourceModel, agentId, sessionId } = args || {};
   requireNonEmptyString(projectId, 'projectId');
   requireNonEmptyString(predicate, 'predicate');
   requireNonEmptyString(newObject, 'newObject');
 
   const targetId = await resolveAssertionUpdateTargetId(client, { projectId, id: args.id, subject, predicate });
+
+  const handoffLib = require('../handoff.js');
+  const resolvedSessionId = (typeof sessionId === 'string' && sessionId.length > 0)
+    ? sessionId
+    : await handoffLib.resolveSessionId(client, projectId, {});
 
   await client.query('BEGIN');
   try {
@@ -300,8 +380,12 @@ async function assertionUpdate(client, args) {
     // moment of the guard — a concurrent supersede/suppress between the
     // target-resolution read above and this UPDATE is caught here, never
     // silently double-superseded.
+    // cm#231: suppression_kind = 'superseded' added — matches
+    // db-seam.js's buildSupersessionUpdate (the seed/close path's own
+    // supersession UPDATE), which the pre-cm#231 version of this guard
+    // omitted.
     const guardRes = await client.query(
-      `UPDATE assertions SET suppressed = true, invalid_at = now()
+      `UPDATE assertions SET suppressed = true, invalid_at = now(), suppression_kind = 'superseded'
         WHERE id = $1 AND project_id = $2 AND suppressed = false AND invalid_at IS NULL
         RETURNING subject, predicate, confidence, source, source_model, agent_id`,
       [targetId, projectId]
@@ -315,8 +399,10 @@ async function assertionUpdate(client, args) {
     const old = guardRes.rows[0];
 
     const insertRes = await client.query(
-      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, source_model, agent_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      `INSERT INTO assertions
+         (project_id, subject, predicate, object, confidence, source, source_model, agent_id,
+          session_id, last_reinforced, valid_at, tier)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now(), $10)
        RETURNING *`,
       [
         projectId, old.subject, old.predicate, newObject,
@@ -324,6 +410,8 @@ async function assertionUpdate(client, args) {
         source || old.source,
         sourceModel || old.source_model,
         agentId || old.agent_id,
+        resolvedSessionId,
+        handoffLib.ASSERTION_TIER_PROBATIONARY,
       ]
     );
 
@@ -335,13 +423,24 @@ async function assertionUpdate(client, args) {
   }
 }
 
+/**
+ * assertionSuppress — cm#231: now sets invalid_at=now() and
+ * suppression_kind='retired' alongside suppressed=true, matching the seed/
+ * close path's own operator-retirement vocabulary (cmdRetire / L5's
+ * buildRetirementUpdate — 'retired': "operator-retired ... non-destructive",
+ * handoff-core-schema.sql's suppression_kind CHECK comment). Previously this
+ * set suppressed=true only, leaving invalid_at NULL and suppression_kind
+ * NULL on a row that is otherwise indistinguishable, at read time, from a
+ * live row for any query that (correctly) also checks invalid_at IS NULL.
+ */
 async function assertionSuppress(client, { projectId, id }) {
   requireNonEmptyString(projectId, 'projectId');
   if (!Number.isInteger(id)) {
     throw new EntityGraphCrudError('validation', 'entity-graph-crud: assertionSuppress requires an integer id');
   }
   const { rows } = await client.query(
-    `UPDATE assertions SET suppressed = true WHERE id = $1 AND project_id = $2 RETURNING *`,
+    `UPDATE assertions SET suppressed = true, invalid_at = now(), suppression_kind = 'retired'
+      WHERE id = $1 AND project_id = $2 RETURNING *`,
     [id, projectId]
   );
   if (rows.length === 0) {

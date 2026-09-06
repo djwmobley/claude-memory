@@ -75,6 +75,11 @@ const { embedQuery }                               = require('./lib/embed');
 const { execFileSync }                             = require('child_process');
 const crypto                                       = require('crypto');
 const { REALITY_CHECKS, runVerifyDispatch }        = require('./lib/reality-checks');
+// cm#230: the SAME decisions-row writer scripts/handoff-mcp.mjs's
+// persist_decisions MCP tool uses — writeExtraction below is the SECOND
+// (and, before this fix, only-validated-never-written) entry point onto
+// this one write path.
+const { validateDecisionRows, persistDecisionRow } = require('./lib/decisions-writer');
 
 process.on('exit', () => {
   const ms = Number(process.hrtime.bigint() - __startNs) / 1e6;
@@ -2743,6 +2748,60 @@ async function cmdInit(args) {
   console.log(`\nDone: handoff:init — project ${projectId} provisioned`);
 }
 
+// ── live-row count helper (cm#232) ──────────────────────────────────────────
+//
+// Single source of truth for what "live" means per table, so status/close/
+// checkpoint can never report divergent numbers for the same underlying data.
+// entities/edges carry only `suppressed` (no bi-temporal column); assertions
+// additionally carry `invalid_at` (bi-temporal supersession — see
+// handoff-core-schema.sql). The live predicate mirrors the one already used
+// throughout writeAssertionWithSupersession/persistSessionIntent/the resurrect
+// engine: `suppressed = false AND invalid_at IS NULL`.
+//
+// Before this fix, handoff:status's `assertions` count was a raw
+// `COUNT(*) FROM assertions` with no suppressed/invalid_at filter at all —
+// it counted every row ever written for the project, suppressed or not,
+// inflating the reported live count (evidence: pwa-etl reported 30 after
+// 4 suppressions + 3 adds when the live count was 26). entities/edges had
+// the identical unfiltered-COUNT(*) bug (no `suppressed = false` filter).
+const ASSERTIONS_LIVE_SQL = 'suppressed = false AND invalid_at IS NULL';
+
+async function getLiveCounts(db, projectId) {
+  const entRes = await db.query(
+    'SELECT COUNT(*) AS n FROM entities WHERE project_id = $1 AND suppressed = false',
+    [projectId]
+  );
+  const edgRes = await db.query(
+    'SELECT COUNT(*) AS n FROM edges WHERE project_id = $1 AND suppressed = false',
+    [projectId]
+  );
+  const assLiveRes = await db.query(
+    `SELECT COUNT(*) AS n FROM assertions WHERE project_id = $1 AND ${ASSERTIONS_LIVE_SQL}`,
+    [projectId]
+  );
+  const assSuppRes = await db.query(
+    'SELECT COUNT(*) AS n FROM assertions WHERE project_id = $1 AND suppressed = true',
+    [projectId]
+  );
+  const assInvOnlyRes = await db.query(
+    'SELECT COUNT(*) AS n FROM assertions WHERE project_id = $1 AND suppressed = false AND invalid_at IS NOT NULL',
+    [projectId]
+  );
+  const assTotalRes = await db.query(
+    'SELECT COUNT(*) AS n FROM assertions WHERE project_id = $1',
+    [projectId]
+  );
+
+  return {
+    entities:                  parseInt(entRes.rows[0].n, 10),
+    edges:                     parseInt(edgRes.rows[0].n, 10),
+    assertionsLive:            parseInt(assLiveRes.rows[0].n, 10),
+    assertionsSuppressed:      parseInt(assSuppRes.rows[0].n, 10),
+    assertionsInvalidatedOnly: parseInt(assInvOnlyRes.rows[0].n, 10),
+    assertionsTotal:           parseInt(assTotalRes.rows[0].n, 10),
+  };
+}
+
 // ── status ────────────────────────────────────────────────────────────────────
 
 async function cmdStatus(args = []) {
@@ -2755,6 +2814,10 @@ async function cmdStatus(args = []) {
   const projectId   = resolveProjectId();
   const handoffPath = resolveHandoffMdPath(projectId);
   const fm          = readHandoffFrontmatter(handoffPath);
+  // cm#232: human-readable project name, distinct from the marker uuid
+  // (projectId) — surfaced so a status/close summary read out of context
+  // (e.g. pasted into chat) can't be misread as belonging to another project.
+  const projectName = path.basename(findProjectRoot());
 
   let db;
   try {
@@ -2764,13 +2827,10 @@ async function cmdStatus(args = []) {
     process.exit(1);
   }
 
-  // Counts — sequential awaits because pg.Client is single-connection and rejects
-  // concurrent queries on pg@9 (deprecation warning on pg@8). Pool would allow
-  // concurrency, but these are four trivial COUNT/SELECT round-trips and serial
-  // is plenty fast.
-  const entRes = await db.query('SELECT COUNT(*) AS n FROM entities           WHERE project_id = $1', [projectId]);
-  const assRes = await db.query('SELECT COUNT(*) AS n FROM assertions         WHERE project_id = $1', [projectId]);
-  const edgRes = await db.query('SELECT COUNT(*) AS n FROM edges              WHERE project_id = $1', [projectId]);
+  // Counts — cm#232: getLiveCounts is the single shared query behind every
+  // entity/assertion/edge count status reports (prose, --json, and the Done
+  // line all derive from this one call — see getLiveCounts above).
+  const liveCounts = await getLiveCounts(db, projectId);
   const rcRes  = await db.query('SELECT name        FROM retrieval_contract  WHERE project_id = $1 ORDER BY name', [projectId]);
 
   // Session-in-progress marker
@@ -2803,9 +2863,11 @@ async function cmdStatus(args = []) {
     );
 
     // Top-10 predicate distribution across LIVE assertions only.
+    // cm#232: was suppressed=false only, missing invalid_at IS NULL — now uses
+    // the same ASSERTIONS_LIVE_SQL predicate as getLiveCounts above.
     const predRes = await db.query(
       `SELECT predicate, COUNT(*) AS n
-         FROM assertions WHERE project_id = $1 AND suppressed = false
+         FROM assertions WHERE project_id = $1 AND ${ASSERTIONS_LIVE_SQL}
          GROUP BY predicate
          ORDER BY n DESC
          LIMIT 10`,
@@ -2906,13 +2968,17 @@ async function cmdStatus(args = []) {
   if (jsonFlag) {
     const out = {
       project_id:     projectId,
+      project_name:   projectName,
       db:             'connected',
       handoff_md:     fs.existsSync(handoffPath) ? handoffPath : null,
       last_close:     lastClose,
       days_since:     days,
-      entities:       parseInt(entRes.rows[0].n, 10),
-      assertions:     parseInt(assRes.rows[0].n, 10),
-      edges:          parseInt(edgRes.rows[0].n, 10),
+      entities:       liveCounts.entities,
+      assertions:     liveCounts.assertionsLive,
+      assertions_suppressed: liveCounts.assertionsSuppressed,
+      assertions_invalidated: liveCounts.assertionsInvalidatedOnly,
+      assertions_total: liveCounts.assertionsTotal,
+      edges:          liveCounts.edges,
       contracts:      rcRes.rows.map((r) => r.name),
       session_active: sip ? true : false,
       session_id:     sip || null,
@@ -2926,18 +2992,19 @@ async function cmdStatus(args = []) {
       out.stale_pointer_count = stalePointerCount;
     }
     console.log(JSON.stringify(out, null, 2));
-    console.log(`\nDone: handoff:status — ${out.entities} entities, ${out.assertions} assertions, ${out.edges} edges`);
+    console.log(`\nDone: handoff:status — project=${projectName} marker=${projectId} — ${out.entities} entities, ${out.assertions} assertions (suppressed: ${out.assertions_suppressed}, invalidated: ${out.assertions_invalidated}), ${out.edges} edges`);
     return;
   }
 
   // ── Prose output path (default) ─────────────────────────────────────────
   console.log('\n  === handoff status ===');
+  console.log(`  project_name:     ${projectName}`);
   console.log(`  project_id:       ${projectId}`);
   console.log(`  last_close:       ${lastClose} (${daysStr})`);
   console.log(`  handoff.md:       ${fs.existsSync(handoffPath) ? handoffPath : '(missing)'}`);
-  console.log(`  entities:         ${entRes.rows[0].n}`);
-  console.log(`  assertions:       ${assRes.rows[0].n}`);
-  console.log(`  edges:            ${edgRes.rows[0].n}`);
+  console.log(`  entities:         ${liveCounts.entities}`);
+  console.log(`  assertions:       ${liveCounts.assertionsLive} (suppressed: ${liveCounts.assertionsSuppressed}, invalidated: ${liveCounts.assertionsInvalidatedOnly})`);
+  console.log(`  edges:            ${liveCounts.edges}`);
   console.log(`  contracts:        ${contracts}`);
   console.log(`  session_active:   ${sip ? `YES (session_id=${sip})` : 'no'}`);
   if (packagingLine) console.log(packagingLine);
@@ -2969,7 +3036,7 @@ async function cmdStatus(args = []) {
     }
   }
 
-  console.log(`\nDone: handoff:status — ${entRes.rows[0].n} entities, ${assRes.rows[0].n} assertions, ${edgRes.rows[0].n} edges`);
+  console.log(`\nDone: handoff:status — project=${projectName} marker=${projectId} — ${liveCounts.entities} entities, ${liveCounts.assertionsLive} assertions (suppressed: ${liveCounts.assertionsSuppressed}, invalidated: ${liveCounts.assertionsInvalidatedOnly}), ${liveCounts.edges} edges`);
 }
 
 // ── runResurrectQuery — shared resurrect engine ───────────────────────────────
@@ -4407,9 +4474,35 @@ async function cmdDrop() {
  * @param {object} ass           — assertion object: {subject, predicate, object, confidence, source}
  * @param {string} sessionId     — session_id (may be null)
  * @param {string} registryMode  — 'permissive'|'strict'
- * @returns {boolean} true if the row was inserted; false if skipped (strict unrecognized)
+ * @param {object} [opts]        — cm#231: opts.returnRow (boolean, default false).
+ *   When false/omitted, the return contract is BYTE-IDENTICAL to every existing
+ *   call site (a plain boolean — true if a row was inserted, false if skipped/
+ *   touch-only). When true (used by the MCP assertion_create/assertion_update
+ *   write path, cm#231), returns a richer object instead:
+ *     { inserted: true,  row: <the newly-inserted row> }
+ *     { inserted: false, row: <the touch-only-bumped row>, touchOnly: true }
+ *     { inserted: false, row: null, skipped: true, reason: <string> }  — strict-mode
+ *       registry rejection (unrecognized predicate); the caller decides whether
+ *       that is a hard error (MCP single-call API) or a swallowed skip (close
+ *       payload batch).
+ * @returns {boolean|object} see opts.returnRow above.
  */
-async function writeAssertionWithSupersession(db, projectId, ass, sessionId, registryMode) {
+// cm#231: named tier constants — the assertions.tier CHECK constraint's own
+// authoritative vocabulary (handoff-core-schema.sql:
+// CHECK (tier IN ('probationary', 'consolidated'))). writeAssertionWithSupersession's
+// own L0/L2 gate branches below keep their pre-existing inline literals unchanged
+// (this function's tier-decision logic is unchanged by cm#231 — touching it risks
+// the very consolidation-gate invariants L0/L2's test suites pin byte-for-byte).
+// These constants exist so that OTHER write paths that need to mint a fresh,
+// never-corroborated assertion row (entity-graph-crud.js's assertionCreate/
+// assertionUpdate, cm#231) reference the SAME string values by name instead of
+// re-typing the literal — never a second, independently-typo-able copy of the
+// vocabulary.
+const ASSERTION_TIER_PROBATIONARY = 'probationary';
+const ASSERTION_TIER_CONSOLIDATED = 'consolidated';
+
+async function writeAssertionWithSupersession(db, projectId, ass, sessionId, registryMode, opts) {
+  opts = opts || {};
   // Classify predicate cardinality.  strict throws for unrecognized; permissive returns 1:N.
   let cardinality;
   try {
@@ -4425,6 +4518,7 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
     process.stderr.write(
       `[handoff] skipping assertion (predicate="${ass.predicate}"): ${regErr.message}\n`
     );
+    if (opts.returnRow) return { inserted: false, row: null, skipped: true, reason: regErr.message };
     return false;
   }
 
@@ -4610,6 +4704,13 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
     if (touchOnlyIds.length > 0 && storedSubjectsToSuppress.size === 0) {
       const bumpStmt = db.buildBumpAssertions(touchOnlyIds);
       if (bumpStmt) await db.query(bumpStmt.sql, bumpStmt.params);
+      if (opts.returnRow) {
+        const { rows: touched } = await db.query(
+          `SELECT * FROM assertions WHERE id = $1`, [touchOnlyIds[0]]
+        );
+        await db.query('COMMIT');
+        return { inserted: false, row: touched[0] || null, touchOnly: true };
+      }
       await db.query('COMMIT');
       return false; // no new row; caller must NOT increment assertionsWritten
     }
@@ -4739,14 +4840,28 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
       ? (maxPriorCorrob + 1)
       : 1;
 
-    await db.query(
+    // RETURNING id: harmless addition for every existing caller (none of them
+    // destructure the query result today) — cm#231's opts.returnRow path uses
+    // it to fetch the full row below, inside the same transaction, before COMMIT.
+    const insertResult = await db.query(
       `INSERT INTO assertions
          (project_id, subject, predicate, object, confidence, source, session_id,
           last_reinforced, valid_at, tier, consolidated_at, corroboration_count)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now(), $8, ${consolidatedAtSql}, $9)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now(), $8, ${consolidatedAtSql}, $9)
+       RETURNING id`,
       [projectId, canonSubject, ass.predicate, ass.object, conf, source, sessionId,
        newTier, newCorrob]
     );
+
+    if (opts.returnRow) {
+      const insertedId = insertResult && insertResult.rows && insertResult.rows[0]
+        ? insertResult.rows[0].id : null;
+      const { rows: inserted } = await db.query(
+        `SELECT * FROM assertions WHERE id = $1`, [insertedId]
+      );
+      await db.query('COMMIT');
+      return { inserted: true, row: inserted[0] || null };
+    }
 
     await db.query('COMMIT');
   } catch (err) {
@@ -5024,6 +5139,58 @@ async function writeExtraction(db, projectId, payload, opts) {
     edgesWritten++;
   }
 
+  // Decisions — cm#230: payload.decisions[] persisted through the SAME
+  // decisions-writer.js write path scripts/handoff-mcp.mjs's persist_decisions
+  // MCP tool uses (persistDecisionRow). Before this fix, payload.decisions[]
+  // was schema-validated (readStdin/validatePayload) but NEVER written here —
+  // the intended write path (persist_decisions) was a separate, unconnected
+  // tool. Per-row fault isolation, matching entities'/edges' own
+  // skip-malformed-item behavior above: one row that fails validation, hits
+  // a genuine write error (including a missing `decisions` table on a DB
+  // that has not yet run ensureSchemaCurrent — e.g. the async queue-drain
+  // path, which does not call it), or degrades its embedding (fail-soft,
+  // per write-time-embed.js's own header) never blocks the rest of this
+  // decisions[] array OR the rest of the close. Failures/degradations are
+  // collected into decisionDivergences and merged into the SAME
+  // intentDivergences channel cm#227 built for session-intent persistence
+  // failures below — one DIVERGENCE-line mechanism, not two.
+  let decisionsWritten = 0;
+  const decisionDivergences = [];
+  for (const row of (payload.decisions || [])) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
+    const topicForMessage = (typeof row.topic === 'string' && row.topic) ? row.topic : '(no topic)';
+    const rowErrors = validateDecisionRows([row]);
+    if (rowErrors.length > 0) {
+      decisionDivergences.push({
+        predicate: `decision:${topicForMessage}`,
+        subject: topicForMessage,
+        message: `validation failed — ${rowErrors.join('; ')}`,
+        kind: 'not_persisted',
+      });
+      continue;
+    }
+    try {
+      const { warning } = await persistDecisionRow(db, projectId, row);
+      decisionsWritten++;
+      if (warning) {
+        decisionDivergences.push({
+          predicate: `decision:${row.topic}`,
+          subject: row.topic,
+          message: warning,
+          kind: 'embed_degraded',
+        });
+      }
+    } catch (err) {
+      process.stderr.write(`[handoff] decision write failed for topic "${topicForMessage}" (non-fatal): ${err.message}\n`);
+      decisionDivergences.push({
+        predicate: `decision:${topicForMessage}`,
+        subject: topicForMessage,
+        message: err.message,
+        kind: 'not_persisted',
+      });
+    }
+  }
+
   // Retrieval contract change — versioned and history-recorded (non-fatal).
   if (payload.contract && typeof payload.contract === 'object') {
     const changeNote = `close session=${payload.session_id || 'unknown'}`;
@@ -5071,19 +5238,39 @@ async function writeExtraction(db, projectId, payload, opts) {
     intentDivergences = [{ predicate: '(unknown)', subject: '(unknown)', message: intentErr.message }];
   }
 
-  return { entitiesWritten, assertionsWritten, edgesWritten, intentDivergences };
+  // cm#230: decision-row divergences share the SAME channel session-intent
+  // divergences use (formatIntentDivergenceLines, below) — one DIVERGENCE-line
+  // mechanism for the whole close/checkpoint summary and handoff.md Degraded
+  // section, not a second parallel one. decisionsWritten is additionally
+  // returned on its own for any caller that wants the raw count.
+  return {
+    entitiesWritten, assertionsWritten, edgesWritten, decisionsWritten,
+    intentDivergences: [...intentDivergences, ...decisionDivergences],
+  };
 }
 
 /**
  * cm#227: build the `DIVERGENCE: <predicate> NOT PERSISTED — <first line>` lines
  * for a list of persistSessionIntent divergences, shared by the close/checkpoint
  * console summary and the handoff.md Degraded section.
- * @param {Array<{predicate:string, subject:string, message:string}>} divergences
+ *
+ * cm#230: also formats decisions-writer divergences (writeExtraction's
+ * decisionDivergences, merged into the same array this function receives).
+ * Those carry an explicit `d.kind` — 'embed_degraded' renders a DISTINCT
+ * line (the row WAS persisted; only its embedding degraded to NULL,
+ * fail-soft per write-time-embed.js) so it is never confused with an actual
+ * NOT-PERSISTED write failure. Any divergence with no `kind` (every existing
+ * session-intent divergence, cm#227) renders EXACTLY as before — this is a
+ * strict superset, not a behavior change for the pre-existing callers.
+ * @param {Array<{predicate:string, subject:string, message:string, kind?:string}>} divergences
  * @returns {string[]}
  */
 function formatIntentDivergenceLines(divergences) {
   return (divergences || []).map((d) => {
     const firstLine = String(d.message || '').split('\n')[0];
+    if (d.kind === 'embed_degraded') {
+      return `DIVERGENCE: ${d.predicate} EMBEDDING DEGRADED (row persisted, embedding=NULL) — ${firstLine}`;
+    }
     return `DIVERGENCE: ${d.predicate} NOT PERSISTED — ${firstLine}`;
   });
 }
@@ -5223,10 +5410,10 @@ async function cmdCheckpoint(args) {
 
     if (written) {
       console.log(`\n  note captured: ${noteText}`);
-      console.log(`\nDone: handoff:checkpoint --note — session_note written (session marker preserved)`);
+      console.log(`\nDone: handoff:checkpoint --note — project=${basename} marker=${projectId} — session_note written (session marker preserved)`);
     } else {
       console.log(`\n  note skipped (predicate not recognized in strict mode): ${noteText}`);
-      console.log(`\nDone: handoff:checkpoint --note — session_note skipped`);
+      console.log(`\nDone: handoff:checkpoint --note — project=${basename} marker=${projectId} — session_note skipped`);
     }
     return;
   }
@@ -5328,7 +5515,7 @@ async function cmdCheckpoint(args) {
 
     await db.end();
 
-    console.log(`\nDone: handoff:checkpoint — payload queued for async extraction (session marker preserved for continued attribution)`);
+    console.log(`\nDone: handoff:checkpoint — project=${path.basename(root)} marker=${projectId} — payload queued for async extraction (session marker preserved for continued attribution)`);
     return;
   }
 
@@ -5380,7 +5567,7 @@ async function cmdCheckpoint(args) {
   for (const line of divergenceLines) {
     console.log(`  ${line}`);
   }
-  console.log(`\nDone: handoff:checkpoint — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written (session marker preserved for continued attribution)`);
+  console.log(`\nDone: handoff:checkpoint — project=${path.basename(root)} marker=${projectId} — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written (session marker preserved for continued attribution)`);
 }
 
 // ── resolveSessionId ──────────────────────────────────────────────────────────
@@ -5715,12 +5902,12 @@ async function cmdClose(args) {
     if (extractionEmptyAtEntry) {
       console.log(
         '\n  WARNING: extraction-empty close — payload carried no entities/assertions/edges. ' +
-        'The close contract expects the full extraction in one pass (see commands/handoff/close.md §1-§4). ' +
+        'The close contract expects the full extraction in one pass (see commands/handoff/close.md §1-§5). ' +
         'Queued for async extraction anyway.'
       );
     }
 
-    console.log(`\nDone: handoff:close — payload queued for async extraction, session marker cleared`);
+    console.log(`\nDone: handoff:close — project=${path.basename(root)} marker=${projectId} — payload queued for async extraction, session marker cleared`);
     return;
   }
 
@@ -5905,7 +6092,7 @@ async function cmdClose(args) {
     if (extractionEmptyAtEntry) {
       console.log(
         '\n  WARNING: extraction-empty close — payload carries no entities/assertions/edges. ' +
-        'The close contract expects the full extraction in one pass (see commands/handoff/close.md §1-§4). ' +
+        'The close contract expects the full extraction in one pass (see commands/handoff/close.md §1-§5). ' +
         'Intent rows (if any) would still be written on a real close.'
       );
     }
@@ -6019,7 +6206,7 @@ async function cmdClose(args) {
     console.log('\n  skipped in dry-run: writeExtraction, handoff.md render, session_in_progress clear, C2, C3, L4 degraded record');
 
     await db.end();
-    console.log('\nDone: handoff:close --dry-run — no mutations performed');
+    console.log(`\nDone: handoff:close --dry-run — project=${path.basename(root)} marker=${projectId} — no mutations performed`);
     return;
   }
 
@@ -6770,12 +6957,12 @@ async function cmdClose(args) {
   if (extractionEmptyAtEntry) {
     console.log(
       '\n  WARNING: extraction-empty close — payload carried no entities/assertions/edges. ' +
-      'The close contract expects the full extraction in one pass (see commands/handoff/close.md §1-§4). ' +
+      'The close contract expects the full extraction in one pass (see commands/handoff/close.md §1-§5). ' +
       'Intent rows were still written.'
     );
   }
 
-  console.log(`\nDone: handoff:close — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written, session marker cleared`);
+  console.log(`\nDone: handoff:close — project=${path.basename(root)} marker=${projectId} — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written, session marker cleared`);
 
   // L4: Exit-code gate — 'strict' mode exits 3 when any subsystem ran degraded.
   if (_degradedSubsystems.length > 0 && closeDegradedExitMode === 'strict') {
@@ -6951,7 +7138,8 @@ async function cmdLoaderStop() {
 
     await db.end();
 
-    process.stderr.write('Done: handoff SessionEnd hook — implicit close written, session marker cleared\n');
+    const projectName = path.basename(findProjectRoot());
+    process.stderr.write(`Done: handoff SessionEnd hook — project=${projectName} marker=${projectId} — implicit close written, session marker cleared\n`);
     process.exit(0);
 
   } catch (err) {
@@ -7986,5 +8174,19 @@ if (require.main === module) {
     checkPgvectorGatedObjects,
     reportPgvectorGatedDegradation,
     SCHEMA_EPOCH,
+    // cm#230: exposed for test/lib/test-decisions-writer.js — no test-side
+    // reimplementation of writeExtraction's decisions[] handling or the
+    // DIVERGENCE-line formatter.
+    writeExtraction,
+    formatIntentDivergenceLines,
+    // cm#231: shared write-path exports — entity-graph-crud.js's assertionCreate/
+    // assertionUpdate route through these so the MCP write path applies the SAME
+    // tier/valid_at/session_id defaults as the seed/close path, instead of
+    // duplicating default-setting logic per entry point.
+    writeAssertionWithSupersession,
+    getSetting,
+    resolveSessionId,
+    ASSERTION_TIER_PROBATIONARY,
+    ASSERTION_TIER_CONSOLIDATED,
   };
 }
