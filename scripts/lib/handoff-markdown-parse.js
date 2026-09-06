@@ -5,7 +5,22 @@
  * line classifier + markdown-table cell parser for
  * scripts/migrations/migrate-08-handoff-markdown.js (CONSOLIDATION-
  * RUNBOOK.md §6.1(h) + its H-1..H-14 spec-adversary amendment,
- * memory-manager#11(h)).
+ * memory-manager#11(h)) — and cm#222's further hardening pass (2026-09-06):
+ * true --dry-run, total-classification session headings, header-driven
+ * carry-over tables, explicit NEXT SESSION states.
+ *
+ * cm#222 GROUND TRUTH: this rewrite was verified against the two real
+ * target files (read-only, never quoted at length here or in fixtures —
+ * anonymized synthetic content only per H-13/owner instruction):
+ *   - HANDOFF.md: 1 numbered session heading, 3 durable-section headings,
+ *     no "## NEXT SESSION" heading (uses a different "LEAD:" convention),
+ *     one 3-column "### Open carry-overs" table (Item/Status/Notes).
+ *   - HANDOFF-HISTORY.md: 118 session headings — 85 "## Session N <sep>
+ *     date <sep> title" (session_numbered) and 33 "## SESSION <date>
+ *     [(parenthetical)] <sep> title" (session_dated, e.g. "(session 18)",
+ *     "(c)", or no parenthetical at all); zero fell into
+ *     session_shaped_unparsed or produced orphan_rows once the fixes below
+ *     were applied. See this PR's H-13 acceptance section for exact counts.
  *
  * SUPERSESSION NOTE (H-3/H-8/H-9): the base §6.1(h) text said to reuse
  * `extractCarryoverTable`/`applyDeltasToRows`. Those functions do not
@@ -22,46 +37,129 @@
  * directly from scripts/handoff.js for subject derivation (H-7/H-11); this
  * file only produces raw text for the caller to run through it.
  *
- * TOTAL CLASSIFICATION (H-5): every real (non-fenced/blockquote/comment)
- * `##`-level heading in the document is classified into EXACTLY ONE of
- * four buckets — session-block / durable-section / next-session /
- * unknown-flagged — never a fifth "ignored" bucket. An unknown-flagged
- * heading still terminates the PRIOR section's body (it is a real section
- * boundary), it simply produces no assertion row of its own; it is always
- * reported, never silently dropped.
+ * TOTAL CLASSIFICATION (H-5, widened by cm#222 A2): every real
+ * (non-fenced/blockquoted/commented) `##`-level heading in the document is
+ * classified into EXACTLY ONE of these buckets — never a silent drop:
+ *   - session_numbered   `## Session N <sep> date <sep> title`
+ *   - session_dated       `## SESSION <date> [(paren)] <sep> title`
+ *   - session_shaped_unparsed  heading contains the word "session" (case-
+ *     insensitive) but matches neither session shape above — ALWAYS listed
+ *     individually with its line number (never merged into the generic
+ *     `other` bucket — cm#222 F-3).
+ *   - durable             matches a configured durable-heading canonical
+ *     name (Run commands / Critical operational notes / Key paths / ...).
+ *   - next_session        canonical "## NEXT SESSION" (optionally with a
+ *     trailing parenthetical), case-insensitive.
+ *   - next_session_variant  heading contains both "next" and "session"
+ *     (case-insensitive) but is not the canonical form — reported with its
+ *     line number (cm#222 F-5/A5).
+ *   - other               everything else — a real section boundary that
+ *     produces no assertion row of its own, but is still reported.
+ *
+ * ONE NORMALIZATION ENGINE (cm#222 adversary pin): every heading-text
+ * comparison in this file goes through `canonicalizeWhitespace()` (trim +
+ * collapse internal whitespace) before an optional case-fold — captured/
+ * display text (titles, dates, notes) is NEVER case-folded or otherwise
+ * altered; only a throwaway comparison copy is.
  *
  * NORMALIZATION (H-10): callers MUST run `normalizeMarkdown()` on raw file
  * content before any other function in this module sees it. BOM strip,
  * CRLF -> LF, per-line trailing-whitespace trim, and a dash-class scan
  * that FLAGS (never silently coerces) any Unicode dash character used
  * adjacent to what looks like a heading separator that is not one of the
- * three characters H-5's pinned regex already recognizes (em dash U+2014,
- * en dash U+2013, hyphen-minus U+002D) — those three need no coercion
- * since the regex already accepts all three as-is.
+ * three characters the session-heading regexes already recognize (em dash
+ * U+2014, en dash U+2013, hyphen-minus U+002D) or the "--" two-hyphen
+ * token (cm#222 F-2) — those need no coercion since the separator-token
+ * alternation already accepts them as-is.
  */
 
 const RECOGNIZED_DASHES = ['—', '–', '-']; // em, en, hyphen-minus
-const DASH_CLASS = '[—–-]';
 
-// H-5: PINNED regex, single dash-class character class. Group 1 = session
-// number, group 2 = date (non-greedy, stops at the NEXT dash), group 3 =
-// title (greedy — deliberately swallows any FURTHER embedded dashes; this
-// is what makes a "4-way-split" heading like
-// "## Session 3 — Part A — Fixed the bug — v2" parse DETERMINISTICALLY as
-// date="Part A", title="Fixed the bug — v2", never ambiguous, never a
-// guess).
-const SESSION_HEADING_RE = /^##\s+Session\s+(\d+)\s+[—–-]\s+(.+?)\s+[—–-]\s+(.+)$/;
+// cm#222 F-2 (CRITICAL): the separator between a session heading's parts is
+// a TOKEN, not a single character class member. 107/118 of the real
+// pwa-etl HANDOFF-HISTORY.md headings use a literal two-hyphen "--" run as
+// their separator — no single-character class, however wide, can ever
+// match a two-character run. The alternation tries the two-hyphen token
+// FIRST so it is never partially consumed by the single-dash-class branch.
+const SEP_TOKEN_SRC = '(?:--|[—–-])';
 
-// Any Unicode dash-punctuation-class character NOT in RECOGNIZED_DASHES.
-// Deliberately narrow (Pd-category dashes commonly confused with the
-// recognized three) rather than the full Unicode Pd category, which also
-// contains characters no realistic HANDOFF.md would use as a heading
-// separator — narrowest set that resolves the actual observed confusable
-// class (figure dash, horizontal bar, small em dash, two-em/three-em dash,
-// swung dash, minus sign).
+// cm#222 F-3 (CRITICAL): TWO structurally distinct real session-heading
+// shapes exist. Order matters at the call site (classifyHeading) — the
+// DATED shape is tried first because it is the more specific pattern (an
+// exact YYYY-MM-DD immediately after the keyword); the NUMBERED shape's
+// `\d+` would otherwise happily (and wrongly) consume a date's leading
+// "2026" as if it were a session number.
+//
+// cm#222 own finding (beyond F-2 as literally stated): the separator MUST
+// be flanked by actual whitespace (`\s+`, not `\s*`) on both sides, never
+// merely optional whitespace. A YYYY-MM-DD date's own hyphens ("2026-07-
+// 22") are never surrounded by whitespace, while every real structural
+// separator IS (" -- ", " — "). Without this, the single-hyphen member of
+// SEP_TOKEN_SRC's alternation would let the non-greedy date-capture group
+// below stop at the date's own FIRST embedded hyphen instead of the real
+// separator — verified empirically against this file's own test suite
+// before being caught (see A2-1/A2-2 in test-handoff-markdown-parse.js).
+const FLANKED_SEP_RE_SRC = `\\s+${SEP_TOKEN_SRC}\\s+`;
+
+// session_numbered: "## Session <N> <sep> <date-ish> <sep> <title>" — date
+// group is non-greedy (stops at the NEXT separator token); title group is
+// greedy (deliberately swallows any further embedded separators, so a
+// "4-way-split" heading parses deterministically, never ambiguously).
+const SESSION_NUMBERED_RE = new RegExp(
+  `^##\\s+session\\s+(\\d+)${FLANKED_SEP_RE_SRC}(.+?)${FLANKED_SEP_RE_SRC}(.+)$`,
+  'i'
+);
+
+// session_dated: "## SESSION <YYYY-MM-DD> [(parenthetical)] <sep> <title>"
+// — the parenthetical is genuinely optional content (a session number like
+// "(session 18)", a same-day letter suffix like "(c)", or absent
+// entirely); real pwa-etl data exercises all three sub-shapes. No
+// non-greedy ambiguity here: the date is a fixed-width literal pattern
+// (its own hyphens are never separator candidates), so a single
+// flanked-separator match is unambiguous.
+const SESSION_DATED_RE = new RegExp(
+  `^##\\s+session\\s+(\\d{4}-\\d{2}-\\d{2})\\s*(?:\\(([^)]*)\\))?${FLANKED_SEP_RE_SRC}(.+)$`,
+  'i'
+);
+
+// A heading "starts with" the session keyword (first word) vs merely
+// "contains" it elsewhere — both are session-shaped for F-3's purposes,
+// but only the starts-with form is even attempted against the two shape
+// regexes above (their own anchors already require the keyword first).
+const SESSION_STARTS_RE = /^##\s+session\b/i;
+const SESSION_WORD_RE = /\bsession\b/i;
+
+// Any Unicode dash-punctuation-class character NOT one of the three
+// RECOGNIZED_DASHES. Deliberately narrow (Pd-category dashes commonly
+// confused with the recognized three) rather than the full Unicode Pd
+// category, which also contains characters no realistic HANDOFF.md would
+// use as a heading separator — narrowest set that resolves the actual
+// observed confusable class (figure dash, horizontal bar, small em dash,
+// two-em/three-em dash, swung dash, minus sign).
 const UNRECOGNIZED_DASH_RE = /[‐‑‒―﹘﹣⸺⸻⁓−]/g;
 
-const NEXT_SESSION_HEADING_RE = /^next\s+session$/i;
+// cm#222 A5: canonical NEXT SESSION heading, optionally with a trailing
+// parenthetical suffix ("## Next Session (carry-over)" still counts as
+// canonical/present — pinned explicitly, not left implicit per the
+// adversary's identity table).
+const NEXT_SESSION_CANONICAL_RE = /^next\s+session(?:\s*\([^)]*\))?$/i;
+const NEXT_WORD_RE = /\bnext\b/i;
+
+// ─── ONE NORMALIZATION ENGINE ────────────────────────────────────────────
+
+/**
+ * canonicalizeWhitespace — trim + collapse internal whitespace. This is
+ * the SOLE normalization primitive every heading-text comparison in this
+ * file goes through (durable-heading matching, NEXT-SESSION canonical
+ * matching, session/next-session-variant keyword scans). Never mutates
+ * captured/display text — callers apply this to a COMPARISON COPY only.
+ *
+ * @param {string} s
+ * @returns {string}
+ */
+function canonicalizeWhitespace(s) {
+  return String(s == null ? '' : s).trim().replace(/\s+/g, ' ');
+}
 
 // ─── H-10: NORMALIZATION ────────────────────────────────────────────────
 
@@ -149,7 +247,6 @@ function classifyLineContexts(text) {
     const inBlockquote = /^>/.test(trimmed);
 
     // HTML comment: handle same-line open/close and multi-line spans.
-    let inHtmlCommentForThisLine = inComment;
     let scanPos = 0;
     let lineHasCommentContent = inComment;
     while (true) {
@@ -170,7 +267,7 @@ function classifyLineContexts(text) {
     // part of it was inside a comment span (opened before this line, or
     // opened partway through this line) — conservative: a heading-shaped
     // fragment anywhere near comment markers on this line is suppressed.
-    inHtmlCommentForThisLine = lineHasCommentContent;
+    const inHtmlCommentForThisLine = lineHasCommentContent;
 
     out.push({
       lineNo: i + 1,
@@ -189,49 +286,124 @@ function isRealContentLine(ctxLine) {
   return !ctxLine.inFence && !ctxLine.isFenceDelimiter && !ctxLine.inBlockquote && !ctxLine.inHtmlComment;
 }
 
-// ─── H-5: HEADING TOTAL CLASSIFICATION ──────────────────────────────────
+// ─── H-5 / cm#222 A2: HEADING TOTAL CLASSIFICATION ──────────────────────
 
 /**
  * classifyHeading — total classification of one real `##`-level heading's
- * text into exactly one bucket.
+ * text into exactly one bucket. See file header for the full bucket list.
  *
  * @param {string} headingLine - the full line text, e.g. "## Run commands"
  * @param {Array<{canonical:string, predicate:string}>} durableHeadings
- * @returns {{type:'session', sessionNum:string, date:string, title:string}
- *         | {type:'durable', predicate:string, canonical:string}
- *         | {type:'next_session'}
- *         | {type:'unknown', headingText:string}
- *         | null} null iff headingLine is not a `##`-level heading at all
- *           (caller's job to only pass real `##` lines).
+ * @returns {object|null} null iff headingLine is not a `##`-level heading
+ *   at all (caller's job to only pass real `##` lines).
  */
 function classifyHeading(headingLine, durableHeadings) {
-  const m = /^##\s+(.*)$/.exec(headingLine.trim());
+  const trimmedLine = headingLine.trim();
+  const m = /^##\s+(.*)$/.exec(trimmedLine);
   if (!m) return null;
   const headingText = m[1].trim();
+  const canon = canonicalizeWhitespace(headingText);
 
-  const sessionMatch = SESSION_HEADING_RE.exec(headingLine.trim());
-  if (sessionMatch) {
-    return { type: 'session', sessionNum: sessionMatch[1], date: sessionMatch[2].trim(), title: sessionMatch[3].trim() };
-  }
-
-  if (NEXT_SESSION_HEADING_RE.test(headingText)) {
-    return { type: 'next_session' };
-  }
-
-  const normalizedHeadingText = headingText.toLowerCase().trim();
+  // 1) Durable-section exact match (configured, deterministic — checked
+  //    first since it is an explicit mapping, never shadowed by a
+  //    heuristic bucket).
   for (const entry of (durableHeadings || [])) {
-    if (String(entry.canonical || '').toLowerCase().trim() === normalizedHeadingText) {
+    if (canonicalizeWhitespace(entry.canonical).toLowerCase() === canon.toLowerCase()) {
       return { type: 'durable', predicate: entry.predicate, canonical: entry.canonical };
     }
   }
 
-  return { type: 'unknown', headingText };
+  // 2) Session family, WHEN THE HEADING STARTS WITH THE KEYWORD (cm#222
+  //    A2/F-2/F-3) — checked before the NEXT-SESSION heuristic below,
+  //    because a session heading's own TITLE text can innocuously contain
+  //    the word "next" (e.g. "...reload-as-AD-linked is next", a real
+  //    pwa-etl example) without being a NEXT-SESSION heading at all.
+  //    Dated shape is tried BEFORE numbered (see SESSION_DATED_RE's header
+  //    comment: a date's leading digit run would otherwise falsely satisfy
+  //    the numbered shape).
+  if (SESSION_STARTS_RE.test(trimmedLine)) {
+    const datedMatch = SESSION_DATED_RE.exec(trimmedLine);
+    if (datedMatch) {
+      return {
+        type: 'session_dated',
+        date: datedMatch[1],
+        parenthetical: datedMatch[2] != null ? datedMatch[2].trim() : null,
+        title: datedMatch[3].trim(),
+      };
+    }
+    const numberedMatch = SESSION_NUMBERED_RE.exec(trimmedLine);
+    if (numberedMatch) {
+      return {
+        type: 'session_numbered',
+        sessionNum: numberedMatch[1],
+        date: numberedMatch[2].trim(),
+        title: numberedMatch[3].trim(),
+      };
+    }
+    // cm#222 F-3: session-SHAPED (starts with the keyword) but matches
+    // neither concrete shape — its own bucket, NEVER merged into the
+    // generic `other` list (an operator must be able to tell "N lost
+    // session summaries" from "N harmless stray headings").
+    return { type: 'session_shaped_unparsed', headingText };
+  }
+
+  // 3) NEXT SESSION family (cm#222 A5) — only reachable once the heading
+  //    is known NOT to start with "session" itself.
+  if (NEXT_SESSION_CANONICAL_RE.test(canon)) {
+    return { type: 'next_session' };
+  }
+  if (NEXT_WORD_RE.test(canon) && SESSION_WORD_RE.test(canon)) {
+    return { type: 'next_session_variant', headingText };
+  }
+
+  // 4) A heading that mentions "session" SOMEWHERE but not at the start
+  //    (and isn't a NEXT-SESSION variant) is still session-shaped for
+  //    F-3's purposes — e.g. "## Recap of last session".
+  if (SESSION_WORD_RE.test(canon)) {
+    return { type: 'session_shaped_unparsed', headingText };
+  }
+
+  // 5) Total classification default branch.
+  return { type: 'other', headingText };
+}
+
+/**
+ * detectSessionHeadingLevel — cm#222 A2: "Level: `##` only, unless the
+ * file uses `###` for sessions consistently — detect and report the level
+ * used." Scoping decision (documented, not silent — see this file's PR
+ * blind spots): this DETECTS and REPORTS which level carries session-
+ * shaped headings; it does NOT re-architect section-boundary splitting to
+ * use `###` as the boundary level even when detected, since no real
+ * pwa-etl content exercises an all-`###`-sessions document and doing so
+ * would require treating `###` as a top-level boundary throughout (a
+ * structural change beyond this fix's scope). `splitDocumentIntoSections`
+ * always splits on `##`; this function's result is carried in the report
+ * for operator visibility only.
+ *
+ * @param {string} normalizedText
+ * @returns {'##'|'###'}
+ */
+function detectSessionHeadingLevel(normalizedText) {
+  const lines = normalizedText.split('\n');
+  const ctx = classifyLineContexts(normalizedText);
+  let hasLevel2 = false;
+  let hasLevel3 = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (!isRealContentLine(ctx[i])) continue;
+    const trimmed = lines[i].trim();
+    const m2 = /^##(?!#)\s+(.*)$/.exec(trimmed);
+    if (m2 && SESSION_WORD_RE.test(canonicalizeWhitespace(m2[1]))) hasLevel2 = true;
+    const m3 = /^###(?!#)\s+(.*)$/.exec(trimmed);
+    if (m3 && SESSION_WORD_RE.test(canonicalizeWhitespace(m3[1]))) hasLevel3 = true;
+  }
+  if (!hasLevel2 && hasLevel3) return '###';
+  return '##';
 }
 
 /**
  * splitDocumentIntoSections — finds every real `##`-level heading (H-8-
- * aware) in document order, classifies each (H-5), and returns the
- * sections they bound. A `##`-level heading is a line matching
+ * aware) in document order, classifies each (H-5/cm#222 A2), and returns
+ * the sections they bound. A `##`-level heading is a line matching
  * `^##\s+\S` at zero indentation with EXACTLY two leading `#` (a `###+`
  * heading is a nested sub-heading, never a top-level boundary here).
  *
@@ -264,7 +436,7 @@ function splitDocumentIntoSections(normalizedText, durableHeadings) {
     const bodyLines = lines.slice(bodyStartIdx, endIdx);
     const classification = classifyHeading(lines[startIdx], durableHeadings);
     sections.push({
-      type: classification ? classification.type : 'unknown',
+      type: classification ? classification.type : 'other',
       headingLineNo: startIdx + 1,
       headingLine: lines[startIdx],
       classification,
@@ -277,21 +449,21 @@ function splitDocumentIntoSections(normalizedText, durableHeadings) {
   return sections;
 }
 
-// ─── H-9: MARKDOWN-TABLE CELL PARSING (inverse of renderCarryoverTable) ──
+// ─── H-9 / cm#222 A3: MARKDOWN-TABLE CELL PARSING ───────────────────────
 
 /**
  * splitOnUnescapedPipe — splits a raw table-row line on `|` characters
  * that are NOT escaped. `\|` and `\\` are treated as atomic two-character
  * tokens during the scan (never split inside them); any other lone `\`
  * is passed through literally (defensive: hand-typed tables may contain
- * stray backslashes with no escaping intent — H-9's "never index-shift"
- * requirement means we never guess at what a stray backslash meant, we
- * just don't treat it as a delimiter escape unless it precedes `|` or `\`).
+ * stray backslashes with no escaping intent — never guess at what a
+ * stray backslash meant, just don't treat it as a delimiter escape unless
+ * it precedes `|` or `\`).
  *
  * @param {string} line
  * @returns {string[]} raw (still-escaped) cell segments, INCLUDING any
  *   leading/trailing empty segment produced by bounding pipes — callers
- *   trim bounding empties explicitly (see parseTableRow).
+ *   trim bounding empties explicitly (see parseTableRowCells).
  */
 function splitOnUnescapedPipe(line) {
   const cells = [];
@@ -333,6 +505,28 @@ function unescapeTableCell(raw) {
 const TABLE_SEPARATOR_RE = /^\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)*\|?$/;
 
 /**
+ * parseTableRowCells — cm#222 A3: split one raw table-row line into its
+ * (still-escaped-content-unescaped) cells WITHOUT asserting a cell count.
+ * The base for both `parseTableRow` (fixed-count assertion, kept for
+ * back-compat / unit tests) and the header-driven row parser below (count
+ * derived from the header row itself, per column-name mapping, never a
+ * hardcoded literal).
+ *
+ * @param {string} line
+ * @returns {{cells:string[], count:number}} raw (still-escaped) cells,
+ *   with a genuinely-empty bounding leading/trailing segment dropped (see
+ *   file header note on the inherent ambiguity this shares with GFM
+ *   itself for a truly blank edge data cell with no bounding pipe).
+ */
+function parseTableRowCells(line) {
+  const trimmed = line.trim();
+  let segments = splitOnUnescapedPipe(trimmed);
+  if (segments.length > 1 && segments[0].trim() === '') segments = segments.slice(1);
+  if (segments.length > 1 && segments[segments.length - 1].trim() === '') segments = segments.slice(0, -1);
+  return { cells: segments, count: segments.length };
+}
+
+/**
  * parseTableRow — parse one raw table-row line into exactly N unescaped,
  * trimmed cells, OR a flagged failure. H-9: wrong cell count is ALWAYS a
  * flagged branch, never an index-shifted guess.
@@ -342,19 +536,9 @@ const TABLE_SEPARATOR_RE = /^\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)*\|?$/;
  * @returns {{ok:true, cells:string[]}|{ok:false, reason:string, raw:string, actualCellCount:number}}
  */
 function parseTableRow(line, expectedCellCount) {
-  const raw = line;
-  const trimmed = line.trim();
-  let segments = splitOnUnescapedPipe(trimmed);
-  // Drop a genuinely-empty leading/trailing segment produced by an
-  // (optional, GFM-standard) bounding pipe — only the FIRST/LAST segment,
-  // and only when it is empty after trim (see file header note on the
-  // inherent ambiguity this shares with GFM itself for a truly blank edge
-  // data cell with no bounding pipe).
-  if (segments.length > 1 && segments[0].trim() === '') segments = segments.slice(1);
-  if (segments.length > 1 && segments[segments.length - 1].trim() === '') segments = segments.slice(0, -1);
-
+  const { cells: segments } = parseTableRowCells(line);
   if (segments.length !== expectedCellCount) {
-    return { ok: false, reason: `expected ${expectedCellCount} cell(s), got ${segments.length}`, raw, actualCellCount: segments.length };
+    return { ok: false, reason: `expected ${expectedCellCount} cell(s), got ${segments.length}`, raw: line, actualCellCount: segments.length };
   }
   const cells = segments.map((s) => unescapeTableCell(s.trim()));
   return { ok: true, cells };
@@ -368,46 +552,161 @@ function isTableSeparatorRow(line) {
   return TABLE_SEPARATOR_RE.test(line.trim());
 }
 
+// cm#222 A3: column-name synonym map. Case-insensitive + whitespace-
+// canonicalized (via canonicalizeWhitespace + toLowerCase — the SAME
+// normalization engine used for headings), applied once. An unrecognized
+// header cell name is never coerced to a guessed role — it becomes an
+// "extra" column, folded verbatim into notes as `name=value` (never
+// silently dropped, never silently misassigned to item/status/notes).
+const COLUMN_ROLE_SYNONYMS = {
+  item: ['item', 'thread', 'topic', 'task', 'carry-over', 'carryover'],
+  status: ['status', 'state'],
+  notes: ['notes', 'note', 'detail', 'details', 'comment'],
+};
+
+function normalizeColumnName(name) {
+  return canonicalizeWhitespace(name).toLowerCase();
+}
+
+function resolveColumnRole(name) {
+  const norm = normalizeColumnName(name);
+  for (const role of Object.keys(COLUMN_ROLE_SYNONYMS)) {
+    if (COLUMN_ROLE_SYNONYMS[role].includes(norm)) return role;
+  }
+  return null;
+}
+
 /**
- * findOpenCarryoverTables — scans a section's body text for every
- * `### Open carry-overs` sub-heading (H-8-aware within the body itself —
- * fenced/blockquoted/commented fake sub-headings are skipped the same
- * way top-level headings are) and parses the 2-column (Subject, Detail)
- * table that follows each one — or recognizes the renderer's own
+ * buildColumnMap — cm#222 F-7: pins the column-name-to-role mapping.
+ * `itemIdx`/`statusIdx` are the FIRST header cell matching that role
+ * (documented decision: a second same-role column, e.g. two "Notes"
+ * columns, is treated as an extra column rather than silently merged —
+ * see this file's PR blind spots); `notesIdxs` collects every notes-role
+ * column in header order; `extraIdxs` collects every unrecognized column.
+ *
+ * @param {string[]} headerCells - raw (untrimmed-not-yet) header cell text
+ * @returns {{count:number, names:string[], roles:Array<string|null>, itemIdx:number, statusIdx:number, notesIdxs:number[], extraIdxs:number[]}}
+ */
+function buildColumnMap(headerCells) {
+  const names = headerCells.map((c) => c.trim());
+  const roles = names.map((name) => resolveColumnRole(name));
+  const itemIdx = roles.indexOf('item');
+  const statusIdx = roles.indexOf('status');
+  const notesIdxs = [];
+  const extraIdxs = [];
+  roles.forEach((role, idx) => {
+    if (role === 'notes') {
+      if (!notesIdxs.length) notesIdxs.push(idx);
+      else extraIdxs.push(idx); // cm#222: 2nd+ notes-role column -> extra, documented above
+    } else if (role === null) {
+      extraIdxs.push(idx);
+    }
+  });
+  return { count: names.length, names, roles, itemIdx, statusIdx, notesIdxs, extraIdxs };
+}
+
+// ─── cm#222 A4: STATUS CELL TOTAL CLASSIFICATION ────────────────────────
+
+// Keyword lists pinned by the cm#222 spec-adversary's total-classification
+// table (section 3 of the adversary findings). Word-boundary, case-
+// insensitive substring scan over the WHOLE cell text — never an exact-
+// match enum, since real Status cells are free-text narrative (F-4).
+const CLOSED_KEYWORDS = ['DONE', 'MERGED', 'SHIPPED', 'SOLVED', 'RESOLVED', 'COMPLETE', 'COMPLETED', 'FIXED'];
+const OPEN_KEYWORDS = ['OPEN', 'NOT RUN', 'NOT BUILT', 'UNEXERCISED', 'PENDING', 'BLOCKED', 'TODO', 'DEFERRED', 'OWNER-GATED', 'UNPROVEN'];
+
+// cm#222 own decision (the adversary's A4 line references "the adversary
+// table" for an emoji map, but no such table is present in the findings
+// file this PR was authored against — see this PR's blind spots): a
+// narrow, defensible 3-emoji mapping, additive to the keyword scan and
+// subject to the SAME dual-signal-wins-unknown rule.
+const CLOSED_EMOJI = ['✅'];
+const OPEN_EMOJI = ['❌', '⏳'];
+
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function keywordHits(text, keywords) {
+  return keywords.filter((kw) => new RegExp(`\\b${escapeRegExp(kw)}\\b`, 'i').test(text));
+}
+
+/**
+ * classifyStatusCell — cm#222 A4: total classification of one Status cell
+ * into exactly one of `closed` / `open` / `unknown`. `unknown` is the
+ * default branch — empty cell, a cell matching neither list, AND a cell
+ * matching BOTH lists (dual signal) all land here, by design: a dual-
+ * signal cell is never resolved by a "last keyword wins" or "closed wins"
+ * tiebreak invented ad hoc (cm#222 F-4).
+ *
+ * @param {string} raw
+ * @returns {{class:'closed'|'open'|'unknown', dualSignal:boolean, matchedClosed:string[], matchedOpen:string[]}}
+ */
+function classifyStatusCell(raw) {
+  const text = String(raw == null ? '' : raw).trim();
+  if (text === '') return { class: 'unknown', dualSignal: false, matchedClosed: [], matchedOpen: [] };
+  const matchedClosed = keywordHits(text, CLOSED_KEYWORDS);
+  const matchedOpen = keywordHits(text, OPEN_KEYWORDS);
+  const closedHit = matchedClosed.length > 0 || CLOSED_EMOJI.some((e) => text.includes(e));
+  const openHit = matchedOpen.length > 0 || OPEN_EMOJI.some((e) => text.includes(e));
+  if (closedHit && openHit) return { class: 'unknown', dualSignal: true, matchedClosed, matchedOpen };
+  if (closedHit) return { class: 'closed', dualSignal: false, matchedClosed, matchedOpen };
+  if (openHit) return { class: 'open', dualSignal: false, matchedClosed, matchedOpen };
+  return { class: 'unknown', dualSignal: false, matchedClosed, matchedOpen };
+}
+
+/**
+ * findOpenCarryoverTables — cm#222 A3 rewrite: scans a section's body text
+ * for every `### Open carry-overs` sub-heading (H-8-aware, same as
+ * top-level headings) and parses the HEADER-DRIVEN table that follows —
+ * cell count and column roles derived from the header row itself (cm#222
+ * F-1: the old hardcoded 2-cell assumption failed on 100% of real
+ * pwa-etl rows, which are 3-column) — or recognizes the renderer's own
  * `_(no open carry-overs)_` empty-state placeholder as zero rows, never a
  * parse error.
  *
  * HEADER DETECTION IS STRUCTURAL, NEVER POSITIONAL (independent-review
- * fix, PR #172 blocker 1): the first content line after the heading is a
- * HEADER only if the line immediately following it matches
- * `isTableSeparatorRow` (a `|---|---|`-shaped divider). If it does not,
- * the first content line is DATA — a hand-typed table with no
- * header/separator row is still parsed in full, never silently losing its
- * first row to a positional "line 1 is always the header" assumption.
+ * fix, PR #172 blocker 1; reaffirmed cm#222 F-8): the first content line
+ * after the heading is a HEADER only if the line immediately following it
+ * is a valid separator row. The two checks COMPOSE (structural separator
+ * check AND name-matching) — name-matching never replaces the structural
+ * check, so a headerless table whose first row happens to literally read
+ * `| Item | Status | Notes |` as DATA is never misclassified as a header.
  *
- * TOTALITY (H-9): every content line under the heading is placed into
- * exactly one of three buckets — a well-formed row (`rows`), a malformed
- * row (`flaggedRows`, e.g. wrong cell count, or a line with no `|` at
- * all), or a boundary (blank line / next heading / EOF, which ends the
- * table). No line is ever silently skipped. A header+separator pair
- * followed by ZERO data/flagged rows (a "header-only" table) is itself
- * flagged — distinct from the renderer's own explicit `_(none)_`
- * empty-state placeholder, and therefore a suspicious, hand-edited shape
- * that should never be silently indistinguishable from a genuinely empty
- * section.
+ * A table with NO header row at all cannot have its columns named — cm#222
+ * decision (undictated by the spec/adversary, documented here): column 0
+ * is always the item/subject; every other column is an unnamed "extra"
+ * column folded into notes; status is always `unknown` for every row
+ * (consistent with, and a strict generalization of, A3's own "missing
+ * status column -> unknown for every row" rule).
+ *
+ * A header row present but carrying NO recognizable item-role column
+ * (cm#222 F-7) flags the WHOLE table — never guessed by position, even
+ * when the cell count happens to match.
+ *
+ * TOTALITY (H-9, extended cm#222 A3): every content line under the
+ * heading is placed into exactly one of: a well-formed row (`rows`), a
+ * malformed row (`flaggedRows`), or a boundary (blank line / next heading
+ * / EOF). A blank line ends the table; any further pipe-shaped, non-blank
+ * line found BEFORE the next heading is an `orphanRows` entry (cm#222
+ * F-6) — never silently dropped. Multiple `### Open carry-overs` headings
+ * in one section body are all parsed independently.
  *
  * @param {string} bodyText
  * @param {number} bodyStartLineNo - 1-based line number bodyText's line 0 corresponds to, for report accuracy
  * @returns {Array<{
  *   headingLineNo: number,
- *   rows: Array<{subjectRaw:string, objectRaw:string, lineNo:number}>,
+ *   columns: string[]|null,
+ *   rows: Array<{itemRaw:string, statusRaw:string, statusClass:string, statusDualSignal:boolean, notesRaw:string, lineNo:number, subjectRaw:string, objectRaw:string}>,
  *   flaggedRows: Array<{raw:string, reason:string, lineNo:number}>,
+ *   orphanRows: Array<{raw:string, lineNo:number}>,
  * }>}
  */
 function findOpenCarryoverTables(bodyText, bodyStartLineNo) {
   const lines = bodyText.split('\n');
   const ctx = classifyLineContexts(bodyText);
   const results = [];
+
+  const isHeadingBoundary = (idx) => idx >= lines.length || /^#{2,3}(?!#)\s+/.test(lines[idx].trim());
 
   for (let i = 0; i < lines.length; i++) {
     if (!isRealContentLine(ctx[i])) continue;
@@ -417,35 +716,36 @@ function findOpenCarryoverTables(bodyText, bodyStartLineNo) {
     const headingLineNo = bodyStartLineNo + i;
     const rows = [];
     const flaggedRows = [];
+    const orphanRows = [];
 
-    // Skip blank lines to find the first content line after the heading.
     let j = i + 1;
     while (j < lines.length && lines[j].trim() === '') j++;
 
-    const isBoundary = (idx) => idx >= lines.length || lines[idx].trim() === '' || /^#{2,3}(?!#)\s+/.test(lines[idx].trim());
-
-    if (isBoundary(j)) {
-      // Nothing at all under this heading before the next boundary —
-      // legitimately empty (the renderer's own convention is to always
-      // emit the `_(none)_` placeholder for a truly empty table, so an
-      // outright-blank section is not itself suspicious the way a
-      // header-only table is).
-      results.push({ headingLineNo, rows, flaggedRows });
+    if (isHeadingBoundary(j)) {
+      results.push({ headingLineNo, columns: null, rows, flaggedRows, orphanRows });
       continue;
     }
 
     if (/^_\(.*\)_$/.test(lines[j].trim())) {
-      // Empty-state placeholder — zero rows, not an error.
-      results.push({ headingLineNo, rows, flaggedRows });
+      results.push({ headingLineNo, columns: null, rows, flaggedRows, orphanRows });
       continue;
     }
 
-    // STRUCTURAL header detection: line j is a header iff line j+1 is a
-    // separator row. Otherwise line j is DATA (headerless table).
+    // STRUCTURAL header detection, validated against the header's OWN
+    // cell count (cm#222 A3: "separator row must exist and be validated").
     let k = j;
-    const headerPresent = (j + 1 < lines.length) && isTableSeparatorRow(lines[j + 1]);
+    let columns = null;
+    let wholeTableFlagged = false;
+    const headerCellsAttempt = parseTableRowCells(lines[j]);
+    const separatorLooksValid = (j + 1 < lines.length)
+      && isTableSeparatorRow(lines[j + 1])
+      && parseTableRowCells(lines[j + 1]).count === headerCellsAttempt.count;
+    const headerPresent = separatorLooksValid;
+
     if (headerPresent) {
-      k = j + 2; // skip header row + separator row
+      columns = buildColumnMap(headerCellsAttempt.cells);
+      k = j + 2;
+      if (columns.itemIdx === -1) wholeTableFlagged = true;
     }
 
     for (; k < lines.length; k++) {
@@ -454,22 +754,27 @@ function findOpenCarryoverTables(bodyText, bodyStartLineNo) {
       if (/^#{2,3}(?!#)\s+/.test(rowTrimmed)) break;
       const lineNo = bodyStartLineNo + k;
       if (!rowTrimmed.includes('|')) {
-        // A non-blank, non-heading line under this heading that cannot be
-        // placed as a table row at all (no pipe delimiter whatsoever) —
-        // H-9 totality: flagged, never silently skipped or treated as an
-        // implicit end-of-table boundary.
         flaggedRows.push({ raw: lines[k], reason: 'expected a pipe-delimited table row, blank line, or heading — found neither', lineNo });
         continue;
       }
-      const parsed = parseTableRow(rowTrimmed, 2);
-      if (parsed.ok) {
-        rows.push({ subjectRaw: parsed.cells[0], objectRaw: parsed.cells[1], lineNo });
+      const { cells } = parseTableRowCells(rowTrimmed);
+
+      if (headerPresent) {
+        if (wholeTableFlagged) {
+          flaggedRows.push({ raw: lines[k], reason: 'no item/subject column identified in the header — whole table flagged, never guessed by position', lineNo });
+          continue;
+        }
+        if (cells.length !== columns.count) {
+          flaggedRows.push({ raw: lines[k], reason: `expected ${columns.count} cell(s) (from header), got ${cells.length}`, lineNo });
+          continue;
+        }
+        rows.push(buildRowFromColumns(cells, columns, lineNo));
       } else {
-        flaggedRows.push({ raw: lines[k], reason: parsed.reason, lineNo });
+        rows.push(buildHeaderlessRow(cells, lineNo));
       }
     }
 
-    if (headerPresent && rows.length === 0 && flaggedRows.length === 0) {
+    if (headerPresent && !wholeTableFlagged && rows.length === 0 && flaggedRows.length === 0) {
       flaggedRows.push({
         raw: lines[j],
         reason: 'header-only table: a header + separator row was present but zero data rows followed (use the renderer\'s "_(no open carry-overs)_" placeholder for a genuinely empty table, not a bare header)',
@@ -477,10 +782,71 @@ function findOpenCarryoverTables(bodyText, bodyStartLineNo) {
       });
     }
 
-    results.push({ headingLineNo, rows, flaggedRows });
+    // cm#222 F-6: a table ended by a blank line — scan forward (before the
+    // next heading) for any stray pipe-shaped line and report it as an
+    // orphan row, never silently drop it.
+    if (k < lines.length && lines[k].trim() === '') {
+      let m = k + 1;
+      while (m < lines.length && !/^#{2,3}(?!#)\s+/.test(lines[m].trim())) {
+        const t = lines[m].trim();
+        if (t !== '' && t.includes('|')) {
+          orphanRows.push({ raw: lines[m], lineNo: bodyStartLineNo + m });
+        }
+        m++;
+      }
+    }
+
+    results.push({ headingLineNo, columns: columns ? columns.names : null, rows, flaggedRows, orphanRows });
   }
 
   return results;
+}
+
+function buildRowFromColumns(cells, columns, lineNo) {
+  const itemRaw = unescapeTableCell(cells[columns.itemIdx].trim());
+  const hasStatus = columns.statusIdx !== -1;
+  const statusRaw = hasStatus ? unescapeTableCell(cells[columns.statusIdx].trim()) : '';
+  const statusClassification = hasStatus ? classifyStatusCell(statusRaw) : { class: 'unknown', dualSignal: false };
+  const notesParts = columns.notesIdxs
+    .map((idx) => unescapeTableCell(cells[idx].trim()))
+    .filter((s) => s !== '');
+  const extraParts = columns.extraIdxs.map((idx) => {
+    const colName = canonicalizeWhitespace(columns.names[idx]);
+    const val = unescapeTableCell(cells[idx].trim());
+    return `${colName}=${val}`;
+  });
+  const notesRaw = [...notesParts, ...extraParts].join('; ');
+  return {
+    itemRaw,
+    statusRaw,
+    statusClass: statusClassification.class,
+    statusDualSignal: !!statusClassification.dualSignal,
+    notesRaw,
+    lineNo,
+    // Back-compat field names for existing callers (migrate-08's
+    // parseFileIntoRows) that read subjectRaw/objectRaw.
+    subjectRaw: itemRaw,
+    objectRaw: notesRaw,
+  };
+}
+
+function buildHeaderlessRow(cells, lineNo) {
+  const itemRaw = unescapeTableCell((cells[0] || '').trim());
+  const extraParts = [];
+  for (let idx = 1; idx < cells.length; idx++) {
+    extraParts.push(`col${idx + 1}=${unescapeTableCell(cells[idx].trim())}`);
+  }
+  const notesRaw = extraParts.join('; ');
+  return {
+    itemRaw,
+    statusRaw: '',
+    statusClass: 'unknown',
+    statusDualSignal: false,
+    notesRaw,
+    lineNo,
+    subjectRaw: itemRaw,
+    objectRaw: notesRaw,
+  };
 }
 
 // ─── H-11: NEXT SESSION LIST-ITEM PARSING ────────────────────────────────
@@ -536,18 +902,13 @@ function parseNextSessionItems(bodyText) {
 // ─── H-12: BODY-LENGTH-DELTA HEURISTIC ──────────────────────────────────
 
 /**
- * computeBodyLengthDeltaFlags — H-12's per-block heuristic, this file's
- * own concrete design decision (the amendment specifies the >2x/<0.5x
- * threshold shape, not the baseline it is measured against — no prior art
- * exists in this repo to reuse, so this is a documented new decision, not
- * a restated one): for a FILE with 2+ detected session blocks, flag any
- * block whose rawLineSpan is more than 2x or less than 0.5x the MEDIAN
- * rawLineSpan across that file's own session blocks. A lone (0 or 1)
- * session block in a file cannot be compared to siblings and is never
- * flagged by this heuristic (documented blind spot: this is a
- * same-file-relative check, not an absolute ground-truth check — it
- * catches a merged-block anomaly relative to a project's OWN typical
- * session-entry size, not against any external baseline).
+ * computeBodyLengthDeltaFlags — H-12's per-block heuristic: for a FILE
+ * with 2+ detected session blocks, flag any block whose rawLineSpan is
+ * more than 2x or less than 0.5x the MEDIAN rawLineSpan across that
+ * file's own session blocks. A lone (0 or 1) session block in a file
+ * cannot be compared to siblings and is never flagged by this heuristic
+ * (documented blind spot: this is a same-file-relative check, not an
+ * absolute ground-truth check).
  *
  * @param {Array<{headingLineNo:number, rawLineSpan:number}>} sessionSections
  * @returns {Array<{headingLineNo:number, rawLineSpan:number, medianSpan:number, ratio:number}>}
@@ -570,19 +931,31 @@ function computeBodyLengthDeltaFlags(sessionSections) {
 
 module.exports = {
   RECOGNIZED_DASHES,
-  SESSION_HEADING_RE,
+  SEP_TOKEN_SRC,
+  SESSION_NUMBERED_RE,
+  SESSION_DATED_RE,
   UNRECOGNIZED_DASH_RE,
-  NEXT_SESSION_HEADING_RE,
+  NEXT_SESSION_CANONICAL_RE,
+  canonicalizeWhitespace,
   normalizeMarkdown,
   classifyLineContexts,
   isRealContentLine,
   classifyHeading,
+  detectSessionHeadingLevel,
   splitDocumentIntoSections,
   splitOnUnescapedPipe,
   unescapeTableCell,
+  parseTableRowCells,
   parseTableRow,
   isTableSeparatorRow,
+  buildColumnMap,
+  resolveColumnRole,
+  classifyStatusCell,
   findOpenCarryoverTables,
   parseNextSessionItems,
   computeBodyLengthDeltaFlags,
+  CLOSED_KEYWORDS,
+  OPEN_KEYWORDS,
+  CLOSED_EMOJI,
+  OPEN_EMOJI,
 };

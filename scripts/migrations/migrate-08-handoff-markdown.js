@@ -4,21 +4,39 @@
  * migrate-08-handoff-markdown.js
  *
  * CONSOLIDATION-RUNBOOK.md §6.1(h) + its H-1..H-14 spec-adversary
- * amendment (2026-08-16, memory-manager#11(h)): parses ONE project's
- * `HANDOFF.md` (active fat card) and `.claude/HANDOFF-HISTORY.md`
- * (append-only archive) into `assertions` rows on a memory-manager
- * consolidation target — the markdown-source PEER of the SQL-source
- * migrations (migrate-02 etc.), not an afterthought.
+ * amendment (2026-08-16, memory-manager#11(h)) + cm#222's further
+ * hardening pass (2026-09-06, PR body has the full disposition of
+ * findings F-1..F-9): parses ONE project's `HANDOFF.md` (active fat card)
+ * and `.claude/HANDOFF-HISTORY.md` (append-only archive) into `assertions`
+ * rows on a memory-manager consolidation target — the markdown-source
+ * PEER of the SQL-source migrations (migrate-02 etc.), not an afterthought.
  *
- * H-13 (owner-declined scope, stated up front): this script was authored
- * and tested against SYNTHETIC fixtures only. It was never run against a
- * real project's HANDOFF.md/HANDOFF-HISTORY.md — access outside the
- * project sandbox was declined for this pass. The parser is written
- * generic + fail-soft specifically because of this: a real-file dry run
- * (owner-initiated, `--file`/`--history-file` pointed at the real paths)
- * is the actual acceptance gate, not this authoring pass.
+ * cm#222 FIXES (this pass):
+ *   A1 — a TRUE `--dry-run`: zero DDL/INSERT/UPDATE/DELETE. With `--db`,
+ *        runs ONLY the two read-only schema-precondition SELECTs and
+ *        reports PASS/FAIL for each (never silently "assumed OK" — F-9).
+ *        Without `--db`, reports "schema preconditions not checked".
+ *   A2 — session-heading TOTAL classification widened to the real shapes
+ *        (session_numbered / session_dated / session_shaped_unparsed —
+ *        see scripts/lib/handoff-markdown-parse.js for the regex/bucket
+ *        design and its cm#222 F-2/F-3 rationale).
+ *   A3 — carry-over tables are HEADER-DRIVEN (cell count + column roles
+ *        derived from the header row's own cell names via a synonym map),
+ *        replacing the old hardcoded-2-cell assumption that failed on
+ *        100% of real pwa-etl rows (F-1).
+ *   A4 — Status cells get a total classification (closed/open/unknown,
+ *        dual-signal -> unknown) surfaced in the report — NOT written as
+ *        a new `assertions` column (out of scope; carryover_status stays
+ *        fixed 'open' for every parsed row per the base spec's H-4, which
+ *        cm#222 does not revisit).
+ *   A5 — "## NEXT SESSION" gets an explicit per-file state (absent /
+ *        present_empty / present_with_items / present_variant) instead of
+ *        an ambiguous zero count (F-5).
+ *   A6 — the report (both modes) carries bucket counts + line-numbered
+ *        lists for every unparsed/flagged/orphaned item (H-13 acceptance
+ *        artifact).
  *
- * WHAT THIS SCRIPT DOES (normal / MIGRATE mode):
+ * WHAT THIS SCRIPT DOES (normal / MIGRATE mode, unchanged from H-1..H-14):
  *   1. Resolves + validates the TARGET database exactly like migrate-02
  *      (via migrate-01's classifyTarget, reused by reference).
  *   2. Bundles its own additive schema preamble (mirrors migrate-03's own
@@ -35,10 +53,10 @@
  *      a missing file is fail-soft (0 sections from it, logged), not
  *      fatal, UNLESS both are missing/unreadable (nothing to migrate).
  *   4. Parses each file via scripts/lib/handoff-markdown-parse.js's total
- *      classification (H-5/H-8) into sections, then derives four
- *      assertion categories per H-1/H-4/H-7/H-11:
- *        - session_tldr_archived  (EVERY session-block section, in EITHER
- *          file — never live session_tldr, H-1)
+ *      classification into sections, then derives four assertion
+ *      categories per H-1/H-4/H-7/H-11:
+ *        - session_tldr_archived  (EVERY session-block section — numbered
+ *          or dated — in EITHER file — never live session_tldr, H-1)
  *        - open_thread             ("### Open carry-overs" tables nested
  *          in ANY section's body, in EITHER file — always
  *          carryover_status='open', H-4)
@@ -50,58 +68,47 @@
  *      stdout AND carried in the fail-soft report (point 8) — never
  *      silently overwritten; both/all colliding rows are still written
  *      (every category here is 1:N-safe by construction). Two DISTINCT
- *      collision checks run: WITHIN one file (`[SUBJECT-COLLISION]`,
- *      computed per-file by parseFileIntoRows/findCollisions) and ACROSS
- *      the active file and the archive file (`[CROSS-FILE-SUBJECT-
- *      COLLISION]`, computed once both files are parsed by
- *      computeCrossFileCollisions/findCrossFileCollisions — e.g. an
- *      identical `## Session N — date — title` heading present in BOTH
- *      HANDOFF.md's active preamble and HANDOFF-HISTORY.md's archive).
+ *      collision checks run: WITHIN one file (`[SUBJECT-COLLISION]`) and
+ *      ACROSS the active file and the archive file
+ *      (`[CROSS-FILE-SUBJECT-COLLISION]`).
  *   6. Re-run semantics (H-6): per-project DELETE of this script's own
  *      `source_model='markdown-migration-h'` rows, then bulk INSERT of
  *      every freshly-parsed row, in ONE transaction — idempotent by
- *      construction (unchanged source file -> unchanged resulting rows),
- *      never a per-row upsert key.
+ *      construction, never a per-row upsert key.
  *   7. Writes migration_manifest + migration_manifest_row_hashes per
- *      logical slice (source_table one of: handoff_active_session_summary
- *      / handoff_open_carryovers / handoff_durable_sections /
- *      handoff_next_session_items for HANDOFF.md; handoff_history_
- *      session_blocks / handoff_history_open_carryovers for
- *      HANDOFF-HISTORY.md — see SLICE_NAMES), source_db =
- *      `filesystem:<H-14-normalized path>`, in the SAME transaction as
- *      that slice's assertion rows (mirrors migrate-02's D-5/D-11
- *      per-slice atomicity).
+ *      logical slice, source_db = `filesystem:<H-14-normalized path>`, in
+ *      the SAME transaction as that slice's assertion rows.
  *   8. Writes a per-project fail-soft report
  *      (`handoff-markdown-parse-report-<project>-<ts>.json` under
- *      scripts/migrations/reports/, gitignored) covering: sections found/
- *      unmatched, raw-line vs parsed-row tallies, H-12's per-block
- *      body-length-delta flags, H-10's unrecognized-dash flags, H-6's
- *      within-file AND cross-file subject-collision events, H-9's
- *      flagged (wrong-cell-count / header-only) table rows, and H-11's
- *      dropped stray-list-line notes.
+ *      scripts/migrations/reports/, gitignored) — see cm#222 A6 above for
+ *      the extended shape.
+ *
+ * DRY-RUN MODE (--dry-run, cm#222 A1): parses + reports; opens a
+ * connection ONLY to run the two read-only precondition SELECTs when
+ * `--db` is given; zero DDL, zero writes. Mutually exclusive with
+ * --rollback (both are refused together — ambiguous scope, exit 2).
  *
  * ROLLBACK MODE (--rollback): deletes every `assertions` row tagged
- * `source_model='markdown-migration-h' AND project_id=$1` (point 7 of the
- * base spec), plus this run's migration_manifest(+row_hashes) rows for
- * this project_id, in ONE transaction.
+ * `source_model='markdown-migration-h' AND project_id=$1`, plus this
+ * run's migration_manifest(+row_hashes) rows for this project_id, in ONE
+ * transaction.
  *
  * WHAT THIS SCRIPT DELIBERATELY DOES NOT DO (out of scope):
  *   - No inter-session diff / resolved-carryover detection (H-4 — every
- *     parsed carryover row is 'open' by construction).
- *   - No project_id derivation from a file path (D3-1's "never decode a
- *     path to guess an identity" principle applies here too) — the
- *     caller MUST pass --project-id explicitly.
+ *     parsed carryover row is 'open' by construction; cm#222's Status
+ *     total-classification is report-only, never fed back into
+ *     carryover_status).
+ *   - No project_id derivation from a file path — the caller MUST pass
+ *     --project-id explicitly.
  *   - No wiring into the verify-15-*.js battery beyond the two roster
- *     rows H-2 requires (handoff_next_session_items /
- *     handoff_active_session_summary) — see this script's PR body for the
- *     exact rows and the blind-spot this leaves for the other four slices.
+ *     rows H-2 requires.
  *
  * Usage:
  *   node scripts/migrations/migrate-08-handoff-markdown.js --db <target>
  *     --project-id <id> [--file <HANDOFF.md path>]
  *     [--history-file <HANDOFF-HISTORY.md path>]
  *     [--headings-config <path>] [--authoring-mode caveman|verbose]
- *     [--rollback] [--report-dir <path>]
+ *     [--dry-run] [--rollback] [--report-dir <path>]
  *
  * Exit codes: 0 = PASS, 1 = refused / failure, 2 = bad CLI usage.
  */
@@ -133,11 +140,7 @@ const DDL_PREAMBLE_SQL = [
   "ALTER TABLE assertions ADD COLUMN IF NOT EXISTS authoring_mode TEXT CHECK (authoring_mode IN ('caveman','verbose'))",
 ];
 
-// Logical manifest slice names (source_table) — H-2 requires roster rows
-// for exactly the two ACTIVE-file (HANDOFF.md) slices named below; see
-// this script's PR body / report for the exact rows to add and the
-// documented blind spot the other four slices carry (no roster/verify-15
-// battery coverage yet).
+// Logical manifest slice names (source_table).
 const SLICE_NAMES = {
   ACTIVE_SESSION_SUMMARY: 'handoff_active_session_summary',
   ACTIVE_OPEN_CARRYOVERS: 'handoff_open_carryovers',
@@ -145,14 +148,11 @@ const SLICE_NAMES = {
   ACTIVE_NEXT_SESSION_ITEMS: 'handoff_next_session_items',
   HISTORY_SESSION_BLOCKS: 'handoff_history_session_blocks',
   HISTORY_OPEN_CARRYOVERS: 'handoff_history_open_carryovers',
-  // Fail-soft edge case: a durable-section or NEXT-SESSION heading found
-  // INSIDE the archive file (unexpected but not dropped — total
-  // classification never silently discards a real match). Fixed constant
-  // names (not template-string-built at call sites) so runRollback's
-  // Object.values(SLICE_NAMES) enumeration covers them too.
   HISTORY_DURABLE_SECTIONS: 'handoff_durable_sections_in_history',
   HISTORY_NEXT_SESSION_ITEMS: 'handoff_next_session_items_in_history',
 };
+
+const SESSION_TYPES = new Set(['session_numbered', 'session_dated']);
 
 // ─── CLI ARGS ─────────────────────────────────────────────────────────────
 
@@ -162,7 +162,7 @@ function parseArgs(argv) {
   const parsed = {
     db: null, projectId: null, file: null, historyFile: null,
     headingsConfig: DEFAULT_HEADINGS_CONFIG_PATH, authoringMode: 'verbose',
-    rollback: false, reportDir: DEFAULT_REPORT_DIR, help: false,
+    rollback: false, dryRun: false, reportDir: DEFAULT_REPORT_DIR, help: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -179,6 +179,7 @@ function parseArgs(argv) {
     else if (a === '--authoring-mode') parsed.authoringMode = argv[++i];
     else if (a.startsWith('--authoring-mode=')) parsed.authoringMode = a.slice('--authoring-mode='.length);
     else if (a === '--rollback') parsed.rollback = true;
+    else if (a === '--dry-run') parsed.dryRun = true;
     else if (a === '--report-dir') parsed.reportDir = argv[++i];
     else if (a.startsWith('--report-dir=')) parsed.reportDir = a.slice('--report-dir='.length);
     else if (a === '--help' || a === '-h') parsed.help = true;
@@ -192,7 +193,7 @@ function printUsage() {
     'Usage: node scripts/migrations/migrate-08-handoff-markdown.js --db <target> --project-id <id>',
     '         [--file <HANDOFF.md path>] [--history-file <HANDOFF-HISTORY.md path>]',
     '         [--headings-config <path>] [--authoring-mode caveman|verbose]',
-    '         [--rollback] [--report-dir <path>]',
+    '         [--dry-run] [--rollback] [--report-dir <path>]',
     '',
     '  --db <name>            Target database (else MIGRATE_TARGET_DB env, else memory_manager_staging).',
     '  --project-id <id>      Required. Never derived/guessed from a file path.',
@@ -200,6 +201,8 @@ function printUsage() {
     '  --history-file <path>  HANDOFF-HISTORY.md (archive). Optional if --file is given.',
     '  --headings-config <p>  Durable-section headings config (default: handoff-section-headings.json).',
     '  --authoring-mode <m>   "caveman" or "verbose" — tags every row this run writes (default: verbose).',
+    '  --dry-run              Parse + report only. Zero DDL/INSERT/UPDATE/DELETE. With --db, runs only',
+    '                         the two read-only schema-precondition checks. Mutually exclusive with --rollback.',
     '  --rollback             Delete this project\'s migrated rows + manifest slices instead of migrating.',
     '  --report-dir <path>    Directory for the per-project fail-soft parse report (default: ./reports).',
   ].join('\n'));
@@ -219,12 +222,47 @@ function loadAndNormalizeFile(filePath) {
   return { present: true, path: filePath, normalized, readError: null };
 }
 
+// ─── NEXT SESSION per-file state (cm#222 A5) ──────────────────────────────
+
+/**
+ * computeNextSessionState — cm#222 A5: an explicit per-file state instead
+ * of an ambiguous zero item-count. Four-way total classification (the
+ * spec names three notable states; `present_with_items` is this file's
+ * own necessary completion of the enum for the normal/expected case —
+ * documented, not left implicit).
+ *
+ * @param {Array} sections
+ * @returns {{state:'absent'|'present_empty'|'present_with_items'|'present_variant', headingLineNo:number|null, itemCount:number, variantHeadingText:string|null}}
+ */
+function computeNextSessionState(sections) {
+  const canonical = sections.find((s) => s.type === 'next_session');
+  if (canonical) {
+    const items = mdParse.parseNextSessionItems(canonical.bodyText);
+    return {
+      state: items.length > 0 ? 'present_with_items' : 'present_empty',
+      headingLineNo: canonical.headingLineNo,
+      itemCount: items.length,
+      variantHeadingText: null,
+    };
+  }
+  const variant = sections.find((s) => s.type === 'next_session_variant');
+  if (variant) {
+    return {
+      state: 'present_variant',
+      headingLineNo: variant.headingLineNo,
+      itemCount: 0,
+      variantHeadingText: variant.classification.headingText,
+    };
+  }
+  return { state: 'absent', headingLineNo: null, itemCount: 0, variantHeadingText: null };
+}
+
 // ─── PARSE ONE FILE INTO CATEGORIZED ROWS ─────────────────────────────────
 
 /**
  * parseFileIntoRows — runs the total classification over one already-
  * normalized file and produces the four assertion-category row lists PLUS
- * a per-file report fragment. Pure (no I/O, no DB).
+ * a per-file report fragment (cm#222 A6). Pure (no I/O, no DB).
  *
  * @param {string} normalizedText
  * @param {Array<{canonical:string, predicate:string}>} durableHeadings
@@ -236,35 +274,54 @@ function loadAndNormalizeFile(filePath) {
  */
 function parseFileIntoRows(normalizedText, durableHeadings, fileKind) {
   const sections = mdParse.splitDocumentIntoSections(normalizedText, durableHeadings);
+  const sessionHeadingLevel = mdParse.detectSessionHeadingLevel(normalizedText);
 
   const sessionTldrRows = [];
   const openThreadRows = [];
   const durableRows = [];
   const nextStepRows = [];
 
-  const unknownHeadings = [];
+  const otherHeadings = [];
+  const sessionShapedUnparsedHeadings = [];
+  const nextSessionVariantHeadings = [];
   const flaggedTableRows = [];
+  const orphanTableRows = [];
+  let tablesParsedCount = 0;
   let nextSeq = 0;
 
+  const statusClassCounts = { closed: 0, open: 0, unknown: 0 };
+  const dualSignalStatusCells = [];
+  const MAX_DUAL_SIGNAL_EXAMPLES = 20;
+
   for (const section of sections) {
-    // H-4/base-point-3: "### Open carry-overs" tables can appear inside
-    // ANY section's body (active preamble OR an archived session block) —
-    // extracted uniformly regardless of the enclosing section's type.
+    // "### Open carry-overs" tables can appear inside ANY section's body
+    // (active preamble OR an archived session block) — extracted uniformly
+    // regardless of the enclosing section's type (H-4/base-point-3).
     const tables = mdParse.findOpenCarryoverTables(section.bodyText, section.bodyStartLine);
     for (const table of tables) {
+      tablesParsedCount += 1;
       for (const row of table.rows) {
         openThreadRows.push({
-          subject: deriveIntentSubject(row.subjectRaw),
-          object: row.objectRaw,
+          subject: deriveIntentSubject(row.itemRaw),
+          object: row.notesRaw,
+          statusRaw: row.statusRaw,
+          statusClass: row.statusClass,
           sourceLineNo: row.lineNo,
         });
+        statusClassCounts[row.statusClass] = (statusClassCounts[row.statusClass] || 0) + 1;
+        if (row.statusDualSignal && dualSignalStatusCells.length < MAX_DUAL_SIGNAL_EXAMPLES) {
+          dualSignalStatusCells.push({ raw: row.statusRaw, lineNo: row.lineNo, enclosingHeadingLineNo: section.headingLineNo });
+        }
       }
       for (const flagged of table.flaggedRows) {
         flaggedTableRows.push({ ...flagged, enclosingHeadingLineNo: section.headingLineNo });
       }
+      for (const orphan of table.orphanRows) {
+        orphanTableRows.push({ ...orphan, enclosingHeadingLineNo: section.headingLineNo });
+      }
     }
 
-    if (section.type === 'session') {
+    if (SESSION_TYPES.has(section.type)) {
       const headingText = section.headingLine.replace(/^##\s+/, '').trim();
       const parsedDate = new Date(section.classification.date);
       const validDate = !Number.isNaN(parsedDate.getTime());
@@ -276,7 +333,12 @@ function parseFileIntoRows(normalizedText, durableHeadings, fileKind) {
         rawDate: section.classification.date,
         headingLineNo: section.headingLineNo,
         rawLineSpan: section.rawLineSpan,
+        sessionHeadingType: section.type,
       });
+    } else if (section.type === 'session_shaped_unparsed') {
+      // cm#222 F-3: never silently merged into the generic "other" list —
+      // its own line-numbered bucket, always surfaced.
+      sessionShapedUnparsedHeadings.push({ headingLine: section.headingLine, headingLineNo: section.headingLineNo });
     } else if (section.type === 'durable') {
       durableRows.push({
         subject: section.classification.canonical,
@@ -295,15 +357,19 @@ function parseFileIntoRows(normalizedText, durableHeadings, fileKind) {
           headingLineNo: section.headingLineNo,
         });
       }
-    } else if (section.type === 'unknown') {
-      unknownHeadings.push({ headingLine: section.headingLine, headingLineNo: section.headingLineNo });
+    } else if (section.type === 'next_session_variant') {
+      // cm#222 F-5/A5: reported distinctly, never absorbed as a fuzzy
+      // synonym match — no items are extracted from a variant heading.
+      nextSessionVariantHeadings.push({ headingLine: section.headingLine, headingLineNo: section.headingLineNo });
+    } else if (section.type === 'other') {
+      otherHeadings.push({ headingLine: section.headingLine, headingLineNo: section.headingLineNo });
     }
-    // type === 'session' already handled; durable/next_session/unknown above.
   }
 
   // H-12: per-block body-length-delta heuristic, computed over this FILE's
-  // own session blocks only (same-file-relative, see handoff-markdown-
-  // parse.js's computeBodyLengthDeltaFlags header comment).
+  // own session blocks only (numbered + dated together — same-file-
+  // relative, see handoff-markdown-parse.js's computeBodyLengthDeltaFlags
+  // header comment).
   const bodyLengthDeltaFlags = mdParse.computeBodyLengthDeltaFlags(
     sessionTldrRows.map((r) => ({ headingLineNo: r.headingLineNo, rawLineSpan: r.rawLineSpan }))
   );
@@ -320,6 +386,10 @@ function parseFileIntoRows(normalizedText, durableHeadings, fileKind) {
   const totalRawLines = normalizedText.split('\n').length;
   const parsedRowCount = sessionTldrRows.length + openThreadRows.length + durableRows.length + nextStepRows.length;
 
+  const nextSessionState = computeNextSessionState(sections);
+
+  const sectionTypeCounts = countByType(sections);
+
   return {
     sessionTldrRows,
     openThreadRows,
@@ -328,9 +398,17 @@ function parseFileIntoRows(normalizedText, durableHeadings, fileKind) {
     report: {
       fileKind,
       sectionsFound: sections.length,
-      sectionTypeCounts: countByType(sections),
-      unknownHeadings,
+      sectionTypeCounts,
+      sessionHeadingLevelDetected: sessionHeadingLevel,
+      otherHeadings,
+      sessionShapedUnparsedHeadings,
+      nextSessionVariantHeadings,
+      nextSessionState,
       flaggedTableRows,
+      orphanTableRows,
+      tablesParsedCount,
+      statusClassCounts,
+      dualSignalStatusCells,
       bodyLengthDeltaFlags,
       collisions,
       totalRawLines,
@@ -361,25 +439,7 @@ function findCollisions(rows, keyFn) {
 
 /**
  * findCrossFileCollisions — H-6 cross-file collision detection
- * (independent-review fix, PR #172 blocker 2). findCollisions() above
- * only sees duplicates WITHIN one already-parsed file's row list; it has
- * no way to notice that the SAME subject/predicate key was ALSO produced
- * by the OTHER file (e.g. an identical `## Session N — date — title`
- * heading rotated into both HANDOFF.md's active preamble AND
- * HANDOFF-HISTORY.md's archive). This function is that cross-file check,
- * run by the caller AFTER both files are parsed.
- *
- * Write-semantics decision (this file's own, since neither the base spec
- * nor the H amendment states it explicitly): under the whole-project
- * delete-and-reinsert design (writeProjectMigration), BOTH contributing
- * rows are written and BOTH survive — every category this function is
- * called for is 1:N-safe by construction (session_tldr_archived/
- * open_thread/next_step are registry-declared 1:N; a durable-section
- * subject is the fixed canonical heading name, so a cross-file collision
- * there is the EXPECTED shape whenever a project's durable sections are
- * mirrored into both files). This function's job is only to make that
- * outcome an EXPLICITLY REPORTED one — never a silent accident the
- * operator has to notice by re-deriving it themselves.
+ * (independent-review fix, PR #172 blocker 2).
  *
  * @param {Array} activeRows
  * @param {Array} historyRows
@@ -416,9 +476,7 @@ const COLLISION_KEY_FNS = {
 /**
  * computeCrossFileCollisions — runs findCrossFileCollisions() over all
  * four categories between the active-file and history-file parse
- * results. Returns null when either file was absent (nothing to compare
- * across — a single-file run cannot have a CROSS-file collision, only the
- * WITHIN-file kind findCollisions() already covers).
+ * results. Returns null when either file was absent.
  */
 function computeCrossFileCollisions(activeParsed, historyParsed) {
   if (!activeParsed || !historyParsed) return null;
@@ -437,33 +495,17 @@ function computeContentFingerprint(rowsOrderedForHash) {
   return crypto.createHash('md5').update(concatenated).digest('hex');
 }
 
-// ─── WHOLE-PROJECT WRITE (H-6: "per-project delete-and-reinsert ... in one
-// transaction" — deliberately NOT per-slice. A per-slice delete scoped by
-// predicate would be unsound here: session_tldr_archived rows come from
-// BOTH the active-file slice and the history-file slice, so a
-// predicate-scoped per-slice delete would clobber the OTHER slice's rows
-// written earlier in the same run (or a prior run). The correct H-6
-// mechanism is ONE delete of every row this project's markdown migration
-// has ever written (unconditional on predicate, scoped only by
-// project_id + source_model), followed by inserting every freshly-parsed
-// row from every slice, all inside one transaction. Manifest bookkeeping
-// (migration_manifest/_row_hashes) stays per-slice — that is pure
-// reporting metadata, not the write-scope problem above. ────────────────
+// ─── WHOLE-PROJECT WRITE (H-6) ─────────────────────────────────────────────
 
 /**
  * writeProjectMigration — the H-6 whole-project delete-and-reinsert.
  *
- * @param {Array<{sourceDb, sourceTable, rows}>} slices - rows are
- *   {subject, predicate, object, pinned, carryoverStatus, seq, createdAt}
+ * @param {Array<{sourceDb, sourceTable, rows}>} slices
  */
 async function writeProjectMigration(tgtClient, { projectId, authoringMode, slices }) {
   await tgtClient.query('BEGIN');
   let totalWritten = 0;
   try {
-    // ONE unconditional delete of this project's entire markdown-migration
-    // footprint — matches the base spec's rollback command exactly
-    // (point 7: "DELETE FROM assertions WHERE source_model =
-    // 'markdown-migration-h' AND project_id = '<project>'").
     await tgtClient.query(
       `DELETE FROM assertions WHERE project_id = $1 AND source_model = $2`,
       [projectId, SOURCE_MODEL_TAG]
@@ -485,10 +527,6 @@ async function writeProjectMigration(tgtClient, { projectId, authoringMode, slic
         totalWritten += 1;
       }
 
-      // Manifest bookkeeping is per-slice (T1/T3 coverage, base point 6) —
-      // ALWAYS written (even row_count=0) so a slice whose content
-      // vanished between runs still reflects "0 rows this run" rather
-      // than leaving a stale nonzero manifest row behind.
       await tgtClient.query(
         `DELETE FROM migration_manifest WHERE source_db=$1 AND source_table=$2 AND project_id_or_null=$3`,
         [slice.sourceDb, slice.sourceTable, projectId]
@@ -556,6 +594,50 @@ async function runRollback(tgtClient, projectId) {
   return { deletedAssertions, deletedManifest, deletedHashes };
 }
 
+// ─── SCHEMA PRECONDITION CHECKS (shared by MIGRATE and cm#222 --dry-run) ──
+
+/**
+ * checkSchemaPreconditions — the two read-only SELECTs both MIGRATE mode
+ * and --dry-run mode (with --db) run: the "assertions" table exists, and
+ * it carries source_model + carryover_status. Never mutates anything.
+ *
+ * @returns {{assertionsTable:'pass'|'fail', requiredColumns:'pass'|'fail'|'not_checked'}}
+ */
+async function checkSchemaPreconditions(tgtClient) {
+  const { rows: tblRows } = await tgtClient.query(
+    `SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'assertions' AND table_type = 'BASE TABLE'`
+  );
+  if (tblRows.length === 0) {
+    return { assertionsTable: 'fail', requiredColumns: 'not_checked' };
+  }
+  const { rows: reqCols } = await tgtClient.query(
+    `SELECT column_name FROM information_schema.columns WHERE table_name='assertions' AND column_name IN ('source_model','carryover_status')`
+  );
+  return { assertionsTable: 'pass', requiredColumns: reqCols.length >= 2 ? 'pass' : 'fail' };
+}
+
+// ─── HUMAN-READABLE SUMMARY (cm#222 A1: dry-run emits this + the JSON) ────
+
+function printHumanSummary({ parsed, activeParsed, historyParsed, preconditionChecks }) {
+  console.log('--- handoff-markdown parse summary ---');
+  console.log(`  mode: ${parsed.dryRun ? 'DRY-RUN' : (parsed.rollback ? 'ROLLBACK' : 'MIGRATE')}`);
+  if (preconditionChecks) {
+    console.log(`  schema preconditions: assertions_table=${preconditionChecks.assertionsTable} required_columns=${preconditionChecks.requiredColumns}`);
+  } else {
+    console.log('  schema preconditions: not_checked (no --db)');
+  }
+  for (const [label, p] of [['active (--file)', activeParsed], ['history (--history-file)', historyParsed]]) {
+    if (!p) { console.log(`  ${label}: not provided`); continue; }
+    const r = p.report;
+    console.log(`  ${label}: sections=${r.sectionsFound} types=${JSON.stringify(r.sectionTypeCounts)} sessionHeadingLevel=${r.sessionHeadingLevelDetected}`);
+    console.log(`    session_shaped_unparsed=${r.sessionShapedUnparsedHeadings.length} other=${r.otherHeadings.length} next_session_variant=${r.nextSessionVariantHeadings.length}`);
+    console.log(`    next_session_state=${r.nextSessionState.state} (items=${r.nextSessionState.itemCount})`);
+    console.log(`    tables_parsed=${r.tablesParsedCount} flagged_rows=${r.flaggedTableRows.length} orphan_rows=${r.orphanTableRows.length}`);
+    console.log(`    status_classes=${JSON.stringify(r.statusClassCounts)} dual_signal_examples=${r.dualSignalStatusCells.length}`);
+  }
+  console.log('--- end summary ---');
+}
+
 // ─── MAIN ───────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -578,6 +660,10 @@ async function main() {
     console.error('Refused: --project-id is required (never derived/guessed from a file path).');
     process.exit(2);
   }
+  if (parsed.dryRun && parsed.rollback) {
+    console.error('Refused: --dry-run and --rollback are mutually exclusive (ambiguous scope).');
+    process.exit(2);
+  }
   if (!parsed.rollback && !parsed.file && !parsed.historyFile) {
     console.error('Refused: at least one of --file / --history-file is required (nothing to migrate).');
     process.exit(2);
@@ -585,6 +671,77 @@ async function main() {
   if (!AUTHORING_MODE_VALUES.has(parsed.authoringMode)) {
     console.error(`Invalid --authoring-mode "${parsed.authoringMode}" — must be "caveman" or "verbose".`);
     process.exit(2);
+  }
+
+  // ── cm#222 A1: TRUE dry-run — parse + report, zero DDL/writes. ─────────
+  if (parsed.dryRun) {
+    let preconditionChecks = null;
+    if (parsed.db) {
+      const { name: target, source: targetSource } = migrateOne.resolveTargetDb({ db: parsed.db });
+      if (!migrateOne.DB_NAME_RE.test(target)) {
+        console.error(`Invalid database name "${target}" (from ${targetSource}) — must match /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/.`);
+        process.exit(1);
+      }
+      const classification = migrateOne.classifyTarget(target);
+      if (!classification.allowed) {
+        console.error(`Refused: ${classification.reason}`);
+        console.error(`(resolved from ${targetSource} — no database connection was opened.)`);
+        process.exit(1);
+      }
+      console.log(`migrate-08-handoff-markdown: DRY-RUN target="${target}" (resolved from ${targetSource}) — read-only precondition checks only, zero writes`);
+      const tgtClient = new Client(migrateOne.pgConfig(target));
+      try {
+        await tgtClient.connect();
+        preconditionChecks = await checkSchemaPreconditions(tgtClient);
+      } catch (err) {
+        console.error(`Could not connect to target database "${target}" for read-only precondition checks: ${err.message}`);
+        process.exit(1);
+      } finally {
+        await tgtClient.end();
+      }
+    } else {
+      console.log('migrate-08-handoff-markdown: DRY-RUN (no --db) — schema preconditions not checked, parse-only');
+    }
+
+    const headingsConfig = loadHeadingsConfig(parsed.headingsConfig);
+    const activeFile = loadAndNormalizeFile(parsed.file);
+    const historyFile = loadAndNormalizeFile(parsed.historyFile);
+
+    if (parsed.file && !activeFile.present) {
+      console.log(`  [FAIL-SOFT] could not read --file "${parsed.file}": ${activeFile.readError}`);
+    }
+    if (parsed.historyFile && !historyFile.present) {
+      console.log(`  [FAIL-SOFT] could not read --history-file "${parsed.historyFile}": ${historyFile.readError}`);
+    }
+    if (!activeFile.present && !historyFile.present) {
+      console.error('Refused: neither --file nor --history-file could be read. Nothing to report.');
+      process.exit(1);
+    }
+
+    for (const flag of [...(activeFile.normalized ? activeFile.normalized.flags : []), ...(historyFile.normalized ? historyFile.normalized.flags : [])]) {
+      console.log(`  [FLAG] unrecognized-dash at line ${flag.line}: "${flag.char}" (H-10 — not silently coerced)`);
+    }
+
+    const activeParsed = activeFile.present ? parseFileIntoRows(activeFile.normalized.text, headingsConfig.headings, 'active') : null;
+    const historyParsed = historyFile.present ? parseFileIntoRows(historyFile.normalized.text, headingsConfig.headings, 'history') : null;
+    const crossFileCollisions = computeCrossFileCollisions(activeParsed, historyParsed);
+
+    printHumanSummary({ parsed, activeParsed, historyParsed, preconditionChecks });
+
+    const report = buildReport({ parsed, activeParsed, historyParsed, totalWritten: 0, crossFileCollisions, preconditionChecks, mode: 'dry_run' });
+    const reportPath = writeReport(parsed.reportDir, parsed.projectId, report);
+    console.log(`  [REPORT] ${reportPath}`);
+
+    const preconditionsFailed = preconditionChecks
+      && (preconditionChecks.assertionsTable === 'fail' || preconditionChecks.requiredColumns === 'fail');
+    if (preconditionsFailed) {
+      console.error('DRY_RUN_RESULT: FAIL (schema preconditions not met on target — see report)');
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`DRY_RUN_RESULT: PASS (project_id="${parsed.projectId}", zero writes performed)`);
+    process.exitCode = 0;
+    return;
   }
 
   const { name: target, source: targetSource } = migrateOne.resolveTargetDb({ db: parsed.db });
@@ -611,28 +768,14 @@ async function main() {
 
   let exitCode = 0;
   try {
-    const { rows: tblRows } = await tgtClient.query(
-      `SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'assertions' AND table_type = 'BASE TABLE'`
-    );
-    if (tblRows.length === 0) {
+    const preconditionChecks = await checkSchemaPreconditions(tgtClient);
+    if (preconditionChecks.assertionsTable === 'fail') {
       console.error(`Refused: target "${target}" is missing the "assertions" table.`);
       console.error('Run migrate-01-canonical-db.js against this target first. Nothing was applied.');
       process.exitCode = 1;
       return;
     }
-
-    // Precondition: source_model/agent_id (attribution-columns.sql) and
-    // carryover_status (migrate-06-carryover-status.sql) are pre-existing
-    // generic assertions columns from already-shipped §7-era addenda, NOT
-    // something this §6.1(h) migration bundles itself (this script's own
-    // DDL_PREAMBLE_SQL only adds what §6.1(h) actually introduces: seq +
-    // authoring_mode). Checked explicitly here so a target that only ran
-    // migrate-01 gets a clear, actionable refusal instead of a raw
-    // "column does not exist" SQL error mid-transaction.
-    const { rows: reqCols } = await tgtClient.query(
-      `SELECT column_name FROM information_schema.columns WHERE table_name='assertions' AND column_name IN ('source_model','carryover_status')`
-    );
-    if (reqCols.length < 2) {
+    if (preconditionChecks.requiredColumns === 'fail') {
       console.error(`Refused: target "${target}"'s "assertions" table is missing source_model and/or carryover_status.`);
       console.error('Run migrate-schema-addenda.js against this target first (attribution-columns.sql + migrate-06-carryover-status.sql). Nothing was applied.');
       process.exitCode = 1;
@@ -691,14 +834,6 @@ async function main() {
       const historySourceDb = filesystemSourceDb(parsed.historyFile);
       slices.push({ sourceDb: historySourceDb, sourceTable: SLICE_NAMES.HISTORY_SESSION_BLOCKS, rows: toSessionAssertionRows(historyParsed.sessionTldrRows) });
       slices.push({ sourceDb: historySourceDb, sourceTable: SLICE_NAMES.HISTORY_OPEN_CARRYOVERS, rows: toOpenThreadAssertionRows(historyParsed.openThreadRows) });
-      // Fail-soft generic parser: durable-section / NEXT-SESSION headings
-      // found INSIDE the archive file are still written (total
-      // classification never drops a real heading match), tagged under
-      // the history file's own source_db so they never collide with the
-      // active file's manifest keys. Pushed UNCONDITIONALLY (even when
-      // empty this run) so a slice that HAD content in a prior run and
-      // now has none still gets its manifest row overwritten to
-      // row_count=0 rather than left stale.
       slices.push({ sourceDb: historySourceDb, sourceTable: SLICE_NAMES.HISTORY_DURABLE_SECTIONS, rows: toDurableAssertionRows(historyParsed.durableRows) });
       slices.push({ sourceDb: historySourceDb, sourceTable: SLICE_NAMES.HISTORY_NEXT_SESSION_ITEMS, rows: toNextStepAssertionRows(historyParsed.nextStepRows) });
     }
@@ -710,18 +845,18 @@ async function main() {
       console.log(`  [OK] slice source_db="${slice.sourceDb}" source_table="${slice.sourceTable}": ${slice.rows.length} row(s)`);
     }
 
-    // H-6: loud named collision events — WITHIN one file (findCollisions,
-    // computed per-file in parseFileIntoRows) and ACROSS the two files
-    // (findCrossFileCollisions, computed here once both files are
-    // parsed). Both kinds are printed to stdout (not just carried in the
-    // JSON report) so "loud" in the header comment's own framing is true
-    // in practice, not just in the report file.
     for (const [fileLabel, filesParsed] of [['active', activeParsed], ['history', historyParsed]]) {
       if (!filesParsed) continue;
       for (const [category, list] of Object.entries(filesParsed.report.collisions)) {
         for (const c of list) {
           console.log(`  [SUBJECT-COLLISION] file=${fileLabel} category="${category}" key=${JSON.stringify(c.key)}: ${c.count} row(s) share this subject within one file`);
         }
+      }
+      if (filesParsed.report.sessionShapedUnparsedHeadings.length) {
+        console.log(`  [SESSION-SHAPED-UNPARSED] file=${fileLabel}: ${filesParsed.report.sessionShapedUnparsedHeadings.length} heading(s) contained "session" but matched no known shape — see report`);
+      }
+      if (filesParsed.report.orphanTableRows.length) {
+        console.log(`  [ORPHAN-ROWS] file=${fileLabel}: ${filesParsed.report.orphanTableRows.length} pipe-shaped line(s) after a table's blank-line end were not silently dropped — see report`);
       }
     }
     const crossFileCollisions = computeCrossFileCollisions(activeParsed, historyParsed);
@@ -733,7 +868,7 @@ async function main() {
       }
     }
 
-    const report = buildReport({ parsed, activeParsed, historyParsed, totalWritten, crossFileCollisions });
+    const report = buildReport({ parsed, activeParsed, historyParsed, totalWritten, crossFileCollisions, preconditionChecks, mode: 'migrate' });
     const reportPath = writeReport(parsed.reportDir, parsed.projectId, report);
     console.log(`  [REPORT] ${reportPath}`);
 
@@ -793,24 +928,23 @@ function loadHeadingsConfig(configPath) {
   return parsed;
 }
 
-// ─── REPORT (base spec point 5, fail-soft) ────────────────────────────────
+// ─── REPORT (base spec point 5, fail-soft; cm#222 A6 extension) ──────────
 
-function buildReport({ parsed, activeParsed, historyParsed, totalWritten, crossFileCollisions }) {
+function buildReport({ parsed, activeParsed, historyParsed, totalWritten, crossFileCollisions, preconditionChecks, mode }) {
   return {
+    mode: mode || (parsed.dryRun ? 'dry_run' : (parsed.rollback ? 'rollback' : 'migrate')),
     project_id: parsed.projectId,
     generated_at: new Date().toISOString(),
     file: parsed.file || null,
     history_file: parsed.historyFile || null,
     authoring_mode: parsed.authoringMode,
     total_assertions_written: totalWritten,
+    precondition_checks: preconditionChecks
+      ? { assertions_table: preconditionChecks.assertionsTable, required_columns: preconditionChecks.requiredColumns }
+      : { assertions_table: 'not_checked', required_columns: 'not_checked' },
     active: activeParsed ? activeParsed.report : null,
     history: historyParsed ? historyParsed.report : null,
-    // H-6 cross-file collision events (independent-review fix, PR #172
-    // blocker 2) — null when either file was absent (nothing to compare
-    // across); otherwise one entry per category, each an array of
-    // {key, activeCount, historyCount}. See findCrossFileCollisions()'s
-    // header comment for the write-semantics decision this documents:
-    // both contributing rows are written and survive, by design.
+    // H-6 cross-file collision events — null when either file was absent.
     cross_file_collisions: crossFileCollisions,
   };
 }
@@ -837,12 +971,14 @@ module.exports = {
   printUsage,
   loadAndNormalizeFile,
   parseFileIntoRows,
+  computeNextSessionState,
   findCollisions,
   findCrossFileCollisions,
   computeCrossFileCollisions,
   computeContentFingerprint,
   writeProjectMigration,
   runRollback,
+  checkSchemaPreconditions,
   loadHeadingsConfig,
   buildReport,
   toSessionAssertionRows,

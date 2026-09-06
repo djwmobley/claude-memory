@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **cm#222: migrate-08 handoff-markdown parser hardening** — a real-file
+  dry run (H-13's own stated acceptance gate) against a live project's
+  `HANDOFF.md`/`HANDOFF-HISTORY.md` surfaced 4 defects in the H-1..H-14
+  parser: (1) `--dry-run` did not exist at all — every acceptance check
+  required a live write; now a true dry-run parses + reports with zero
+  DDL/INSERT/UPDATE/DELETE, and (with `--db`) runs only the two read-only
+  schema-precondition SELECTs, reporting PASS/FAIL/not_checked rather than
+  ever assuming a target is ready. (2) The session-heading separator was a
+  single-dash character class, but the majority of real headings use a
+  literal two-hyphen `--` token — widened to a token alternation
+  (`--`/em-dash/en-dash/hyphen), each instance required to be flanked by
+  actual whitespace so a `YYYY-MM-DD` date's own embedded hyphens are never
+  mistaken for the separator. A second, structurally distinct real shape
+  (`## SESSION <date> [(parenthetical)] -- <title>`, date-first) is now its
+  own `session_dated` bucket alongside `session_numbered`; a heading that
+  merely contains the word "session" but matches neither shape is its own
+  `session_shaped_unparsed` bucket, always listed with a line number —
+  never silently merged into the generic "other" bucket. (3) Carry-over
+  tables were parsed with a hardcoded 2-cell assumption that failed on
+  100% of real (3-column Item/Status/Notes) rows; parsing is now
+  header-driven — cell count and column roles (item/status/notes, plus a
+  synonym map) are derived from the header row itself, column order is
+  irrelevant, an unrecognized column folds into notes as `name=value`, a
+  missing status column yields `unknown` for every row, and a header with
+  no identifiable item column flags the whole table rather than guessing
+  by position. Status-cell text now gets its own total classification
+  (closed/open/unknown, a cell matching both lists is `unknown`, never a
+  tiebreak guess) surfaced in the report only (never written to the DB —
+  `carryover_status` stays fixed `'open'`, unchanged, out of scope). A
+  table split by a stray blank line now reports the orphaned trailing rows
+  instead of silently dropping them. (4) A missing `## NEXT SESSION`
+  heading previously collapsed to an ambiguous zero-item count; the report
+  now carries an explicit per-file state (`absent` / `present_empty` /
+  `present_with_items` / `present_variant`, the last for a heading
+  containing both "next" and "session" without matching the canonical
+  form). New/changed: `scripts/lib/handoff-markdown-parse.js`,
+  `scripts/migrations/migrate-08-handoff-markdown.js`.
+
 ### Added
 
 - **cm#185 schema bring-forward** — generalizes the handoff engine's schema

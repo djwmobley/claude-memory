@@ -3,24 +3,32 @@
 /**
  * test-migrate-08-handoff-markdown.js — DB integration test harness for
  * scripts/migrations/migrate-08-handoff-markdown.js (CONSOLIDATION-
- * RUNBOOK.md §6.1(h) + H-1..H-14 amendment, memory-manager#11(h)).
+ * RUNBOOK.md §6.1(h) + H-1..H-14 amendment, memory-manager#11(h), + cm#222
+ * 2026-09-06 hardening pass: true --dry-run, header-driven carry-over
+ * tables, NEXT SESSION explicit states).
  *
  * Mirrors test-migrate-02-decisions.js's conventions: self-contained
  * scratch database ("_staging"-suffixed to satisfy migrate-01's own
  * classifyTarget, reused by reference), unconditional cleanup. Fixture
  * HANDOFF.md / HANDOFF-HISTORY.md files are written to a scratch temp
  * directory per run — SYNTHETIC content only (invented project/session
- * names), never a real file, per H-13.
+ * names), never real pwa-etl text, per H-13. Fixtures now use the
+ * 3-column (Item/Status/Notes) header shape cm#222's header-driven
+ * rewrite was built against — this IS the real-world shape (F-1).
  *
  * Covers:
- *   - Happy path: both files present -> session_tldr_archived (both
- *     files' blocks survive, proving the H-6 whole-project delete does
- *     NOT clobber across slices sharing the session_tldr_archived
- *     predicate), open_thread (all carryover_status='open'), pinned
- *     durable-section rows, next_step rows with seq.
+ *   - Happy path: both files present -> session_tldr_archived (numbered
+ *     AND dated shapes both land here — both files' blocks survive),
+ *     open_thread (all carryover_status='open', header-driven 3-column
+ *     parsing), pinned durable-section rows, next_step rows with seq.
  *   - H-1: session_tldr_archived is written, NEVER live session_tldr;
  *     created_at is backdated to the parsed session date.
- *   - H-4: every open_thread row is carryover_status='open'.
+ *   - H-4: every open_thread row is carryover_status='open' regardless of
+ *     the cm#222 Status total-classification (report-only, never written).
+ *   - cm#222 A1: --dry-run performs ZERO assertions/manifest writes and
+ *     is refused together with --rollback.
+ *   - cm#222 A5: NEXT SESSION absent / present_empty / present_variant
+ *     states are surfaced in the report.
  *   - Idempotent re-run: identical content re-run produces the identical
  *     row set (no duplication).
  *   - Content-shrink re-run: a next_step item removed between runs is
@@ -105,9 +113,6 @@ function runMigrate08(args, timeoutMs = 30000) {
 async function setupTargetSchema(dbName) {
   const r1 = runMigrateOne(['--db', dbName]);
   if (r1.status !== 0) throw new Error(`migrate-01 fixture setup failed: status=${r1.status} stderr=${r1.stderr}`);
-  // attribution-columns.sql (source_model/agent_id) + migrate-06-carryover-
-  // status.sql (carryover_status) both land via migrate-schema-addenda.js —
-  // migrate-01 alone does not carry either column.
   const r2 = runAddenda(['--db', dbName]);
   if (r2.status !== 0) throw new Error(`schema-addenda fixture setup failed: status=${r2.status} stderr=${r2.stderr}`);
 }
@@ -119,7 +124,9 @@ const SCRATCH_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'migrate08-fixtures-')
 
 const PROJECT_A = `example-project-alpha-${TS}`;
 
-// ── Synthetic fixtures (invented content only, per H-13) ──────────────────
+// ── Synthetic fixtures (invented content only, per H-13) — 3-column
+//    (Item/Status/Notes) header shape, the real-world convention cm#222's
+//    header-driven rewrite targets. ──────────────────────────────────────
 
 const HANDOFF_MD = [
   '## NEXT SESSION',
@@ -139,10 +146,10 @@ const HANDOFF_MD = [
   '',
   '### Open carry-overs',
   '',
-  '| Subject | Detail |',
-  '|---|---|',
-  '| EXAMPLE-THREAD-ALPHA: something | do the example alpha thing |',
-  '| EXAMPLE-THREAD-BETA: other | do the example beta thing |',
+  '| Item | Status | Notes |',
+  '|------|--------|-------|',
+  '| EXAMPLE-THREAD-ALPHA: something | Open | do the example alpha thing |',
+  '| EXAMPLE-THREAD-BETA: other | DONE -- merged | do the example beta thing |',
   '',
   '## Run commands',
   '',
@@ -166,11 +173,11 @@ const HANDOFF_HISTORY_MD = [
   '',
   '### Open carry-overs',
   '',
-  '| Subject | Detail |',
-  '|---|---|',
-  '| EXAMPLE-THREAD-GAMMA: legacy | resolved in a later session, still open by construction |',
+  '| Item | Status | Notes |',
+  '|------|--------|-------|',
+  '| EXAMPLE-THREAD-GAMMA: legacy | Open | resolved in a later session, still open by construction |',
   '',
-  '## Session 1 — 2025-12-20 — Initial example commit',
+  '## SESSION 2025-12-20 (session 1) -- Initial example commit',
   '',
   '### Done',
   '- initial example commit',
@@ -185,6 +192,12 @@ function writeFixture(name, content) {
   const p = path.join(SCRATCH_DIR, name);
   fs.writeFileSync(p, content, 'utf8');
   return p;
+}
+
+function readReportFile(reportScratchDir, projectId) {
+  const files = fs.readdirSync(reportScratchDir).filter((f) => f.includes(projectId));
+  assertEq(files.length, 1, `expected exactly one report file for project ${projectId}`);
+  return JSON.parse(fs.readFileSync(path.join(reportScratchDir, files[0]), 'utf8'));
 }
 
 async function main() {
@@ -219,12 +232,12 @@ async function main() {
       assert(allRows.every((r2) => r2.authoring_mode === 'verbose'), 'default authoring_mode should be "verbose"');
 
       const tldrRows = allRows.filter((r2) => r2.predicate === 'session_tldr_archived');
-      assertEq(tldrRows.length, 3, 'expected 3 session_tldr_archived rows (2 in history + 1 in active)');
+      assertEq(tldrRows.length, 3, 'expected 3 session_tldr_archived rows (2 in history + 1 in active) — numbered AND dated shapes both land here');
       assert(allRows.every((r2) => r2.predicate !== 'session_tldr'), 'H-1 violation: a live session_tldr row was written by the migration');
 
       const openThreadRows = allRows.filter((r2) => r2.predicate === 'open_thread');
-      assertEq(openThreadRows.length, 3, 'expected 3 open_thread rows (2 active + 1 history)');
-      assert(openThreadRows.every((r2) => r2.carryover_status === 'open'), 'H-4 violation: an open_thread row was not carryover_status=open');
+      assertEq(openThreadRows.length, 3, 'expected 3 open_thread rows (2 active + 1 history) — header-driven 3-column parsing');
+      assert(openThreadRows.every((r2) => r2.carryover_status === 'open'), 'H-4 violation: an open_thread row was not carryover_status=open, regardless of Status cell content');
 
       const pinnedRows = allRows.filter((r2) => r2.pinned === true);
       assertEq(pinnedRows.length, 3, 'expected 3 pinned durable-section rows');
@@ -240,8 +253,8 @@ async function main() {
     }
   });
 
-  // ── T2: H-1 created_at backdating ────────────────────────────────────
-  await run('T2', 'H-1: session_tldr_archived created_at is backdated to the parsed session date', async () => {
+  // ── T2: H-1 created_at backdating (numbered AND dated shapes) ────────
+  await run('T2', 'H-1: session_tldr_archived created_at is backdated to the parsed session date, for both the numbered and dated heading shapes', async () => {
     const client = await pgConnect(DB_TARGET);
     try {
       const { rows } = await client.query(
@@ -250,9 +263,9 @@ async function main() {
       );
       assertEq(rows.length, 3, 'expected 3 rows');
       const first = new Date(rows[0].created_at);
-      assertEq(first.toISOString().slice(0, 10), '2025-12-20', 'earliest session block not backdated correctly');
+      assertEq(first.toISOString().slice(0, 10), '2025-12-20', 'earliest (dated-shape) session block not backdated correctly');
       const last = new Date(rows[2].created_at);
-      assertEq(last.toISOString().slice(0, 10), '2026-01-05', 'latest session block not backdated correctly');
+      assertEq(last.toISOString().slice(0, 10), '2026-01-05', 'latest (numbered-shape) session block not backdated correctly');
     } finally {
       await client.end();
     }
@@ -336,11 +349,7 @@ async function main() {
     }
   });
 
-  // ── T6b: H-6 cross-file collision reporting (independent-review fix,
-  // PR #172 blocker 2) — same session heading present in BOTH --file and
-  // --history-file must produce a loud, named cross-file collision event
-  // (console line + report entry), never silently write both rows with
-  // an empty collision array. ──────────────────────────────────────────
+  // ── T6b: H-6 cross-file collision reporting ──────────────────────────
   await run('T6b', 'H-6: an identical session heading in both files produces a reported cross-file collision, and BOTH rows survive', async () => {
     const dupHeading = '## Session 9 — 2026-02-10 — Duplicated across files';
     const activeDupPath = writeFixture(
@@ -370,9 +379,7 @@ async function main() {
       await client.end();
     }
 
-    const reportFiles = fs.readdirSync(reportScratchDir).filter((f) => f.includes(projectC));
-    assertEq(reportFiles.length, 1, 'expected exactly one report file for this run');
-    const report = JSON.parse(fs.readFileSync(path.join(reportScratchDir, reportFiles[0]), 'utf8'));
+    const report = readReportFile(reportScratchDir, projectC);
     assert(report.cross_file_collisions, 'report is missing cross_file_collisions entirely');
     const sessionCollisions = report.cross_file_collisions.session_tldr_archived;
     assertEq(sessionCollisions.length, 1, 'expected exactly one session_tldr_archived cross-file collision entry in the report');
@@ -380,20 +387,7 @@ async function main() {
     assertEq(sessionCollisions[0].historyCount, 1, 'wrong historyCount in the cross-file collision report entry');
   });
 
-  // ── T6c: H-6 WITHIN-file durable-heading collision (independent-review
-  // fix, PR #176) — a duplicated durable-section heading (e.g. two
-  // '## Run commands' sections in the SAME file) is the exact regression
-  // PR #176's author found empirically: registering run_commands/
-  // critical_operational_notes/key_paths as cardinality 1:1 (and widening
-  // assertions_1to1_unique to match) converts this documented, log-and-
-  // continue collision path into a hard Postgres "duplicate key value
-  // violates unique constraint" error that aborts the whole-project
-  // transaction (zero rows written). This fixture pins the CORRECT (1:N)
-  // behavior permanently so a future re-introduction of 1:1 for any
-  // durable-section predicate fails this test immediately, not just the
-  // reviewer's one-off manual repro. Distinct from T6b: T6b is a CROSS-file
-  // (--file vs --history-file) collision on session_tldr_archived; this is
-  // a WITHIN-file collision on a durable-section predicate. ─────────────
+  // ── T6c: H-6 WITHIN-file durable-heading collision ───────────────────
   await run('T6c', 'H-6: a duplicated durable-section heading ("## Run commands" twice) within one file produces a reported within-file collision, exits 0, and BOTH rows survive', async () => {
     const dupDurablePath = writeFixture(
       'HANDOFF-dup-durable.md',
@@ -431,9 +425,7 @@ async function main() {
       await client.end();
     }
 
-    const reportFiles = fs.readdirSync(reportScratchDir).filter((f) => f.includes(projectD));
-    assertEq(reportFiles.length, 1, 'expected exactly one report file for this run');
-    const report = JSON.parse(fs.readFileSync(path.join(reportScratchDir, reportFiles[0]), 'utf8'));
+    const report = readReportFile(reportScratchDir, projectD);
     assert(report.active && report.active.collisions && report.active.collisions.durable, 'report is missing active.collisions.durable entirely');
     const durableCollisions = report.active.collisions.durable;
     assertEq(durableCollisions.length, 1, 'expected exactly one durable within-file collision entry in the report');
@@ -454,6 +446,10 @@ async function main() {
     const r = runMigrate08(['--db', DB_TARGET, '--project-id', PROJECT_A, '--file', activeFilePath, '--authoring-mode', 'bogus']);
     assertEq(r.status, 2, 'invalid --authoring-mode should exit 2');
   });
+  await run('T7d', 'cm#222 A1: usage: --dry-run and --rollback together is refused (ambiguous scope)', async () => {
+    const r = runMigrate08(['--db', DB_TARGET, '--project-id', PROJECT_A, '--dry-run', '--rollback']);
+    assertEq(r.status, 2, '--dry-run + --rollback together should exit 2');
+  });
 
   // ── T8: rollback ──────────────────────────────────────────────────────
   await run('T8', 'rollback: deletes exactly this project\'s tagged rows', async () => {
@@ -466,6 +462,138 @@ async function main() {
       assertEq(rows[0].n, 0, 'rollback did not remove all of this project\'s rows');
       const { rows: manifestRows } = await client.query(`SELECT COUNT(*)::int AS n FROM migration_manifest WHERE project_id_or_null=$1`, [PROJECT_A]);
       assertEq(manifestRows[0].n, 0, 'rollback did not remove this project\'s manifest rows');
+    } finally {
+      await client.end();
+    }
+  });
+
+  // ── T9: cm#222 A1 — true --dry-run performs ZERO writes ──────────────
+  await run('T9', 'cm#222 A1: --dry-run with --db runs only the read-only precondition checks and writes ZERO assertions/manifest rows', async () => {
+    const projectE = `example-project-epsilon-${TS}`;
+    const reportScratchDir = path.join(SCRATCH_DIR, 'reports-t9');
+    const before = await pgConnect(DB_TARGET);
+    let beforeAssertions;
+    let beforeManifest;
+    try {
+      beforeAssertions = (await before.query(`SELECT COUNT(*)::int AS n FROM assertions`)).rows[0].n;
+      beforeManifest = (await before.query(`SELECT COUNT(*)::int AS n FROM migration_manifest`)).rows[0].n;
+    } finally {
+      await before.end();
+    }
+
+    const r = runMigrate08(['--db', DB_TARGET, '--project-id', projectE, '--file', activeFilePath, '--history-file', historyFilePath, '--dry-run', '--report-dir', reportScratchDir]);
+    if (r.status !== 0) throw new Error(`dry-run failed: status=${r.status}\nstdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert(/DRY_RUN_RESULT: PASS/.test(r.stdout), 'expected DRY_RUN_RESULT: PASS in stdout');
+    assert(r.stdout.includes('precondition'), 'expected the precondition-check summary in stdout');
+
+    const after = await pgConnect(DB_TARGET);
+    try {
+      const afterAssertions = (await after.query(`SELECT COUNT(*)::int AS n FROM assertions`)).rows[0].n;
+      const afterManifest = (await after.query(`SELECT COUNT(*)::int AS n FROM migration_manifest`)).rows[0].n;
+      assertEq(afterAssertions, beforeAssertions, '--dry-run must never write any assertions row, anywhere');
+      assertEq(afterManifest, beforeManifest, '--dry-run must never write any migration_manifest row, anywhere');
+      const { rows: projectRows } = await after.query(`SELECT COUNT(*)::int AS n FROM assertions WHERE project_id=$1`, [projectE]);
+      assertEq(projectRows[0].n, 0, '--dry-run must not have written anything for its own project_id either');
+    } finally {
+      await after.end();
+    }
+
+    const report = readReportFile(reportScratchDir, projectE);
+    assertEq(report.mode, 'dry_run', 'report mode should be dry_run');
+    assertEq(report.total_assertions_written, 0, 'report should reflect zero writes');
+    assert(report.precondition_checks, 'report is missing precondition_checks');
+    assertEq(report.precondition_checks.assertions_table, 'pass', 'precondition check should pass against a fully-provisioned target');
+    assertEq(report.precondition_checks.required_columns, 'pass', 'precondition check should pass against a fully-provisioned target');
+  });
+
+  await run('T9b', 'cm#222 A1/F-9: --dry-run without --db reports "not checked", never "assumed OK"', async () => {
+    const projectF = `example-project-zeta-${TS}`;
+    const reportScratchDir = path.join(SCRATCH_DIR, 'reports-t9b');
+    const r = runMigrate08(['--project-id', projectF, '--file', activeFilePath, '--dry-run', '--report-dir', reportScratchDir]);
+    if (r.status !== 0) throw new Error(`no-db dry-run failed: status=${r.status}\nstdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert(/DRY_RUN_RESULT: PASS/.test(r.stdout), 'expected DRY_RUN_RESULT: PASS in stdout');
+    assert(/not checked/i.test(r.stdout), 'expected an explicit "not checked" precondition message without --db');
+    const report = readReportFile(reportScratchDir, projectF);
+    assertEq(report.precondition_checks.assertions_table, 'not_checked', 'precondition check should be not_checked without --db, never assumed pass');
+    assertEq(report.precondition_checks.required_columns, 'not_checked', 'precondition check should be not_checked without --db, never assumed pass');
+  });
+
+  await run('T9c', 'cm#222 F-9: --dry-run against a target missing required columns reports FAIL, never silently PASS', async () => {
+    const dbBare = `verify08_bare_${TS}_staging`;
+    CREATED_DBS.push(dbBare);
+    await dropDb(dbBare);
+    const sysB = await pgConnect('postgres');
+    await sysB.query(`CREATE DATABASE "${dbBare}"`);
+    await sysB.end();
+    const r1 = runMigrateOne(['--db', dbBare]); // migrate-01 ONLY — no schema-addenda, so source_model/carryover_status are missing
+    if (r1.status !== 0) throw new Error(`migrate-01 bare fixture setup failed: status=${r1.status} stderr=${r1.stderr}`);
+
+    const projectG = `example-project-eta-${TS}`;
+    const reportScratchDir = path.join(SCRATCH_DIR, 'reports-t9c');
+    const r = runMigrate08(['--db', dbBare, '--project-id', projectG, '--file', activeFilePath, '--dry-run', '--report-dir', reportScratchDir]);
+    assertEq(r.status, 1, 'dry-run against a target missing required columns should exit 1 (FAIL), not 0');
+    assert(/DRY_RUN_RESULT: FAIL/.test(r.stdout + r.stderr), 'expected DRY_RUN_RESULT: FAIL in stdout or stderr');
+
+    const report = readReportFile(reportScratchDir, projectG);
+    assertEq(report.precondition_checks.assertions_table, 'pass', 'assertions table itself exists after migrate-01');
+    assertEq(report.precondition_checks.required_columns, 'fail', 'required_columns should FAIL on a migrate-01-only target, never silently pass');
+  });
+
+  // ── T10: cm#222 A5 — NEXT SESSION explicit states ────────────────────
+  await run('T10', 'cm#222 A5: NEXT SESSION state is "absent" when no such heading (canonical or variant) exists', () => {
+    const migrate08 = require(MIGRATE08_PATH);
+    const mdParse = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'handoff-markdown-parse.js'));
+    const doc = ['## Session 1 — 2026-01-01 — Title', '', 'body', ''].join('\n');
+    const sections = mdParse.splitDocumentIntoSections(doc, []);
+    const state = migrate08.computeNextSessionState(sections);
+    assertEq(state.state, 'absent', 'expected absent state');
+  });
+
+  await run('T10b', 'cm#222 A5: NEXT SESSION state is "present_empty" when the canonical heading has zero items', () => {
+    const migrate08 = require(MIGRATE08_PATH);
+    const mdParse = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'handoff-markdown-parse.js'));
+    const doc = ['## NEXT SESSION', '', '_(none)_', ''].join('\n');
+    const sections = mdParse.splitDocumentIntoSections(doc, []);
+    const state = migrate08.computeNextSessionState(sections);
+    assertEq(state.state, 'present_empty', 'expected present_empty state');
+    assertEq(state.itemCount, 0, 'expected zero items');
+  });
+
+  await run('T10c', 'cm#222 A5: NEXT SESSION state is "present_with_items" for the normal case', () => {
+    const migrate08 = require(MIGRATE08_PATH);
+    const mdParse = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'handoff-markdown-parse.js'));
+    const doc = ['## NEXT SESSION', '', '1. do the thing', ''].join('\n');
+    const sections = mdParse.splitDocumentIntoSections(doc, []);
+    const state = migrate08.computeNextSessionState(sections);
+    assertEq(state.state, 'present_with_items', 'expected present_with_items state');
+    assertEq(state.itemCount, 1, 'expected one item');
+  });
+
+  await run('T10d', 'cm#222 A5/F-5: NEXT SESSION state is "present_variant" for a non-canonical next+session heading, and no items are extracted from it', () => {
+    const migrate08 = require(MIGRATE08_PATH);
+    const mdParse = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'handoff-markdown-parse.js'));
+    const doc = ['## Next up: session wrap notes', '', '1. this should not become a next_step row', ''].join('\n');
+    const sections = mdParse.splitDocumentIntoSections(doc, []);
+    const state = migrate08.computeNextSessionState(sections);
+    assertEq(state.state, 'present_variant', 'expected present_variant state');
+    assert(state.variantHeadingText, 'expected the variant heading text to be captured');
+  });
+
+  await run('T10e', 'end-to-end: NEXT SESSION absence is surfaced in the migrate-08 report, and zero next_step rows are written', async () => {
+    const noNextSessionPath = writeFixture(
+      'HANDOFF-no-next-session.md',
+      ['## Session 5 — 2026-03-01 — No NEXT SESSION heading in this file', '', '### Done', '- something', ''].join('\n')
+    );
+    const reportScratchDir = path.join(SCRATCH_DIR, 'reports-t10e');
+    const projectH = `example-project-theta-${TS}`;
+    const r = runMigrate08(['--db', DB_TARGET, '--project-id', projectH, '--file', noNextSessionPath, '--report-dir', reportScratchDir]);
+    if (r.status !== 0) throw new Error(`run failed: status=${r.status}\nstdout=${r.stdout}\nstderr=${r.stderr}`);
+    const report = readReportFile(reportScratchDir, projectH);
+    assertEq(report.active.nextSessionState.state, 'absent', 'report should say the NEXT SESSION heading is absent');
+    const client = await pgConnect(DB_TARGET);
+    try {
+      const { rows } = await client.query(`SELECT COUNT(*)::int AS n FROM assertions WHERE project_id=$1 AND predicate='next_step'`, [projectH]);
+      assertEq(rows[0].n, 0, 'zero next_step rows should be written when NEXT SESSION is absent');
     } finally {
       await client.end();
     }
