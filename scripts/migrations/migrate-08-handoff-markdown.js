@@ -11,7 +11,21 @@
  * rows on a memory-manager consolidation target — the markdown-source
  * PEER of the SQL-source migrations (migrate-02 etc.), not an afterthought.
  *
- * PER-BRANCH PRECONDITION FIX (this pass, item B / #251 follow-up — the pwa-etl
+ * ENGINE INDEX BRING-FORWARD + INTEGRITY-INDEX GATE (this pass, 2026-09-06 —
+ * unblocks item B's pwa-etl HANDOFF-HISTORY write, item B/#251's own
+ * successor): a live WRITE against memory_manager_staging failed with
+ * "index row size 3552 exceeds btree version 4 maximum 2704 for index
+ * assertions_1ton_exact_unique" — this file NEVER called the engine's
+ * ensureSchemaCurrent() before INSERTing, so a target whose
+ * assertions_1ton_exact_unique index was still the stale pre-cm#227 raw
+ * form was never brought forward to the md5(object)-keyed canonical form.
+ * checkSchemaPreconditions() only ever probed information_schema.columns,
+ * which cannot see an index's DEFINITION (only whether a required column
+ * exists). See the "INTEGRITY INDEX CLASSIFICATION" section below
+ * (classifyIntegrityIndex and its call sites in main()) for the full S1
+ * (bring-forward)/S2 (total classification)/S3 (write gate) design.
+ *
+ * PER-BRANCH PRECONDITION FIX (prior pass, item B / #251 follow-up — the pwa-etl
  * HANDOFF-HISTORY.md write, #251 having just made pipeline_pwa_etl classify
  * PER_PROJECT_ENGINE instead of being name-refused):
  *   checkSchemaPreconditions() is now BRANCH-AWARE. Every column this
@@ -165,7 +179,9 @@ const { Client } = require('pg');
 
 const migrateOne = require('./migrate-01-canonical-db'); // reused by reference, never forked
 const shared = require('./lib/verify15-shared'); // reused by reference: connect config, rowHash, applyDdl
-const { intentKey } = require('../handoff.js'); // reused by reference (H-3/H-7, cm#233), never reimplemented
+const handoffMod = require('../handoff.js'); // reused by reference (H-3/H-7 intentKey, cm#233; S1 ensureSchemaCurrent bring-forward, S2 _extractIntegrityIndexOps)
+const { intentKey } = handoffMod;
+const { PostgresAdapter } = require('../lib/db-seam.js'); // S1: wraps this file's own pg.Client for ensureSchemaCurrent's db-port contract
 const { AUTHORING_MODE_VALUES } = require('../lib/memory-upsert.js'); // reused by reference, never a second Set
 const mdParse = require('../lib/handoff-markdown-parse.js');
 const { filesystemSourceDb } = require('../lib/fs-path-normalize.js'); // H-14: same normalizer roster entries use
@@ -173,6 +189,10 @@ const { filesystemSourceDb } = require('../lib/fs-path-normalize.js'); // H-14: 
 const MIGRATIONS_DIR = __dirname;
 const DEFAULT_HEADINGS_CONFIG_PATH = path.join(MIGRATIONS_DIR, 'handoff-section-headings.json');
 const DEFAULT_REPORT_DIR = path.join(MIGRATIONS_DIR, 'reports');
+// S2: the canonical schema file whose CREATE UNIQUE INDEX statement for
+// assertions_1ton_exact_unique is the ground truth this migration's
+// integrity-index classification compares the live catalog against.
+const CORE_SCHEMA_SQL_PATH = path.join(MIGRATIONS_DIR, '..', 'sql', 'handoff-core-schema.sql');
 
 const SOURCE_MODEL_TAG = 'markdown-migration-h';
 const DEFAULT_CONFIDENCE = 8;
@@ -819,6 +839,224 @@ async function checkSchemaPreconditions(tgtClient, branch) {
   };
 }
 
+// ─── INTEGRITY INDEX CLASSIFICATION (S2/S3 — engine index bring-forward) ──
+//
+// DEFECT this closes (2026-09-06): a live migrate-08 WRITE against
+// memory_manager_staging failed with "index row size 3552 exceeds btree
+// version 4 maximum 2704 for index assertions_1ton_exact_unique". Staging's
+// live index was still the STALE pre-cm#227 raw form
+// `(project_id, subject, predicate, object) WHERE (suppressed = false)`;
+// the canonical form is keyed on md5(object) instead (see
+// handoff-core-schema.sql's own comment on the index for the full
+// rationale). Root cause: this file never called the engine's own
+// ensureSchemaCurrent() before INSERTing, so a target whose schema was
+// behind (or whose integrity index re-create had once silently failed)
+// was never brought forward — checkSchemaPreconditions() only ever probed
+// information_schema.columns, which cannot see an index's DEFINITION at
+// all (only whether a required COLUMN is present).
+//
+// S1 (see main(), WRITE mode only) calls ensureSchemaCurrent(db, projectId)
+// before checkSchemaPreconditions() and checks its return: any reason
+// other than 'current' or 'applied' aborts before any INSERT. A failed
+// CREATE for the integrity index leaves the STALE index intact — db-seam.js
+// (db.runIntegrityIndexPair) rolls the paired DROP back too when the CREATE
+// fails, so the index is never left dropped-and-not-recreated. On a shared
+// STAGING/CANON target this bring-forward step is expected to re-run once
+// per distinct project_id that touches it (project_settings.schema_
+// fingerprint is keyed per (project_id, key)) — each re-run is itself
+// idempotent (every unit's own DDL is IF NOT EXISTS / DROP+CREATE-safe).
+//
+// S2/S3 (classifyIntegrityIndex, below + its call sites in main()): a total,
+// independent classification of the LIVE assertions_1ton_exact_unique index
+// into exactly one of CURRENT | STALE_RAW_OBJECT | MISSING | UNRECOGNIZED —
+// checked AFTER S1 in WRITE mode (S1's own reported success is never taken
+// as proof the live catalog object actually matches; this function inspects
+// pg_class/pg_index directly, every time). WRITE proceeds only on CURRENT.
+// DRY-RUN always reports the class; STALE_RAW_OBJECT/MISSING are
+// PASS-with-note ("write mode will bring forward"); UNRECOGNIZED fails the
+// dry-run report.
+//
+//   CURRENT           - live pg_get_indexdef (normalized) text-equals the
+//                        canonical definition's pg_get_indexdef (also
+//                        normalized), AND indisvalid=true AND
+//                        indisunique=true.
+//   STALE_RAW_OBJECT   - live pg_get_indexdef (normalized) text-equals the
+//                        KNOWN pre-cm#227 raw form's pg_get_indexdef (also
+//                        normalized). Requires indisvalid=true — checked
+//                        BEFORE any shape comparison, below.
+//   MISSING            - no index named assertions_1ton_exact_unique exists
+//                        ON THE assertions TABLE specifically (indrelid-
+//                        scoped: a same-named index that exists on a
+//                        DIFFERENT table does not count as present here —
+//                        still MISSING for assertions). Also covers
+//                        "assertions itself does not exist yet" (by
+//                        definition, no index can exist on an absent
+//                        table).
+//   UNRECOGNIZED       - the default branch: an INVALID index of ANY form
+//                        (checked first, unconditionally — an invalid
+//                        index is never CURRENT or STALE_RAW_OBJECT no
+//                        matter what its definition text says), or any
+//                        VALID index whose definition matches neither
+//                        canonical nor the known stale-raw form.
+//
+// Canonical-definition normalization engine (the ONE rule — S2, no other
+// string munging applied anywhere in this classification): inside a
+// transaction that is ALWAYS rolled back (never committed — dry-run leaves
+// zero persistent objects, and this same code path runs in both dry-run
+// and write mode), create a TEMP TABLE literally named "assertions" —
+// shadowing the real table via Postgres's own pg_temp-searched-first name
+// resolution, so an UNMODIFIED copy of the real CREATE UNIQUE INDEX
+// statement (extracted BY INDEX NAME from handoff-core-schema.sql via
+// handoff.js's own _extractIntegrityIndexOps — never a second parser) runs
+// against it without any rewriting. Read back pg_get_indexdef, then
+// ROLLBACK. The SAME 'assertions'::regclass-scoped query used for the LIVE
+// probe (_queryLiveIndexInfo) is reused unchanged for this reference
+// computation: outside the temp transaction it resolves to the real table;
+// inside it, to the shadowing temp table. The two texts are compared only
+// after replacing the "ON <optional-schema-qualifier>.assertions" relation
+// qualifier on BOTH sides with the bare "ON assertions" — the real table
+// may render schema-qualified or not depending on search_path, and the
+// temp table always renders qualified with its session-scoped pg_temp_N
+// schema name; this qualifier strip is the only textual normalization
+// applied, identically, to both sides.
+
+const INTEGRITY_INDEX_NAME = 'assertions_1ton_exact_unique';
+
+// The KNOWN pre-cm#227 raw form (see this section's DEFECT note above and
+// cm#227's own comment in handoff-core-schema.sql). Intentionally
+// hardcoded here, NOT extracted from any live schema file — this shape no
+// longer exists anywhere in this repo's schema roster; it is a fixed
+// historical reference point for classification only, never applied to any
+// real database by this file.
+const STALE_RAW_OBJECT_CREATE_SQL =
+  'CREATE UNIQUE INDEX assertions_1ton_exact_unique ' +
+  'ON assertions (project_id, subject, predicate, object) ' +
+  'WHERE suppressed = false';
+
+/**
+ * The ONE normalization rule (S2): strip an optional "<schema>." qualifier
+ * immediately before "assertions" in the index definition's "ON ..."
+ * clause. Never mutates anything else in the string.
+ */
+function _normalizeIndexDefForCompare(def) {
+  if (typeof def !== 'string') return def;
+  return def.replace(/\bON\s+(?:[A-Za-z_][A-Za-z0-9_$]*\.)?assertions\b/i, 'ON assertions');
+}
+
+/**
+ * Search-path-aware live probe: scoped by indrelid='assertions'::regclass
+ * (never a bare relname match), so a same-named index on a DIFFERENT table
+ * is correctly invisible here. Reused unchanged, inside a temp-table-
+ * shadowing transaction, to compute a reference definition (see the
+ * section header comment).
+ */
+async function _queryLiveIndexInfo(tgtClient, indexName) {
+  const { rows } = await tgtClient.query(
+    `SELECT c.relname AS indexname, i.indisvalid, i.indisunique,
+            pg_get_indexdef(i.indexrelid) AS indexdef
+       FROM pg_index i
+       JOIN pg_class c ON c.oid = i.indexrelid
+      WHERE i.indrelid = 'assertions'::regclass
+        AND c.relname = $1`,
+    [indexName]
+  );
+  return rows.length > 0 ? rows[0] : null;
+}
+
+/**
+ * Extract the canonical CREATE UNIQUE INDEX statement for indexName from
+ * handoff-core-schema.sql, reusing handoff.js's own _extractIntegrityIndexOps
+ * (never a second SQL parser). Throws on schema-file drift (the index is
+ * gone from the file, or renamed) — that is a build-time bug, never a
+ * live-DB classification outcome.
+ */
+function _extractCanonicalCreateSql(indexName) {
+  const schemaSql = fs.readFileSync(CORE_SCHEMA_SQL_PATH, 'utf8');
+  const { ops } = handoffMod._extractIntegrityIndexOps(schemaSql);
+  const op = ops.find((o) => o.name === indexName);
+  if (!op) {
+    throw new Error(
+      `_extractCanonicalCreateSql: no CREATE UNIQUE INDEX "${indexName}" found via ` +
+      `_extractIntegrityIndexOps() over ${CORE_SCHEMA_SQL_PATH} -- schema file drift?`
+    );
+  }
+  return op.createSql;
+}
+
+/**
+ * Compute the pg_get_indexdef() an (unmodified) CREATE UNIQUE INDEX
+ * statement would produce, without ever persisting anything — see the
+ * section header comment for the full temp-table-shadowing mechanism.
+ * Returns null if the statement's index never becomes visible under the
+ * expected name (defensive; not expected to occur for either of this
+ * file's two reference statements).
+ */
+async function _computeReferenceIndexDef(tgtClient, indexName, createSql) {
+  await tgtClient.query('BEGIN');
+  try {
+    await tgtClient.query(
+      `CREATE TEMP TABLE assertions (
+         project_id TEXT, subject TEXT, predicate TEXT, object TEXT, suppressed BOOLEAN
+       ) ON COMMIT DROP`
+    );
+    await tgtClient.query(createSql);
+    const info = await _queryLiveIndexInfo(tgtClient, indexName);
+    return info ? info.indexdef : null;
+  } finally {
+    await tgtClient.query('ROLLBACK');
+  }
+}
+
+/**
+ * classifyIntegrityIndex — S2's total classification of the LIVE
+ * assertions_1ton_exact_unique index. Never throws for a live-DB shape
+ * reason: MISSING covers "assertions itself doesn't exist yet" too (a
+ * 42P01 undefined_table from the 'assertions'::regclass cast is caught and
+ * folded into MISSING — by definition, no index can exist on an absent
+ * table). Only a schema-file-drift error (canonical DDL not found in
+ * handoff-core-schema.sql) or a genuine connection error propagates.
+ *
+ * @param {object} tgtClient - connected pg.Client
+ * @returns {Promise<{class: 'CURRENT'|'STALE_RAW_OBJECT'|'MISSING'|'UNRECOGNIZED', indexdef: string|null, indisvalid: boolean|null, indisunique: boolean|null}>}
+ */
+async function classifyIntegrityIndex(tgtClient) {
+  const indexName = INTEGRITY_INDEX_NAME;
+  let live;
+  try {
+    live = await _queryLiveIndexInfo(tgtClient, indexName);
+  } catch (err) {
+    if (err && err.code === '42P01') {
+      return { class: 'MISSING', indexdef: null, indisvalid: null, indisunique: null };
+    }
+    throw err;
+  }
+  if (!live) {
+    return { class: 'MISSING', indexdef: null, indisvalid: null, indisunique: null };
+  }
+  if (live.indisvalid !== true) {
+    // INVALID of ANY form -> UNRECOGNIZED, checked BEFORE any shape
+    // comparison (S2).
+    return { class: 'UNRECOGNIZED', indexdef: live.indexdef, indisvalid: live.indisvalid, indisunique: live.indisunique };
+  }
+
+  const liveNorm = _normalizeIndexDefForCompare(live.indexdef);
+
+  const canonicalCreateSql = _extractCanonicalCreateSql(indexName);
+  const canonicalDef = await _computeReferenceIndexDef(tgtClient, indexName, canonicalCreateSql);
+  const canonicalNorm = _normalizeIndexDefForCompare(canonicalDef);
+  if (canonicalNorm != null && liveNorm === canonicalNorm && live.indisunique === true) {
+    return { class: 'CURRENT', indexdef: live.indexdef, indisvalid: live.indisvalid, indisunique: live.indisunique };
+  }
+
+  const staleDef = await _computeReferenceIndexDef(tgtClient, indexName, STALE_RAW_OBJECT_CREATE_SQL);
+  const staleNorm = _normalizeIndexDefForCompare(staleDef);
+  if (staleNorm != null && liveNorm === staleNorm) {
+    return { class: 'STALE_RAW_OBJECT', indexdef: live.indexdef, indisvalid: live.indisvalid, indisunique: live.indisunique };
+  }
+
+  return { class: 'UNRECOGNIZED', indexdef: live.indexdef, indisvalid: live.indisvalid, indisunique: live.indisunique };
+}
+
 // ─── HUMAN-READABLE SUMMARY (cm#222 A1: dry-run emits this + the JSON) ────
 
 function printHumanSummary({ parsed, activeParsed, historyParsed, preconditionChecks, branch }) {
@@ -890,6 +1128,7 @@ async function main() {
   if (parsed.dryRun) {
     let preconditionChecks = null;
     let dbBranch = null;
+    let integrityIndexResult = null;
     if (parsed.db) {
       const { name: target, source: targetSource } = migrateOne.resolveTargetDb({ db: parsed.db });
       if (!migrateOne.DB_NAME_RE.test(target)) {
@@ -927,11 +1166,26 @@ async function main() {
       try {
         await tgtClient.connect();
         preconditionChecks = await checkSchemaPreconditions(tgtClient, dbBranch);
+        // S2: total classification of the LIVE integrity index — read-only
+        // (temp-table-shadowed, always rolled back — see the section header
+        // comment above classifyIntegrityIndex). Runs regardless of the
+        // column-precondition result above: independent checks, both
+        // reported.
+        integrityIndexResult = await classifyIntegrityIndex(tgtClient);
       } catch (err) {
-        console.error(`Could not connect to target database "${target}" for read-only precondition checks: ${err.message}`);
+        console.error(`Could not complete read-only precondition checks against target "${target}": ${err.message}`);
         process.exit(1);
       } finally {
         await tgtClient.end();
+      }
+      console.log(`  integrity_index_class=${integrityIndexResult.class} indisvalid=${integrityIndexResult.indisvalid} indisunique=${integrityIndexResult.indisunique}`);
+      if (integrityIndexResult.indexdef) {
+        console.log(`  live_indexdef=${integrityIndexResult.indexdef}`);
+      }
+      if (integrityIndexResult.class === 'STALE_RAW_OBJECT' || integrityIndexResult.class === 'MISSING') {
+        console.log(`  note: write mode will bring forward (class=${integrityIndexResult.class})`);
+      } else if (integrityIndexResult.class === 'UNRECOGNIZED') {
+        console.log('  note: UNRECOGNIZED integrity index shape — write mode will refuse (S3); manual investigation required');
       }
     } else {
       console.log('migrate-08-handoff-markdown: DRY-RUN (no --db) — schema preconditions not checked, parse-only');
@@ -962,14 +1216,17 @@ async function main() {
 
     printHumanSummary({ parsed, activeParsed, historyParsed, preconditionChecks, branch: dbBranch });
 
-    const report = buildReport({ parsed, activeParsed, historyParsed, totalWritten: 0, crossFileCollisions, preconditionChecks, mode: 'dry_run', branch: dbBranch });
+    const report = buildReport({ parsed, activeParsed, historyParsed, totalWritten: 0, crossFileCollisions, preconditionChecks, integrityIndexResult, mode: 'dry_run', branch: dbBranch });
     const reportPath = writeReport(parsed.reportDir, parsed.projectId, report);
     console.log(`  [REPORT] ${reportPath}`);
 
     const preconditionsFailed = preconditionChecks
       && (preconditionChecks.assertionsTable === 'fail' || preconditionChecks.requiredColumns === 'fail');
-    if (preconditionsFailed) {
-      console.error('DRY_RUN_RESULT: FAIL (schema preconditions not met on target — see report)');
+    // S3: UNRECOGNIZED makes the dry-run report FAIL — CURRENT/STALE_RAW_OBJECT/
+    // MISSING (and 'not checked', no --db) never fail the dry-run on their own.
+    const integrityIndexUnrecognized = integrityIndexResult && integrityIndexResult.class === 'UNRECOGNIZED';
+    if (preconditionsFailed || integrityIndexUnrecognized) {
+      console.error('DRY_RUN_RESULT: FAIL (schema preconditions not met, or integrity index class is UNRECOGNIZED — see report)');
       process.exitCode = 1;
       return;
     }
@@ -1021,6 +1278,51 @@ async function main() {
   let exitCode = 0;
   try {
     const branch = classification.branch;
+
+    // ── S1 (bring-forward, WRITE mode only — this is not the --dry-run
+    // branch, which returned above and never reaches here): run BEFORE
+    // checkSchemaPreconditions() and BEFORE any INSERT/DELETE. A target
+    // whose schema is behind (or whose integrity index previously failed to
+    // apply) must never reach the write path silently — see this file's
+    // "INTEGRITY INDEX CLASSIFICATION" section header comment (above
+    // classifyIntegrityIndex) for the full DEFECT/root-cause writeup.
+    // Invoked once per (target, projectId) per process — on a shared
+    // STAGING/CANON target, a distinct --project-id re-runs this (and its
+    // own SCHEMA_EPOCH-gated intent-key migration) again; both are
+    // idempotent (project_settings.schema_fingerprint is keyed per
+    // (project_id, key), and every unit's own DDL is IF NOT EXISTS /
+    // DROP+CREATE-safe).
+    const schemaAdapter = new PostgresAdapter(tgtClient);
+    const bringForward = await handoffMod.ensureSchemaCurrent(schemaAdapter, parsed.projectId, { silent: false });
+    console.log(`  [SCHEMA-BRING-FORWARD] applied=${bringForward.applied} reason=${bringForward.reason}`);
+    if (bringForward.reason !== 'current' && bringForward.reason !== 'applied') {
+      console.error(`Refused: schema bring-forward for project_id="${parsed.projectId}" on target "${target}" did not succeed (reason=${bringForward.reason}).`);
+      console.error(`  detail=${JSON.stringify(bringForward.detail || {})}`);
+      console.error(
+        '  A failed CREATE for an integrity index leaves the STALE index intact ' +
+        '(db-seam.js runIntegrityIndexPair rolls the paired DROP back too when the CREATE ' +
+        'fails, so the index is never left dropped-and-not-recreated) — but nothing was ' +
+        'brought forward either. Nothing was applied.'
+      );
+      process.exitCode = 1;
+      return;
+    }
+
+    // ── S2/S3 (index classification gate, checked AFTER S1, independent of
+    // S1's own return value): WRITE proceeds only when the LIVE index is
+    // classified CURRENT. S1 reporting success is never trusted as proof
+    // the live catalog object actually matches the canonical shape.
+    const integrityIndexResult = await classifyIntegrityIndex(tgtClient);
+    console.log(`  integrity_index_class=${integrityIndexResult.class} indisvalid=${integrityIndexResult.indisvalid} indisunique=${integrityIndexResult.indisunique}`);
+    if (integrityIndexResult.class !== 'CURRENT') {
+      console.error(`Refused: assertions_1ton_exact_unique is not CURRENT after schema bring-forward (class=${integrityIndexResult.class}).`);
+      console.error(`  live pg_get_indexdef=${integrityIndexResult.indexdef}`);
+      console.error(`  indisvalid=${integrityIndexResult.indisvalid}`);
+      console.error('  Nothing was applied.');
+      process.exitCode = 1;
+      return;
+    }
+
     const preconditionChecks = await checkSchemaPreconditions(tgtClient, branch);
     console.log(`  required_columns=[${preconditionChecks.requiredColumnsList.join(',')}] (branch=${branch})`);
     if (preconditionChecks.assertionsTable === 'fail') {
@@ -1132,7 +1434,7 @@ async function main() {
       }
     }
 
-    const report = buildReport({ parsed, activeParsed, historyParsed, totalWritten, crossFileCollisions, preconditionChecks, mode: 'migrate', branch });
+    const report = buildReport({ parsed, activeParsed, historyParsed, totalWritten, crossFileCollisions, preconditionChecks, integrityIndexResult, mode: 'migrate', branch });
     const reportPath = writeReport(parsed.reportDir, parsed.projectId, report);
     console.log(`  [REPORT] ${reportPath}`);
 
@@ -1194,7 +1496,7 @@ function loadHeadingsConfig(configPath) {
 
 // ─── REPORT (base spec point 5, fail-soft; cm#222 A6 extension) ──────────
 
-function buildReport({ parsed, activeParsed, historyParsed, totalWritten, crossFileCollisions, preconditionChecks, mode, branch }) {
+function buildReport({ parsed, activeParsed, historyParsed, totalWritten, crossFileCollisions, preconditionChecks, integrityIndexResult, mode, branch }) {
   return {
     mode: mode || (parsed.dryRun ? 'dry_run' : (parsed.rollback ? 'rollback' : 'migrate')),
     project_id: parsed.projectId,
@@ -1212,6 +1514,16 @@ function buildReport({ parsed, activeParsed, historyParsed, totalWritten, crossF
         missing_columns: preconditionChecks.missingColumns,
       }
       : { assertions_table: 'not_checked', required_columns: 'not_checked', required_columns_list: [], missing_columns: [] },
+    // S2/S3: total classification of the live assertions_1ton_exact_unique
+    // index. 'not_checked' only when no --db was given in dry-run mode.
+    integrity_index_class: integrityIndexResult ? integrityIndexResult.class : 'not_checked',
+    integrity_index_detail: integrityIndexResult
+      ? {
+        indexdef: integrityIndexResult.indexdef,
+        indisvalid: integrityIndexResult.indisvalid,
+        indisunique: integrityIndexResult.indisunique,
+      }
+      : null,
     // ADDENDA_ONLY columns this migration's write path omits from the
     // INSERT column list on this branch (empty on CANON/STAGING).
     omitted_columns: branch ? omittedColumnsForBranch(branch) : [],
@@ -1268,4 +1580,16 @@ module.exports = {
   ENGINE_CANON_COLUMNS,
   ADDENDA_ONLY_COLUMNS,
   SELF_BOOTSTRAPPED_COLUMNS,
+  // S1/S2/S3 — engine index bring-forward + total-classified integrity-index
+  // gate (exposed for test-migrate-08-handoff-markdown.js; no test-side
+  // reimplementation of the classification or the temp-table normalization
+  // engine).
+  classifyIntegrityIndex,
+  _normalizeIndexDefForCompare,
+  _extractCanonicalCreateSql,
+  _computeReferenceIndexDef,
+  _queryLiveIndexInfo,
+  INTEGRITY_INDEX_NAME,
+  STALE_RAW_OBJECT_CREATE_SQL,
+  CORE_SCHEMA_SQL_PATH,
 };

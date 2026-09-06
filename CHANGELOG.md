@@ -23,6 +23,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **migrate-08: engine index bring-forward + total-classified integrity-index gate (unblocks pwa-etl item B)** —
+  a live WRITE against `memory_manager_staging` failed with `index row size
+  3552 exceeds btree version 4 maximum 2704 for index
+  "assertions_1ton_exact_unique"`. Staging's live index was still the stale
+  pre-cm#227 raw form `(project_id, subject, predicate, object) WHERE
+  (suppressed = false)`; the canonical form is keyed on `md5(object)`
+  instead. Root cause: `scripts/migrations/migrate-08-handoff-markdown.js`
+  never called the engine's own `ensureSchemaCurrent()` before INSERTing —
+  `checkSchemaPreconditions()` only ever probed
+  `information_schema.columns`, which cannot see an index's DEFINITION
+  (only whether a required column is present).
+  Fixed with three parts: **S1** — before `checkSchemaPreconditions()`, WRITE
+  mode now calls `ensureSchemaCurrent(db, projectId)` (via a `PostgresAdapter`
+  wrapping this file's own client) and checks its return; any reason other
+  than `current`/`applied` aborts before any INSERT, printing the reason. A
+  failed CREATE for the integrity index leaves the stale index intact
+  (`db-seam.js`'s `runIntegrityIndexPair` rolls the paired DROP back too). On
+  a shared STAGING/CANON target this re-runs once per distinct `project_id`
+  that touches it — idempotent. **S2** — `classifyIntegrityIndex()` is a
+  total, independent classification of the LIVE
+  `assertions_1ton_exact_unique` index into exactly one of `CURRENT` |
+  `STALE_RAW_OBJECT` | `MISSING` | `UNRECOGNIZED`, scoped by
+  `indrelid='assertions'::regclass` (a same-named index on a different table
+  is `MISSING` for assertions, never a false match) and gated on
+  `indisvalid`/`indisunique`. The canonical-definition comparison uses one
+  normalization rule: inside a transaction that is always rolled back, a TEMP
+  TABLE literally named `assertions` shadows the real table so the
+  UNMODIFIED `CREATE UNIQUE INDEX` extracted by name from
+  `handoff-core-schema.sql` (reusing `handoff.js`'s own
+  `_extractIntegrityIndexOps`) can run against it verbatim; the two
+  `pg_get_indexdef()` outputs are compared only after stripping the `ON
+  <schema>.assertions` qualifier from both sides. Leaves zero persistent
+  objects on the target, in both dry-run and write mode. **S3** — WRITE
+  proceeds only when S2 (checked AFTER S1) reports `CURRENT`; otherwise it
+  aborts before any INSERT, printing the class, the live
+  `pg_get_indexdef()`, and `indisvalid`. `--dry-run` always reports the
+  class (`integrity_index_class` in the JSON report); `STALE_RAW_OBJECT`/
+  `MISSING` are PASS-with-note ("write mode will bring forward"),
+  `UNRECOGNIZED` fails the dry-run report. Existing dry-run counts
+  (sections/tables_parsed/orphan_rows/unrecognized_dash) are unchanged.
+
 - **cm#233: `open_thread` subject derivation replaced (`intentKey`) + resolved_threads/open_threads matcher classification, migrated together** —
   `deriveIntentSubject` (colon-split-before-char-60-else-truncate-to-80, no
   Unicode normalization, no whitespace collapse) is REMOVED, not aliased,
