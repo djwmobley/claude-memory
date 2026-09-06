@@ -5436,7 +5436,7 @@ async function cmdClose(args) {
     if (extractionEmptyAtEntry) {
       console.log(
         '\n  WARNING: extraction-empty close — payload carried no entities/assertions/edges. ' +
-        'The close contract expects the full extraction in one pass (see commands/handoff/close.md §1-§4). ' +
+        'The close contract expects the full extraction in one pass (see commands/handoff/close.md §1-§5). ' +
         'Queued for async extraction anyway.'
       );
     }
@@ -5626,7 +5626,7 @@ async function cmdClose(args) {
     if (extractionEmptyAtEntry) {
       console.log(
         '\n  WARNING: extraction-empty close — payload carries no entities/assertions/edges. ' +
-        'The close contract expects the full extraction in one pass (see commands/handoff/close.md §1-§4). ' +
+        'The close contract expects the full extraction in one pass (see commands/handoff/close.md §1-§5). ' +
         'Intent rows (if any) would still be written on a real close.'
       );
     }
@@ -6482,7 +6482,7 @@ async function cmdClose(args) {
   if (extractionEmptyAtEntry) {
     console.log(
       '\n  WARNING: extraction-empty close — payload carried no entities/assertions/edges. ' +
-      'The close contract expects the full extraction in one pass (see commands/handoff/close.md §1-§4). ' +
+      'The close contract expects the full extraction in one pass (see commands/handoff/close.md §1-§5). ' +
       'Intent rows were still written.'
     );
   }
