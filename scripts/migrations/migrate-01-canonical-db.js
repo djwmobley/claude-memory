@@ -74,6 +74,13 @@
  *                        result when the probe fails for them.
  *   - UNKNOWN:           defensive-only default (e.g. no name supplied);
  *                        not reachable via any documented CLI usage.
+ * A `--project-id` alongside a CANON/STAGING name is never validated against
+ * a live database (those branches never probe) — but it is not silently
+ * swallowed either: it is normalized and UUID-shape-checked in place, and
+ * the classification's `reason` (still `allowed: true`) carries a note —
+ * `project-id ignored for <branch> target` (well-formed) or `...
+ * (malformed)` (not UUID-shaped) — so a caller who passed one by mistake
+ * sees it named, rather than a silent no-op.
  * The refusal check runs BEFORE any WRITE connection is opened. A refused
  * name-only branch (CANON/STAGING never refuse; the three historical
  * SOURCE_ONLY names refuse without a --project-id) never opens a
@@ -190,6 +197,30 @@ function normalizeProjectId(raw) {
   let s = String(raw).trim();
   if (s.startsWith('{') && s.endsWith('}')) s = s.slice(1, -1).trim();
   return s.toLowerCase();
+}
+
+/**
+ * A caller-supplied --project-id is meaningless for a CANON/STAGING target
+ * (those branches are decided by name alone, never by a marker probe) — but
+ * silently dropping it would hide a caller's mistake (e.g. a copy-pasted
+ * --project-id left over from a PER_PROJECT_ENGINE invocation, or a
+ * malformed one that would have failed the probe had this been a probed
+ * target). Rather than validate-and-refuse (which would turn a harmless
+ * no-op flag into a hard failure on an otherwise-fine CANON/STAGING run),
+ * this surfaces the fact — and, if the value doesn't even look like a UUID,
+ * that too — as a note in `reason` on the still-allowed classification, so
+ * the caller sees it instead of silence. Returns null (no note) when no
+ * projectId was supplied at all, which is the common case and keeps
+ * `reason` exactly `null` for it, unchanged from before this note existed.
+ *
+ * @param {'CANON'|'STAGING'} branch
+ * @param {string|null|undefined} projectId
+ * @returns {string|null}
+ */
+function projectIdIgnoredNote(branch, projectId) {
+  if (!projectId) return null;
+  const malformed = !isValidUUID(normalizeProjectId(projectId));
+  return `project-id ignored for ${branch} target${malformed ? ' (malformed)' : ''}`;
 }
 
 /**
@@ -377,11 +408,19 @@ async function classifyTarget({ dbName, projectId, connect } = {}) {
     return { branch: 'UNKNOWN', allowed: false, reason: 'no database name supplied', connectionOpened: false };
   }
 
-  if (name === 'memory_manager' || name === 'memory_manager_staging') {
-    return { branch: 'CANON', allowed: true, reason: null, connectionOpened: false };
+  if (name === 'memory_manager') {
+    return {
+      branch: 'CANON', allowed: true,
+      reason: projectIdIgnoredNote('CANON', projectId),
+      connectionOpened: false,
+    };
   }
-  if (/_staging$/.test(name)) {
-    return { branch: 'STAGING', allowed: true, reason: null, connectionOpened: false };
+  if (name === 'memory_manager_staging' || /_staging$/.test(name)) {
+    return {
+      branch: 'STAGING', allowed: true,
+      reason: projectIdIgnoredNote('STAGING', projectId),
+      connectionOpened: false,
+    };
   }
 
   const probe = await probeProjectMarker({ dbName: name, projectId, connect });
@@ -773,6 +812,11 @@ async function main() {
   }
 
   console.log(`migrate-01-canonical-db: target="${target}" (resolved from ${source}, branch=${classification.branch})`);
+  if (classification.reason) {
+    // Allowed-but-noteworthy (e.g. a --project-id supplied alongside a
+    // CANON/STAGING target, where it is ignored) — surfaced, never silent.
+    console.log(`  note: ${classification.reason}`);
+  }
 
   // ── Step 1/2: connect to maintenance DB, create target if absent (race-safe) ──
 
