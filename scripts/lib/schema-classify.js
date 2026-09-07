@@ -282,6 +282,66 @@ function _checkManifestEntryAgainstOwnSQL(basename, normalizedSQL, manifestEntry
       }
     }
   }
+
+  // cm#185-schema-heal constraint extension: same desync guard for
+  // expected_uniques/expected_not_nulls/expected_checks/expected_index_defs
+  // — every table/columns/expression token declared must textually appear
+  // in this unit's own SQL, or a manifest hand-edit (typo/rename/phantom)
+  // fails loudly at classification time (manifest_desync) instead of
+  // becoming a permanent DEGRADED row the live database can never satisfy.
+  const expectedUniques = Array.isArray(manifestEntry.expected_uniques) ? manifestEntry.expected_uniques : [];
+  for (const u of expectedUniques) {
+    const parts = [
+      ['table', u.table],
+      ...((Array.isArray(u.columns) ? u.columns : []).map((c) => ['columns', c])),
+    ];
+    for (const [field, identifier] of parts) {
+      if (typeof identifier !== 'string' || !_identifierAppearsInSQL(normalizedSQL, identifier)) {
+        errors.push(
+          `${basename}: schema-manifest.json expected_uniques entry (table="${u.table}") — ${field} value ` +
+          `"${identifier}" has no textual match in this unit's own SQL — manifest/DDL desync (manifest_desync)`
+        );
+      }
+    }
+  }
+
+  const expectedNotNulls = Array.isArray(manifestEntry.expected_not_nulls) ? manifestEntry.expected_not_nulls : [];
+  for (const nn of expectedNotNulls) {
+    for (const [field, identifier] of [['table', nn.table], ['column', nn.column]]) {
+      if (typeof identifier !== 'string' || !_identifierAppearsInSQL(normalizedSQL, identifier)) {
+        errors.push(
+          `${basename}: schema-manifest.json expected_not_nulls entry (table="${nn.table}") — ${field} value ` +
+          `"${identifier}" has no textual match in this unit's own SQL — manifest/DDL desync (manifest_desync)`
+        );
+      }
+    }
+  }
+
+  const expectedChecks = Array.isArray(manifestEntry.expected_checks) ? manifestEntry.expected_checks : [];
+  for (const ck of expectedChecks) {
+    const parts = [
+      ['table', ck.table],
+      ...((Array.isArray(ck.expression_tokens) ? ck.expression_tokens : []).map((t) => ['expression_tokens', t])),
+    ];
+    for (const [field, identifier] of parts) {
+      if (typeof identifier !== 'string' || !_identifierAppearsInSQL(normalizedSQL, identifier)) {
+        errors.push(
+          `${basename}: schema-manifest.json expected_checks entry (table="${ck.table}") — ${field} value ` +
+          `"${identifier}" has no textual match in this unit's own SQL — manifest/DDL desync (manifest_desync)`
+        );
+      }
+    }
+  }
+
+  const expectedIndexDefs = Array.isArray(manifestEntry.expected_index_defs) ? manifestEntry.expected_index_defs : [];
+  for (const ix of expectedIndexDefs) {
+    if (typeof ix.name !== 'string' || !_identifierAppearsInSQL(normalizedSQL, ix.name)) {
+      errors.push(
+        `${basename}: schema-manifest.json expected_index_defs entry — name value "${ix.name}" has no textual ` +
+        `match in this unit's own SQL — manifest/DDL desync (manifest_desync)`
+      );
+    }
+  }
 }
 
 function loadManifest(sqlDir) {

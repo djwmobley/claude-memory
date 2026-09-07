@@ -2448,6 +2448,287 @@ async function _healExpectedFks(db, projectId, fixable) {
   }
 }
 
+/**
+ * cm#185-schema-heal constraint extension: normalize a CHECK/index-def
+ * expression for text comparison — collapse whitespace, lowercase, strip
+ * outer parens (once — a def wrapped in more than one layer keeps its inner
+ * parens, which is fine: they'll match on both sides identically as long as
+ * both the expected and actual text went through this SAME function).
+ */
+function _normalizeDefText(text) {
+  if (typeof text !== 'string') return '';
+  let t = text.replace(/\s+/g, ' ').trim().toLowerCase();
+  // A CHECK constraint's pg_get_constraintdef text always leads with the
+  // literal "CHECK " keyword before its own outer-parenthesized expression
+  // (e.g. "CHECK ((qty >= 0))") — strip that keyword first so the outer-
+  // paren strip below reaches the actual expression on both sides of a
+  // comparison (a hand-written manifest `def` may or may not include the
+  // "CHECK" keyword itself; this is a no-op when it's absent).
+  t = t.replace(/^check\s*/, '');
+  if (t.startsWith('(') && t.endsWith(')')) t = t.slice(1, -1).trim();
+  return t;
+}
+
+function _sameColumnSet(a, b) {
+  const sa = [...(a || [])].sort();
+  const sb = [...(b || [])].sort();
+  return _sameOrderedList(sa, sb);
+}
+
+// ── UNIQUE (constraints/indexes) ────────────────────────────────────────────
+
+function _collectExpectedUniques(manifest, units) {
+  const list = [];
+  for (const u of units) {
+    const entry = manifest.units[u.basename];
+    const arr = entry && Array.isArray(entry.expected_uniques) ? entry.expected_uniques : [];
+    for (const uq of arr) {
+      list.push({
+        unit: u.basename, table: uq.table,
+        columns: Array.isArray(uq.columns) ? uq.columns : [],
+        predicate: typeof uq.predicate === 'string' ? uq.predicate : null,
+      });
+    }
+  }
+  return list;
+}
+
+/** Total classification: table_absent | absent | present_mismatched(reason) | present_matching. */
+function _classifyExpectedUniques(expected, tablesFound, liveUniques) {
+  const byTable = new Map();
+  for (const r of (liveUniques || [])) {
+    if (!byTable.has(r.table)) byTable.set(r.table, []);
+    byTable.get(r.table).push(r);
+  }
+  const results = [];
+  for (const uq of expected) {
+    if (!tablesFound.has(uq.table)) { results.push({ ...uq, state: 'table_absent' }); continue; }
+    const candidates = (byTable.get(uq.table) || []).filter((r) => _sameColumnSet(r.columns, uq.columns));
+    if (candidates.length === 0) { results.push({ ...uq, state: 'absent' }); continue; }
+    const expPred = uq.predicate ? _normalizeDefText(uq.predicate) : null;
+    const match = candidates.find((r) => {
+      const actPred = r.predicate ? _normalizeDefText(r.predicate) : null;
+      return actPred === expPred;
+    });
+    const extras = match ? candidates.filter((r) => r.name !== match.name) : [];
+    if (!match) {
+      results.push({ ...uq, state: 'present_mismatched', reason: 'predicate_mismatch', actual: candidates[0], extras: candidates, dropTargets: candidates });
+      continue;
+    }
+    if (extras.length > 0) {
+      results.push({ ...uq, state: 'present_mismatched', reason: `extra_constraint:${extras.map((e) => e.name).join(',')}`, actual: match, extras, dropTargets: extras });
+      continue;
+    }
+    results.push({ ...uq, state: 'present_matching', actual: match });
+  }
+  return results;
+}
+
+async function _healExpectedUniques(db, projectId, fixable) {
+  const lockKey = 'schema_apply:' + projectId;
+  await db.acquireSchemaApplyLock(lockKey);
+  try {
+    const plans = fixable.map((uq) => {
+      const dropTargets = uq.dropTargets || uq.extras || [];
+      const needsAdd = !(typeof uq.reason === 'string' && uq.reason.startsWith('extra_constraint:'));
+      return {
+        kind: 'unique', table: uq.table, columns: uq.columns, predicate: uq.predicate,
+        dropNames: dropTargets.map((e) => e.name).filter(Boolean), skipAdd: !needsAdd,
+      };
+    });
+    return await db.healConstraints(plans);
+  } finally {
+    await db.releaseSchemaApplyLock(lockKey);
+  }
+}
+
+// ── NOT NULL ─────────────────────────────────────────────────────────────
+
+function _collectExpectedNotNulls(manifest, units) {
+  const list = [];
+  for (const u of units) {
+    const entry = manifest.units[u.basename];
+    const arr = entry && Array.isArray(entry.expected_not_nulls) ? entry.expected_not_nulls : [];
+    for (const nn of arr) list.push({ unit: u.basename, table: nn.table, column: nn.column });
+  }
+  return list;
+}
+
+/** table_absent | absent (column present but nullable, or column missing entirely is table_absent's sibling — see below) | present_matching. */
+function _classifyExpectedNotNulls(expected, tablesFound, liveNotNulls) {
+  const byKey = new Map();
+  for (const r of (liveNotNulls || [])) byKey.set(`${r.table}.${r.column}`, r);
+  const results = [];
+  for (const nn of expected) {
+    if (!tablesFound.has(nn.table)) { results.push({ ...nn, state: 'table_absent' }); continue; }
+    const row = byKey.get(`${nn.table}.${nn.column}`);
+    if (!row) { results.push({ ...nn, state: 'absent' }); continue; } // column itself absent
+    if (row.notNull !== true) { results.push({ ...nn, state: 'present_mismatched', reason: 'nullable' }); continue; }
+    results.push({ ...nn, state: 'present_matching' });
+  }
+  return results;
+}
+
+async function _healExpectedNotNulls(db, projectId, fixable) {
+  const lockKey = 'schema_apply:' + projectId;
+  await db.acquireSchemaApplyLock(lockKey);
+  try {
+    const plans = fixable.map((nn) => ({ kind: 'notnull', table: nn.table, column: nn.column }));
+    return await db.healConstraints(plans);
+  } finally {
+    await db.releaseSchemaApplyLock(lockKey);
+  }
+}
+
+// ── CHECK ────────────────────────────────────────────────────────────────
+
+function _collectExpectedChecks(manifest, units) {
+  const list = [];
+  for (const u of units) {
+    const entry = manifest.units[u.basename];
+    const arr = entry && Array.isArray(entry.expected_checks) ? entry.expected_checks : [];
+    for (const ck of arr) {
+      list.push({
+        unit: u.basename, table: ck.table,
+        // Identity (PR #268 review finding): the column set the CHECK
+        // expression references, matched against the live probe's
+        // pg_constraint.conkey-derived columns — never just "some CHECK on
+        // this table with matching text", which let a drifted expression on
+        // the SAME columns silently classify as a distinct-but-unrelated
+        // "absent" entry (the exact suppression_kind CHECK-narrowing
+        // failure class from PR #129) instead of present_mismatched.
+        columns: Array.isArray(ck.columns) ? ck.columns : (Array.isArray(ck.expression_tokens) ? ck.expression_tokens : []),
+        expression_tokens: Array.isArray(ck.expression_tokens) ? ck.expression_tokens : [],
+        normalized_def: _normalizeDefText(ck.def || ''),
+        def: ck.def,
+      });
+    }
+  }
+  return list;
+}
+
+/**
+ * PR #268 review fix: TOTAL classification — table_absent | absent |
+ * present_mismatched(check_def_drift:<conname> | extra_constraint:<names>)
+ * | present_matching. Identity is (table, sorted column set) — NEVER just
+ * "does some live CHECK on this table have matching text", which
+ * previously let a drifted expression on the identity-matching columns
+ * classify as `absent` (a phantom "missing" that then ADD-only healed
+ * alongside the untouched stale one, silently masking it forever once the
+ * fresh one cleared degradation — same failure class as PR #129's
+ * suppression_kind CHECK narrowing).
+ */
+function _classifyExpectedChecks(expected, tablesFound, liveChecks) {
+  const byIdentity = new Map();
+  for (const r of (liveChecks || [])) {
+    const key = `${r.table}::${[...(r.columns || [])].sort().join(',')}`;
+    if (!byIdentity.has(key)) byIdentity.set(key, []);
+    byIdentity.get(key).push(r);
+  }
+  const results = [];
+  for (const ck of expected) {
+    if (!tablesFound.has(ck.table)) { results.push({ ...ck, state: 'table_absent' }); continue; }
+    const key = `${ck.table}::${[...(ck.columns || [])].sort().join(',')}`;
+    const candidates = byIdentity.get(key) || [];
+    if (candidates.length === 0) { results.push({ ...ck, state: 'absent' }); continue; }
+    const match = candidates.find((r) => _normalizeDefText(r.def) === ck.normalized_def);
+    const extras = match ? candidates.filter((r) => r.conname !== match.conname) : [];
+    if (!match) {
+      // Wrong/drifted expression on the identity-matching column set — drop
+      // EVERY candidate on this identity (the whole stale set, not just the
+      // first one) and add the correct constraint fresh.
+      results.push({
+        ...ck, state: 'present_mismatched',
+        reason: `check_def_drift:${candidates[0].conname}`, actual: candidates[0],
+        extras: candidates, dropTargets: candidates,
+      });
+      continue;
+    }
+    if (extras.length > 0) {
+      results.push({
+        ...ck, state: 'present_mismatched',
+        reason: `extra_constraint:${extras.map((e) => e.conname).join(',')}`, actual: match,
+        extras, dropTargets: extras,
+      });
+      continue;
+    }
+    results.push({ ...ck, state: 'present_matching', actual: match });
+  }
+  return results;
+}
+
+/**
+ * PR #268 review fix: dropNames now carries the drifted/extra constraint
+ * name(s) (never hardcoded []) so heal is a real DROP+ADD in one
+ * transaction — a stale CHECK never lingers once the fresh one clears
+ * degradation. `skipAdd` mirrors the FK/UNIQUE extra_constraint-only case:
+ * the identity-matching constraint is already correct, only a stale extra
+ * needs to go, so re-adding would leave a duplicate.
+ */
+async function _healExpectedChecks(db, projectId, fixable) {
+  const lockKey = 'schema_apply:' + projectId;
+  await db.acquireSchemaApplyLock(lockKey);
+  try {
+    const plans = fixable.map((ck, i) => {
+      const dropTargets = ck.dropTargets || ck.extras || [];
+      const needsAdd = !(typeof ck.reason === 'string' && ck.reason.startsWith('extra_constraint:'));
+      return {
+        kind: 'check', table: ck.table, conname: `heal_${i}_${Date.now()}`, def: ck.def,
+        dropNames: dropTargets.map((e) => e.conname).filter(Boolean), skipAdd: !needsAdd,
+      };
+    });
+    return await db.healConstraints(plans);
+  } finally {
+    await db.releaseSchemaApplyLock(lockKey);
+  }
+}
+
+// ── INDEX DEFINITIONS ────────────────────────────────────────────────────
+
+function _collectExpectedIndexDefs(manifest, units) {
+  const list = [];
+  for (const u of units) {
+    const entry = manifest.units[u.basename];
+    const arr = entry && Array.isArray(entry.expected_index_defs) ? entry.expected_index_defs : [];
+    for (const ix of arr) {
+      list.push({
+        unit: u.basename, name: ix.name,
+        create_sql: ix.create_sql,
+        normalized_def: _normalizeDefText(ix.normalized_def || ix.create_sql || ''),
+      });
+    }
+  }
+  return list;
+}
+
+/** absent | present_mismatched(index_def_drift) | present_matching — no table_absent branch: identity is the index name itself (already covered by the ungated `indexes` expected-objects existence probe). */
+function _classifyExpectedIndexDefs(expected, liveIndexDefs) {
+  const byName = new Map();
+  for (const r of (liveIndexDefs || [])) byName.set(r.name, r);
+  const results = [];
+  for (const ix of expected) {
+    const row = byName.get(ix.name);
+    if (!row) { results.push({ ...ix, state: 'absent' }); continue; }
+    if (_normalizeDefText(row.def) !== ix.normalized_def) {
+      results.push({ ...ix, state: 'present_mismatched', reason: 'index_def_drift', actual: row });
+      continue;
+    }
+    results.push({ ...ix, state: 'present_matching', actual: row });
+  }
+  return results;
+}
+
+async function _healExpectedIndexDefs(db, projectId, fixable) {
+  const lockKey = 'schema_apply:' + projectId;
+  await db.acquireSchemaApplyLock(lockKey);
+  try {
+    const plans = fixable.map((ix) => ({ kind: 'indexdef', name: ix.name, def: ix.create_sql }));
+    return await db.healConstraints(plans);
+  } finally {
+    await db.releaseSchemaApplyLock(lockKey);
+  }
+}
+
 async function checkPgvectorGatedObjects(db, manifest, units) {
   const gatedColumns = _collectGatedColumns(manifest, units);
   if (gatedColumns.length === 0) return { ok: true, vectorExtensionPresent: null, missing: [] };
@@ -2881,13 +3162,19 @@ async function ensureSchemaCurrentCore(db, projectId, { silent } = {}) {
     const shapeTargets = gatedColumns
       .filter((gc) => gc.type || gc.dims != null)
       .map((gc) => ({ table: gc.table, column: gc.column }));
+    // cm#185-schema-heal constraint extension: expected_index_defs names
+    // must be included in the SAME `indexes` param the combined probe's
+    // 'indexdef' arm filters by (F2-style: no table_absent branch, no extra
+    // round trip on the common all-clean touch).
+    const expectedIndexDefNames = _collectExpectedIndexDefs(classification.manifest, units).map((e) => e.name);
+    const probeIndexes = [...new Set([...(expected.indexes || []), ...expectedIndexDefNames])];
 
     let probe;
     try {
       probe = await db.probeFastPathSchemaState({
         tables: expected.tables,
         columns: expected.columns.concat(gatedColumns.map((gc) => ({ table: gc.table, column: gc.column }))),
-        indexes: expected.indexes,
+        indexes: probeIndexes,
         shapeTargets,
       });
     } catch (probeErr) {
@@ -2978,6 +3265,84 @@ async function ensureSchemaCurrentCore(db, projectId, { silent } = {}) {
       // other) degraded row exactly like the gated-column branch below does
       // when its own set is clean; idempotent no-op when nothing is set.
       await clearSchemaDegradation(db, projectId);
+    }
+
+    // ── UNIQUE/NOT NULL/CHECK/index-def verification + heal (cm#185-schema-
+    // heal constraint extension) ────────────────────────────────────────────
+    // Same shape as the FK block above, off the SAME combined probe — no
+    // extra round trip on the common all-clean touch. Each kind runs
+    // independently (a failure in one kind still lets the others heal) but
+    // any kind left non-clean after its own heal attempt DEGRADEs the touch
+    // with that kind's specific reason string.
+    const constraintKinds = [
+      { key: 'uniques',   reason: 'unique_mismatch',    collect: _collectExpectedUniques,   classify: (exp, tf, p) => _classifyExpectedUniques(exp, tf, p.uniques),   heal: _healExpectedUniques,   reprobeKind: 'uniques' },
+      { key: 'notNulls',  reason: 'notnull_mismatch',   collect: _collectExpectedNotNulls,  classify: (exp, tf, p) => _classifyExpectedNotNulls(exp, tf, p.notNulls), heal: _healExpectedNotNulls,  reprobeKind: 'notNulls' },
+      { key: 'checks',    reason: 'check_mismatch',     collect: _collectExpectedChecks,    classify: (exp, tf, p) => _classifyExpectedChecks(exp, tf, p.checks),    heal: _healExpectedChecks,    reprobeKind: 'checks' },
+    ];
+    for (const kindDef of constraintKinds) {
+      const expectedList = kindDef.collect(classification.manifest, units);
+      if (expectedList.length === 0) continue;
+      let results = kindDef.classify(expectedList, probe.tablesFound, probe);
+      const fixable = results.filter((r) => r.state === 'absent' || r.state === 'present_mismatched');
+      if (fixable.length > 0) {
+        const healOutcome = await kindDef.heal(db, projectId, fixable);
+        if (!healOutcome.ok) {
+          const detail = { items: results, reason: `heal_failed:${(healOutcome.sqlstate || 'unknown')}`, healMessage: healOutcome.message };
+          await recordSchemaDegradation(db, projectId, kindDef.reason, detail, { silent });
+          return { applied: false, reason: 'degraded', detail };
+        }
+        let reprobe;
+        try {
+          const reTables = [...new Set(expectedList.map((e) => e.table))];
+          reprobe = await db.probeFastPathSchemaState({ tables: reTables, columns: [], indexes: [], shapeTargets: [] });
+        } catch (probeErr) {
+          const detail = { message: probeErr.message, reason: 'verification_probe_failed' };
+          await recordSchemaDegradation(db, projectId, kindDef.reason, detail, { silent });
+          return { applied: false, reason: 'degraded', detail };
+        }
+        results = kindDef.classify(expectedList, reprobe.tablesFound, reprobe);
+      }
+      const stillBad = results.filter((r) => r.state !== 'present_matching');
+      if (stillBad.length > 0) {
+        const detail = { items: stillBad };
+        await recordSchemaDegradation(db, projectId, kindDef.reason, detail, { silent });
+        return { applied: false, reason: 'degraded', detail };
+      }
+      await clearSchemaDegradation(db, projectId);
+    }
+    // index-defs: identity is the index name (no table_absent branch needed
+    // — see _classifyExpectedIndexDefs's own doc) — kept as its own block
+    // since it re-probes via the `indexes` param, not `tables`.
+    {
+      const expectedIndexDefs = _collectExpectedIndexDefs(classification.manifest, units);
+      if (expectedIndexDefs.length > 0) {
+        let results = _classifyExpectedIndexDefs(expectedIndexDefs, probe.indexDefs);
+        const fixable = results.filter((r) => r.state === 'absent' || r.state === 'present_mismatched');
+        if (fixable.length > 0) {
+          const healOutcome = await _healExpectedIndexDefs(db, projectId, fixable);
+          if (!healOutcome.ok) {
+            const detail = { items: results, reason: `heal_failed:${(healOutcome.sqlstate || 'unknown')}`, healMessage: healOutcome.message };
+            await recordSchemaDegradation(db, projectId, 'index_def_mismatch', detail, { silent });
+            return { applied: false, reason: 'degraded', detail };
+          }
+          let reprobe;
+          try {
+            reprobe = await db.probeFastPathSchemaState({ tables: [], columns: [], indexes: expectedIndexDefs.map((e) => e.name), shapeTargets: [] });
+          } catch (probeErr) {
+            const detail = { message: probeErr.message, reason: 'verification_probe_failed' };
+            await recordSchemaDegradation(db, projectId, 'index_def_mismatch', detail, { silent });
+            return { applied: false, reason: 'degraded', detail };
+          }
+          results = _classifyExpectedIndexDefs(expectedIndexDefs, reprobe.indexDefs);
+        }
+        const stillBad = results.filter((r) => r.state !== 'present_matching');
+        if (stillBad.length > 0) {
+          const detail = { items: stillBad };
+          await recordSchemaDegradation(db, projectId, 'index_def_mismatch', detail, { silent });
+          return { applied: false, reason: 'degraded', detail };
+        }
+        await clearSchemaDegradation(db, projectId);
+      }
     }
 
     // Ungated objects are all present — now total-classify the gated
@@ -10026,6 +10391,18 @@ if (require.main === module) {
     _collectExpectedFks,
     _classifyExpectedFks,
     _healExpectedFks,
+    _collectExpectedUniques,
+    _classifyExpectedUniques,
+    _healExpectedUniques,
+    _collectExpectedNotNulls,
+    _classifyExpectedNotNulls,
+    _healExpectedNotNulls,
+    _collectExpectedChecks,
+    _classifyExpectedChecks,
+    _healExpectedChecks,
+    _collectExpectedIndexDefs,
+    _classifyExpectedIndexDefs,
+    _healExpectedIndexDefs,
     // cm#185-schema-heal — exposed for test/test-schema-heal.js (no test-side
     // reimplementation of the fingerprint-persistence or readiness-reuse logic).
     recordSchemaFingerprint,
