@@ -383,10 +383,31 @@ async function seedDefaultProvider(dbName, { nativeDims = 8, storedDims = 4, end
     out = runCli(['status', '--json'], { cwd: projectDir, env: { PROJECT_ROOT: projectDir, HANDOFF_DB: undefined } }).stdout || '';
     assert(out.includes('"embedding_readiness": "UNEMBEDDABLE:no-provider"'), `expected no-provider state, got:\n${out}`);
 
-    // Seed a default provider -> READY.
+    // Seed a default provider pointed at a NON-live endpoint (owner directive
+    // "READY should mean fully embedded" — E1 now requires a successful LIVE
+    // provider probe, so a row existing alone is no longer sufficient) ->
+    // DEGRADED:probe-failed, never a silent READY.
     await seedDefaultProvider(dbName);
     out = runCli(['status', '--json'], { cwd: projectDir, env: { PROJECT_ROOT: projectDir, HANDOFF_DB: undefined } }).stdout || '';
-    assert(out.includes('"embedding_readiness": "READY"'), `expected READY state, got:\n${out}`);
+    assert(out.includes('"embedding_readiness": "DEGRADED:probe-failed('), `expected DEGRADED:probe-failed state for a non-live endpoint, got:\n${out}`);
+
+    // Point the default provider at a REAL fake embed server (matching its
+    // seeded native/stored dims) -> the live probe now succeeds, and with
+    // zero actionable backlog the classifier converges to READY.
+    let fakeServer = null;
+    try {
+      fakeServer = await startFakeEmbedServerProcess(8, 0.1);
+      const dbFix = await pgConnect(dbName);
+      await dbFix.query(
+        `UPDATE embedding_providers SET endpoint = $1 WHERE name = 'test-provider'`,
+        [`http://127.0.0.1:${fakeServer.port}/v1/embeddings`]
+      );
+      await dbFix.end();
+      out = runCli(['status', '--json'], { cwd: projectDir, env: { PROJECT_ROOT: projectDir, HANDOFF_DB: undefined } }).stdout || '';
+      assert(out.includes('"embedding_readiness": "READY"'), `expected READY state with a live probe + no backlog, got:\n${out}`);
+    } finally {
+      if (fakeServer) { try { fakeServer.stop(); } catch (_) {} }
+    }
 
     await dropRawDb(dbName);
     fs.rmSync(projectDir, { recursive: true, force: true });
@@ -628,6 +649,36 @@ async function seedDefaultProvider(dbName, { nativeDims = 8, storedDims = 4, end
     await db.end();
     blackHole.close();
     await dropRawDb(dbName);
+  });
+
+  // ─── T14: checkpoint --note Done line carries embedding: <state> (PR #273
+  //     review gap — every Done line, including --note, must carry it) ─────
+  console.log('\n=== T14: handoff:checkpoint --note Done line includes embedding: <state> ===');
+  await test('T14: checkpoint --note Done line carries embedding: <state>', async () => {
+    const dbName = `handoff_embed_t14_${TS}`;
+    const projectDir = makeTempDir('t14');
+    const baseDir = makeTempDir('t14-base');
+    await createRawDb(dbName);
+    writePipelineYml(projectDir, { database: dbName });
+    let fakeServer = null;
+    try {
+      fakeServer = await startFakeEmbedServerProcess(LOCAL_PROVIDER_NATIVE_DIMS, 0.1);
+      const endpointUrl = `http://127.0.0.1:${fakeServer.port}`;
+      fs.writeFileSync(path.join(baseDir, 'handoff-embed.json'), JSON.stringify({ vllm_embed_url: endpointUrl }), 'utf8');
+      const initEnv = { PROJECT_ROOT: projectDir, HANDOFF_DB: undefined, VLLM_EMBED_URL: undefined, HANDOFF_BASE_DIR: baseDir };
+      const initRes = runCli(['init', '-y'], { cwd: projectDir, env: initEnv });
+      assertEqual(initRes.status, 0, `expected init exit 0, got ${initRes.status}. Output:\n${(initRes.stdout || '') + (initRes.stderr || '')}`);
+
+      const noteRes = runCli(['checkpoint', '--note', 't14 note text'], { cwd: projectDir, env: initEnv });
+      const out = (noteRes.stdout || '') + (noteRes.stderr || '');
+      assertEqual(noteRes.status, 0, `expected checkpoint --note exit 0, got ${noteRes.status}. Output:\n${out.slice(0, 1200)}`);
+      assert(/Done: handoff:checkpoint --note.*embedding: \S+/.test(out), `expected the --note Done line to carry embedding: <state>, got:\n${out.slice(0, 1200)}`);
+    } finally {
+      if (fakeServer) { try { fakeServer.stop(); } catch (_) {} }
+      await dropRawDb(dbName);
+      fs.rmSync(projectDir, { recursive: true, force: true });
+      fs.rmSync(baseDir, { recursive: true, force: true });
+    }
   });
 
   console.log(`\n─── Results ──────────────────────────────────────`);

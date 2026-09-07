@@ -134,8 +134,19 @@ default 250, `0` disables) within a 2-second wall-clock budget on every
 `status`/`resume`/`init`/`close`/`checkpoint` touch, under a non-blocking
 advisory lock, reusing `runBackfillEmbeddings` (never a second embed-loop
 implementation) — see `docs/how-memory-works.md`'s "Heal-on-touch" section.
-`handoff_status`'s result now includes `last_embed_heal`. **Not
-detected**: a target where the `vector` extension itself is present but an
+`handoff_status`'s result now includes `last_embed_heal`, plus (owner
+directive "READY should mean fully embedded") `embedding_readiness`
+(the single classifier's verbatim state — `DISABLED` |
+`UNEMBEDDABLE:no-extension` | `UNEMBEDDABLE:no-provider` |
+`DEGRADED:probe-failed(<reason>)` | `HEALING(<n>)` | `READY`, or
+`UNSUPPORTED:sqlite`; `READY` now requires BOTH a zero live+actionable
+NULL-embedding backlog AND a successful live provider probe — a row
+existing in `embedding_providers` is no longer sufficient on its own),
+`backlog` (the live+actionable NULL count backing `HEALING(<n>)`), and
+`unembeddable_empty_text` (empty-embed-text NULL rows — never counted
+toward `backlog`, never blocking `READY`). This is the exact same JSON
+`handoff.js status --json` returns; the MCP tool never re-derives it.
+**Not detected**: a target where the `vector` extension itself is present but an
 old version lacks the `halfvec` type (or `hnsw`/`halfvec_cosine_ops`) — the
 DO block's `EXCEPTION WHEN OTHERS` still degrades gracefully there, but
 `checkPgvectorGatedObjects()`'s `pg_extension` probe only checks whether

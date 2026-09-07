@@ -64,6 +64,28 @@ const TEXT_JS_BUILDER = {
 };
 
 /**
+ * LIVE_SQL_EXPR — E2/E4 (owner directive "READY should mean fully
+ * embedded"): the "is this row still live" predicate per table, for the
+ * optional `liveOnly` scoping threaded through _countsForTable/
+ * _sampleSubjects/_applyTable/runBackfillEmbeddings below. `assertions`
+ * carries suppressed/invalid_at; `decisions` carries neither column (no
+ * suppression/invalidation concept exists for that table today), so every
+ * decisions row is live by construction — `null` here means "no extra
+ * filter needed," never "skip this table."
+ */
+const LIVE_SQL_EXPR = {
+  assertions: `suppressed = false AND invalid_at IS NULL`,
+  decisions:  null,
+};
+
+/** Returns an `AND <expr>` fragment (or '') for the liveOnly scoping of `table`. */
+function _liveScopeSql(table, liveOnly) {
+  if (!liveOnly) return '';
+  const expr = LIVE_SQL_EXPR[table];
+  return expr ? `AND ${expr}` : '';
+}
+
+/**
  * resolveTables — normalize the --table flag ('assertions'|'decisions'|'all')
  * into the concrete array this run processes. Total classification: any
  * other value is a usage error (caller's responsibility to validate before
@@ -95,9 +117,10 @@ async function _hasEmbeddingColumns(db, table) {
  * optional projectId. Distinguishes "no embeddable text" (never actionable
  * — adversary finding #9) from genuinely pending rows.
  */
-async function _countsForTable(db, table, projectId) {
+async function _countsForTable(db, table, projectId, liveOnly = false) {
   const textExpr = TEXT_SQL_EXPR[table];
   const scopeSql = projectId ? `AND project_id = $1` : '';
+  const liveSql = _liveScopeSql(table, liveOnly);
   const params = projectId ? [projectId] : [];
   const { rows } = await db.query(
     `SELECT
@@ -106,7 +129,7 @@ async function _countsForTable(db, table, projectId) {
        COUNT(*) FILTER (WHERE embedding IS NOT NULL)                          AS already_embedded,
        COUNT(*)                                                                AS total
      FROM ${table}
-     WHERE 1=1 ${scopeSql}`,
+     WHERE 1=1 ${scopeSql} ${liveSql}`,
     params
   );
   const r = rows[0];
@@ -118,14 +141,15 @@ async function _countsForTable(db, table, projectId) {
   };
 }
 
-async function _sampleSubjects(db, table, projectId, limit) {
+async function _sampleSubjects(db, table, projectId, limit, liveOnly = false) {
   const textExpr = TEXT_SQL_EXPR[table];
   const scopeSql = projectId ? `AND project_id = $1` : '';
+  const liveSql = _liveScopeSql(table, liveOnly);
   const params = projectId ? [projectId, limit] : [limit];
   const limitIdx = projectId ? 2 : 1;
   const { rows } = await db.query(
     `SELECT id, ${textExpr} AS text FROM ${table}
-     WHERE embedding IS NULL AND trim(${textExpr}) <> '' ${scopeSql}
+     WHERE embedding IS NULL AND trim(${textExpr}) <> '' ${scopeSql} ${liveSql}
      ORDER BY id ASC LIMIT $${limitIdx}`,
     params
   );
@@ -164,6 +188,8 @@ async function _applyTable(db, table, projectId, provider, providerId, batchSize
   // byte-identical when neither option is supplied.
   const rowCap     = Number.isFinite(boundOpts.rowCap) ? boundOpts.rowCap : Infinity;
   const deadlineAt = Number.isFinite(boundOpts.deadlineAt) ? boundOpts.deadlineAt : Infinity;
+  const liveOnly   = !!boundOpts.liveOnly;
+  const liveSql    = _liveScopeSql(table, liveOnly);
   let stopped = null; // null | 'row_cap' | 'deadline'
 
   for (;;) {
@@ -175,7 +201,7 @@ async function _applyTable(db, table, projectId, provider, providerId, batchSize
     const limitIdx = projectId ? 3 : 2;
     const { rows: batch } = await db.query(
       `SELECT id, ${textExpr} AS text FROM ${table}
-       WHERE embedding IS NULL AND trim(${textExpr}) <> '' AND id > $1 ${scopeSql}
+       WHERE embedding IS NULL AND trim(${textExpr}) <> '' AND id > $1 ${scopeSql} ${liveSql}
        ORDER BY id ASC LIMIT $${limitIdx}`,
       projectId ? [lastId, projectId, thisBatchSize] : [lastId, thisBatchSize]
     );
@@ -262,6 +288,11 @@ async function runBackfillEmbeddings(opts = {}) {
   const tables = resolveTables(opts.table);
   const rowCap = Number.isFinite(opts.rowCap) ? opts.rowCap : Infinity;
   const deadlineAt = Number.isFinite(opts.deadlineAt) ? opts.deadlineAt : Infinity;
+  // E2/E4 (owner directive): scope candidate rows to LIVE (suppressed=false
+  // AND invalid_at IS NULL, on tables that carry those columns) -- default
+  // false preserves byte-identical behavior for the pre-existing CLI/dev-
+  // script callers; embed-heal.js's own calls opt in explicitly.
+  const liveOnly = !!opts.liveOnly;
 
   // ── SQLite: total-classification 4th branch — never queries, never BLOCKs ──
   if (dialect === 'sqlite') {
@@ -329,7 +360,7 @@ async function runBackfillEmbeddings(opts = {}) {
     const results = [];
     let totalEmbeddedSoFar = 0;
     for (const table of tables) {
-      const counts = await _countsForTable(db, table, projectId);
+      const counts = await _countsForTable(db, table, projectId, liveOnly);
       const remainingRowCap = rowCap - totalEmbeddedSoFar;
       if (remainingRowCap <= 0 || Date.now() >= deadlineAt) {
         // Budget already exhausted by an earlier table — skip this one's
@@ -347,7 +378,7 @@ async function runBackfillEmbeddings(opts = {}) {
         continue;
       }
       const applied = await _applyTable(db, table, projectId, provider, providerRow.id, batchSize, log, {
-        rowCap: remainingRowCap, deadlineAt,
+        rowCap: remainingRowCap, deadlineAt, liveOnly,
       });
       totalEmbeddedSoFar += applied.embedded;
       results.push({
@@ -374,8 +405,8 @@ async function runBackfillEmbeddings(opts = {}) {
       });
       continue;
     }
-    const counts = await _countsForTable(db, table, projectId);
-    const samples = counts.actionableNull > 0 ? await _sampleSubjects(db, table, projectId, 5) : [];
+    const counts = await _countsForTable(db, table, projectId, liveOnly);
+    const samples = counts.actionableNull > 0 ? await _sampleSubjects(db, table, projectId, 5, liveOnly) : [];
     results.push({
       table, dialect: 'postgres',
       actionableNull: counts.actionableNull,

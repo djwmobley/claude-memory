@@ -30,8 +30,10 @@ const __startNs = process.hrtime.bigint();
  *                           --batch-size=N (default 10), --project-id=<id> (default: whole DB),
  *                           --force-mixed-provider (bypass the mixed-provider refusal).
  *   status                  Read-only: show counts, last close, contract names, and
- *                           embedding_readiness (READY | UNEMBEDDABLE:no-extension |
- *                           UNEMBEDDABLE:no-provider | DEGRADED:opt-out | N/A (sqlite backend)).
+ *                           embedding_readiness (DISABLED | UNEMBEDDABLE:no-extension |
+ *                           UNEMBEDDABLE:no-provider | DEGRADED:probe-failed(<reason>) |
+ *                           HEALING(<n>) | READY | UNSUPPORTED:sqlite — READY requires a
+ *                           zero live+actionable backlog AND a successful live provider probe).
  *   resume                  Inline SessionStart load (prints compact context summary).
  *   drop                    Zero all assertions, archive handoff.md, create fresh one.
  *   checkpoint --json -     Mid-session extraction (reads JSON from stdin).
@@ -94,10 +96,13 @@ const { embedQuery }                               = require('./lib/embed');
 const {
   seedLocalEmbeddingProvider,
   resolveConfiguredEmbedEndpointDetailed,
+  resolveDefaultProvider,
+  createProviderFromRow,
+  probeProvider,
 } = require('./lib/embedding-provider');
 const { embedForWrite, classifyEmbeddingWriteError } = require('./lib/write-time-embed');
 const { runBackfillEmbeddings }                    = require('./lib/backfill-embeddings');
-const { runEmbedHealIfNeeded, DEFAULT_BATCH_PER_TOUCH: DEFAULT_EMBED_HEAL_BATCH } = require('./lib/embed-heal');
+const { runEmbedHealIfNeeded } = require('./lib/embed-heal');
 const { execFileSync }                             = require('child_process');
 const crypto                                       = require('crypto');
 const { REALITY_CHECKS, runVerifyDispatch }        = require('./lib/reality-checks');
@@ -2787,25 +2792,82 @@ async function checkPgvectorGatedObjects(db, manifest, units) {
 }
 
 /**
- * computeEmbeddingReadiness — init-embeddability spec ("Status + resume
- * changes"): a SINGLE total classification of "can this project embed
- * anything right now", surfaced by cmdStatus and cmdLoaderLoad's resume
- * banner. Total classification — every reachable state maps to exactly one
- * of the branches below, never a default "looks fine":
+ * cm#embedding-readiness-single-classifier (owner directive "READY should
+ * mean fully embedded", 2026-09-07): a `probeProvider` result cache, TTL-
+ * bounded to a few seconds, keyed by `${projectId}:${providerId}` — E1
+ * requires READY to include a successful LIVE provider probe on every call,
+ * but a `status`/`resume`/close-Done-line touch happening seconds apart
+ * (e.g. a hook chain) must not each pay a fresh network round-trip. Never
+ * shared across providerId (a mid-session provider swap invalidates by key
+ * change alone, not by explicit eviction).
+ */
+const _EMBED_PROBE_CACHE_TTL_MS = 5000;
+const _embedProbeCache = new Map(); // key -> { ts, ok, reason }
+
+async function _cachedProbeProvider(projectId, providerRow) {
+  // Keyed by projectId + providerId + endpoint (as documented above): a
+  // same-id provider row edited in place (e.g. its endpoint swapped) and a
+  // second project sharing the same providerId in-process both bust the
+  // cache — neither reuses a stale entry.
+  const key = `${projectId}:${providerRow.id}:${providerRow.endpoint}`;
+  const cached = _embedProbeCache.get(key);
+  if (cached && (Date.now() - cached.ts) < _EMBED_PROBE_CACHE_TTL_MS) {
+    return cached;
+  }
+  const provider = createProviderFromRow(providerRow);
+  let result;
+  try {
+    await probeProvider(provider);
+    result = { ts: Date.now(), ok: true, reason: null };
+  } catch (err) {
+    result = { ts: Date.now(), ok: false, reason: String(err.message || 'probe failed').replace(/\s+/g, ' ').trim().slice(0, 160) };
+  }
+  _embedProbeCache.set(key, result);
+  return result;
+}
+
+/**
+ * computeEmbeddingReadiness — E1 (owner directive "READY should mean fully
+ * embedded"): a SINGLE total classification of "can this project embed
+ * anything right now", surfaced VERBATIM by cmdStatus (prose + --json),
+ * cmdLoaderLoad's resume banner, the MCP handoff_status tool (which shells
+ * out to `status --json`), and the close/checkpoint Done line. Total
+ * classification — every reachable state maps to exactly one of the
+ * branches below, checked in this order, never a default "looks fine":
  *
- *   N/A (sqlite backend)     — dialect-gated top branch (no embedding
- *                              column on any SQLite table at all).
- *   DEGRADED:opt-out         — project_settings.embeddings_opt_out is on
- *                              file (an operator explicitly ran
- *                              `init --no-embeddings`).
+ *   UNSUPPORTED:sqlite      — dialect-gated top branch (no embedding
+ *                               column on any SQLite table at all; out of
+ *                               this spec's 6-state enumeration by
+ *                               construction — SQLite cannot embed at all,
+ *                               see docs/how-memory-works.md).
+ *   DISABLED                  — project_settings.embeddings_opt_out is on
+ *                               file (an operator explicitly ran
+ *                               `init --no-embeddings`). Renamed from the
+ *                               prior `DEGRADED:opt-out` — an explicit,
+ *                               standing operator choice is not "degraded."
  *   UNEMBEDDABLE:no-extension — pgvector is absent OR a gated column/index
- *                              was skipped at schema-apply time (reuses
- *                              checkPgvectorGatedObjects — the SAME check
- *                              schema-drift detection uses, never a second,
- *                              independently-drifting probe).
+ *                               was skipped at schema-apply time (reuses
+ *                               checkPgvectorGatedObjects — the SAME check
+ *                               schema-drift detection uses, never a
+ *                               second, independently-drifting probe).
  *   UNEMBEDDABLE:no-provider  — extension/columns are fine, but no
- *                              embedding_providers row has is_default=true.
- *   READY                     — both axes pass.
+ *                               embedding_providers row has is_default=true.
+ *   DEGRADED:probe-failed(<reason>) — a default provider row exists, but a
+ *                               LIVE probeProvider() call against it failed
+ *                               (connection refused/timeout/HTTP error/dim
+ *                               mismatch) — cached up to
+ *                               _EMBED_PROBE_CACHE_TTL_MS so repeated
+ *                               touches don't each pay a network round trip.
+ *   HEALING(<n>)               — probe succeeded, but n>0 LIVE
+ *                               (suppressed=false AND invalid_at IS NULL)
+ *                               actionable (non-empty-text) rows across
+ *                               assertions+decisions still carry
+ *                               embedding IS NULL. n is the SAME
+ *                               "actionable" predicate backfill-
+ *                               embeddings.js uses (its `liveOnly` scoping,
+ *                               added alongside this classifier) — one
+ *                               source of truth, never a re-derivation.
+ *   READY                      — n === 0 AND the live probe succeeded.
  *
  * Never throws — any unexpected probe error is folded into the
  * conservative UNEMBEDDABLE:no-extension branch (never a silent READY).
@@ -2826,15 +2888,15 @@ async function checkPgvectorGatedObjects(db, manifest, units) {
  *   failed, ahead, unknown, ...) is genuinely ambiguous for this purpose —
  *   omit the option and this function falls back to its own independent,
  *   conservative probe exactly as before.
- * @returns {Promise<string>} one of the five states above
+ * @returns {Promise<string>} one of the states documented above
  */
 async function computeEmbeddingReadiness(db, projectId, { precomputedGatedOk } = {}) {
   if (db && typeof db.supportsEmbeddingColumns === 'function' && !db.supportsEmbeddingColumns()) {
-    return 'N/A (sqlite backend)';
+    return 'UNSUPPORTED:sqlite';
   }
 
   const optedOut = await isEmbeddingsOptedOut(db, projectId);
-  if (optedOut) return 'DEGRADED:opt-out';
+  if (optedOut) return 'DISABLED';
 
   if (typeof precomputedGatedOk === 'boolean') {
     if (!precomputedGatedOk) return 'UNEMBEDDABLE:no-extension';
@@ -2852,15 +2914,50 @@ async function computeEmbeddingReadiness(db, projectId, { precomputedGatedOk } =
     }
   }
 
+  let providerRow;
   try {
-    const { rows } = await db.query(`SELECT COUNT(*) AS n FROM embedding_providers WHERE is_default = true`);
-    const n = parseInt(rows[0] && rows[0].n, 10) || 0;
-    if (n === 0) return 'UNEMBEDDABLE:no-provider';
+    const { rows } = await db.query(`SELECT * FROM embedding_providers WHERE is_default = true LIMIT 1`);
+    if (rows.length === 0) return 'UNEMBEDDABLE:no-provider';
+    providerRow = rows[0];
   } catch (_) {
     return 'UNEMBEDDABLE:no-provider';
   }
 
+  let probe;
+  try {
+    probe = await _cachedProbeProvider(projectId, providerRow);
+  } catch (err) {
+    // _cachedProbeProvider itself never throws by design, but fold any
+    // unexpected failure into the conservative branch anyway.
+    return `DEGRADED:probe-failed(${String(err.message || 'unknown').slice(0, 160)})`;
+  }
+  if (!probe.ok) return `DEGRADED:probe-failed(${probe.reason})`;
+
+  let backlogN = 0;
+  try {
+    const dry = await runBackfillEmbeddings({ db, projectId, table: 'all', apply: false, liveOnly: true });
+    backlogN = (dry.tables || []).reduce((sum, t) => sum + (t.actionableNull || 0), 0);
+  } catch (_) {
+    // Backlog probe failure is conservative-folded too — never a silent READY.
+    return 'UNEMBEDDABLE:no-provider';
+  }
+
+  if (backlogN > 0) return `HEALING(${backlogN})`;
   return 'READY';
+}
+
+/**
+ * _shouldWarnOnResume — the resume banner's own "is this state worth a
+ * RESUME WARNING" predicate, extracted so it is exercised by tests and the
+ * production banner from the SAME code path (never a re-derivation).
+ * DISABLED (an operator's deliberate --no-embeddings opt-out) and
+ * UNSUPPORTED:* (a backend that structurally cannot embed at all, e.g.
+ * SQLite) are standing facts, not degradations — never a recurring nag on
+ * every resume. Every other non-READY state (UNEMBEDDABLE:*,
+ * DEGRADED:probe-failed(...), HEALING(<n>)) warrants a warning.
+ */
+function _shouldWarnOnResume(readiness) {
+  return readiness !== 'READY' && readiness !== 'DISABLED' && !readiness.startsWith('UNSUPPORTED:');
 }
 
 /**
@@ -2880,34 +2977,41 @@ function _gatedOkFromSchemaHealResult(result) {
 }
 
 /**
- * computeEmbeddingNullCounts — A3: per-table NULL-embedding counts, for
- * status/resume to print "whenever nonzero" (spec's own phrasing). Reads
- * only tables/columns that actually exist (a Postgres DB with the gated
- * embedding column absent, or a SQLite DB with no such column at all,
- * simply reports 0 for that table — never an error surfaced to the
+ * computeEmbeddingNullCounts — E2 (owner directive "READY should mean
+ * fully embedded"): per-table LIVE+actionable NULL-embedding counts, for
+ * status/resume to print "whenever nonzero" (spec's own phrasing). Fixed
+ * to the SAME live+actionable scope computeEmbeddingReadiness's HEALING(n)
+ * uses (backfill-embeddings.js's `liveOnly` option) — an empty-text NULL
+ * or a suppressed/invalidated assertion's NULL no longer inflates this
+ * count (previously a bare `embedding IS NULL`, which double-counted rows
+ * that can never legitimately embed and rows nobody will ever act on).
+ * Reads only tables/columns that actually exist (a Postgres DB with the
+ * gated embedding column absent, or a SQLite DB with no such column at
+ * all, simply reports 0 for that table — never an error surfaced to the
  * operator for a structurally-expected absence).
  *
  * @param {object} db
  * @param {string} projectId
- * @returns {Promise<{assertions:number, decisions:number}>}
+ * @returns {Promise<{assertions:number, decisions:number, unembeddableEmptyText:{assertions:number, decisions:number}}>}
  */
 async function computeEmbeddingNullCounts(db, projectId) {
   const counts = { assertions: 0, decisions: 0 };
+  const emptyText = { assertions: 0, decisions: 0 };
   if (db && typeof db.supportsEmbeddingColumns === 'function' && !db.supportsEmbeddingColumns()) {
-    return counts; // SQLite: no embedding column anywhere — always 0, never an error.
+    return { ...counts, unembeddableEmptyText: emptyText }; // SQLite: never an error.
   }
-  for (const table of ['assertions', 'decisions']) {
-    try {
-      const { rows } = await db.query(
-        `SELECT COUNT(*) AS n FROM ${table} WHERE project_id = $1 AND embedding IS NULL`,
-        [projectId]
-      );
-      counts[table] = parseInt(rows[0] && rows[0].n, 10) || 0;
-    } catch (_) {
-      counts[table] = 0; // table/column absent on this DB — structurally expected, not an error.
+  try {
+    const dry = await runBackfillEmbeddings({ db, projectId, table: 'all', apply: false, liveOnly: true });
+    for (const t of (dry.tables || [])) {
+      if (t.table === 'assertions' || t.table === 'decisions') {
+        counts[t.table] = t.actionableNull || 0;
+        emptyText[t.table] = t.noTextNull || 0;
+      }
     }
+  } catch (_) {
+    // Non-fatal — keep zeros rather than surface an error to the operator.
   }
-  return counts;
+  return { ...counts, unembeddableEmptyText: emptyText };
 }
 
 /**
@@ -4651,7 +4755,12 @@ async function cmdStatus(args = []) {
       schema_heal:    schemaHealedLine,
       schema_apply_degraded: schemaDegraded,
       embedding_readiness: embeddingReadiness,
-      embedding_null_counts: embeddingNullCounts,
+      embedding_null_counts: { assertions: embeddingNullCounts.assertions, decisions: embeddingNullCounts.decisions },
+      // E2: aggregate LIVE+actionable backlog (the same n the classifier's
+      // HEALING(n) state carries) and the empty-text carve-out — --json only,
+      // per spec; empty-text NULLs never block READY and never count toward n.
+      backlog: embeddingNullCounts.assertions + embeddingNullCounts.decisions,
+      unembeddable_empty_text: (embeddingNullCounts.unembeddableEmptyText.assertions || 0) + (embeddingNullCounts.unembeddableEmptyText.decisions || 0),
       last_embed_heal: lastEmbedHeal,
       last_loader_stop: lastLoaderStop,
     };
@@ -4685,14 +4794,13 @@ async function cmdStatus(args = []) {
   if (schemaDegraded) {
     console.log(`  schema_apply:     DEGRADED (${schemaDegraded.reason || 'unknown'}) — see detail: ${JSON.stringify(schemaDegraded.detail)}`);
   }
-  // E3: a nonzero NULL backlog must never render as a bare "READY" — that
-  // reads as "nothing to do" when there is in fact a drain in progress.
-  const embeddingBacklog = embeddingNullCounts.assertions + embeddingNullCounts.decisions;
-  if (embeddingReadiness === 'READY' && embeddingBacklog > 0) {
-    console.log(`  embedding:        READY (backlog ${embeddingBacklog}, healing ≤${DEFAULT_EMBED_HEAL_BATCH}/touch)`);
-  } else {
-    console.log(`  embedding:        ${embeddingReadiness}`);
-  }
+  // E3: render the classifier's return verbatim — no per-surface
+  // re-derivation. A nonzero backlog is already surfaced as its own
+  // HEALING(n) state by computeEmbeddingReadiness itself (never a bare
+  // "READY (backlog N)" print-time override — that was PR #269's design,
+  // now superseded: HEALING(n) carries the same information as a real
+  // classifier state, not a prose annotation bolted onto READY).
+  console.log(`  embedding:        ${embeddingReadiness}`);
   if (embeddingNullCounts.assertions > 0 || embeddingNullCounts.decisions > 0) {
     console.log(`  embedding NULLs:  assertions=${embeddingNullCounts.assertions}, decisions=${embeddingNullCounts.decisions}`);
   }
@@ -5166,19 +5274,20 @@ async function cmdLoaderLoad(opts = {}) {
     process.stderr.write('[handoff] schema-degradation resume check failed (non-fatal): ' + schemaDegCheckErr.message + '\n');
   }
 
-  // init-embeddability spec (A3): same loud-whenever-nonzero convention as
-  // the schema-degradation banner above — a resumed session sees embedding
-  // unreadiness without running `status` separately. Silent for READY/N-A
-  // (never noise on the common case).
+  // E3 (owner directive "READY should mean fully embedded"): render the
+  // classifier's return verbatim — warn on any GENUINE problem state (was
+  // previously narrowed to just `readiness.startsWith('UNEMBEDDABLE')`,
+  // which stayed silent through DEGRADED:probe-failed/HEALING — a resumed
+  // session now sees those without running `status` separately, matching
+  // the schema-degradation banner's own loud-whenever-not-clean convention
+  // above). DISABLED and UNSUPPORTED:sqlite are standing, structural facts
+  // (an operator's deliberate opt-out; a backend that cannot embed at all)
+  // — never a recurring nag on every resume.
   try {
     const readiness = await computeEmbeddingReadiness(db, projectId, {
       precomputedGatedOk: _gatedOkFromSchemaHealResult(schemaHealResult),
     });
-    // Only genuine UNEMBEDDABLE:* states warrant a resume nag — an explicit
-    // opt-out (DEGRADED:opt-out) is an operator's deliberate, standing
-    // choice and must stay silent on every subsequent resume, not repeat
-    // as a recurring warning.
-    if (readiness.startsWith('UNEMBEDDABLE')) {
+    if (_shouldWarnOnResume(readiness)) {
       const bannerLine = `RESUME WARNING: embedding ${readiness} — run /handoff:status for detail`;
       if (!silent) {
         console.log(`\n  ${bannerLine}`);
@@ -7413,14 +7522,21 @@ async function cmdCheckpoint(args) {
       process.exit(1);
     }
 
+    // Every Done line carries embedding: <state> (PR #273 review gap) — read
+    // BEFORE db.end() below, non-fatal on any probe failure.
+    let noteEmbeddingState = 'UNKNOWN';
+    try {
+      noteEmbeddingState = await computeEmbeddingReadiness(db, projectId);
+    } catch (_) { /* non-fatal — Done line still prints */ }
+
     await db.end();
 
     if (written) {
       console.log(`\n  note captured: ${noteText}`);
-      console.log(`\nDone: handoff:checkpoint --note — project=${basename} marker=${projectId} — session_note written (session marker preserved)`);
+      console.log(`\nDone: handoff:checkpoint --note — project=${basename} marker=${projectId} — session_note written, embedding: ${noteEmbeddingState} (session marker preserved)`);
     } else {
       console.log(`\n  note skipped (predicate not recognized in strict mode): ${noteText}`);
-      console.log(`\nDone: handoff:checkpoint --note — project=${basename} marker=${projectId} — session_note skipped`);
+      console.log(`\nDone: handoff:checkpoint --note — project=${basename} marker=${projectId} — session_note skipped, embedding: ${noteEmbeddingState}`);
     }
     return;
   }
@@ -7538,9 +7654,14 @@ async function cmdCheckpoint(args) {
     // Clearing it at checkpoint time kills C2 attribution for any work done after
     // the checkpoint, defeating the entire purpose of mid-session saves.
 
+    let queuedEmbeddingState = 'UNKNOWN';
+    try {
+      queuedEmbeddingState = await computeEmbeddingReadiness(db, projectId);
+    } catch (_) { /* non-fatal — Done line still prints */ }
+
     await db.end();
 
-    console.log(`\nDone: handoff:checkpoint — project=${path.basename(root)} marker=${projectId} — payload queued for async extraction (session marker preserved for continued attribution)`);
+    console.log(`\nDone: handoff:checkpoint — project=${path.basename(root)} marker=${projectId} — payload queued for async extraction, embedding: ${queuedEmbeddingState} (session marker preserved for continued attribution)`);
     return;
   }
 
@@ -7593,6 +7714,13 @@ async function cmdCheckpoint(args) {
   // Run reranker gate (informational)
   await runRerankerGate(db, projectId, root);
 
+  // E3: append the classifier's own verbatim state to the Done line — read
+  // BEFORE db.end() (below), non-fatal on any probe failure.
+  let checkpointEmbeddingState = 'UNKNOWN';
+  try {
+    checkpointEmbeddingState = await computeEmbeddingReadiness(db, projectId);
+  } catch (_) { /* non-fatal — Done line still prints */ }
+
   await db.end();
 
   console.log(`\n  entities written:    ${entitiesWritten}`);
@@ -7602,7 +7730,7 @@ async function cmdCheckpoint(args) {
   for (const line of divergenceLines) {
     console.log(`  ${line}`);
   }
-  console.log(`\nDone: handoff:checkpoint — project=${path.basename(root)} marker=${projectId} — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written, decisions: ${decisionsWritten}${embedWarnSuffix} (session marker preserved for continued attribution)`);
+  console.log(`\nDone: handoff:checkpoint — project=${path.basename(root)} marker=${projectId} — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written, decisions: ${decisionsWritten}${embedWarnSuffix}, embedding: ${checkpointEmbeddingState} (session marker preserved for continued attribution)`);
 }
 
 // ── resolveSessionId ──────────────────────────────────────────────────────────
@@ -7975,6 +8103,11 @@ async function cmdClose(args) {
     // queue-drain) — always safe to clear here.
     await clearSessionMarkerForClose(db, projectId, payload);
 
+    let queuedCloseEmbeddingState = 'UNKNOWN';
+    try {
+      queuedCloseEmbeddingState = await computeEmbeddingReadiness(db, projectId);
+    } catch (_) { /* non-fatal — Done line still prints */ }
+
     await db.end();
 
     console.log(`\n  entities:    0 (queued)`);
@@ -7993,7 +8126,7 @@ async function cmdClose(args) {
       );
     }
 
-    console.log(`\nDone: handoff:close — project=${path.basename(root)} marker=${projectId} — payload queued for async extraction, session marker cleared`);
+    console.log(`\nDone: handoff:close — project=${path.basename(root)} marker=${projectId} — payload queued for async extraction, embedding: ${queuedCloseEmbeddingState}, session marker cleared`);
     return;
   }
 
@@ -8306,8 +8439,13 @@ async function cmdClose(args) {
     // Skipped subsystems.
     console.log('\n  skipped in dry-run: writeExtraction, handoff.md render, session_in_progress clear, C2, C3, L4 degraded record');
 
+    let dryRunEmbeddingState = 'UNKNOWN';
+    try {
+      dryRunEmbeddingState = await computeEmbeddingReadiness(db, projectId);
+    } catch (_) { /* non-fatal — Done line still prints */ }
+
     await db.end();
-    console.log(`\nDone: handoff:close --dry-run — project=${path.basename(root)} marker=${projectId} — no mutations performed`);
+    console.log(`\nDone: handoff:close --dry-run — project=${path.basename(root)} marker=${projectId} — no mutations performed, embedding: ${dryRunEmbeddingState} (dry-run)`);
     return;
   }
 
@@ -9051,6 +9189,13 @@ async function cmdClose(args) {
   // Values: 'warn' (default, exit 0) | 'strict' (exit 3 on any degraded subsystem).
   const closeDegradedExitMode = await getSetting(db, projectId, 'close_degraded_exit_mode', 'warn');
 
+  // E3: append the classifier's own verbatim state to the Done line — read
+  // BEFORE db.end() (below), non-fatal on any probe failure.
+  let closeEmbeddingState = 'UNKNOWN';
+  try {
+    closeEmbeddingState = await computeEmbeddingReadiness(db, projectId);
+  } catch (_) { /* non-fatal — Done line still prints */ }
+
   await db.end();
 
   console.log(`\n  entities written:    ${entitiesWritten}`);
@@ -9079,7 +9224,7 @@ async function cmdClose(args) {
     );
   }
 
-  console.log(`\nDone: handoff:close — project=${path.basename(root)} marker=${projectId} — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written, decisions: ${decisionsWritten}${embedWarnSuffix}, session marker cleared`);
+  console.log(`\nDone: handoff:close — project=${path.basename(root)} marker=${projectId} — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written, decisions: ${decisionsWritten}${embedWarnSuffix}, embedding: ${closeEmbeddingState}, session marker cleared`);
 
   // L4: Exit-code gate — 'strict' mode exits 3 when any subsystem ran degraded.
   if (_degradedSubsystems.length > 0 && closeDegradedExitMode === 'strict') {
@@ -10552,6 +10697,9 @@ if (require.main === module) {
     // of the readiness/opt-out/backfill logic).
     computeEmbeddingReadiness,
     computeEmbeddingNullCounts,
+    _shouldWarnOnResume,
+    _cachedProbeProvider,
+    _embedProbeCache,
     isEmbeddingsOptedOut,
     cmdBackfillEmbeddings,
   };
