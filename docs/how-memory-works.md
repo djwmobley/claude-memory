@@ -245,9 +245,14 @@ still missing. A live write against a missing embedding column gets a named, act
 (naming pgvector and pointing at `schema_apply_degraded`) instead of a bare database error. This
 does **not** detect a `vector` extension that is installed but too old to provide the `halfvec`
 type — that case still shows up as a loud degradation (a column genuinely missing), just without a
-version-specific diagnosis; nor does it verify the configured endpoint is actually *reachable* —
-see `/handoff:status`'s `embedding_readiness` field for the loud, always-computed structural
-readiness signal, and `backfill-embeddings` below for closing the gap after the fact.
+version-specific diagnosis. `init` itself DOES verify the configured endpoint is reachable, once,
+before seeding the default provider row: a bounded preflight probe classifies the result as
+REACHABLE-with-matching-dims (proceeds), UNREACHABLE (BLOCKs, naming the endpoint and the local
+vLLM start command), or DIM_MISMATCH (BLOCKs, stating observed vs. expected dims) — but this is a
+point-in-time check, never re-run afterward, so an endpoint that goes down (or is replaced by a
+same-dims-but-different model) *after* a successful `init` is not caught by it. See
+`/handoff:status`'s `embedding_readiness` field for the loud, always-computed structural readiness
+signal, and `backfill-embeddings` below for closing the gap after the fact.
 
 **Backfilling NULL embeddings.** Rows written while the provider was down, or written before an
 embedding provider was ever configured, keep a NULL `embedding` — this is fail-soft by design and

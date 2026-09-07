@@ -395,6 +395,23 @@ async function runTests() {
     assert.strictEqual(await countVllmLocalRows(), before, 'REMOTE must never change the row count');
   });
 
+  // init-embeddability amendment A1 (restored on review): seedLocalEmbeddingProvider
+  // now runs a live preflight probe against the configured endpoint BEFORE
+  // seeding. The fake embed stub for the three tests below (REMOTE+
+  // --allow-remote-embed and both LOCAL cases) MUST run as a genuinely
+  // SEPARATE OS process (startFakeEmbedServerProcess) — runSeedProvider
+  // uses execFileSync, which blocks THIS process's entire event loop until
+  // the child exits, so an in-process http.Server here could never answer
+  // the child's probe request (verified empirically to deadlock until the
+  // probe's own timeout: a same-process fake server made these three tests
+  // FALSE POSITIVES — the earlier weak `.includes('Done: ...')` assertion
+  // matched the FAILED line's own shared prefix too). Bound to the FIXED
+  // port 8800 (not a random port) since these tests hardcode that port in
+  // VLLM_EMBED_URL for both the 0.0.0.0 and localhost hostnames.
+  const { LOCAL_PROVIDER_NATIVE_DIMS: _A1_NATIVE_DIMS } = require('../../scripts/lib/embedding-provider');
+  const { startFakeEmbedServerProcess } = require('../../scripts/lib/test-pg-helpers.js');
+  let _a1FakeEmbedServer = null;
+
   await test('init --seed-provider: REMOTE endpoint WITH --allow-remote-embed seeds (data_egress_approved=false)', async () => {
     // Runs against whatever vllm-local state the prior tests left behind —
     // if a row already exists (from the LOCAL test below, which runs later
@@ -403,9 +420,11 @@ async function runTests() {
     // (still exit 0, still deterministic). We only assert on exit code and
     // row-count-never-decreases here, matching this suite's existing
     // "never delete/mutate a pre-existing row" convention.
+    _a1FakeEmbedServer = await startFakeEmbedServerProcess(_A1_NATIVE_DIMS, 0.1, 8800);
     const before = await countVllmLocalRows();
     const out = runSeedProvider({ extraEnv: { VLLM_EMBED_URL: 'http://0.0.0.0:8800' }, extraArgs: ['--allow-remote-embed'] });
     assert.ok(out.includes('Done: handoff:init --seed-provider'), `expected a successful Done line, got:\n${out}`);
+    assert.ok(!out.includes('[FAIL]'), `must succeed (no [FAIL] line) — the probe must have found the fake stub reachable, got:\n${out}`);
     assert.ok(await countVllmLocalRows() >= Math.max(before, 1), 'a row must exist afterward (either freshly seeded or already present)');
   });
 
@@ -413,6 +432,7 @@ async function runTests() {
     const before = await countVllmLocalRows();
     const out = runSeedProvider({ extraEnv: { VLLM_EMBED_URL: 'http://localhost:8800' } });
     assert.ok(out.includes('Done: handoff:init --seed-provider'), `expected a successful Done line, got:\n${out}`);
+    assert.ok(!out.includes('[FAIL]'), `must succeed (no [FAIL] line) — the probe must have found the fake stub reachable, got:\n${out}`);
     if (before === 0) {
       assert.ok(out.includes('[OK]') && out.includes('vllm-local'), `expected the OK seeded line for a fresh insert, got:\n${out}`);
     } else {
@@ -426,8 +446,10 @@ async function runTests() {
     // at least one vllm-local row present — so this call is unconditionally
     // the "already present" branch.
     const out = runSeedProvider({ extraEnv: { VLLM_EMBED_URL: 'http://localhost:8800' } });
+    assert.ok(!out.includes('[FAIL]'), `must succeed (no [FAIL] line) — the probe must have found the fake stub reachable, got:\n${out}`);
     assert.ok(out.includes('[NOTE]') && out.includes('already present'), `expected the "already present" NOTE line, got:\n${out}`);
     assert.strictEqual(await countVllmLocalRows(), 1, 'still exactly one row after a guaranteed-second call');
+    if (_a1FakeEmbedServer) { _a1FakeEmbedServer.stop(); _a1FakeEmbedServer = null; }
   });
 
   // ── Test 2: status is read-only and outputs expected fields ──────────────

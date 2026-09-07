@@ -573,13 +573,106 @@ const REMOTE_PROVIDER_APPROVED_BY = 'handoff-init:remote-endpoint-explicit-allow
  *   data_egress_approved=false and prints the exact hand-edit SQL an
  *   operator runs to flip it to true. Never bypasses the NONE/INVALID
  *   branches — those still report unseeded regardless of this flag.
- * @returns {Promise<{classification: string, endpoint: string|null, source: string|null, seeded: boolean, lines: string[]}>}
+ * @param {function} [opts.probeTransport] -- TEST-ONLY, see
+ *   _probeConfiguredEndpoint's own header. Production call sites never pass
+ *   this — the real preflight probe (A1) always runs against LOCAL and
+ *   REMOTE+allowRemoteEmbed endpoints before seeding.
+ * @returns {Promise<{classification: string, endpoint: string|null, source: string|null, seeded: boolean, lines: string[], probeFailed?: boolean, probeState?: string}>}
  *   `lines` are fully-formatted, ready to console.log() as-is (cmdInit's own
  *   "  [OK]    "/"  [NOTE]  " indentation convention). `source` is
  *   'pipeline_yml'|'env'|'user_scope'|null (init-embeddability spec item 3).
  */
+/**
+ * _probeConfiguredEndpoint — init-embeddability amendment A1 (previously
+ * omitted, restored on review): a structurally-valid, well-classified
+ * endpoint (LOCAL, or REMOTE with explicit attestation) is STILL not proof
+ * of embeddability — the endpoint might be down, the wrong model might be
+ * served on that port, or it might answer with the wrong dimensionality
+ * entirely. Runs the SAME preflight probe (embedding-provider.js's own
+ * probeProvider, bounded by resolveDefaultTimeoutMs's default) against a
+ * throwaway provider object built from the fixed vllm-local identity,
+ * BEFORE the INSERT — never after. Total classification of the result:
+ *   REACHABLE      — probe succeeded, dims match; proceed to seed.
+ *   DIM_MISMATCH    — probe answered but native/stored dims don't match the
+ *                     declared vllm-local identity (wrong model/config).
+ *   UNREACHABLE     — connection refused/timeout/non-2xx/malformed body, or
+ *                     any other unexpected probe failure (the default
+ *                     branch — never a silent proceed).
+ *
+ * @param {string} endpoint
+ * @param {function} [transport] — TEST-ONLY injectable transport, same
+ *   `(text, endpoint, modelLabel, opts) => Promise<number[]>` shape
+ *   VllmEmbeddingProvider itself accepts (see its own header). Production
+ *   call sites (cmdInit, `init --seed-provider`) NEVER pass this — the real
+ *   HTTP transport is always used there. Tests inject a deterministic fake
+ *   so the pure-unit Section 3 suite in test/test-embed-endpoint-classify.js
+ *   and scripts/test-sqlite-seam.js's Section 20 stay network-free, per
+ *   those files' own "no live Postgres/SQLite/network required" headers.
+ * @returns {Promise<{state: 'REACHABLE'|'DIM_MISMATCH'|'UNREACHABLE', error?: Error}>}
+ */
+async function _probeConfiguredEndpoint(endpoint, transport) {
+  const provider = new VllmEmbeddingProvider({
+    name: LOCAL_PROVIDER_NAME,
+    modelLabel: LOCAL_PROVIDER_MODEL_LABEL,
+    nativeDims: LOCAL_PROVIDER_NATIVE_DIMS,
+    storedDims: LOCAL_PROVIDER_STORED_DIMS,
+    endpoint,
+    transport,
+  });
+  try {
+    await probeProvider(provider);
+    return { state: 'REACHABLE' };
+  } catch (err) {
+    if (err instanceof ProviderProbeError) {
+      // Dim-mismatch ProviderProbeErrors (probeProvider's own two
+      // `result.rawDims !== nativeDims` / `result.dims !== storedDims`
+      // checks) carry `observedRawDims`/`observedDims` in `.details`, NOT a
+      // `.details.failureClass` key (that key is set only by the transport
+      // catch block above them, for connection/timeout/HTTP failures) — the
+      // distinguishing text lives in `.message` itself
+      // (`failure_class="dim mismatch: ..."`, always present verbatim).
+      const isDimMismatch = /dim mismatch/i.test(err.message)
+        || (err.details && (err.details.observedRawDims !== undefined || err.details.observedDims !== undefined));
+      if (isDimMismatch) return { state: 'DIM_MISMATCH', error: err };
+      return { state: 'UNREACHABLE', error: err };
+    }
+    // Any other unexpected error — the default BLOCK branch, never a silent proceed.
+    return { state: 'UNREACHABLE', error: err };
+  }
+}
+
+/**
+ * _probeFailureLines — builds the seedLocalEmbeddingProvider-shaped BLOCK
+ * result for a failed preflight probe (A1). `probeFailed`/`probeState` let
+ * callers (cmdInit) distinguish this from the pre-A1
+ * NONE/INVALID/REMOTE-without-allow branches if ever needed, though the
+ * existing `seeded === false && !alreadyPresent` BLOCK check already
+ * covers this case without any cmdInit-side change.
+ */
+function _probeFailureLines(classification, endpoint, source, probeResult) {
+  const msg = (probeResult.error && probeResult.error.message) || 'unknown probe error';
+  if (probeResult.state === 'DIM_MISMATCH') {
+    return {
+      classification, endpoint, source, seeded: false, probeFailed: true, probeState: 'DIM_MISMATCH',
+      lines: [
+        `  [FAIL]  embedding endpoint ${endpoint} answered the preflight probe but its dimensions do not match ` +
+        `the expected provider identity (native_dims=${LOCAL_PROVIDER_NATIVE_DIMS}, stored_dims=${LOCAL_PROVIDER_STORED_DIMS}) — ${msg}`,
+        '          The served model does not match — point at the correct endpoint/model, then re-run init.',
+      ],
+    };
+  }
+  return {
+    classification, endpoint, source, seeded: false, probeFailed: true, probeState: 'UNREACHABLE',
+    lines: [
+      `  [FAIL]  embedding endpoint ${endpoint} is unreachable (preflight probe failed) — ${msg}`,
+      '          Start the local vLLM server (e.g. ~/start-vllm-040.sh) or verify the endpoint configured in ' +
+      '.claude/pipeline.yml / VLLM_EMBED_URL / ~/.claude/handoff-embed.json is correct and running, then re-run init.',
+    ],
+  };
+}
+
 async function seedLocalEmbeddingProvider(opts = {}) {
-  const { db, projectRoot, env, allowRemoteEmbed } = opts;
+  const { db, projectRoot, env, allowRemoteEmbed, probeTransport } = opts;
   const dialect = (db && db.dialect) || opts.dialect;
   try {
     const resolved = resolveConfiguredEmbedEndpointDetailed({ projectRoot, env });
@@ -626,6 +719,13 @@ async function seedLocalEmbeddingProvider(opts = {}) {
         };
       }
 
+      // A1: probe BEFORE seeding — a REMOTE endpoint an operator explicitly
+      // attested to can still be down or serving the wrong model/dims.
+      const remoteProbe = await _probeConfiguredEndpoint(endpoint, probeTransport);
+      if (remoteProbe.state !== 'REACHABLE') {
+        return _probeFailureLines(classification, endpoint, resolved.source, remoteProbe);
+      }
+
       // A5: explicit narrow escape hatch — seed the row anyway, but with
       // data_egress_approved=false (an operator's own hand-edit, printed
       // below, is what flips a REMOTE row to actually-approved).
@@ -660,6 +760,16 @@ async function seedLocalEmbeddingProvider(opts = {}) {
         };
       }
       return await _alreadyPresentLines(db, dialect, classification, endpoint, resolved.source);
+    }
+
+    // A1: probe BEFORE seeding — a syntactically LOCAL, well-formed endpoint
+    // is not proof of embeddability; it might be down or serving the wrong
+    // model/dims. --no-embeddings never reaches this function at all
+    // (cmdInit's effectiveNoEmbeddings branch skips seedLocalEmbeddingProvider
+    // entirely), so the probe is never invoked in that case, per spec.
+    const localProbe = await _probeConfiguredEndpoint(endpoint, probeTransport);
+    if (localProbe.state !== 'REACHABLE') {
+      return _probeFailureLines(classification, endpoint, resolved.source, localProbe);
     }
 
     // LOCAL — one statement, no check-then-insert. Untargeted ON CONFLICT

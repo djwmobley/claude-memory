@@ -27,10 +27,11 @@ const PROJECT_ROOT   = path.resolve(__dirname, '..');
 const HANDOFF_SCRIPT = path.join(PROJECT_ROOT, 'scripts', 'handoff.js');
 const TS = Date.now();
 
-const { pgConnect } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'test-pg-helpers.js'));
+const { pgConnect, startFakeEmbedServerProcess } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'test-pg-helpers.js'));
 const { MARKER_FILENAME } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'project-marker.js'));
 const { runBackfillEmbeddings } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'backfill-embeddings.js'));
 const { resolveDialect, createAdapter } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'db-seam.js'));
+const { LOCAL_PROVIDER_NATIVE_DIMS } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'embedding-provider.js'));
 
 let passed = 0, failed = 0;
 const failures = [];
@@ -225,7 +226,19 @@ async function seedDefaultProvider(dbName, { nativeDims = 8, storedDims = 4, end
     await db.query('CREATE EXTENSION IF NOT EXISTS vector').catch(() => {});
     await db.end();
     writePipelineYml(projectDir, { database: dbName }); // no vllm_embed_url
-    fs.writeFileSync(path.join(baseDir, 'handoff-embed.json'), JSON.stringify({ vllm_embed_url: 'http://127.0.0.1:8800' }), 'utf8');
+    // init-embeddability amendment A1 (restored on review): seedLocalEmbeddingProvider
+    // now probes the endpoint before seeding — a real local stub server is
+    // required so the probe actually finds a well-formed /v1/embeddings
+    // response. Run as a SEPARATE OS process (startFakeEmbedServerProcess),
+    // never an in-process http.Server: `runCli` below uses spawnSync, which
+    // blocks THIS process's entire event loop until the child exits — an
+    // in-process server here could never answer the child's probe request
+    // (verified empirically to deadlock until the probe's own timeout).
+    // The probe uses the FIXED vllm-local identity (native_dims=4096), not
+    // this test file's arbitrary HALFVEC_DIMS test-provider convention.
+    const fakeServer = await startFakeEmbedServerProcess(LOCAL_PROVIDER_NATIVE_DIMS, 0.1);
+    const endpointUrl = `http://127.0.0.1:${fakeServer.port}`;
+    fs.writeFileSync(path.join(baseDir, 'handoff-embed.json'), JSON.stringify({ vllm_embed_url: endpointUrl }), 'utf8');
     try {
       const r = runCli(['init', '-y'], {
         cwd: projectDir,
@@ -238,8 +251,9 @@ async function seedDefaultProvider(dbName, { nativeDims = 8, storedDims = 4, end
       const { rows } = await checkDb.query(`SELECT endpoint FROM embedding_providers WHERE is_default = true`);
       await checkDb.end();
       assertEqual(rows.length, 1, 'exactly one default provider row expected');
-      assertEqual(rows[0].endpoint, 'http://127.0.0.1:8800');
+      assertEqual(rows[0].endpoint, endpointUrl);
     } finally {
+      fakeServer.stop();
       await dropRawDb(dbName);
       fs.rmSync(projectDir, { recursive: true, force: true });
       fs.rmSync(baseDir, { recursive: true, force: true });

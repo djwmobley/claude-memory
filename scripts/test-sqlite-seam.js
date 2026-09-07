@@ -2237,7 +2237,13 @@ async function runSection19() {
 async function runSection20() {
   console.log('\n=== Section 20: embedding_providers local-seed INSERT via SQLite dialect (init-seed-local-provider) ===');
 
-  const { seedLocalEmbeddingProvider, LOCAL_PROVIDER_NAME } = require('./lib/embedding-provider');
+  const { seedLocalEmbeddingProvider, LOCAL_PROVIDER_NAME, LOCAL_PROVIDER_NATIVE_DIMS } = require('./lib/embedding-provider');
+
+  // Deterministic, network-free probeTransport (init-embeddability
+  // amendment A1) — see test/test-embed-endpoint-classify.js's identical
+  // helper for the full rationale; this pure-unit suite must stay
+  // network-free too.
+  const REACHABLE_PROBE_TRANSPORT = async () => new Array(LOCAL_PROVIDER_NATIVE_DIMS).fill(0.1);
 
   async function makeSchemaDb() {
     const db = new SQLiteAdapter(':memory:');
@@ -2252,6 +2258,7 @@ async function runSection20() {
     try {
       const result = await seedLocalEmbeddingProvider({
         db, dialect: 'sqlite', env: { VLLM_EMBED_URL: 'http://localhost:8800' },
+        probeTransport: REACHABLE_PROBE_TRANSPORT,
       });
       assertTrue(result.seeded, 'expected seeded=true');
       assertEqual(result.classification, 'LOCAL');
@@ -2265,8 +2272,8 @@ async function runSection20() {
   await test('seedLocalEmbeddingProvider: a second call is a no-op (rowCount 0, no duplicate row)', async () => {
     const db = await makeSchemaDb();
     try {
-      await seedLocalEmbeddingProvider({ db, dialect: 'sqlite', env: { VLLM_EMBED_URL: 'http://localhost:8800' } });
-      const second = await seedLocalEmbeddingProvider({ db, dialect: 'sqlite', env: { VLLM_EMBED_URL: 'http://localhost:8800' } });
+      await seedLocalEmbeddingProvider({ db, dialect: 'sqlite', env: { VLLM_EMBED_URL: 'http://localhost:8800' }, probeTransport: REACHABLE_PROBE_TRANSPORT });
+      const second = await seedLocalEmbeddingProvider({ db, dialect: 'sqlite', env: { VLLM_EMBED_URL: 'http://localhost:8800' }, probeTransport: REACHABLE_PROBE_TRANSPORT });
       assertFalse(second.seeded, 'second call must not seed again');
       const { rows } = await db.query('SELECT * FROM embedding_providers WHERE name = ?', [LOCAL_PROVIDER_NAME]);
       assertEqual(rows.length, 1, 'still exactly one row after second call');
@@ -2280,7 +2287,7 @@ async function runSection20() {
         `INSERT INTO embedding_providers (name, model_label, native_dims, stored_dims, endpoint, is_default) VALUES (?,?,?,?,?,1)`,
         ['other-provider', 'Other/Model', 1024, 1024, 'http://localhost:9999']
       );
-      const result = await seedLocalEmbeddingProvider({ db, dialect: 'sqlite', env: { VLLM_EMBED_URL: 'http://localhost:8800' } });
+      const result = await seedLocalEmbeddingProvider({ db, dialect: 'sqlite', env: { VLLM_EMBED_URL: 'http://localhost:8800' }, probeTransport: REACHABLE_PROBE_TRANSPORT });
       assertFalse(result.seeded, 'insert should be blocked by the existing default row');
       const { rows } = await db.query('SELECT * FROM embedding_providers WHERE name = ?', [LOCAL_PROVIDER_NAME]);
       assertEqual(rows.length, 0, 'vllm-local row must not have been inserted');
