@@ -2804,8 +2804,12 @@ async function checkPgvectorGatedObjects(db, manifest, units) {
 const _EMBED_PROBE_CACHE_TTL_MS = 5000;
 const _embedProbeCache = new Map(); // key -> { ts, ok, reason }
 
-async function _cachedProbeProvider(providerRow) {
-  const key = `${providerRow.id}`;
+async function _cachedProbeProvider(projectId, providerRow) {
+  // Keyed by projectId + providerId + endpoint (as documented above): a
+  // same-id provider row edited in place (e.g. its endpoint swapped) and a
+  // second project sharing the same providerId in-process both bust the
+  // cache — neither reuses a stale entry.
+  const key = `${projectId}:${providerRow.id}:${providerRow.endpoint}`;
   const cached = _embedProbeCache.get(key);
   if (cached && (Date.now() - cached.ts) < _EMBED_PROBE_CACHE_TTL_MS) {
     return cached;
@@ -2921,7 +2925,7 @@ async function computeEmbeddingReadiness(db, projectId, { precomputedGatedOk } =
 
   let probe;
   try {
-    probe = await _cachedProbeProvider(providerRow);
+    probe = await _cachedProbeProvider(projectId, providerRow);
   } catch (err) {
     // _cachedProbeProvider itself never throws by design, but fold any
     // unexpected failure into the conservative branch anyway.
@@ -10694,6 +10698,8 @@ if (require.main === module) {
     computeEmbeddingReadiness,
     computeEmbeddingNullCounts,
     _shouldWarnOnResume,
+    _cachedProbeProvider,
+    _embedProbeCache,
     isEmbeddingsOptedOut,
     cmdBackfillEmbeddings,
   };

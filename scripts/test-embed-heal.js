@@ -393,6 +393,30 @@ async function main() {
       pass(label);
     } catch (err) { fail('T9', err.message); }
 
+    // ── T10: probe cache key includes projectId + endpoint (PR #273 review
+    //    gap — was keyed on providerId alone) ────────────────────────────
+    try {
+      const label = 'T10: probe cache is keyed by projectId+providerId+endpoint — no cross-project/endpoint reuse';
+      await seedProvider(raw, endpoint, 4096, 4000);
+      const { rows: provRows } = await raw.query(`SELECT * FROM embedding_providers WHERE name = 'test-provider'`);
+      const providerRow = provRows[0];
+      handoffModule._embedProbeCache.clear();
+
+      await handoffModule._cachedProbeProvider('t10-project-a', providerRow);
+      assertEqual(handoffModule._embedProbeCache.size, 1, 'expected exactly 1 cache entry after the first project probes');
+
+      // Same providerId, DIFFERENT projectId -> must NOT reuse the same entry.
+      await handoffModule._cachedProbeProvider('t10-project-b', providerRow);
+      assertEqual(handoffModule._embedProbeCache.size, 2, 'expected a SEPARATE cache entry for a second project sharing the same providerId');
+
+      // Same projectId+providerId, DIFFERENT endpoint (in-place row edit) -> must NOT reuse either.
+      const editedRow = { ...providerRow, endpoint: endpoint + '?edited=1' };
+      await handoffModule._cachedProbeProvider('t10-project-a', editedRow);
+      assertEqual(handoffModule._embedProbeCache.size, 3, 'expected a changed endpoint to bust the cache (new entry), not reuse the stale one');
+
+      pass(label);
+    } catch (err) { fail('T10', err.message); }
+
   } finally {
     if (fakeServer) { try { fakeServer.stop(); } catch (_) {} }
     await tearDownSharedDb(raw);
