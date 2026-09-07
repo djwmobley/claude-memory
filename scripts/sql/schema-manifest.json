@@ -97,6 +97,32 @@
         { "table": "embedding_providers", "column": "model_label" },
         { "table": "embedding_providers", "column": "native_dims" },
         { "table": "embedding_providers", "column": "stored_dims" }
+      ],
+      "expected_checks": [
+        { "_doc": "assertions.confidence CHECK (confidence >= 1.0 AND confidence <= 10.0). `def` is the FULL pg_get_constraintdef text (the CHECK(...) keyword included, byte-identical to a fresh throwaway DB's own rendering after applying this unit's SQL) -- healConstraints's ADD CONSTRAINT uses it AS-IS, never re-wrapped, so the same _normalizeDefText pipeline applies identically to both sides with no paren-layer mismatch.", "table": "assertions", "expression_tokens": ["confidence"], "def": "CHECK (((confidence >= (1.0)::double precision) AND (confidence <= (10.0)::double precision)))" },
+        { "_doc": "assertions.reality_check CHECK (reality_check IN ('verified','mismatch','unverifiable')).", "table": "assertions", "expression_tokens": ["reality_check"], "def": "CHECK ((reality_check = ANY (ARRAY['verified'::text, 'mismatch'::text, 'unverifiable'::text])))" },
+        { "_doc": "assertions.source CHECK (source IN (...)).", "table": "assertions", "expression_tokens": ["source"], "def": "CHECK ((source = ANY (ARRAY['user_stated'::text, 'model_extracted'::text, 'doc_quoted'::text, 'retrieved_from_prior'::text])))" },
+        { "_doc": "assertions.suppression_kind CHECK (single authoritative block -- see suppression_kind CHECK comment in this unit's own SQL).", "table": "assertions", "expression_tokens": ["suppression_kind"], "def": "CHECK ((suppression_kind = ANY (ARRAY['superseded'::text, 'downvoted_terminal'::text, 'downvoted_probation'::text, 'retired'::text, 'reality_reconciled'::text])))" },
+        { "_doc": "assertions.tier CHECK (tier IN ('probationary','consolidated')).", "table": "assertions", "expression_tokens": ["tier"], "def": "CHECK ((tier = ANY (ARRAY['probationary'::text, 'consolidated'::text])))" },
+        { "_doc": "extraction_queue.status CHECK (status IN ('pending','done','error')).", "table": "extraction_queue", "expression_tokens": ["status"], "def": "CHECK ((status = ANY (ARRAY['pending'::text, 'done'::text, 'error'::text])))" }
+      ],
+      "expected_index_defs": [
+        { "_doc": "1:1 partial unique index -- see DROP INDEX IF EXISTS assertions_1to1_unique / CREATE UNIQUE INDEX assertions_1to1_unique below. create_sql is the fresh-DB canonical pg_indexes.indexdef text (re-runnable as-is after a DROP INDEX).", "name": "assertions_1to1_unique", "create_sql": "CREATE UNIQUE INDEX assertions_1to1_unique ON public.assertions USING btree (project_id, subject, predicate) WHERE ((suppressed = false) AND (predicate = ANY (ARRAY['README_roadmap_scope'::text, 'added_via'::text, 'affirmed'::text, 'are_safe_outside_claude-memory'::text, 'are_safe_outside_this_project'::text, 'branch_exists'::text, 'chose'::text, 'cmdDrop_refactor'::text, 'commit_merged'::text, 'converged'::text, 'created_by'::text, 'currently_at'::text, 'default'::text, 'defaults_to'::text, 'defined_as'::text, 'elevates_to'::text, 'evaluates_at'::text, 'false_positive'::text, 'fixed_in'::text, 'has_unpackaged_state'::text, 'is_at_commit'::text, 'is_authoritative_db'::text, 'is_cleared_by'::text, 'is_direction'::text, 'is_exactly'::text, 'is_model'::text, 'is_status'::text, 'is_value'::text, 'matching_algorithm'::text, 'moved_to'::text, 'must_mean'::text, 'now_uses'::text, 'open_thread'::text, 'orchestrates_only'::text, 'phase_ordering'::text, 'pr_state'::text, 'prefers'::text, 'quick_reference'::text, 'schema_migration_is'::text, 'session_tldr'::text, 'shipped_at'::text, 'skipped'::text, 'usage'::text, 'user_chose'::text, 'user_directed'::text, 'uses_db'::text])))" },
+        { "_doc": "1:N exact-object dedup unique index -- see CREATE UNIQUE INDEX assertions_1ton_exact_unique below.", "name": "assertions_1ton_exact_unique", "create_sql": "CREATE UNIQUE INDEX assertions_1ton_exact_unique ON public.assertions USING btree (project_id, subject, predicate, md5(object)) WHERE (suppressed = false)" },
+        { "name": "assertions_confidence_idx", "create_sql": "CREATE INDEX assertions_confidence_idx ON public.assertions USING btree (project_id, confidence DESC)" },
+        { "name": "assertions_project_idx", "create_sql": "CREATE INDEX assertions_project_idx ON public.assertions USING btree (project_id)" },
+        { "name": "assertions_subject_idx", "create_sql": "CREATE INDEX assertions_subject_idx ON public.assertions USING btree (project_id, subject)" },
+        { "name": "edges_from_idx", "create_sql": "CREATE INDEX edges_from_idx ON public.edges USING btree (project_id, from_entity)" },
+        { "name": "edges_project_idx", "create_sql": "CREATE INDEX edges_project_idx ON public.edges USING btree (project_id)" },
+        { "name": "edges_to_idx", "create_sql": "CREATE INDEX edges_to_idx ON public.edges USING btree (project_id, to_entity)" },
+        { "name": "embedding_providers_is_default_unique_idx", "create_sql": "CREATE UNIQUE INDEX embedding_providers_is_default_unique_idx ON public.embedding_providers USING btree (is_default) WHERE is_default" },
+        { "name": "entities_name_idx", "create_sql": "CREATE INDEX entities_name_idx ON public.entities USING btree (project_id, name)" },
+        { "name": "entities_project_idx", "create_sql": "CREATE INDEX entities_project_idx ON public.entities USING btree (project_id)" },
+        { "name": "entity_communities_lookup_idx", "create_sql": "CREATE INDEX entity_communities_lookup_idx ON public.entity_communities USING btree (project_id, entity_name)" },
+        { "name": "entity_communities_run_idx", "create_sql": "CREATE INDEX entity_communities_run_idx ON public.entity_communities USING btree (project_id, run_id)" },
+        { "name": "extraction_queue_project_status_idx", "create_sql": "CREATE INDEX extraction_queue_project_status_idx ON public.extraction_queue USING btree (project_id, status)" },
+        { "name": "retrieval_contract_history_idx", "create_sql": "CREATE INDEX retrieval_contract_history_idx ON public.retrieval_contract_history USING btree (project_id, name, version)" },
+        { "name": "retrieval_contract_project_idx", "create_sql": "CREATE INDEX retrieval_contract_project_idx ON public.retrieval_contract USING btree (project_id)" }
       ]
     },
     "handoff-sqlite-schema.sql": {
@@ -194,6 +220,16 @@
       ],
       "expected_not_nulls": [
         { "table": "retrieval_event_assertions", "column": "event_id" }
+      ],
+      "expected_checks": [
+        { "_doc": "retrieval_events.outcome CHECK (outcome IN ('pending','success','failure','irrelevant')).", "table": "retrieval_events", "expression_tokens": ["outcome"], "def": "CHECK ((outcome = ANY (ARRAY['pending'::text, 'success'::text, 'failure'::text, 'irrelevant'::text])))" }
+      ],
+      "expected_index_defs": [
+        { "name": "rea_assertion_idx", "create_sql": "CREATE INDEX rea_assertion_idx ON public.retrieval_event_assertions USING btree (assertion_id)" },
+        { "name": "rea_event_idx", "create_sql": "CREATE INDEX rea_event_idx ON public.retrieval_event_assertions USING btree (event_id)" },
+        { "name": "retrieval_events_outcome_idx", "create_sql": "CREATE INDEX retrieval_events_outcome_idx ON public.retrieval_events USING btree (outcome) WHERE (outcome = 'pending'::text)" },
+        { "name": "retrieval_events_project_idx", "create_sql": "CREATE INDEX retrieval_events_project_idx ON public.retrieval_events USING btree (project_id)" },
+        { "name": "retrieval_events_time_idx", "create_sql": "CREATE INDEX retrieval_events_time_idx ON public.retrieval_events USING btree (retrieved_at DESC)" }
       ]
     },
     "decisions-base.sql": {
@@ -240,6 +276,17 @@
         { "table": "decisions", "column": "project_id" },
         { "table": "decisions", "column": "topic" },
         { "table": "decisions", "column": "decision" }
+      ],
+      "expected_checks": [
+        { "_doc": "decisions.authoring_mode CHECK (authoring_mode IN ('caveman','verbose')).", "table": "decisions", "expression_tokens": ["authoring_mode"], "def": "CHECK ((authoring_mode = ANY (ARRAY['caveman'::text, 'verbose'::text])))" }
+      ],
+      "expected_index_defs": [
+        { "name": "audit_log_created_idx", "create_sql": "CREATE INDEX audit_log_created_idx ON public.audit_log USING btree (created_at DESC)" },
+        { "name": "audit_log_table_op_idx", "create_sql": "CREATE INDEX audit_log_table_op_idx ON public.audit_log USING btree (table_name, operation)" },
+        { "name": "decisions_fts_idx", "create_sql": "CREATE INDEX decisions_fts_idx ON public.decisions USING gin (fts_vec)" },
+        { "name": "decisions_project_idx", "create_sql": "CREATE INDEX decisions_project_idx ON public.decisions USING btree (project_id)" },
+        { "name": "decisions_project_topic_unique", "create_sql": "CREATE UNIQUE INDEX decisions_project_topic_unique ON public.decisions USING btree (project_id, topic)" },
+        { "name": "decisions_topic_idx", "create_sql": "CREATE INDEX decisions_topic_idx ON public.decisions USING btree (project_id, topic)" }
       ]
     },
     "phase3b-schema.sql": {

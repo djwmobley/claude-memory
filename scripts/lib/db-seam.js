@@ -2015,7 +2015,14 @@ class PostgresAdapter {
             await this._client.query(`ALTER TABLE ${q(plan.table)} DROP CONSTRAINT IF EXISTS ${q(nm)}`);
           }
           const healName = `${plan.table}_${plan.conname}_heal`;
-          await this._client.query(`ALTER TABLE ${q(plan.table)} ADD CONSTRAINT ${q(healName)} CHECK (${plan.def})`);
+          // plan.def is the FULL canonical constraint definition text (the
+          // manifest's `def` is expected to be pg_get_constraintdef's own
+          // output, "CHECK (...)" wrapper included) — used AS-IS after
+          // ADD CONSTRAINT <name>, never re-wrapped in another CHECK(...),
+          // so the same normalization pipeline (_normalizeDefText) applies
+          // identically to both the manifest's stored def and the live
+          // probe's def with no asymmetric paren-layer mismatch.
+          await this._client.query(`ALTER TABLE ${q(plan.table)} ADD CONSTRAINT ${q(healName)} ${plan.def}`);
         } else if (plan.kind === 'indexdef') {
           await this._client.query(`DROP INDEX IF EXISTS ${q(plan.name)}`);
           // plan.def is the manifest's own literal CREATE INDEX statement

@@ -1705,6 +1705,82 @@ async function testCT10() {
   }
 }
 
+async function testCT11() {
+  const label = 'CT11: inventory completeness — every live CHECK on an expected_objects table and every named expected_objects index is covered by a manifest expected_checks/expected_index_defs entry; a fresh DB classifies every kind present_matching';
+  if (!(await isPgAvailable())) { skip(label, 'Postgres unavailable'); return; }
+  const dbName = `cm185heal_ct11_${Date.now()}`;
+  const PID = 'schema-heal-ct11';
+  try {
+    await createThrowawayDb(dbName);
+    const client = await pgConnect(dbName);
+    const { adapter, classification, units } = await bootstrapCurrentDb(client, PID, { withExtension: false });
+
+    const expectedChecks = handoffModule._collectExpectedChecks(classification.manifest, units);
+    const expectedIndexDefs = handoffModule._collectExpectedIndexDefs(classification.manifest, units);
+    const coveredCheckTables = new Set(expectedChecks.map((c) => c.table));
+    const coveredIndexNames = new Set(expectedIndexDefs.map((i) => i.name));
+
+    for (const u of units) {
+      const entry = classification.manifest.units[u.basename];
+      if (!entry || !entry.expected_objects) continue;
+      const tables = entry.expected_objects.tables || [];
+      const indexes = entry.expected_objects.indexes || [];
+
+      if (tables.length > 0) {
+        const { rows: liveChecks } = await client.query(
+          `SELECT c.relname AS table, con.conname
+             FROM pg_constraint con
+             JOIN pg_class c ON c.oid = con.conrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'public'
+            WHERE con.contype = 'c' AND c.relname = ANY($1::text[])`,
+          [tables]
+        );
+        for (const r of liveChecks) {
+          assertTrue(
+            coveredCheckTables.has(r.table),
+            `CT11: live CHECK "${r.conname}" on table "${r.table}" (in ${u.basename}'s expected_objects.tables) has NO expected_checks manifest entry — a CHECK added to DDL without a manifest entry must fail this test`
+          );
+        }
+      }
+      for (const idxName of indexes) {
+        assertTrue(
+          coveredIndexNames.has(idxName),
+          `CT11: expected_objects index "${idxName}" (${u.basename}) has NO expected_index_defs manifest entry — an index added to expected_objects.indexes without a matching expected_index_defs entry must fail this test`
+        );
+      }
+    }
+    // Reverse direction: every expected_index_defs entry this PR's manifest
+    // names is one the fresh DB actually has (no phantom entry slipped
+    // through as "populated" but absent).
+    const { rows: liveIdx } = await client.query(
+      `SELECT indexname FROM pg_indexes WHERE schemaname='public' AND indexname = ANY($1::text[])`,
+      [[...coveredIndexNames]]
+    );
+    assertEqual(liveIdx.length, coveredIndexNames.size, `CT11: every expected_index_defs entry name exists on the fresh DB — got ${liveIdx.length}/${coveredIndexNames.size}`);
+
+    // A fresh, fully-applied DB classifies every populated kind present_matching.
+    const probe = await adapter.probeFastPathSchemaState({
+      tables: [...new Set([...expectedChecks.map((c) => c.table), ...handoffModule._collectExpectedUniques(classification.manifest, units).map((u2) => u2.table), ...handoffModule._collectExpectedNotNulls(classification.manifest, units).map((n) => n.table)])],
+      columns: [], indexes: [...coveredIndexNames], shapeTargets: [],
+    });
+    const uniqResults = handoffModule._classifyExpectedUniques(handoffModule._collectExpectedUniques(classification.manifest, units), probe.tablesFound, probe.uniques);
+    const nnResults = handoffModule._classifyExpectedNotNulls(handoffModule._collectExpectedNotNulls(classification.manifest, units), probe.tablesFound, probe.notNulls);
+    const checkResults = handoffModule._classifyExpectedChecks(expectedChecks, probe.tablesFound, probe.checks);
+    const idxResults = handoffModule._classifyExpectedIndexDefs(expectedIndexDefs, probe.indexDefs);
+    for (const [kind, results] of [['unique', uniqResults], ['notnull', nnResults], ['check', checkResults], ['indexdef', idxResults]]) {
+      const bad = results.filter((r) => r.state !== 'present_matching');
+      assertEqual(bad.length, 0, `CT11: every ${kind} entry classifies present_matching on a fresh DB — got ${JSON.stringify(bad)}`);
+    }
+
+    await client.end();
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+  }
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -1745,6 +1821,7 @@ async function main() {
   await testCT8();
   await testCT9();
   await testCT10();
+  await testCT11();
 
   console.log('');
   console.log(`Results: ${passed} passed, ${failed} failed, ${skipped} skipped`);
