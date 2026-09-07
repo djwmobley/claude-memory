@@ -1284,6 +1284,23 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run embed-heal-on-touch tests (categorical write-time-embed-gap fix)
+        # 7 tests against a throwaway Postgres DB: NULL rows + READY provider
+        # -> healed; embed_heal_batch bound respected -> partial; batch=0 ->
+        # disabled; no default provider -> provider_unready (ensureSchemaCurrent's
+        # own {applied,reason,detail} contract unaffected); two real connections
+        # racing the same backlog -> no double embed (advisory lock namespace
+        # 44); status/readiness rendering; entity-graph-crud.js assertionUpdate
+        # write-time embed. Uses the SAME fake-embed-server subprocess helper
+        # (test-pg-helpers.js's startFakeEmbedServerProcess) every other
+        # embedding-provider test in this workflow uses -- never a live vLLM
+        # endpoint, never localhost:8800. Creates/drops its own throwaway DB;
+        # never touches claude_memory_eval_test/pipeline_judge/pipeline_pwa_etl.
+        run: node scripts/test-embed-heal.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run schema-heal total-classification tests (cm#185-schema-heal)
         # A fingerprint-current DB can still be missing an ungated/gated
         # object (S1), and cmdInit never recorded schema_fingerprint at all

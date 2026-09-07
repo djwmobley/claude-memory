@@ -153,19 +153,31 @@ async function _mixedProviderCheck(db, table, projectId, defaultProviderId) {
  * _applyTable — the actual backfill loop for one table. Keyset-paginated
  * (id > lastId), per-batch BEGIN/COMMIT, UPDATE re-checks embedding IS NULL.
  */
-async function _applyTable(db, table, projectId, provider, providerId, batchSize, log) {
+async function _applyTable(db, table, projectId, provider, providerId, batchSize, log, boundOpts = {}) {
   const textExpr = TEXT_SQL_EXPR[table];
   let embedded = 0, alreadyEmbedded = 0, errors = 0, lastId = 0;
   const t0 = Date.now();
+  // cm#embed-heal-on-touch: optional bounds so this shared loop can also
+  // serve a time/row-budgeted "heal a little on every touch" caller
+  // (scripts/lib/embed-heal.js), never just the unbounded CLI backfill run.
+  // Both default to unbounded (Infinity) — the pre-existing CLI behavior is
+  // byte-identical when neither option is supplied.
+  const rowCap     = Number.isFinite(boundOpts.rowCap) ? boundOpts.rowCap : Infinity;
+  const deadlineAt = Number.isFinite(boundOpts.deadlineAt) ? boundOpts.deadlineAt : Infinity;
+  let stopped = null; // null | 'row_cap' | 'deadline'
 
   for (;;) {
+    if (embedded >= rowCap) { stopped = 'row_cap'; break; }
+    if (Date.now() >= deadlineAt) { stopped = 'deadline'; break; }
+
+    const thisBatchSize = Math.max(1, Math.min(batchSize, rowCap - embedded));
     const scopeSql = projectId ? `AND project_id = $2` : '';
     const limitIdx = projectId ? 3 : 2;
     const { rows: batch } = await db.query(
       `SELECT id, ${textExpr} AS text FROM ${table}
        WHERE embedding IS NULL AND trim(${textExpr}) <> '' AND id > $1 ${scopeSql}
        ORDER BY id ASC LIMIT $${limitIdx}`,
-      projectId ? [lastId, projectId, batchSize] : [lastId, batchSize]
+      projectId ? [lastId, projectId, thisBatchSize] : [lastId, thisBatchSize]
     );
     if (batch.length === 0) break;
     lastId = batch[batch.length - 1].id;
@@ -175,6 +187,10 @@ async function _applyTable(db, table, projectId, provider, providerId, batchSize
     // / decisions-writer.js).
     const updates = [];
     for (const row of batch) {
+      // "measure and stop between rows" (embed-heal.js spec E2 time budget):
+      // checked before EACH embed call, not just between batches, so a
+      // slow-responding provider can't blow past the deadline mid-batch.
+      if (Date.now() >= deadlineAt) { stopped = 'deadline'; break; }
       try {
         const result = await provider.embed(row.text);
         updates.push({ id: row.id, vecLiteral: `[${result.vector.join(',')}]` });
@@ -183,7 +199,7 @@ async function _applyTable(db, table, projectId, provider, providerId, batchSize
         log(`  ERROR: embed failed for ${table} id=${row.id}: ${embedErr.message}`);
       }
     }
-    if (updates.length === 0) continue;
+    if (updates.length === 0) { if (stopped) break; continue; }
 
     try {
       await db.query('BEGIN');
@@ -205,9 +221,10 @@ async function _applyTable(db, table, projectId, provider, providerId, batchSize
       errors++;
       log(`  ERROR: batch write failed for ${table} (rows up to id=${lastId}): ${dbErr.message}`);
     }
+    if (stopped) break;
   }
 
-  return { embedded, alreadyEmbedded, errors, elapsedMs: Date.now() - t0 };
+  return { embedded, alreadyEmbedded, errors, elapsedMs: Date.now() - t0, stopped };
 }
 
 /**
@@ -223,6 +240,15 @@ async function _applyTable(db, table, projectId, provider, providerId, batchSize
  * @param {number} [opts.batchSize] — rows per BEGIN/COMMIT batch (default 10)
  * @param {boolean} [opts.forceMixedProvider] — bypass the mixed-provider refusal
  * @param {function} [opts.log]     — line-sink (default: no-op; caller wires console.log)
+ * @param {number} [opts.rowCap]    — cm#embed-heal-on-touch: max TOTAL rows to
+ *   embed across all tables THIS call (default Infinity — unbounded, the
+ *   pre-existing CLI behavior). Consumed across tables in `tables` order —
+ *   a cap reached partway through the first table stops before the second
+ *   ever runs.
+ * @param {number} [opts.deadlineAt] — cm#embed-heal-on-touch: a Date.now()-
+ *   comparable epoch-ms wall-clock deadline (default Infinity — unbounded).
+ *   Checked between batches AND between individual row embeds within a
+ *   batch (see _applyTable) so a slow provider cannot blow past it.
  * @returns {Promise<{ ok: boolean, dryRun: boolean, refusal: object|null, tables: Array<object> }>}
  */
 async function runBackfillEmbeddings(opts = {}) {
@@ -234,6 +260,8 @@ async function runBackfillEmbeddings(opts = {}) {
   const forceMixedProvider = !!opts.forceMixedProvider;
   const log = typeof opts.log === 'function' ? opts.log : () => {};
   const tables = resolveTables(opts.table);
+  const rowCap = Number.isFinite(opts.rowCap) ? opts.rowCap : Infinity;
+  const deadlineAt = Number.isFinite(opts.deadlineAt) ? opts.deadlineAt : Infinity;
 
   // ── SQLite: total-classification 4th branch — never queries, never BLOCKs ──
   if (dialect === 'sqlite') {
@@ -299,9 +327,29 @@ async function runBackfillEmbeddings(opts = {}) {
     }
 
     const results = [];
+    let totalEmbeddedSoFar = 0;
     for (const table of tables) {
       const counts = await _countsForTable(db, table, projectId);
-      const applied = await _applyTable(db, table, projectId, provider, providerRow.id, batchSize, log);
+      const remainingRowCap = rowCap - totalEmbeddedSoFar;
+      if (remainingRowCap <= 0 || Date.now() >= deadlineAt) {
+        // Budget already exhausted by an earlier table — skip this one's
+        // apply entirely (never a zero-row apply call, just a bounds-only
+        // report) rather than issuing a no-op batch query.
+        results.push({
+          table, dialect: 'postgres',
+          providerId: providerRow.id, providerName: providerRow.name,
+          beforeActionableNull: counts.actionableNull,
+          beforeNoTextNull: counts.noTextNull,
+          beforeAlreadyEmbedded: counts.alreadyEmbedded,
+          embedded: 0, alreadyEmbedded: 0, errors: 0, elapsedMs: 0,
+          stopped: remainingRowCap <= 0 ? 'row_cap' : 'deadline',
+        });
+        continue;
+      }
+      const applied = await _applyTable(db, table, projectId, provider, providerRow.id, batchSize, log, {
+        rowCap: remainingRowCap, deadlineAt,
+      });
+      totalEmbeddedSoFar += applied.embedded;
       results.push({
         table, dialect: 'postgres',
         providerId: providerRow.id, providerName: providerRow.name,

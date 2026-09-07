@@ -266,6 +266,22 @@ embedding spaces in the same vector column would silently corrupt cosine-similar
 SQLite (seam-test-only; see below) every table reports "0 embeddable rows (no embedding column on
 this backend)" rather than an error.
 
+**Heal-on-touch (draining the backlog automatically).** Not every writer embeds inline at write
+time — a bulk migration (e.g. `migrate-08`) intentionally does not, and any future writer that
+forgets to could reintroduce a silent NULL backlog even while `/handoff:status` kept reading
+`embedding: READY`. To close that gap categorically rather than one manual `backfill-embeddings`
+run at a time, `ensureSchemaCurrent` (the shared entry every `status`/`resume`/`init`/`close`/
+`checkpoint` touch runs through) also runs a small, bounded embed-heal step after schema is
+confirmed healthy: up to `project_settings.embed_heal_batch` rows (default 250; set to `0` to
+disable) per touch, within a 2-second wall-clock budget, under a non-blocking advisory lock so
+concurrent touches never double-embed. The outcome (`healed`, `partial`, `disabled`,
+`provider_unready`, or `error:<short>`) is recorded to `project_settings.last_embed_heal` and
+surfaced by `/handoff:status` — a nonzero backlog on a READY project now renders as
+`embedding: READY (backlog N, healing ≤250/touch)` instead of a bare `READY`, with an
+`embedding heal: embedded X, remaining Y` line after a heal actually runs. This drains any backlog
+over a handful of touches without an operator ever running `backfill-embeddings --apply` by hand;
+the manual command remains available for an immediate, unbounded, one-shot drain.
+
 ---
 
 ## A word on what the hooks are doing
