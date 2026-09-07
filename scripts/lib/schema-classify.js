@@ -258,6 +258,30 @@ function _checkManifestEntryAgainstOwnSQL(basename, normalizedSQL, manifestEntry
       }
     }
   }
+
+  // FK follow-up (cm#185-schema-heal FK extension, F1): same desync guard,
+  // extended to expected_fks — table, EVERY declared local column, ref_table,
+  // and EVERY declared ref_column must each textually appear in this unit's
+  // own SQL. A typo in any one of these must fail at classification time
+  // (loud, non-fatal) — never silently become a permanent DEGRADED row from
+  // an FK identity that can never match the live catalog.
+  const expectedFks = Array.isArray(manifestEntry.expected_fks) ? manifestEntry.expected_fks : [];
+  for (const fk of expectedFks) {
+    const parts = [
+      ['table', fk.table],
+      ...((Array.isArray(fk.columns) ? fk.columns : []).map((c) => ['columns', c])),
+      ['ref_table', fk.ref_table],
+      ...((Array.isArray(fk.ref_columns) ? fk.ref_columns : []).map((c) => ['ref_columns', c])),
+    ];
+    for (const [field, identifier] of parts) {
+      if (typeof identifier !== 'string' || !_identifierAppearsInSQL(normalizedSQL, identifier)) {
+        errors.push(
+          `${basename}: schema-manifest.json expected_fks entry (table="${fk.table}") — ${field} value ` +
+          `"${identifier}" has no textual match in this unit's own SQL — manifest/DDL desync (manifest_desync)`
+        );
+      }
+    }
+  }
 }
 
 function loadManifest(sqlDir) {

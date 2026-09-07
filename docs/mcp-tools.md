@@ -138,6 +138,43 @@ that specific case is reported as "column missing, extension present"
 still loud (a `schema_apply_degraded` row IS written), just without a
 version-specific diagnosis.
 
+**FK verification + heal (cm#185-schema-heal FK extension).** The fast path
+above verifies column existence and pgvector shape but, before this
+extension, never the FK itself — a column recreated without its
+`REFERENCES` clause (e.g. `assertions.embedded_by_provider_id` missing its
+link to `embedding_providers.id`) read HEALED and a later write (e.g.
+`backfill-embeddings`) failed at runtime with a bare FK-violation error.
+Each manifest unit now declares an `expected_fks` array (today:
+`handoff-core-schema.sql`'s `assertions.embedded_by_provider_id ->
+embedding_providers.id`, `decisions-base.sql`'s
+`decisions.embedded_by_provider_id -> embedding_providers.id`), checked on
+every `'current'`-fast-path touch from the SAME combined catalog probe
+`probeFastPathSchemaState` already issues (one additional `UNION ALL` arm
+over `pg_constraint` — no extra round trip). Every expected FK is TOTAL-
+classified into exactly one of `table_absent | absent |
+present_mismatched(reason) | present_matching` — identity is `(table,
+ordered columns, ref_table, ordered ref_columns)`, never the constraint
+name; `ON DELETE` mismatch, an unvalidated (`NOT VALID`) constraint, and a
+stale extra FK on the same columns are all `present_mismatched` reasons.
+Any non-matching entry HEALS automatically: `DROP CONSTRAINT` (the
+mismatched constraint plus any extras) and the corrective `ADD CONSTRAINT`
+run together in ONE transaction, so an `ADD` failure (e.g. orphan rows
+violating the new FK) rolls back cleanly, leaving the prior constraint
+exactly as it was and recording `schema_apply_degraded` with reason
+`fk_mismatch` / `heal_failed:<sqlstate>`. A degraded row clears only after
+a fresh post-heal re-probe reports every expected FK `present_matching`; a
+re-probe error itself keeps the row DEGRADED (`verification_probe_failed`),
+never a silent clear. SQLite declares zero `expected_fks` entries today —
+the probe's FK arm is a real Postgres-only no-op there (an empty set),
+revisited only if a SQLite unit ever declares one. **Not detected:**
+constraints declared only in ad-hoc migration scripts but never added to
+`expected_fks` (the same manifest-desync class the ungated/gated checks
+already have — closed at classification time by `schema-classify.js`'s
+textual cross-check, never a silent live-probe skip); `DEFERRABLE`/
+`INITIALLY DEFERRED` state (not read by this probe); triggers (out of
+scope — not a constraint); multi-column `CHECK` expression equality beyond
+this extension's scope entirely (FK-only).
+
 ## `memory_search` — hybrid vector+FTS, project-scoped
 
 Runs the same `ts_rank * 0.3 + cosine * 0.7` scoring formula the engine's
