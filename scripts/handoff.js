@@ -5893,34 +5893,58 @@ async function writeExtraction(db, projectId, payload, opts) {
   // default row temporarily absent, not an operator opt-out).
   const embeddingsOptedOut = await isEmbeddingsOptedOut(db, projectId);
 
-  // init-embeddability A2: assertion embed failures are fail-soft (row still
-  // persisted, embedding=NULL) — collected into assertionEmbedDivergences via
-  // opts.warnSink and merged into the SAME DIVERGENCE-line channel decisions'
-  // embed warnings already use (formatIntentDivergenceLines). A per-item
-  // try/catch here is a NEW safety net (writeAssertionWithSupersession could
-  // previously only throw on a genuine DB error, which — pre-existing
+  // init-embeddability A2, corrected per markdown-thin-pointer review: the
+  // spec's own wording is "fail-soft to NULL with a counted WARN on the
+  // close summary line" — a COUNT on stdout, never a per-row line persisted
+  // into handoff.md. An earlier revision of this code routed assertion
+  // embed-degraded warnings through the SAME channel decisions[]'s
+  // pre-existing (and intentionally unchanged) embed-degraded contract
+  // uses (formatIntentDivergenceLines -> handoff.md's "## Degraded"
+  // section) — assertions are written far more densely than decisions in
+  // ordinary sessions, and on any DB with no default embedding provider
+  // configured (the common case for a project that has never opted into
+  // embeddings via `init`) that put ONE full-length DIVERGENCE line per
+  // assertion into the persisted markdown body, blowing the 512-byte
+  // thin-pointer budget (test/north-star/test-retrieval-economy.js INV5a,
+  // test/north-star/test-lifecycle-roundtrip.js test B — both fixtures
+  // bootstrap via ns-harness.js's applySchemas(), never `cmdInit`, so no
+  // embeddings_opt_out row is ever stamped for them). Fixed: an
+  // embed-degraded warning now ONLY increments a count (assertionEmbedWarnCount,
+  // surfaced solely via the stdout Done-line's embed_warnings figure below)
+  // — it is NEVER pushed into intentDivergences/the markdown body. A
+  // GENUINE write failure (the row did not persist at all — a real DB
+  // error, e.g. EmbeddingColumnAbsentError on a pgvector-degraded target
+  // with a provider configured anyway) is a categorically different,
+  // comparatively rare event and still surfaces via the existing
+  // NOT-PERSISTED divergence channel, matching persistSessionIntent's own
+  // established convention for the same class of failure. The per-item
+  // try/catch here is itself a NEW safety net (writeAssertionWithSupersession
+  // could previously only throw on a genuine DB error, which — pre-existing
   // behavior — was never caught in this specific loop): with embedding
   // columns now sometimes referenced, a genuinely pgvector-degraded target
-  // (a live DB where a provider is configured but the embedding column was
-  // never added) must degrade this ONE assertion, never abort the rest of
+  // must degrade this ONE assertion, never abort the rest of
   // entities/edges/decisions/session-intent processing still to come.
-  const assertionEmbedDivergences = [];
+  const assertionWriteFailures = [];
+  let assertionEmbedWarnCount = 0;
   for (const ass of (payload.assertions || [])) {
     if (!ass.subject || !ass.predicate || !ass.object) continue;
     try {
+      const embedWarnSink = [];
       const inserted = await writeAssertionWithSupersession(
         db, projectId, ass, sessionId, registryMode,
-        { warnSink: assertionEmbedDivergences, embeddingsOptedOut }
+        { warnSink: embedWarnSink, embeddingsOptedOut }
       );
       if (inserted) assertionsWritten++;
+      assertionEmbedWarnCount += embedWarnSink.length;
     } catch (err) {
       process.stderr.write(
         `[handoff] assertion write failed for predicate "${ass.predicate}" subject "${ass.subject}" (non-fatal): ${err.message}\n`
       );
       // No `kind` — renders as a standard "NOT PERSISTED" divergence line
-      // (this row genuinely failed to write, unlike an 'embed_degraded'
-      // entry above where the row WAS persisted and only its embedding is NULL).
-      assertionEmbedDivergences.push({
+      // (this row genuinely failed to write — a real, comparatively rare
+      // operational failure worth surfacing in the markdown body, unlike
+      // the routine embed-degraded case above which is counted, not quoted).
+      assertionWriteFailures.push({
         predicate: ass.predicate,
         subject: ass.subject,
         message: err.message,
@@ -6052,7 +6076,10 @@ async function writeExtraction(db, projectId, payload, opts) {
   // returned on its own for any caller that wants the raw count.
   return {
     entitiesWritten, assertionsWritten, edgesWritten, decisionsWritten,
-    intentDivergences: [...intentDivergences, ...decisionDivergences, ...assertionEmbedDivergences],
+    intentDivergences: [...intentDivergences, ...decisionDivergences, ...assertionWriteFailures],
+    // Count-only (never rendered into handoff.md — see the header comment
+    // above assertionWriteFailures/assertionEmbedWarnCount for why).
+    assertionEmbedWarnCount,
   };
 }
 
@@ -6340,10 +6367,14 @@ async function cmdCheckpoint(args) {
   // and in handoff.md's Degraded section. Non-fatal: exit code is unchanged.
   const intentDivergences     = extraction.intentDivergences || [];
   const divergenceLines       = formatIntentDivergenceLines(intentDivergences);
-  // A3: counted WARN on the summary Done line (never buried only inside the
-  // per-line DIVERGENCE list above) — the count of embed-degraded rows
-  // (assertions and/or decisions; both share the same 'embed_degraded' kind).
-  const embedWarnCount = intentDivergences.filter((d) => d.kind === 'embed_degraded').length;
+  // A3: counted WARN on the summary Done line (stdout only — never rendered
+  // into handoff.md; see writeExtraction's own header comment on
+  // assertionEmbedWarnCount for why assertions and decisions are counted
+  // differently here). decisions[] embed-degraded rows still render their
+  // own per-row DIVERGENCE line too (cm#230's pre-existing, unchanged
+  // contract) — this count folds both sources into one stdout figure.
+  const embedWarnCount = intentDivergences.filter((d) => d.kind === 'embed_degraded').length
+    + (extraction.assertionEmbedWarnCount || 0);
   const embedWarnSuffix = embedWarnCount > 0 ? `, embed_warnings: ${embedWarnCount}` : '';
   const checkpointDegradedSection = divergenceLines.length > 0
     ? '\n\n## Degraded\n' + divergenceLines.map((l) => `- ${l}`).join('\n')
@@ -7048,7 +7079,7 @@ async function cmdClose(args) {
   }
 
   // ── Synchronous path (default) — unchanged behavior ──────────────────────────
-  const { entitiesWritten, assertionsWritten, edgesWritten, decisionsWritten, intentDivergences } =
+  const { entitiesWritten, assertionsWritten, edgesWritten, decisionsWritten, intentDivergences, assertionEmbedWarnCount } =
     await writeExtraction(db, projectId, payload, { projectBasename: path.basename(root) });
   // cm#227: DIVERGENCE lines for any session_tldr/open_thread/quick_reference
   // persistence failure — surfaced below in the Done summary AND rendered into
@@ -7056,9 +7087,10 @@ async function cmdClose(args) {
   // on purpose: this must never affect close_degraded_exit_mode='strict' — only
   // visibility changes, never the exit code.
   const intentDivergenceLines = formatIntentDivergenceLines(intentDivergences);
-  // A3: counted WARN on the summary Done line — see cmdCheckpoint's identical
-  // computation for rationale.
-  const embedWarnCount  = intentDivergences.filter((d) => d.kind === 'embed_degraded').length;
+  // A3: counted WARN on the summary Done line (stdout only — never rendered
+  // into handoff.md) — see cmdCheckpoint's identical computation for rationale.
+  const embedWarnCount  = intentDivergences.filter((d) => d.kind === 'embed_degraded').length
+    + (assertionEmbedWarnCount || 0);
   const embedWarnSuffix = embedWarnCount > 0 ? `, embed_warnings: ${embedWarnCount}` : '';
 
   // Surface CLAUDE.md promotion candidates (conf >= 9, user_stated, multi-session).
