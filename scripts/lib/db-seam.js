@@ -978,8 +978,21 @@ class SQLiteAdapter {
     // SQLite unit ever declares a real FK, this must be revisited to read
     // `PRAGMA foreign_key_list(table)` (a genuine per-table equivalent —
     // unlike the shape/pgvector case, which has no SQLite analog at all).
-    return { tablesFound, columnsFound, indexesFound, vectorExtensionPresent: false, shapes: new Map(), fks: [] };
+    // cm#185-schema-heal constraint extension: no SQLite unit declares any
+    // expected_uniques/expected_not_nulls/expected_checks/expected_index_defs
+    // entry today (schema-manifest.json) — same rationale as the fks arm
+    // above. Real empty arrays (never a thrown "unsupported"), so a caller
+    // that unconditionally reads probe.uniques/etc. never branches on
+    // dialect; the classify functions below treat an empty expected set as
+    // trivially present_matching for this dialect.
+    return { tablesFound, columnsFound, indexesFound, vectorExtensionPresent: false, shapes: new Map(), fks: [], uniques: [], notNulls: [], checks: [], indexDefs: [] };
   }
+
+  /**
+   * cm#185-schema-heal constraint extension: no-op for SQLite — see
+   * probeFastPathSchemaState's own doc above; present for interface parity.
+   */
+  async healConstraints(_plans) { return { ok: true }; }
 
   /**
    * Execute a SELECT query that may fail (e.g., table might not exist) without
@@ -1750,29 +1763,45 @@ class PostgresAdapter {
     // array_agg(... ORDER BY u.ord) return the local and referenced column
     // lists in matching, semantically-correct order (F2: "ordered by array
     // position — not attnum, not unordered").
+    // cm#185-schema-heal constraint extension (unique/not-null/check/index-def):
+    // four more UNION ALL branches on this SAME combined query — still one
+    // round trip. Two generic trailing columns (`extra_def`/`extra_flag`)
+    // are reused by kind rather than adding a column per new kind:
+    //   'uniq'     — name=table, col2=index name, fk_cols=ordered unique
+    //                columns, extra_def=partial predicate (pg_get_expr, NULL
+    //                for a non-partial unique). Covers BOTH a table-level
+    //                UNIQUE constraint (which Postgres backs with an index)
+    //                and a bare CREATE UNIQUE INDEX — pg_index is the single
+    //                source both forms share, so one arm covers both.
+    //   'notnull'  — name=table, col2=column, extra_flag=pg_attribute.attnotnull
+    //   'check'    — name=table, col2=constraint name, extra_def=pg_get_constraintdef(oid)
+    //   'indexdef' — name=index name, extra_def=pg_indexes.indexdef (filtered
+    //                by the SAME $2 indexes array the 'index' arm already
+    //                uses — indexes the manifest lists by name only)
     const { rows } = await this._client.query(
       `SELECT 'table'::text AS kind, table_name::text AS name, NULL::text AS col2, NULL::text AS type, NULL::int AS dims,
-              NULL::text[] AS fk_cols, NULL::text AS fk_ref_table, NULL::text[] AS fk_ref_cols, NULL::text AS fk_on_delete, NULL::boolean AS fk_validated, NULL::text AS fk_conname
+              NULL::text[] AS fk_cols, NULL::text AS fk_ref_table, NULL::text[] AS fk_ref_cols, NULL::text AS fk_on_delete, NULL::boolean AS fk_validated, NULL::text AS fk_conname,
+              NULL::text AS extra_def, NULL::boolean AS extra_flag
          FROM information_schema.tables
         WHERE table_schema = 'public' AND table_name = ANY($1::text[])
        UNION ALL
        SELECT 'column', table_name, column_name, NULL::text, NULL::int,
-              NULL::text[], NULL::text, NULL::text[], NULL::text, NULL::boolean, NULL::text
+              NULL::text[], NULL::text, NULL::text[], NULL::text, NULL::boolean, NULL::text, NULL::text, NULL::boolean
          FROM information_schema.columns
         WHERE table_schema = 'public'
        UNION ALL
        SELECT 'index', indexname, NULL::text, NULL::text, NULL::int,
-              NULL::text[], NULL::text, NULL::text[], NULL::text, NULL::boolean, NULL::text
+              NULL::text[], NULL::text, NULL::text[], NULL::text, NULL::boolean, NULL::text, NULL::text, NULL::boolean
          FROM pg_indexes
         WHERE schemaname = 'public' AND indexname = ANY($2::text[])
        UNION ALL
        SELECT 'extension', extname, NULL::text, NULL::text, NULL::int,
-              NULL::text[], NULL::text, NULL::text[], NULL::text, NULL::boolean, NULL::text
+              NULL::text[], NULL::text, NULL::text[], NULL::text, NULL::boolean, NULL::text, NULL::text, NULL::boolean
          FROM pg_extension
         WHERE extname = 'vector'
        UNION ALL
        SELECT 'shape', shp.tbl, shp.col, ty.typname, a.atttypmod,
-              NULL::text[], NULL::text, NULL::text[], NULL::text, NULL::boolean, NULL::text
+              NULL::text[], NULL::text, NULL::text[], NULL::text, NULL::boolean, NULL::text, NULL::text, NULL::boolean
          FROM unnest($3::text[], $4::text[]) AS shp(tbl, col)
          JOIN pg_attribute a ON a.attrelid = ('public.' || shp.tbl)::regclass
                              AND a.attname = shp.col AND a.attnum > 0 AND NOT a.attisdropped
@@ -1784,7 +1813,8 @@ class PostgresAdapter {
               array_agg(ra.attname ORDER BY u.ord)::text[],
               c.confdeltype::text,
               c.convalidated,
-              c.conname::text
+              c.conname::text,
+              NULL::text, NULL::boolean
          FROM pg_constraint c
          JOIN pg_class tc ON tc.oid = c.conrelid
          JOIN pg_namespace tn ON tn.oid = tc.relnamespace AND tn.nspname = 'public'
@@ -1794,7 +1824,41 @@ class PostgresAdapter {
          JOIN pg_attribute ta ON ta.attrelid = c.conrelid AND ta.attnum = u.local_attnum
          JOIN pg_attribute ra ON ra.attrelid = c.confrelid AND ra.attnum = u.foreign_attnum
         WHERE c.contype = 'f' AND tc.relname = ANY($1::text[])
-        GROUP BY c.oid, tc.relname, rc.relname, c.confdeltype, c.convalidated, c.conname`,
+        GROUP BY c.oid, tc.relname, rc.relname, c.confdeltype, c.convalidated, c.conname
+       UNION ALL
+       SELECT 'uniq', tc.relname::text, ic.relname::text, NULL::text, NULL::int,
+              array_agg(a.attname ORDER BY k.ord)::text[], NULL::text, NULL::text[], NULL::text, NULL::boolean, NULL::text,
+              pg_get_expr(ix.indpred, ix.indrelid), NULL::boolean
+         FROM pg_index ix
+         JOIN pg_class ic ON ic.oid = ix.indexrelid
+         JOIN pg_class tc ON tc.oid = ix.indrelid
+         JOIN pg_namespace tn ON tn.oid = tc.relnamespace AND tn.nspname = 'public'
+         CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord)
+         JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = k.attnum
+        WHERE ix.indisunique AND tc.relname = ANY($1::text[])
+        GROUP BY tc.relname, ic.relname, ix.indpred, ix.indrelid
+       UNION ALL
+       SELECT 'notnull', c.relname::text, a.attname::text, NULL::text, NULL::int,
+              NULL::text[], NULL::text, NULL::text[], NULL::text, NULL::boolean, NULL::text,
+              NULL::text, a.attnotnull
+         FROM pg_attribute a
+         JOIN pg_class c ON c.oid = a.attrelid
+         JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'public'
+        WHERE c.relname = ANY($1::text[]) AND a.attnum > 0 AND NOT a.attisdropped
+       UNION ALL
+       SELECT 'check', c.relname::text, con.conname::text, NULL::text, NULL::int,
+              NULL::text[], NULL::text, NULL::text[], NULL::text, NULL::boolean, NULL::text,
+              pg_get_constraintdef(con.oid), NULL::boolean
+         FROM pg_constraint con
+         JOIN pg_class c ON c.oid = con.conrelid
+         JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'public'
+        WHERE con.contype = 'c' AND c.relname = ANY($1::text[])
+       UNION ALL
+       SELECT 'indexdef', indexname::text, NULL::text, NULL::text, NULL::int,
+              NULL::text[], NULL::text, NULL::text[], NULL::text, NULL::boolean, NULL::text,
+              indexdef, NULL::boolean
+         FROM pg_indexes
+        WHERE schemaname = 'public' AND indexname = ANY($2::text[])`,
       [tables || [], indexes || [], shapeTables, shapeCols]
     );
     const tablesFound  = new Set();
@@ -1802,6 +1866,10 @@ class PostgresAdapter {
     const indexesFound = new Set();
     const shapes = new Map();
     const fks = [];
+    const uniques = [];
+    const notNulls = [];
+    const checks = [];
+    const indexDefs = [];
     let vectorExtensionPresent = false;
     for (const r of rows) {
       switch (r.kind) {
@@ -1826,10 +1894,26 @@ class PostgresAdapter {
           });
           break;
         }
+        case 'uniq': {
+          uniques.push({ table: r.name, name: r.col2, columns: r.fk_cols || [], predicate: r.extra_def || null });
+          break;
+        }
+        case 'notnull': {
+          notNulls.push({ table: r.name, column: r.col2, notNull: r.extra_flag === true });
+          break;
+        }
+        case 'check': {
+          checks.push({ table: r.name, conname: r.col2, def: r.extra_def });
+          break;
+        }
+        case 'indexdef': {
+          indexDefs.push({ name: r.name, def: r.extra_def });
+          break;
+        }
         default: break;
       }
     }
-    return { tablesFound, columnsFound, indexesFound, vectorExtensionPresent, shapes, fks };
+    return { tablesFound, columnsFound, indexesFound, vectorExtensionPresent, shapes, fks, uniques, notNulls, checks, indexDefs };
   }
 
   /**
@@ -1872,6 +1956,75 @@ class PostgresAdapter {
           `ALTER TABLE ${q(plan.table)} ADD CONSTRAINT ${q(healName)} ` +
           `FOREIGN KEY (${cols}) REFERENCES ${q(plan.ref_table)} (${refCols}) ON DELETE ${onDelete}`
         );
+      }
+      await this._client.query('COMMIT');
+      return { ok: true };
+    } catch (e) {
+      try { await this._client.query('ROLLBACK'); } catch (_) {}
+      return { ok: false, sqlstate: e && e.code, message: e && e.message };
+    }
+  }
+
+  /**
+   * cm#185-schema-heal constraint extension: heal a batch of unique/
+   * not-null/check/index-def mismatches or absences in ONE transaction —
+   * same all-or-nothing shape as healForeignKeys. On any failure (e.g. a
+   * NOT NULL heal on a column that still has NULL rows, or a UNIQUE heal on
+   * a table with duplicate rows) the whole transaction rolls back and the
+   * prior state is retained exactly as it was — this is what makes a NOT
+   * NULL heal fail CLOSED rather than silently truncating/erroring rows.
+   *
+   * @param {Array<{kind:'unique'|'notnull'|'check'|'indexdef', table?, columns?,
+   *   predicate?, name?, column?, conname?, def?, dropNames?:string[]}>} plans
+   * @returns {Promise<{ok:boolean, sqlstate?:string, message?:string}>}
+   */
+  async healConstraints(plans) {
+    const q = (ident) => '"' + String(ident).replace(/"/g, '""') + '"';
+    try {
+      await this._client.query('BEGIN');
+      await this._client.query(`SET LOCAL lock_timeout = '5s'`);
+      await this._client.query(`SET LOCAL statement_timeout = '120s'`);
+      for (const plan of plans) {
+        if (plan.kind === 'unique') {
+          // A UNIQUE identity can be backed by EITHER a table-level UNIQUE
+          // constraint (inline `UNIQUE (...)` in the CREATE TABLE — Postgres
+          // auto-creates a same-name index that DROP INDEX alone cannot
+          // remove: "cannot drop index X because constraint X ... requires
+          // it") OR a bare `CREATE UNIQUE INDEX`. Try the constraint form
+          // first (IF EXISTS makes it a safe no-op when the name is not a
+          // constraint), THEN the bare-index form (a no-op if the
+          // constraint drop above already removed the backing index) —
+          // this covers both without needing to know which one it is.
+          for (const nm of (plan.dropNames || [])) {
+            await this._client.query(`ALTER TABLE ${q(plan.table)} DROP CONSTRAINT IF EXISTS ${q(nm)}`);
+            await this._client.query(`DROP INDEX IF EXISTS ${q(nm)}`);
+          }
+          if (plan.skipAdd) continue;
+          const healName = `${plan.table}_${plan.columns.join('_')}_uniq_heal`;
+          const cols = plan.columns.map(q).join(', ');
+          const where = plan.predicate ? ` WHERE ${plan.predicate}` : '';
+          await this._client.query(`CREATE UNIQUE INDEX ${q(healName)} ON ${q(plan.table)} (${cols})${where}`);
+        } else if (plan.kind === 'notnull') {
+          // Fails closed: ALTER ... SET NOT NULL throws (23502) if any live
+          // row has NULL in this column — that error propagates to the
+          // catch below and rolls the whole transaction back, never a
+          // partial heal.
+          await this._client.query(`ALTER TABLE ${q(plan.table)} ALTER COLUMN ${q(plan.column)} SET NOT NULL`);
+        } else if (plan.kind === 'check') {
+          for (const nm of (plan.dropNames || [])) {
+            await this._client.query(`ALTER TABLE ${q(plan.table)} DROP CONSTRAINT IF EXISTS ${q(nm)}`);
+          }
+          const healName = `${plan.table}_${plan.conname}_heal`;
+          await this._client.query(`ALTER TABLE ${q(plan.table)} ADD CONSTRAINT ${q(healName)} CHECK (${plan.def})`);
+        } else if (plan.kind === 'indexdef') {
+          await this._client.query(`DROP INDEX IF EXISTS ${q(plan.name)}`);
+          // plan.def is the manifest's own literal CREATE INDEX statement
+          // text (not the live pg_indexes.indexdef) — see
+          // _healExpectedIndexDefs in handoff.js for why this is safe (the
+          // manifest desync check already proved this text's identifiers
+          // appear in the unit's own SQL).
+          await this._client.query(plan.def);
+        }
       }
       await this._client.query('COMMIT');
       return { ok: true };

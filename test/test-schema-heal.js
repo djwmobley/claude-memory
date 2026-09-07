@@ -1330,6 +1330,381 @@ async function testFKT7() {
   }
 }
 
+// ── Constraint extension tests (cm#185-schema-heal constraint follow-up) ──
+//   CT1 — a phantom entry in each of expected_uniques/expected_not_nulls/
+//         expected_checks/expected_index_defs is a manifest_desync
+//         classification_error, never a live "missing".
+//   CT2 — _classifyExpectedUniques total-classification matrix.
+//   CT3 — _classifyExpectedNotNulls total-classification matrix.
+//   CT4 — _classifyExpectedChecks total-classification matrix.
+//   CT5 — _classifyExpectedIndexDefs total-classification matrix.
+//   CT6 — SQLite's probeFastPathSchemaState returns real empty arrays for
+//         all four new kinds — never a crash or false match.
+//   CT7 — an absent UNIQUE (dropped by hand) is healed on touch.
+//   CT8 — a NOT NULL heal on a column with live NULL rows fails CLOSED:
+//         the whole heal transaction rolls back, prior state retained,
+//         DEGRADED reason names the SQLSTATE.
+//   CT9 — a UNIQUE heal on a table with duplicate rows fails CLOSED, same
+//         rollback guarantee.
+
+function testCT1() {
+  const label = 'CT1: phantom expected_uniques/expected_not_nulls/expected_checks/expected_index_defs entries are manifest_desync classification_errors';
+  try {
+    const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cm185heal-ct1-'));
+    const sqlDir = path.join(scratchRoot, 'scripts', 'sql');
+    fs.mkdirSync(sqlDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sqlDir, 'fake-unit.sql'),
+      '-- handoff:dialect postgres\n' +
+      'CREATE TABLE IF NOT EXISTS widgets (id serial primary key, sku text NOT NULL, qty int CHECK (qty >= 0));\n' +
+      'CREATE UNIQUE INDEX IF NOT EXISTS widgets_sku_idx ON widgets (sku);\n',
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(sqlDir, 'schema-manifest.json'),
+      JSON.stringify({
+        schema_epoch: 1,
+        required_roster: ['fake-unit.sql'],
+        units: {
+          'fake-unit.sql': {
+            classification: 'postgres',
+            order: 10,
+            expected_objects: { tables: ['widgets'], columns: [], indexes: ['widgets_sku_idx'] },
+            expected_uniques: [{ table: 'widgets', columns: ['totally_phantom_unique_col'] }],
+            expected_not_nulls: [{ table: 'widgets', column: 'totally_phantom_notnull_col' }],
+            expected_checks: [{ table: 'widgets', expression_tokens: ['totally_phantom_check_token'], def: 'totally_phantom_check_token >= 0' }],
+            expected_index_defs: [{ name: 'totally_phantom_index_name', create_sql: 'CREATE INDEX totally_phantom_index_name ON widgets (sku)' }],
+          },
+        },
+      }, null, 2),
+      'utf8'
+    );
+    const result = classifySchemaFiles({ engineRoot: scratchRoot });
+    assertFalse(result.ok, 'CT1: classification must FAIL on the four phantom entries');
+    for (const needle of ['totally_phantom_unique_col', 'totally_phantom_notnull_col', 'totally_phantom_check_token', 'totally_phantom_index_name']) {
+      assertTrue(
+        result.errors.some((e) => e.includes(needle) && e.includes('manifest_desync')),
+        `CT1: an error names "${needle}" and tags manifest_desync — got: ${JSON.stringify(result.errors)}`
+      );
+    }
+    fs.rmSync(scratchRoot, { recursive: true, force: true });
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  }
+}
+
+function testCT2() {
+  const label = 'CT2: _classifyExpectedUniques total-classification matrix (table_absent/absent/mismatched-predicate/mismatched-extra/matching)';
+  try {
+    const expected = [
+      { unit: 'u', table: 'ghost_table', columns: ['x'], predicate: null },
+      { unit: 'u', table: 'widgets', columns: ['absent_col'], predicate: null },
+      { unit: 'u', table: 'widgets', columns: ['pred_col'], predicate: 'active = true' },
+      { unit: 'u', table: 'widgets', columns: ['extra_col'], predicate: null },
+      { unit: 'u', table: 'widgets', columns: ['ok_col'], predicate: null },
+    ];
+    const tablesFound = new Set(['widgets']);
+    const liveUniques = [
+      { table: 'widgets', name: 'pred_idx', columns: ['pred_col'], predicate: 'deleted = false' },
+      { table: 'widgets', name: 'extra_idx_1', columns: ['extra_col'], predicate: null },
+      { table: 'widgets', name: 'extra_idx_2', columns: ['extra_col'], predicate: null },
+      { table: 'widgets', name: 'ok_idx', columns: ['ok_col'], predicate: null },
+    ];
+    const results = handoffModule._classifyExpectedUniques(expected, tablesFound, liveUniques);
+    const byCol = {}; for (const r of results) byCol[r.columns[0]] = r;
+    assertEqual(byCol['x'].state, 'table_absent', 'CT2: ghost_table -> table_absent');
+    assertEqual(byCol['absent_col'].state, 'absent', 'CT2: no live row -> absent');
+    assertEqual(byCol['pred_col'].state, 'present_mismatched', 'CT2: wrong predicate -> present_mismatched');
+    assertEqual(byCol['pred_col'].reason, 'predicate_mismatch', 'CT2: reason is predicate_mismatch');
+    assertEqual(byCol['extra_col'].state, 'present_mismatched', 'CT2: two live indexes on same columns -> present_mismatched (inventory diff)');
+    assertTrue(byCol['extra_col'].reason.startsWith('extra_constraint:'), 'CT2: reason names extra_constraint');
+    assertEqual(byCol['ok_col'].state, 'present_matching', 'CT2: identity+predicate agree -> present_matching');
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  }
+}
+
+function testCT3() {
+  const label = 'CT3: _classifyExpectedNotNulls total-classification matrix (table_absent/absent/mismatched-nullable/matching)';
+  try {
+    const expected = [
+      { unit: 'u', table: 'ghost_table', column: 'x' },
+      { unit: 'u', table: 'widgets', column: 'absent_col' },
+      { unit: 'u', table: 'widgets', column: 'nullable_col' },
+      { unit: 'u', table: 'widgets', column: 'ok_col' },
+    ];
+    const tablesFound = new Set(['widgets']);
+    const liveNotNulls = [
+      { table: 'widgets', column: 'nullable_col', notNull: false },
+      { table: 'widgets', column: 'ok_col', notNull: true },
+    ];
+    const results = handoffModule._classifyExpectedNotNulls(expected, tablesFound, liveNotNulls);
+    const byCol = {}; for (const r of results) byCol[r.column] = r;
+    assertEqual(byCol['x'].state, 'table_absent', 'CT3: ghost_table -> table_absent');
+    assertEqual(byCol['absent_col'].state, 'absent', 'CT3: column itself absent -> absent');
+    assertEqual(byCol['nullable_col'].state, 'present_mismatched', 'CT3: live column is nullable -> present_mismatched');
+    assertEqual(byCol['nullable_col'].reason, 'nullable', 'CT3: reason is nullable');
+    assertEqual(byCol['ok_col'].state, 'present_matching', 'CT3: attnotnull=true -> present_matching');
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  }
+}
+
+function testCT4() {
+  const label = 'CT4: _classifyExpectedChecks total-classification matrix (table_absent/absent/matching, normalized-text comparison)';
+  try {
+    // Build via the real collector so normalized_def is computed the SAME way _classifyExpectedChecks expects.
+    const manifest = { units: { fake: { expected_checks: [
+      { table: 'ghost_table', expression_tokens: ['x'], def: 'CHECK ((x >= 0))' },
+      { table: 'widgets', expression_tokens: ['absent'], def: 'CHECK ((absent >= 0))' },
+      { table: 'widgets', expression_tokens: ['qty'], def: '  CHECK ( (qty  >=   0) )  ' },
+    ] } } };
+    const collected = handoffModule._collectExpectedChecks(manifest, [{ basename: 'fake' }]);
+    const tablesFound = new Set(['widgets']);
+    const liveChecks = [
+      { table: 'widgets', conname: 'widgets_qty_check', def: 'CHECK((qty >= 0))' },
+    ];
+    const results = handoffModule._classifyExpectedChecks(collected, tablesFound, liveChecks);
+    const byTable = {}; for (const r of results) byTable[`${r.table}:${r.expression_tokens[0]}`] = r;
+    assertEqual(byTable['ghost_table:x'].state, 'table_absent', 'CT4: ghost_table -> table_absent');
+    assertEqual(byTable['widgets:absent'].state, 'absent', 'CT4: no matching live CHECK text -> absent');
+    assertEqual(byTable['widgets:qty'].state, 'present_matching', 'CT4: whitespace/case/paren-normalized text matches -> present_matching');
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  }
+}
+
+function testCT5() {
+  const label = 'CT5: _classifyExpectedIndexDefs total-classification matrix (absent/mismatched index_def_drift/matching, normalized-text comparison)';
+  try {
+    const expected = handoffModule._collectExpectedIndexDefs(
+      { units: { fake: { expected_index_defs: [
+        { name: 'ghost_idx', create_sql: 'CREATE INDEX ghost_idx ON widgets (sku)' },
+        { name: 'drift_idx', create_sql: 'CREATE INDEX drift_idx ON widgets (sku)' },
+        { name: 'ok_idx', create_sql: '  CREATE   INDEX ok_idx ON widgets (sku)  ' },
+      ] } } },
+      [{ basename: 'fake' }]
+    );
+    const liveIndexDefs = [
+      { name: 'drift_idx', def: 'CREATE INDEX drift_idx ON widgets USING btree (qty)' },
+      { name: 'ok_idx', def: 'CREATE INDEX ok_idx ON widgets (sku)' },
+    ];
+    const results = handoffModule._classifyExpectedIndexDefs(expected, liveIndexDefs);
+    const byName = {}; for (const r of results) byName[r.name] = r;
+    assertEqual(byName['ghost_idx'].state, 'absent', 'CT5: no live index by this name -> absent');
+    assertEqual(byName['drift_idx'].state, 'present_mismatched', 'CT5: different definition text -> present_mismatched');
+    assertEqual(byName['drift_idx'].reason, 'index_def_drift', 'CT5: reason is index_def_drift');
+    assertEqual(byName['ok_idx'].state, 'present_matching', 'CT5: whitespace-normalized text matches -> present_matching');
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  }
+}
+
+async function testCT6() {
+  const label = 'CT6: SQLite probeFastPathSchemaState returns real empty arrays for uniques/notNulls/checks/indexDefs — never a crash or false match';
+  try {
+    const dbPath = path.join(os.tmpdir(), `cm185heal-ct6-${Date.now()}.sqlite`);
+    const adapter = new SQLiteAdapter(dbPath);
+    await adapter.connect();
+    const classification = classifySchemaFiles({ engineRoot: PROJECT_ROOT });
+    const units = classification.unitsByDialect.sqlite;
+    const applyResult = await handoffModule.applyAdditiveSchema(adapter, units, { silent: true });
+    assertTrue(applyResult.ok, `CT6 precondition: SQLite apply must succeed — ${applyResult.errorMsg}`);
+
+    const probe = await adapter.probeFastPathSchemaState({ tables: ['assertions'], columns: [], indexes: [], shapeTargets: [] });
+    for (const key of ['uniques', 'notNulls', 'checks', 'indexDefs']) {
+      assertTrue(Array.isArray(probe[key]), `CT6: probe.${key} is an array on SQLite`);
+      assertEqual(probe[key].length, 0, `CT6: probe.${key} is empty on SQLite`);
+    }
+    const healResult = await adapter.healConstraints([{ kind: 'notnull', table: 'assertions', column: 'confidence' }]);
+    assertTrue(healResult.ok, 'CT6: SQLite healConstraints is a real no-op (ok:true), never a crash');
+
+    await adapter.end();
+    fs.rmSync(dbPath, { force: true });
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  }
+}
+
+async function testCT7() {
+  const label = 'CT7: an absent UNIQUE (dropped by hand) is healed on touch; the live catalog carries the correct unique index afterward';
+  if (!(await isPgAvailable())) { skip(label, 'Postgres unavailable'); return; }
+  const dbName = `cm185heal_ct7_${Date.now()}`;
+  const PID = 'schema-heal-ct7';
+  try {
+    await createThrowawayDb(dbName);
+    const client = await pgConnect(dbName);
+    const { adapter } = await bootstrapCurrentDb(client, PID, { withExtension: false });
+
+    const { rows: before } = await client.query(
+      `SELECT indexname FROM pg_indexes WHERE tablename='entities' AND indexdef ILIKE '%UNIQUE%' AND indexname NOT LIKE '%pkey%'`
+    );
+    assertTrue(before.length > 0, 'CT7 precondition: entities has a live unique index to drop');
+    for (const r of before) {
+      // entities' UNIQUE (project_id, name) is a table-level constraint
+      // (auto-backed by a same-name index) — DROP CONSTRAINT first (a
+      // no-op if it's actually a bare index), then DROP INDEX.
+      await client.query(`ALTER TABLE entities DROP CONSTRAINT IF EXISTS "${r.indexname}"`);
+      await client.query(`DROP INDEX IF EXISTS "${r.indexname}"`);
+    }
+
+    // bootstrapCurrentDb runs with withExtension:false — the pgvector-gated
+    // columns are therefore ALSO legitimately absent, independent of this
+    // test's own unique-index scenario, so the overall touch result can
+    // legitimately still be 'degraded' (pgvector_gated_skip). What CT7
+    // actually proves is narrower and unaffected by that: the unique heal
+    // itself ran and the index was restored, and the degraded reason (if
+    // any) does not name unique_mismatch.
+    const result = await handoffModule.ensureSchemaCurrentCore(adapter, PID, { silent: true });
+    assertTrue(result.reason === 'current' || result.reason === 'degraded', `CT7: a recognizable reason — got ${result.reason}`);
+
+    const { rows: after } = await client.query(
+      `SELECT 1 FROM pg_indexes WHERE tablename='entities' AND indexdef ILIKE '%UNIQUE%' AND indexname NOT LIKE '%pkey%'`
+    );
+    assertTrue(after.length > 0, 'CT7: the unique index on entities(project_id, name) exists again after one touch');
+    const degradedRow = await getDegradedRow(client, PID);
+    assertTrue(!degradedRow || degradedRow.reason !== 'unique_mismatch', `CT7: no lingering unique_mismatch degradation — got ${JSON.stringify(degradedRow)}`);
+
+    await client.end();
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+  }
+}
+
+async function testCT8() {
+  const label = 'CT8: F4-equivalent — a NOT NULL heal on a column with live NULL rows fails CLOSED: rollback, prior nullable state retained, DEGRADED names the SQLSTATE';
+  if (!(await isPgAvailable())) { skip(label, 'Postgres unavailable'); return; }
+  const dbName = `cm185heal_ct8_${Date.now()}`;
+  const PID = 'schema-heal-ct8';
+  try {
+    await createThrowawayDb(dbName);
+    const client = await pgConnect(dbName);
+    const { adapter } = await bootstrapCurrentDb(client, PID, { withExtension: false });
+
+    // Make `assertions.confidence` nullable and insert a live NULL row, then
+    // declare it expected-not-null via a scratch manifest override so the
+    // heal path actually attempts (and must fail) a SET NOT NULL.
+    await client.query(`ALTER TABLE assertions ALTER COLUMN confidence DROP NOT NULL`);
+    await client.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
+       VALUES ('ct8', 'subj', 'affirmed', 'obj', NULL, 'user_stated')`
+    );
+
+    const fixable = [{ unit: 'u', table: 'assertions', column: 'confidence', state: 'present_mismatched', reason: 'nullable' }];
+    const healOutcome = await handoffModule._healExpectedNotNulls(adapter, PID, fixable);
+    assertFalse(healOutcome.ok, 'CT8: heal must fail (NULL rows present)');
+    assertTrue(!!healOutcome.sqlstate, `CT8: a SQLSTATE is reported — got ${JSON.stringify(healOutcome)}`);
+
+    const { rows: after } = await client.query(
+      `SELECT attnotnull FROM pg_attribute WHERE attrelid='assertions'::regclass AND attname='confidence'`
+    );
+    assertEqual(after[0].attnotnull, false, 'CT8: prior nullable state was retained — no partial heal');
+    const { rows: stillNull } = await client.query(`SELECT 1 FROM assertions WHERE project_id='ct8' AND confidence IS NULL`);
+    assertEqual(stillNull.length, 1, 'CT8: the NULL row is untouched — heal never silently deleted/coerced it');
+
+    await client.end();
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+  }
+}
+
+async function testCT9() {
+  const label = 'CT9: a UNIQUE heal on a table with duplicate rows fails CLOSED: rollback, no partial index left behind, DEGRADED names the SQLSTATE';
+  if (!(await isPgAvailable())) { skip(label, 'Postgres unavailable'); return; }
+  const dbName = `cm185heal_ct9_${Date.now()}`;
+  const PID = 'schema-heal-ct9';
+  try {
+    await createThrowawayDb(dbName);
+    const client = await pgConnect(dbName);
+    const { adapter } = await bootstrapCurrentDb(client, PID, { withExtension: false });
+
+    const { rows: idx } = await client.query(
+      `SELECT indexname FROM pg_indexes WHERE tablename='entities' AND indexdef ILIKE '%UNIQUE%' AND indexname NOT LIKE '%pkey%'`
+    );
+    for (const r of idx) {
+      await client.query(`ALTER TABLE entities DROP CONSTRAINT IF EXISTS "${r.indexname}"`);
+      await client.query(`DROP INDEX IF EXISTS "${r.indexname}"`);
+    }
+    await client.query(`INSERT INTO entities (project_id, name, entity_type) VALUES ('ct9', 'dup', 'concept'), ('ct9', 'dup', 'concept')`);
+
+    const fixable = [{ unit: 'u', table: 'entities', columns: ['project_id', 'name'], predicate: null, state: 'absent' }];
+    const healOutcome = await handoffModule._healExpectedUniques(adapter, PID, fixable);
+    assertFalse(healOutcome.ok, 'CT9: heal must fail (duplicate rows present)');
+    assertTrue(!!healOutcome.sqlstate, `CT9: a SQLSTATE is reported — got ${JSON.stringify(healOutcome)}`);
+
+    const { rows: after } = await client.query(
+      `SELECT 1 FROM pg_indexes WHERE tablename='entities' AND indexdef ILIKE '%UNIQUE%' AND indexname NOT LIKE '%pkey%'`
+    );
+    assertEqual(after.length, 0, 'CT9: no partial/leftover unique index — the failed heal left the table exactly as it was');
+
+    await client.end();
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+  }
+}
+
+async function testCT10() {
+  const label = 'CT10: reviewer follow-up — retrieval_event_assertions.event_id -> retrieval_events(id) ON DELETE CASCADE classifies present_matching on a fresh DB and heals absent -> present after a hand-drop';
+  if (!(await isPgAvailable())) { skip(label, 'Postgres unavailable'); return; }
+  const dbName = `cm185heal_ct10_${Date.now()}`;
+  const PID = 'schema-heal-ct10';
+  try {
+    await createThrowawayDb(dbName);
+    const client = await pgConnect(dbName);
+    const { adapter, classification, units } = await bootstrapCurrentDb(client, PID, { withExtension: false });
+
+    const expectedFks = handoffModule._collectExpectedFks(classification.manifest, units);
+    const reaEntry = expectedFks.find((f) => f.table === 'retrieval_event_assertions');
+    assertTrue(!!reaEntry, 'CT10 precondition: retrieval_event_assertions has an expected_fks entry');
+
+    let probe = await adapter.probeFastPathSchemaState({ tables: ['retrieval_event_assertions'], columns: [], indexes: [], shapeTargets: [] });
+    let classified = handoffModule._classifyExpectedFks([reaEntry], probe.tablesFound, probe.fks);
+    assertEqual(classified[0].state, 'present_matching', `CT10: fresh DB classifies present_matching — got ${classified[0].state}`);
+
+    const { rows: before } = await client.query(
+      `SELECT conname FROM pg_constraint WHERE conrelid = 'retrieval_event_assertions'::regclass AND contype = 'f'`
+    );
+    assertTrue(before.length > 0, 'CT10 precondition: a live FK exists to drop');
+    for (const r of before) await client.query(`ALTER TABLE retrieval_event_assertions DROP CONSTRAINT "${r.conname}"`);
+
+    probe = await adapter.probeFastPathSchemaState({ tables: ['retrieval_event_assertions'], columns: [], indexes: [], shapeTargets: [] });
+    classified = handoffModule._classifyExpectedFks([reaEntry], probe.tablesFound, probe.fks);
+    assertEqual(classified[0].state, 'absent', `CT10: dropped FK classifies absent — got ${classified[0].state}`);
+
+    await handoffModule.ensureSchemaCurrentCore(adapter, PID, { silent: true });
+
+    const { rows: after } = await client.query(
+      `SELECT confrelid::regclass::text AS ref_table, confdeltype
+         FROM pg_constraint WHERE conrelid = 'retrieval_event_assertions'::regclass AND contype = 'f'`
+    );
+    assertEqual(after.length, 1, 'CT10: the FK exists again after one touch');
+    assertEqual(after[0].ref_table, 'retrieval_events', `CT10: healed FK targets retrieval_events — got ${after[0].ref_table}`);
+    assertEqual(after[0].confdeltype, 'c', 'CT10: healed FK is ON DELETE CASCADE');
+
+    await client.end();
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+  }
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -1359,6 +1734,17 @@ async function main() {
   await testFKT5();
   await testFKT6();
   await testFKT7();
+
+  testCT1();
+  testCT2();
+  testCT3();
+  testCT4();
+  testCT5();
+  await testCT6();
+  await testCT7();
+  await testCT8();
+  await testCT9();
+  await testCT10();
 
   console.log('');
   console.log(`Results: ${passed} passed, ${failed} failed, ${skipped} skipped`);

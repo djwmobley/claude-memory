@@ -175,6 +175,63 @@ textual cross-check, never a silent live-probe skip); `DEFERRABLE`/
 scope — not a constraint); multi-column `CHECK` expression equality beyond
 this extension's scope entirely (FK-only).
 
+**UNIQUE / NOT NULL / CHECK / index-definition verification + heal
+(cm#185-schema-heal constraint extension).** Same shape as the FK
+verification above, extended to the constraint kinds the shape check still
+ignored — a manifest unit now optionally declares `expected_uniques`
+(`table` + ordered `columns` + optional partial `predicate`),
+`expected_not_nulls` (`table` + `column`), `expected_checks` (`table` +
+`expression_tokens` for the manifest-desync check + `def`, the constraint
+expression), and `expected_index_defs` (`name` + `create_sql`, for indexes
+the manifest already lists by name in `expected_objects.indexes`). All four
+run off the SAME combined `probeFastPathSchemaState` catalog probe (four
+more `UNION ALL` arms — `pg_index`/`pg_attribute.attnotnull`/
+`pg_constraint contype='c'`/`pg_indexes.indexdef` — no extra round trip on
+the common all-clean touch).
+
+Each kind is TOTAL-classified: UNIQUE and NOT NULL map to `table_absent |
+absent | present_mismatched(reason) | present_matching`; index-defs map to
+`absent | present_mismatched(index_def_drift) | present_matching` (no
+`table_absent` branch — identity is the index name itself, already covered
+by the ungated `expected_objects.indexes` existence probe). UNIQUE identity
+is `(table, ordered columns, partial predicate)` — covers both a
+table-level `UNIQUE (...)` constraint (Postgres auto-backs it with a
+same-name index) and a bare `CREATE UNIQUE INDEX`; a stale extra unique
+index on the same columns is `present_mismatched(extra_constraint:<name>)`,
+same inventory-diff shape as the FK case. `CHECK`/index-def text comparison
+normalizes both sides identically: collapse whitespace, lowercase, strip a
+leading `CHECK` keyword, strip one layer of outer parens.
+
+Healing runs under `acquireSchemaApplyLock` in one transaction per kind via
+`db.healConstraints`: UNIQUE drops the stale constraint/index (trying
+`DROP CONSTRAINT IF EXISTS` then `DROP INDEX IF EXISTS`, since either form
+can back a unique identity) and re-creates it; CHECK drops and re-adds;
+index-def drops and re-runs the manifest's own `create_sql`; NOT NULL runs
+`ALTER COLUMN ... SET NOT NULL` directly. **NOT NULL and UNIQUE both fail
+CLOSED by construction**: a `SET NOT NULL` against a column with a live
+`NULL` row, or a `CREATE UNIQUE INDEX` against duplicate rows, throws inside
+the transaction — the whole heal rolls back, the prior (mismatched/absent)
+state is retained exactly as it was, and `schema_apply_degraded` records
+`unique_mismatch` / `notnull_mismatch` / `check_mismatch` /
+`index_def_mismatch` with reason `heal_failed:<sqlstate>`. A degraded row
+clears only after a fresh post-heal re-probe reports every expected item
+`present_matching` for that kind. SQLite declares zero entries of any of
+these four kinds today — `probeFastPathSchemaState`'s four new arms are a
+real empty-array Postgres-only no-op there, and `healConstraints` is a
+no-op too.
+
+**Not detected:** the same manifest-desync class as the FK case (closed at
+classification time, never a silent live-probe skip) for a constraint never
+added to the manifest; `DEFERRABLE` state on a UNIQUE/CHECK constraint;
+triggers; semantic `CHECK`-expression equivalence beyond normalized-text
+comparison (e.g. `x > 0` vs `NOT (x <= 0)` classify as different even though
+they are logically equivalent — this extension compares text, not SQL
+semantics); an `expected_index_defs` entry's `create_sql` is trusted to be
+valid, re-runnable DDL — a manifest typo there that still passes the
+desync check (every identifier textually present) but produces broken SQL
+surfaces as a `heal_failed:<sqlstate>` DEGRADED row, not a classification
+error, on the next touch that needs to heal it.
+
 ## `memory_search` — hybrid vector+FTS, project-scoped
 
 Runs the same `ts_rank * 0.3 + cosine * 0.7` scoring formula the engine's

@@ -83,6 +83,20 @@
           "ref_columns": ["id"],
           "on_delete": "NO ACTION"
         }
+      ],
+      "expected_uniques": [
+        { "_doc": "entities: UNIQUE (project_id, name).", "table": "entities", "columns": ["project_id", "name"] },
+        { "_doc": "embedding_providers: name TEXT NOT NULL UNIQUE.", "table": "embedding_providers", "columns": ["name"] }
+      ],
+      "expected_not_nulls": [
+        { "table": "assertions", "column": "confidence" },
+        { "table": "assertions", "column": "source" },
+        { "table": "entities", "column": "project_id" },
+        { "table": "entities", "column": "name" },
+        { "table": "embedding_providers", "column": "name" },
+        { "table": "embedding_providers", "column": "model_label" },
+        { "table": "embedding_providers", "column": "native_dims" },
+        { "table": "embedding_providers", "column": "stored_dims" }
       ]
     },
     "handoff-sqlite-schema.sql": {
@@ -167,7 +181,20 @@
           "rea_event_idx",
           "rea_assertion_idx"
         ]
-      }
+      },
+      "expected_fks": [
+        {
+          "_doc": "Reviewer follow-up on PR #265 (schema-heal constraint extension task): required_roster DDL enumeration missed this one -- ALTER... event_id INTEGER NOT NULL REFERENCES retrieval_events(id) ON DELETE CASCADE.",
+          "table": "retrieval_event_assertions",
+          "columns": ["event_id"],
+          "ref_table": "retrieval_events",
+          "ref_columns": ["id"],
+          "on_delete": "CASCADE"
+        }
+      ],
+      "expected_not_nulls": [
+        { "table": "retrieval_event_assertions", "column": "event_id" }
+      ]
     },
     "decisions-base.sql": {
       "classification": "postgres",
@@ -205,6 +232,14 @@
           "ref_columns": ["id"],
           "on_delete": "NO ACTION"
         }
+      ],
+      "expected_uniques": [
+        { "_doc": "decisions_project_topic_unique: CREATE UNIQUE INDEX ... ON decisions(project_id, topic).", "table": "decisions", "columns": ["project_id", "topic"] }
+      ],
+      "expected_not_nulls": [
+        { "table": "decisions", "column": "project_id" },
+        { "table": "decisions", "column": "topic" },
+        { "table": "decisions", "column": "decision" }
       ]
     },
     "phase3b-schema.sql": {
