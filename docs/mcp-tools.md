@@ -194,8 +194,8 @@ Each kind is TOTAL-classified: UNIQUE, NOT NULL, and CHECK map to
 index-defs map to `absent | present_mismatched(index_def_drift) |
 present_matching` (no `table_absent` branch — identity is the index name
 itself, already covered by the ungated `expected_objects.indexes`
-existence probe). UNIQUE identity is `(table, ordered columns, partial
-predicate)` — covers both a table-level `UNIQUE (...)` constraint
+existence probe). UNIQUE identity is `(table, order-independent column set,
+partial predicate)` — covers both a table-level `UNIQUE (...)` constraint
 (Postgres auto-backs it with a same-name index) and a bare `CREATE UNIQUE
 INDEX`. **CHECK identity is `(table, the column set the expression
 references — `pg_constraint.conkey`, order-independent)`, never just
