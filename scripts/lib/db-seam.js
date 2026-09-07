@@ -1774,7 +1774,11 @@ class PostgresAdapter {
     //                and a bare CREATE UNIQUE INDEX — pg_index is the single
     //                source both forms share, so one arm covers both.
     //   'notnull'  — name=table, col2=column, extra_flag=pg_attribute.attnotnull
-    //   'check'    — name=table, col2=constraint name, extra_def=pg_get_constraintdef(oid)
+    //   'check'    — name=table, col2=constraint name, fk_cols=ordered column
+    //                set the expression references (pg_constraint.conkey,
+    //                a scalar correlated subquery so a zero-column conkey
+    //                never drops the whole row the way a JOIN would),
+    //                extra_def=pg_get_constraintdef(oid)
     //   'indexdef' — name=index name, extra_def=pg_indexes.indexdef (filtered
     //                by the SAME $2 indexes array the 'index' arm already
     //                uses — indexes the manifest lists by name only)
@@ -1847,7 +1851,10 @@ class PostgresAdapter {
         WHERE c.relname = ANY($1::text[]) AND a.attnum > 0 AND NOT a.attisdropped
        UNION ALL
        SELECT 'check', c.relname::text, con.conname::text, NULL::text, NULL::int,
-              NULL::text[], NULL::text, NULL::text[], NULL::text, NULL::boolean, NULL::text,
+              (SELECT array_agg(a2.attname ORDER BY k.ord)
+                 FROM unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)
+                 JOIN pg_attribute a2 ON a2.attrelid = con.conrelid AND a2.attnum = k.attnum)::text[],
+              NULL::text, NULL::text[], NULL::text, NULL::boolean, NULL::text,
               pg_get_constraintdef(con.oid), NULL::boolean
          FROM pg_constraint con
          JOIN pg_class c ON c.oid = con.conrelid
@@ -1903,7 +1910,7 @@ class PostgresAdapter {
           break;
         }
         case 'check': {
-          checks.push({ table: r.name, conname: r.col2, def: r.extra_def });
+          checks.push({ table: r.name, conname: r.col2, columns: r.fk_cols || [], def: r.extra_def });
           break;
         }
         case 'indexdef': {
@@ -2014,6 +2021,7 @@ class PostgresAdapter {
           for (const nm of (plan.dropNames || [])) {
             await this._client.query(`ALTER TABLE ${q(plan.table)} DROP CONSTRAINT IF EXISTS ${q(nm)}`);
           }
+          if (plan.skipAdd) continue;
           const healName = `${plan.table}_${plan.conname}_heal`;
           // plan.def is the FULL canonical constraint definition text (the
           // manifest's `def` is expected to be pg_get_constraintdef's own

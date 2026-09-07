@@ -2590,6 +2590,14 @@ function _collectExpectedChecks(manifest, units) {
     for (const ck of arr) {
       list.push({
         unit: u.basename, table: ck.table,
+        // Identity (PR #268 review finding): the column set the CHECK
+        // expression references, matched against the live probe's
+        // pg_constraint.conkey-derived columns — never just "some CHECK on
+        // this table with matching text", which let a drifted expression on
+        // the SAME columns silently classify as a distinct-but-unrelated
+        // "absent" entry (the exact suppression_kind CHECK-narrowing
+        // failure class from PR #129) instead of present_mismatched.
+        columns: Array.isArray(ck.columns) ? ck.columns : (Array.isArray(ck.expression_tokens) ? ck.expression_tokens : []),
         expression_tokens: Array.isArray(ck.expression_tokens) ? ck.expression_tokens : [],
         normalized_def: _normalizeDefText(ck.def || ''),
         def: ck.def,
@@ -2599,30 +2607,76 @@ function _collectExpectedChecks(manifest, units) {
   return list;
 }
 
+/**
+ * PR #268 review fix: TOTAL classification — table_absent | absent |
+ * present_mismatched(check_def_drift:<conname> | extra_constraint:<names>)
+ * | present_matching. Identity is (table, sorted column set) — NEVER just
+ * "does some live CHECK on this table have matching text", which
+ * previously let a drifted expression on the identity-matching columns
+ * classify as `absent` (a phantom "missing" that then ADD-only healed
+ * alongside the untouched stale one, silently masking it forever once the
+ * fresh one cleared degradation — same failure class as PR #129's
+ * suppression_kind CHECK narrowing).
+ */
 function _classifyExpectedChecks(expected, tablesFound, liveChecks) {
-  const byTable = new Map();
+  const byIdentity = new Map();
   for (const r of (liveChecks || [])) {
-    if (!byTable.has(r.table)) byTable.set(r.table, []);
-    byTable.get(r.table).push(r);
+    const key = `${r.table}::${[...(r.columns || [])].sort().join(',')}`;
+    if (!byIdentity.has(key)) byIdentity.set(key, []);
+    byIdentity.get(key).push(r);
   }
   const results = [];
   for (const ck of expected) {
     if (!tablesFound.has(ck.table)) { results.push({ ...ck, state: 'table_absent' }); continue; }
-    const candidates = byTable.get(ck.table) || [];
+    const key = `${ck.table}::${[...(ck.columns || [])].sort().join(',')}`;
+    const candidates = byIdentity.get(key) || [];
+    if (candidates.length === 0) { results.push({ ...ck, state: 'absent' }); continue; }
     const match = candidates.find((r) => _normalizeDefText(r.def) === ck.normalized_def);
-    if (!match) { results.push({ ...ck, state: 'absent' }); continue; }
+    const extras = match ? candidates.filter((r) => r.conname !== match.conname) : [];
+    if (!match) {
+      // Wrong/drifted expression on the identity-matching column set — drop
+      // EVERY candidate on this identity (the whole stale set, not just the
+      // first one) and add the correct constraint fresh.
+      results.push({
+        ...ck, state: 'present_mismatched',
+        reason: `check_def_drift:${candidates[0].conname}`, actual: candidates[0],
+        extras: candidates, dropTargets: candidates,
+      });
+      continue;
+    }
+    if (extras.length > 0) {
+      results.push({
+        ...ck, state: 'present_mismatched',
+        reason: `extra_constraint:${extras.map((e) => e.conname).join(',')}`, actual: match,
+        extras, dropTargets: extras,
+      });
+      continue;
+    }
     results.push({ ...ck, state: 'present_matching', actual: match });
   }
   return results;
 }
 
+/**
+ * PR #268 review fix: dropNames now carries the drifted/extra constraint
+ * name(s) (never hardcoded []) so heal is a real DROP+ADD in one
+ * transaction — a stale CHECK never lingers once the fresh one clears
+ * degradation. `skipAdd` mirrors the FK/UNIQUE extra_constraint-only case:
+ * the identity-matching constraint is already correct, only a stale extra
+ * needs to go, so re-adding would leave a duplicate.
+ */
 async function _healExpectedChecks(db, projectId, fixable) {
   const lockKey = 'schema_apply:' + projectId;
   await db.acquireSchemaApplyLock(lockKey);
   try {
-    const plans = fixable.map((ck, i) => ({
-      kind: 'check', table: ck.table, conname: `heal_${i}_${Date.now()}`, def: ck.def, dropNames: [],
-    }));
+    const plans = fixable.map((ck, i) => {
+      const dropTargets = ck.dropTargets || ck.extras || [];
+      const needsAdd = !(typeof ck.reason === 'string' && ck.reason.startsWith('extra_constraint:'));
+      return {
+        kind: 'check', table: ck.table, conname: `heal_${i}_${Date.now()}`, def: ck.def,
+        dropNames: dropTargets.map((e) => e.conname).filter(Boolean), skipAdd: !needsAdd,
+      };
+    });
     return await db.healConstraints(plans);
   } finally {
     await db.releaseSchemaApplyLock(lockKey);

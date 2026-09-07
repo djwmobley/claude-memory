@@ -1465,7 +1465,7 @@ function testCT4() {
     const collected = handoffModule._collectExpectedChecks(manifest, [{ basename: 'fake' }]);
     const tablesFound = new Set(['widgets']);
     const liveChecks = [
-      { table: 'widgets', conname: 'widgets_qty_check', def: 'CHECK((qty >= 0))' },
+      { table: 'widgets', conname: 'widgets_qty_check', columns: ['qty'], def: 'CHECK((qty >= 0))' },
     ];
     const results = handoffModule._classifyExpectedChecks(collected, tablesFound, liveChecks);
     const byTable = {}; for (const r of results) byTable[`${r.table}:${r.expression_tokens[0]}`] = r;
@@ -1781,6 +1781,131 @@ async function testCT11() {
   }
 }
 
+// ── PR #268 review fix: CHECK identity/drift/extra tests (CT12-CT14) ───────
+
+function testCT12() {
+  const label = 'CT12: _classifyExpectedChecks identity fix — a drifted expression on the SAME column set is present_mismatched(check_def_drift), never absent; a stale extra on the same identity is present_mismatched(extra_constraint)';
+  try {
+    const manifest = { units: { fake: { expected_checks: [
+      { table: 'widgets', columns: ['qty'], expression_tokens: ['qty'], def: 'CHECK ((qty >= 0))' },
+      { table: 'widgets', columns: ['sku'], expression_tokens: ['sku'], def: "CHECK ((sku <> ''::text))" },
+    ] } } };
+    const collected = handoffModule._collectExpectedChecks(manifest, [{ basename: 'fake' }]);
+    const tablesFound = new Set(['widgets']);
+    // qty: live CHECK on the SAME column but a DIFFERENT expression (drift).
+    // sku: live CHECK matches identity-exactly PLUS a stale duplicate (extra).
+    const liveChecks = [
+      { table: 'widgets', conname: 'widgets_qty_drifted', columns: ['qty'], def: 'CHECK ((qty > 0))' },
+      { table: 'widgets', conname: 'widgets_sku_check', columns: ['sku'], def: "CHECK ((sku <> ''::text))" },
+      { table: 'widgets', conname: 'widgets_sku_stale', columns: ['sku'], def: "CHECK ((sku <> ''::text))" },
+    ];
+    const results = handoffModule._classifyExpectedChecks(collected, tablesFound, liveChecks);
+    const byCol = {}; for (const r of results) byCol[r.columns[0]] = r;
+
+    assertEqual(byCol['qty'].state, 'present_mismatched', 'CT12: a drifted expression on the identity-matching column classifies present_mismatched, NEVER absent');
+    assertTrue(byCol['qty'].reason.startsWith('check_def_drift:'), `CT12: reason names check_def_drift — got ${byCol['qty'].reason}`);
+    assertEqual(byCol['qty'].dropTargets.length, 1, 'CT12: dropTargets names the ONE stale drifted constraint to drop');
+
+    assertEqual(byCol['sku'].state, 'present_mismatched', 'CT12: an identity-match PLUS a stale duplicate classifies present_mismatched (inventory diff)');
+    assertTrue(byCol['sku'].reason.startsWith('extra_constraint:'), `CT12: reason names extra_constraint — got ${byCol['sku'].reason}`);
+    assertEqual(byCol['sku'].dropTargets.length, 1, 'CT12: dropTargets names ONLY the stale extra, not the already-correct match');
+    assertEqual(byCol['sku'].dropTargets[0].conname, 'widgets_sku_stale', 'CT12: the correct widgets_sku_check is NOT in dropTargets');
+
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  }
+}
+
+async function testCT13() {
+  const label = 'CT13: a drifted CHECK (same column, different expression) heals — old constraint gone, new one present, one transaction';
+  if (!(await isPgAvailable())) { skip(label, 'Postgres unavailable'); return; }
+  const dbName = `cm185heal_ct13_${Date.now()}`;
+  const PID = 'schema-heal-ct13';
+  try {
+    await createThrowawayDb(dbName);
+    const client = await pgConnect(dbName);
+    const { adapter } = await bootstrapCurrentDb(client, PID, { withExtension: false });
+
+    // Drift the live authoring_mode CHECK to a DIFFERENT (but still valid
+    // for existing rows) expression on the SAME column.
+    const { rows: liveChk } = await client.query(
+      `SELECT conname FROM pg_constraint WHERE conrelid='decisions'::regclass AND contype='c'`
+    );
+    const authoringConname = liveChk.find((r) => r.conname.includes('authoring_mode'));
+    assertTrue(!!authoringConname, 'CT13 precondition: the live authoring_mode CHECK exists');
+    await client.query(`ALTER TABLE decisions DROP CONSTRAINT "${authoringConname.conname}"`);
+    await client.query(`ALTER TABLE decisions ADD CONSTRAINT decisions_authoring_mode_drifted CHECK (authoring_mode = ANY (ARRAY['caveman','verbose','legacy']))`);
+
+    const result = await handoffModule.ensureSchemaCurrentCore(adapter, PID, { silent: true });
+    assertTrue(result.reason === 'current' || result.reason === 'degraded', `CT13 sanity: got ${result.reason}`);
+
+    const { rows: after } = await client.query(
+      `SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid='decisions'::regclass AND contype='c'`
+    );
+    assertEqual(after.length, 1, `CT13: exactly one CHECK remains on decisions.authoring_mode's column — got ${after.length}: ${JSON.stringify(after)}`);
+    assertTrue(!after.some((r) => r.conname === 'decisions_authoring_mode_drifted'), 'CT13: the drifted constraint is GONE');
+    assertTrue(after[0].def.includes("'legacy'") === false, 'CT13: the healed constraint is the canonical one (no legacy value)');
+
+    await client.end();
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+  }
+}
+
+async function testCT14() {
+  const label = 'CT14: a CHECK heal that would reject live violating rows fails CLOSED — rollback, prior (drifted) constraint retained, DEGRADED names the SQLSTATE';
+  if (!(await isPgAvailable())) { skip(label, 'Postgres unavailable'); return; }
+  const dbName = `cm185heal_ct14_${Date.now()}`;
+  const PID = 'schema-heal-ct14';
+  try {
+    await createThrowawayDb(dbName);
+    const client = await pgConnect(dbName);
+    const { adapter } = await bootstrapCurrentDb(client, PID, { withExtension: false });
+
+    const { rows: liveChk } = await client.query(
+      `SELECT conname FROM pg_constraint WHERE conrelid='decisions'::regclass AND contype='c'`
+    );
+    const authoringConname = liveChk.find((r) => r.conname.includes('authoring_mode'));
+    await client.query(`ALTER TABLE decisions DROP CONSTRAINT "${authoringConname.conname}"`);
+    // A permissive drifted CHECK that allows a value the canonical CHECK
+    // (caveman|verbose only) rejects, then a live row using that value —
+    // the heal's ADD CONSTRAINT must fail against this row.
+    await client.query(`ALTER TABLE decisions ADD CONSTRAINT decisions_authoring_mode_permissive CHECK (authoring_mode IS NOT NULL)`);
+    await client.query(
+      `INSERT INTO decisions (project_id, topic, decision, authoring_mode) VALUES ('ct14', 'topic1', 'dec1', 'legacy_bad_value')`
+    );
+
+    const fixable = [{
+      unit: 'u', table: 'decisions', columns: ['authoring_mode'],
+      def: "CHECK ((authoring_mode = ANY (ARRAY['caveman'::text, 'verbose'::text])))",
+      state: 'present_mismatched', reason: 'check_def_drift:decisions_authoring_mode_permissive',
+      dropTargets: [{ conname: 'decisions_authoring_mode_permissive' }],
+    }];
+    const healOutcome = await handoffModule._healExpectedChecks(adapter, PID, fixable);
+    assertFalse(healOutcome.ok, 'CT14: heal must fail (a live row violates the corrective CHECK)');
+    assertTrue(!!healOutcome.sqlstate, `CT14: a SQLSTATE is reported — got ${JSON.stringify(healOutcome)}`);
+
+    const { rows: after } = await client.query(
+      `SELECT conname FROM pg_constraint WHERE conrelid='decisions'::regclass AND contype='c'`
+    );
+    assertEqual(after.length, 1, 'CT14: exactly one CHECK remains — the ROLLED-BACK heal left it exactly as it was');
+    assertEqual(after[0].conname, 'decisions_authoring_mode_permissive', 'CT14: the prior (drifted/permissive) constraint is retained, not silently dropped');
+    const { rows: stillThere } = await client.query(`SELECT 1 FROM decisions WHERE project_id='ct14' AND authoring_mode='legacy_bad_value'`);
+    assertEqual(stillThere.length, 1, 'CT14: the violating row is untouched');
+
+    await client.end();
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+  }
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -1822,6 +1947,9 @@ async function main() {
   await testCT9();
   await testCT10();
   await testCT11();
+  testCT12();
+  await testCT13();
+  await testCT14();
 
   console.log('');
   console.log(`Results: ${passed} passed, ${failed} failed, ${skipped} skipped`);

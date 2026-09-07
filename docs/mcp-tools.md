@@ -189,24 +189,41 @@ more `UNION ALL` arms — `pg_index`/`pg_attribute.attnotnull`/
 `pg_constraint contype='c'`/`pg_indexes.indexdef` — no extra round trip on
 the common all-clean touch).
 
-Each kind is TOTAL-classified: UNIQUE and NOT NULL map to `table_absent |
-absent | present_mismatched(reason) | present_matching`; index-defs map to
-`absent | present_mismatched(index_def_drift) | present_matching` (no
-`table_absent` branch — identity is the index name itself, already covered
-by the ungated `expected_objects.indexes` existence probe). UNIQUE identity
-is `(table, ordered columns, partial predicate)` — covers both a
-table-level `UNIQUE (...)` constraint (Postgres auto-backs it with a
-same-name index) and a bare `CREATE UNIQUE INDEX`; a stale extra unique
-index on the same columns is `present_mismatched(extra_constraint:<name>)`,
-same inventory-diff shape as the FK case. `CHECK`/index-def text comparison
-normalizes both sides identically: collapse whitespace, lowercase, strip a
-leading `CHECK` keyword, strip one layer of outer parens.
+Each kind is TOTAL-classified: UNIQUE, NOT NULL, and CHECK map to
+`table_absent | absent | present_mismatched(reason) | present_matching`;
+index-defs map to `absent | present_mismatched(index_def_drift) |
+present_matching` (no `table_absent` branch — identity is the index name
+itself, already covered by the ungated `expected_objects.indexes`
+existence probe). UNIQUE identity is `(table, ordered columns, partial
+predicate)` — covers both a table-level `UNIQUE (...)` constraint
+(Postgres auto-backs it with a same-name index) and a bare `CREATE UNIQUE
+INDEX`. **CHECK identity is `(table, the column set the expression
+references — `pg_constraint.conkey`, order-independent)`, never just
+"any CHECK on this table with matching normalized text"**: a live CHECK on
+the identity-matching columns whose normalized definition differs is
+`present_mismatched(check_def_drift:<conname>)` — this is what closes the
+gap a first draft of this extension shipped with (classifying a drifted
+expression as `absent`, which then only ADDed a fresh constraint and left
+the stale, wrong one in place forever once the touch cleared degradation —
+the same silent-narrowing failure class as PR #129's suppression_kind
+CHECK). A stale extra UNIQUE or CHECK on the same identity is
+`present_mismatched(extra_constraint:<name(s)>)`, same inventory-diff shape
+as the FK case. `CHECK`/index-def text comparison normalizes both sides
+identically: collapse whitespace, lowercase, strip a leading `CHECK`
+keyword, strip one layer of outer parens — the manifest's own `def` is
+stored as the FULL `pg_get_constraintdef` text (`CHECK (...)` wrapper
+included), never pre-stripped, so both sides pass through the exact same
+normalization with no paren-layer asymmetry.
 
 Healing runs under `acquireSchemaApplyLock` in one transaction per kind via
 `db.healConstraints`: UNIQUE drops the stale constraint/index (trying
 `DROP CONSTRAINT IF EXISTS` then `DROP INDEX IF EXISTS`, since either form
-can back a unique identity) and re-creates it; CHECK drops and re-adds;
-index-def drops and re-runs the manifest's own `create_sql`; NOT NULL runs
+can back a unique identity) and re-creates it; CHECK DROPs every
+identity-matching stale/extra constraint (`dropNames`, never hardcoded
+empty) and ADDs the correct one fresh, in the same transaction — a pure
+`extra_constraint` case drops only the stale extra and skips the ADD
+(the identity-matching constraint is already correct); index-def drops and
+re-runs the manifest's own `create_sql`; NOT NULL runs
 `ALTER COLUMN ... SET NOT NULL` directly. **NOT NULL and UNIQUE both fail
 CLOSED by construction**: a `SET NOT NULL` against a column with a live
 `NULL` row, or a `CREATE UNIQUE INDEX` against duplicate rows, throws inside
