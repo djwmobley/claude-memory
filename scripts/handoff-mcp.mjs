@@ -865,7 +865,9 @@ function buildServer() {
       description:
         'Runs `handoff.js status --json` for the given project and returns the parsed result: project_id, ' +
         'entity/assertion/edge counts, handoff.md path, last_close/days_since, contracts, session_active, ' +
-        'session_id, and packaging state (e.g. "UNPACKAGED (dirty working tree)" or "clean"). Read-only — makes no writes.',
+        'session_id, packaging state (e.g. "UNPACKAGED (dirty working tree)" or "clean"), and last_loader_stop ' +
+        '(the most recent SessionEnd/loader-stop outcome: {ts, session_id, outcome} or null if it has never fired). ' +
+        'Read-only — makes no writes.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root (the directory containing the project marker / .git).'),
       },
