@@ -920,6 +920,14 @@ class SQLiteAdapter {
   async checkColumnShape(_table, _column) { return null; }
 
   /**
+   * cm#185-schema-heal FK extension (F5): no-op for SQLite — no SQLite unit
+   * declares any `expected_fks` entry (schema-manifest.json), so this is
+   * never actually invoked on this dialect today; present for interface
+   * parity so a caller never branches on dialect before calling it.
+   */
+  async healForeignKeys(_plans) { return { ok: true }; }
+
+  /**
    * cm#185-schema-heal review (PR #262 perf follow-up): combined fast-path
    * catalog probe — tables/columns/indexes existence, pgvector extension
    * presence, and gated-column shape, all in ONE call. SQLite is an
@@ -961,7 +969,16 @@ class SQLiteAdapter {
     // SQLite's manifest unit declares zero pgvector_gated columns, so
     // shapeTargets is always empty in practice here — no extension/shape
     // concept exists on this dialect regardless.
-    return { tablesFound, columnsFound, indexesFound, vectorExtensionPresent: false, shapes: new Map() };
+    //
+    // FK follow-up (cm#185-schema-heal FK extension, F5): SQLite units
+    // declare zero expected_fks entries today (schema-manifest.json), so
+    // this arm is never actually exercised on this dialect — kept as a
+    // real empty-set no-op (not a thrown "unsupported") so a caller that
+    // unconditionally spreads `probe.fks` never branches on dialect. If a
+    // SQLite unit ever declares a real FK, this must be revisited to read
+    // `PRAGMA foreign_key_list(table)` (a genuine per-table equivalent —
+    // unlike the shape/pgvector case, which has no SQLite analog at all).
+    return { tablesFound, columnsFound, indexesFound, vectorExtensionPresent: false, shapes: new Map(), fks: [] };
   }
 
   /**
@@ -1717,34 +1734,74 @@ class PostgresAdapter {
   async probeFastPathSchemaState({ tables, indexes, shapeTargets }) {
     const shapeTables = (shapeTargets || []).map((s) => s.table);
     const shapeCols   = (shapeTargets || []).map((s) => s.column);
+    // FK arm (cm#185-schema-heal FK extension, F2): one additional UNION ALL
+    // branch on the SAME combined query — no added round trip. Filters by
+    // `tc.relname = ANY($1::text[])` (the caller's `tables` set, reused —
+    // never a fresh param) rather than a `::regclass` cast on a manifest
+    // name, so a manifest entry naming a table that does not (yet) exist
+    // cannot abort the whole combined query (F2 requirement) — the join to
+    // pg_class simply produces zero rows for that table, which the caller
+    // distinguishes from "table exists, FK absent" via the SEPARATE `table`
+    // arm's tablesFound set (F3's table_absent branch).
+    //
+    // conkey/confkey are paired by ordinal position via a two-array
+    // `unnest(...) WITH ORDINALITY` (not two independent LATERAL joins,
+    // which would cross-join and scramble the pairing) — this is what lets
+    // array_agg(... ORDER BY u.ord) return the local and referenced column
+    // lists in matching, semantically-correct order (F2: "ordered by array
+    // position — not attnum, not unordered").
     const { rows } = await this._client.query(
-      `SELECT 'table'::text AS kind, table_name::text AS name, NULL::text AS col2, NULL::text AS type, NULL::int AS dims
+      `SELECT 'table'::text AS kind, table_name::text AS name, NULL::text AS col2, NULL::text AS type, NULL::int AS dims,
+              NULL::text[] AS fk_cols, NULL::text AS fk_ref_table, NULL::text[] AS fk_ref_cols, NULL::text AS fk_on_delete, NULL::boolean AS fk_validated, NULL::text AS fk_conname
          FROM information_schema.tables
         WHERE table_schema = 'public' AND table_name = ANY($1::text[])
        UNION ALL
-       SELECT 'column', table_name, column_name, NULL::text, NULL::int
+       SELECT 'column', table_name, column_name, NULL::text, NULL::int,
+              NULL::text[], NULL::text, NULL::text[], NULL::text, NULL::boolean, NULL::text
          FROM information_schema.columns
         WHERE table_schema = 'public'
        UNION ALL
-       SELECT 'index', indexname, NULL::text, NULL::text, NULL::int
+       SELECT 'index', indexname, NULL::text, NULL::text, NULL::int,
+              NULL::text[], NULL::text, NULL::text[], NULL::text, NULL::boolean, NULL::text
          FROM pg_indexes
         WHERE schemaname = 'public' AND indexname = ANY($2::text[])
        UNION ALL
-       SELECT 'extension', extname, NULL::text, NULL::text, NULL::int
+       SELECT 'extension', extname, NULL::text, NULL::text, NULL::int,
+              NULL::text[], NULL::text, NULL::text[], NULL::text, NULL::boolean, NULL::text
          FROM pg_extension
         WHERE extname = 'vector'
        UNION ALL
-       SELECT 'shape', shp.tbl, shp.col, ty.typname, a.atttypmod
+       SELECT 'shape', shp.tbl, shp.col, ty.typname, a.atttypmod,
+              NULL::text[], NULL::text, NULL::text[], NULL::text, NULL::boolean, NULL::text
          FROM unnest($3::text[], $4::text[]) AS shp(tbl, col)
          JOIN pg_attribute a ON a.attrelid = ('public.' || shp.tbl)::regclass
                              AND a.attname = shp.col AND a.attnum > 0 AND NOT a.attisdropped
-         JOIN pg_type ty ON ty.oid = a.atttypid`,
+         JOIN pg_type ty ON ty.oid = a.atttypid
+       UNION ALL
+       SELECT 'fk', tc.relname::text, NULL::text, NULL::text, NULL::int,
+              array_agg(ta.attname ORDER BY u.ord)::text[],
+              rc.relname::text,
+              array_agg(ra.attname ORDER BY u.ord)::text[],
+              c.confdeltype::text,
+              c.convalidated,
+              c.conname::text
+         FROM pg_constraint c
+         JOIN pg_class tc ON tc.oid = c.conrelid
+         JOIN pg_namespace tn ON tn.oid = tc.relnamespace AND tn.nspname = 'public'
+         JOIN pg_class rc ON rc.oid = c.confrelid
+         JOIN pg_namespace rn ON rn.oid = rc.relnamespace AND rn.nspname = 'public'
+         CROSS JOIN LATERAL unnest(c.conkey, c.confkey) WITH ORDINALITY AS u(local_attnum, foreign_attnum, ord)
+         JOIN pg_attribute ta ON ta.attrelid = c.conrelid AND ta.attnum = u.local_attnum
+         JOIN pg_attribute ra ON ra.attrelid = c.confrelid AND ra.attnum = u.foreign_attnum
+        WHERE c.contype = 'f' AND tc.relname = ANY($1::text[])
+        GROUP BY c.oid, tc.relname, rc.relname, c.confdeltype, c.convalidated, c.conname`,
       [tables || [], indexes || [], shapeTables, shapeCols]
     );
     const tablesFound  = new Set();
     const columnsFound = new Set();
     const indexesFound = new Set();
     const shapes = new Map();
+    const fks = [];
     let vectorExtensionPresent = false;
     for (const r of rows) {
       switch (r.kind) {
@@ -1757,10 +1814,71 @@ class PostgresAdapter {
           shapes.set(`${r.name}.${r.col2}`, { type: r.type, dims: Number.isFinite(typmod) && typmod > 0 ? typmod : null });
           break;
         }
+        case 'fk': {
+          fks.push({
+            table: r.name,
+            columns: r.fk_cols || [],
+            ref_table: r.fk_ref_table,
+            ref_columns: r.fk_ref_cols || [],
+            on_delete: r.fk_on_delete,
+            validated: r.fk_validated,
+            conname: r.fk_conname,
+          });
+          break;
+        }
         default: break;
       }
     }
-    return { tablesFound, columnsFound, indexesFound, vectorExtensionPresent, shapes };
+    return { tablesFound, columnsFound, indexesFound, vectorExtensionPresent, shapes, fks };
+  }
+
+  /**
+   * cm#185-schema-heal FK extension (F4): heal a batch of FK mismatches/
+   * absences in ONE transaction — every DROP CONSTRAINT (mismatched +
+   * extras) and the single corrective ADD CONSTRAINT, all-or-nothing.
+   * Never a bare `ADD CONSTRAINT IF NOT EXISTS` (Postgres has no such form
+   * for FKs) — this always drops first, so a re-add against an
+   * already-correct target is idempotent by construction.
+   *
+   * On ADD failure (e.g. orphan rows violating the new FK), the whole
+   * transaction rolls back — the prior constraint (if any) is retained
+   * exactly as it was, never left half-migrated. Returns the failing
+   * statement's SQLSTATE so the caller can record a specific
+   * `heal_failed:<sqlstate>` degradation reason (F4).
+   *
+   * @param {Array<{table, columns:string[], ref_table, ref_columns:string[],
+   *   on_delete, dropConnames:string[]}>} plans
+   * @returns {Promise<{ok:boolean, sqlstate?:string, message?:string}>}
+   */
+  async healForeignKeys(plans) {
+    const q = (ident) => '"' + String(ident).replace(/"/g, '""') + '"';
+    try {
+      await this._client.query('BEGIN');
+      await this._client.query(`SET LOCAL lock_timeout = '5s'`);
+      await this._client.query(`SET LOCAL statement_timeout = '120s'`);
+      for (const plan of plans) {
+        for (const conname of (plan.dropConnames || [])) {
+          await this._client.query(`ALTER TABLE ${q(plan.table)} DROP CONSTRAINT IF EXISTS ${q(conname)}`);
+        }
+        // skipAdd: a pure stale-duplicate case where the identity-matching
+        // FK is already correct and only needed its extra dropped — adding
+        // a fresh constraint here would leave two FKs on the same columns.
+        if (plan.skipAdd) continue;
+        const healName = `${plan.table}_${plan.columns.join('_')}_fkey_heal`;
+        const cols = plan.columns.map(q).join(', ');
+        const refCols = plan.ref_columns.map(q).join(', ');
+        const onDelete = plan.on_delete || 'NO ACTION';
+        await this._client.query(
+          `ALTER TABLE ${q(plan.table)} ADD CONSTRAINT ${q(healName)} ` +
+          `FOREIGN KEY (${cols}) REFERENCES ${q(plan.ref_table)} (${refCols}) ON DELETE ${onDelete}`
+        );
+      }
+      await this._client.query('COMMIT');
+      return { ok: true };
+    } catch (e) {
+      try { await this._client.query('ROLLBACK'); } catch (_) {}
+      return { ok: false, sqlstate: e && e.code, message: e && e.message };
+    }
   }
 
   get dialect() { return 'postgres'; }
