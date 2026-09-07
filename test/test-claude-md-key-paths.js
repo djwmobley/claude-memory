@@ -27,11 +27,13 @@
  */
 
 const fs   = require('fs');
+const os   = require('os');
 const path = require('path');
 
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 const {
   renderKeyPathsBullets,
+  healKeyPathsSection,
   isAbsolutePath,
   isPortableForm,
 } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'claude-md-key-paths.js'));
@@ -171,6 +173,192 @@ for (const { label, env } of ENV_COMBOS) {
     assert(section.includes(bullets.helperPath), `${label}: expected symbolic helper path "${bullets.helperPath}" in rendered section`);
   });
 }
+
+// ─── healKeyPathsSection() — healKeyPathsSection() coverage ─────────────────
+//
+// TOTAL classification: every fixture below is constructed to land in
+// exactly one of {absent, ambiguous, healed, noop, unrecognized}.
+
+test('legacy absolute fixture: healed, other lines preserved', () => {
+  const fixture =
+    '# proj\n' +
+    '\n' +
+    '## Key paths\n' +
+    '\n' +
+    '- Handoff file: `C:\\Users\\bob\\.claude\\projects\\abc123\\handoff.md`\n' +
+    '- Helper script: `C:\\Users\\bob\\claude-memory\\scripts\\handoff.js`\n' +
+    '\n' +
+    '## Durable facts\n' +
+    '\n' +
+    '- none\n';
+  const r = healKeyPathsSection(fixture, {});
+  assertEqual(r.outcome, 'healed');
+  assert(r.text.includes('- Handoff file: `~/.claude/projects/<project-id>/handoff.md`'), 'handoff bullet not healed to portable form');
+  assert(r.text.includes('- Helper script: `<engine-root>/scripts/handoff.js`'), 'helper bullet not healed to portable form');
+  assert(r.text.includes('<!-- memory-engine:key-paths v2 -->'), 'marker not inserted');
+  assert(r.text.includes('# proj\n'), 'unrelated leading line not preserved');
+  assert(r.text.includes('## Durable facts\n\n- none\n'), 'Durable facts section not preserved verbatim');
+});
+
+test('idempotent second pass: healing already-healed output is byte-identical (noop)', () => {
+  const fixture =
+    '## Key paths\n\n' +
+    '- Handoff file: `/home/bob/.claude/projects/xyz/handoff.md`\n' +
+    '- Helper script: `/home/bob/claude-memory/scripts/handoff.js`\n';
+  const first  = healKeyPathsSection(fixture, {});
+  assertEqual(first.outcome, 'healed');
+  const second = healKeyPathsSection(first.text, {});
+  assertEqual(second.outcome, 'noop');
+  assertEqual(second.text, first.text, 'second pass must be byte-identical to first pass output');
+});
+
+test('extra user bullet + absolute engine bullets: healed, extra bullet preserved', () => {
+  const fixture =
+    '## Key paths\n\n' +
+    '- Handoff file: `/home/bob/.claude/projects/xyz/handoff.md`\n' +
+    '- Helper script: `/home/bob/claude-memory/scripts/handoff.js`\n' +
+    '- Extra: something else entirely\n';
+  const r = healKeyPathsSection(fixture, {});
+  assertEqual(r.outcome, 'healed');
+  assert(r.text.includes('- Extra: something else entirely\n'), 'extra user bullet must be preserved verbatim');
+  assert(!r.text.includes('/home/bob/'), 'absolute paths must be gone after heal');
+});
+
+test('hand-authored /home/bob/notes.md section: unrecognized + leak note', () => {
+  const fixture = '## Key paths\n\n- Notes: /home/bob/notes.md\n';
+  const r = healKeyPathsSection(fixture, {});
+  assertEqual(r.outcome, 'unrecognized');
+  assertEqual(r.text, fixture, 'unrecognized must leave text unchanged');
+  assert(r.notes.length >= 1, 'unrecognized must carry a note');
+  assert(r.notes.some((n) => n.includes('/home/bob/notes.md')), 'note must name the leaked absolute path');
+});
+
+test('duplicate "## Key paths" heading: ambiguous', () => {
+  const fixture = '## Key paths\n\n- a\n\n## Key paths\n\n- b\n';
+  const r = healKeyPathsSection(fixture, {});
+  assertEqual(r.outcome, 'ambiguous');
+  assertEqual(r.text, fixture, 'ambiguous must leave text unchanged');
+  assert(r.notes.length >= 1, 'ambiguous must carry a note');
+});
+
+test('heading inside a fenced code block is ignored (no real heading -> absent)', () => {
+  const fixture = '```\n## Key paths\n```\nSome other content\n';
+  const r = healKeyPathsSection(fixture, {});
+  assertEqual(r.outcome, 'absent');
+  assertEqual(r.text, fixture);
+});
+
+test('"### Key paths" (level 3) is not matched -> absent', () => {
+  const fixture = '### Key paths\n\n- x\n';
+  const r = healKeyPathsSection(fixture, {});
+  assertEqual(r.outcome, 'absent');
+});
+
+test('"## Key Paths " (case + trailing space) is matched', () => {
+  const fixture =
+    '## Key Paths \n\n' +
+    '- Handoff file: `~/.claude/projects/<project-id>/handoff.md`\n' +
+    '- Helper script: `<engine-root>/scripts/handoff.js`\n';
+  const r = healKeyPathsSection(fixture, {});
+  assert(r.outcome !== 'absent', 'trailing-space/case heading must still be recognized');
+  assertEqual(r.outcome, 'noop', 'already-portable engine bullets must be a noop');
+});
+
+test('CRLF line endings and a leading BOM are preserved through a heal', () => {
+  const fixture =
+    '\uFEFF' +
+    '## Key paths\r\n\r\n' +
+    '- Handoff file: `C:\\Users\\bob\\.claude\\projects\\abc\\handoff.md`\r\n' +
+    '- Helper script: `C:\\Users\\bob\\repo\\scripts\\handoff.js`\r\n' +
+    '\r\n## Durable facts\r\n\r\n- none\r\n';
+  const r = healKeyPathsSection(fixture, {});
+  assertEqual(r.outcome, 'healed');
+  assert(r.text.charCodeAt(0) === 0xFEFF, 'leading BOM must be preserved');
+  assert(r.text.includes('\r\n## Durable facts\r\n\r\n- none\r\n'), 'CRLF-terminated unrelated lines must be preserved exactly');
+  assert(!r.text.includes('\n\n## Durable facts\n'), 'must not silently flatten CRLF to LF');
+});
+
+test('EOF without a trailing newline is preserved', () => {
+  const fixture =
+    '## Key paths\n\n' +
+    '- Handoff file: `/home/bob/.claude/projects/x/handoff.md`\n' +
+    '- Helper script: `/home/bob/repo/scripts/handoff.js`'; // no trailing \n
+  const r = healKeyPathsSection(fixture, {});
+  assertEqual(r.outcome, 'healed');
+  assert(!r.text.endsWith('\n'), 'must not add a trailing newline that was not in the original');
+  assert(r.text.endsWith('`<engine-root>/scripts/handoff.js`'), 'last line must be the healed helper bullet with no trailing newline');
+});
+
+test('absent: no "## Key paths" heading at all', () => {
+  const fixture = '# proj\n\nsome content\n\n## Durable facts\n\n- none\n';
+  const r = healKeyPathsSection(fixture, {});
+  assertEqual(r.outcome, 'absent');
+  assertEqual(r.text, fixture);
+  assertEqual(r.notes.length, 0);
+});
+
+test('engine-shaped via marker alone (bullets absent) with no absolute path: noop', () => {
+  const fixture =
+    '## Key paths\n\n' +
+    '<!-- memory-engine:key-paths v2 -->\n' +
+    '- Something: not a recognized bullet shape\n';
+  const r = healKeyPathsSection(fixture, {});
+  assertEqual(r.outcome, 'noop');
+  assertEqual(r.text, fixture);
+});
+
+// ─── integration-style: init-on-existing write path (no DB required) ──────
+//
+// Mirrors the exact heal+atomic-write sequence in cmdInit's "CLAUDE.md
+// already exists" branch (scripts/handoff.js, Step 11) without needing a DB
+// connection — this block only exercises the filesystem side of that
+// branch: read -> healKeyPathsSection -> write only on 'healed'.
+
+test('init-on-existing integration: healed legacy CLAUDE.md is written atomically', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-heal-test-'));
+  const claudeMdPath = path.join(tmpDir, 'CLAUDE.md');
+  const legacy =
+    '# proj\n\n## Key paths\n\n' +
+    '- Handoff file: `C:\\Users\\bob\\.claude\\projects\\abc\\handoff.md`\n' +
+    '- Helper script: `C:\\Users\\bob\\repo\\scripts\\handoff.js`\n';
+  fs.writeFileSync(claudeMdPath, legacy, 'utf8');
+
+  // Same sequence as cmdInit Step 11's existing-file branch.
+  const existingContent = fs.readFileSync(claudeMdPath, 'utf8');
+  const healResult = healKeyPathsSection(existingContent, {});
+  assertEqual(healResult.outcome, 'healed');
+  const tmpPath = `${claudeMdPath}.tmp-${process.pid}`;
+  fs.writeFileSync(tmpPath, healResult.text, 'utf8');
+  fs.renameSync(tmpPath, claudeMdPath);
+
+  assert(!fs.existsSync(tmpPath), 'tmp file must be renamed away, not left behind');
+  const onDisk = fs.readFileSync(claudeMdPath, 'utf8');
+  assertEqual(onDisk, healResult.text, 'on-disk content must match the healed text');
+  assert(onDisk.includes('~/.claude/projects/<project-id>/handoff.md'), 'on-disk file must carry the healed portable path');
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('init-on-existing integration: unrecognized existing file is left untouched (no write)', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-heal-test-'));
+  const claudeMdPath = path.join(tmpDir, 'CLAUDE.md');
+  const handAuthored = '## Key paths\n\n- Notes: /home/bob/notes.md\n';
+  fs.writeFileSync(claudeMdPath, handAuthored, 'utf8');
+  const before = fs.statSync(claudeMdPath).mtimeMs;
+
+  const existingContent = fs.readFileSync(claudeMdPath, 'utf8');
+  const healResult = healKeyPathsSection(existingContent, {});
+  assertEqual(healResult.outcome, 'unrecognized');
+  // Only 'healed' writes — an unrecognized outcome must never touch disk.
+  if (healResult.outcome !== 'healed') {
+    // no-op: matches cmdInit's branch, which skips the write here
+  }
+  const after = fs.statSync(claudeMdPath).mtimeMs;
+  assertEqual(after, before, 'file must not be rewritten for a non-healed outcome');
+  assertEqual(fs.readFileSync(claudeMdPath, 'utf8'), handAuthored);
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
 
 // ─── summary ──────────────────────────────────────────────────────────────
 

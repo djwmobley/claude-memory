@@ -105,7 +105,7 @@ const { REALITY_CHECKS, runVerifyDispatch }        = require('./lib/reality-chec
 // (and, before this fix, only-validated-never-written) entry point onto
 // this one write path.
 const { validateDecisionRows, persistDecisionRow } = require('./lib/decisions-writer');
-const { renderKeyPathsBullets }                    = require('./lib/claude-md-key-paths');
+const { renderKeyPathsBullets, healKeyPathsSection } = require('./lib/claude-md-key-paths');
 
 process.on('exit', () => {
   const ms = Number(process.hrtime.bigint() - __startNs) / 1e6;
@@ -3619,7 +3619,27 @@ async function cmdInit(args) {
   // CLAUDE.md) — resolvePromotionFilePath() already validated it above.
   const promotionFilename = path.basename(claudeMdPath);
   if (fs.existsSync(claudeMdPath)) {
-    console.log(`  [OK]    ${promotionFilename} already exists — skipped: ${claudeMdPath}`);
+    // heal-on-touch: heal a legacy/absolute "## Key paths" section on touch, rather
+    // than a bare skip. Total classification in healKeyPathsSection() — only
+    // the 'healed' outcome writes; every other outcome leaves the file as-is
+    // (with a diagnostic note on stderr for 'ambiguous'/'unrecognized').
+    try {
+      const existingContent = fs.readFileSync(claudeMdPath, 'utf8');
+      const healResult = healKeyPathsSection(existingContent, process.env);
+      for (const note of healResult.notes) {
+        process.stderr.write(`handoff: CLAUDE.md Key paths: ${note}\n`);
+      }
+      if (healResult.outcome === 'healed') {
+        const tmpPath = `${claudeMdPath}.tmp-${process.pid}`;
+        fs.writeFileSync(tmpPath, healResult.text, 'utf8');
+        fs.renameSync(tmpPath, claudeMdPath);
+        console.log(`  [OK]    ${promotionFilename} already exists — healed absolute Key paths bullet(s): ${claudeMdPath}`);
+      } else {
+        console.log(`  [OK]    ${promotionFilename} already exists — skipped (Key paths: ${healResult.outcome}): ${claudeMdPath}`);
+      }
+    } catch (err) {
+      console.log(`  [WARN]  ${promotionFilename} Key paths heal check failed (non-fatal): ${err.message}`);
+    }
   } else {
     try {
       const projectName = args.find((a) => !a.startsWith('-')) || path.basename(root);
@@ -7622,7 +7642,18 @@ async function cmdClose(args) {
   if (payload.confirm_claude_md_promotion && candidates.length > 0) {
     const claudeMdPath = closePromotionPath;
     if (fs.existsSync(claudeMdPath)) {
-      const existing  = fs.readFileSync(claudeMdPath, 'utf8');
+      // heal-on-touch: heal a legacy/absolute "## Key paths" section before the
+      // Durable-facts rewrite below — close writes the file anyway, so fold
+      // the heal (if any) into that same write rather than skipping it.
+      const rawExisting = fs.readFileSync(claudeMdPath, 'utf8');
+      const healResult  = healKeyPathsSection(rawExisting, process.env);
+      for (const note of healResult.notes) {
+        process.stderr.write(`handoff: CLAUDE.md Key paths: ${note}\n`);
+      }
+      if (healResult.outcome === 'healed') {
+        console.log(`  ${closePromotionFilename}: healed absolute Key paths bullet(s).`);
+      }
+      const existing  = healResult.text;
       const today     = new Date().toISOString().slice(0, 10);
       const sessionId = payload.session_id || 'unknown';
       const additions = candidates.map((r) => {
