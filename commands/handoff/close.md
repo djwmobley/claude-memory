@@ -136,13 +136,18 @@ For each decision:
 cm#230: `decisions[]` is persisted through the SAME write path as the standalone
 `persist_decisions` MCP tool (`scripts/lib/decisions-writer.js`) — inline-embedded at write
 time, **fail-soft** on the embedding step: a down embedding provider never blocks the write,
-the row still lands with `embedding=NULL`, surfaced as a non-fatal
-`DIVERGENCE: decision:<topic> EMBEDDING DEGRADED (row persisted, embedding=NULL) — <reason>`
-line. A row that fails validation (bad `topic` shape, missing `decision`/`reason`) or hits a
-genuine write error (e.g. a stale project DB that has not yet picked up the `decisions`
-table) is skipped — non-fatal, surfaced as `DIVERGENCE: decision:<topic> NOT PERSISTED —
-<reason>` — one bad row never blocks the rest of the close. Same `DIVERGENCE:` channel and
-console/`handoff.md` surfacing as the session-intent persistence failures described above.
+the row still lands with `embedding=NULL`. This is an OPERATIONAL warning only — counted
+into the Done line's `embed_warnings` figure, never rendered as a per-row line in
+`handoff.md` (init-embeddability A2, PR #260: an earlier revision folded this into the
+`DIVERGENCE:` channel below, which could blow the markdown thin-pointer budget on a close
+with several decisions on a project with no default embedding provider configured — fixed
+to count-only). A row that fails validation (bad `topic` shape, missing `decision`/`reason`)
+or hits a genuine write error (e.g. a stale project DB that has not yet picked up the
+`decisions` table) is skipped — non-fatal, surfaced as `DIVERGENCE: decision:<topic> NOT
+PERSISTED — <reason>` — one bad row never blocks the rest of the close. Same `DIVERGENCE:`
+channel and console/`handoff.md` surfacing as the session-intent persistence failures
+described above for genuine write/validation failures — embed-degraded is deliberately NOT
+part of that channel.
 
 ### 5. Retrieval contract
 

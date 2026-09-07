@@ -5154,8 +5154,11 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
   // opts.embedTimeoutMs are threaded straight to embedForWrite; opts.warnSink,
   // when supplied as an array, collects a `{predicate, subject, message,
   // kind:'embed_degraded'}` entry per degraded embed — writeExtraction uses
-  // this to fold assertion embed-warnings into the SAME DIVERGENCE-line
-  // channel (formatIntentDivergenceLines) decisions embed-warnings already use.
+  // only this array's LENGTH (assertionEmbedWarnCount below), never its
+  // contents: it is counted into the Done line's `embed_warnings` figure,
+  // never rendered into handoff.md (init-embeddability A2, PR #260 — see
+  // the header comment above the assertionWriteFailures/assertionEmbedWarnCount
+  // declarations below for the full rationale, which decisions[] shares).
   const embedSkipped = (db && typeof db.supportsEmbeddingColumns === 'function' && !db.supportsEmbeddingColumns())
     || !!opts.embeddingsOptedOut;
   const embedResult = embedSkipped
@@ -6101,12 +6104,19 @@ async function writeExtraction(db, projectId, payload, opts) {
  *
  * cm#230: also formats decisions-writer divergences (writeExtraction's
  * decisionDivergences, merged into the same array this function receives).
- * Those carry an explicit `d.kind` — 'embed_degraded' renders a DISTINCT
- * line (the row WAS persisted; only its embedding degraded to NULL,
- * fail-soft per write-time-embed.js) so it is never confused with an actual
- * NOT-PERSISTED write failure. Any divergence with no `kind` (every existing
- * session-intent divergence, cm#227) renders EXACTLY as before — this is a
- * strict superset, not a behavior change for the pre-existing callers.
+ * An earlier revision routed embed-degraded warnings (assertions and
+ * decisions alike) into this same array with `d.kind === 'embed_degraded'`,
+ * rendering a DISTINCT "EMBEDDING DEGRADED" line below. Fixed
+ * (init-embeddability A2, PR #260): embed-degraded is counted only —
+ * assertionEmbedWarnCount/decisionEmbedWarnCount, folded into the Done
+ * line's `embed_warnings` figure — and is NEVER pushed into
+ * decisionDivergences/intentDivergences, so no caller passes
+ * `kind: 'embed_degraded'` into this function anymore; the branch below is
+ * kept as a defensive no-op (removing it would be a code-behavior change,
+ * out of scope for this doc fix) rather than because it is still reachable.
+ * Any divergence with no `kind` (every existing session-intent divergence,
+ * cm#227, plus decision write/validation failures) renders EXACTLY as
+ * before.
  * @param {Array<{predicate:string, subject:string, message:string, kind?:string}>} divergences
  * @returns {string[]}
  */
