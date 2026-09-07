@@ -26,8 +26,9 @@ These rules are canon. They override convenience, time pressure, and apparent co
 
 ## Key paths
 
-- Handoff file: `{{HANDOFF_MD_PATH}}`
-- Helper script: `{{PROJECT_ROOT}}/scripts/handoff.js`
+<!-- memory-engine:key-paths v2 -->
+- Handoff file: `{{KEY_PATHS_HANDOFF_PATH}}` — `<project-id>` is the marker UUID in `.memory-engine` (or legacy `.claude-memory`) at the repo root, falling back to the encoded-cwd id for un-migrated projects. See `resolveHandoffMdPath` in `scripts/lib/handoff-paths.js` of the engine.
+- Helper script: `{{KEY_PATHS_HELPER_PATH}}` — the claude-memory checkout; standalone installs record it in `<base>/commands/handoff/.engine-path`. Never `<repo-root>` — the target project is not the engine.
 
 ---
 
