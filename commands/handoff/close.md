@@ -86,7 +86,10 @@ DB connection or file write. Likewise, running `close` with no `--json` payload 
 with `--json -` piped from genuinely empty stdin, now exits 2 (`--json - requires a payload
 on stdin`) instead of proceeding with a default empty payload — that used to be an
 extraction-empty close that looked like it did something. Pass `--allow-empty` to opt into
-that no-payload close deliberately. `close --help` / `-h` prints this command's usage and
+that no-payload close deliberately. `--dry-run` without `--json` is accepted on its own,
+with no `--allow-empty` needed, since it performs no writes; `--json -` still requires a
+stdin payload otherwise, and `--allow-empty` is the only other way to close without one.
+`close --help` / `-h` prints this command's usage and
 exits 0 with no side effect. This closes a real incident: an unrecognized flag being
 silently ignored let a write command run for real with no extraction data, clearing the
 session marker and overwriting handoff.md. `checkpoint` has the identical fail-closed
