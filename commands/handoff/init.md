@@ -2,7 +2,7 @@
 
 > Running: handoff:init
 
-First-run setup. Creates the database tables, writes a project-level durable-facts promotion file (`CLAUDE.md` by default), and registers the default retrieval contract. Run once per project. Safe to re-run — it won't overwrite anything that already exists.
+First-run setup. Creates the database tables, writes a project-level durable-facts promotion file (`CLAUDE.md` by default), and registers the default retrieval contract. Run once per project. Safe to re-run — it won't overwrite anything that already exists, with one narrow exception: an existing promotion file's `## Key paths` section is healed in place (see item 5 below).
 
 ## What this does
 
@@ -12,7 +12,7 @@ First-run setup. Creates the database tables, writes a project-level durable-fac
    remote or unconfigured endpoint.
 3. Inserts default `project_settings` rows (staleness_days, loader_token_budget, etc.) if absent.
 4. Creates `~/.claude/projects/{project_id}/handoff.md` from the template if absent (base directory configurable via `HANDOFF_BASE_DIR`; default `~/.claude`).
-5. Creates the durable-facts promotion file at the project root if absent (should be git-committed). Default filename `CLAUDE.md`; configurable via `HANDOFF_PROMOTION_FILE`.
+5. Creates the durable-facts promotion file at the project root if absent (should be git-committed). Default filename `CLAUDE.md`; configurable via `HANDOFF_PROMOTION_FILE`. If the file already exists, `init` does not skip it silently: it reads the existing `## Key paths` section and runs it through `healKeyPathsSection()` (`scripts/lib/claude-md-key-paths.js`). That function applies a total classification to whatever shape the section is in — `absent`, `ambiguous` (duplicate heading), `healed` (an engine-generated section carrying a filesystem-absolute Handoff-file or Helper-script bullet, e.g. from a pre-cm#263 `init` or a file copied from another machine), `noop` (already portable), or `unrecognized` (hand-authored content, or a shape it can't confidently classify). Only the `healed` case rewrites the file, and it rewrites only the absolute bullet line(s) — atomically (temp file + rename) — leaving every other line, including any hand-added content, untouched byte-for-byte. `ambiguous` and `unrecognized` outcomes are never written; they print a `handoff: CLAUDE.md Key paths: ...` diagnostic to stderr instead, so an unrecognized section is surfaced as friction rather than silently left with a potential absolute-path leak. `handoff:close`'s durable-facts promotion write performs the same heal, folded into its own rewrite, whenever it updates an existing promotion file.
 6. Inserts a default `retrieval_contract` row for this project if absent.
 
 ## Local embedding provider seeding
