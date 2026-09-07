@@ -721,7 +721,7 @@ async function runTests() {
     assert.strictEqual(rows[0].reason, 'initial reason');
   });
 
-  await test('close: decisions[] embedding-provider-down is non-fatal and surfaces a DIVERGENCE line (no default embedding_providers row)', async () => {
+  await test('close: decisions[] embedding-provider-down is non-fatal and counted in embed_warnings, never rendered as a DIVERGENCE line in the markdown body (no default embedding_providers row)', async () => {
     // SHARED-DB INVARIANT vs SEEDED DEFAULT (cm#250): this assertion needs
     // zero embedding_providers rows with is_default=true at the moment
     // runHelper's subprocess calls resolveDefaultProvider(). CI's fresh DB
@@ -755,10 +755,28 @@ async function runTests() {
         }),
       });
       assert.ok(out.includes('Done: handoff:close'), 'a degraded embedding must never fail the close (non-fatal contract)');
+      // markdown-thin-pointer fix: embed-degraded is an OPERATIONAL warning
+      // (the row persisted fine; only its embedding is NULL), never a
+      // content divergence — it must be counted on the stdout Done line's
+      // embed_warnings figure, and must NEVER be rendered as a per-row
+      // DIVERGENCE line into handoff.md's body (a close with several such
+      // decisions rows on a no-provider project previously blew the
+      // 512-byte thin-pointer budget this way — a real pipeline_judge
+      // close with 5 decisions did exactly this).
       assert.ok(
-        out.includes(`DIVERGENCE: decision:${decisionTopic}-probe EMBEDDING DEGRADED`),
-        `expected an EMBEDDING DEGRADED divergence line for a DB with no default provider, got:\n${out}`
+        !out.includes(`DIVERGENCE: decision:${decisionTopic}-probe EMBEDDING DEGRADED`),
+        `embed-degraded must NEVER render as a markdown DIVERGENCE line anymore, got:\n${out}`
       );
+      assert.ok(
+        /embed_warnings: [1-9]\d*/.test(out),
+        `expected a nonzero embed_warnings count on the Done line, got:\n${out}`
+      );
+      const { rows: decisionRows } = await db.query(
+        'SELECT decision, embedding FROM decisions WHERE project_id = $1 AND topic = $2',
+        [encodedRoot, `${decisionTopic}-probe`]
+      );
+      assert.strictEqual(decisionRows.length, 1, 'the row itself must still be persisted (fail-soft, never lost)');
+      assert.strictEqual(decisionRows[0].embedding, null, 'embedding must be NULL when the provider is down');
     } finally {
       if (defaultIds.length > 0) {
         await db.query(

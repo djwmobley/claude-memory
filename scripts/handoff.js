@@ -5975,11 +5975,27 @@ async function writeExtraction(db, projectId, payload, opts) {
   // that has not yet run ensureSchemaCurrent — e.g. the async queue-drain
   // path, which does not call it), or degrades its embedding (fail-soft,
   // per write-time-embed.js's own header) never blocks the rest of this
-  // decisions[] array OR the rest of the close. Failures/degradations are
-  // collected into decisionDivergences and merged into the SAME
-  // intentDivergences channel cm#227 built for session-intent persistence
-  // failures below — one DIVERGENCE-line mechanism, not two.
+  // decisions[] array OR the rest of the close. Genuine NOT-PERSISTED
+  // failures are collected into decisionDivergences and merged into the
+  // SAME intentDivergences channel cm#227 built for session-intent
+  // persistence failures below — one DIVERGENCE-line mechanism, not two.
+  //
+  // markdown-thin-pointer fix (same bug class the assertions loop above was
+  // just fixed for): an embed-degraded warning is an OPERATIONAL signal
+  // (the row persisted fine; only its embedding is NULL), not a content
+  // divergence — it must never be rendered as a per-row DIVERGENCE line
+  // into handoff.md's body. This previously ALSO routed through
+  // decisionDivergences/formatIntentDivergenceLines exactly like
+  // assertions did, and is the identical bug: a close with several
+  // decisions[] rows on a project with no default embedding provider
+  // configured blows the 512-byte thin-pointer budget the same way (a
+  // real pipeline_judge close with 5 decisions did exactly this). Fixed
+  // identically: embed-degraded now only increments a count
+  // (decisionEmbedWarnCount, folded into the SAME stdout embed_warnings
+  // figure assertions already contribute to) — never pushed into
+  // decisionDivergences. Genuine write/validation failures are unchanged.
   let decisionsWritten = 0;
+  let decisionEmbedWarnCount = 0;
   const decisionDivergences = [];
   for (const row of (payload.decisions || [])) {
     if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
@@ -5997,14 +6013,7 @@ async function writeExtraction(db, projectId, payload, opts) {
     try {
       const { warning } = await persistDecisionRow(db, projectId, row);
       decisionsWritten++;
-      if (warning) {
-        decisionDivergences.push({
-          predicate: `decision:${row.topic}`,
-          subject: row.topic,
-          message: warning,
-          kind: 'embed_degraded',
-        });
-      }
+      if (warning) decisionEmbedWarnCount++;
     } catch (err) {
       process.stderr.write(`[handoff] decision write failed for topic "${topicForMessage}" (non-fatal): ${err.message}\n`);
       decisionDivergences.push({
@@ -6077,9 +6086,11 @@ async function writeExtraction(db, projectId, payload, opts) {
   return {
     entitiesWritten, assertionsWritten, edgesWritten, decisionsWritten,
     intentDivergences: [...intentDivergences, ...decisionDivergences, ...assertionWriteFailures],
-    // Count-only (never rendered into handoff.md — see the header comment
-    // above assertionWriteFailures/assertionEmbedWarnCount for why).
+    // Count-only (never rendered into handoff.md — see the header comments
+    // above assertionWriteFailures/assertionEmbedWarnCount and
+    // decisionEmbedWarnCount for why).
     assertionEmbedWarnCount,
+    decisionEmbedWarnCount,
   };
 }
 
@@ -6368,13 +6379,12 @@ async function cmdCheckpoint(args) {
   const intentDivergences     = extraction.intentDivergences || [];
   const divergenceLines       = formatIntentDivergenceLines(intentDivergences);
   // A3: counted WARN on the summary Done line (stdout only — never rendered
-  // into handoff.md; see writeExtraction's own header comment on
-  // assertionEmbedWarnCount for why assertions and decisions are counted
-  // differently here). decisions[] embed-degraded rows still render their
-  // own per-row DIVERGENCE line too (cm#230's pre-existing, unchanged
-  // contract) — this count folds both sources into one stdout figure.
-  const embedWarnCount = intentDivergences.filter((d) => d.kind === 'embed_degraded').length
-    + (extraction.assertionEmbedWarnCount || 0);
+  // into handoff.md; see writeExtraction's own header comments on
+  // assertionEmbedWarnCount/decisionEmbedWarnCount for why embed-degraded
+  // warnings for BOTH assertions and decisions are counts here, never
+  // per-row markdown DIVERGENCE lines — that was the exact body-budget bug
+  // this figure's computation used to reintroduce for decisions).
+  const embedWarnCount = (extraction.assertionEmbedWarnCount || 0) + (extraction.decisionEmbedWarnCount || 0);
   const embedWarnSuffix = embedWarnCount > 0 ? `, embed_warnings: ${embedWarnCount}` : '';
   const checkpointDegradedSection = divergenceLines.length > 0
     ? '\n\n## Degraded\n' + divergenceLines.map((l) => `- ${l}`).join('\n')
@@ -7079,7 +7089,7 @@ async function cmdClose(args) {
   }
 
   // ── Synchronous path (default) — unchanged behavior ──────────────────────────
-  const { entitiesWritten, assertionsWritten, edgesWritten, decisionsWritten, intentDivergences, assertionEmbedWarnCount } =
+  const { entitiesWritten, assertionsWritten, edgesWritten, decisionsWritten, intentDivergences, assertionEmbedWarnCount, decisionEmbedWarnCount } =
     await writeExtraction(db, projectId, payload, { projectBasename: path.basename(root) });
   // cm#227: DIVERGENCE lines for any session_tldr/open_thread/quick_reference
   // persistence failure — surfaced below in the Done summary AND rendered into
@@ -7089,8 +7099,7 @@ async function cmdClose(args) {
   const intentDivergenceLines = formatIntentDivergenceLines(intentDivergences);
   // A3: counted WARN on the summary Done line (stdout only — never rendered
   // into handoff.md) — see cmdCheckpoint's identical computation for rationale.
-  const embedWarnCount  = intentDivergences.filter((d) => d.kind === 'embed_degraded').length
-    + (assertionEmbedWarnCount || 0);
+  const embedWarnCount  = (assertionEmbedWarnCount || 0) + (decisionEmbedWarnCount || 0);
   const embedWarnSuffix = embedWarnCount > 0 ? `, embed_warnings: ${embedWarnCount}` : '';
 
   // Surface CLAUDE.md promotion candidates (conf >= 9, user_stated, multi-session).
