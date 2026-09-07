@@ -1241,6 +1241,15 @@ jobs:
         #       both equal the canonical set in the SQL schema CHECK constraint
         # Pure static analysis — no Postgres or Ollama required.
         run: node scripts/test-doc-lint.js
+      - name: Run §8 CRUD vector-strip tests (embedding stripping + read-limit clamp)
+        # cm MCP-payload fix (PR #271): scripts/lib/vector-strip.js strips
+        # pgvector-typed columns (manifest-driven, schema-manifest.json's
+        # pgvector_gated) from every entity/assertion/edge/decisions row a
+        # §8 CRUD tool returns, plus entity_read/assertion_read/edge_read's
+        # limit/offset pagination and the MAX_READ_LIMIT=1000 clamp.
+        # Exercises entity-graph-crud.js against a minimal fake pg client —
+        # no Postgres or Ollama required.
+        run: node test/test-vector-strip.js
       - name: Run CLI argument fail-closed tests (A1-A4, incident 2026-09-07)
         # Total-classification argument gate for every write subcommand
         # (scripts/lib/cli-args.js): unknown flags / --help exit before any

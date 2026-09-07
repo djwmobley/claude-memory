@@ -40,6 +40,7 @@ const path = require('path');
 // named, actionable error instead of letting it escape to an MCP caller —
 // see write-time-embed.js's own header comment for the full rationale.
 const { classifyEmbeddingWriteError } = require('./write-time-embed.js');
+const { stripRows } = require('./vector-strip.js');
 
 // ─── Column contract per table (S-1: hardcoded, never derived from caller
 // input; S-3: app-level validation rules per column). type: 'text' | 'int'
@@ -594,7 +595,7 @@ async function findContradictingAssertion(client, projectId, subject, predicate,
 // caller-writable column set) — never caller-supplied SQL identifiers
 // (S-1's identifier-safety rule, reused here).
 
-async function memoryGet(client, table, projectId, key) {
+async function memoryGet(client, table, projectId, key, { includeEmbeddings = false } = {}) {
   if (!Object.prototype.hasOwnProperty.call(TABLE_COLUMN_MAP, table)) {
     throw new MemoryUpsertError(
       'unknownTable',
@@ -632,7 +633,10 @@ async function memoryGet(client, table, projectId, key) {
     `SELECT * FROM "${table}" WHERE ${conditions.join(' AND ')}`,
     values
   );
-  return rows;
+  // R1: strip manifest-declared vector columns (e.g. decisions.embedding) —
+  // see scripts/lib/vector-strip.js. Generic across every ALLOWED_TABLES
+  // entry: a table with no pgvector_gated manifest entry is a no-op here.
+  return stripRows(rows, table, { includeEmbeddings });
 }
 
 module.exports = {

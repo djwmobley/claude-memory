@@ -36,6 +36,28 @@
 const { normalizeForCompare } = require('./normalize-text.js');
 const { cardinalityOf } = require('./predicate-registry.js');
 const { embedForWrite } = require('./write-time-embed.js');
+const { stripRow, stripRows } = require('./vector-strip.js');
+
+// R3 default page size for entity_read/assertion_read/edge_read — matches
+// the handoff-mcp.mjs tool schema defaults (kept as one constant so the
+// two never drift independently).
+const DEFAULT_READ_LIMIT = 200;
+
+// PR #271 reviewer follow-up: the MCP tool schemas (handoff-mcp.mjs) reject
+// limit > 1000 via zod's .max(1000) — a hard error for MCP callers. THIS
+// constant is the second, independent enforcement point for any caller that
+// reaches entityRead/assertionRead/edgeRead directly (bypassing the MCP
+// zod layer entirely — e.g. a future non-MCP script requiring this lib).
+// Chosen behavior here is a SILENT CLAMP (never a thrown error) — documented
+// in docs/mcp-tools.md — because a direct lib caller has no tool-schema
+// validation step to reject against; clamping preserves "the call still
+// returns useful data" over "the call now throws where it didn't before".
+const MAX_READ_LIMIT = 1000;
+
+function clampReadLimit(limit) {
+  if (!Number.isInteger(limit) || limit <= 0) return DEFAULT_READ_LIMIT;
+  return Math.min(limit, MAX_READ_LIMIT);
+}
 
 class EntityGraphCrudError extends Error {
   constructor(code, message, details) {
@@ -109,7 +131,7 @@ async function findNearMatchEntities(client, projectId, name) {
  *   warnings = { exact: [...], fuzzy: [...] } — near-match rows OTHER than
  *   the one actually written/revived (never auto-merged).
  */
-async function entityCreate(client, { projectId, name, entityType, description, sourceModel, agentId }) {
+async function entityCreate(client, { projectId, name, entityType, description, sourceModel, agentId, includeEmbeddings }) {
   requireNonEmptyString(projectId, 'projectId');
   requireNonEmptyString(name, 'name');
   requireNonEmptyString(entityType, 'entityType');
@@ -126,7 +148,7 @@ async function entityCreate(client, { projectId, name, entityType, description, 
       [entityType, description || null, suppressedExact.id, projectId]
     );
     return {
-      row: rows[0],
+      row: stripRow(rows[0], 'entities', { includeEmbeddings }),
       revived: true,
       warnings: {
         exact: exact.filter((r) => r.id !== suppressedExact.id),
@@ -141,22 +163,25 @@ async function entityCreate(client, { projectId, name, entityType, description, 
      RETURNING *`,
     [projectId, name, entityType, description || null, sourceModel || null, agentId || null]
   );
-  return { row: rows[0], revived: false, warnings: { exact, fuzzy } };
+  return { row: stripRow(rows[0], 'entities', { includeEmbeddings }), revived: false, warnings: { exact, fuzzy } };
 }
 
-async function entityRead(client, { projectId, id, name }) {
+async function entityRead(client, { projectId, id, name, includeEmbeddings, limit, offset }) {
   requireNonEmptyString(projectId, 'projectId');
   if (id === undefined && name === undefined) {
     throw new EntityGraphCrudError('validation', 'entity-graph-crud: entityRead requires either id or name');
   }
+  const lim = clampReadLimit(limit);
+  const off = Number.isInteger(offset) && offset >= 0 ? offset : 0;
   const { rows } = await client.query(
-    `SELECT * FROM entities WHERE project_id = $1 AND ($2::integer IS NULL OR id = $2) AND ($3::text IS NULL OR name = $3)`,
-    [projectId, id ?? null, name ?? null]
+    `SELECT * FROM entities WHERE project_id = $1 AND ($2::integer IS NULL OR id = $2) AND ($3::text IS NULL OR name = $3)
+      ORDER BY id LIMIT $4 OFFSET $5`,
+    [projectId, id ?? null, name ?? null, lim, off]
   );
-  return rows;
+  return stripRows(rows, 'entities', { includeEmbeddings });
 }
 
-async function entityUpdate(client, { projectId, id, entityType, description }) {
+async function entityUpdate(client, { projectId, id, entityType, description, includeEmbeddings }) {
   requireNonEmptyString(projectId, 'projectId');
   if (!Number.isInteger(id)) {
     throw new EntityGraphCrudError('validation', 'entity-graph-crud: entityUpdate requires an integer id');
@@ -172,10 +197,10 @@ async function entityUpdate(client, { projectId, id, entityType, description }) 
   if (rows.length === 0) {
     throw new EntityGraphCrudError('notFound', `entity-graph-crud: entityUpdate found no row with id=${id} project_id=${projectId}`);
   }
-  return rows[0];
+  return stripRow(rows[0], 'entities', { includeEmbeddings });
 }
 
-async function entitySuppress(client, { projectId, id }) {
+async function entitySuppress(client, { projectId, id, includeEmbeddings }) {
   requireNonEmptyString(projectId, 'projectId');
   if (!Number.isInteger(id)) {
     throw new EntityGraphCrudError('validation', 'entity-graph-crud: entitySuppress requires an integer id');
@@ -187,7 +212,7 @@ async function entitySuppress(client, { projectId, id }) {
   if (rows.length === 0) {
     throw new EntityGraphCrudError('notFound', `entity-graph-crud: entitySuppress found no row with id=${id} project_id=${projectId}`);
   }
-  return rows[0];
+  return stripRow(rows[0], 'entities', { includeEmbeddings });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -216,7 +241,7 @@ async function entitySuppress(client, { projectId, id }) {
  * object, 1:N) prior row is still surfaced as contradictionWarning even
  * when cardinality means it is not auto-superseded.
  */
-async function assertionCreate(client, { projectId, subject, predicate, object, confidence, source, sourceModel, agentId, sessionId }) {
+async function assertionCreate(client, { projectId, subject, predicate, object, confidence, source, sourceModel, agentId, sessionId, includeEmbeddings }) {
   requireNonEmptyString(projectId, 'projectId');
   requireNonEmptyString(subject, 'subject');
   requireNonEmptyString(predicate, 'predicate');
@@ -271,21 +296,30 @@ async function assertionCreate(client, { projectId, subject, predicate, object, 
     row = updated[0] || row;
   }
 
-  return { row, contradictionWarning: conflict, touchOnly: !!result.touchOnly };
+  return {
+    row: stripRow(row, 'assertions', { includeEmbeddings }),
+    contradictionWarning: conflict,
+    touchOnly: !!result.touchOnly,
+  };
 }
 
-async function assertionRead(client, { projectId, id, subject, predicate }) {
+async function assertionRead(client, { projectId, id, subject, predicate, objectPrefix, contains, includeEmbeddings, limit, offset }) {
   requireNonEmptyString(projectId, 'projectId');
+  const lim = clampReadLimit(limit);
+  const off = Number.isInteger(offset) && offset >= 0 ? offset : 0;
   const { rows } = await client.query(
     `SELECT * FROM assertions
       WHERE project_id = $1
         AND ($2::integer IS NULL OR id = $2)
         AND ($3::text IS NULL OR subject = $3)
         AND ($4::text IS NULL OR predicate = $4)
-        AND suppressed = false AND invalid_at IS NULL`,
-    [projectId, id ?? null, subject ?? null, predicate ?? null]
+        AND ($5::text IS NULL OR object LIKE $5 || '%')
+        AND ($6::text IS NULL OR object ILIKE '%' || $6 || '%')
+        AND suppressed = false AND invalid_at IS NULL
+      ORDER BY id LIMIT $7 OFFSET $8`,
+    [projectId, id ?? null, subject ?? null, predicate ?? null, objectPrefix ?? null, contains ?? null, lim, off]
   );
-  return rows;
+  return stripRows(rows, 'assertions', { includeEmbeddings });
 }
 
 /**
@@ -363,7 +397,7 @@ async function resolveAssertionUpdateTargetId(client, { projectId, id, subject, 
  * than inventing a new path that could.
  */
 async function assertionUpdate(client, args) {
-  const { projectId, subject, predicate, newObject, confidence, source, sourceModel, agentId, sessionId } = args || {};
+  const { projectId, subject, predicate, newObject, confidence, source, sourceModel, agentId, sessionId, includeEmbeddings } = args || {};
   requireNonEmptyString(projectId, 'projectId');
   requireNonEmptyString(predicate, 'predicate');
   requireNonEmptyString(newObject, 'newObject');
@@ -462,7 +496,7 @@ async function assertionUpdate(client, args) {
     const insertRes = await client.query(insertSql, insertParams);
 
     await client.query('COMMIT');
-    return { oldId: targetId, newRow: insertRes.rows[0] };
+    return { oldId: targetId, newRow: stripRow(insertRes.rows[0], 'assertions', { includeEmbeddings }) };
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
@@ -479,7 +513,7 @@ async function assertionUpdate(client, args) {
  * NULL on a row that is otherwise indistinguishable, at read time, from a
  * live row for any query that (correctly) also checks invalid_at IS NULL.
  */
-async function assertionSuppress(client, { projectId, id }) {
+async function assertionSuppress(client, { projectId, id, includeEmbeddings }) {
   requireNonEmptyString(projectId, 'projectId');
   if (!Number.isInteger(id)) {
     throw new EntityGraphCrudError('validation', 'entity-graph-crud: assertionSuppress requires an integer id');
@@ -492,7 +526,7 @@ async function assertionSuppress(client, { projectId, id }) {
   if (rows.length === 0) {
     throw new EntityGraphCrudError('notFound', `entity-graph-crud: assertionSuppress found no row with id=${id} project_id=${projectId}`);
   }
-  return rows[0];
+  return stripRow(rows[0], 'assertions', { includeEmbeddings });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -501,7 +535,7 @@ async function assertionSuppress(client, { projectId, id }) {
 // edges_audit (already wired).
 // ─────────────────────────────────────────────────────────────────────────
 
-async function edgeCreate(client, { projectId, fromEntity, edgeType, toEntity, weight, sourceModel, agentId }) {
+async function edgeCreate(client, { projectId, fromEntity, edgeType, toEntity, weight, sourceModel, agentId, includeEmbeddings }) {
   requireNonEmptyString(projectId, 'projectId');
   requireNonEmptyString(fromEntity, 'fromEntity');
   requireNonEmptyString(edgeType, 'edgeType');
@@ -512,24 +546,27 @@ async function edgeCreate(client, { projectId, fromEntity, edgeType, toEntity, w
      RETURNING *`,
     [projectId, fromEntity, edgeType, toEntity, weight ?? null, sourceModel || null, agentId || null]
   );
-  return rows[0];
+  return stripRow(rows[0], 'edges', { includeEmbeddings });
 }
 
-async function edgeRead(client, { projectId, id, fromEntity, toEntity }) {
+async function edgeRead(client, { projectId, id, fromEntity, toEntity, includeEmbeddings, limit, offset }) {
   requireNonEmptyString(projectId, 'projectId');
+  const lim = clampReadLimit(limit);
+  const off = Number.isInteger(offset) && offset >= 0 ? offset : 0;
   const { rows } = await client.query(
     `SELECT * FROM edges
       WHERE project_id = $1
         AND ($2::integer IS NULL OR id = $2)
         AND ($3::text IS NULL OR from_entity = $3)
         AND ($4::text IS NULL OR to_entity = $4)
-        AND (suppressed = false)`,
-    [projectId, id ?? null, fromEntity ?? null, toEntity ?? null]
+        AND (suppressed = false)
+      ORDER BY id LIMIT $5 OFFSET $6`,
+    [projectId, id ?? null, fromEntity ?? null, toEntity ?? null, lim, off]
   );
-  return rows;
+  return stripRows(rows, 'edges', { includeEmbeddings });
 }
 
-async function edgeUpdate(client, { projectId, id, edgeType, weight }) {
+async function edgeUpdate(client, { projectId, id, edgeType, weight, includeEmbeddings }) {
   requireNonEmptyString(projectId, 'projectId');
   if (!Number.isInteger(id)) {
     throw new EntityGraphCrudError('validation', 'entity-graph-crud: edgeUpdate requires an integer id');
@@ -545,10 +582,10 @@ async function edgeUpdate(client, { projectId, id, edgeType, weight }) {
   if (rows.length === 0) {
     throw new EntityGraphCrudError('notFound', `entity-graph-crud: edgeUpdate found no row with id=${id} project_id=${projectId}`);
   }
-  return rows[0];
+  return stripRow(rows[0], 'edges', { includeEmbeddings });
 }
 
-async function edgeSuppress(client, { projectId, id }) {
+async function edgeSuppress(client, { projectId, id, includeEmbeddings }) {
   requireNonEmptyString(projectId, 'projectId');
   if (!Number.isInteger(id)) {
     throw new EntityGraphCrudError('validation', 'entity-graph-crud: edgeSuppress requires an integer id');
@@ -560,13 +597,15 @@ async function edgeSuppress(client, { projectId, id }) {
   if (rows.length === 0) {
     throw new EntityGraphCrudError('notFound', `entity-graph-crud: edgeSuppress found no row with id=${id} project_id=${projectId}`);
   }
-  return rows[0];
+  return stripRow(rows[0], 'edges', { includeEmbeddings });
 }
 
 module.exports = {
   EntityGraphCrudError,
   FUZZY_MIN_NORMALIZED_LEN,
   FUZZY_SIMILARITY_THRESHOLD,
+  DEFAULT_READ_LIMIT,
+  MAX_READ_LIMIT,
   findNearMatchEntities,
   entityCreate,
   entityRead,

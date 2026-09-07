@@ -47,6 +47,7 @@ const { ensureSchemaCurrent } = require('./handoff.js');
 const memoryUpsertLib = require('./lib/memory-upsert.js');
 const memorySearchLib = require('./lib/memory-search.js');
 const entityCrudLib = require('./lib/entity-graph-crud.js');
+const vectorStripLib = require('./lib/vector-strip.js');
 const memoryViewLib = require('./lib/memory-view.js');
 const memoryLintLib = require('./lib/memory-lint.js');
 const exchangeLogLib = require('./lib/exchange-log.js');
@@ -457,10 +458,10 @@ async function toolMemoryUpsert({ projectRoot, table, row }) {
   }
 }
 
-async function toolMemoryGet({ projectRoot, table, key }) {
+async function toolMemoryGet({ projectRoot, table, key, includeEmbeddings }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const rows = await memoryUpsertLib.memoryGet(db, table, projectId, key);
+      const rows = await memoryUpsertLib.memoryGet(db, table, projectId, key, { includeEmbeddings });
       return textResult({ rows });
     });
   } catch (err) {
@@ -501,10 +502,10 @@ async function toolMemoryViewRun({ projectRoot, name }) {
   }
 }
 
-async function toolEntityCreate({ projectRoot, name, entityType, description, sourceModel, agentId }) {
+async function toolEntityCreate({ projectRoot, name, entityType, description, sourceModel, agentId, includeEmbeddings }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const result = await entityCrudLib.entityCreate(db, { projectId, name, entityType, description, sourceModel, agentId });
+      const result = await entityCrudLib.entityCreate(db, { projectId, name, entityType, description, sourceModel, agentId, includeEmbeddings });
       return textResult(result);
     });
   } catch (err) {
@@ -512,10 +513,10 @@ async function toolEntityCreate({ projectRoot, name, entityType, description, so
   }
 }
 
-async function toolEntityRead({ projectRoot, id, name }) {
+async function toolEntityRead({ projectRoot, id, name, includeEmbeddings, limit, offset }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const rows = await entityCrudLib.entityRead(db, { projectId, id, name });
+      const rows = await entityCrudLib.entityRead(db, { projectId, id, name, includeEmbeddings, limit, offset });
       return textResult({ rows });
     });
   } catch (err) {
@@ -523,10 +524,10 @@ async function toolEntityRead({ projectRoot, id, name }) {
   }
 }
 
-async function toolEntityUpdate({ projectRoot, id, entityType, description }) {
+async function toolEntityUpdate({ projectRoot, id, entityType, description, includeEmbeddings }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const row = await entityCrudLib.entityUpdate(db, { projectId, id, entityType, description });
+      const row = await entityCrudLib.entityUpdate(db, { projectId, id, entityType, description, includeEmbeddings });
       return textResult(row);
     });
   } catch (err) {
@@ -534,10 +535,10 @@ async function toolEntityUpdate({ projectRoot, id, entityType, description }) {
   }
 }
 
-async function toolEntitySuppress({ projectRoot, id }) {
+async function toolEntitySuppress({ projectRoot, id, includeEmbeddings }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const row = await entityCrudLib.entitySuppress(db, { projectId, id });
+      const row = await entityCrudLib.entitySuppress(db, { projectId, id, includeEmbeddings });
       return textResult(row);
     });
   } catch (err) {
@@ -545,10 +546,10 @@ async function toolEntitySuppress({ projectRoot, id }) {
   }
 }
 
-async function toolAssertionCreate({ projectRoot, subject, predicate, object, confidence, source, sourceModel, agentId, sessionId }) {
+async function toolAssertionCreate({ projectRoot, subject, predicate, object, confidence, source, sourceModel, agentId, sessionId, includeEmbeddings }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const result = await entityCrudLib.assertionCreate(db, { projectId, subject, predicate, object, confidence, source, sourceModel, agentId, sessionId });
+      const result = await entityCrudLib.assertionCreate(db, { projectId, subject, predicate, object, confidence, source, sourceModel, agentId, sessionId, includeEmbeddings });
       return textResult(result);
     });
   } catch (err) {
@@ -556,10 +557,10 @@ async function toolAssertionCreate({ projectRoot, subject, predicate, object, co
   }
 }
 
-async function toolAssertionRead({ projectRoot, id, subject, predicate }) {
+async function toolAssertionRead({ projectRoot, id, subject, predicate, objectPrefix, contains, includeEmbeddings, limit, offset }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const rows = await entityCrudLib.assertionRead(db, { projectId, id, subject, predicate });
+      const rows = await entityCrudLib.assertionRead(db, { projectId, id, subject, predicate, objectPrefix, contains, includeEmbeddings, limit, offset });
       return textResult({ rows });
     });
   } catch (err) {
@@ -567,10 +568,10 @@ async function toolAssertionRead({ projectRoot, id, subject, predicate }) {
   }
 }
 
-async function toolAssertionUpdate({ projectRoot, id, subject, predicate, newObject, confidence, source, sourceModel, agentId, sessionId }) {
+async function toolAssertionUpdate({ projectRoot, id, subject, predicate, newObject, confidence, source, sourceModel, agentId, sessionId, includeEmbeddings }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const result = await entityCrudLib.assertionUpdate(db, { projectId, id, subject, predicate, newObject, confidence, source, sourceModel, agentId, sessionId });
+      const result = await entityCrudLib.assertionUpdate(db, { projectId, id, subject, predicate, newObject, confidence, source, sourceModel, agentId, sessionId, includeEmbeddings });
       return textResult(result);
     });
   } catch (err) {
@@ -578,10 +579,10 @@ async function toolAssertionUpdate({ projectRoot, id, subject, predicate, newObj
   }
 }
 
-async function toolAssertionSuppress({ projectRoot, id }) {
+async function toolAssertionSuppress({ projectRoot, id, includeEmbeddings }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const row = await entityCrudLib.assertionSuppress(db, { projectId, id });
+      const row = await entityCrudLib.assertionSuppress(db, { projectId, id, includeEmbeddings });
       return textResult(row);
     });
   } catch (err) {
@@ -589,10 +590,10 @@ async function toolAssertionSuppress({ projectRoot, id }) {
   }
 }
 
-async function toolEdgeCreate({ projectRoot, fromEntity, edgeType, toEntity, weight, sourceModel, agentId }) {
+async function toolEdgeCreate({ projectRoot, fromEntity, edgeType, toEntity, weight, sourceModel, agentId, includeEmbeddings }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const row = await entityCrudLib.edgeCreate(db, { projectId, fromEntity, edgeType, toEntity, weight, sourceModel, agentId });
+      const row = await entityCrudLib.edgeCreate(db, { projectId, fromEntity, edgeType, toEntity, weight, sourceModel, agentId, includeEmbeddings });
       return textResult(row);
     });
   } catch (err) {
@@ -600,10 +601,10 @@ async function toolEdgeCreate({ projectRoot, fromEntity, edgeType, toEntity, wei
   }
 }
 
-async function toolEdgeRead({ projectRoot, id, fromEntity, toEntity }) {
+async function toolEdgeRead({ projectRoot, id, fromEntity, toEntity, includeEmbeddings, limit, offset }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const rows = await entityCrudLib.edgeRead(db, { projectId, id, fromEntity, toEntity });
+      const rows = await entityCrudLib.edgeRead(db, { projectId, id, fromEntity, toEntity, includeEmbeddings, limit, offset });
       return textResult({ rows });
     });
   } catch (err) {
@@ -611,10 +612,10 @@ async function toolEdgeRead({ projectRoot, id, fromEntity, toEntity }) {
   }
 }
 
-async function toolEdgeUpdate({ projectRoot, id, edgeType, weight }) {
+async function toolEdgeUpdate({ projectRoot, id, edgeType, weight, includeEmbeddings }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const row = await entityCrudLib.edgeUpdate(db, { projectId, id, edgeType, weight });
+      const row = await entityCrudLib.edgeUpdate(db, { projectId, id, edgeType, weight, includeEmbeddings });
       return textResult(row);
     });
   } catch (err) {
@@ -622,10 +623,10 @@ async function toolEdgeUpdate({ projectRoot, id, edgeType, weight }) {
   }
 }
 
-async function toolEdgeSuppress({ projectRoot, id }) {
+async function toolEdgeSuppress({ projectRoot, id, includeEmbeddings }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const row = await entityCrudLib.edgeSuppress(db, { projectId, id });
+      const row = await entityCrudLib.edgeSuppress(db, { projectId, id, includeEmbeddings });
       return textResult(row);
     });
   } catch (err) {
@@ -1104,6 +1105,7 @@ function buildServer() {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         table: z.enum(memoryUpsertLib.ALLOWED_TABLES).describe('Closed table enum.'),
         key: z.record(z.string(), z.any()).describe('Natural-key {column: value} pairs to look up by.'),
+        includeEmbeddings: z.boolean().optional().describe('Return raw vector columns (e.g. decisions.embedding) instead of <col>_present/<col>_dims markers. Default false.'),
       },
     },
     async (args) => toolMemoryGet(args)
@@ -1174,7 +1176,8 @@ function buildServer() {
         '(similarity >= 0.4) — candidates shorter than 4 characters after normalization get the exact check ' +
         'ONLY (flood guard). Every query is explicitly project-scoped. Near-matches are returned as WARNINGS, ' +
         'NEVER auto-merged. M-4: if an exact-normalized match exists among SUPPRESSED rows, this un-suppresses ' +
-        'and updates that row (revival) instead of inserting a second row.',
+        'and updates that row (revival) instead of inserting a second row. entities carry no vector column ' +
+        'today, so includeEmbeddings is a no-op here (accepted for symmetry with assertion_create).',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         name: z.string().describe('Entity name.'),
@@ -1182,6 +1185,7 @@ function buildServer() {
         description: z.string().optional(),
         sourceModel: z.string().optional(),
         agentId: z.string().optional(),
+        includeEmbeddings: z.boolean().optional().describe('Return raw vector columns instead of <col>_present/<col>_dims markers. Default false.'),
       },
     },
     async (args) => toolEntityCreate(args)
@@ -1191,11 +1195,15 @@ function buildServer() {
     'entity_read',
     {
       title: 'Read entities by id or name',
-      description: 'Looks up entity rows by id and/or name, project-scoped. Either id or name is required.',
+      description: 'Looks up entity rows by id and/or name, project-scoped. Either id or name is required. ' +
+        'Paginated: limit defaults to 200, offset to 0. entities carry no vector column today (includeEmbeddings is a no-op, accepted for symmetry).',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         id: z.number().int().optional(),
         name: z.string().optional(),
+        includeEmbeddings: z.boolean().optional().describe('Return raw vector columns instead of <col>_present/<col>_dims markers. Default false.'),
+        limit: z.number().int().min(1).max(1000).optional().describe('Max rows returned. Default 200, capped at 1000.'),
+        offset: z.number().int().min(0).optional().describe('Rows to skip (ORDER BY id). Default 0.'),
       },
     },
     async (args) => toolEntityRead(args)
@@ -1211,6 +1219,7 @@ function buildServer() {
         id: z.number().int().describe('Target entity id.'),
         entityType: z.string().optional(),
         description: z.string().optional(),
+        includeEmbeddings: z.boolean().optional().describe('Return raw vector columns instead of <col>_present/<col>_dims markers. Default false.'),
       },
     },
     async (args) => toolEntityUpdate(args)
@@ -1224,6 +1233,7 @@ function buildServer() {
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         id: z.number().int().describe('Target entity id.'),
+        includeEmbeddings: z.boolean().optional().describe('Return raw vector columns instead of <col>_present/<col>_dims markers. Default false.'),
       },
     },
     async (args) => toolEntitySuppress(args)
@@ -1262,6 +1272,7 @@ function buildServer() {
           'handoff.js\'s own resolveSessionId (CLAUDE_CODE_SESSION_ID env var, then the DB\'s ' +
           'session_in_progress marker) when omitted.'
         ),
+        includeEmbeddings: z.boolean().optional().describe('Return the raw embedding vector on the created row instead of embedding_present/embedding_dims markers. Default false.'),
       },
     },
     async (args) => toolAssertionCreate(args)
@@ -1271,12 +1282,22 @@ function buildServer() {
     'assertion_read',
     {
       title: 'Read live assertions by id, subject, and/or predicate',
-      description: 'Returns live (suppressed=false, invalid_at IS NULL) assertion rows matching the given filters, project-scoped.',
+      description: 'Returns live (suppressed=false, invalid_at IS NULL) assertion rows matching the given ' +
+        'filters, project-scoped. Paginated: limit defaults to 200, offset to 0. By default the embedding ' +
+        'vector column is stripped from each row and replaced with embedding_present (bool) and ' +
+        'embedding_dims (int, when present) — pass includeEmbeddings:true to get the raw vector back. ' +
+        '(Observed 2026-09-07: an unfiltered predicate=open_thread read returned ~2.5MB of raw 4000-dim ' +
+        'vectors, making the tool unusable for its actual purpose of finding rows to update/suppress.)',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         id: z.number().int().optional(),
         subject: z.string().optional(),
         predicate: z.string().optional(),
+        objectPrefix: z.string().optional().describe('Only rows whose object starts with this text (SQL LIKE prefix match).'),
+        contains: z.string().optional().describe('Only rows whose object contains this text (case-insensitive).'),
+        includeEmbeddings: z.boolean().optional().describe('Return the raw embedding vector instead of embedding_present/embedding_dims markers. Default false.'),
+        limit: z.number().int().min(1).max(1000).optional().describe('Max rows returned. Default 200, capped at 1000.'),
+        offset: z.number().int().min(0).optional().describe('Rows to skip (ORDER BY id). Default 0.'),
       },
     },
     async (args) => toolAssertionRead(args)
@@ -1311,6 +1332,7 @@ function buildServer() {
           'cm#231: explicit session id for the new row. Defaults to handoff.js\'s own resolveSessionId ' +
           '(CLAUDE_CODE_SESSION_ID env var, then the DB\'s session_in_progress marker) when omitted.'
         ),
+        includeEmbeddings: z.boolean().optional().describe('Return the raw embedding vector on the new row instead of embedding_present/embedding_dims markers. Default false.'),
       },
     },
     async (args) => toolAssertionUpdate(args)
@@ -1326,6 +1348,7 @@ function buildServer() {
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         id: z.number().int().describe('Target assertion id.'),
+        includeEmbeddings: z.boolean().optional().describe('Return the raw embedding vector on the suppressed row instead of embedding_present/embedding_dims markers. Default false.'),
       },
     },
     async (args) => toolAssertionSuppress(args)
@@ -1335,7 +1358,8 @@ function buildServer() {
     'edge_create',
     {
       title: 'Create an edge between two entities',
-      description: 'Plain INSERT (edges have no dedup/near-match surfacing — that is an entity-only concept, §5.1).',
+      description: 'Plain INSERT (edges have no dedup/near-match surfacing — that is an entity-only concept, §5.1). ' +
+        'edges carry no vector column today (includeEmbeddings is a no-op, accepted for symmetry).',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         fromEntity: z.string(),
@@ -1344,6 +1368,7 @@ function buildServer() {
         weight: z.number().optional(),
         sourceModel: z.string().optional(),
         agentId: z.string().optional(),
+        includeEmbeddings: z.boolean().optional().describe('Return raw vector columns instead of <col>_present/<col>_dims markers. Default false.'),
       },
     },
     async (args) => toolEdgeCreate(args)
@@ -1353,11 +1378,15 @@ function buildServer() {
     'edge_read',
     {
       title: 'Read live edges by id, from_entity, and/or to_entity',
+      description: 'Paginated: limit defaults to 200, offset to 0.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         id: z.number().int().optional(),
         fromEntity: z.string().optional(),
         toEntity: z.string().optional(),
+        includeEmbeddings: z.boolean().optional().describe('Return raw vector columns instead of <col>_present/<col>_dims markers. Default false.'),
+        limit: z.number().int().min(1).max(1000).optional().describe('Max rows returned. Default 200, capped at 1000.'),
+        offset: z.number().int().min(0).optional().describe('Rows to skip (ORDER BY id). Default 0.'),
       },
     },
     async (args) => toolEdgeRead(args)
@@ -1373,6 +1402,7 @@ function buildServer() {
         id: z.number().int().describe('Target edge id.'),
         edgeType: z.string().optional(),
         weight: z.number().optional(),
+        includeEmbeddings: z.boolean().optional().describe('Return raw vector columns instead of <col>_present/<col>_dims markers. Default false.'),
       },
     },
     async (args) => toolEdgeUpdate(args)
@@ -1385,6 +1415,7 @@ function buildServer() {
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         id: z.number().int().describe('Target edge id.'),
+        includeEmbeddings: z.boolean().optional().describe('Return raw vector columns instead of <col>_present/<col>_dims markers. Default false.'),
       },
     },
     async (args) => toolEdgeSuppress(args)
