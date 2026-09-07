@@ -30,10 +30,12 @@ function _envNonEmpty(env, key) {
 /**
  * Resolve the SAME precedence resolveBaseDir() (scripts/lib/handoff-paths.js)
  * uses, but rendered as a literal symbolic token — never the expanded value.
+ * resolveBaseDir() only recognizes HANDOFF_BASE_DIR (falling back to
+ * ~/.claude) — there is no CLAUDE_CONFIG_DIR branch in that function, so
+ * this must not invent one.
  */
 function resolveBaseSymbol(env) {
   if (_envNonEmpty(env, 'HANDOFF_BASE_DIR')) return '$HANDOFF_BASE_DIR';
-  if (_envNonEmpty(env, 'CLAUDE_CONFIG_DIR')) return '$CLAUDE_CONFIG_DIR';
   return '~/.claude';
 }
 
@@ -79,7 +81,6 @@ function isPortableForm(p) {
   return (
     p.startsWith('~/') ||
     p.startsWith('$HANDOFF_BASE_DIR') ||
-    p.startsWith('$CLAUDE_CONFIG_DIR') ||
     p.startsWith('$CLAUDE_PLUGIN_ROOT') ||
     p.startsWith('<engine-root>')
   );

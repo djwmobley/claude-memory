@@ -10,8 +10,8 @@
  *     the legacy {{HANDOFF_MD_PATH}}/{{PROJECT_ROOT}} placeholders are gone).
  *   - scripts/lib/claude-md-key-paths.js's renderKeyPathsBullets(env) computes
  *     the two symbolic bullet values, mirroring resolveBaseDir()'s precedence
- *     (scripts/lib/handoff-paths.js): HANDOFF_BASE_DIR, else CLAUDE_CONFIG_DIR,
- *     else ~/.claude. Helper script: CLAUDE_PLUGIN_ROOT if set, else
+ *     (scripts/lib/handoff-paths.js): HANDOFF_BASE_DIR, else ~/.claude (that
+ *     function has no CLAUDE_CONFIG_DIR branch). Helper script: CLAUDE_PLUGIN_ROOT if set, else
  *     <engine-root> (never <repo-root> — the target project is not the engine).
  *
  * Scope: this test covers ONLY the rendering path (what a fresh `handoff
@@ -77,7 +77,6 @@ function assertNoAbsoluteShape(value, label) {
 const ENV_COMBOS = [
   { label: 'none',               env: {} },
   { label: 'HANDOFF_BASE_DIR',   env: { HANDOFF_BASE_DIR: 'C:\\Users\\bob\\.claude' } },
-  { label: 'CLAUDE_CONFIG_DIR',  env: { CLAUDE_CONFIG_DIR: '/home/bob/.claude' } },
   { label: 'CLAUDE_PLUGIN_ROOT', env: { CLAUDE_PLUGIN_ROOT: 'C:\\plugins\\memory-engine' } },
 ];
 
@@ -103,14 +102,9 @@ test('HANDOFF_BASE_DIR set -> literal $HANDOFF_BASE_DIR token (never expanded)',
   assertEqual(b.handoffPath, '$HANDOFF_BASE_DIR/projects/<project-id>/handoff.md');
 });
 
-test('CLAUDE_CONFIG_DIR set (no HANDOFF_BASE_DIR) -> literal $CLAUDE_CONFIG_DIR token', () => {
+test('CLAUDE_CONFIG_DIR is not a recognized base override (matches resolveBaseDir, which has no such branch)', () => {
   const b = renderKeyPathsBullets({ CLAUDE_CONFIG_DIR: '/home/bob/.claude' });
-  assertEqual(b.handoffPath, '$CLAUDE_CONFIG_DIR/projects/<project-id>/handoff.md');
-});
-
-test('HANDOFF_BASE_DIR takes precedence over CLAUDE_CONFIG_DIR (matches resolveBaseDir)', () => {
-  const b = renderKeyPathsBullets({ HANDOFF_BASE_DIR: 'C:\\a\\.claude', CLAUDE_CONFIG_DIR: '/b/.claude' });
-  assertEqual(b.handoffPath, '$HANDOFF_BASE_DIR/projects/<project-id>/handoff.md');
+  assertEqual(b.handoffPath, '~/.claude/projects/<project-id>/handoff.md');
 });
 
 test('CLAUDE_PLUGIN_ROOT set -> literal $CLAUDE_PLUGIN_ROOT helper, never <repo-root>', () => {
