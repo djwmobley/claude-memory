@@ -31,6 +31,8 @@ const PROJECT_ROOT = path.resolve(__dirname, '..');
 const {
   classifyEmbedEndpoint,
   resolveConfiguredEmbedEndpoint,
+  resolveConfiguredEmbedEndpointDetailed,
+  _readUserScopeEmbedUrl,
   seedLocalEmbeddingProvider,
   LOCAL_PROVIDER_NAME,
   LOCAL_PROVIDER_MODEL_LABEL,
@@ -73,7 +75,7 @@ function makeTmpProjectRoot(pipelineYmlBody) {
  * NOTHING" in the real SQL also absorbs as rowCount 0 — see
  * embedding_providers_is_default_unique_idx).
  */
-function fakeDb({ blockedByExistingDefault = false, dialect = 'postgres' } = {}) {
+function fakeDb({ blockedByExistingDefault = false, dialect = 'postgres', existingDefaultName = null } = {}) {
   const inserted = new Set();
   const calls = [];
   return {
@@ -89,10 +91,25 @@ function fakeDb({ blockedByExistingDefault = false, dialect = 'postgres' } = {})
         inserted.add(name);
         return { rows: [], rowCount: 1 };
       }
+      // Adversary finding #7's diagnostic SELECT (_alreadyPresentLines).
+      if (/^\s*SELECT name FROM embedding_providers WHERE is_default/i.test(sql)) {
+        if (existingDefaultName) return { rows: [{ name: existingDefaultName }], rowCount: 1 };
+        if (inserted.has(LOCAL_PROVIDER_NAME)) return { rows: [{ name: LOCAL_PROVIDER_NAME }], rowCount: 1 };
+        return { rows: [], rowCount: 0 };
+      }
       throw new Error(`fakeDb: unexpected SQL: ${sql}`);
     },
   };
 }
+
+/**
+ * A deterministic, network-free probeTransport (init-embeddability
+ * amendment A1) matching the vllm-local identity's declared dims exactly —
+ * injected into every Section 3 test below that reaches the LOCAL or
+ * REMOTE+allowRemoteEmbed branch, so the new preflight probe never performs
+ * a real network call in this pure-unit suite (see this file's own header).
+ */
+const REACHABLE_PROBE_TRANSPORT = async () => new Array(LOCAL_PROVIDER_NATIVE_DIMS).fill(0.1);
 
 (async () => {
   // ─── Section 1: classifyEmbedEndpoint — adversary case list (spec item 6) ─
@@ -183,27 +200,120 @@ knowledge:
     assertEqual(result, 'http://localhost:9002');
   });
 
-  await test('resolveConfiguredEmbedEndpoint: (c) NONE (null) when neither is set', () => {
-    const root = makeTmpProjectRoot(`
+  // Both tests below fall through to precedence step (c) — the user-scope
+  // ${resolveBaseDir()}/handoff-embed.json file — which reads the REAL
+  // process.env.HANDOFF_BASE_DIR (default ~/.claude) unless isolated here.
+  // Isolating this is required for hermetic CI correctness: if an operator's
+  // real machine ever has a genuine ~/.claude/handoff-embed.json (the whole
+  // point of this feature), these "must resolve to NONE" tests must not
+  // accidentally read it.
+  function withIsolatedBaseDir(fn) {
+    const saved = process.env.HANDOFF_BASE_DIR;
+    const isolatedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'embed-endpoint-basedir-'));
+    process.env.HANDOFF_BASE_DIR = isolatedDir;
+    try {
+      return fn();
+    } finally {
+      if (saved === undefined) delete process.env.HANDOFF_BASE_DIR; else process.env.HANDOFF_BASE_DIR = saved;
+      fs.rmSync(isolatedDir, { recursive: true, force: true });
+    }
+  }
+
+  await test('resolveConfiguredEmbedEndpoint: (c) NONE (null) when neither is set (isolated from any real user-scope file)', () => {
+    withIsolatedBaseDir(() => {
+      const root = makeTmpProjectRoot(`
 project:
   name: test
 `.trim());
-    const result = resolveConfiguredEmbedEndpoint({ projectRoot: root, env: {} });
-    assertEqual(result, null);
+      const result = resolveConfiguredEmbedEndpoint({ projectRoot: root, env: {} });
+      assertEqual(result, null);
+    });
   });
 
-  await test('resolveConfiguredEmbedEndpoint: NEVER falls back to the hardcoded localhost:8800 runtime default', () => {
-    // No projectRoot at all, no pipeline.yml, empty env — must be null, not
-    // the shared.js/embed.js runtime convenience default.
-    const result = resolveConfiguredEmbedEndpoint({ env: {} });
-    assertEqual(result, null);
+  await test('resolveConfiguredEmbedEndpoint: NEVER falls back to the hardcoded localhost:8800 runtime default (isolated from any real user-scope file)', () => {
+    withIsolatedBaseDir(() => {
+      // No projectRoot at all, no pipeline.yml, empty env — must be null, not
+      // the shared.js/embed.js runtime convenience default.
+      const result = resolveConfiguredEmbedEndpoint({ env: {} });
+      assertEqual(result, null);
+    });
   });
 
   await test('resolveConfiguredEmbedEndpoint: absent pipeline.yml file falls through to env', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'embed-endpoint-test-'));
     // No .claude directory at all.
-    const result = resolveConfiguredEmbedEndpoint({ projectRoot: dir, env: { VLLM_EMBED_URL: 'http://localhost:8800' } });
+    const result = resolveConfiguredEmbedEndpoint({ projectRoot: dir, env: { VLLM_EMBED_URL: 'http://localhost:8800' }, probeTransport: REACHABLE_PROBE_TRANSPORT });
     assertEqual(result, 'http://localhost:8800');
+  });
+
+  // ─── Section 2b: user-scope handoff-embed.json precedence (init-embeddability) ─
+
+  console.log('\n=== Section 2b: user-scope handoff-embed.json precedence + corruption handling ===');
+
+  await test('resolveConfiguredEmbedEndpointDetailed: (c) user-scope wins when neither pipeline.yml nor env is set', () => {
+    withIsolatedBaseDir(() => {
+      fs.writeFileSync(path.join(process.env.HANDOFF_BASE_DIR, 'handoff-embed.json'), JSON.stringify({ vllm_embed_url: 'http://127.0.0.1:8800' }), 'utf8');
+      const result = resolveConfiguredEmbedEndpointDetailed({ env: {} });
+      assertEqual(result.url, 'http://127.0.0.1:8800');
+      assertEqual(result.source, 'user_scope');
+    });
+  });
+
+  await test('resolveConfiguredEmbedEndpointDetailed: pipeline.yml (a) still wins over user-scope (c)', () => {
+    withIsolatedBaseDir(() => {
+      fs.writeFileSync(path.join(process.env.HANDOFF_BASE_DIR, 'handoff-embed.json'), JSON.stringify({ vllm_embed_url: 'http://127.0.0.1:9999' }), 'utf8');
+      const root = makeTmpProjectRoot(`
+knowledge:
+  vllm_embed_url: "http://localhost:9001"
+`.trim());
+      const result = resolveConfiguredEmbedEndpointDetailed({ projectRoot: root, env: {} });
+      assertEqual(result.url, 'http://localhost:9001');
+      assertEqual(result.source, 'pipeline_yml');
+    });
+  });
+
+  await test('resolveConfiguredEmbedEndpointDetailed: env (b) still wins over user-scope (c)', () => {
+    withIsolatedBaseDir(() => {
+      fs.writeFileSync(path.join(process.env.HANDOFF_BASE_DIR, 'handoff-embed.json'), JSON.stringify({ vllm_embed_url: 'http://127.0.0.1:9999' }), 'utf8');
+      const result = resolveConfiguredEmbedEndpointDetailed({ env: { VLLM_EMBED_URL: 'http://localhost:9002' } });
+      assertEqual(result.url, 'http://localhost:9002');
+      assertEqual(result.source, 'env');
+    });
+  });
+
+  await test('resolveConfiguredEmbedEndpointDetailed: a user-scope REMOTE value is returned as-is — classification/BLOCK gating happens downstream, never a separate unguarded path (adversary finding #4)', () => {
+    withIsolatedBaseDir(() => {
+      fs.writeFileSync(path.join(process.env.HANDOFF_BASE_DIR, 'handoff-embed.json'), JSON.stringify({ vllm_embed_url: 'http://0.0.0.0:8800' }), 'utf8');
+      const result = resolveConfiguredEmbedEndpointDetailed({ env: {} });
+      assertEqual(result.url, 'http://0.0.0.0:8800');
+      assertEqual(classifyEmbedEndpoint(result.url), 'REMOTE', 'the SAME classifyEmbedEndpoint downstream callers use — no bespoke user-scope classification');
+    });
+  });
+
+  await test('_readUserScopeEmbedUrl: absent file -> url:null, corrupt:false', () => {
+    withIsolatedBaseDir(() => {
+      const result = _readUserScopeEmbedUrl();
+      assertEqual(result.url, null);
+      assertEqual(result.corrupt, false);
+    });
+  });
+
+  await test('_readUserScopeEmbedUrl: corrupt JSON (adversary finding #6) -> url:null, corrupt:true, never throws', () => {
+    withIsolatedBaseDir(() => {
+      fs.writeFileSync(path.join(process.env.HANDOFF_BASE_DIR, 'handoff-embed.json'), '{ not: valid json,,', 'utf8');
+      const result = _readUserScopeEmbedUrl();
+      assertEqual(result.url, null);
+      assertEqual(result.corrupt, true);
+    });
+  });
+
+  await test('_readUserScopeEmbedUrl: valid JSON but missing/non-string vllm_embed_url -> url:null, corrupt:false', () => {
+    withIsolatedBaseDir(() => {
+      fs.writeFileSync(path.join(process.env.HANDOFF_BASE_DIR, 'handoff-embed.json'), JSON.stringify({ other_key: 123 }), 'utf8');
+      const result = _readUserScopeEmbedUrl();
+      assertEqual(result.url, null);
+      assertEqual(result.corrupt, false);
+    });
   });
 
   // ─── Section 3: seedLocalEmbeddingProvider against a FAKE db ─────────────
@@ -238,7 +348,7 @@ project:
 
   await test('seedLocalEmbeddingProvider: LOCAL endpoint → exactly one INSERT, OK line, seeded=true', async () => {
     const db = fakeDb();
-    const result = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://localhost:8800' } });
+    const result = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://localhost:8800' }, probeTransport: REACHABLE_PROBE_TRANSPORT });
     assertEqual(result.classification, 'LOCAL');
     assertEqual(result.seeded, true);
     assertEqual(db.calls.length, 1, 'exactly one statement — never check-then-insert');
@@ -257,7 +367,7 @@ project:
 
   await test('seedLocalEmbeddingProvider: LOCAL on sqlite dialect passes integer 1 params, never a JS boolean', async () => {
     const db = fakeDb({ dialect: 'sqlite' });
-    const result = await seedLocalEmbeddingProvider({ db, dialect: 'sqlite', env: { VLLM_EMBED_URL: 'http://localhost:8800' } });
+    const result = await seedLocalEmbeddingProvider({ db, dialect: 'sqlite', env: { VLLM_EMBED_URL: 'http://localhost:8800' }, probeTransport: REACHABLE_PROBE_TRANSPORT });
     assertEqual(result.seeded, true);
     const { params } = db.calls[0];
     assertEqual(params[5], 1, 'is_default param must be integer 1 for dialect=sqlite (node:sqlite rejects JS booleans)');
@@ -266,30 +376,137 @@ project:
 
   await test('seedLocalEmbeddingProvider: a second call for an already-present row → rowCount 0, NOTE "already present", seeded=false', async () => {
     const db = fakeDb();
-    await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://localhost:8800' } });
-    const second = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://localhost:8800' } });
+    await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://localhost:8800' }, probeTransport: REACHABLE_PROBE_TRANSPORT });
+    const second = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://localhost:8800' }, probeTransport: REACHABLE_PROBE_TRANSPORT });
     assertEqual(second.seeded, false);
     assert(second.lines.some((l) => l.includes('[NOTE]') && l.includes('already present')), 'expected the "already present — left untouched" NOTE line');
   });
 
   await test('seedLocalEmbeddingProvider: an existing DIFFERENT default row → rowCount 0 via untargeted DO NOTHING (never throws)', async () => {
     const db = fakeDb({ blockedByExistingDefault: true });
-    const result = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://localhost:8800' } });
+    const result = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://localhost:8800' }, probeTransport: REACHABLE_PROBE_TRANSPORT });
     assertEqual(result.seeded, false);
     assert(result.lines.some((l) => l.includes('already present')), 'blocked-by-different-default case reports through the same "already present" NOTE bucket, per spec');
   });
 
   await test('seedLocalEmbeddingProvider: db.query throwing is caught — never propagates, init never fails because of this step', async () => {
     const db = { dialect: 'postgres', async query() { throw new Error('connection reset'); } };
-    const result = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://localhost:8800' } });
+    const result = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://localhost:8800' }, probeTransport: REACHABLE_PROBE_TRANSPORT });
     assertEqual(result.seeded, false);
     assert(result.lines.some((l) => l.includes('non-fatal') && l.includes('connection reset')), 'unexpected db errors must be caught and reported non-fatally');
   });
 
   await test('seedLocalEmbeddingProvider: never check-then-insert (exactly one db.query call total)', async () => {
     const db = fakeDb();
-    await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://localhost:8800' } });
+    await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://localhost:8800' }, probeTransport: REACHABLE_PROBE_TRANSPORT });
     assertEqual(db.calls.length, 1, 'exactly one db.query call total — no preceding SELECT/check');
+  });
+
+  await test('seedLocalEmbeddingProvider: INVALID endpoint message names the offending value and the expected shape', async () => {
+    const db = fakeDb();
+    const result = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'localhost:8800' } });
+    assertEqual(result.classification, 'INVALID');
+    assert(result.lines.some((l) => l.includes('localhost:8800')), `expected the offending value in the message, got: ${result.lines.join(' | ')}`);
+    assert(result.lines.some((l) => l.includes('http(s)://host')), `expected the expected-shape hint, got: ${result.lines.join(' | ')}`);
+  });
+
+  await test('seedLocalEmbeddingProvider: adversary finding #7 — a DIFFERENT default provider is distinguished from "same name already present"', async () => {
+    const db = fakeDb({ blockedByExistingDefault: true, existingDefaultName: 'some-other-provider' });
+    const result = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://localhost:8800' }, probeTransport: REACHABLE_PROBE_TRANSPORT });
+    assertEqual(result.seeded, false);
+    assert(result.lines.some((l) => l.includes('some-other-provider') && l.includes('NOT seeded')), `expected the distinguishing NOTE line, got: ${result.lines.join(' | ')}`);
+  });
+
+  await test('seedLocalEmbeddingProvider: adversary finding #7 — a SAME-name already-present row still reports the original "already present" message', async () => {
+    const db = fakeDb();
+    await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://localhost:8800' }, probeTransport: REACHABLE_PROBE_TRANSPORT });
+    const second = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://localhost:8800' }, probeTransport: REACHABLE_PROBE_TRANSPORT });
+    assert(second.lines.some((l) => l.includes('already present') && l.includes(LOCAL_PROVIDER_NAME) && !l.includes('a different provider')), `expected the plain "already present" line, got: ${second.lines.join(' | ')}`);
+  });
+
+  await test('seedLocalEmbeddingProvider: adversary finding #7 diagnostic SELECT failing (minimal fake db) falls back to the generic message, never throws', async () => {
+    // Same fakeDb as the pre-existing "an existing DIFFERENT default row" test
+    // above (no SELECT support) — the diagnostic SELECT throws internally and
+    // is caught, falling back to the pre-cm#-init-embeddability generic message.
+    const db = { dialect: 'postgres', calls: [], async query(sql) { this.calls.push(sql); if (/^\s*INSERT/i.test(sql)) return { rows: [], rowCount: 0 }; throw new Error('no SELECT support'); } };
+    const result = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://localhost:8800' }, probeTransport: REACHABLE_PROBE_TRANSPORT });
+    assertEqual(result.seeded, false);
+    assert(result.lines.some((l) => l.includes('already present')), 'must fall back to the generic message, never throw');
+  });
+
+  await test('seedLocalEmbeddingProvider: REMOTE + allowRemoteEmbed seeds with data_egress_approved=false and prints the hand-edit remedy (A5)', async () => {
+    const db = fakeDb();
+    const result = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', allowRemoteEmbed: true, probeTransport: REACHABLE_PROBE_TRANSPORT, env: { VLLM_EMBED_URL: 'http://0.0.0.0:8800' } });
+    assertEqual(result.classification, 'REMOTE');
+    assertEqual(result.seeded, true);
+    assertEqual(result.remoteApproved, false);
+    const { params } = db.calls[0];
+    assertEqual(params[6], false, 'data_egress_approved must be false for the --allow-remote-embed path');
+    assert(result.lines.some((l) => l.includes('UPDATE embedding_providers') && l.includes('data_egress_approved = true')), 'expected the exact hand-edit SQL remedy');
+  });
+
+  await test('seedLocalEmbeddingProvider: REMOTE WITHOUT allowRemoteEmbed still never writes (regression guard for A5 not weakening the existing BLOCK)', async () => {
+    const db = fakeDb();
+    const result = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://0.0.0.0:8800' } });
+    assertEqual(result.seeded, false);
+    assertEqual(db.calls.length, 0);
+  });
+
+  // ─── Amendment A1: preflight probe BEFORE seeding (restored on review) ────
+
+  console.log('\n=== Section 4: A1 preflight probe — REACHABLE/DIM_MISMATCH/UNREACHABLE total classification ===');
+
+  await test('seedLocalEmbeddingProvider: A1 UNREACHABLE probe -> BLOCK, zero db.query calls, no INSERT ever attempted', async () => {
+    const db = fakeDb();
+    const unreachableTransport = async () => { throw new Error('ECONNREFUSED (fake)'); };
+    const result = await seedLocalEmbeddingProvider({
+      db, dialect: 'postgres', probeTransport: unreachableTransport,
+      env: { VLLM_EMBED_URL: 'http://localhost:8800' },
+    });
+    assertEqual(result.seeded, false);
+    assertEqual(result.probeFailed, true);
+    assertEqual(result.probeState, 'UNREACHABLE');
+    assertEqual(db.calls.length, 0, 'the probe must fail BEFORE any db.query — no INSERT ever attempted');
+    assert(result.lines.some((l) => l.includes('unreachable') && l.includes('http://localhost:8800')), `expected a remedy line naming the endpoint, got: ${result.lines.join(' | ')}`);
+    assert(result.lines.some((l) => l.includes('start-vllm') || l.includes('vLLM')), `expected a start-the-server remedy hint, got: ${result.lines.join(' | ')}`);
+  });
+
+  await test('seedLocalEmbeddingProvider: A1 DIM_MISMATCH probe (wrong-length vector) -> BLOCK, zero db.query calls', async () => {
+    const db = fakeDb();
+    const wrongDimsTransport = async () => new Array(LOCAL_PROVIDER_NATIVE_DIMS - 100).fill(0.1); // wrong native dims
+    const result = await seedLocalEmbeddingProvider({
+      db, dialect: 'postgres', probeTransport: wrongDimsTransport,
+      env: { VLLM_EMBED_URL: 'http://localhost:8800' },
+    });
+    assertEqual(result.seeded, false);
+    assertEqual(result.probeFailed, true);
+    assertEqual(result.probeState, 'DIM_MISMATCH');
+    assertEqual(db.calls.length, 0, 'the probe must fail BEFORE any db.query — no INSERT ever attempted');
+    assert(result.lines.some((l) => l.includes('dimensions')), `expected a dims-mismatch remedy line, got: ${result.lines.join(' | ')}`);
+    assert(result.lines.some((l) => l.includes(String(LOCAL_PROVIDER_NATIVE_DIMS))), `expected the expected native_dims value stated, got: ${result.lines.join(' | ')}`);
+  });
+
+  await test('seedLocalEmbeddingProvider: A1 REACHABLE probe with matching dims -> proceeds to seed (companion to the earlier LOCAL/INSERT tests, explicit for A1)', async () => {
+    const db = fakeDb();
+    const result = await seedLocalEmbeddingProvider({
+      db, dialect: 'postgres', probeTransport: REACHABLE_PROBE_TRANSPORT,
+      env: { VLLM_EMBED_URL: 'http://localhost:8800' },
+    });
+    assertEqual(result.seeded, true);
+    assertEqual(result.probeFailed, undefined);
+    assertEqual(db.calls.length, 1, 'exactly one INSERT after a successful probe');
+  });
+
+  await test('seedLocalEmbeddingProvider: A1 probe is NEVER invoked when the endpoint is NONE (no probeTransport needed to reach the NONE branch)', async () => {
+    const db = fakeDb();
+    // No probeTransport supplied at all — if the implementation tried to
+    // probe here, VllmEmbeddingProvider's real transport would be used and
+    // this test would hang/fail on network; passing with zero db.query calls
+    // AND zero errors proves the probe path was never reached for NONE.
+    const result = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: {} });
+    assertEqual(result.classification, 'NONE');
+    assertEqual(result.seeded, false);
+    assertEqual(db.calls.length, 0);
   });
 
   console.log(`\n─── Results ──────────────────────────────────────`);

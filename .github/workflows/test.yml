@@ -1137,20 +1137,77 @@ jobs:
         # Pure file-system unit test — no Postgres or Ollama required.
         run: node scripts/test-config-loading.js
       - name: Run embed-endpoint classification + local-provider seeding unit tests
-        # init-seed-local-provider AUTHOR task (2026-09-06). Tests
-        # scripts/lib/embedding-provider.js's classifyEmbedEndpoint,
-        # resolveConfiguredEmbedEndpoint, and seedLocalEmbeddingProvider:
+        # init-seed-local-provider AUTHOR task (2026-09-06), extended by the
+        # init-embeddability AUTHOR task. Tests scripts/lib/embedding-provider.js's
+        # classifyEmbedEndpoint, resolveConfiguredEmbedEndpoint(Detailed),
+        # _readUserScopeEmbedUrl, and seedLocalEmbeddingProvider:
         #   Section 1  classifyEmbedEndpoint total classification (LOCAL/REMOTE/INVALID)
         #              adversary case list — uppercase host, trailing dot, IPv6,
         #              userinfo, *.localhost, scheme-less, non-http(s), etc.
         #   Section 2  resolveConfiguredEmbedEndpoint precedence — pipeline.yml
         #              wins over env, env wins over NONE, never the hardcoded
         #              localhost:8800 runtime fallback.
+        #   Section 2b user-scope ~/.claude/handoff-embed.json precedence step (c) —
+        #              pipeline.yml/env still win over it; a REMOTE user-scope value
+        #              is returned as-is (classification/BLOCK gating happens
+        #              downstream, never a separate unguarded path — adversary
+        #              finding #4); corrupt JSON is treated as absent, never throws
+        #              (adversary finding #6); every case isolated via a scratch
+        #              HANDOFF_BASE_DIR (never the real ~/.claude).
         #   Section 3  seedLocalEmbeddingProvider against a fake db — exactly
         #              one INSERT on LOCAL, never check-then-insert, dialect-
-        #              correct boolean/integer params, never throws.
+        #              correct boolean/integer params, never throws; INVALID
+        #              message names the offending value + expected shape;
+        #              adversary finding #7's "different default provider"
+        #              vs. "same name already present" distinguishing NOTE
+        #              (plus its diagnostic-SELECT-failure fallback); REMOTE +
+        #              --allow-remote-embed seeds with data_egress_approved=false
+        #              and the exact hand-edit approval SQL (A5), while REMOTE
+        #              without the flag still never writes (regression guard).
         # Pure unit test with a fake db — no Postgres/SQLite/network required.
         run: node test/test-embed-endpoint-classify.js
+      - name: Run init-embeddability tests (pgvector + provider total classification, backfill-embeddings)
+        # init-embeddability AUTHOR task: end-to-end + lib-level coverage for
+        # scripts/handoff.js's cmdInit changes, scripts/lib/backfill-embeddings.js,
+        # and the embedding_readiness status/resume reporting.
+        #   T1  extension absent, role lacks CREATE privilege -> BLOCK exit 1,
+        #       no marker written, exact `CREATE EXTENSION vector;` remedy string
+        #       (creates + drops its own throwaway low-privilege ROLE).
+        #   T2  extension present, no endpoint configured anywhere -> BLOCK exit 1,
+        #       message distinguishable from T1's.
+        #   T3  extension present, user-scope handoff-embed.json LOCAL url, no
+        #       project/env config -> provider seeded, source=user_scope logged.
+        #   T4  backfill-embeddings dry-run -> correct counts (including the
+        #       no-embeddable-text bucket, adversary finding #9), zero writes.
+        #   T5  backfill-embeddings --apply -> only embedding IS NULL rows change;
+        #       a pre-existing embedding is byte-identical before/after.
+        #   T6  handoff:status embedding_readiness — UNEMBEDDABLE:no-extension /
+        #       UNEMBEDDABLE:no-provider / READY, in sequence on one DB.
+        #   T7  SQLite seam — init/status/backfill-embeddings all take the N/A
+        #       branch, never BLOCK, never report UNEMBEDDABLE.
+        #   T8  concurrency — a row embedded by a concurrent writer mid-run is
+        #       never clobbered (UPDATE's embedding IS NULL re-check); a row
+        #       inserted after a run completes is picked up by the next run.
+        #   AF2 embedForWrite against a real black-holed TCP endpoint (accepts,
+        #       never responds) degrades to fail-soft NULL within the bounded
+        #       timeout instead of hanging (adversary finding #2).
+        #   AF3 backfill-embeddings --apply refuses when existing embedded rows
+        #       carry a different provider id than the resolved default, unless
+        #       --force-mixed-provider (adversary finding #3).
+        #   AF4 a user-scope REMOTE endpoint still BLOCKs via `init` end-to-end
+        #       (adversary finding #4, e2e companion to the unit test above).
+        #   AF5 a prior --no-embeddings opt-out is auto-honored on a routine
+        #       re-init — no false re-BLOCK (adversary finding #5).
+        #   AF6 a corrupt ~/.claude/handoff-embed.json never crashes init
+        #       (adversary finding #6, e2e companion to the unit test above).
+        # Creates/drops its own handoff_embed_*-prefixed scratch databases (and,
+        # for T1, one throwaway Postgres ROLE); never touches
+        # claude_memory_eval_test/pipeline_pwa_etl or any other shared database.
+        run: node test/test-init-embeddability.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run OS-portability invariant assertions
         # Static invariant sweep over the source tree — mirrors S8/S9/S10 style:
         #   P1  pg connection is OS-uniform (no platform branch in connectHandoff)

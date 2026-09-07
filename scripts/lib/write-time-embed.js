@@ -23,6 +23,7 @@
  */
 
 const { resolveDefaultEmbedder } = require('./exchange-log.js');
+const { resolveDefaultTimeoutMs } = require('./embedding-provider.js');
 
 /**
  * embedForWrite — fail-soft wrapper around resolveDefaultEmbedder's embedder.
@@ -46,6 +47,17 @@ const { resolveDefaultEmbedder } = require('./exchange-log.js');
  *   pairing rule) — the injector names the provider id its stub vector is
  *   attributed to; this seam NEVER auto-stamps the live default provider's
  *   id alongside an injected embedder.
+ * @param {number} [opts.timeoutMs] -- cm#-init-embeddability adversary
+ *   finding #2 (BLOCKER): bounded transport timeout for the PRODUCTION
+ *   (no opts.embedder) path only. Defaults to
+ *   embedding-provider.js's resolveDefaultTimeoutMs() (DEFAULT_PROBE_TIMEOUT_MS,
+ *   env-overridable via EMBED_PROBE_TIMEOUT_MS) when omitted — a
+ *   black-holed endpoint (TCP handshake completes, HTTP response never
+ *   arrives) previously hung this call FOREVER (no timeout was ever
+ *   threaded to the underlying transport); it now degrades to the same
+ *   fail-soft NULL+WARN path as a thrown error, within a bounded time.
+ *   Ignored when opts.embedder is supplied (a test double has no real
+ *   transport to bound).
  * @returns {Promise<{ vectorLiteral: string|null, providerId: number|null, warning: string|null }>}
  *   vectorLiteral is a halfvec literal string (e.g. "[0.1,0.2,...]") ready
  *   to bind as a parameterized value, or null on any failure (empty text,
@@ -72,7 +84,8 @@ async function embedForWrite(client, text, opts) {
       embedFn = opts.embedder;
       providerId = opts.embedderProviderId;
     } else {
-      const resolved = await resolveDefaultEmbedder(client);
+      const timeoutMs = resolveDefaultTimeoutMs(opts && opts.timeoutMs);
+      const resolved = await resolveDefaultEmbedder(client, { timeoutMs });
       embedFn = resolved.embed;
       providerId = resolved.providerId;
     }

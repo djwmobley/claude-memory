@@ -23,6 +23,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **init: pgvector + default embedding provider total classification, assertions write-time embed, backfill-embeddings (categorical un-embeddable-project fix)** —
+  a fresh `handoff:init` previously left a project silently un-embeddable:
+  `CREATE EXTENSION vector;` was never issued, and no default
+  `embedding_providers` row was seeded unless an operator had already
+  configured an endpoint, with only a `[NOTE]` line marking either gap.
+  `init` now total-classifies extension state (present / absent-with-privilege
+  / absent-without-privilege / DB-not-yet-created) and endpoint state
+  (`.claude/pipeline.yml` → `VLLM_EMBED_URL` → a new user-scope
+  `~/.claude/handoff-embed.json` → none) BEFORE the existing confirm-before-DDL
+  gate, extending that SAME gate's prompt to also cover `CREATE EXTENSION
+  vector;` rather than adding a second prompt, and BLOCKS (exit 1, no
+  marker/handoff.md written) on the two unrecoverable-without-operator-action
+  branches. New flags: `--no-embeddings` (explicit opt-out, stamped and
+  auto-honored on later routine re-inits), `--clear-opt-out`, and
+  `--allow-remote-embed` (accepts a REMOTE endpoint with
+  `data_egress_approved=false` plus the exact hand-edit approval SQL).
+  `assertions.embedding` now has a live write-time path (previously
+  offline-only): `writeAssertionWithSupersession` embeds via the same
+  `embedForWrite` machinery `decisions` already used, fail-soft to NULL with
+  a counted `embed_warnings` figure on the close/checkpoint summary line.
+  `write-time-embed.js`'s production embed calls now carry a bounded
+  timeout (reusing the existing preflight-probe default) so a black-holed
+  endpoint degrades to fail-soft NULL instead of hanging a close forever.
+  New `node scripts/handoff.js backfill-embeddings` subcommand (dry-run by
+  default; `--apply`, `--table=assertions|decisions|all`, `--batch-size`,
+  `--project-id`, `--force-mixed-provider`) generalizes and replaces the old
+  `scripts/dev/backfill-assertion-embeddings.js` (now a thin forwarding
+  pointer), batched via keyset pagination with a `WHERE embedding IS NULL`
+  re-check on every UPDATE (closing a clobber gap the old script had), and
+  refusing to mix two providers' vectors in the same column without
+  `--force-mixed-provider`. `handoff:status`/the resume banner now report a
+  total-classified `embedding_readiness`
+  (`READY`/`UNEMBEDDABLE:no-extension`/`UNEMBEDDABLE:no-provider`/
+  `DEGRADED:opt-out`/`N/A (sqlite backend)`) plus per-table NULL-embedding
+  counts whenever nonzero. SQLite (seam-test-only) takes an explicit N/A
+  branch throughout — it has no `embedding` column on any table — never a
+  BLOCK.
+
 - **migrate-08: engine index bring-forward + total-classified integrity-index gate (unblocks pwa-etl item B)** —
   a live WRITE against `memory_manager_staging` failed with `index row size
   3552 exceeds btree version 4 maximum 2704 for index

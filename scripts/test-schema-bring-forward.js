@@ -368,7 +368,7 @@ async function testT5() {
 
     const result = spawnSync(
       process.execPath,
-      [path.join(PROJECT_ROOT, 'scripts', 'handoff.js'), 'init', '-y'],
+      [path.join(PROJECT_ROOT, 'scripts', 'handoff.js'), 'init', '-y', '--no-embeddings'],
       {
         cwd: projDir,
         encoding: 'utf8',

@@ -112,12 +112,22 @@ it, so `persist_decisions`/`memory_upsert` calls hitting this get an
 actionable message (naming pgvector and `schema_apply_degraded`) instead of
 a bare driver error; `withProjectDb` also attaches the full degraded record
 from its own `ensureSchemaCurrent()` call onto that same error before it
-reaches the MCP caller. `assertions.embedding` has no live write-time path
-today (populated only by the offline `migrate-07-reembed-corpus.js`
-backfill, which is already immune — it discovers embeddable tables via a
-live `pg_catalog` scan, so it never attempts to write a column it did not
-already find) — but `classifyEmbeddingWriteError()` is table-agnostic, so
-any future live write path gets the same behavior for free. **Not
+reaches the MCP caller. `assertions.embedding` now ALSO has a live
+write-time path (init-embeddability spec, A2): `writeAssertionWithSupersession`
+embeds each assertion's canonical subject via the SAME `embedForWrite`
+machinery `decisions` writes use, fail-soft to NULL with a warning folded
+into the close/checkpoint DIVERGENCE-line channel — never referencing the
+`embedding`/`embedded_by_provider_id` columns at all when no vector was
+produced (the common, no-provider-configured case stays byte-identical to
+the pre-A2 INSERT), and reclassifying a genuine `42703` via
+`classifyEmbeddingWriteError()` the same way `decisions` does when a vector
+WAS produced but the column is unexpectedly absent. `classifyEmbeddingWriteError()`
+is table-agnostic, so any future live write path gets the same behavior for
+free. The offline `migrate-07-reembed-corpus.js` backfill and the newer
+`node scripts/handoff.js backfill-embeddings` subcommand (dry-run by
+default; catalog-driven, provenance-stamped, mixed-provider-refusing) both
+remain available to close the gap for rows written before a provider was
+configured, or while one was down. **Not
 detected**: a target where the `vector` extension itself is present but an
 old version lacks the `halfvec` type (or `hnsw`/`halfvec_cosine_ops`) — the
 DO block's `EXCEPTION WHEN OTHERS` still degrades gracefully there, but

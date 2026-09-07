@@ -144,7 +144,7 @@ async function main() {
     const marker = writeMarker(fakeRoot);
     projectId = marker.uuid;
 
-    const initR = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'init', '-y'], {
+    const initR = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'init', '-y', '--no-embeddings'], {
       cwd: fakeRoot,
       env: { ...process.env, PROJECT_ROOT: fakeRoot },
       encoding: 'utf8',

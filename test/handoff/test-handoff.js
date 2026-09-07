@@ -97,8 +97,24 @@ function parseStatusJson(stdout) {
   return JSON.parse(stdout.slice(start, end + 1));
 }
 
+/**
+ * init-embeddability spec: `init` now BLOCKs by default when no embed
+ * endpoint is configured. None of this suite's fixtures configure a live
+ * endpoint (CI has none available) and none of these tests are ABOUT
+ * embeddability (that's test-init-embeddability.js's job), so bare `init`
+ * calls auto-opt-out via --no-embeddings unless the caller already passed
+ * --seed-provider/--no-embeddings/--allow-remote-embed explicitly.
+ */
+function _initNoEmbeddingsDefault(sub, extraArgs) {
+  const args = extraArgs || [];
+  if (sub !== 'init') return args;
+  if (args.some((a) => a === '--seed-provider' || a === '--no-embeddings' || a === '--allow-remote-embed')) return args;
+  return [...args, '--no-embeddings'];
+}
+
 /** Run the handoff.js helper as a subprocess with a fake project root. */
 function runHelper(sub, extraArgs = [], opts = {}) {
+  extraArgs = _initNoEmbeddingsDefault(sub, extraArgs);
   // We fake the project root by pointing PROJECT_ROOT to a temp dir that has
   // a .git folder and a .claude/pipeline.yml so loadConfig() and findProjectRoot() work.
   const fakeRoot = opts.fakeRoot || global.__fakeRoot;
@@ -336,31 +352,87 @@ async function runTests() {
     for (const k of (opts.deleteEnv || [])) delete env[k];
     return execFileSync(
       process.execPath,
-      [HELPER, 'init', '--seed-provider'],
+      [HELPER, 'init', '--seed-provider', ...(opts.extraArgs || [])],
       { cwd: seedFakeRoot, env, encoding: 'utf8', timeout: 15000 }
     );
   }
 
-  await test('init --seed-provider: NONE (unconfigured) endpoint writes nothing (row count unchanged)', async () => {
+  // init-embeddability spec item 2: --seed-provider standalone mode now
+  // BLOCKs (exit 1) on an unseeded result (NONE/INVALID/REMOTE-without-
+  // --allow-remote-embed) — no marker/FS was ever written by this
+  // standalone path, so there is nothing to unwind. Pre-dates this PR's
+  // spec, these two cases used to report a successful Done line; that is a
+  // DELIBERATE behavior change (never a silent skip — see the spec's
+  // total-classification tables), not a regression.
+  await test('init --seed-provider: NONE (unconfigured) endpoint BLOCKs (exit 1), row count unchanged', async () => {
     const before = await countVllmLocalRows();
-    const out = runSeedProvider({ deleteEnv: ['VLLM_EMBED_URL'] });
+    let threw = null;
+    try {
+      runSeedProvider({ deleteEnv: ['VLLM_EMBED_URL'] });
+    } catch (err) {
+      threw = err;
+    }
+    assert.ok(threw, 'expected --seed-provider to exit non-zero for an unconfigured endpoint');
+    assert.strictEqual(threw.status, 1, `Expected exit code 1, got ${threw.status}`);
+    const out = (threw.stdout || '').toString();
     assert.ok(out.includes('[NOTE]') && out.includes('not configured/invalid'), `expected the NONE/INVALID NOTE line, got:\n${out}`);
-    assert.ok(out.includes('Done: handoff:init --seed-provider'), `expected a successful Done line, got:\n${out}`);
+    assert.ok(out.includes('FAILED'), `expected a FAILED Done line, got:\n${out}`);
     assert.strictEqual(await countVllmLocalRows(), before, 'NONE must never change the row count');
   });
 
-  await test('init --seed-provider: REMOTE endpoint writes nothing (row count unchanged) and names the host in the NOTE line', async () => {
+  await test('init --seed-provider: REMOTE endpoint (no --allow-remote-embed) BLOCKs (exit 1), row count unchanged, names the host', async () => {
     const before = await countVllmLocalRows();
-    const out = runSeedProvider({ extraEnv: { VLLM_EMBED_URL: 'http://0.0.0.0:8800' } });
+    let threw = null;
+    try {
+      runSeedProvider({ extraEnv: { VLLM_EMBED_URL: 'http://0.0.0.0:8800' } });
+    } catch (err) {
+      threw = err;
+    }
+    assert.ok(threw, 'expected --seed-provider to exit non-zero for a REMOTE endpoint without --allow-remote-embed');
+    assert.strictEqual(threw.status, 1, `Expected exit code 1, got ${threw.status}`);
+    const out = (threw.stdout || '').toString();
     assert.ok(out.includes('[NOTE]') && out.includes('0.0.0.0') && out.includes('data_egress_approved'), `expected the REMOTE attestation-required NOTE line, got:\n${out}`);
-    assert.ok(out.includes('Done: handoff:init --seed-provider'), `expected a successful Done line, got:\n${out}`);
     assert.strictEqual(await countVllmLocalRows(), before, 'REMOTE must never change the row count');
+  });
+
+  // init-embeddability amendment A1 (restored on review): seedLocalEmbeddingProvider
+  // now runs a live preflight probe against the configured endpoint BEFORE
+  // seeding. The fake embed stub for the three tests below (REMOTE+
+  // --allow-remote-embed and both LOCAL cases) MUST run as a genuinely
+  // SEPARATE OS process (startFakeEmbedServerProcess) — runSeedProvider
+  // uses execFileSync, which blocks THIS process's entire event loop until
+  // the child exits, so an in-process http.Server here could never answer
+  // the child's probe request (verified empirically to deadlock until the
+  // probe's own timeout: a same-process fake server made these three tests
+  // FALSE POSITIVES — the earlier weak `.includes('Done: ...')` assertion
+  // matched the FAILED line's own shared prefix too). Bound to the FIXED
+  // port 8800 (not a random port) since these tests hardcode that port in
+  // VLLM_EMBED_URL for both the 0.0.0.0 and localhost hostnames.
+  const { LOCAL_PROVIDER_NATIVE_DIMS: _A1_NATIVE_DIMS } = require('../../scripts/lib/embedding-provider');
+  const { startFakeEmbedServerProcess } = require('../../scripts/lib/test-pg-helpers.js');
+  let _a1FakeEmbedServer = null;
+
+  await test('init --seed-provider: REMOTE endpoint WITH --allow-remote-embed seeds (data_egress_approved=false)', async () => {
+    // Runs against whatever vllm-local state the prior tests left behind —
+    // if a row already exists (from the LOCAL test below, which runs later
+    // in file order but may have left state from a prior partial run), the
+    // untargeted ON CONFLICT DO NOTHING absorbs it as "already present"
+    // (still exit 0, still deterministic). We only assert on exit code and
+    // row-count-never-decreases here, matching this suite's existing
+    // "never delete/mutate a pre-existing row" convention.
+    _a1FakeEmbedServer = await startFakeEmbedServerProcess(_A1_NATIVE_DIMS, 0.1, 8800);
+    const before = await countVllmLocalRows();
+    const out = runSeedProvider({ extraEnv: { VLLM_EMBED_URL: 'http://0.0.0.0:8800' }, extraArgs: ['--allow-remote-embed'] });
+    assert.ok(out.includes('Done: handoff:init --seed-provider'), `expected a successful Done line, got:\n${out}`);
+    assert.ok(!out.includes('[FAIL]'), `must succeed (no [FAIL] line) — the probe must have found the fake stub reachable, got:\n${out}`);
+    assert.ok(await countVllmLocalRows() >= Math.max(before, 1), 'a row must exist afterward (either freshly seeded or already present)');
   });
 
   await test('init --seed-provider: LOCAL endpoint — seeds if absent, no-ops if already present, never duplicates', async () => {
     const before = await countVllmLocalRows();
     const out = runSeedProvider({ extraEnv: { VLLM_EMBED_URL: 'http://localhost:8800' } });
     assert.ok(out.includes('Done: handoff:init --seed-provider'), `expected a successful Done line, got:\n${out}`);
+    assert.ok(!out.includes('[FAIL]'), `must succeed (no [FAIL] line) — the probe must have found the fake stub reachable, got:\n${out}`);
     if (before === 0) {
       assert.ok(out.includes('[OK]') && out.includes('vllm-local'), `expected the OK seeded line for a fresh insert, got:\n${out}`);
     } else {
@@ -374,8 +446,10 @@ async function runTests() {
     // at least one vllm-local row present — so this call is unconditionally
     // the "already present" branch.
     const out = runSeedProvider({ extraEnv: { VLLM_EMBED_URL: 'http://localhost:8800' } });
+    assert.ok(!out.includes('[FAIL]'), `must succeed (no [FAIL] line) — the probe must have found the fake stub reachable, got:\n${out}`);
     assert.ok(out.includes('[NOTE]') && out.includes('already present'), `expected the "already present" NOTE line, got:\n${out}`);
     assert.strictEqual(await countVllmLocalRows(), 1, 'still exactly one row after a guaranteed-second call');
+    if (_a1FakeEmbedServer) { _a1FakeEmbedServer.stop(); _a1FakeEmbedServer = null; }
   });
 
   // ── Test 2: status is read-only and outputs expected fields ──────────────
@@ -647,7 +721,7 @@ async function runTests() {
     assert.strictEqual(rows[0].reason, 'initial reason');
   });
 
-  await test('close: decisions[] embedding-provider-down is non-fatal and surfaces a DIVERGENCE line (no default embedding_providers row)', async () => {
+  await test('close: decisions[] embedding-provider-down is non-fatal and counted in embed_warnings, never rendered as a DIVERGENCE line in the markdown body (no default embedding_providers row)', async () => {
     // SHARED-DB INVARIANT vs SEEDED DEFAULT (cm#250): this assertion needs
     // zero embedding_providers rows with is_default=true at the moment
     // runHelper's subprocess calls resolveDefaultProvider(). CI's fresh DB
@@ -681,10 +755,28 @@ async function runTests() {
         }),
       });
       assert.ok(out.includes('Done: handoff:close'), 'a degraded embedding must never fail the close (non-fatal contract)');
+      // markdown-thin-pointer fix: embed-degraded is an OPERATIONAL warning
+      // (the row persisted fine; only its embedding is NULL), never a
+      // content divergence — it must be counted on the stdout Done line's
+      // embed_warnings figure, and must NEVER be rendered as a per-row
+      // DIVERGENCE line into handoff.md's body (a close with several such
+      // decisions rows on a no-provider project previously blew the
+      // 512-byte thin-pointer budget this way — a real pipeline_judge
+      // close with 5 decisions did exactly this).
       assert.ok(
-        out.includes(`DIVERGENCE: decision:${decisionTopic}-probe EMBEDDING DEGRADED`),
-        `expected an EMBEDDING DEGRADED divergence line for a DB with no default provider, got:\n${out}`
+        !out.includes(`DIVERGENCE: decision:${decisionTopic}-probe EMBEDDING DEGRADED`),
+        `embed-degraded must NEVER render as a markdown DIVERGENCE line anymore, got:\n${out}`
       );
+      assert.ok(
+        /embed_warnings: [1-9]\d*/.test(out),
+        `expected a nonzero embed_warnings count on the Done line, got:\n${out}`
+      );
+      const { rows: decisionRows } = await db.query(
+        'SELECT decision, embedding FROM decisions WHERE project_id = $1 AND topic = $2',
+        [encodedRoot, `${decisionTopic}-probe`]
+      );
+      assert.strictEqual(decisionRows.length, 1, 'the row itself must still be persisted (fail-soft, never lost)');
+      assert.strictEqual(decisionRows[0].embedding, null, 'embedding must be NULL when the provider is down');
     } finally {
       if (defaultIds.length > 0) {
         await db.query(
@@ -1120,6 +1212,7 @@ async function runTests() {
   // runHelperBoth — like runHelper but captures both stdout and stderr.
   // Uses spawnSync so both streams are available regardless of exit code.
   function runHelperBoth(sub, extraArgs = [], opts = {}) {
+    extraArgs = _initNoEmbeddingsDefault(sub, extraArgs);
     const fakeRoot = opts.fakeRoot || global.__fakeRoot;
     const env = {
       ...process.env,
@@ -1410,7 +1503,7 @@ knowledge:
       // Run init on the temp git root.
       execFileSync(
         process.execPath,
-        [HELPER, 'init', '-y'],
+        [HELPER, 'init', '-y', '--no-embeddings'],
         {
           cwd: gitTestRoot,
           env: { ...process.env, PROJECT_ROOT: gitTestRoot },

@@ -45,7 +45,8 @@
           { "table": "assertions", "column": "agent_id" },
           { "table": "edges", "column": "source_model" },
           { "table": "edges", "column": "agent_id" },
-          { "table": "edges", "column": "suppressed" }
+          { "table": "edges", "column": "suppressed" },
+          { "table": "assertions", "column": "embedded_by_provider_id" }
         ],
         "indexes": [
           "entities_project_idx",

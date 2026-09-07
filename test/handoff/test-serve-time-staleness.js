@@ -175,7 +175,7 @@ function runClose(fakeRoot, payload) {
 function runInit(fakeRoot) {
   return execFileSync(
     process.execPath,
-    [HELPER, 'init', '-y'],
+    [HELPER, 'init', '-y', '--no-embeddings'],
     { cwd: fakeRoot, env: helperEnv(fakeRoot), encoding: 'utf8', timeout: 60000 }
   );
 }

@@ -768,3 +768,20 @@ CREATE TABLE IF NOT EXISTS embedding_providers (
 -- base.sql's own comment for the full rationale).
 CREATE UNIQUE INDEX IF NOT EXISTS embedding_providers_is_default_unique_idx
   ON embedding_providers (is_default) WHERE is_default;
+
+-- ============================================================================
+-- ASSERTIONS PROVENANCE COLUMN (init-embeddability spec, A2: write-time
+-- embedding of assertions at close/checkpoint)
+--
+-- Placed HERE (after embedding_providers is created above), not next to the
+-- pgvector-gated assertions.embedding block near the top of this file: the
+-- FK target (embedding_providers) must already exist within this same
+-- per-file transaction. Mirrors decisions-base.sql's identical
+-- embedded_by_provider_id column exactly (same rationale: a plain INTEGER
+-- FK column needs no pgvector extension at all -- UNGATED, unlike the
+-- halfvec embedding column itself). ADD COLUMN IF NOT EXISTS is idempotent;
+-- an already-current database picks this up via the normal schema-drift
+-- fingerprint mismatch on its next touch (ensureSchemaCurrent), no
+-- SCHEMA_EPOCH bump required for a plain additive column.
+-- ============================================================================
+ALTER TABLE assertions ADD COLUMN IF NOT EXISTS embedded_by_provider_id INTEGER REFERENCES embedding_providers(id);

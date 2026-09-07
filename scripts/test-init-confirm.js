@@ -95,9 +95,15 @@ function writePipelineYml(projectDir, dbName) {
 
 /** Spawn handoff.js init with specified args in the given projectDir. */
 function runInit(dbName, projectDir, extraArgs = [], extraEnv = {}) {
+  // init-embeddability spec: init now BLOCKs by default without a
+  // configured embed endpoint. This suite tests the confirm-DDL gate, not
+  // embeddability (test-init-embeddability.js's job) — opt out explicitly
+  // unless the caller already did.
+  const finalArgs = extraArgs.some((a) => a === '--seed-provider' || a === '--no-embeddings' || a === '--allow-remote-embed')
+    ? extraArgs : [...extraArgs, '--no-embeddings'];
   return spawnSync(
     process.execPath,
-    [HANDOFF_SCRIPT, 'init', ...extraArgs],
+    [HANDOFF_SCRIPT, 'init', ...finalArgs],
     {
       cwd:      PROJECT_ROOT,
       env: {
@@ -152,7 +158,7 @@ async function testC1() {
     // We run WITHOUT HANDOFF_DB in the env so the pipeline.yml is the resolver.
     const r = spawnSync(
       process.execPath,
-      [HANDOFF_SCRIPT, 'init', '-y'],
+      [HANDOFF_SCRIPT, 'init', '-y', '--no-embeddings'],
       {
         cwd:      PROJECT_ROOT,
         env: {

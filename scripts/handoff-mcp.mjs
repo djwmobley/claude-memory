@@ -836,9 +836,10 @@ const EXTRACTION_PAYLOAD_FIELD_CONTRACT =
   'session_num: number (optional) }, array length <=200. cm#230: persisted through the SAME write path the ' +
   'standalone persist_decisions tool uses — ON CONFLICT (project_id, topic) DO UPDATE (re-closing with the same ' +
   'topic UPDATES that row, never a duplicate), inline-embedded at write time (fail-soft: a down embedding provider ' +
-  'never blocks the write — the row is still persisted with embedding=NULL, surfaced as a non-fatal ' +
-  '`DIVERGENCE: decision:<topic> EMBEDDING DEGRADED` line). A row that fails validation (bad topic shape, missing ' +
-  'decision/reason) or hits a genuine write error is skipped (non-fatal) and surfaced as ' +
+  'never blocks the write — the row is still persisted with embedding=NULL; this is an OPERATIONAL warning only, ' +
+  'counted into the Done line\'s `embed_warnings` figure, never rendered as a per-row line in handoff.md — the ' +
+  'markdown body stays a thin pointer regardless of how many rows degraded). A row that fails validation (bad ' +
+  'topic shape, missing decision/reason) or hits a genuine write error is skipped (non-fatal) and surfaced as ' +
   '`DIVERGENCE: decision:<topic> NOT PERSISTED` — one bad row never blocks the rest of the close.\n\n' +
   'Caveman/telegraphic authoring is MANDATORY for tldr, open_threads, and quick_references: strip function words ' +
   '(a/an/the, is/are/was/were, of/to/in/for/and/or/but, with/that/this/it/as/at/on/by/be) while keeping every ' +

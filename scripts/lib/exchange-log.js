@@ -81,9 +81,21 @@ class ExchangeLogError extends Error {
  * Postgres error instead of a named one).
  *
  * @param {object} client
+ * @param {object} [opts]
+ * @param {number} [opts.timeoutMs] -- cm#-init-embeddability adversary
+ *   finding #2 (BLOCKER): OPT-IN bounded transport timeout, threaded to
+ *   every provider.embed() call this resolved embedder makes. Omitted
+ *   (undefined) by every pre-existing caller of resolveDefaultEmbedder —
+ *   appendExchange's own fail-LOUD §7.7 posture is unchanged: an A2A
+ *   embed call still has no timeout unless a future caller opts in.
+ *   write-time-embed.js's embedForWrite is the one production caller that
+ *   DOES pass this (a bounded default, reusing embedding-provider.js's
+ *   resolveDefaultTimeoutMs/DEFAULT_PROBE_TIMEOUT_MS) so a black-holed
+ *   endpoint degrades to fail-soft NULL within a bounded time instead of
+ *   hanging a close/checkpoint forever.
  * @returns {Promise<{ providerId: number, embed: (text: string) => Promise<number[]> }>}
  */
-async function resolveDefaultEmbedder(client) {
+async function resolveDefaultEmbedder(client, opts) {
   let providerRow;
   try {
     providerRow = await embeddingProvider.resolveDefaultProvider(client);
@@ -94,10 +106,11 @@ async function resolveDefaultEmbedder(client) {
     );
   }
   const provider = embeddingProvider.createProviderFromRow(providerRow);
+  const embedOpts = (opts && opts.timeoutMs !== undefined) ? { timeoutMs: opts.timeoutMs } : undefined;
   return {
     providerId: providerRow.id,
     embed: async function defaultEmbedder(text) {
-      const result = await provider.embed(text); // provider-object-driven wire call (row endpoint/model/stored_dims)
+      const result = await provider.embed(text, embedOpts); // provider-object-driven wire call (row endpoint/model/stored_dims)
       if (!Array.isArray(result.vector) || result.vector.length !== providerRow.stored_dims) {
         throw new ExchangeLogError(
           'dimensionMismatch',

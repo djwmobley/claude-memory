@@ -12,7 +12,7 @@
  * parameters with matching defaults) from the originals — no behavioral changes.
  */
 
-const { spawnSync } = require('child_process');
+const { spawnSync, spawn } = require('child_process');
 const fs            = require('fs');
 const path          = require('path');
 const { Client }    = require('pg');
@@ -207,6 +207,62 @@ async function setContract(db, projectId, queries) {
   );
 }
 
+// ── Fake embed server (init-embeddability amendment A1) ───────────────────────
+
+/**
+ * startFakeEmbedServerProcess — starts scripts/lib/test-fake-embed-server.js
+ * as a genuinely SEPARATE OS process, waits for its "LISTENING <port>"
+ * readiness line, and resolves with `{ port, stop }`.
+ *
+ * WHY a separate process, never an in-process http.Server: a test that
+ * needs a REACHABLE fake embed endpoint WHILE a synchronous
+ * `execFileSync`/`spawnSync` CLI subprocess is running (e.g. `handoff.js
+ * init`'s amendment-A1 preflight probe) cannot use an in-process server —
+ * Node's synchronous child_process functions block the CALLING process's
+ * entire event loop until the child exits, so an in-process http.Server in
+ * that same process cannot accept/answer a request during that window
+ * (verified empirically: it deadlocks until the sync spawn's own timeout
+ * fires). A separate OS process has its own independent event loop and is
+ * unaffected by the test process being blocked on a sync spawn.
+ *
+ * @param {number} nativeDims — length of the fake embedding vector returned
+ * @param {number} [fillValue] — fill value for the fake vector (default 0.1)
+ * @param {number} [port] — 0 (default) for an OS-assigned free port
+ * @returns {Promise<{ port: number, stop: () => void }>}
+ */
+function startFakeEmbedServerProcess(nativeDims, fillValue = 0.1, port = 0) {
+  return new Promise((resolve, reject) => {
+    const scriptPath = path.join(__dirname, 'test-fake-embed-server.js');
+    const child = spawn(process.execPath, [scriptPath, String(port), String(nativeDims), String(fillValue)], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let resolved = false;
+    let buf = '';
+    const timer = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        try { child.kill(); } catch (_) {}
+        reject(new Error('fake embed server did not report LISTENING within 5s'));
+      }
+    }, 5000);
+    child.stdout.on('data', (chunk) => {
+      buf += chunk.toString();
+      const m = buf.match(/^(?:LISTENING|ALREADY_LISTENING) (\d+)/m);
+      if (m && !resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        resolve({ port: parseInt(m[1], 10), stop: () => { try { child.kill(); } catch (_) {} } });
+      }
+    });
+    child.on('error', (err) => {
+      if (!resolved) { resolved = true; clearTimeout(timer); reject(err); }
+    });
+    child.on('exit', (code) => {
+      if (!resolved) { resolved = true; clearTimeout(timer); reject(new Error(`fake embed server exited early with code ${code}`)); }
+    });
+  });
+}
+
 // ── Subprocess helpers ────────────────────────────────────────────────────────
 
 /**
@@ -305,7 +361,14 @@ function cleanupHandoffMd(projectId) {
  * Used by test-l0, test-l2, test-l3, test-l4.
  */
 async function setupProject(dbName, projectDir) {
-  const r = runHandoff('init', ['-y'], null, dbName, projectDir);
+  // init-embeddability spec: a fresh init now BLOCKs by default when no
+  // embed endpoint is configured (never a silent NOTE-and-continue). None
+  // of this shared helper's callers (test-l0/l2/l3/l4 and everything else
+  // that composes through setupProject) configure a live vLLM endpoint —
+  // CI has none available (EMBED_SKIP=1 convention) — so --no-embeddings
+  // opts these throwaway fixtures out explicitly, matching intent: these
+  // tests exercise unrelated engine behavior, not embeddability.
+  const r = runHandoff('init', ['-y', '--no-embeddings'], null, dbName, projectDir);
   if (r.status !== 0) {
     throw new Error(`cmdInit failed: ${r.stderr || r.stdout}`);
   }
@@ -342,4 +405,6 @@ module.exports = {
   resolveHandoffMdPath,
   cleanupHandoffMd,
   setupProject,
+  // Fake embed server (init-embeddability amendment A1)
+  startFakeEmbedServerProcess,
 };

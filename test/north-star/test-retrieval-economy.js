@@ -349,6 +349,103 @@ function rankOf(stdout, needle) {
         }
       }
     );
+
+    // ── INVARIANT 5c — BODY BUDGET UNDER EMBED-DEGRADED LOAD ──────────────────
+    //
+    // Regression guard for a real body-budget bug: on a DB with NO default
+    // embedding_providers row (every fresh scratch fixture, including this
+    // one via ns-harness.js's applySchemas() — never `cmdInit`), EVERY
+    // assertion and decision written at close degrades its embedding
+    // (fail-soft, provider absent). That degradation is an OPERATIONAL
+    // warning (the row persists fine; only its embedding is NULL), never a
+    // content divergence — it must be counted on the stdout Done line's
+    // embed_warnings figure, NEVER rendered as a per-row DIVERGENCE line
+    // into handoff.md's body. A prior revision of this fix got this right
+    // for assertions but left decisions[] routing through the SAME
+    // per-row-DIVERGENCE-into-markdown channel — a real pipeline_judge
+    // close with just 5 decisions (0 provider rows) blew the 512-byte
+    // thin-pointer budget this exact way.
+    await H.test(
+      'INV5c body-budget under embed-degraded load: 10 decisions + 10 assertions on a no-provider DB stay within the thin-pointer budget',
+      async () => {
+        const A = require('assert');
+        const { db, fakeRoot, projectId, cleanup } = await H.setupNs({ namespace: 'economy' });
+        // SHARED-DB INVARIANT (mirrors test-handoff.js's own established
+        // pattern for claude_memory_eval_test): this test needs a genuinely
+        // "no default provider" state to exercise the regression it guards
+        // against, but the underlying DB is shared with other suites (e.g.
+        // test-handoff.js's own --seed-provider tests permanently seed a
+        // live vllm-local row there by design). Never delete/mutate a
+        // pre-existing row: snapshot whichever id(s) are currently default,
+        // flip them to false for the duration of this test, then restore
+        // and verify the exact pre-test state afterward — pass or fail.
+        const { rows: defaultRows } = await db.query(
+          'SELECT id FROM embedding_providers WHERE is_default = true ORDER BY id'
+        );
+        const defaultIds = defaultRows.map((r) => r.id);
+        if (defaultIds.length > 0) {
+          await db.query('UPDATE embedding_providers SET is_default = false WHERE id = ANY($1::int[])', [defaultIds]);
+        }
+        try {
+          const assertions = [];
+          for (let i = 0; i < 10; i++) {
+            assertions.push({
+              subject: `economy-embed-degraded-subject-${i}`,
+              predicate: 'economy_embed_note',
+              object: `value-${i}`,
+              confidence: 6,
+              source: 'user_stated',
+            });
+          }
+          const decisions = [];
+          for (let i = 0; i < 10; i++) {
+            decisions.push({
+              topic: `economy-embed-degraded-${i}`,
+              decision: `decision text number ${i}`,
+              reason: `reason text number ${i}`,
+            });
+          }
+          const out = H.runClose(fakeRoot, {
+            session_id:       'sess-embed-degraded-load',
+            tldr:             'Embed-degraded body-budget regression guard.',
+            assertions,
+            decisions,
+            contract:         ASSERTION_CONTRACT,
+          });
+
+          A.ok(
+            /embed_warnings: \d+/.test(out),
+            `INV5c: expected a nonzero embed_warnings count on the Done line (20 rows, no default provider), got:\n${out}`
+          );
+
+          // Thin-pointer check — the actual regression guard.
+          H.assertMdThinPointer(
+            projectId, 512,
+            'INV5c handoff.md must stay a thin pointer even when every decision/assertion embed degrades'
+          );
+
+          const { rows } = await db.query(
+            `SELECT COUNT(*) FILTER (WHERE embedding IS NULL) AS n FROM decisions WHERE project_id = $1`,
+            [projectId]
+          );
+          A.strictEqual(parseInt(rows[0].n, 10), 10, 'INV5c: all 10 decisions rows must still be persisted with embedding=NULL (fail-soft, never lost)');
+        } finally {
+          if (defaultIds.length > 0) {
+            await db.query('UPDATE embedding_providers SET is_default = true WHERE id = ANY($1::int[])', [defaultIds]);
+          }
+          const { rows: afterRows } = await db.query(
+            'SELECT id FROM embedding_providers WHERE is_default = true ORDER BY id'
+          );
+          A.deepStrictEqual(
+            afterRows.map((r) => r.id),
+            defaultIds,
+            'INV5c: expected the live embedding_providers is_default row(s) to be restored to their exact pre-test state'
+          );
+          try { await db.end(); } catch (_) {}
+          await cleanup();
+        }
+      }
+    );
   });
 })().catch((err) => {
   // A throw out here (e.g. preflight infra error) is an infrastructure failure.

@@ -13,7 +13,25 @@ const __startNs = process.hrtime.bigint();
  *
  * Subcommands:
  *   init                    First-run provisioning for this project.
- *   status                  Read-only: show counts, last close, contract names.
+ *                           Flags: -y/--yes/--force (bypass the confirm-before-DDL gate,
+ *                           also covers CREATE EXTENSION vector when needed); --no-embeddings
+ *                           (opt out of embedding capability, stamps project_settings.
+ *                           embeddings_opt_out); --clear-opt-out (remove a prior opt-out);
+ *                           --allow-remote-embed (accept a REMOTE embed endpoint with
+ *                           data_egress_approved=false, printing the hand-edit approval SQL);
+ *                           --seed-provider (standalone: seed/re-seed the default embedding
+ *                           provider row on an already-initialized project, no schema/marker
+ *                           work). Without --no-embeddings, init BLOCKS (exit 1, no marker/
+ *                           handoff.md written) when pgvector cannot be installed or no embed
+ *                           endpoint is configured anywhere (.claude/pipeline.yml, VLLM_EMBED_URL,
+ *                           or ~/.claude/handoff-embed.json).
+ *   backfill-embeddings     Embed assertions/decisions rows whose embedding is still NULL.
+ *                           Flags: --apply (default: dry-run), --table=assertions|decisions|all,
+ *                           --batch-size=N (default 10), --project-id=<id> (default: whole DB),
+ *                           --force-mixed-provider (bypass the mixed-provider refusal).
+ *   status                  Read-only: show counts, last close, contract names, and
+ *                           embedding_readiness (READY | UNEMBEDDABLE:no-extension |
+ *                           UNEMBEDDABLE:no-provider | DEGRADED:opt-out | N/A (sqlite backend)).
  *   resume                  Inline SessionStart load (prints compact context summary).
  *   drop                    Zero all assertions, archive handoff.md, create fresh one.
  *   checkpoint --json -     Mid-session extraction (reads JSON from stdin).
@@ -51,7 +69,7 @@ const { classifyPredicate, isDirective }            = require('./lib/predicate-r
 const { validatePayload }                          = require('./lib/payload-schema');
 const {
   resolveDialect, createAdapter, createInitProbe,
-  resolveSQLiteDbPath,
+  resolveSQLiteDbPath, probeInitEmbeddabilityState,
 } = require('./lib/db-seam');
 const { canonicalize }                             = require('./lib/subject-canon');
 const { intentKey, intentKeyEquals }                = require('./lib/intent-key');
@@ -73,7 +91,12 @@ const {
   resolvePromotionFilePath,
 } = require('./lib/handoff-paths');
 const { embedQuery }                               = require('./lib/embed');
-const { seedLocalEmbeddingProvider }               = require('./lib/embedding-provider');
+const {
+  seedLocalEmbeddingProvider,
+  resolveConfiguredEmbedEndpointDetailed,
+} = require('./lib/embedding-provider');
+const { embedForWrite, classifyEmbeddingWriteError } = require('./lib/write-time-embed');
+const { runBackfillEmbeddings }                    = require('./lib/backfill-embeddings');
 const { execFileSync }                             = require('child_process');
 const crypto                                       = require('crypto');
 const { REALITY_CHECKS, runVerifyDispatch }        = require('./lib/reality-checks');
@@ -2059,6 +2082,39 @@ async function clearSchemaDegradation(db, projectId) {
 }
 
 /**
+ * isEmbeddingsOptedOut — init-embeddability spec: an operator who ran
+ * `init --no-embeddings` (or had a prior opt-out auto-honored, adversary
+ * finding #5) has explicitly said "proceed without embedding capability."
+ * Write-time assertion embedding (A2) must respect that choice SILENTLY —
+ * never surfacing a per-write DEGRADED divergence line for a state the
+ * operator deliberately chose. This is DISTINCT from cm#230's existing,
+ * intentional decisions[] contract (test-handoff.js: "embedding-provider-
+ * down is non-fatal and surfaces a DIVERGENCE line") — that test exercises
+ * a DB that has NOT opted out (a live default row temporarily flipped to
+ * non-default), where a missing provider genuinely IS worth flagging every
+ * time. The distinction is opted-out vs. merely-unconfigured, not
+ * assertions vs. decisions — this helper is reused wherever an opt-out
+ * check should suppress an otherwise-legitimate embed-degraded warning.
+ * Read-only; any query failure (project_settings absent) is treated as
+ * "not opted out" — never a false positive suppression.
+ *
+ * @param {object} db
+ * @param {string} projectId
+ * @returns {Promise<boolean>}
+ */
+async function isEmbeddingsOptedOut(db, projectId) {
+  try {
+    const { rows } = await db.query(
+      `SELECT 1 FROM project_settings WHERE project_id = $1 AND key = 'embeddings_opt_out'`,
+      [projectId]
+    );
+    return rows.length > 0;
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
  * cm#224 follow-up (independent PR #225 review finding): detects
  * pgvector-gated schema objects that were silently SKIPPED on THIS
  * database. "Gated" = a column/index wrapped in a
@@ -2118,6 +2174,96 @@ async function checkPgvectorGatedObjects(db, manifest, units) {
   );
   const missing = gatedColumns.filter((gc) => missingSet.has(`${gc.table}.${gc.column}`));
   return { ok: missing.length === 0, vectorExtensionPresent, missing };
+}
+
+/**
+ * computeEmbeddingReadiness — init-embeddability spec ("Status + resume
+ * changes"): a SINGLE total classification of "can this project embed
+ * anything right now", surfaced by cmdStatus and cmdLoaderLoad's resume
+ * banner. Total classification — every reachable state maps to exactly one
+ * of the branches below, never a default "looks fine":
+ *
+ *   N/A (sqlite backend)     — dialect-gated top branch (no embedding
+ *                              column on any SQLite table at all).
+ *   DEGRADED:opt-out         — project_settings.embeddings_opt_out is on
+ *                              file (an operator explicitly ran
+ *                              `init --no-embeddings`).
+ *   UNEMBEDDABLE:no-extension — pgvector is absent OR a gated column/index
+ *                              was skipped at schema-apply time (reuses
+ *                              checkPgvectorGatedObjects — the SAME check
+ *                              schema-drift detection uses, never a second,
+ *                              independently-drifting probe).
+ *   UNEMBEDDABLE:no-provider  — extension/columns are fine, but no
+ *                              embedding_providers row has is_default=true.
+ *   READY                     — both axes pass.
+ *
+ * Never throws — any unexpected probe error is folded into the
+ * conservative UNEMBEDDABLE:no-extension branch (never a silent READY).
+ *
+ * @param {object} db
+ * @param {string} projectId
+ * @returns {Promise<string>} one of the five states above
+ */
+async function computeEmbeddingReadiness(db, projectId) {
+  if (db && typeof db.supportsEmbeddingColumns === 'function' && !db.supportsEmbeddingColumns()) {
+    return 'N/A (sqlite backend)';
+  }
+
+  const optedOut = await isEmbeddingsOptedOut(db, projectId);
+  if (optedOut) return 'DEGRADED:opt-out';
+
+  try {
+    const classification = classifySchemaFiles({ engineRoot: _ENGINE_ROOT });
+    if (!classification.ok) return 'UNEMBEDDABLE:no-extension';
+    const rosterEntry = classification.manifest.units[db.schemaFileName];
+    const units = rosterEntry ? classification.unitsByDialect[rosterEntry.classification] : null;
+    if (!units || units.length === 0) return 'UNEMBEDDABLE:no-extension';
+    const gated = await checkPgvectorGatedObjects(db, classification.manifest, units);
+    if (!gated.ok) return 'UNEMBEDDABLE:no-extension';
+  } catch (_) {
+    return 'UNEMBEDDABLE:no-extension';
+  }
+
+  try {
+    const { rows } = await db.query(`SELECT COUNT(*) AS n FROM embedding_providers WHERE is_default = true`);
+    const n = parseInt(rows[0] && rows[0].n, 10) || 0;
+    if (n === 0) return 'UNEMBEDDABLE:no-provider';
+  } catch (_) {
+    return 'UNEMBEDDABLE:no-provider';
+  }
+
+  return 'READY';
+}
+
+/**
+ * computeEmbeddingNullCounts — A3: per-table NULL-embedding counts, for
+ * status/resume to print "whenever nonzero" (spec's own phrasing). Reads
+ * only tables/columns that actually exist (a Postgres DB with the gated
+ * embedding column absent, or a SQLite DB with no such column at all,
+ * simply reports 0 for that table — never an error surfaced to the
+ * operator for a structurally-expected absence).
+ *
+ * @param {object} db
+ * @param {string} projectId
+ * @returns {Promise<{assertions:number, decisions:number}>}
+ */
+async function computeEmbeddingNullCounts(db, projectId) {
+  const counts = { assertions: 0, decisions: 0 };
+  if (db && typeof db.supportsEmbeddingColumns === 'function' && !db.supportsEmbeddingColumns()) {
+    return counts; // SQLite: no embedding column anywhere — always 0, never an error.
+  }
+  for (const table of ['assertions', 'decisions']) {
+    try {
+      const { rows } = await db.query(
+        `SELECT COUNT(*) AS n FROM ${table} WHERE project_id = $1 AND embedding IS NULL`,
+        [projectId]
+      );
+      counts[table] = parseInt(rows[0] && rows[0].n, 10) || 0;
+    } catch (_) {
+      counts[table] = 0; // table/column absent on this DB — structurally expected, not an error.
+    }
+  }
+  return counts;
 }
 
 /**
@@ -2471,6 +2617,7 @@ async function cmdInit(args) {
   if (args.includes('--seed-provider')) {
     const seedCwd  = process.env.PROJECT_ROOT || process.cwd();
     const seedRoot = findProjectRootByMarker(seedCwd) || findProjectRoot();
+    const seedAllowRemoteEmbed = args.includes('--allow-remote-embed');
     let seedDb;
     try {
       seedDb = await connectHandoff();
@@ -2478,9 +2625,18 @@ async function cmdInit(args) {
       console.log(`  [FAIL]  DB connection failed — ${err.message}`);
       process.exit(1);
     }
-    const result = await seedLocalEmbeddingProvider({ db: seedDb, projectRoot: seedRoot });
+    const result = await seedLocalEmbeddingProvider({ db: seedDb, projectRoot: seedRoot, allowRemoteEmbed: seedAllowRemoteEmbed });
     for (const line of result.lines) console.log(line);
     await seedDb.end();
+    // Init changes item 2: standalone --seed-provider mode also BLOCKs
+    // (exit 1) on an unseeded result — no marker/FS was ever written by
+    // this standalone path, so there is nothing to unwind. `alreadyPresent`
+    // (a default provider already exists — same name or a different one)
+    // is a benign idempotent no-op, NEVER a BLOCK-worthy failure.
+    if (!result.seeded && !result.alreadyPresent) {
+      console.log(`\nDone: handoff:init --seed-provider — FAILED (no default provider seeded)`);
+      process.exit(1);
+    }
     console.log(`\nDone: handoff:init --seed-provider`);
     return;
   }
@@ -2551,22 +2707,105 @@ async function cmdInit(args) {
   // Always print before any DDL so the operator knows which DB will be touched.
   console.log(`  Resolved target DB: ${TARGET_DB}  (source: ${_rawTargetDbSource})`);
 
+  // ── init-embeddability: extension-state + opt-out probe, BEFORE the gate ──
+  //
+  // Adversary finding #1 (BLOCKER): the confirm-before-DDL gate below fires
+  // BEFORE any DB connection exists — moving a pgvector-extension check to
+  // "after schema apply" (as first drafted) would mean either (a) running
+  // `CREATE EXTENSION vector;` completely unattended once discovered later,
+  // violating the "no DDL without ack" policy the gate exists to enforce, or
+  // (b) opening a SECOND prompt, which is forbidden (one gate, one policy).
+  // So the probe runs HERE, before the gate, using its own short-lived
+  // connection — its result only ever WIDENS the existing gate's prompt text
+  // (never adds a second prompt) and can BLOCK OUTRIGHT (before any prompt)
+  // on the two states the spec's extension table marks unconditional BLOCK.
+  const noEmbeddingsFlag    = args.includes('--no-embeddings');
+  const allowRemoteEmbed    = args.includes('--allow-remote-embed');
+  const clearOptOutFlag     = args.includes('--clear-opt-out');
+  const initDialect         = resolveDialect(cfg);
+
+  // SQLite: dialect-gated top-level branch (per spec's "SQLite seam
+  // behavior") — extension-state is N/A, never evaluated as BLOCK/DEGRADED.
+  // Explicit --no-embeddings this run also skips the probe entirely — an
+  // operator who has already opted out has no need for a pgvector-state
+  // connection attempt at all.
+  const extProbe = (initDialect === 'sqlite' || noEmbeddingsFlag)
+    ? { state: noEmbeddingsFlag ? 'SKIPPED_NO_EMBEDDINGS' : 'N_A_SQLITE', optOut: null }
+    : await probeInitEmbeddabilityState(cfg, TARGET_DB, projectId);
+
+  // Resolve the configured embed endpoint NOW (pure — file/env reads only,
+  // no I/O beyond that) so the persisted-opt-out auto-honor decision
+  // (adversary finding #5) can see whether a real endpoint has since been
+  // configured, and so the gate text can be built without a second lookup.
+  const initEndpointDetail = resolveConfiguredEmbedEndpointDetailed({ projectRoot: root, env: process.env });
+
+  // Adversary finding #5: an already-persisted embeddings_opt_out row is
+  // auto-honored (no false re-BLOCK on a routine re-init) UNLESS this run
+  // also configured a real endpoint (operator clearly wants embeddings
+  // back) or explicitly passed --clear-opt-out.
+  let effectiveNoEmbeddings = noEmbeddingsFlag;
+  if (!effectiveNoEmbeddings && extProbe.optOut && !clearOptOutFlag && !initEndpointDetail.url) {
+    effectiveNoEmbeddings = true;
+    console.log(
+      `  [NOTE]  embeddings opt-out already on file (stamped ${extProbe.optOut.stamp || 'unknown date'}) — ` +
+      'honoring it for this run. Pass a real endpoint (pipeline.yml/env/~/.claude/handoff-embed.json) ' +
+      'or --clear-opt-out to change this.'
+    );
+  }
+
+  // Unconditional BLOCK branches (spec's extension table) — fire BEFORE the
+  // confirm gate, regardless of -y/--yes/--force, since no confirmation
+  // could make an impossible or unverifiable DDL operation succeed.
+  if (!effectiveNoEmbeddings && initDialect !== 'sqlite') {
+    if (extProbe.state === 'EXT_ABSENT_NO_PRIVILEGE') {
+      console.log(`  [FAIL]  pgvector extension is not installed on database '${TARGET_DB}', and this role lacks CREATE privilege to install it.`);
+      console.log(`          Have a Postgres superuser/owner run:`);
+      console.log(`            CREATE EXTENSION vector;`);
+      console.log(`          on database '${TARGET_DB}', then re-run init. Or pass --no-embeddings to proceed without embedding capability.`);
+      unwindFsLedger();
+      process.exit(1);
+    }
+    if (extProbe.state === 'PROBE_ERROR') {
+      console.log(`  [FAIL]  could not determine pgvector extension state on database '${TARGET_DB}' — ${extProbe.error ? extProbe.error.message : 'unknown error'}`);
+      console.log(`          Refusing to proceed with an unverifiable extension state (never a silent PROCEED). Or pass --no-embeddings to proceed without embedding capability.`);
+      unwindFsLedger();
+      process.exit(1);
+    }
+  }
+
+  // Whether the schema-apply step (below, after DB connect) needs to run
+  // `CREATE EXTENSION vector;` before applying the gated DDL. DB_ABSENT is
+  // included: a freshly created Postgres database never has any extension
+  // installed, so the same install step applies once it exists.
+  const needsExtensionInstall = !effectiveNoEmbeddings && initDialect !== 'sqlite' &&
+    (extProbe.state === 'EXT_ABSENT_HAS_PRIVILEGE' || extProbe.state === 'DB_ABSENT');
+
   // ── Confirmation gate — BEFORE any DDL ───────────────────────────────────
   //
-  // Policy: no schema (CREATE DATABASE or schema apply) executes without explicit
-  // acknowledgment.  Three paths:
+  // Policy: no schema (CREATE DATABASE, CREATE EXTENSION, or schema apply)
+  // executes without explicit acknowledgment.  Three paths:
   //   1. bypass flag (-y / --yes / --force) → skip prompt, proceed immediately.
   //   2. stdin is a TTY → interactive y/N prompt; non-yes answer aborts, exit 1.
   //   3. stdin is NOT a TTY and no bypass flag → safe-fail with a clear message,
   //      exit 1.  NEVER open a readline interface in this path — that hangs.
+  //
+  // Adversary finding #1 (BLOCKER, A2): the SAME single gate below also
+  // covers `CREATE EXTENSION vector;` when needsExtensionInstall is true —
+  // its prompt text is built conditionally from the probe above rather than
+  // adding a second, independent prompt.
+  let gatePromptText = `  Apply handoff schema to database '${TARGET_DB}' (source: ${_rawTargetDbSource})`;
+  if (needsExtensionInstall && extProbe.state === 'EXT_ABSENT_HAS_PRIVILEGE') {
+    gatePromptText += ' — this will also run `CREATE EXTENSION vector;` (pgvector is not yet installed on this database)';
+  } else if (needsExtensionInstall && extProbe.state === 'DB_ABSENT') {
+    gatePromptText += ' — this database does not exist yet and will be created, then `CREATE EXTENSION vector;` will be run on it';
+  }
+  gatePromptText += '? [y/N]: ';
+
   if (!autoCreate) {
     if (process.stdin.isTTY) {
       const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
       const answer = await new Promise((resolve) => {
-        rl.question(
-          `  Apply handoff schema to database '${TARGET_DB}' (source: ${_rawTargetDbSource})? [y/N]: `,
-          (a) => { rl.close(); resolve(a.trim()); }
-        );
+        rl.question(gatePromptText, (a) => { rl.close(); resolve(a.trim()); });
       });
       if (!/^y(es)?$/i.test(answer)) {
         console.log(`  Aborted — no schema changes were made.`);
@@ -2634,6 +2873,27 @@ async function cmdInit(args) {
   } catch (err) {
     console.log(`  [FAIL]  DB connection failed — ${err.message}`);
     process.exit(1);
+  }
+
+  // ── init-embeddability: install pgvector BEFORE the gated schema DDL runs ──
+  // Runs only after the SINGLE confirm gate above already covered this
+  // exact DDL (needsExtensionInstall implies the operator already
+  // confirmed, or passed -y/--force). Installing it here — before
+  // applyAdditiveSchema below — means the schema SQL's own
+  // `DO $$ ... EXCEPTION WHEN OTHERS $$` gated blocks see the extension
+  // already present and create the gated columns/indexes in this SAME run,
+  // rather than leaving them skipped for a later re-init.
+  if (needsExtensionInstall) {
+    try {
+      await db.query('CREATE EXTENSION IF NOT EXISTS vector');
+      console.log(`  [OK]    pgvector extension installed on '${TARGET_DB}' (CREATE EXTENSION vector)`);
+    } catch (extErr) {
+      await db.end();
+      console.log(`  [FAIL]  CREATE EXTENSION vector failed on '${TARGET_DB}' — ${extErr.message}`);
+      console.log(`          Have a Postgres superuser/owner run: CREATE EXTENSION vector; on database '${TARGET_DB}', then re-run init.`);
+      unwindFsLedger();
+      process.exit(1);
+    }
   }
 
   // cm#185 review N2: take the same session-scoped schema-apply advisory lock
@@ -2741,18 +3001,75 @@ async function cmdInit(args) {
   );
   await db.releaseSchemaApplyLock(initLockKey);
 
-  // Step 7.5: seed a default embedding_providers row IFF the operator's
-  // configured embed endpoint is unambiguously local (see
-  // seedLocalEmbeddingProvider / scripts/lib/embedding-provider.js for the
-  // full NONE/INVALID/REMOTE/LOCAL classification and its rationale).
-  // Deliberately lives HERE — inside cmdInit only, never inside
-  // ensureSchemaCurrent's drift-apply path — so it runs exactly once per
-  // fresh init (idempotent re-init is a DO-NOTHING no-op) and never as a
-  // side effect of an unrelated drift-detection check. Init never fails
-  // because of this step (seedLocalEmbeddingProvider never throws).
-  {
-    const seedResult = await seedLocalEmbeddingProvider({ db, projectRoot: root });
+  // ── init-embeddability spec extension table, row 2: "extension present,
+  // gated columns still missing" → BLOCK if STILL missing after this run's
+  // own apply. Since CREATE EXTENSION (above) runs BEFORE applyAdditiveSchema,
+  // a normal re-init naturally re-creates any previously-skipped gated
+  // column/index in the SAME pass — this check only fires for a genuine
+  // schema-apply bug (extension confirmed present, yet the gated DDL still
+  // didn't take), not for the ordinary "extension was just installed" path.
+  if (!effectiveNoEmbeddings && initDialect !== 'sqlite') {
+    const gatedCheck = await checkPgvectorGatedObjects(db, classification.manifest, units);
+    if (!gatedCheck.ok) {
+      await db.end();
+      console.log(`  [FAIL]  pgvector extension is present but gated column(s)/index(es) are still missing after schema apply:`);
+      for (const m of gatedCheck.missing) console.log(`          - ${m.table}.${m.column} (${m.unit})`);
+      console.log(`          This indicates a genuine schema-apply defect, not a privilege/extension problem — investigate before re-running init.`);
+      unwindFsLedger();
+      process.exit(1);
+    }
+  }
+
+  // Step 7.5: seed a default embedding_providers row, or record an explicit
+  // embeddings opt-out. Deliberately lives HERE — inside cmdInit only,
+  // never inside ensureSchemaCurrent's drift-apply path — so it runs
+  // exactly once per fresh init (idempotent re-init is a DO-NOTHING no-op)
+  // and never as a side effect of an unrelated drift-detection check.
+  //
+  // Total classification (init changes item 2 — replaces the old
+  // NONE/INVALID/REMOTE "NOTE, continue" behavior with BLOCK):
+  //   effectiveNoEmbeddings          → stamp/preserve project_settings.embeddings_opt_out; PROCEED.
+  //   seedLocalEmbeddingProvider seeds (LOCAL, or REMOTE+--allow-remote-embed) → PROCEED.
+  //   seedLocalEmbeddingProvider does NOT seed (NONE/INVALID/REMOTE-without-allow) → BLOCK, exit 1.
+  if (clearOptOutFlag) {
+    try {
+      await db.query(`DELETE FROM project_settings WHERE project_id = $1 AND key = 'embeddings_opt_out'`, [projectId]);
+      console.log(`  [OK]    cleared prior embeddings_opt_out (if any)`);
+    } catch (clearErr) {
+      console.log(`  [NOTE]  could not clear embeddings_opt_out (non-fatal): ${clearErr.message}`);
+    }
+  }
+
+  if (effectiveNoEmbeddings) {
+    if (noEmbeddingsFlag) {
+      // Explicit --no-embeddings this run — stamp/refresh the opt-out record.
+      try {
+        await db.query(
+          `INSERT INTO project_settings (project_id, key, value) VALUES ($1, 'embeddings_opt_out', $2)
+           ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
+          [projectId, JSON.stringify({ reason: 'operator', stamp: new Date().toISOString() })]
+        );
+        console.log(`  [NOTE]  embeddings opted out (--no-embeddings) — project_settings.embeddings_opt_out stamped`);
+      } catch (optErr) {
+        console.log(`  [NOTE]  could not stamp embeddings_opt_out (non-fatal): ${optErr.message}`);
+      }
+    }
+    // else: the persisted-opt-out-honored branch already printed its own
+    // NOTE line above, before the confirm gate — nothing further to do here.
+  } else {
+    const seedResult = await seedLocalEmbeddingProvider({ db, projectRoot: root, allowRemoteEmbed });
     for (const line of seedResult.lines) console.log(line);
+    // alreadyPresent (a default provider already exists — same name or a
+    // different one) is a benign idempotent no-op, NEVER a BLOCK-worthy
+    // failure — only NONE/INVALID/REMOTE-without-allow BLOCK.
+    if (!seedResult.seeded && !seedResult.alreadyPresent) {
+      await db.end();
+      console.log(`  [FAIL]  no default embedding provider could be seeded — see NOTE(s) above.`);
+      console.log(`          Configure an endpoint (pipeline.yml/env/~/.claude/handoff-embed.json), pass --allow-remote-embed for a` +
+        ` remote endpoint, or pass --no-embeddings to proceed without embedding capability.`);
+      unwindFsLedger();
+      process.exit(1);
+    }
   }
 
   // Step 8: Insert default project_settings rows (idempotent)
@@ -3152,6 +3469,17 @@ async function cmdStatus(args = []) {
     // Non-fatal — status still reports the rest even if this probe fails.
   }
 
+  // init-embeddability spec (A3): loud, always-computed readiness state +
+  // per-table NULL-embedding counts (printed only when nonzero).
+  let embeddingReadiness = 'UNEMBEDDABLE:no-extension';
+  let embeddingNullCounts = { assertions: 0, decisions: 0 };
+  try {
+    embeddingReadiness = await computeEmbeddingReadiness(db, projectId);
+    embeddingNullCounts = await computeEmbeddingNullCounts(db, projectId);
+  } catch (_) {
+    // Non-fatal — status still reports the rest even if this probe fails.
+  }
+
   await db.end();
 
   const lastClose = fm.last_close || 'never';
@@ -3194,6 +3522,8 @@ async function cmdStatus(args = []) {
       session_id:     sipDisplay.id,
       packaging:      packagingState,
       schema_apply_degraded: schemaDegraded,
+      embedding_readiness: embeddingReadiness,
+      embedding_null_counts: embeddingNullCounts,
     };
     if (breakdownFlag && breakdown !== null) {
       out.breakdown = breakdown;
@@ -3220,6 +3550,10 @@ async function cmdStatus(args = []) {
   if (packagingLine) console.log(packagingLine);
   if (schemaDegraded) {
     console.log(`  schema_apply:     DEGRADED (${schemaDegraded.reason || 'unknown'}) — see detail: ${JSON.stringify(schemaDegraded.detail)}`);
+  }
+  console.log(`  embedding:        ${embeddingReadiness}`);
+  if (embeddingNullCounts.assertions > 0 || embeddingNullCounts.decisions > 0) {
+    console.log(`  embedding NULLs:  assertions=${embeddingNullCounts.assertions}, decisions=${embeddingNullCounts.decisions}`);
   }
 
   if (breakdownFlag && breakdown !== null) {
@@ -3680,6 +4014,37 @@ async function cmdLoaderLoad(opts = {}) {
     }
   } catch (schemaDegCheckErr) {
     process.stderr.write('[handoff] schema-degradation resume check failed (non-fatal): ' + schemaDegCheckErr.message + '\n');
+  }
+
+  // init-embeddability spec (A3): same loud-whenever-nonzero convention as
+  // the schema-degradation banner above — a resumed session sees embedding
+  // unreadiness without running `status` separately. Silent for READY/N-A
+  // (never noise on the common case).
+  try {
+    const readiness = await computeEmbeddingReadiness(db, projectId);
+    // Only genuine UNEMBEDDABLE:* states warrant a resume nag — an explicit
+    // opt-out (DEGRADED:opt-out) is an operator's deliberate, standing
+    // choice and must stay silent on every subsequent resume, not repeat
+    // as a recurring warning.
+    if (readiness.startsWith('UNEMBEDDABLE')) {
+      const bannerLine = `RESUME WARNING: embedding ${readiness} — run /handoff:status for detail`;
+      if (!silent) {
+        console.log(`\n  ${bannerLine}`);
+      } else {
+        process.stderr.write(`[handoff] ${bannerLine}\n`);
+      }
+    }
+    const nullCounts = await computeEmbeddingNullCounts(db, projectId);
+    if (nullCounts.assertions > 0 || nullCounts.decisions > 0) {
+      const countLine = `embedding NULLs pending: assertions=${nullCounts.assertions}, decisions=${nullCounts.decisions} (run \`handoff.js backfill-embeddings\`)`;
+      if (!silent) {
+        console.log(`  ${countLine}`);
+      } else {
+        process.stderr.write(`[handoff] ${countLine}\n`);
+      }
+    }
+  } catch (embedReadinessErr) {
+    process.stderr.write('[handoff] embedding-readiness resume check failed (non-fatal): ' + embedReadinessErr.message + '\n');
   }
 
   // Load retrieval_contract
@@ -4772,6 +5137,43 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
   //   suppressed, invalid_at, and suppression_kind — never the subject column.
   const canonSubject = canonicalize(ass.subject);
 
+  // ── Write-time embedding (init-embeddability spec A2) ─────────────────────
+  // Computed BEFORE opening the transaction below — never hold a
+  // transaction open across a network round-trip (same discipline
+  // decisions-writer.js's persistDecisionRow/write-time-embed.js's
+  // writeRowWithProvenanceRetry already follow for the `decisions` table).
+  // Postgres-only: handoff-sqlite-schema.sql declares no `embedding` column
+  // on ANY table — the dialect-neutral engine skips the attempt entirely on
+  // SQLite rather than computing a vector it could never store (no
+  // per-call dialect branch needed elsewhere: `hasEmbedding` below is
+  // simply always false on that backend). Fail-soft always: embedForWrite
+  // never throws — a failure (no default provider, network error, bounded
+  // timeout) yields vectorLiteral:null, and the INSERT below omits the
+  // embedding columns entirely (backfillable-NULL via `backfill-embeddings`).
+  // opts.embedder/opts.embedderProviderId (test-only, both-or-neither) and
+  // opts.embedTimeoutMs are threaded straight to embedForWrite; opts.warnSink,
+  // when supplied as an array, collects a `{predicate, subject, message,
+  // kind:'embed_degraded'}` entry per degraded embed — writeExtraction uses
+  // this to fold assertion embed-warnings into the SAME DIVERGENCE-line
+  // channel (formatIntentDivergenceLines) decisions embed-warnings already use.
+  const embedSkipped = (db && typeof db.supportsEmbeddingColumns === 'function' && !db.supportsEmbeddingColumns())
+    || !!opts.embeddingsOptedOut;
+  const embedResult = embedSkipped
+    ? { vectorLiteral: null, providerId: null, warning: null }
+    : await embedForWrite(db, canonSubject, {
+        embedder: opts.embedder,
+        embedderProviderId: opts.embedderProviderId,
+        timeoutMs: opts.embedTimeoutMs,
+      });
+  if (embedResult.warning && Array.isArray(opts.warnSink)) {
+    opts.warnSink.push({
+      predicate: ass.predicate,
+      subject: canonSubject,
+      message: embedResult.warning,
+      kind: 'embed_degraded',
+    });
+  }
+
   // Wrap suppress+INSERT in an explicit transaction (atomicity requirement I-A mechanism-a).
   //
   // PR-B: supersession is enriched via db.buildSupersessionUpdate() which sets:
@@ -5063,15 +5465,44 @@ async function writeAssertionWithSupersession(db, projectId, ass, sessionId, reg
     // RETURNING id: harmless addition for every existing caller (none of them
     // destructure the query result today) — cm#231's opts.returnRow path uses
     // it to fetch the full row below, inside the same transaction, before COMMIT.
-    const insertResult = await db.query(
-      `INSERT INTO assertions
-         (project_id, subject, predicate, object, confidence, source, session_id,
-          last_reinforced, valid_at, tier, consolidated_at, corroboration_count)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now(), $8, ${consolidatedAtSql}, $9)
-       RETURNING id`,
-      [projectId, canonSubject, ass.predicate, ass.object, conf, source, sessionId,
-       newTier, newCorrob]
-    );
+    //
+    // Embedding columns are included ONLY when embedResult actually produced
+    // a vector (mirrors memory-upsert.js's upsertDecisionRow convention
+    // exactly) — never referenced at all when embedForWrite failed soft, so
+    // a DB with the embedding column genuinely absent (pgvector not
+    // installed / gated DDL skipped) never sees a 42703 on the common,
+    // no-provider-configured path (the byte-identical-SQL case every
+    // pre-existing test exercises). When a vector WAS produced but the
+    // column is unexpectedly absent (a live but pgvector-degraded DB with a
+    // provider configured anyway), the 42703 is reclassified to a named
+    // EmbeddingColumnAbsentError below, same as decisions.
+    const hasEmbedding = embedResult.vectorLiteral !== null;
+    const insertSql = hasEmbedding
+      ? `INSERT INTO assertions
+           (project_id, subject, predicate, object, confidence, source, session_id,
+            last_reinforced, valid_at, tier, consolidated_at, corroboration_count,
+            embedding, embedded_by_provider_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now(), $8, ${consolidatedAtSql}, $9, $10::halfvec, $11)
+         RETURNING id`
+      : `INSERT INTO assertions
+           (project_id, subject, predicate, object, confidence, source, session_id,
+            last_reinforced, valid_at, tier, consolidated_at, corroboration_count)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now(), $8, ${consolidatedAtSql}, $9)
+         RETURNING id`;
+    const insertParams = hasEmbedding
+      ? [projectId, canonSubject, ass.predicate, ass.object, conf, source, sessionId,
+         newTier, newCorrob, embedResult.vectorLiteral, embedResult.providerId]
+      : [projectId, canonSubject, ass.predicate, ass.object, conf, source, sessionId,
+         newTier, newCorrob];
+
+    let insertResult;
+    try {
+      insertResult = await db.query(insertSql, insertParams);
+    } catch (err) {
+      const embedErr = classifyEmbeddingWriteError(err, 'assertions');
+      if (embedErr) throw embedErr;
+      throw err;
+    }
 
     if (opts.returnRow) {
       const insertedId = insertResult && insertResult.rows && insertResult.rows[0]
@@ -5265,7 +5696,8 @@ function printOpenThreadDuplicates(duplicates) {
  * @param {string} [projectBasename] - path.basename(root) for tldr/quick_reference subjects.
  * @returns {Promise<Array<{predicate: string, subject: string, message: string}>>}
  */
-async function persistSessionIntent(db, projectId, payload, projectBasename) {
+async function persistSessionIntent(db, projectId, payload, projectBasename, opts) {
+  opts = opts || {};
   const divergences = [];
   const sessionId = (typeof payload.session_id === 'string' && payload.session_id.length > 0)
     ? payload.session_id
@@ -5355,7 +5787,8 @@ async function persistSessionIntent(db, projectId, payload, projectBasename) {
           source:     'user_stated',
         },
         sessionId,
-        registryMode
+        registryMode,
+        { embeddingsOptedOut: opts.embeddingsOptedOut }
       );
     } catch (err) {
       process.stderr.write(
@@ -5452,10 +5885,71 @@ async function writeExtraction(db, projectId, payload, opts) {
   // (project_id, subject, predicate, object) duplicates.
   const registryMode = await getSetting(db, projectId, 'predicate_registry_mode', 'permissive');
 
+  // init-embeddability: an operator who ran `init --no-embeddings` (or had a
+  // prior opt-out auto-honored) gets NO per-write degraded warnings at all —
+  // see isEmbeddingsOptedOut's own header for why this is distinct from
+  // cm#230's existing "no provider configured" decisions[] contract, which
+  // is intentionally unaffected by this flag (that scenario is a live
+  // default row temporarily absent, not an operator opt-out).
+  const embeddingsOptedOut = await isEmbeddingsOptedOut(db, projectId);
+
+  // init-embeddability A2, corrected per markdown-thin-pointer review: the
+  // spec's own wording is "fail-soft to NULL with a counted WARN on the
+  // close summary line" — a COUNT on stdout, never a per-row line persisted
+  // into handoff.md. An earlier revision of this code routed assertion
+  // embed-degraded warnings through the SAME channel decisions[]'s
+  // pre-existing (and intentionally unchanged) embed-degraded contract
+  // uses (formatIntentDivergenceLines -> handoff.md's "## Degraded"
+  // section) — assertions are written far more densely than decisions in
+  // ordinary sessions, and on any DB with no default embedding provider
+  // configured (the common case for a project that has never opted into
+  // embeddings via `init`) that put ONE full-length DIVERGENCE line per
+  // assertion into the persisted markdown body, blowing the 512-byte
+  // thin-pointer budget (test/north-star/test-retrieval-economy.js INV5a,
+  // test/north-star/test-lifecycle-roundtrip.js test B — both fixtures
+  // bootstrap via ns-harness.js's applySchemas(), never `cmdInit`, so no
+  // embeddings_opt_out row is ever stamped for them). Fixed: an
+  // embed-degraded warning now ONLY increments a count (assertionEmbedWarnCount,
+  // surfaced solely via the stdout Done-line's embed_warnings figure below)
+  // — it is NEVER pushed into intentDivergences/the markdown body. A
+  // GENUINE write failure (the row did not persist at all — a real DB
+  // error, e.g. EmbeddingColumnAbsentError on a pgvector-degraded target
+  // with a provider configured anyway) is a categorically different,
+  // comparatively rare event and still surfaces via the existing
+  // NOT-PERSISTED divergence channel, matching persistSessionIntent's own
+  // established convention for the same class of failure. The per-item
+  // try/catch here is itself a NEW safety net (writeAssertionWithSupersession
+  // could previously only throw on a genuine DB error, which — pre-existing
+  // behavior — was never caught in this specific loop): with embedding
+  // columns now sometimes referenced, a genuinely pgvector-degraded target
+  // must degrade this ONE assertion, never abort the rest of
+  // entities/edges/decisions/session-intent processing still to come.
+  const assertionWriteFailures = [];
+  let assertionEmbedWarnCount = 0;
   for (const ass of (payload.assertions || [])) {
     if (!ass.subject || !ass.predicate || !ass.object) continue;
-    const inserted = await writeAssertionWithSupersession(db, projectId, ass, sessionId, registryMode);
-    if (inserted) assertionsWritten++;
+    try {
+      const embedWarnSink = [];
+      const inserted = await writeAssertionWithSupersession(
+        db, projectId, ass, sessionId, registryMode,
+        { warnSink: embedWarnSink, embeddingsOptedOut }
+      );
+      if (inserted) assertionsWritten++;
+      assertionEmbedWarnCount += embedWarnSink.length;
+    } catch (err) {
+      process.stderr.write(
+        `[handoff] assertion write failed for predicate "${ass.predicate}" subject "${ass.subject}" (non-fatal): ${err.message}\n`
+      );
+      // No `kind` — renders as a standard "NOT PERSISTED" divergence line
+      // (this row genuinely failed to write — a real, comparatively rare
+      // operational failure worth surfacing in the markdown body, unlike
+      // the routine embed-degraded case above which is counted, not quoted).
+      assertionWriteFailures.push({
+        predicate: ass.predicate,
+        subject: ass.subject,
+        message: err.message,
+      });
+    }
   }
 
   // Edges
@@ -5481,11 +5975,27 @@ async function writeExtraction(db, projectId, payload, opts) {
   // that has not yet run ensureSchemaCurrent — e.g. the async queue-drain
   // path, which does not call it), or degrades its embedding (fail-soft,
   // per write-time-embed.js's own header) never blocks the rest of this
-  // decisions[] array OR the rest of the close. Failures/degradations are
-  // collected into decisionDivergences and merged into the SAME
-  // intentDivergences channel cm#227 built for session-intent persistence
-  // failures below — one DIVERGENCE-line mechanism, not two.
+  // decisions[] array OR the rest of the close. Genuine NOT-PERSISTED
+  // failures are collected into decisionDivergences and merged into the
+  // SAME intentDivergences channel cm#227 built for session-intent
+  // persistence failures below — one DIVERGENCE-line mechanism, not two.
+  //
+  // markdown-thin-pointer fix (same bug class the assertions loop above was
+  // just fixed for): an embed-degraded warning is an OPERATIONAL signal
+  // (the row persisted fine; only its embedding is NULL), not a content
+  // divergence — it must never be rendered as a per-row DIVERGENCE line
+  // into handoff.md's body. This previously ALSO routed through
+  // decisionDivergences/formatIntentDivergenceLines exactly like
+  // assertions did, and is the identical bug: a close with several
+  // decisions[] rows on a project with no default embedding provider
+  // configured blows the 512-byte thin-pointer budget the same way (a
+  // real pipeline_judge close with 5 decisions did exactly this). Fixed
+  // identically: embed-degraded now only increments a count
+  // (decisionEmbedWarnCount, folded into the SAME stdout embed_warnings
+  // figure assertions already contribute to) — never pushed into
+  // decisionDivergences. Genuine write/validation failures are unchanged.
   let decisionsWritten = 0;
+  let decisionEmbedWarnCount = 0;
   const decisionDivergences = [];
   for (const row of (payload.decisions || [])) {
     if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
@@ -5503,14 +6013,7 @@ async function writeExtraction(db, projectId, payload, opts) {
     try {
       const { warning } = await persistDecisionRow(db, projectId, row);
       decisionsWritten++;
-      if (warning) {
-        decisionDivergences.push({
-          predicate: `decision:${row.topic}`,
-          subject: row.topic,
-          message: warning,
-          kind: 'embed_degraded',
-        });
-      }
+      if (warning) decisionEmbedWarnCount++;
     } catch (err) {
       process.stderr.write(`[handoff] decision write failed for topic "${topicForMessage}" (non-fatal): ${err.message}\n`);
       decisionDivergences.push({
@@ -5569,7 +6072,7 @@ async function writeExtraction(db, projectId, payload, opts) {
   let intentDivergences = [];
   try {
     const projectBasename = (opts && opts.projectBasename) ? opts.projectBasename : null;
-    intentDivergences = await persistSessionIntent(db, projectId, payload, projectBasename);
+    intentDivergences = await persistSessionIntent(db, projectId, payload, projectBasename, { embeddingsOptedOut });
   } catch (intentErr) {
     process.stderr.write(`[handoff] persistSessionIntent outer error (non-fatal): ${intentErr.message}\n`);
     intentDivergences = [{ predicate: '(unknown)', subject: '(unknown)', message: intentErr.message }];
@@ -5582,7 +6085,12 @@ async function writeExtraction(db, projectId, payload, opts) {
   // returned on its own for any caller that wants the raw count.
   return {
     entitiesWritten, assertionsWritten, edgesWritten, decisionsWritten,
-    intentDivergences: [...intentDivergences, ...decisionDivergences],
+    intentDivergences: [...intentDivergences, ...decisionDivergences, ...assertionWriteFailures],
+    // Count-only (never rendered into handoff.md — see the header comments
+    // above assertionWriteFailures/assertionEmbedWarnCount and
+    // decisionEmbedWarnCount for why).
+    assertionEmbedWarnCount,
+    decisionEmbedWarnCount,
   };
 }
 
@@ -5870,6 +6378,14 @@ async function cmdCheckpoint(args) {
   // and in handoff.md's Degraded section. Non-fatal: exit code is unchanged.
   const intentDivergences     = extraction.intentDivergences || [];
   const divergenceLines       = formatIntentDivergenceLines(intentDivergences);
+  // A3: counted WARN on the summary Done line (stdout only — never rendered
+  // into handoff.md; see writeExtraction's own header comments on
+  // assertionEmbedWarnCount/decisionEmbedWarnCount for why embed-degraded
+  // warnings for BOTH assertions and decisions are counts here, never
+  // per-row markdown DIVERGENCE lines — that was the exact body-budget bug
+  // this figure's computation used to reintroduce for decisions).
+  const embedWarnCount = (extraction.assertionEmbedWarnCount || 0) + (extraction.decisionEmbedWarnCount || 0);
+  const embedWarnSuffix = embedWarnCount > 0 ? `, embed_warnings: ${embedWarnCount}` : '';
   const checkpointDegradedSection = divergenceLines.length > 0
     ? '\n\n## Degraded\n' + divergenceLines.map((l) => `- ${l}`).join('\n')
     : '';
@@ -5908,7 +6424,7 @@ async function cmdCheckpoint(args) {
   for (const line of divergenceLines) {
     console.log(`  ${line}`);
   }
-  console.log(`\nDone: handoff:checkpoint — project=${path.basename(root)} marker=${projectId} — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written, decisions: ${decisionsWritten} (session marker preserved for continued attribution)`);
+  console.log(`\nDone: handoff:checkpoint — project=${path.basename(root)} marker=${projectId} — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written, decisions: ${decisionsWritten}${embedWarnSuffix} (session marker preserved for continued attribution)`);
 }
 
 // ── resolveSessionId ──────────────────────────────────────────────────────────
@@ -6573,7 +7089,7 @@ async function cmdClose(args) {
   }
 
   // ── Synchronous path (default) — unchanged behavior ──────────────────────────
-  const { entitiesWritten, assertionsWritten, edgesWritten, decisionsWritten, intentDivergences } =
+  const { entitiesWritten, assertionsWritten, edgesWritten, decisionsWritten, intentDivergences, assertionEmbedWarnCount, decisionEmbedWarnCount } =
     await writeExtraction(db, projectId, payload, { projectBasename: path.basename(root) });
   // cm#227: DIVERGENCE lines for any session_tldr/open_thread/quick_reference
   // persistence failure — surfaced below in the Done summary AND rendered into
@@ -6581,6 +7097,10 @@ async function cmdClose(args) {
   // on purpose: this must never affect close_degraded_exit_mode='strict' — only
   // visibility changes, never the exit code.
   const intentDivergenceLines = formatIntentDivergenceLines(intentDivergences);
+  // A3: counted WARN on the summary Done line (stdout only — never rendered
+  // into handoff.md) — see cmdCheckpoint's identical computation for rationale.
+  const embedWarnCount  = (assertionEmbedWarnCount || 0) + (decisionEmbedWarnCount || 0);
+  const embedWarnSuffix = embedWarnCount > 0 ? `, embed_warnings: ${embedWarnCount}` : '';
 
   // Surface CLAUDE.md promotion candidates (conf >= 9, user_stated, multi-session).
   // Hole A fix: col-minus-col epoch difference now goes through a port method so both
@@ -7325,7 +7845,7 @@ async function cmdClose(args) {
     );
   }
 
-  console.log(`\nDone: handoff:close — project=${path.basename(root)} marker=${projectId} — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written, decisions: ${decisionsWritten}, session marker cleared`);
+  console.log(`\nDone: handoff:close — project=${path.basename(root)} marker=${projectId} — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written, decisions: ${decisionsWritten}${embedWarnSuffix}, session marker cleared`);
 
   // L4: Exit-code gate — 'strict' mode exits 3 when any subsystem ran degraded.
   if (_degradedSubsystems.length > 0 && closeDegradedExitMode === 'strict') {
@@ -8463,6 +8983,86 @@ async function cmdRetire(args) {
   console.log(`\nDone: handoff:retire — ${retiredCount} row(s) retired`);
 }
 
+// ── backfill-embeddings ───────────────────────────────────────────────────────
+
+/**
+ * cmdBackfillEmbeddings — init-embeddability spec: dry-run by default,
+ * `--apply` performs writes. Thin CLI wrapper around
+ * scripts/lib/backfill-embeddings.js's runBackfillEmbeddings — ALL actual
+ * logic (column-shape gate, mixed-provider refusal, keyset-paginated batches,
+ * SQLite N/A branch) lives there, reused by the thinned
+ * scripts/dev/backfill-assertion-embeddings.js pointer too.
+ *
+ * Usage:
+ *   node scripts/handoff.js backfill-embeddings [--apply] [--table=assertions|decisions|all]
+ *       [--batch-size=N] [--project-id=<id>] [--force-mixed-provider]
+ */
+async function cmdBackfillEmbeddings(args) {
+  console.log('Running: handoff:backfill-embeddings\n');
+
+  const apply = args.includes('--apply');
+  const forceMixedProvider = args.includes('--force-mixed-provider');
+  const tableFlag = (args.find((a) => a.startsWith('--table=')) || '').slice('--table='.length) || 'all';
+  const batchFlag = (args.find((a) => a.startsWith('--batch-size=')) || '').slice('--batch-size='.length);
+  const batchSize = batchFlag ? parseInt(batchFlag, 10) : 10;
+  const projectIdFlag = (args.find((a) => a.startsWith('--project-id=')) || '').slice('--project-id='.length) || null;
+
+  if (batchFlag && (isNaN(batchSize) || batchSize < 1)) {
+    console.error('  --batch-size must be a positive integer');
+    process.exit(2);
+  }
+
+  let db;
+  try {
+    db = await connectHandoff();
+  } catch (err) {
+    console.error(`DB connection failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  let result;
+  try {
+    result = await runBackfillEmbeddings({
+      db,
+      projectId: projectIdFlag,
+      table: tableFlag,
+      apply,
+      batchSize,
+      forceMixedProvider,
+      log: (line) => console.log(line),
+    });
+  } catch (err) {
+    await db.end();
+    console.error(`  backfill-embeddings failed: ${err.message}`);
+    process.exit(1);
+  }
+  await db.end();
+
+  if (!result.ok) {
+    console.log(`  [FAIL]  ${result.refusal.reason}: ${result.refusal.detail}`);
+    console.log(`\nDone: handoff:backfill-embeddings — refused (${result.refusal.reason})`);
+    process.exit(1);
+  }
+
+  for (const t of result.tables) {
+    if (t.embeddableRows === 0 && t.note) {
+      console.log(`  ${t.table}: 0 embeddable rows (${t.note})`);
+      continue;
+    }
+    if (result.dryRun) {
+      console.log(`  ${t.table}: ${t.actionableNull} to embed, ${t.noTextNull} no-embeddable-text (expected, never actionable), ${t.alreadyEmbedded} already embedded, ${t.total} total`);
+      if (t.sampleSubjects && t.sampleSubjects.length > 0) {
+        console.log(`    sample subjects (up to 5):`);
+        for (const s of t.sampleSubjects) console.log(`      ${String(s).slice(0, 120)}`);
+      }
+    } else {
+      console.log(`  ${t.table}: embedded=${t.embedded} already-embedded=${t.alreadyEmbedded} errors=${t.errors} elapsed=${(t.elapsedMs / 1000).toFixed(1)}s (provider="${t.providerName}" id=${t.providerId})`);
+    }
+  }
+
+  console.log(`\nDone: handoff:backfill-embeddings — ${result.dryRun ? 'dry-run (no changes)' : 'apply complete'}`);
+}
+
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -8484,6 +9084,7 @@ async function main() {
     'queue-drain':   () => cmdQueueDrain(rest),
     prune:           () => cmdPrune(rest),
     retire:          () => cmdRetire(rest),
+    'backfill-embeddings': () => cmdBackfillEmbeddings(rest),
   };
 
   if (!sub || !subcommands[sub]) {
@@ -8582,5 +9183,12 @@ if (require.main === module) {
     withSessionMarkerLock,
     findMatchingMarkerIndex,
     latestSessionMarker,
+    // init-embeddability spec — exposed for test/test-init-embeddability.js
+    // and test/test-embed-endpoint-classify.js (no test-side reimplementation
+    // of the readiness/opt-out/backfill logic).
+    computeEmbeddingReadiness,
+    computeEmbeddingNullCounts,
+    isEmbeddingsOptedOut,
+    cmdBackfillEmbeddings,
   };
 }

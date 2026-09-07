@@ -157,7 +157,21 @@ function mkFakeRoot(dbName) {
   return fakeRoot;
 }
 
+/**
+ * init-embeddability spec: `init` now BLOCKs by default when no embed
+ * endpoint is configured; this suite's fixtures configure none (CI has
+ * none available) and are not about embeddability, so bare `init` calls
+ * auto-opt-out via --no-embeddings unless already opted in explicitly.
+ */
+function _initNoEmbeddingsDefault(sub, extraArgs) {
+  const args = extraArgs || [];
+  if (sub !== 'init') return args;
+  if (args.some((a) => a === '--seed-provider' || a === '--no-embeddings' || a === '--allow-remote-embed')) return args;
+  return [...args, '--no-embeddings'];
+}
+
 function runHelper(sub, extraArgs, opts = {}) {
+  extraArgs = _initNoEmbeddingsDefault(sub, extraArgs);
   const fakeRoot = opts.fakeRoot;
   const env = { ...process.env, PROJECT_ROOT: fakeRoot };
   if (opts.deleteEnv) {
