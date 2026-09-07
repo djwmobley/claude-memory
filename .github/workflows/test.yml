@@ -1250,6 +1250,15 @@ jobs:
         # Exercises entity-graph-crud.js against a minimal fake pg client —
         # no Postgres or Ollama required.
         run: node test/test-vector-strip.js
+      - name: Run CLI argument fail-closed tests (A1-A4, incident 2026-09-07)
+        # Total-classification argument gate for every write subcommand
+        # (scripts/lib/cli-args.js): unknown flags / --help exit before any
+        # DB connection is attempted; close/checkpoint --json - with empty
+        # stdin rejects; a bare close/checkpoint rejects unless --allow-empty
+        # opts in; loader-stop confirmed untouched by the gate. No live
+        # Postgres required — every case runs against a scratch project root
+        # with no DB config at all.
+        run: node test/test-cli-args-fail-closed.js
       - name: Run schema suppression_kind ordering tests
         # Regression guard for the suppression_kind CHECK constraint ordering bug (#124):
         #   T1  Field-report repro: apply schema fresh; INSERT one row per suppression_kind

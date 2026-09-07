@@ -74,6 +74,26 @@ was not met; it does not block the close or change its exit code.
 |---|---|---|
 | `--json` | off | Read extraction payload from stdin (JSON). Accepts `--json` alone or the legacy `--json -` form. |
 | `--dry-run` | off | Parse and validate the payload, run read-only validation/probe passes, print a summary of what WOULD be written, then exit without any DB mutations or handoff.md update. |
+| `--allow-empty` | off | Explicit opt-in for a close with no `--json` payload (or `--json` with genuinely empty stdin). Without it, either shape now rejects (exit 2) rather than silently running an extraction-empty close. |
+
+## Argument handling is fail-closed
+
+Every token on the command line after `close` is checked against the flags above before
+anything else runs — see `scripts/lib/cli-args.js`. An unrecognized flag (including a typo
+or an unsupported flag like `--help` was, before this was fixed) exits 2 with
+`unknown argument "<flag>" for close; run "handoff.js close --help"` and performs **no**
+DB connection or file write. Likewise, running `close` with no `--json` payload at all, or
+with `--json -` piped from genuinely empty stdin, now exits 2 (`--json - requires a payload
+on stdin`) instead of proceeding with a default empty payload — that used to be an
+extraction-empty close that looked like it did something. Pass `--allow-empty` to opt into
+that no-payload close deliberately. `--dry-run` without `--json` is accepted on its own,
+with no `--allow-empty` needed, since it performs no writes; `--json -` still requires a
+stdin payload otherwise, and `--allow-empty` is the only other way to close without one.
+`close --help` / `-h` prints this command's usage and
+exits 0 with no side effect. This closes a real incident: an unrecognized flag being
+silently ignored let a write command run for real with no extraction data, clearing the
+session marker and overwriting handoff.md. `checkpoint` has the identical fail-closed
+argument handling and `--allow-empty` opt-in (see `commands/handoff/checkpoint.md`).
 
 ## Extraction instructions for Claude
 

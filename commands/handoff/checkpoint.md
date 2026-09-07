@@ -18,6 +18,16 @@ This writes one `session_note` assertion (subject = project basename, confidence
 |---|---|---|
 | `--json` | off | Read full extraction payload from stdin (JSON). Mutually exclusive with `--note`. |
 | `--note "<text>"` | — | Write a single `session_note` assertion without requiring a JSON payload. Text is stored verbatim. |
+| `--allow-empty` | off | Explicit opt-in for a checkpoint with no `--note` and no `--json` payload (or `--json` with genuinely empty stdin). Without it, any of those shapes rejects (exit 2) rather than silently writing nothing while looking like it did. |
+
+## Argument handling is fail-closed
+
+Every token after `checkpoint` is validated against the flags above before anything else
+runs (`scripts/lib/cli-args.js`) — an unrecognized flag exits 2 with `unknown argument
+"<flag>" for checkpoint; run "handoff.js checkpoint --help"` and performs no DB connection
+or file write. `checkpoint --help` / `-h` prints usage and exits 0 with no side effect. See
+`commands/handoff/close.md` for the incident this closes (an unrecognized flag being
+silently ignored let a write command run for real with no payload).
 
 ## Extraction instructions for Claude
 
