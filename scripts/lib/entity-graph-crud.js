@@ -35,6 +35,7 @@
 
 const { normalizeForCompare } = require('./normalize-text.js');
 const { cardinalityOf } = require('./predicate-registry.js');
+const { embedForWrite } = require('./write-time-embed.js');
 
 class EntityGraphCrudError extends Error {
   constructor(code, message, details) {
@@ -398,22 +399,67 @@ async function assertionUpdate(client, args) {
     }
     const old = guardRes.rows[0];
 
-    const insertRes = await client.query(
-      `INSERT INTO assertions
-         (project_id, subject, predicate, object, confidence, source, source_model, agent_id,
-          session_id, last_reinforced, valid_at, tier)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now(), $10)
-       RETURNING *`,
-      [
-        projectId, old.subject, old.predicate, newObject,
-        Number.isInteger(confidence) ? confidence : old.confidence,
-        source || old.source,
-        sourceModel || old.source_model,
-        agentId || old.agent_id,
-        resolvedSessionId,
-        handoffLib.ASSERTION_TIER_PROBATIONARY,
-      ]
-    );
+    // cm#embed-heal-on-touch E4: write-time embed for the new row born from
+    // this supersession — previously this INSERT set no embedding column at
+    // all, leaving the row NULL until the NEXT heal-on-touch/backfill pass
+    // (this is exactly the gap live-observed on pipeline_judge: 2 NULL rows
+    // written via a non-close path while status still read READY). Matches
+    // backfill-embeddings.js's own TEXT_JS_BUILDER.assertions (`row.subject`)
+    // — the subject is unchanged by an assertionUpdate (only object changes),
+    // so this embeds the SAME text a later backfill pass would have computed,
+    // never a second, drifting embed-text definition. Fail-soft: embedForWrite
+    // never throws; a degraded embed leaves embedding/embedded_by_provider_id
+    // NULL and the row is still written (row-never-lost promise preserved).
+    // Blind spot (documented in the PR, not hidden): this call sits INSIDE
+    // the open transaction/row-lock — unlike writeAssertionWithSupersession's
+    // pre-transaction embed — because the embed text (old.subject) is only
+    // known after the guard UPDATE above resolves it; a slow/degraded
+    // provider therefore holds this single row's lock for up to its bounded
+    // timeout rather than zero time. Narrow, single-row impact; not a
+    // wider-table lock.
+    const embedSkipped = client && typeof client.supportsEmbeddingColumns === 'function' && !client.supportsEmbeddingColumns();
+    const embedResult = embedSkipped
+      ? { vectorLiteral: null, providerId: null }
+      : await embedForWrite(client, old.subject, {});
+
+    // Conditional column list — mirrors writeAssertionWithSupersession's own
+    // hasEmbedding branch (handoff.js) byte-for-byte: SQLite declares NO
+    // embedding/embedded_by_provider_id columns on ANY table, so a query
+    // naming them there is a hard SQL error, not merely a NULL write.
+    const hasEmbedding = embedResult.vectorLiteral !== null;
+    const insertSql = hasEmbedding
+      ? `INSERT INTO assertions
+           (project_id, subject, predicate, object, confidence, source, source_model, agent_id,
+            session_id, last_reinforced, valid_at, tier, embedding, embedded_by_provider_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now(), $10, $11::halfvec, $12)
+         RETURNING *`
+      : `INSERT INTO assertions
+           (project_id, subject, predicate, object, confidence, source, source_model, agent_id,
+            session_id, last_reinforced, valid_at, tier)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now(), $10)
+         RETURNING *`;
+    const insertParams = hasEmbedding
+      ? [
+          projectId, old.subject, old.predicate, newObject,
+          Number.isInteger(confidence) ? confidence : old.confidence,
+          source || old.source,
+          sourceModel || old.source_model,
+          agentId || old.agent_id,
+          resolvedSessionId,
+          handoffLib.ASSERTION_TIER_PROBATIONARY,
+          embedResult.vectorLiteral,
+          embedResult.providerId,
+        ]
+      : [
+          projectId, old.subject, old.predicate, newObject,
+          Number.isInteger(confidence) ? confidence : old.confidence,
+          source || old.source,
+          sourceModel || old.source_model,
+          agentId || old.agent_id,
+          resolvedSessionId,
+          handoffLib.ASSERTION_TIER_PROBATIONARY,
+        ];
+    const insertRes = await client.query(insertSql, insertParams);
 
     await client.query('COMMIT');
     return { oldId: targetId, newRow: insertRes.rows[0] };

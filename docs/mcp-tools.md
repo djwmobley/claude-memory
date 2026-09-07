@@ -127,7 +127,14 @@ free. The offline `migrate-07-reembed-corpus.js` backfill and the newer
 `node scripts/handoff.js backfill-embeddings` subcommand (dry-run by
 default; catalog-driven, provenance-stamped, mixed-provider-refusing) both
 remain available to close the gap for rows written before a provider was
-configured, or while one was down. **Not
+configured, or while one was down. `ensureSchemaCurrent` ALSO now drains
+this backlog automatically — `scripts/lib/embed-heal.js`'s
+`runEmbedHealIfNeeded` runs a bounded batch (`project_settings.embed_heal_batch`,
+default 250, `0` disables) within a 2-second wall-clock budget on every
+`status`/`resume`/`init`/`close`/`checkpoint` touch, under a non-blocking
+advisory lock, reusing `runBackfillEmbeddings` (never a second embed-loop
+implementation) — see `docs/how-memory-works.md`'s "Heal-on-touch" section.
+`handoff_status`'s result now includes `last_embed_heal`. **Not
 detected**: a target where the `vector` extension itself is present but an
 old version lacks the `halfvec` type (or `hnsw`/`halfvec_cosine_ops`) — the
 DO block's `EXCEPTION WHEN OTHERS` still degrades gracefully there, but

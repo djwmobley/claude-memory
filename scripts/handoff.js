@@ -97,6 +97,7 @@ const {
 } = require('./lib/embedding-provider');
 const { embedForWrite, classifyEmbeddingWriteError } = require('./lib/write-time-embed');
 const { runBackfillEmbeddings }                    = require('./lib/backfill-embeddings');
+const { runEmbedHealIfNeeded, DEFAULT_BATCH_PER_TOUCH: DEFAULT_EMBED_HEAL_BATCH } = require('./lib/embed-heal');
 const { execFileSync }                             = require('child_process');
 const crypto                                       = require('crypto');
 const { REALITY_CHECKS, runVerifyDispatch }        = require('./lib/reality-checks');
@@ -3155,6 +3156,20 @@ async function ensureSchemaCurrent(db, projectId, opts = {}) {
   const result = await ensureSchemaCurrentCore(db, projectId, opts);
   if (result && (result.reason === 'current' || result.reason === 'applied')) {
     await runIntentKeyMigrationIfNeeded(db, projectId, opts);
+    // cm#embed-heal-on-touch (categorical fix for the writer-bypasses-write-
+    // time-embed NULL backlog — see embed-heal.js header): only runs after
+    // schema is confirmed healed, same gating as the intent-key migration
+    // immediately above. Fail-soft/never-throws/bounded — see that module's
+    // own doc. Deliberately NOT folded into this function's return value,
+    // for the same reason runIntentKeyMigrationIfNeeded isn't: it never
+    // alters the {applied, reason, detail} contract callers/tests pin.
+    try {
+      await runEmbedHealIfNeeded(db, projectId, opts);
+    } catch (embedHealErr) {
+      // Belt-and-suspenders — runEmbedHealIfNeeded already never throws,
+      // but a touch must never fail because of this side-effecting step.
+      process.stderr.write(`[handoff] embed-heal check failed (non-fatal): ${embedHealErr.message}\n`);
+    }
   }
   return result;
 }
@@ -4184,6 +4199,20 @@ async function cmdStatus(args = []) {
     // Non-fatal — status still reports the rest even if this probe fails.
   }
 
+  // cm#embed-heal-on-touch (E3): surface the heal-on-touch step's own
+  // record from THIS invocation's ensureSchemaCurrent call above (or a
+  // prior touch's, if this touch's heal didn't run — e.g. schema wasn't
+  // 'current'/'applied'). Total-classification outcome string, never a
+  // guess: absent entirely means the heal step has never recorded anything
+  // for this project (e.g. SQLite backend, or first touch after upgrade).
+  let lastEmbedHeal = null;
+  try {
+    const rawHeal = await getSetting(db, projectId, 'last_embed_heal', null);
+    if (rawHeal) lastEmbedHeal = JSON.parse(rawHeal);
+  } catch (_) {
+    // Non-fatal — status still reports the rest even if this probe fails.
+  }
+
   // cm#263 (loader-stop verifiability): surface the last recorded SessionEnd
   // (loader-stop) outcome — the only persisted evidence that the hook ever
   // fired, since it otherwise only writes to stderr, which the harness
@@ -4241,6 +4270,7 @@ async function cmdStatus(args = []) {
       schema_apply_degraded: schemaDegraded,
       embedding_readiness: embeddingReadiness,
       embedding_null_counts: embeddingNullCounts,
+      last_embed_heal: lastEmbedHeal,
       last_loader_stop: lastLoaderStop,
     };
     if (breakdownFlag && breakdown !== null) {
@@ -4273,9 +4303,19 @@ async function cmdStatus(args = []) {
   if (schemaDegraded) {
     console.log(`  schema_apply:     DEGRADED (${schemaDegraded.reason || 'unknown'}) — see detail: ${JSON.stringify(schemaDegraded.detail)}`);
   }
-  console.log(`  embedding:        ${embeddingReadiness}`);
+  // E3: a nonzero NULL backlog must never render as a bare "READY" — that
+  // reads as "nothing to do" when there is in fact a drain in progress.
+  const embeddingBacklog = embeddingNullCounts.assertions + embeddingNullCounts.decisions;
+  if (embeddingReadiness === 'READY' && embeddingBacklog > 0) {
+    console.log(`  embedding:        READY (backlog ${embeddingBacklog}, healing ≤${DEFAULT_EMBED_HEAL_BATCH}/touch)`);
+  } else {
+    console.log(`  embedding:        ${embeddingReadiness}`);
+  }
   if (embeddingNullCounts.assertions > 0 || embeddingNullCounts.decisions > 0) {
     console.log(`  embedding NULLs:  assertions=${embeddingNullCounts.assertions}, decisions=${embeddingNullCounts.decisions}`);
+  }
+  if (lastEmbedHeal && (lastEmbedHeal.embedded > 0 || lastEmbedHeal.outcome === 'partial')) {
+    console.log(`  embedding heal:   embedded ${lastEmbedHeal.embedded}, remaining ${lastEmbedHeal.remaining != null ? lastEmbedHeal.remaining : '?'} (${lastEmbedHeal.outcome})`);
   }
 
   if (breakdownFlag && breakdown !== null) {
