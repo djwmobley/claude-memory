@@ -39,6 +39,7 @@ const {
   LOCAL_PROVIDER_NATIVE_DIMS,
   LOCAL_PROVIDER_STORED_DIMS,
 } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'embedding-provider.js'));
+const { withIsolatedHandoffBaseDir } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'test-env-isolation.js'));
 
 let passed = 0, failed = 0;
 async function test(label, fn) {
@@ -206,21 +207,14 @@ knowledge:
   // Isolating this is required for hermetic CI correctness: if an operator's
   // real machine ever has a genuine ~/.claude/handoff-embed.json (the whole
   // point of this feature), these "must resolve to NONE" tests must not
-  // accidentally read it.
-  function withIsolatedBaseDir(fn) {
-    const saved = process.env.HANDOFF_BASE_DIR;
-    const isolatedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'embed-endpoint-basedir-'));
-    process.env.HANDOFF_BASE_DIR = isolatedDir;
-    try {
-      return fn();
-    } finally {
-      if (saved === undefined) delete process.env.HANDOFF_BASE_DIR; else process.env.HANDOFF_BASE_DIR = saved;
-      fs.rmSync(isolatedDir, { recursive: true, force: true });
-    }
-  }
+  // accidentally read it. Uses the shared withIsolatedHandoffBaseDir helper
+  // (scripts/lib/test-env-isolation.js) rather than a local copy, so every
+  // in-process caller isolates identically — see that module's header
+  // comment for the root cause (PR #267 and this file's own Section 3
+  // "NONE" cases, fixed the same way below).
 
-  await test('resolveConfiguredEmbedEndpoint: (c) NONE (null) when neither is set (isolated from any real user-scope file)', () => {
-    withIsolatedBaseDir(() => {
+  await test('resolveConfiguredEmbedEndpoint: (c) NONE (null) when neither is set (isolated from any real user-scope file)', async () => {
+    await withIsolatedHandoffBaseDir(() => {
       const root = makeTmpProjectRoot(`
 project:
   name: test
@@ -230,8 +224,8 @@ project:
     });
   });
 
-  await test('resolveConfiguredEmbedEndpoint: NEVER falls back to the hardcoded localhost:8800 runtime default (isolated from any real user-scope file)', () => {
-    withIsolatedBaseDir(() => {
+  await test('resolveConfiguredEmbedEndpoint: NEVER falls back to the hardcoded localhost:8800 runtime default (isolated from any real user-scope file)', async () => {
+    await withIsolatedHandoffBaseDir(() => {
       // No projectRoot at all, no pipeline.yml, empty env — must be null, not
       // the shared.js/embed.js runtime convenience default.
       const result = resolveConfiguredEmbedEndpoint({ env: {} });
@@ -250,8 +244,8 @@ project:
 
   console.log('\n=== Section 2b: user-scope handoff-embed.json precedence + corruption handling ===');
 
-  await test('resolveConfiguredEmbedEndpointDetailed: (c) user-scope wins when neither pipeline.yml nor env is set', () => {
-    withIsolatedBaseDir(() => {
+  await test('resolveConfiguredEmbedEndpointDetailed: (c) user-scope wins when neither pipeline.yml nor env is set', async () => {
+    await withIsolatedHandoffBaseDir(() => {
       fs.writeFileSync(path.join(process.env.HANDOFF_BASE_DIR, 'handoff-embed.json'), JSON.stringify({ vllm_embed_url: 'http://127.0.0.1:8800' }), 'utf8');
       const result = resolveConfiguredEmbedEndpointDetailed({ env: {} });
       assertEqual(result.url, 'http://127.0.0.1:8800');
@@ -259,8 +253,8 @@ project:
     });
   });
 
-  await test('resolveConfiguredEmbedEndpointDetailed: pipeline.yml (a) still wins over user-scope (c)', () => {
-    withIsolatedBaseDir(() => {
+  await test('resolveConfiguredEmbedEndpointDetailed: pipeline.yml (a) still wins over user-scope (c)', async () => {
+    await withIsolatedHandoffBaseDir(() => {
       fs.writeFileSync(path.join(process.env.HANDOFF_BASE_DIR, 'handoff-embed.json'), JSON.stringify({ vllm_embed_url: 'http://127.0.0.1:9999' }), 'utf8');
       const root = makeTmpProjectRoot(`
 knowledge:
@@ -272,8 +266,8 @@ knowledge:
     });
   });
 
-  await test('resolveConfiguredEmbedEndpointDetailed: env (b) still wins over user-scope (c)', () => {
-    withIsolatedBaseDir(() => {
+  await test('resolveConfiguredEmbedEndpointDetailed: env (b) still wins over user-scope (c)', async () => {
+    await withIsolatedHandoffBaseDir(() => {
       fs.writeFileSync(path.join(process.env.HANDOFF_BASE_DIR, 'handoff-embed.json'), JSON.stringify({ vllm_embed_url: 'http://127.0.0.1:9999' }), 'utf8');
       const result = resolveConfiguredEmbedEndpointDetailed({ env: { VLLM_EMBED_URL: 'http://localhost:9002' } });
       assertEqual(result.url, 'http://localhost:9002');
@@ -281,8 +275,8 @@ knowledge:
     });
   });
 
-  await test('resolveConfiguredEmbedEndpointDetailed: a user-scope REMOTE value is returned as-is — classification/BLOCK gating happens downstream, never a separate unguarded path (adversary finding #4)', () => {
-    withIsolatedBaseDir(() => {
+  await test('resolveConfiguredEmbedEndpointDetailed: a user-scope REMOTE value is returned as-is — classification/BLOCK gating happens downstream, never a separate unguarded path (adversary finding #4)', async () => {
+    await withIsolatedHandoffBaseDir(() => {
       fs.writeFileSync(path.join(process.env.HANDOFF_BASE_DIR, 'handoff-embed.json'), JSON.stringify({ vllm_embed_url: 'http://0.0.0.0:8800' }), 'utf8');
       const result = resolveConfiguredEmbedEndpointDetailed({ env: {} });
       assertEqual(result.url, 'http://0.0.0.0:8800');
@@ -290,16 +284,16 @@ knowledge:
     });
   });
 
-  await test('_readUserScopeEmbedUrl: absent file -> url:null, corrupt:false', () => {
-    withIsolatedBaseDir(() => {
+  await test('_readUserScopeEmbedUrl: absent file -> url:null, corrupt:false', async () => {
+    await withIsolatedHandoffBaseDir(() => {
       const result = _readUserScopeEmbedUrl();
       assertEqual(result.url, null);
       assertEqual(result.corrupt, false);
     });
   });
 
-  await test('_readUserScopeEmbedUrl: corrupt JSON (adversary finding #6) -> url:null, corrupt:true, never throws', () => {
-    withIsolatedBaseDir(() => {
+  await test('_readUserScopeEmbedUrl: corrupt JSON (adversary finding #6) -> url:null, corrupt:true, never throws', async () => {
+    await withIsolatedHandoffBaseDir(() => {
       fs.writeFileSync(path.join(process.env.HANDOFF_BASE_DIR, 'handoff-embed.json'), '{ not: valid json,,', 'utf8');
       const result = _readUserScopeEmbedUrl();
       assertEqual(result.url, null);
@@ -307,8 +301,8 @@ knowledge:
     });
   });
 
-  await test('_readUserScopeEmbedUrl: valid JSON but missing/non-string vllm_embed_url -> url:null, corrupt:false', () => {
-    withIsolatedBaseDir(() => {
+  await test('_readUserScopeEmbedUrl: valid JSON but missing/non-string vllm_embed_url -> url:null, corrupt:false', async () => {
+    await withIsolatedHandoffBaseDir(() => {
       fs.writeFileSync(path.join(process.env.HANDOFF_BASE_DIR, 'handoff-embed.json'), JSON.stringify({ other_key: 123 }), 'utf8');
       const result = _readUserScopeEmbedUrl();
       assertEqual(result.url, null);
@@ -321,12 +315,18 @@ knowledge:
   console.log('\n=== Section 3: seedLocalEmbeddingProvider (fake db — no live Postgres/SQLite) ===');
 
   await test('seedLocalEmbeddingProvider: NONE endpoint → no write, NOTE line, seeded=false', async () => {
-    const db = fakeDb();
-    const result = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: {} });
-    assertEqual(result.classification, 'NONE');
-    assertEqual(result.seeded, false);
-    assertEqual(db.calls.length, 0, 'NONE must never touch the db');
-    assert(result.lines.some((l) => l.includes('[NOTE]') && l.includes('not configured/invalid')), 'expected the NONE/INVALID NOTE line');
+    // Isolated: see the shared withIsolatedHandoffBaseDir helper's header
+    // comment (scripts/lib/test-env-isolation.js) — env:{} alone does not
+    // stop this from falling through to a developer machine's REAL
+    // ~/.claude/handoff-embed.json.
+    await withIsolatedHandoffBaseDir(async () => {
+      const db = fakeDb();
+      const result = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: {} });
+      assertEqual(result.classification, 'NONE');
+      assertEqual(result.seeded, false);
+      assertEqual(db.calls.length, 0, 'NONE must never touch the db');
+      assert(result.lines.some((l) => l.includes('[NOTE]') && l.includes('not configured/invalid')), 'expected the NONE/INVALID NOTE line');
+    });
   });
 
   await test('seedLocalEmbeddingProvider: INVALID endpoint → no write, same NOTE bucket as NONE', async () => {
@@ -498,15 +498,19 @@ knowledge:
   });
 
   await test('seedLocalEmbeddingProvider: A1 probe is NEVER invoked when the endpoint is NONE (no probeTransport needed to reach the NONE branch)', async () => {
-    const db = fakeDb();
-    // No probeTransport supplied at all — if the implementation tried to
-    // probe here, VllmEmbeddingProvider's real transport would be used and
-    // this test would hang/fail on network; passing with zero db.query calls
-    // AND zero errors proves the probe path was never reached for NONE.
-    const result = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: {} });
-    assertEqual(result.classification, 'NONE');
-    assertEqual(result.seeded, false);
-    assertEqual(db.calls.length, 0);
+    // Isolated: see the shared withIsolatedHandoffBaseDir helper's header
+    // comment (scripts/lib/test-env-isolation.js).
+    await withIsolatedHandoffBaseDir(async () => {
+      const db = fakeDb();
+      // No probeTransport supplied at all — if the implementation tried to
+      // probe here, VllmEmbeddingProvider's real transport would be used and
+      // this test would hang/fail on network; passing with zero db.query calls
+      // AND zero errors proves the probe path was never reached for NONE.
+      const result = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: {} });
+      assertEqual(result.classification, 'NONE');
+      assertEqual(result.seeded, false);
+      assertEqual(db.calls.length, 0);
+    });
   });
 
   console.log(`\n─── Results ──────────────────────────────────────`);

@@ -2238,6 +2238,7 @@ async function runSection20() {
   console.log('\n=== Section 20: embedding_providers local-seed INSERT via SQLite dialect (init-seed-local-provider) ===');
 
   const { seedLocalEmbeddingProvider, LOCAL_PROVIDER_NAME, LOCAL_PROVIDER_NATIVE_DIMS } = require('./lib/embedding-provider');
+  const { withIsolatedHandoffBaseDir } = require('./lib/test-env-isolation');
 
   // Deterministic, network-free probeTransport (init-embeddability
   // amendment A1) — see test/test-embed-endpoint-classify.js's identical
@@ -2297,7 +2298,13 @@ async function runSection20() {
   await test('seedLocalEmbeddingProvider: NONE (unconfigured) endpoint writes nothing', async () => {
     const db = await makeSchemaDb();
     try {
-      const result = await seedLocalEmbeddingProvider({ db, dialect: 'sqlite', env: {} });
+      // Isolated: env:{} alone does not stop resolveConfiguredEmbedEndpoint's
+      // precedence step (c) from falling through to a developer machine's
+      // REAL ~/.claude/handoff-embed.json (resolveBaseDir reads
+      // process.env.HANDOFF_BASE_DIR directly, not opts.env) -- see PR #267
+      // and scripts/lib/test-env-isolation.js's header comment.
+      const result = await withIsolatedHandoffBaseDir(() =>
+        seedLocalEmbeddingProvider({ db, dialect: 'sqlite', env: {} }));
       assertEqual(result.classification, 'NONE');
       assertFalse(result.seeded);
       const { rows } = await db.query('SELECT * FROM embedding_providers');
