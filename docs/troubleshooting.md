@@ -188,6 +188,8 @@ Correct example (Mac/Linux):
 }
 ```
 
+`loader-stop` only writes to stderr, which Claude Code's hook harness swallows — there is no visible confirmation it ran. To check whether it has actually fired, look at the `last SessionEnd (loader-stop): <ts> <outcome>` line in `/handoff:status` output (`never` means it has not fired yet for this project).
+
 ---
 
 ### Windows: values in `pipeline.yml` look garbled, or connection settings don't match what you typed

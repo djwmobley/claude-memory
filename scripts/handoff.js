@@ -3931,6 +3931,18 @@ async function cmdStatus(args = []) {
     // Non-fatal — status still reports the rest even if this probe fails.
   }
 
+  // cm#263 (loader-stop verifiability): surface the last recorded SessionEnd
+  // (loader-stop) outcome — the only persisted evidence that the hook ever
+  // fired, since it otherwise only writes to stderr, which the harness
+  // swallows.
+  let lastLoaderStop = null;
+  try {
+    const lastLoaderStopRaw = await getSetting(db, projectId, 'last_loader_stop', null);
+    if (lastLoaderStopRaw) lastLoaderStop = JSON.parse(lastLoaderStopRaw);
+  } catch (_) {
+    // Non-fatal — status still reports the rest even if this probe fails.
+  }
+
   await db.end();
 
   const lastClose = fm.last_close || 'never';
@@ -3976,6 +3988,7 @@ async function cmdStatus(args = []) {
       schema_apply_degraded: schemaDegraded,
       embedding_readiness: embeddingReadiness,
       embedding_null_counts: embeddingNullCounts,
+      last_loader_stop: lastLoaderStop,
     };
     if (breakdownFlag && breakdown !== null) {
       out.breakdown = breakdown;
@@ -3999,6 +4012,7 @@ async function cmdStatus(args = []) {
   console.log(`  edges:            ${liveCounts.edges}`);
   console.log(`  contracts:        ${contracts}`);
   console.log(`  session_active:   ${sipDisplay.prose}`);
+  console.log(`  last SessionEnd (loader-stop): ${lastLoaderStop ? `${lastLoaderStop.ts} ${lastLoaderStop.outcome}${lastLoaderStop.session_id ? ` [session ${lastLoaderStop.session_id}]` : ''}` : 'never'}`);
   if (packagingLine) console.log(packagingLine);
   if (schemaHealedLine) {
     console.log(`  schema_heal:      ${schemaHealedLine}`);
@@ -6938,6 +6952,15 @@ async function resolveSessionId(db, projectId, payload) {
  * marker is left for the SessionEnd/late-close paths to reconcile.
  * Lock-guarded (withSessionMarkerLock) — same read-modify-write race as
  * every other marker mutation site.
+ *
+ * loader-stop verifiability (cm#263): when an explicit close actually clears
+ * a marker for THIS session, also stamp a single project_settings breadcrumb
+ * row ('last_explicit_close' = {session_id, ts}) — the ONLY signal that lets
+ * a later SessionEnd (loader-stop) distinguish "no marker because an explicit
+ * close already ran this session" (outcome explicit_close_present) from "no
+ * marker because none was ever set" (outcome no_marker). One overwritten row,
+ * not one row per session — no unbounded growth. Fail-soft: a failure to
+ * stamp the breadcrumb never blocks or fails the close itself.
  */
 async function clearSessionMarkerForClose(db, projectId, payload) {
   const currentSessionId =
@@ -6946,13 +6969,22 @@ async function clearSessionMarkerForClose(db, projectId, payload) {
       : (typeof process.env.CLAUDE_CODE_SESSION_ID === 'string' && process.env.CLAUDE_CODE_SESSION_ID.length > 0)
         ? process.env.CLAUDE_CODE_SESSION_ID
         : null;
-  await withSessionMarkerLock(db, projectId, async () => {
+  const cleared = await withSessionMarkerLock(db, projectId, async () => {
     const markers = await getSessionMarkers(db, projectId);
     const idx = findMatchingMarkerIndex(markers, currentSessionId);
-    if (idx === -1) return;
+    if (idx === -1) return false;
     const remaining = markers.filter((_, i) => i !== idx);
     await setSessionMarkers(db, projectId, remaining);
+    return true;
   });
+  if (cleared) {
+    try {
+      await setSetting(db, projectId, 'last_explicit_close', JSON.stringify({
+        session_id: currentSessionId || null,
+        ts: new Date().toISOString(),
+      }));
+    } catch (_) { /* fail-soft: breadcrumb loss never blocks close */ }
+  }
 }
 
 // ── close ─────────────────────────────────────────────────────────────────────
@@ -8436,6 +8468,31 @@ async function cmdPurge(args) {
  *
  * Defensive contract: ALWAYS exits 0. Any error is logged to stderr and the
  * hook exits silently — we must never break session teardown.
+ *
+ * cm#263 (loader-stop verifiability): SessionEnd firing was previously
+ * invisible except via stderr, which the harness swallows — there was no
+ * persisted evidence it ran. Every exit path AFTER the S1 filter above (i.e.
+ * every real SessionEnd-shaped invocation — a Stop-shaped or malformed
+ * invocation still pays zero I/O, per S1, and records nothing) now upserts
+ * one project_settings row, key 'last_loader_stop', value
+ * {ts, session_id, outcome}, outcome in one of:
+ *   'implicit_close_recorded'  — this session's marker matched; implicit
+ *                                 close ran.
+ *   'explicit_close_present'   — no marker matched, and the last recorded
+ *                                 clearSessionMarkerForClose breadcrumb
+ *                                 (project_settings 'last_explicit_close')
+ *                                 names THIS session — an explicit close (or
+ *                                 checkpoint-queue enqueue) already ran.
+ *   'no_marker'                — no marker matched and no matching explicit-
+ *                                 close breadcrumb either (loader-hook never
+ *                                 fired for this session, project not
+ *                                 provisioned, or implicit_close=disabled).
+ *   'error:<short>'            — an exception was caught before an outcome
+ *                                 could be determined.
+ * Persistence is fail-soft end to end (see persistOutcome): a failure to
+ * write the row NEVER changes this hook's exit code or behavior. It also
+ * cannot happen at all when there is no DB connection or no project id to
+ * key the row on — see BLIND SPOTS in the PR description.
  */
 async function cmdLoaderStop() {
   // S1 — total classification BEFORE any file or DB I/O.
@@ -8447,19 +8504,44 @@ async function cmdLoaderStop() {
   const currentSessionId = resolveHookSessionId(hookPayload);
 
   let db = null;
-  try {
-    const projectId   = resolveProjectId();
-    const handoffPath = resolveHandoffMdPath(projectId);
+  let projectId = null;
+  let dbEnded = false;
 
-    // Defensive: handoff.md absent means project is not provisioned — no-op.
-    if (!fs.existsSync(handoffPath)) {
-      process.exit(0);
+  async function persistOutcome(outcome) {
+    if (!db || !projectId || dbEnded) return;
+    try {
+      await setSetting(db, projectId, 'last_loader_stop', JSON.stringify({
+        ts: new Date().toISOString(),
+        session_id: currentSessionId || null,
+        outcome,
+      }));
+    } catch (_) { /* fail-soft: persistence failure never changes exit code */ }
+  }
+
+  async function endDb() {
+    if (db && !dbEnded) {
+      dbEnded = true;
+      try { await db.end(); } catch (_) { /* ignore */ }
     }
+  }
+
+  try {
+    projectId = resolveProjectId();
+    const handoffPath = resolveHandoffMdPath(projectId);
 
     try {
       db = await connectHandoff();
     } catch (err) {
+      // No DB connection means the outcome row cannot be persisted either —
+      // there is nowhere to write it. Still fail-soft: exit 0 regardless.
       process.stderr.write(`handoff loader-stop: DB connection failed (${err.message}) — skipping\n`);
+      process.exit(0);
+    }
+
+    // Defensive: handoff.md absent means project is not provisioned — no-op.
+    if (!fs.existsSync(handoffPath)) {
+      await persistOutcome('no_marker');
+      await endDb();
       process.exit(0);
     }
 
@@ -8467,7 +8549,8 @@ async function cmdLoaderStop() {
     // a full no-op here.
     const implicitClose = await getSetting(db, projectId, 'implicit_close', 'enabled');
     if (implicitClose === 'disabled') {
-      await db.end();
+      await persistOutcome('no_marker');
+      await endDb();
       process.exit(0);
     }
 
@@ -8494,11 +8577,25 @@ async function cmdLoaderStop() {
     });
 
     if (!acted) {
-      await db.end();
+      // Disambiguate "explicit close already ran this session" from "no
+      // marker was ever set" via the clearSessionMarkerForClose breadcrumb.
+      let outcome = 'no_marker';
+      try {
+        const lastExplicitRaw = await getSetting(db, projectId, 'last_explicit_close', null);
+        if (lastExplicitRaw && currentSessionId) {
+          const lastExplicit = JSON.parse(lastExplicitRaw);
+          if (lastExplicit && lastExplicit.session_id === currentSessionId) {
+            outcome = 'explicit_close_present';
+          }
+        }
+      } catch (_) { /* malformed breadcrumb — fall back to no_marker */ }
+      await persistOutcome(outcome);
+      await endDb();
       process.exit(0);
     }
 
-    await db.end();
+    await persistOutcome('implicit_close_recorded');
+    await endDb();
 
     const projectName = path.basename(findProjectRoot());
     process.stderr.write(`Done: handoff SessionEnd hook — project=${projectName} marker=${projectId} — implicit close written, session marker cleared\n`);
@@ -8507,9 +8604,8 @@ async function cmdLoaderStop() {
   } catch (err) {
     // Catch-all: log to stderr, never break session teardown.
     process.stderr.write(`handoff loader-stop error: ${err.message}\n`);
-    if (db) {
-      try { await db.end(); } catch (_) { /* ignore */ }
-    }
+    await persistOutcome(`error:${String(err.message || err).slice(0, 80)}`);
+    await endDb();
     process.exit(0);
   }
 }
