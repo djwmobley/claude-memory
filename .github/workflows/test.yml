@@ -1269,6 +1269,20 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run schema-heal total-classification tests (cm#185-schema-heal)
+        # A fingerprint-current DB can still be missing an ungated/gated
+        # object (S1), and cmdInit never recorded schema_fingerprint at all
+        # (S2) -- 16 tests covering S1(a)-(d)'s total classification on the
+        # fast path, S2's init fingerprint-recording (with its own fatal
+        # policy UNCHANGED), S3's status/backfill-embeddings healing, S4's
+        # always-current degraded-row semantics, plus one regression test
+        # per accepted adversary finding (#1, #3, #5-#10). Every fixture is
+        # its own throwaway DB/dir; never touches claude_memory_eval_test.
+        run: node test/test-schema-heal.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run host-agnostic naming tests
         # Regression guard for #135 (host-agnostic naming generalization):
         #   M1-M7  Dual-marker same-directory classification (new .memory-engine

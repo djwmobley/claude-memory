@@ -160,13 +160,18 @@ async function testB_BringForwardFromOldIndex() {
   let projectId;
   try {
     await createDb(dbName, projectDir);
-    // NOTE: `handoff init` (setupProject) applies schema via applyAdditiveSchema
-    // directly and does NOT write project_settings.schema_fingerprint (that is
-    // ensureSchemaCurrent's exclusive job — cmdInit is a separate, one-shot
-    // fresh-apply path). So a just-inited DB starts with NO fingerprint row;
-    // this test establishes one first (simulating "a live DB last touched at
-    // the current epoch"), THEN reverts the index and downgrades that
-    // fingerprint's epoch to simulate a live pre-cm#227 DB.
+    // NOTE (cm#185-schema-heal, S2): `handoff init` (setupProject) now
+    // records project_settings.schema_fingerprint itself (previously it
+    // never did — cmdInit was a separate, one-shot fresh-apply path that
+    // left every project immediately BEHIND on its own first subsequent
+    // touch; see the schema-heal PR). So a just-inited DB now starts WITH a
+    // current fingerprint row already — this "baseline" touch is a no-op
+    // fast-path 'current' in that case, or 'applied' if init's own write
+    // somehow didn't happen (e.g. an integrity index failed, per R-6); this
+    // test only needs the row to EXIST afterward (either reason leaves a
+    // valid, current row), never a specific one of the two. It then reverts
+    // the index and downgrades that fingerprint's epoch to simulate a live
+    // pre-cm#227 DB.
     projectId = await setupProject(dbName, projectDir);
 
     db = await pgConnect(dbName);
@@ -174,10 +179,11 @@ async function testB_BringForwardFromOldIndex() {
     const { PostgresAdapter } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'db-seam.js'));
     const adapter = new PostgresAdapter(db);
 
-    // Establish a baseline current fingerprint (absent -> applied).
+    // Establish a baseline current fingerprint (init already wrote it, so
+    // this is typically a 'current' no-op; 'applied' is also acceptable).
     const baseline = await handoffLib.ensureSchemaCurrent(adapter, projectId, { silent: true });
-    if (baseline.reason !== 'applied') {
-      throw new Error(`precondition failed: baseline ensureSchemaCurrent expected reason='applied', got ${JSON.stringify(baseline)}`);
+    if (baseline.reason !== 'applied' && baseline.reason !== 'current') {
+      throw new Error(`precondition failed: baseline ensureSchemaCurrent expected reason 'applied' or 'current', got ${JSON.stringify(baseline)}`);
     }
 
     // Now simulate a live pre-cm#227 DB: revert to the OLD (raw-object) index
