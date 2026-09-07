@@ -110,7 +110,22 @@ const SPECS = {
     summary: 'Retire (suppress) an assertion by subject/predicate/object (dry-run by default; --apply to execute).',
     flags: {
       '--apply':        { kind: 'boolean', desc: 'Execute the retire (default is dry-run/report-only).' },
-      '--replace-with': { kind: 'boolean', desc: 'Not supported — rejected by cmdRetire with a specific error.' },
+      // scripts/handoff.js:10124-10130 — cmdRetire checks presence via
+      // `args.includes('--replace-with')` (so, from cmdRetire's own body
+      // alone, this reads as boolean). BUT the real invocation
+      // (scripts/test-l5-directive-retirement.js:561-563, T10) is
+      // `--replace-with new-rule` -- the value token that follows is never
+      // read by cmdRetire (it exits before reaching positional handling),
+      // yet it is still a real token in a real invocation that this gate
+      // must classify. Declaring it 'boolean' left "new-rule" unclassified
+      // -> the gate rejected it as an extra positional with a GENERIC
+      // "unknown argument" message, preempting cmdRetire's own specific
+      // "--replace-with is not supported" error (T10 asserts stderr
+      // mentions "--replace-with"). Declaring it 'value' here consumes
+      // "new-rule" as this flag's value (unvalidated, per this module's
+      // contract), lets the token classify successfully, and hands control
+      // to cmdRetire, which then produces its own specific rejection.
+      '--replace-with': { kind: 'value',   desc: 'Not supported — cmdRetire rejects with a specific error naming --replace-with (scripts/handoff.js:10124).' },
       '--subject':      { kind: 'value',   desc: 'Subject to retire (required).' },
       '--predicate':    { kind: 'value',   desc: 'Predicate to retire (required).' },
       '--object':       { kind: 'value',   desc: 'Object to retire (optional).' },

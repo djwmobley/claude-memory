@@ -228,6 +228,35 @@ const LEGIT_INVOCATIONS = [
   { cmd: 'prune',      argv: ['--suppressed'],      cite: 'scripts/smoketest-handoff.js:6259' },
   { cmd: 'prune',      argv: ['--suppressed', '--suppression-kind', 'superseded', '--apply'], cite: 'scripts/smoketest-handoff.js:6293' },
   { cmd: 'prune',      argv: ['--suppressed', '--include-pinned', '--apply'], cite: 'scripts/smoketest-handoff.js:6376' },
+
+  // retire — no commands/handoff/*.md caller exists; every shape below is
+  // lifted from scripts/test-l5-directive-retirement.js's runHandoff() calls
+  // (PR #272 review round 2: retire/backfill-embeddings had no .md-sourced
+  // ACCEPT cases at all).
+  { cmd: 'retire', argv: ['--subject', 'rule-engine', '--predicate', 'must_do'], cite: 'scripts/test-l5-directive-retirement.js:414 (T5)' },
+  { cmd: 'retire', argv: ['--subject', 'system', '--predicate', 'must_do', '--object', 'check-A', '--apply'], cite: 'scripts/test-l5-directive-retirement.js:440-442 (T6)' },
+  { cmd: 'retire', argv: ['--subject', 'agent', '--predicate', 'never_uses', '--apply'], cite: 'scripts/test-l5-directive-retirement.js:475-477 (T7)' },
+  { cmd: 'retire', argv: ['--subject', 'some-subject', '--predicate', 'uses'], cite: 'scripts/test-l5-directive-retirement.js:505-507 (T8)' },
+  { cmd: 'retire', argv: ['--subject', 'config-service', '--predicate', 'policy', '--object', 'no-debug-in-prod', '--apply'], cite: 'scripts/test-l5-directive-retirement.js:525-528 (T9)' },
+  // T10's own point: this shape (--replace-with VALUE) must be ACCEPTED by
+  // the gate -- cmdRetire itself is the one that rejects it, with its own
+  // specific message. See the dedicated precedence test below for the
+  // full spawnSync round-trip proving cmdRetire's message wins.
+  { cmd: 'retire', argv: ['--subject', 'x', '--predicate', 'must_do', '--object', 'old-rule', '--replace-with', 'new-rule'], cite: 'scripts/test-l5-directive-retirement.js:560-563 (T10)' },
+
+  // backfill-embeddings — no commands/handoff/*.md or spawnSync-based test
+  // caller exists (test-init-embeddability.js calls runBackfillEmbeddings()
+  // as an in-process library function, not through the CLI argv path).
+  // Shapes below are derived directly from cmdBackfillEmbeddings's own body
+  // (scripts/handoff.js:10290-10298) plus the two documented forms in
+  // docs/how-memory-works.md:259/282 and docs/mcp-tools.md:127 (outside
+  // commands/handoff/*.md, but the only documented CLI usage that exists).
+  { cmd: 'backfill-embeddings', argv: [], cite: 'scripts/handoff.js:10293 apply=false default; docs/how-memory-works.md:259 (dry-run)' },
+  { cmd: 'backfill-embeddings', argv: ['--apply'], cite: 'scripts/handoff.js:10293; docs/how-memory-works.md:282' },
+  { cmd: 'backfill-embeddings', argv: ['--force-mixed-provider'], cite: 'scripts/handoff.js:10294' },
+  { cmd: 'backfill-embeddings', argv: ['--table=assertions'], cite: 'scripts/handoff.js:10295' },
+  { cmd: 'backfill-embeddings', argv: ['--batch-size=25'], cite: 'scripts/handoff.js:10296-10297' },
+  { cmd: 'backfill-embeddings', argv: ['--project-id=00000000-0000-0000-0000-000000000000'], cite: 'scripts/handoff.js:10298' },
 ];
 
 function assertAccepted(cmd, argv, cite) {
@@ -251,6 +280,30 @@ function assertAccepted(cmd, argv, cite) {
 for (const { cmd, argv, cite } of LEGIT_INVOCATIONS) {
   test(`ACCEPT ${cmd} ${JSON.stringify(argv)} — ${cite}`, () => assertAccepted(cmd, argv, cite));
 }
+
+// ── Precedence: a command's own specific rejection message must win over
+// the gate's generic "unknown argument" message (PR #272 review round 2) ──
+//
+// scripts/test-l5-directive-retirement.js's T10 spawns the real CLI with
+// `retire --subject x --predicate must_do --object old-rule --replace-with
+// new-rule` and asserts exit 2 with stderr mentioning "--replace-with" --
+// cmdRetire's own dedicated message (scripts/handoff.js:10124-10130), not
+// this gate's generic rejection. Declaring --replace-with as a 'value' flag
+// (see scripts/lib/cli-args.js SPECS.retire) lets the whole argv classify
+// successfully at the gate, so cmdRetire is actually invoked and its own
+// check fires. Reproduced here as a full spawnSync round-trip (not just the
+// in-process classifier check above) so a regression that reintroduces the
+// generic-message-wins bug is caught even if someone "fixes" the gate a
+// different way that still happens to pass the pure classifier check.
+test('retire --replace-with precedence: cmdRetire\'s own message wins, not a generic "unknown argument"', () => {
+  const r = runCli([
+    'retire', '--subject', 'x', '--predicate', 'must_do',
+    '--object', 'old-rule', '--replace-with', 'new-rule',
+  ]);
+  assert(r.status === 2, `expected exit 2, got ${r.status} (stderr: ${(r.stderr || '').slice(0, 300)})`);
+  assert(r.stderr.includes('--replace-with'), `expected cmdRetire's specific --replace-with message, got: ${r.stderr}`);
+  assert(!r.stderr.includes('unknown argument'), `the gate's generic message must NOT preempt cmdRetire's specific one, got: ${r.stderr}`);
+});
 
 // ── A4: loader-stop (SessionEnd implicit-close) is untouched by this gate ───
 // loader-stop is intentionally NOT declared in scripts/lib/cli-args.js
