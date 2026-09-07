@@ -34,7 +34,7 @@ const path = require('path');
 
 const PROJECT_ROOT   = path.resolve(__dirname, '..');
 const HANDOFF_SCRIPT = path.join(PROJECT_ROOT, 'scripts', 'handoff.js');
-const { WRITE_SUBCOMMANDS } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'cli-args.js'));
+const { WRITE_SUBCOMMANDS, SPECS, enforceTotalClassification } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'cli-args.js'));
 
 let passed = 0, failed = 0;
 const failures = [];
@@ -169,6 +169,88 @@ test('close --allow-empty (no --json) proceeds past the empty-payload guard to a
   assert(combined.includes(CONNECTION_MARKER),
     `--allow-empty should reach connectHandoff() (and fail there, since this scratch root has no DB config) -- got: ${combined.slice(0, 300)}`);
 });
+
+// ── Legitimate-invocation acceptance tests ───────────────────────────────────
+//
+// PR #272 review finding: SPECS.init declared no positional, so the REAL
+// `init <name> -y` shape (used by scripts/handoff-mcp.mjs's toolHandoffInit
+// AND documented in commands/handoff/init.md) was itself rejected by the
+// new gate — a false positive from a spec that was guessed instead of
+// derived from cmdInit's own body (scripts/handoff.js:4273:
+// `args.find((a) => !a.startsWith('-'))` — an OPTIONAL project-name
+// positional). Fixed in scripts/lib/cli-args.js.
+//
+// Every entry below is a REAL argv shape lifted verbatim from one of the
+// three caller classes named in the review: (a) scripts/handoff-mcp.mjs's
+// spawn arrays, (b) a `handoff.js <cmd> ...` line in commands/handoff/*.md,
+// (c) a spawnSync argv in .github/workflows/test.yml-run scripts/test-*.js
+// or test/**/*.js. Each must be ACCEPTED (enforceTotalClassification must
+// return normally, not call process.exit) — a regression here means a real
+// caller would start failing exactly like the PR #272 finding.
+const LEGIT_INVOCATIONS = [
+  // (a) scripts/handoff-mcp.mjs
+  { cmd: 'init',       argv: ['my-project', '-y'], cite: 'scripts/handoff-mcp.mjs:366 toolHandoffInit (name given)' },
+  { cmd: 'init',       argv: ['-y'],               cite: 'scripts/handoff-mcp.mjs:366 toolHandoffInit (no name)' },
+  { cmd: 'checkpoint', argv: ['--json', '-'],       cite: 'scripts/handoff-mcp.mjs:343 runPayloadSubcommand (checkpoint)' },
+  { cmd: 'close',      argv: ['--json', '-'],       cite: 'scripts/handoff-mcp.mjs:343 runPayloadSubcommand (close)' },
+
+  // (b) commands/handoff/*.md
+  { cmd: 'init',       argv: ['--seed-provider'],  cite: 'commands/handoff/init.md:53' },
+  { cmd: 'init',       argv: [],                    cite: 'commands/handoff/init.md:116' },
+  { cmd: 'init',       argv: ['my-project'],        cite: 'commands/handoff/init.md:119' },
+  { cmd: 'init',       argv: ['-y'],                cite: 'commands/handoff/init.md:122' },
+  { cmd: 'init',       argv: ['my-project', '-y'],  cite: 'commands/handoff/init.md:125' },
+  { cmd: 'drop',       argv: [],                    cite: 'commands/handoff/drop.md:64' },
+  { cmd: 'checkpoint', argv: ['--note', 'discovered session_id threading gap in L2 path'], cite: 'commands/handoff/checkpoint.md:10' },
+  { cmd: 'checkpoint', argv: ['--json'],            cite: 'commands/handoff/checkpoint.md:153' },
+  { cmd: 'checkpoint', argv: ['--json', '-'],       cite: 'commands/handoff/checkpoint.md:156' },
+  { cmd: 'close',      argv: ['--json'],            cite: 'commands/handoff/close.md:308' },
+  { cmd: 'close',      argv: ['--json', '-'],       cite: 'commands/handoff/close.md:311' },
+  { cmd: 'close',      argv: ['--json', '--dry-run'], cite: 'commands/handoff/close.md:314' },
+  { cmd: 'purge',      argv: ['--yes'],             cite: 'commands/handoff/purge.md:75' },
+  { cmd: 'purge',      argv: ['--dry-run'],         cite: 'commands/handoff/purge.md:78' },
+  { cmd: 'promote',    argv: ['42'],                cite: 'commands/handoff/promote.md:65' },
+  { cmd: 'promote',    argv: ['--subject', 'vLLM', '--predicate', 'is_model', '--object', 'Qwen3-Embedding-8B'], cite: 'commands/handoff/promote.md:68' },
+  { cmd: 'promote',    argv: ['--subject', 'vLLM', '--predicate', 'is_model'], cite: 'commands/handoff/promote.md:71' },
+  { cmd: 'promote',    argv: ['--demote', '42'],    cite: 'commands/handoff/promote.md:74' },
+  { cmd: 'queue-drain', argv: [],                   cite: 'commands/handoff/close.md:17' },
+
+  // (c) .github/workflows/test.yml-run scripts/test-*.js and test/**/*.js
+  { cmd: 'init',       argv: ['-y', '--no-embeddings'], cite: 'scripts/smoketest-handoff.js:1408 (et al.), scripts/test-init-atomic.js:149, test/handoff/test-session-marker-concurrency.js:147' },
+  { cmd: 'init',       argv: [],                    cite: 'scripts/test-init-confirm.js:280 (NO -y, C3 non-TTY safe-fail case)' },
+  { cmd: 'init',       argv: ['--no-embeddings'],   cite: 'scripts/test-init-confirm.js:102 finalArgs (--no-embeddings already present)' },
+  { cmd: 'init',       argv: ['--allow-remote-embed'], cite: 'scripts/test-init-confirm.js:102 finalArgs (--allow-remote-embed already present)' },
+  { cmd: 'promote',    argv: ['5'],                 cite: 'scripts/smoketest-handoff.js:1617' },
+  { cmd: 'close',      argv: ['--json', '-'],       cite: 'scripts/test-async-queue.js:135' },
+  { cmd: 'checkpoint', argv: ['--json', '-'],       cite: 'scripts/test-async-queue.js:152' },
+  { cmd: 'queue-drain', argv: [],                   cite: 'scripts/test-async-queue.js:169 (no extraArgs)' },
+  { cmd: 'prune',      argv: [],                    cite: 'scripts/smoketest-handoff.js:6233' },
+  { cmd: 'prune',      argv: ['--suppressed'],      cite: 'scripts/smoketest-handoff.js:6259' },
+  { cmd: 'prune',      argv: ['--suppressed', '--suppression-kind', 'superseded', '--apply'], cite: 'scripts/smoketest-handoff.js:6293' },
+  { cmd: 'prune',      argv: ['--suppressed', '--include-pinned', '--apply'], cite: 'scripts/smoketest-handoff.js:6376' },
+];
+
+function assertAccepted(cmd, argv, cite) {
+  const origExit = process.exit;
+  let exitCalledWith = null;
+  process.exit = (code) => {
+    exitCalledWith = code;
+    throw new Error(`__ENFORCE_EXIT_${code}__`);
+  };
+  try {
+    enforceTotalClassification(cmd, argv);
+  } catch (e) {
+    if (!/^__ENFORCE_EXIT_/.test(e.message)) throw e;
+  } finally {
+    process.exit = origExit;
+  }
+  assert(exitCalledWith === null,
+    `${cite}: real argv ${JSON.stringify([cmd, ...argv])} must be ACCEPTED, but the classifier called process.exit(${exitCalledWith})`);
+}
+
+for (const { cmd, argv, cite } of LEGIT_INVOCATIONS) {
+  test(`ACCEPT ${cmd} ${JSON.stringify(argv)} — ${cite}`, () => assertAccepted(cmd, argv, cite));
+}
 
 // ── A4: loader-stop (SessionEnd implicit-close) is untouched by this gate ───
 // loader-stop is intentionally NOT declared in scripts/lib/cli-args.js

@@ -37,6 +37,15 @@ const SPECS = {
       '--no-embeddings':      { kind: 'boolean', desc: 'Opt this project out of embedding backfill.' },
       '--clear-opt-out':      { kind: 'boolean', desc: 'Clear a previously-set embeddings opt-out.' },
     },
+    // scripts/handoff.js:4273 — `args.find((a) => !a.startsWith('-'))`: the
+    // first non-flag token is an OPTIONAL project-name override (falls back
+    // to path.basename(root) when absent). Order-independent relative to
+    // the boolean flags above (e.g. `init myname -y` and `init -y myname`
+    // both work against the real function), so this is a genuine positional,
+    // not a value bound to a specific flag. scripts/handoff-mcp.mjs:366's
+    // toolHandoffInit emits exactly `['init', name, '-y']` when a name is
+    // given.
+    positionals: { max: 1, desc: 'project name override (optional) — scripts/handoff.js:4273.' },
   },
   drop: {
     summary: 'Archive prior session memory and start fresh.',
