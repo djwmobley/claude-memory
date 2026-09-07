@@ -42,20 +42,51 @@ const {
 // scripts/handoff.js's module.exports for this literal-fixture test.
 const { renderTemplate } = require(path.join(PROJECT_ROOT, 'scripts', 'handoff.js'));
 
-// Frozen snapshot of templates/project-claude-md.tpl as it stood at 8314367
-// (pre-#263: {{HANDOFF_MD_PATH}} / {{PROJECT_ROOT}}/scripts/handoff.js
-// placeholders, both filesystem-absolute when rendered by that era's
-// cmdInit). Frozen inline rather than read via `git show 8314367:...` so the
+// Verbatim snapshot of templates/project-claude-md.tpl as it stood at commit
+// 8314367 (`git show 8314367:templates/project-claude-md.tpl`) — the last
+// commit before #263's portable-path rewrite: {{HANDOFF_MD_PATH}} /
+// {{PROJECT_ROOT}}/scripts/handoff.js placeholders, both filesystem-absolute
+// when rendered by that era's cmdInit. Embedded byte-for-byte (all 36 lines,
+// not a reduced excerpt) rather than read via `git show` at test time so the
 // fixture does not depend on git history being present in a shallow CI
 // checkout.
 const LEGACY_TPL_8314367 =
-  '# {{PROJECT_NAME}}\n\n{{PROJECT_DESCRIPTION}}\n\n---\n\n' +
-  '## Skill invocation hints\n\n- `/handoff:status` — status\n\n---\n\n' +
-  '## Key paths\n\n' +
+  '# {{PROJECT_NAME}}\n' +
+  '\n' +
+  '{{PROJECT_DESCRIPTION}}\n' +
+  '\n' +
+  '---\n' +
+  '\n' +
+  '## Operating canon (non-negotiable)\n' +
+  '\n' +
+  'These rules are canon. They override convenience, time pressure, and apparent context. Violating them is a workflow bug to be remediated, not a stylistic choice.\n' +
+  '\n' +
+  '1. **Follow the user\'s directions and scope exactly.** When asked to do X, and X has an established definition (a backlog item, a prior handoff, a multi-part deliverable), deliver all of X. Do not silently narrow scope, reinterpret it, or substitute a smaller deliverable. If scope genuinely seems too large or ambiguous, say so and ask — do not shrink it unilaterally.\n' +
+  '2. **Never autonomously defer authorized work to a subsequent session, bundle, or phase.** Deferring in-scope work without explicit user say-so is a bug. Surface genuine design forks as written open questions with a recommended lean; never use deferral or an invented "later phase" as a mechanism to offload work that is in scope now.\n' +
+  '\n' +
+  '---\n' +
+  '\n' +
+  '## Skill invocation hints\n' +
+  '\n' +
+  '- `/handoff:status` — show last close, days since close, entity/assertion counts\n' +
+  '- `/handoff:resume` — load context from prior session regardless of staleness\n' +
+  '- `/handoff:close` — end-of-session extraction: entities, assertions, edges, contract update\n' +
+  '- `/handoff:checkpoint` — mid-session save without ending the session\n' +
+  '- `/handoff:drop` — archive prior session memory and start fresh\n' +
+  '- `/handoff:purge` — hard delete all project memory (confirmation required)\n' +
+  '\n' +
+  '---\n' +
+  '\n' +
+  '## Key paths\n' +
+  '\n' +
   '- Handoff file: `{{HANDOFF_MD_PATH}}`\n' +
-  '- Helper script: `{{PROJECT_ROOT}}/scripts/handoff.js`\n\n---\n\n' +
-  '## Durable facts\n\n' +
-  '- (No durable facts promoted yet)\n';
+  '- Helper script: `{{PROJECT_ROOT}}/scripts/handoff.js`\n' +
+  '\n' +
+  '---\n' +
+  '\n' +
+  '## Durable facts\n' +
+  '\n' +
+  '- (No durable facts promoted yet — promoted by `/handoff:close` when confidence ≥ 9 and user_stated across multiple sessions)\n';
 
 let passed = 0, failed = 0;
 function test(label, fn) {
@@ -234,7 +265,7 @@ for (const { label, handoffMdPath, projectRoot } of LEGACY_FIXTURE_VARIANTS) {
     assert(r.text.includes('- Helper script: `<engine-root>/scripts/handoff.js`'), 'helper bullet not healed to portable form');
     assert(r.text.includes('<!-- memory-engine:key-paths v2 -->'), 'marker not inserted');
     assert(r.text.includes('# proj\n'), 'unrelated leading line not preserved');
-    assert(r.text.includes('## Durable facts\n\n- (No durable facts promoted yet)\n'), 'Durable facts section not preserved verbatim');
+    assert(r.text.includes('## Durable facts\n\n- (No durable facts promoted yet — promoted by `/handoff:close` when confidence ≥ 9 and user_stated across multiple sessions)\n'), 'Durable facts section not preserved verbatim');
     assert(!r.text.includes(handoffMdPath), 'absolute handoff path must be gone after heal');
     assert(!r.text.includes(projectRoot), 'absolute project root must be gone after heal');
   });
