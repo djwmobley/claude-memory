@@ -207,6 +207,13 @@ const LEGIT_INVOCATIONS = [
   { cmd: 'close',      argv: ['--json'],            cite: 'commands/handoff/close.md:308' },
   { cmd: 'close',      argv: ['--json', '-'],       cite: 'commands/handoff/close.md:311' },
   { cmd: 'close',      argv: ['--json', '--dry-run'], cite: 'commands/handoff/close.md:314' },
+  // --dry-run without --json is a real, tested, legitimate shape: --dry-run
+  // performs ZERO DB mutations by construction, so an empty/missing payload
+  // under it carries none of the incident's risk. Found as a real
+  // regression (CI red on scripts/handoff.js's original A3 gate, which did
+  // not exempt --dry-run) via test/handoff/test-write-path-params.js's own
+  // "close --dry-run: works without --json (empty payload)" test.
+  { cmd: 'close',      argv: ['--dry-run'],           cite: 'test/handoff/test-write-path-params.js:525' },
   { cmd: 'purge',      argv: ['--yes'],             cite: 'commands/handoff/purge.md:75' },
   { cmd: 'purge',      argv: ['--dry-run'],         cite: 'commands/handoff/purge.md:78' },
   { cmd: 'promote',    argv: ['42'],                cite: 'commands/handoff/promote.md:65' },

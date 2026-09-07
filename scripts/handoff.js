@@ -7707,22 +7707,30 @@ async function cmdClose(args) {
   // A3: this is the exact incident shape (close --help silently ignored the
   // unknown flag, useJson stayed false, payload stayed {} default, and a
   // real extraction-empty close ran). Reject up front, before any DB
-  // connection, unless the caller explicitly opts in with --allow-empty.
+  // connection, unless the caller explicitly opts in with --allow-empty --
+  // OR --dry-run is set. --dry-run is exempt by construction: it performs
+  // ZERO DB mutations regardless of payload content (see the --dry-run
+  // doc comment above: no writes, handoff.md untouched, session marker
+  // untouched), so an empty/missing payload under --dry-run carries none of
+  // the incident's risk (a real write with no extraction data) -- it is
+  // just a preview of "nothing would be written", which is itself a
+  // legitimate, tested invocation (test/handoff/test-write-path-params.js:
+  // "close --dry-run: works without --json (empty payload)").
   // The SessionEnd loader-stop implicit-close path does NOT go through
   // cmdClose/this argv path at all (it calls writeImplicitClose() directly),
   // so it is unaffected by this gate — see PR body "blind spots".
   let payload = {};
   if (useJson) {
     if (process.stdin.isTTY) {
-      if (!allowEmpty) {
+      if (!allowEmpty && !dryRun) {
         console.error('--json - requires a payload on stdin');
         process.exit(2);
       }
       payload = {};
     } else {
-      payload = await readStdin({ allowEmpty });
+      payload = await readStdin({ allowEmpty: allowEmpty || dryRun });
     }
-  } else if (!allowEmpty) {
+  } else if (!allowEmpty && !dryRun) {
     console.error('close requires --json (with a payload piped on stdin) or an explicit --allow-empty opt-in');
     process.exit(2);
   }
