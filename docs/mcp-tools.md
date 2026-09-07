@@ -311,7 +311,44 @@ authored fact is never lost because a model server happened to be down.
 `memory_get` looks up rows by an explicit natural key
 (`{decisions: {topic}}`, `{findings: {id}}`, and so on) — every table also
 accepts `{id: <n>}` even where the column is a server-generated `SERIAL`,
-not part of the caller-writable column set.
+not part of the caller-writable column set. Vector columns (`decisions`
+has one) are stripped by default — see "Embedding-column stripping" below.
+
+## `entity_read` / `assertion_read` / `edge_read` — §8 CRUD lookups
+
+`entity_read`, `assertion_read`, and `edge_read` look up rows by id and/or
+natural filters (`assertion_read` additionally accepts `objectPrefix` — an
+SQL `LIKE` prefix match — and `contains`, a case-insensitive substring
+match, both against `object`). All three are paginated: `limit` defaults
+to 200, `offset` to 0, `ORDER BY id`.
+
+Every row these (and every other §8 CRUD tool below) return has its vector
+columns stripped by default — see "Embedding-column stripping" below.
+
+## Embedding-column stripping (`includeEmbeddings`)
+
+Observed live 2026-09-07: `assertion_read` with `predicate=open_thread` on
+this project's own DB returned ~2.5MB across ~1,500 lines, because every
+row carried its full `embedding` column (a 4000-dim `halfvec`) inline —
+the tool was unusable for its actual purpose (finding rows by
+subject/predicate to update or suppress). The same shape hit write-tool
+responses too: `assertion_suppress` alone echoed ~52KB per call via its
+`RETURNING *`.
+
+Every §8 CRUD tool that can return an `entities`/`assertions`/`edges`/
+`decisions` row — `entity_create/read/update/suppress`,
+`assertion_create/read/update/suppress`, `edge_create/read/update/suppress`,
+`memory_get` — now strips vector-typed columns from every row by default,
+replacing each with `<col>_present: true|false` and (when present)
+`<col>_dims: N`. Pass `includeEmbeddings: true` on any of these tools to
+get the raw vector back instead.
+
+The set of vector columns per table is **not** a hard-coded name list — it
+is derived from `scripts/sql/schema-manifest.json`'s `pgvector_gated`
+entries (`scripts/lib/vector-strip.js`), so a table with no
+`pgvector_gated` entry (currently `entities`, `edges`) strips nothing, and
+a future vector column only starts being stripped once it is declared in
+the manifest.
 
 ## `memory_lint` — read-only store health sweep
 
