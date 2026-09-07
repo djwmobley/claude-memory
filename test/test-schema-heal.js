@@ -47,10 +47,15 @@
  *                BLOCKs, it never flows into the apply-retry branch.
  *   T16 S5     — SQLite seam: the fast path's new ungated probe is
  *                dialect-agnostic and does not regress the SQLite adapter.
+ *   T17 review round 3 — classifySchemaFiles() memoizes per engineRoot (a
+ *                second call in the same process does ZERO additional file
+ *                reads and returns the SAME result object); touching a
+ *                schema file's mtime invalidates the cache on the very
+ *                next call (no DB — pure fixture, like T7).
  *
  * Requires live Postgres (PGHOST/PGUSER/PGPASSWORD, defaults
- * localhost/postgres/postgres) for T1-T6, T8-T13, T15. T7 and T14 are pure
- * (no DB). T16 uses node:sqlite in-process. Every fixture is its own
+ * localhost/postgres/postgres) for T1-T6, T8-T13, T15. T7, T14, and T17 are
+ * pure (no DB). T16 uses node:sqlite in-process. Every fixture is its own
  * throwaway DB/dir; none touch claude_memory_eval_test, pipeline_pwa_etl,
  * or any other shared/live database. Exit 0 = all run tests passed.
  */
@@ -65,7 +70,7 @@ const HANDOFF_SCRIPT = path.join(PROJECT_ROOT, 'scripts', 'handoff.js');
 
 const handoffModule = require(path.join(PROJECT_ROOT, 'scripts', 'handoff.js'));
 const { PostgresAdapter, SQLiteAdapter } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'db-seam.js'));
-const { classifySchemaFiles } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'schema-classify.js'));
+const { classifySchemaFiles, _clearClassifyCache } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'schema-classify.js'));
 // cm#185 review: 'pg' is a dependency of scripts/ (scripts/node_modules),
 // not of the repo root or test/ — requiring it from a lib file that already
 // lives under scripts/ (test-pg-helpers.js) resolves correctly regardless
@@ -957,6 +962,72 @@ async function testT16() {
   }
 }
 
+// ── T17: review round 3 — classifySchemaFiles memoization ──────────────────
+
+function testT17() {
+  const label = 'T17: review round 3 — classifySchemaFiles() memoizes per engineRoot; a schema file mtime change invalidates';
+  const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cm185heal-t17-'));
+  try {
+    const sqlDir = path.join(scratchRoot, 'scripts', 'sql');
+    fs.mkdirSync(sqlDir, { recursive: true });
+    const sqlFile = path.join(sqlDir, 'fake-unit.sql');
+    fs.writeFileSync(
+      sqlFile,
+      '-- handoff:dialect postgres\nCREATE TABLE IF NOT EXISTS widgets (id serial primary key);\n',
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(sqlDir, 'schema-manifest.json'),
+      JSON.stringify({
+        schema_epoch: 1,
+        required_roster: ['fake-unit.sql'],
+        units: {
+          'fake-unit.sql': { classification: 'postgres', order: 10, expected_objects: { tables: ['widgets'], columns: [], indexes: [] } },
+        },
+      }, null, 2),
+      'utf8'
+    );
+
+    _clearClassifyCache(); // isolate from any other test that reused this path (none do; belt-and-suspenders)
+
+    // Prove "the parse is skipped" directly: count fs.readFileSync calls.
+    // Fully synchronous section (classifySchemaFiles itself is sync, and
+    // this test never awaits) — no other code can interleave and pollute
+    // the count between install and restore.
+    const originalReadFileSync = fs.readFileSync;
+    let readCount = 0;
+    fs.readFileSync = function (...args) { readCount++; return originalReadFileSync.apply(fs, args); };
+    try {
+      const r1 = classifySchemaFiles({ engineRoot: scratchRoot });
+      assertTrue(r1.ok, `T17 precondition: fixture classifies cleanly — ${JSON.stringify(r1.errors)}`);
+      const afterFirstCall = readCount;
+      assertTrue(afterFirstCall > 0, 'T17 precondition: the first call actually read file content (manifest + the SQL unit)');
+
+      const r2 = classifySchemaFiles({ engineRoot: scratchRoot });
+      assertEqual(readCount, afterFirstCall, 'T17: a second call in the same process performs ZERO additional file reads — cache hit, parse skipped');
+      assertTrue(r1 === r2, 'T17: the cache hit returns the SAME result object reference (not merely equal content)');
+
+      // Touch the SQL file's mtime forward — the stat SIGNATURE is always
+      // recomputed (that part is never skipped), so this must invalidate.
+      const future = new Date(Date.now() + 10000);
+      fs.utimesSync(sqlFile, future, future);
+
+      const r3 = classifySchemaFiles({ engineRoot: scratchRoot });
+      assertTrue(readCount > afterFirstCall, 'T17: after an mtime change, the NEXT call re-reads file content — cache invalidated, never held stale past a real on-disk change');
+      assertTrue(r3 !== r1, 'T17: the invalidated call returns a freshly-computed result object, not the stale cached one');
+      assertTrue(r3.ok, 'T17: the freshly-computed result is still a clean classification (content itself did not change, only mtime)');
+    } finally {
+      fs.readFileSync = originalReadFileSync;
+    }
+
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    fs.rmSync(scratchRoot, { recursive: true, force: true });
+  }
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -964,6 +1035,7 @@ async function main() {
   testT7();
   testT13();
   testT14();
+  testT17();
   await testT16();
   await testT1();
   await testT2();

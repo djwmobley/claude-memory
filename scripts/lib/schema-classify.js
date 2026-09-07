@@ -23,11 +23,40 @@
 //     error: enumerated-but-unclassified, roster-but-absent, header/
 //     manifest disagreement, basename collision after case-fold,
 //     non-regular/dir/symlink entry, a *.sql file enumerated but not
-//     tracked by git (when a .git directory is present at all -- packaged
-//     / marketplace installs without a .git fall back to
-//     manifest ∪ roster as the complete allowed set).
+//     present in schema-manifest.json or the required roster (manifest ∪
+//     roster is the complete allowed set — see PR #262 review round 3 note
+//     below for why this is now unconditional, not just a no-.git fallback).
 //   - 'apply-for-both' is not a legal classification (R-9) -- the manifest
 //     schema enforces single-dialect or excluded only (validated below).
+//
+// PR #262 review round 3 (perf): this used to additionally cross-check via
+// a `git ls-files` subprocess spawn, falling back to manifest ∪ roster only
+// when no .git directory was present. That git check's UNIQUE value over
+// the manifest ∪ roster check alone was narrow (catching a file whose name
+// matches a manifest entry but was never `git add`ed) and its own
+// correctness cannot be captured by a simple file-stat signature (the git
+// INDEX can change — a file gets committed — with zero effect on that
+// file's own mtime/size), which would have made the memoization below
+// either wrong (a stale "untracked" verdict surviving past the commit that
+// tracked it) or required tracking un-cacheable git-index state. Dropped
+// entirely: enumeration is already a plain directory read (this module's
+// own enumerateSqlDir), and the "is this enumerated file expected"
+// question is fully answered by manifest ∪ roster with no git dependency
+// at all — removing the spawn also removes the dominant cost
+// classifySchemaFiles paid on every call before this memoization existed.
+//
+// Also new in review round 3: classifySchemaFiles's result is memoized at
+// module level, keyed on (engineRoot, a stat signature of schema-manifest.json
+// + every *.sql-matching directory entry: path+size+mtimeMs+type). A cache
+// hit skips BOTH the (now-removed) subprocess spawn and the per-file
+// content parse/desync-check work — status previously paid the full
+// classification cost on every touch even though the schema files
+// virtually never change within one process's lifetime. The stat
+// signature is recomputed (cheap: one readdir + N lstat calls, no content
+// reads) on every call regardless of cache state, so a long-lived process
+// (e.g. handoff-mcp.mjs's stdio server) still sees an edited schema file
+// on its very next call — never a stale classification held past a real
+// on-disk change.
 //
 // Exports:
 //   classifySchemaFiles({ engineRoot }) -> {
@@ -43,7 +72,6 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execFileSync } = require('child_process');
 
 const SQL_DIRNAME = 'sql';
 const MANIFEST_BASENAME = 'schema-manifest.json';
@@ -90,21 +118,29 @@ function parseHeaderDirective(normalizedContent) {
  * Non-recursive enumeration of engineRoot/scripts/sql/*.sql.
  * Rejects directories, symlinks, and any non-regular dirent.
  * Case-folds the extension match (.SQL, .Sql, etc. all match).
- * Returns { files: [{ basename, fullPath }...], errors: string[] }.
+ * Returns { files: [{ basename, fullPath }...], errors: string[],
+ *           rawNames: string[] } — rawNames is EVERY *.sql-matching dirent
+ * name regardless of type (symlink/dir included), for the memoization
+ * cache's stat signature (PR #262 review round 3): a newly-added symlink
+ * is filtered out of `files` but must still invalidate the cache, since
+ * re-classifying it is exactly what would surface its own rejection error
+ * on the next real (non-cached) pass.
  */
 function enumerateSqlDir(sqlDir) {
   const errors = [];
   const files = [];
+  const rawNames = [];
   let entries;
   try {
     entries = fs.readdirSync(sqlDir, { withFileTypes: true });
   } catch (err) {
     errors.push(`cannot read schema directory ${sqlDir}: ${err.message}`);
-    return { files, errors };
+    return { files, errors, rawNames };
   }
   for (const ent of entries) {
     const isSqlExt = /\.sql$/i.test(ent.name);
     if (!isSqlExt) continue;
+    rawNames.push(ent.name);
     if (ent.isSymbolicLink()) {
       errors.push(`${ent.name}: symlink entries are not permitted in scripts/sql/ (rejected, not applied)`);
       continue;
@@ -115,31 +151,42 @@ function enumerateSqlDir(sqlDir) {
     }
     files.push({ basename: ent.name, fullPath: path.join(sqlDir, ent.name) });
   }
-  return { files, errors };
+  return { files, errors, rawNames };
 }
 
+// ── Memoization (PR #262 review round 3) ───────────────────────────────────
+//
+// Keyed by engineRoot (a test suite calling classifySchemaFiles against
+// several different scratch engineRoots within one process must never see
+// one root's cached result leak into another's).
+const _classifyCache = new Map(); // engineRoot -> { signature: Map<path,string>, result }
+
 /**
- * Determine the git-tracked subset of the given relative paths (POSIX-style,
- * relative to engineRoot) using `git ls-files`. Returns null when engineRoot
- * has no .git directory (packaged/marketplace install with no repo present)
- * — callers fall back to manifest ∪ roster as the complete allowed set in
- * that case, per R-2.
+ * Cheap stat signature for the manifest + every enumerated *.sql dirent:
+ * one lstatSync per path (no content read). lstatSync (not statSync) so a
+ * symlink's OWN mtime/type is what's compared — never dereferenced — and a
+ * broken symlink never throws here (statSync would).
  */
-function gitTrackedSqlFiles(engineRoot) {
-  const gitDir = path.join(engineRoot, '.git');
-  if (!fs.existsSync(gitDir)) return null;
-  try {
-    const out = execFileSync(
-      'git', ['-C', engineRoot, 'ls-files', '--', path.join('scripts', SQL_DIRNAME) + '/'],
-      { encoding: 'utf8' }
-    );
-    const rels = out.split('\n').map((l) => l.trim()).filter(Boolean);
-    return new Set(rels.map((r) => path.basename(r).toLowerCase()));
-  } catch (_) {
-    // git present but the invocation failed for some other reason (not a repo,
-    // detached worktree oddity, etc.) — treat as "cannot determine", same as absent.
-    return null;
+function _computeStatSignature(manifestPath, sqlDir, rawNames) {
+  const sig = new Map();
+  for (const p of [manifestPath, ...rawNames.map((n) => path.join(sqlDir, n))]) {
+    try {
+      const st = fs.lstatSync(p);
+      sig.set(p, `${st.size}:${st.mtimeMs}:${st.isSymbolicLink() ? 'L' : st.isDirectory() ? 'D' : 'F'}`);
+    } catch (_) {
+      sig.set(p, 'MISSING');
+    }
   }
+  return sig;
+}
+
+/** Two stat signatures are equal iff they cover the same path set with identical values. */
+function _signaturesEqual(a, b) {
+  if (a.size !== b.size) return false;
+  for (const [k, v] of a) {
+    if (b.get(k) !== v) return false;
+  }
+  return true;
 }
 
 /** Escape a string for literal use inside a RegExp. */
@@ -252,7 +299,15 @@ function loadManifest(sqlDir) {
  * full contract. Never throws for ordinary classification problems (those
  * are collected into errors[]); only throws if schema-manifest.json itself
  * cannot be loaded/parsed at all (an engine-integrity failure, not a
- * per-file classification failure).
+ * per-file classification failure) — this can only happen on a genuine
+ * cache MISS, since a cache HIT never re-reads the manifest's content.
+ *
+ * PR #262 review round 3: memoized per engineRoot, invalidated by a stat
+ * signature (path+size+mtimeMs+type) over schema-manifest.json and every
+ * *.sql dirent — see the module header and _computeStatSignature's own doc.
+ * The signature itself is ALWAYS recomputed (cheap: one readdir + N lstat,
+ * no content reads, no subprocess) — only the expensive per-file content
+ * parse + desync-check work below is skipped on a cache hit.
  *
  * @param {object} opts
  * @param {string} opts.engineRoot — absolute path to the claude-memory engine root
@@ -261,11 +316,18 @@ function loadManifest(sqlDir) {
  */
 function classifySchemaFiles({ engineRoot }) {
   const sqlDir = path.join(engineRoot, 'scripts', SQL_DIRNAME);
-  const manifest = loadManifest(sqlDir);
-  const errors = [];
+  const manifestPath = path.join(sqlDir, MANIFEST_BASENAME);
 
-  const { files, errors: enumErrors } = enumerateSqlDir(sqlDir);
-  errors.push(...enumErrors);
+  const { files, errors: enumErrors, rawNames } = enumerateSqlDir(sqlDir);
+  const signature = _computeStatSignature(manifestPath, sqlDir, rawNames);
+
+  const cached = _classifyCache.get(engineRoot);
+  if (cached && _signaturesEqual(cached.signature, signature)) {
+    return cached.result;
+  }
+
+  const manifest = loadManifest(sqlDir);
+  const errors = [...enumErrors];
 
   // ── basename collision after case-fold ──────────────────────────────────
   const byLower = new Map();
@@ -280,28 +342,17 @@ function classifySchemaFiles({ engineRoot }) {
     }
   }
 
-  // ── git-tracked cross-check ──────────────────────────────────────────────
-  const tracked = gitTrackedSqlFiles(engineRoot); // Set<lowercased basename> | null
+  // ── expected-set cross-check (manifest ∪ roster; git-tracked-ness dropped
+  //    entirely — see the module header's PR #262 review round 3 note) ─────
   const manifestOrRoster = new Set([
     ...Object.keys(manifest.units).map((b) => b.toLowerCase()),
     ...manifest.required_roster.map((b) => b.toLowerCase()),
   ]);
   for (const f of files) {
     const lower = f.basename.toLowerCase();
-    if (tracked !== null) {
-      if (!tracked.has(lower)) {
-        errors.push(
-          `${f.basename}: enumerated in scripts/sql/ but NOT tracked by git — refusing to classify or apply ` +
-          `an untracked file against a live project DB (remove it from scripts/sql/, or add+commit it with a ` +
-          `header directive and a schema-manifest.json entry)`
-        );
-      }
-    } else if (!manifestOrRoster.has(lower)) {
-      // Packaged install with no .git: fall back to manifest ∪ roster as the
-      // complete allowed set — an enumerated file outside that set is still loud.
+    if (!manifestOrRoster.has(lower)) {
       errors.push(
-        `${f.basename}: enumerated in scripts/sql/ but not present in schema-manifest.json or the required ` +
-        `roster (no .git present to cross-check git-tracked status — packaged/marketplace install fallback)`
+        `${f.basename}: enumerated in scripts/sql/ but not present in schema-manifest.json or the required roster`
       );
     }
   }
@@ -371,13 +422,27 @@ function classifySchemaFiles({ engineRoot }) {
   unitsByDialect.postgres.sort((a, b) => (a.order - b.order) || (a.basename < b.basename ? -1 : 1));
   unitsByDialect.sqlite.sort((a, b) => (a.order - b.order) || (a.basename < b.basename ? -1 : 1));
 
-  return {
+  const result = {
     ok: errors.length === 0,
     errors,
     manifest,
     unitsByDialect,
     allFiles: files,
   };
+  _classifyCache.set(engineRoot, { signature, result });
+  return result;
+}
+
+/**
+ * Test-only escape hatch: drop all memoized classification results. No
+ * production call site ever needs this (the stat signature already
+ * self-invalidates on any real on-disk change) — exists so a test process
+ * that constructs multiple DIFFERENT schema-manifest.json/SQL fixtures at
+ * the SAME reused path (rather than a fresh scratch dir per fixture) can
+ * force a clean re-classification.
+ */
+function _clearClassifyCache() {
+  _classifyCache.clear();
 }
 
 module.exports = {
@@ -385,4 +450,7 @@ module.exports = {
   normalizeContent,
   parseHeaderDirective,
   enumerateSqlDir,
+  // PR #262 review round 3 — exposed for test/test-schema-heal.js's own
+  // memoization coverage (no test-side reimplementation of the cache).
+  _clearClassifyCache,
 };
