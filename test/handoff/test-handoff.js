@@ -348,6 +348,21 @@ async function runTests() {
     // is the sole source of truth for each scenario — a value inherited from
     // the operator's own shell must never leak into these deterministic tests.
     delete env.VLLM_EMBED_URL;
+    // Isolate HANDOFF_BASE_DIR to a fresh empty temp dir so the endpoint
+    // resolution's final fallback (${resolveBaseDir()}/handoff-embed.json,
+    // see scripts/lib/embedding-provider.js) never reads a developer
+    // machine's REAL ~/.claude/handoff-embed.json. Without this, a machine
+    // with that file configured (e.g. from init-embeddability's own
+    // seed-provider setup, PR #260) resolves a LOCAL endpoint instead of
+    // NONE, and the "NONE (unconfigured) endpoint BLOCKs" test fails only
+    // locally — passing in CI, which has no such file. This mirrors the
+    // isolation pattern already used in test/test-embed-endpoint-classify.js
+    // and test/test-schema-heal.js. Tests that pass VLLM_EMBED_URL via
+    // extraEnv are unaffected either way (env outranks the file), but every
+    // seed-provider call is isolated uniformly rather than only the ones
+    // that currently need it, so a future NONE-adjacent case can't regress
+    // the same way.
+    env.HANDOFF_BASE_DIR = opts.handoffBaseDir || fs.mkdtempSync(path.join(os.tmpdir(), 'handoff-test-embedbase-'));
     Object.assign(env, opts.extraEnv);
     for (const k of (opts.deleteEnv || [])) delete env[k];
     return execFileSync(
