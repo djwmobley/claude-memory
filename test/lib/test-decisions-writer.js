@@ -133,6 +133,14 @@ async function main() {
 
   // ── formatIntentDivergenceLines: cm#230's embed_degraded branch is a ──
   // ── STRICT SUPERSET of cm#227's existing NOT-PERSISTED rendering ──────
+  // NOTE (PR #260): no production caller passes kind:'embed_degraded' into
+  // this function anymore — writeExtraction counts embed-degraded (into
+  // assertionEmbedWarnCount/decisionEmbedWarnCount -> the Done line's
+  // `embed_warnings` figure) instead of pushing it into
+  // decisionDivergences/intentDivergences. DW-11 below exercises the branch
+  // directly (unit-testing the function in isolation) — it is a retained
+  // defensive no-op in current production flow, not a demonstration of live
+  // routing.
   await run('DW-10', 'formatIntentDivergenceLines: a divergence with NO kind (every pre-existing cm#227 caller) renders EXACTLY as before', async () => {
     const lines = handoffModule.formatIntentDivergenceLines([
       { predicate: 'session_tldr', subject: 'proj', message: 'boom\nsecond line ignored' },
