@@ -73,7 +73,17 @@
         "columns": [
           { "table": "assertions", "column": "embedding", "type": "halfvec", "dims": 4000 }
         ]
-      }
+      },
+      "expected_fks": [
+        {
+          "_doc": "FK follow-up to the schema-heal fingerprint fast path (PR #262): probeFastPathSchemaState verified column existence + pgvector shape but never the FK itself -- a column recreated without REFERENCES embedding_providers(id) reads HEALED and backfill-embeddings then fails at write time. table/columns/ref_table/ref_columns must each textually appear in this unit's own SQL (see ALTER TABLE assertions ADD COLUMN ... embedded_by_provider_id INTEGER REFERENCES embedding_providers(id)) -- enforced by schema-classify.js's manifest/DDL desync check.",
+          "table": "assertions",
+          "columns": ["embedded_by_provider_id"],
+          "ref_table": "embedding_providers",
+          "ref_columns": ["id"],
+          "on_delete": "NO ACTION"
+        }
+      ]
     },
     "handoff-sqlite-schema.sql": {
       "classification": "sqlite",
@@ -185,7 +195,17 @@
         "columns": [
           { "table": "decisions", "column": "embedding", "type": "halfvec", "dims": 4000 }
         ]
-      }
+      },
+      "expected_fks": [
+        {
+          "_doc": "Same FK-heal follow-up as handoff-core-schema.sql's expected_fks -- see ALTER TABLE decisions ADD COLUMN ... embedded_by_provider_id INTEGER REFERENCES embedding_providers(id) below.",
+          "table": "decisions",
+          "columns": ["embedded_by_provider_id"],
+          "ref_table": "embedding_providers",
+          "ref_columns": ["id"],
+          "on_delete": "NO ACTION"
+        }
+      ]
     },
     "phase3b-schema.sql": {
       "classification": "excluded",

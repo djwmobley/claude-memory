@@ -17,10 +17,9 @@
  * scripts/lib/handoff-paths.js exactly, but renders the literal env-var
  * token rather than the expanded value.
  *
- * renderKeyPathsBullets() governs what a fresh `handoff init` writes.
- * healKeyPathsSection() (below) additionally heals an already-generated
- * CLAUDE.md's Key paths section on touch (init re-run, or close's
- * durable-facts rewrite) when it still carries a filesystem-absolute bullet.
+ * Scope note: this module intentionally does NOT heal an already-generated
+ * CLAUDE.md's Key paths section — that is out of scope for this change (see
+ * cm#263 AUTHOR spec). It only governs what a fresh `handoff init` writes.
  */
 
 function _envNonEmpty(env, key) {

@@ -202,6 +202,24 @@ async function setSetting(db, projectId, key, value) {
   );
 }
 
+async function getSettingRaw(db, projectId, key) {
+  const { rows } = await db.query(
+    `SELECT value FROM project_settings WHERE project_id = $1 AND key = $2`,
+    [projectId, key]
+  );
+  return rows.length > 0 ? rows[0].value : null;
+}
+
+async function clearSettingRaw(db, projectId, key) {
+  await db.query(`DELETE FROM project_settings WHERE project_id = $1 AND key = $2`, [projectId, key]);
+}
+
+/** Read the 'last_loader_stop' project_settings breadcrumb — cm#263 (loader-stop verifiability). */
+async function getLastLoaderStop(db, projectId) {
+  const raw = await getSettingRaw(db, projectId, 'last_loader_stop');
+  return raw ? JSON.parse(raw) : null;
+}
+
 function tmpResidueFiles(handoffDir) {
   return fs.readdirSync(handoffDir).filter((f) => f.includes('.tmp-'));
 }
@@ -211,6 +229,15 @@ function readLastClose(handoffPath) {
   const content = fs.readFileSync(handoffPath, 'utf8');
   const m = content.match(/^last_close:\s*(.+)$/m);
   return m ? m[1].trim() : null;
+}
+
+/** `handoff.js status --json` prints a "Running: ..." banner before the JSON
+ * object (and a "Done: ..." summary after it) — mirrors test-handoff.js's
+ * own parseStatusJson()/handoff-mcp.mjs's extractJsonBlock(). */
+function parseStatusJson(stdout) {
+  const start = stdout.indexOf('{');
+  const end   = stdout.lastIndexOf('}');
+  return JSON.parse(stdout.slice(start, end + 1));
 }
 
 // ─── TESTS ────────────────────────────────────────────────────────────────────
@@ -386,6 +413,152 @@ async function runTests() {
 
     // Restore for hygiene (not strictly required — teardown deletes the project's rows).
     await setSetting(db, projectId, 'implicit_close', 'enabled');
+  });
+
+  // ── cm#263: loader-stop verifiability — last_loader_stop outcome persistence ──
+  // Every real SessionEnd invocation (post S1 filter) upserts one
+  // project_settings row (key 'last_loader_stop', value {ts, session_id,
+  // outcome}) — total classification over
+  // {implicit_close_recorded, explicit_close_present, no_marker, error:<short>}.
+
+  // ── T9: implicit_close_recorded ───────────────────────────────────────────
+  await test('cm#263: implicit close run -> last_loader_stop outcome=implicit_close_recorded', async () => {
+    await clearSettingRaw(db, projectId, 'last_loader_stop');
+    await setMarkerRaw(db, projectId, [{ session_id: 'sess-outcome-1', ts: new Date().toISOString() }]);
+    const r = runHook('loader-stop', { hook_event_name: 'SessionEnd', session_id: 'sess-outcome-1' }, { fakeRoot });
+    assert.strictEqual(r.status, 0, `expected exit 0, got ${r.status}; stderr: ${r.stderr}`);
+
+    const rec = await getLastLoaderStop(db, projectId);
+    assert.ok(rec, 'expected a last_loader_stop row to be persisted');
+    assert.strictEqual(rec.outcome, 'implicit_close_recorded', `got: ${JSON.stringify(rec)}`);
+    assert.strictEqual(rec.session_id, 'sess-outcome-1');
+    assert.ok(!Number.isNaN(Date.parse(rec.ts)), `ts should be parseable, got: ${rec.ts}`);
+  });
+
+  // ── T10: no_marker (no marker, no explicit-close breadcrumb for this session) ──
+  await test('cm#263: no marker, no explicit-close breadcrumb -> last_loader_stop outcome=no_marker', async () => {
+    await clearSettingRaw(db, projectId, 'last_loader_stop');
+    await clearSettingRaw(db, projectId, 'last_explicit_close');
+    await clearMarkerRaw(db, projectId);
+    const r = runHook('loader-stop', { hook_event_name: 'SessionEnd', session_id: 'sess-outcome-2' }, { fakeRoot });
+    assert.strictEqual(r.status, 0, `expected exit 0, got ${r.status}; stderr: ${r.stderr}`);
+
+    const rec = await getLastLoaderStop(db, projectId);
+    assert.ok(rec, 'expected a last_loader_stop row to be persisted');
+    assert.strictEqual(rec.outcome, 'no_marker', `got: ${JSON.stringify(rec)}`);
+  });
+
+  // ── T11: explicit_close_present (breadcrumb names THIS session) ──────────
+  await test('cm#263: last_explicit_close breadcrumb names this session -> outcome=explicit_close_present', async () => {
+    await clearSettingRaw(db, projectId, 'last_loader_stop');
+    await clearMarkerRaw(db, projectId);
+    await setSetting(db, projectId, 'last_explicit_close', JSON.stringify({
+      session_id: 'sess-outcome-3',
+      ts: new Date().toISOString(),
+    }));
+    const r = runHook('loader-stop', { hook_event_name: 'SessionEnd', session_id: 'sess-outcome-3' }, { fakeRoot });
+    assert.strictEqual(r.status, 0, `expected exit 0, got ${r.status}; stderr: ${r.stderr}`);
+
+    const rec = await getLastLoaderStop(db, projectId);
+    assert.ok(rec, 'expected a last_loader_stop row to be persisted');
+    assert.strictEqual(rec.outcome, 'explicit_close_present', `got: ${JSON.stringify(rec)}`);
+  });
+
+  // ── T11b: a SIBLING session's explicit-close breadcrumb does NOT count ───
+  await test('cm#263: a sibling session\'s explicit-close breadcrumb -> outcome stays no_marker', async () => {
+    await clearSettingRaw(db, projectId, 'last_loader_stop');
+    await clearMarkerRaw(db, projectId);
+    await setSetting(db, projectId, 'last_explicit_close', JSON.stringify({
+      session_id: 'sess-someone-else',
+      ts: new Date().toISOString(),
+    }));
+    const r = runHook('loader-stop', { hook_event_name: 'SessionEnd', session_id: 'sess-outcome-4' }, { fakeRoot });
+    assert.strictEqual(r.status, 0, `expected exit 0, got ${r.status}; stderr: ${r.stderr}`);
+
+    const rec = await getLastLoaderStop(db, projectId);
+    assert.strictEqual(rec.outcome, 'no_marker', `a sibling breadcrumb must not be attributed to this session; got: ${JSON.stringify(rec)}`);
+  });
+
+  // ── T12: real explicit close (via /handoff:close --json -) leaves a breadcrumb
+  //         that a SUBSEQUENT SessionEnd for the SAME session reads as
+  //         explicit_close_present — proves the end-to-end wiring, not just
+  //         the raw-SQL breadcrumb shortcut used in T11 above.
+  await test('cm#263: a real close leaves a breadcrumb that loader-stop reads as explicit_close_present', async () => {
+    await clearSettingRaw(db, projectId, 'last_loader_stop');
+    await clearMarkerRaw(db, projectId);
+    await setMarkerRaw(db, projectId, [{ session_id: 'sess-real-close', ts: new Date().toISOString() }]);
+
+    const closePayload = {
+      session_id: 'sess-real-close',
+      tldr: 'cm#263 real-close breadcrumb test',
+      entities: [], assertions: [], edges: [],
+    };
+    const closeResult = spawnSync(
+      process.execPath,
+      [HELPER, 'close', '--json', '-'],
+      { cwd: fakeRoot, env: { ...process.env, PROJECT_ROOT: fakeRoot }, encoding: 'utf8', timeout: 20000, input: JSON.stringify(closePayload) }
+    );
+    assert.strictEqual(closeResult.status, 0, `close should exit 0; stderr: ${closeResult.stderr}`);
+
+    const breadcrumb = await getSettingRaw(db, projectId, 'last_explicit_close');
+    assert.ok(breadcrumb, 'expected clearSessionMarkerForClose to have stamped last_explicit_close');
+    assert.strictEqual(JSON.parse(breadcrumb).session_id, 'sess-real-close');
+
+    const r = runHook('loader-stop', { hook_event_name: 'SessionEnd', session_id: 'sess-real-close' }, { fakeRoot });
+    assert.strictEqual(r.status, 0, `expected exit 0, got ${r.status}; stderr: ${r.stderr}`);
+    const rec = await getLastLoaderStop(db, projectId);
+    assert.strictEqual(rec.outcome, 'explicit_close_present', `got: ${JSON.stringify(rec)}`);
+  });
+
+  // ── T13: handoff:status renders the last_loader_stop line ────────────────
+  // (Deliberately BEFORE T14: T14 turns handoffPath into a directory, which
+  // would make handoff:status itself throw EISDIR reading it.)
+  await test('cm#263: handoff:status renders "last SessionEnd (loader-stop): <ts> <outcome>"', async () => {
+    await setSetting(db, projectId, 'last_loader_stop', JSON.stringify({
+      ts: '2026-01-01T00:00:00.000Z',
+      session_id: 'sess-status-render',
+      outcome: 'implicit_close_recorded',
+    }));
+    const proseOut = runHelper('status', [], { fakeRoot });
+    assert.ok(
+      proseOut.includes('last SessionEnd (loader-stop): 2026-01-01T00:00:00.000Z implicit_close_recorded'),
+      `expected the prose status line naming ts+outcome; got tail: ${proseOut.slice(-800)}`
+    );
+
+    const jsonOut = runHelper('status', ['--json'], { fakeRoot });
+    let parsed;
+    try { parsed = parseStatusJson(jsonOut); } catch (e) {
+      throw new Error(`handoff:status --json was not parseable: ${e.message}; output: ${jsonOut.slice(0, 800)}`);
+    }
+    assert.ok(parsed.last_loader_stop, 'expected --json output to carry a last_loader_stop object');
+    assert.strictEqual(parsed.last_loader_stop.outcome, 'implicit_close_recorded');
+
+    await clearSettingRaw(db, projectId, 'last_loader_stop');
+    const neverOut = runHelper('status', [], { fakeRoot });
+    assert.ok(neverOut.includes('last SessionEnd (loader-stop): never'), `expected "never" when no row exists; got tail: ${neverOut.slice(-800)}`);
+  });
+
+  // ── T14: error:<short> — a filesystem fault mid-implicit-close is caught,
+  //         never breaks the hook's exit code, and IS persisted (db is still
+  //         open at the point of failure). Forces EISDIR by replacing
+  //         handoff.md with a directory of the same name — deterministic,
+  //         cross-platform. This is the LAST loader-stop test in this file:
+  //         it permanently breaks handoffPath as a plain file for this
+  //         fakeRoot, so nothing after it may assume handoffPath is a file.
+  await test('cm#263: filesystem fault mid-implicit-close -> exit 0, outcome=error:<short>', async () => {
+    await clearSettingRaw(db, projectId, 'last_loader_stop');
+    await clearMarkerRaw(db, projectId);
+    await setMarkerRaw(db, projectId, [{ session_id: 'sess-outcome-error', ts: new Date().toISOString() }]);
+
+    fs.rmSync(handoffPath, { force: true });
+    fs.mkdirSync(handoffPath); // handoff.md is now a directory -> EISDIR on read
+
+    const r = runHook('loader-stop', { hook_event_name: 'SessionEnd', session_id: 'sess-outcome-error' }, { fakeRoot });
+    assert.strictEqual(r.status, 0, `must still exit 0 (fail-soft), got ${r.status}; stderr: ${r.stderr}`);
+
+    const rec = await getLastLoaderStop(db, projectId);
+    assert.ok(rec, 'expected a last_loader_stop row to be persisted even on the error path');
+    assert.ok(rec.outcome.startsWith('error:'), `expected outcome to start with 'error:', got: ${JSON.stringify(rec)}`);
   });
 
   await db.end();

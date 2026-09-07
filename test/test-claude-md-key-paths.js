@@ -37,6 +37,25 @@ const {
   isAbsolutePath,
   isPortableForm,
 } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'claude-md-key-paths.js'));
+// renderTemplate() — the SAME {{KEY}}-substitution function cmdInit uses to
+// write both handoff.md and the CLAUDE.md promotion file — exposed by
+// scripts/handoff.js's module.exports for this literal-fixture test.
+const { renderTemplate } = require(path.join(PROJECT_ROOT, 'scripts', 'handoff.js'));
+
+// Frozen snapshot of templates/project-claude-md.tpl as it stood at 8314367
+// (pre-#263: {{HANDOFF_MD_PATH}} / {{PROJECT_ROOT}}/scripts/handoff.js
+// placeholders, both filesystem-absolute when rendered by that era's
+// cmdInit). Frozen inline rather than read via `git show 8314367:...` so the
+// fixture does not depend on git history being present in a shallow CI
+// checkout.
+const LEGACY_TPL_8314367 =
+  '# {{PROJECT_NAME}}\n\n{{PROJECT_DESCRIPTION}}\n\n---\n\n' +
+  '## Skill invocation hints\n\n- `/handoff:status` — status\n\n---\n\n' +
+  '## Key paths\n\n' +
+  '- Handoff file: `{{HANDOFF_MD_PATH}}`\n' +
+  '- Helper script: `{{PROJECT_ROOT}}/scripts/handoff.js`\n\n---\n\n' +
+  '## Durable facts\n\n' +
+  '- (No durable facts promoted yet)\n';
 
 let passed = 0, failed = 0;
 function test(label, fn) {
@@ -174,31 +193,52 @@ for (const { label, env } of ENV_COMBOS) {
   });
 }
 
-// ─── healKeyPathsSection() — healKeyPathsSection() coverage ─────────────────
+// ─── healKeyPathsSection() — heal-on-touch coverage ────────────────────────
 //
 // TOTAL classification: every fixture below is constructed to land in
 // exactly one of {absent, ambiguous, healed, noop, unrecognized}.
 
-test('legacy absolute fixture: healed, other lines preserved', () => {
-  const fixture =
-    '# proj\n' +
-    '\n' +
-    '## Key paths\n' +
-    '\n' +
-    '- Handoff file: `C:\\Users\\bob\\.claude\\projects\\abc123\\handoff.md`\n' +
-    '- Helper script: `C:\\Users\\bob\\claude-memory\\scripts\\handoff.js`\n' +
-    '\n' +
-    '## Durable facts\n' +
-    '\n' +
-    '- none\n';
-  const r = healKeyPathsSection(fixture, {});
-  assertEqual(r.outcome, 'healed');
-  assert(r.text.includes('- Handoff file: `~/.claude/projects/<project-id>/handoff.md`'), 'handoff bullet not healed to portable form');
-  assert(r.text.includes('- Helper script: `<engine-root>/scripts/handoff.js`'), 'helper bullet not healed to portable form');
-  assert(r.text.includes('<!-- memory-engine:key-paths v2 -->'), 'marker not inserted');
-  assert(r.text.includes('# proj\n'), 'unrelated leading line not preserved');
-  assert(r.text.includes('## Durable facts\n\n- none\n'), 'Durable facts section not preserved verbatim');
-});
+// Literal-fixture helper: render LEGACY_TPL_8314367 through the repo's real
+// renderTemplate() with an absolute HANDOFF_MD_PATH / PROJECT_ROOT pair, the
+// same way pre-#263 cmdInit actually wrote a CLAUDE.md.
+function renderLegacyFixture(handoffMdPath, projectRoot) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-legacy-tpl-'));
+  const tplPath = path.join(tmpDir, 'project-claude-md.tpl');
+  fs.writeFileSync(tplPath, LEGACY_TPL_8314367, 'utf8');
+  try {
+    return renderTemplate(tplPath, {
+      PROJECT_NAME:        'proj',
+      PROJECT_DESCRIPTION: 'desc',
+      HANDOFF_MD_PATH:     handoffMdPath,
+      PROJECT_ROOT:        projectRoot,
+    });
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+const LEGACY_FIXTURE_VARIANTS = [
+  { label: 'Windows',  handoffMdPath: 'C:\\Users\\bob\\.claude\\projects\\abc123\\handoff.md', projectRoot: 'C:\\Users\\bob\\claude-memory' },
+  { label: 'POSIX',    handoffMdPath: '/home/bob/.claude/projects/abc123/handoff.md',           projectRoot: '/home/bob/claude-memory' },
+];
+
+for (const { label, handoffMdPath, projectRoot } of LEGACY_FIXTURE_VARIANTS) {
+  test(`legacy absolute fixture (${label}, rendered via real renderTemplate): healed, other lines preserved`, () => {
+    const fixture = renderLegacyFixture(handoffMdPath, projectRoot);
+    // Sanity: the literal-rendered fixture really does carry an absolute
+    // bullet before healing (otherwise this test would vacuously pass).
+    assert(fixture.includes(handoffMdPath), 'fixture must contain the absolute handoff path pre-heal');
+    const r = healKeyPathsSection(fixture, {});
+    assertEqual(r.outcome, 'healed');
+    assert(r.text.includes('- Handoff file: `~/.claude/projects/<project-id>/handoff.md`'), 'handoff bullet not healed to portable form');
+    assert(r.text.includes('- Helper script: `<engine-root>/scripts/handoff.js`'), 'helper bullet not healed to portable form');
+    assert(r.text.includes('<!-- memory-engine:key-paths v2 -->'), 'marker not inserted');
+    assert(r.text.includes('# proj\n'), 'unrelated leading line not preserved');
+    assert(r.text.includes('## Durable facts\n\n- (No durable facts promoted yet)\n'), 'Durable facts section not preserved verbatim');
+    assert(!r.text.includes(handoffMdPath), 'absolute handoff path must be gone after heal');
+    assert(!r.text.includes(projectRoot), 'absolute project root must be gone after heal');
+  });
+}
 
 test('idempotent second pass: healing already-healed output is byte-identical (noop)', () => {
   const fixture =
@@ -359,6 +399,7 @@ test('init-on-existing integration: unrecognized existing file is left untouched
 
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
+
 
 // ─── summary ──────────────────────────────────────────────────────────────
 

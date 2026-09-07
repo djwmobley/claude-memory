@@ -1028,6 +1028,308 @@ function testT17() {
   }
 }
 
+// ── FK extension tests (cm#185-schema-heal FK follow-up, F1-F8) ────────────
+//   FKT1 F1  — a phantom expected_fks entry (table/column/ref_table/
+//              ref_column with no textual match) is a manifest_desync
+//              classification_error, never a live "missing" finding.
+//   FKT2 F3  — _classifyExpectedFks total-classification matrix: table_absent,
+//              absent, present_mismatched (wrong reference / on_delete /
+//              not_validated / extra_constraint), present_matching — pure,
+//              no DB, fabricated probe rows.
+//   FKT3 F5  — SQLite's probeFastPathSchemaState FK arm is a real empty set,
+//              never a crash or a false "missing".
+//   FKT4 F7  — an absent FK is healed on touch; the live catalog now carries
+//              the correct constraint.
+//   FKT5 F7  — a wrong-reference FK (pointing at entities instead of
+//              embedding_providers) is healed: DROP the wrong one, ADD the
+//              correct one, in one transaction.
+//   FKT6 F4/F7 — orphan rows make the corrective ADD CONSTRAINT fail; the
+//              whole heal transaction rolls back, the prior (absent) state
+//              is retained, and the degraded reason names the SQLSTATE.
+//   FKT7 F3/F7 — a NOT VALID FK (right identity, unvalidated) classifies as
+//              present_mismatched(not_validated) and heals to validated.
+
+async function testFKT1() {
+  const label = 'FKT1: F1 — a phantom expected_fks entry is a manifest_desync classification_error, never a live "missing"';
+  try {
+    const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cm185heal-fkt1-'));
+    const sqlDir = path.join(scratchRoot, 'scripts', 'sql');
+    fs.mkdirSync(sqlDir, { recursive: true });
+
+    fs.writeFileSync(
+      path.join(sqlDir, 'fake-unit.sql'),
+      '-- handoff:dialect postgres\n' +
+      'CREATE TABLE IF NOT EXISTS widgets (id serial primary key);\n' +
+      'CREATE TABLE IF NOT EXISTS makers (id serial primary key);\n' +
+      'ALTER TABLE widgets ADD COLUMN IF NOT EXISTS maker_id INTEGER REFERENCES makers(id);\n',
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(sqlDir, 'schema-manifest.json'),
+      JSON.stringify({
+        schema_epoch: 1,
+        required_roster: ['fake-unit.sql'],
+        units: {
+          'fake-unit.sql': {
+            classification: 'postgres',
+            order: 10,
+            expected_objects: { tables: ['widgets', 'makers'], columns: [{ table: 'widgets', column: 'maker_id' }], indexes: [] },
+            expected_fks: [
+              { table: 'widgets', columns: ['maker_id'], ref_table: 'totally_phantom_ref_table', ref_columns: ['id'], on_delete: 'NO ACTION' },
+            ],
+          },
+        },
+      }, null, 2),
+      'utf8'
+    );
+
+    const result = classifySchemaFiles({ engineRoot: scratchRoot });
+    assertFalse(result.ok, 'FKT1: classification must FAIL on the phantom ref_table entry');
+    assertTrue(
+      result.errors.some((e) => e.includes('totally_phantom_ref_table') && e.includes('manifest_desync')),
+      `FKT1: an error names the phantom ref_table and tags manifest_desync — got: ${JSON.stringify(result.errors)}`
+    );
+    fs.rmSync(scratchRoot, { recursive: true, force: true });
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  }
+}
+
+function testFKT2() {
+  const label = 'FKT2: F3 — _classifyExpectedFks total-classification matrix (table_absent/absent/mismatched×4/matching)';
+  try {
+    const expected = [
+      { unit: 'u', table: 'ghost_table', columns: ['x'], ref_table: 'r', ref_columns: ['id'], on_delete: 'NO ACTION' },
+      { unit: 'u', table: 'assertions', columns: ['absent_col'], ref_table: 'embedding_providers', ref_columns: ['id'], on_delete: 'NO ACTION' },
+      { unit: 'u', table: 'assertions', columns: ['wrong_ref_col'], ref_table: 'embedding_providers', ref_columns: ['id'], on_delete: 'NO ACTION' },
+      { unit: 'u', table: 'assertions', columns: ['bad_delete_col'], ref_table: 'embedding_providers', ref_columns: ['id'], on_delete: 'NO ACTION' },
+      { unit: 'u', table: 'assertions', columns: ['not_valid_col'], ref_table: 'embedding_providers', ref_columns: ['id'], on_delete: 'NO ACTION' },
+      { unit: 'u', table: 'assertions', columns: ['extra_col'], ref_table: 'embedding_providers', ref_columns: ['id'], on_delete: 'NO ACTION' },
+      { unit: 'u', table: 'assertions', columns: ['ok_col'], ref_table: 'embedding_providers', ref_columns: ['id'], on_delete: 'NO ACTION' },
+    ];
+    const tablesFound = new Set(['assertions']); // ghost_table absent
+    const liveFks = [
+      { table: 'assertions', columns: ['wrong_ref_col'], ref_table: 'entities', ref_columns: ['id'], on_delete: 'a', validated: true, conname: 'c1' },
+      { table: 'assertions', columns: ['bad_delete_col'], ref_table: 'embedding_providers', ref_columns: ['id'], on_delete: 'c', validated: true, conname: 'c2' },
+      { table: 'assertions', columns: ['not_valid_col'], ref_table: 'embedding_providers', ref_columns: ['id'], on_delete: 'a', validated: false, conname: 'c3' },
+      { table: 'assertions', columns: ['extra_col'], ref_table: 'embedding_providers', ref_columns: ['id'], on_delete: 'a', validated: true, conname: 'c4' },
+      { table: 'assertions', columns: ['extra_col'], ref_table: 'entities', ref_columns: ['id'], on_delete: 'a', validated: true, conname: 'c4_stale' },
+      { table: 'assertions', columns: ['ok_col'], ref_table: 'embedding_providers', ref_columns: ['id'], on_delete: 'a', validated: true, conname: 'c5' },
+    ];
+    const results = handoffModule._classifyExpectedFks(expected, tablesFound, liveFks);
+    const byCol = {};
+    for (const r of results) byCol[r.columns[0]] = r;
+
+    assertEqual(byCol['x'].state, 'table_absent', `FKT2: ghost_table -> table_absent, got ${byCol['x'].state}`);
+    assertEqual(byCol['absent_col'].state, 'absent', `FKT2: no live row -> absent, got ${byCol['absent_col'].state}`);
+    assertEqual(byCol['wrong_ref_col'].state, 'present_mismatched', 'FKT2: wrong ref -> present_mismatched');
+    assertTrue(byCol['wrong_ref_col'].reason.startsWith('wrong_reference:'), `FKT2: reason names wrong_reference — got ${byCol['wrong_ref_col'].reason}`);
+    assertEqual(byCol['bad_delete_col'].state, 'present_mismatched', 'FKT2: ON DELETE mismatch -> present_mismatched');
+    assertEqual(byCol['bad_delete_col'].reason, 'on_delete:CASCADE', `FKT2: reason names actual on_delete — got ${byCol['bad_delete_col'].reason}`);
+    assertEqual(byCol['not_valid_col'].state, 'present_mismatched', 'FKT2: convalidated=false -> present_mismatched');
+    assertEqual(byCol['not_valid_col'].reason, 'not_validated', 'FKT2: reason is not_validated');
+    assertEqual(byCol['extra_col'].state, 'present_mismatched', 'FKT2: a correct match PLUS a stale extra on the same columns -> present_mismatched (inventory diff)');
+    assertTrue(byCol['extra_col'].reason.startsWith('extra_constraint:'), `FKT2: reason names extra_constraint — got ${byCol['extra_col'].reason}`);
+    assertEqual(byCol['ok_col'].state, 'present_matching', 'FKT2: identity+on_delete+validated all agree -> present_matching');
+
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  }
+}
+
+async function testFKT3() {
+  const label = 'FKT3: F5 — SQLite probeFastPathSchemaState FK arm is a real empty set, never a crash';
+  try {
+    const dbPath = path.join(os.tmpdir(), `cm185heal-fkt3-${Date.now()}.sqlite`);
+    const adapter = new SQLiteAdapter(dbPath);
+    await adapter.connect();
+    const classification = classifySchemaFiles({ engineRoot: PROJECT_ROOT });
+    const units = classification.unitsByDialect.sqlite;
+    const applyResult = await handoffModule.applyAdditiveSchema(adapter, units, { silent: true });
+    assertTrue(applyResult.ok, `FKT3 precondition: SQLite apply must succeed — ${applyResult.errorMsg}`);
+
+    const probe = await adapter.probeFastPathSchemaState({ tables: ['assertions'], columns: [], indexes: [], shapeTargets: [] });
+    assertTrue(Array.isArray(probe.fks), 'FKT3: probe.fks is an array on SQLite');
+    assertEqual(probe.fks.length, 0, 'FKT3: probe.fks is empty on SQLite');
+    const classified = handoffModule._classifyExpectedFks(
+      [{ unit: 'u', table: 'assertions', columns: ['x'], ref_table: 'y', ref_columns: ['id'], on_delete: 'NO ACTION' }],
+      probe.tablesFound, probe.fks
+    );
+    assertEqual(classified[0].state, 'absent', 'FKT3: an empty FK set classifies any declared entry as absent, never a false match/crash (assertions table itself IS present)');
+    await adapter.end();
+    fs.rmSync(dbPath, { force: true });
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  }
+}
+
+async function testFKT4() {
+  const label = 'FKT4: F7 — an absent FK (dropped by hand) is healed on touch; the live catalog carries the correct constraint afterward';
+  if (!(await isPgAvailable())) { skip(label, 'Postgres unavailable'); return; }
+
+  const dbName = `cm185heal_fkt4_${Date.now()}`;
+  const PID = 'schema-heal-fkt4';
+  try {
+    await createThrowawayDb(dbName);
+    const client = await pgConnect(dbName);
+    const { adapter } = await bootstrapCurrentDb(client, PID, { withExtension: false });
+
+    const { rows: before } = await client.query(
+      `SELECT conname FROM pg_constraint WHERE conrelid = 'assertions'::regclass AND contype = 'f'`
+    );
+    assertTrue(before.length > 0, 'FKT4 precondition: assertions has a live FK to drop');
+    for (const r of before) {
+      await client.query(`ALTER TABLE assertions DROP CONSTRAINT "${r.conname}"`);
+    }
+
+    await handoffModule.ensureSchemaCurrentCore(adapter, PID, { silent: true });
+
+    const { rows: after } = await client.query(
+      `SELECT confrelid::regclass::text AS ref_table
+         FROM pg_constraint c
+         JOIN pg_class tc ON tc.oid = c.conrelid
+        WHERE tc.relname = 'assertions' AND c.contype = 'f'
+          AND c.conkey = (SELECT array_agg(attnum) FROM pg_attribute WHERE attrelid='assertions'::regclass AND attname='embedded_by_provider_id')`
+    );
+    assertTrue(after.length > 0, 'FKT4: the FK exists again after one touch');
+    assertEqual(after[0].ref_table, 'embedding_providers', `FKT4: the healed FK targets embedding_providers — got ${after[0].ref_table}`);
+
+    await client.end();
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+  }
+}
+
+async function testFKT5() {
+  const label = 'FKT5: F7 — a wrong-reference FK (pointing at entities instead of embedding_providers) is healed: drop wrong, add correct, one transaction';
+  if (!(await isPgAvailable())) { skip(label, 'Postgres unavailable'); return; }
+
+  const dbName = `cm185heal_fkt5_${Date.now()}`;
+  const PID = 'schema-heal-fkt5';
+  try {
+    await createThrowawayDb(dbName);
+    const client = await pgConnect(dbName);
+    const { adapter } = await bootstrapCurrentDb(client, PID, { withExtension: false });
+
+    const { rows: before } = await client.query(
+      `SELECT conname FROM pg_constraint WHERE conrelid = 'assertions'::regclass AND contype = 'f'`
+    );
+    for (const r of before) await client.query(`ALTER TABLE assertions DROP CONSTRAINT "${r.conname}"`);
+    await client.query(
+      `ALTER TABLE assertions ADD CONSTRAINT assertions_wrong_ref_fkey FOREIGN KEY (embedded_by_provider_id) REFERENCES entities(id)`
+    );
+
+    await handoffModule.ensureSchemaCurrentCore(adapter, PID, { silent: true });
+
+    const { rows: after } = await client.query(
+      `SELECT c.conname, confrelid::regclass::text AS ref_table
+         FROM pg_constraint c JOIN pg_class tc ON tc.oid = c.conrelid
+        WHERE tc.relname = 'assertions' AND c.contype = 'f'`
+    );
+    assertEqual(after.length, 1, `FKT5: exactly one FK remains on assertions (stale wrong one dropped) — got ${JSON.stringify(after)}`);
+    assertEqual(after[0].ref_table, 'embedding_providers', 'FKT5: the surviving FK targets embedding_providers');
+    assertTrue(after[0].conname !== 'assertions_wrong_ref_fkey', 'FKT5: the wrong-reference constraint name is gone');
+
+    await client.end();
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+  }
+}
+
+async function testFKT6() {
+  const label = 'FKT6: F4 — orphan rows make the corrective ADD CONSTRAINT fail; the heal transaction rolls back and the prior (absent) state is retained';
+  if (!(await isPgAvailable())) { skip(label, 'Postgres unavailable'); return; }
+
+  const dbName = `cm185heal_fkt6_${Date.now()}`;
+  const PID = 'schema-heal-fkt6';
+  try {
+    await createThrowawayDb(dbName);
+    const client = await pgConnect(dbName);
+    const { adapter } = await bootstrapCurrentDb(client, PID, { withExtension: false });
+
+    const { rows: before } = await client.query(
+      `SELECT conname FROM pg_constraint WHERE conrelid = 'assertions'::regclass AND contype = 'f'`
+    );
+    for (const r of before) await client.query(`ALTER TABLE assertions DROP CONSTRAINT "${r.conname}"`);
+
+    // Orphan row: embedded_by_provider_id references a provider id that
+    // does not exist — with the FK gone, this insert succeeds freely.
+    await client.query(
+      `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, embedded_by_provider_id)
+       VALUES ('fkt6', 'subj', 'pred', 'obj', 5.0, 'user_stated', 999999)`
+    );
+
+    const result = await handoffModule.ensureSchemaCurrentCore(adapter, PID, { silent: true });
+    assertEqual(result.reason, 'degraded', `FKT6: heal failure must report degraded, never 'applied'/'current' — got ${JSON.stringify(result)}`);
+    assertTrue(
+      typeof result.detail.reason === 'string' && result.detail.reason.startsWith('heal_failed:'),
+      `FKT6: degraded detail names heal_failed:<sqlstate> — got ${JSON.stringify(result.detail)}`
+    );
+
+    const { rows: after } = await client.query(
+      `SELECT conname FROM pg_constraint WHERE conrelid = 'assertions'::regclass AND contype = 'f'`
+    );
+    assertEqual(after.length, 0, 'FKT6: rollback left the prior (absent) state exactly as it was — no half-migrated constraint');
+
+    const degraded = await getDegradedRow(client, PID);
+    assertEqual(degraded.reason, 'fk_mismatch', 'FKT6: the degraded row is keyed fk_mismatch');
+
+    await client.end();
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+  }
+}
+
+async function testFKT7() {
+  const label = 'FKT7: F3/F7 — a NOT VALID FK (right identity, unvalidated) classifies present_mismatched(not_validated) and heals to validated';
+  if (!(await isPgAvailable())) { skip(label, 'Postgres unavailable'); return; }
+
+  const dbName = `cm185heal_fkt7_${Date.now()}`;
+  const PID = 'schema-heal-fkt7';
+  try {
+    await createThrowawayDb(dbName);
+    const client = await pgConnect(dbName);
+    const { adapter } = await bootstrapCurrentDb(client, PID, { withExtension: false });
+
+    const { rows: before } = await client.query(
+      `SELECT conname FROM pg_constraint WHERE conrelid = 'assertions'::regclass AND contype = 'f'`
+    );
+    for (const r of before) await client.query(`ALTER TABLE assertions DROP CONSTRAINT "${r.conname}"`);
+    await client.query(
+      `ALTER TABLE assertions ADD CONSTRAINT assertions_notvalid_fkey
+         FOREIGN KEY (embedded_by_provider_id) REFERENCES embedding_providers(id) NOT VALID`
+    );
+
+    const result = await handoffModule.ensureSchemaCurrentCore(adapter, PID, { silent: true });
+    assertTrue(result.reason === 'current' || result.reason === 'degraded', `FKT7 sanity: a recognizable reason — got ${result.reason}`);
+
+    const { rows: after } = await client.query(
+      `SELECT convalidated FROM pg_constraint WHERE conrelid = 'assertions'::regclass AND contype = 'f'`
+    );
+    assertEqual(after.length, 1, 'FKT7: exactly one FK remains');
+    assertEqual(after[0].convalidated, true, 'FKT7: the healed FK is validated');
+
+    await client.end();
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+  }
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -1049,6 +1351,14 @@ async function main() {
   await testT11();
   await testT12();
   await testT15();
+
+  await testFKT1();
+  testFKT2();
+  await testFKT3();
+  await testFKT4();
+  await testFKT5();
+  await testFKT6();
+  await testFKT7();
 
   console.log('');
   console.log(`Results: ${passed} passed, ${failed} failed, ${skipped} skipped`);
