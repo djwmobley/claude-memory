@@ -1039,14 +1039,31 @@ async function runPointerGate(fields, projectRoot, db, projectId, mode) {
  * Allowed top-level keys: tldr, open_threads, quick_references, entities,
  *   assertions, edges, decisions, contract, session_id, confirm_claude_md_promotion.
  */
-function readStdin() {
+// A3: opts.allowEmpty controls what happens when stdin carries no data at
+// all (as opposed to invalid JSON, which is always a hard reject regardless
+// of allowEmpty). Default (allowEmpty: false, the caller-side default):
+// empty stdin REJECTS with exit 2 and the exact message
+// `--json - requires a payload on stdin`, so `close --help` or any other
+// unintended argument can never again fall through to an extraction-empty
+// write (see incident, scripts/lib/cli-args.js header comment). Callers that
+// deliberately want a no-payload close/checkpoint must pass --allow-empty,
+// which this function honors by resolving {} instead of rejecting.
+function readStdin(opts = {}) {
+  const allowEmpty = !!opts.allowEmpty;
   return new Promise((resolve, reject) => {
     const chunks = [];
     process.stdin.on('data', (d) => chunks.push(d));
     process.stdin.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8');
+      if (raw.trim().length === 0) {
+        if (allowEmpty) return resolve({});
+        console.error('--json - requires a payload on stdin');
+        process.exit(2);
+        return;
+      }
       let parsed;
       try {
-        parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        parsed = JSON.parse(raw);
       } catch (e) {
         return reject(new Error(`Failed to parse JSON from stdin: ${e.message}`));
       }
@@ -7409,14 +7426,30 @@ async function cmdCheckpoint(args) {
   }
 
   // Accept --json alone OR the legacy --json - form (backward compatible).
-  const useJson = args.includes('--json');
+  const useJson    = args.includes('--json');
+  const allowEmpty = args.includes('--allow-empty');
   const projectId   = resolveProjectId();
   const handoffPath = resolveHandoffMdPath(projectId);
   const root        = findProjectRoot();
 
+  // A3: an empty checkpoint (no --note, no --json, no explicit opt-in) is a
+  // no-op that looks like it did something — the same failure shape as the
+  // close incident. Reject it up front, before any DB connection, unless
+  // the caller explicitly opts in with --allow-empty.
   let payload = {};
   if (useJson) {
-    payload = await readStdin();
+    if (process.stdin.isTTY) {
+      if (!allowEmpty) {
+        console.error('--json - requires a payload on stdin');
+        process.exit(2);
+      }
+      payload = {};
+    } else {
+      payload = await readStdin({ allowEmpty });
+    }
+  } else if (!allowEmpty) {
+    console.error('checkpoint requires --note "<text>", --json (with a payload piped on stdin), or an explicit --allow-empty opt-in');
+    process.exit(2);
   }
 
   let db;
@@ -7668,11 +7701,30 @@ async function cmdClose(args) {
   const dryRun = args.includes('--dry-run');
 
   // Accept --json alone OR the legacy --json - form (backward compatible).
-  const useJson = args.includes('--json');
+  const useJson    = args.includes('--json');
+  const allowEmpty = args.includes('--allow-empty');
 
+  // A3: this is the exact incident shape (close --help silently ignored the
+  // unknown flag, useJson stayed false, payload stayed {} default, and a
+  // real extraction-empty close ran). Reject up front, before any DB
+  // connection, unless the caller explicitly opts in with --allow-empty.
+  // The SessionEnd loader-stop implicit-close path does NOT go through
+  // cmdClose/this argv path at all (it calls writeImplicitClose() directly),
+  // so it is unaffected by this gate — see PR body "blind spots".
   let payload = {};
   if (useJson) {
-    payload = await readStdin();
+    if (process.stdin.isTTY) {
+      if (!allowEmpty) {
+        console.error('--json - requires a payload on stdin');
+        process.exit(2);
+      }
+      payload = {};
+    } else {
+      payload = await readStdin({ allowEmpty });
+    }
+  } else if (!allowEmpty) {
+    console.error('close requires --json (with a payload piped on stdin) or an explicit --allow-empty opt-in');
+    process.exit(2);
   }
 
   // ── Extraction-empty detection snapshot ───────────────────────────────────
@@ -10361,6 +10413,16 @@ async function main() {
     console.error(`Subcommands: ${available}`);
     process.exit(2);
   }
+
+  // Total-classification argv check for write subcommands (scripts/lib/cli-args.js).
+  // MUST run before subcommands[sub]() is invoked — this is what guarantees
+  // "reject before any DB connection or file write" for every write command,
+  // regardless of where inside that command's own body it happens to connect
+  // (e.g. cmdPromote connects to the DB before parsing its own flags).
+  // See incident: `close --help` silently ignored the unknown flag and ran a
+  // real close. --help / an unknown flag is now caught HERE, first.
+  const { enforceTotalClassification } = require('./lib/cli-args');
+  enforceTotalClassification(sub, rest);
 
   try {
     await subcommands[sub]();
