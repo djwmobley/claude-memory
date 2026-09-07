@@ -170,6 +170,36 @@ const FAKE_EMBEDDING = Array.from({ length: 4000 }, (_, i) => (i % 10) / 10);
     assert(Array.isArray(row.embedding), 'raw vector returned on write-tool response when opted in');
   });
 
+  // ── PR #271 reviewer follow-up: MAX_READ_LIMIT clamp ─────────────────
+  // The MCP tool schemas (handoff-mcp.mjs) reject limit > 1000 via zod's
+  // .max(1000) — that hard-rejection path is only reachable through the
+  // MCP server itself and is not exercised here. entity-graph-crud.js's
+  // OWN clamp is the second, independent enforcement point for any caller
+  // that reaches these functions directly (bypassing zod) — chosen
+  // behavior is a SILENT CLAMP to MAX_READ_LIMIT (never a thrown error),
+  // documented in docs/mcp-tools.md. One test per read path.
+
+  await test('T13 assertionRead: limit=5000 is clamped to MAX_READ_LIMIT (1000), never thrown', async () => {
+    const client = makeFakeClient([]);
+    await entityCrud.assertionRead(client, { projectId: 'p1', limit: 5000 });
+    const { params } = client.calls[0];
+    assertEqual(params[params.length - 2], entityCrud.MAX_READ_LIMIT, 'assertionRead clamps limit to MAX_READ_LIMIT');
+  });
+
+  await test('T14 entityRead: limit=5000 is clamped to MAX_READ_LIMIT (1000), never thrown', async () => {
+    const client = makeFakeClient([]);
+    await entityCrud.entityRead(client, { projectId: 'p1', id: 1, limit: 5000 });
+    const { params } = client.calls[0];
+    assertEqual(params[params.length - 2], entityCrud.MAX_READ_LIMIT, 'entityRead clamps limit to MAX_READ_LIMIT');
+  });
+
+  await test('T15 edgeRead: limit=5000 is clamped to MAX_READ_LIMIT (1000), never thrown', async () => {
+    const client = makeFakeClient([]);
+    await entityCrud.edgeRead(client, { projectId: 'p1', limit: 5000 });
+    const { params } = client.calls[0];
+    assertEqual(params[params.length - 2], entityCrud.MAX_READ_LIMIT, 'edgeRead clamps limit to MAX_READ_LIMIT');
+  });
+
   console.log(`\n─── Results ──────────────────────────────────────`);
   console.log(`PASS ${passed}  FAIL ${failed}`);
   if (failures.length > 0) {

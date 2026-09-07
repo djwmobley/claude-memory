@@ -1241,6 +1241,15 @@ jobs:
         #       both equal the canonical set in the SQL schema CHECK constraint
         # Pure static analysis — no Postgres or Ollama required.
         run: node scripts/test-doc-lint.js
+      - name: Run §8 CRUD vector-strip tests (embedding stripping + read-limit clamp)
+        # cm MCP-payload fix (PR #271): scripts/lib/vector-strip.js strips
+        # pgvector-typed columns (manifest-driven, schema-manifest.json's
+        # pgvector_gated) from every entity/assertion/edge/decisions row a
+        # §8 CRUD tool returns, plus entity_read/assertion_read/edge_read's
+        # limit/offset pagination and the MAX_READ_LIMIT=1000 clamp.
+        # Exercises entity-graph-crud.js against a minimal fake pg client —
+        # no Postgres or Ollama required.
+        run: node test/test-vector-strip.js
       - name: Run schema suppression_kind ordering tests
         # Regression guard for the suppression_kind CHECK constraint ordering bug (#124):
         #   T1  Field-report repro: apply schema fresh; INSERT one row per suppression_kind

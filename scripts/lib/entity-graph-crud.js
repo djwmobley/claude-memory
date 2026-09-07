@@ -43,6 +43,22 @@ const { stripRow, stripRows } = require('./vector-strip.js');
 // two never drift independently).
 const DEFAULT_READ_LIMIT = 200;
 
+// PR #271 reviewer follow-up: the MCP tool schemas (handoff-mcp.mjs) reject
+// limit > 1000 via zod's .max(1000) — a hard error for MCP callers. THIS
+// constant is the second, independent enforcement point for any caller that
+// reaches entityRead/assertionRead/edgeRead directly (bypassing the MCP
+// zod layer entirely — e.g. a future non-MCP script requiring this lib).
+// Chosen behavior here is a SILENT CLAMP (never a thrown error) — documented
+// in docs/mcp-tools.md — because a direct lib caller has no tool-schema
+// validation step to reject against; clamping preserves "the call still
+// returns useful data" over "the call now throws where it didn't before".
+const MAX_READ_LIMIT = 1000;
+
+function clampReadLimit(limit) {
+  if (!Number.isInteger(limit) || limit <= 0) return DEFAULT_READ_LIMIT;
+  return Math.min(limit, MAX_READ_LIMIT);
+}
+
 class EntityGraphCrudError extends Error {
   constructor(code, message, details) {
     super(message);
@@ -155,7 +171,7 @@ async function entityRead(client, { projectId, id, name, includeEmbeddings, limi
   if (id === undefined && name === undefined) {
     throw new EntityGraphCrudError('validation', 'entity-graph-crud: entityRead requires either id or name');
   }
-  const lim = Number.isInteger(limit) && limit > 0 ? limit : DEFAULT_READ_LIMIT;
+  const lim = clampReadLimit(limit);
   const off = Number.isInteger(offset) && offset >= 0 ? offset : 0;
   const { rows } = await client.query(
     `SELECT * FROM entities WHERE project_id = $1 AND ($2::integer IS NULL OR id = $2) AND ($3::text IS NULL OR name = $3)
@@ -289,7 +305,7 @@ async function assertionCreate(client, { projectId, subject, predicate, object, 
 
 async function assertionRead(client, { projectId, id, subject, predicate, objectPrefix, contains, includeEmbeddings, limit, offset }) {
   requireNonEmptyString(projectId, 'projectId');
-  const lim = Number.isInteger(limit) && limit > 0 ? limit : DEFAULT_READ_LIMIT;
+  const lim = clampReadLimit(limit);
   const off = Number.isInteger(offset) && offset >= 0 ? offset : 0;
   const { rows } = await client.query(
     `SELECT * FROM assertions
@@ -535,7 +551,7 @@ async function edgeCreate(client, { projectId, fromEntity, edgeType, toEntity, w
 
 async function edgeRead(client, { projectId, id, fromEntity, toEntity, includeEmbeddings, limit, offset }) {
   requireNonEmptyString(projectId, 'projectId');
-  const lim = Number.isInteger(limit) && limit > 0 ? limit : DEFAULT_READ_LIMIT;
+  const lim = clampReadLimit(limit);
   const off = Number.isInteger(offset) && offset >= 0 ? offset : 0;
   const { rows } = await client.query(
     `SELECT * FROM edges
@@ -588,6 +604,8 @@ module.exports = {
   EntityGraphCrudError,
   FUZZY_MIN_NORMALIZED_LEN,
   FUZZY_SIMILARITY_THRESHOLD,
+  DEFAULT_READ_LIMIT,
+  MAX_READ_LIMIT,
   findNearMatchEntities,
   entityCreate,
   entityRead,

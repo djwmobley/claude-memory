@@ -320,7 +320,12 @@ has one) are stripped by default — see "Embedding-column stripping" below.
 natural filters (`assertion_read` additionally accepts `objectPrefix` — an
 SQL `LIKE` prefix match — and `contains`, a case-insensitive substring
 match, both against `object`). All three are paginated: `limit` defaults
-to 200, `offset` to 0, `ORDER BY id`.
+to 200, `offset` to 0, `ORDER BY id`. `limit` is capped at 1000, enforced
+at two independent points: the MCP tool schema rejects `limit > 1000`
+outright (a hard tool error), while `scripts/lib/entity-graph-crud.js`'s
+own `MAX_READ_LIMIT` clamps any direct (non-MCP) caller's `limit` down to
+1000 silently — never throwing — since a direct lib caller has no
+tool-schema validation step to reject against.
 
 Every row these (and every other §8 CRUD tool below) return has its vector
 columns stripped by default — see "Embedding-column stripping" below.
