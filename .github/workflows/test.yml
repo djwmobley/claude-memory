@@ -103,6 +103,22 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run Key paths portability tests (cm#263)
+        # Regression guard: the generated project CLAUDE.md's "## Key paths"
+        # section used to interpolate filesystem-absolute paths
+        # ({{HANDOFF_MD_PATH}}, {{PROJECT_ROOT}}) at init time, breaking on
+        # clone to a second machine/user and always wrong for the helper-
+        # script bullet under CLAUDE_PLUGIN_ROOT. Now both bullets render
+        # symbolic tokens (~/.claude, $HANDOFF_BASE_DIR, $CLAUDE_CONFIG_DIR,
+        # $CLAUDE_PLUGIN_ROOT, <engine-root>, <project-id>) per
+        # scripts/lib/claude-md-key-paths.js. Pure unit test, no DB, no
+        # network — asserts no absolute-path shape for {none, HANDOFF_BASE_DIR,
+        # CLAUDE_CONFIG_DIR, CLAUDE_PLUGIN_ROOT} env combos, both via the lib
+        # function directly and via a real templates/project-claude-md.tpl
+        # render.
+        run: node test/test-claude-md-key-paths.js
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run init confirmation gate tests
         # Regression guard for the init DB-confirmation gate (#126).
         # C1: resolved DB name and source tier printed before DDL (pipeline.yml tier).

@@ -105,6 +105,7 @@ const { REALITY_CHECKS, runVerifyDispatch }        = require('./lib/reality-chec
 // (and, before this fix, only-validated-never-written) entry point onto
 // this one write path.
 const { validateDecisionRows, persistDecisionRow } = require('./lib/decisions-writer');
+const { renderKeyPathsBullets }                    = require('./lib/claude-md-key-paths');
 
 process.on('exit', () => {
   const ms = Number(process.hrtime.bigint() - __startNs) / 1e6;
@@ -3623,11 +3624,12 @@ async function cmdInit(args) {
     try {
       const projectName = args.find((a) => !a.startsWith('-')) || path.basename(root);
       const projectDesc = `Memory and retrieval infrastructure project.`;
+      const keyPathsBullets = renderKeyPathsBullets(process.env);
       const content = renderTemplate(PROJECT_CLAUDE_MD_TEMPLATE, {
-        PROJECT_NAME:        projectName,
-        PROJECT_DESCRIPTION: projectDesc,
-        HANDOFF_MD_PATH:     handoffPath,
-        PROJECT_ROOT:        root,
+        PROJECT_NAME:          projectName,
+        PROJECT_DESCRIPTION:   projectDesc,
+        KEY_PATHS_HANDOFF_PATH: keyPathsBullets.handoffPath,
+        KEY_PATHS_HELPER_PATH:  keyPathsBullets.helperPath,
       });
       fs.writeFileSync(claudeMdPath, content, 'utf8');
       fsLedger.push(claudeMdPath);
