@@ -142,6 +142,77 @@ function gitTrackedSqlFiles(engineRoot) {
   }
 }
 
+/** Escape a string for literal use inside a RegExp. */
+function _escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Does `identifier` appear as a whole word (\b-bounded, case-insensitive)
+ * anywhere in `sql`? A cheap textual sanity check — NOT a DDL parser. It
+ * exists solely to catch a manifest/DDL desync (adversary finding #1,
+ * BLOCKER): a schema-manifest.json hand-edit (typo, rename, phantom entry)
+ * with no corresponding SQL change. Since the schema fingerprint hashes only
+ * the SQL files' bytes (never schema-manifest.json), such a desync leaves
+ * the fingerprint 'current' forever while every touch's expected-objects
+ * probe finds the phantom object "missing" — without this check, that flows
+ * straight into the apply-retry branch (a no-op re-apply, since the SQL
+ * didn't change) and BLOCKs every command forever on a manifest typo that
+ * has nothing to do with the live database's actual state.
+ */
+function _identifierAppearsInSQL(sql, identifier) {
+  const re = new RegExp('\\b' + _escapeRegExp(identifier) + '\\b', 'i');
+  return re.test(sql);
+}
+
+/**
+ * Cross-check one classified unit's own manifest entry (expected_objects +
+ * pgvector_gated) against that SAME unit's own SQL text. Pushes one error
+ * per entry with no textual match — a classification_error, never allowed
+ * to silently pass through as a live "missing on this DB" finding (see
+ * _identifierAppearsInSQL's doc for why this distinction matters).
+ * Excluded units carry neither expected_objects nor pgvector_gated, so the
+ * loops below are no-ops for them.
+ */
+function _checkManifestEntryAgainstOwnSQL(basename, normalizedSQL, manifestEntry, errors) {
+  const eo = manifestEntry.expected_objects || {};
+  for (const t of (eo.tables || [])) {
+    if (!_identifierAppearsInSQL(normalizedSQL, t)) {
+      errors.push(
+        `${basename}: schema-manifest.json expected_objects.tables entry "${t}" has no textual match in ` +
+        `this unit's own SQL — manifest/DDL desync (classification_error)`
+      );
+    }
+  }
+  for (const c of (eo.columns || [])) {
+    if (!_identifierAppearsInSQL(normalizedSQL, c.column)) {
+      errors.push(
+        `${basename}: schema-manifest.json expected_objects.columns entry "${c.table}.${c.column}" — column ` +
+        `"${c.column}" has no textual match in this unit's own SQL — manifest/DDL desync (classification_error)`
+      );
+    }
+  }
+  for (const idx of (eo.indexes || [])) {
+    if (!_identifierAppearsInSQL(normalizedSQL, idx)) {
+      errors.push(
+        `${basename}: schema-manifest.json expected_objects.indexes entry "${idx}" has no textual match in ` +
+        `this unit's own SQL — manifest/DDL desync (classification_error)`
+      );
+    }
+  }
+  const gated = manifestEntry.pgvector_gated;
+  if (gated && Array.isArray(gated.columns)) {
+    for (const c of gated.columns) {
+      if (!_identifierAppearsInSQL(normalizedSQL, c.column)) {
+        errors.push(
+          `${basename}: schema-manifest.json pgvector_gated.columns entry "${c.table}.${c.column}" — column ` +
+          `"${c.column}" has no textual match in this unit's own SQL — manifest/DDL desync (classification_error)`
+        );
+      }
+    }
+  }
+}
+
 function loadManifest(sqlDir) {
   const manifestPath = path.join(sqlDir, MANIFEST_BASENAME);
   let raw;
@@ -273,6 +344,14 @@ function classifySchemaFiles({ engineRoot }) {
       classification: manifestEntry.classification,
       order: typeof manifestEntry.order === 'number' ? manifestEntry.order : 0,
     });
+
+    // Adversary finding #1 (BLOCKER): manifest/DDL desync check, scoped to
+    // THIS unit's own SQL text only (never cross-unit) — a phantom or
+    // renamed expected_objects/pgvector_gated entry with no matching DDL in
+    // its own file is a loud classification_error here, never allowed to
+    // reach the fingerprint-fast-path's ungated/gated probes as a live
+    // "missing on this DB" finding.
+    _checkManifestEntryAgainstOwnSQL(f.basename, normalized, manifestEntry, errors);
   }
 
   // ── required-roster absence check ────────────────────────────────────────

@@ -903,6 +903,23 @@ class SQLiteAdapter {
   async releaseSchemaApplyLock(_lockKey) { /* no-op: see method doc */ }
 
   /**
+   * cm#185-schema-heal (adversary finding #7, MAJOR): pin a single canonical
+   * schema for the schema-apply lifecycle. No-op for SQLite -- there is no
+   * schema/search_path concept to pin (a SQLite database file has exactly
+   * one implicit namespace).
+   */
+  async pinCanonicalSchema() { /* no-op: see method doc */ }
+
+  /**
+   * cm#185-schema-heal (adversary finding #6, MAJOR): probe a gated column's
+   * actual type/dimension shape. No-op (returns null) for SQLite -- the
+   * SQLite schema declares no pgvector_gated columns at all (see
+   * schema-manifest.json), so this is never actually called on this
+   * dialect; present for interface completeness.
+   */
+  async checkColumnShape(_table, _column) { return null; }
+
+  /**
    * Execute a SELECT query that may fail (e.g., table might not exist) without
    * aborting the surrounding transaction.
    *
@@ -1570,6 +1587,58 @@ class PostgresAdapter {
 
   async releaseSchemaApplyLock(lockKey) {
     try { await this._client.query(`SELECT pg_advisory_unlock(hashtext($1), 43)`, [lockKey]); } catch (_) {}
+  }
+
+  /**
+   * cm#185-schema-heal (adversary finding #7, MAJOR): a schema-apply/verify
+   * decision taken via `current_schema()` (as schemaObjectsExist and
+   * checkPgvectorGatedObjects's catalog probes already do) is only
+   * self-consistent for the CONNECTION it runs on. A maintenance role with
+   * a customized default search_path touching the SAME database as the
+   * application role could otherwise apply DDL into, or verify against, a
+   * different resolved schema than the app's own runtime queries use.
+   * Pinned to the fixed literal 'public' (this engine's own SQL files never
+   * schema-qualify a CREATE TABLE/ALTER TABLE target and have no config
+   * knob for an alternate schema anywhere in this codebase) for the
+   * remainder of THIS connection, at the earliest point the schema-apply
+   * lifecycle (fingerprint check / apply / verify / gated check) begins —
+   * best-effort: a role lacking permission to SET search_path degrades
+   * non-fatally (the existing ambient-schema behavior is unaffected, not a
+   * new failure mode) rather than aborting the whole command.
+   */
+  async pinCanonicalSchema() {
+    try { await this._client.query(`SET search_path TO public`); } catch (_) { /* best-effort — see method doc */ }
+  }
+
+  /**
+   * cm#185-schema-heal (adversary finding #6, MAJOR): existence alone
+   * (schemaObjectsExist) cannot distinguish a hand-created `vector(1024)`
+   * column from the manifest's intended `halfvec(4000)` — both satisfy "the
+   * column exists". pgvector's vector/halfvec typmod IS the dimension count
+   * directly (unlike varchar's VARHDRSZ-offset typmod), so atttypmod can be
+   * compared to the manifest's declared `dims` with no extension-specific
+   * decoding. Returns null (never a false mismatch) on any probe failure —
+   * including "table/column does not exist", which checkPgvectorGatedObjects's
+   * own existence probe already reports separately.
+   *
+   * @returns {Promise<{type:string, dims:number|null}|null>}
+   */
+  async checkColumnShape(table, column) {
+    try {
+      const { rows } = await this._client.query(
+        `SELECT t.typname AS type, a.atttypmod AS typmod
+           FROM pg_attribute a
+           JOIN pg_type t ON t.oid = a.atttypid
+          WHERE a.attrelid = $1::regclass AND a.attname = $2
+            AND a.attnum > 0 AND NOT a.attisdropped`,
+        [table, column]
+      );
+      if (rows.length === 0) return null;
+      const typmod = parseInt(rows[0].typmod, 10);
+      return { type: rows[0].type, dims: Number.isFinite(typmod) && typmod > 0 ? typmod : null };
+    } catch (_) {
+      return null;
+    }
   }
 
   get dialect() { return 'postgres'; }

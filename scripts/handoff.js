@@ -1879,6 +1879,16 @@ function _hashSchemaFileNormalized(filePath) {
  * which is platform-dependent (S-7) — before hashing, so a rename with
  * identical content changes the fingerprint and a removal changes it too.
  *
+ * cm#185-schema-heal (adversary finding #9, MINOR): also folds
+ * schema-manifest.json's own bytes into the hash. Without this, an
+ * expected_objects/pgvector_gated hand-edit with zero SQL byte change
+ * (a typo, a rename, a phantom entry) leaves the fingerprint bit-identical
+ * — the very next probe could flip degraded/healed status purely from a
+ * manifest commit, with no epoch bump and no "drift detected" line
+ * explaining why. Folding the manifest's bytes in means any such edit
+ * forces exactly one (idempotent, safe) re-apply on the next touch, same as
+ * any SQL file edit already does.
+ *
  * @param {Array<{basename:string, fullPath:string}>} units
  * @returns {string} "<SCHEMA_EPOCH>:<sha256 hex>"
  */
@@ -1897,6 +1907,8 @@ function _computeSchemaFingerprint(units) {
   for (const u of sorted) {
     hash.update(u.basename + '\0' + _hashSchemaFileNormalized(u.fullPath), 'utf8');
   }
+  const manifestPath = path.join(_ENGINE_ROOT, 'scripts', 'sql', 'schema-manifest.json');
+  hash.update('schema-manifest.json\0' + _hashSchemaFileNormalized(manifestPath), 'utf8');
   return `${SCHEMA_EPOCH}:${hash.digest('hex')}`;
 }
 
@@ -2082,6 +2094,24 @@ async function clearSchemaDegradation(db, projectId) {
 }
 
 /**
+ * cm#185-schema-heal (S2): the ONE shared upsert for project_settings'
+ * schema_fingerprint row — used by both ensureSchemaCurrentCore's apply
+ * sequence AND cmdInit (which, before this fix, never wrote this row at
+ * all — a fresh/re-`init` left every project immediately BEHIND on its very
+ * first touch). S2 unifies only this persistence PLUMBING (the literal
+ * INSERT/UPDATE), never the surrounding pass/fail POLICY — cmdInit keeps
+ * its own fatal-exit decision around a still-missing gated object; only the
+ * write statement itself is shared, per adversary finding #4/#8.
+ */
+async function recordSchemaFingerprint(db, projectId, fingerprint) {
+  await db.query(
+    `INSERT INTO project_settings (project_id, key, value) VALUES ($1, 'schema_fingerprint', $2)
+     ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
+    [projectId, fingerprint]
+  );
+}
+
+/**
  * isEmbeddingsOptedOut — init-embeddability spec: an operator who ran
  * `init --no-embeddings` (or had a prior opt-out auto-honored, adversary
  * finding #5) has explicitly said "proceed without embedding capability."
@@ -2139,6 +2169,10 @@ async function isEmbeddingsOptedOut(db, projectId) {
  * apply that first skipped it (that "reported once, then silent forever"
  * gap is exactly the finding this closes).
  *
+ * cm#185-schema-heal (S4): always queries pg_extension + the live catalog
+ * fresh on every call — never cached — so the result reflects the CURRENT
+ * probe at the moment it's called, not a snapshot from classification time.
+ *
  * @param {object} db — connected StoragePort adapter
  * @param {object} manifest — classification.manifest (schema-manifest.json, parsed)
  * @param {Array<{basename:string}>} units — the active dialect's applicable unit set
@@ -2150,7 +2184,13 @@ async function checkPgvectorGatedObjects(db, manifest, units) {
     const entry = manifest.units[u.basename];
     const gated = entry && entry.pgvector_gated;
     if (gated && Array.isArray(gated.columns)) {
-      for (const c of gated.columns) gatedColumns.push({ unit: u.basename, table: c.table, column: c.column });
+      for (const c of gated.columns) {
+        gatedColumns.push({
+          unit: u.basename, table: c.table, column: c.column,
+          type: typeof c.type === 'string' ? c.type : null,
+          dims: typeof c.dims === 'number' ? c.dims : null,
+        });
+      }
     }
   }
   if (gatedColumns.length === 0) return { ok: true, vectorExtensionPresent: null, missing: [] };
@@ -2172,7 +2212,38 @@ async function checkPgvectorGatedObjects(db, manifest, units) {
       .filter((m) => m.type === 'column')
       .map((m) => `${m.table}.${m.column}`)
   );
-  const missing = gatedColumns.filter((gc) => missingSet.has(`${gc.table}.${gc.column}`));
+  const missing = gatedColumns
+    .filter((gc) => missingSet.has(`${gc.table}.${gc.column}`))
+    .map((gc) => ({ unit: gc.unit, table: gc.table, column: gc.column, reason: 'absent' }));
+
+  // Adversary finding #6 (MAJOR): existence alone does not prove SHAPE — a
+  // column present with the wrong type/dims (e.g. a hand-created
+  // `vector(1024)` instead of the manifest's intended `halfvec(4000)` — this
+  // project's own prior legacy-1024-dim-store incident class) passes the
+  // bare existence probe above but is not the column the write path
+  // actually expects. Only checked for a manifest entry that DECLARES a
+  // type/dims (backward-compatible: an entry with neither behaves exactly
+  // as before this fix) and only for columns that already passed the
+  // existence probe (an absent column is reported above; never double-counted).
+  const presentGated = gatedColumns.filter(
+    (gc) => !missingSet.has(`${gc.table}.${gc.column}`) && (gc.type || gc.dims != null)
+  );
+  if (presentGated.length > 0 && typeof db.checkColumnShape === 'function') {
+    for (const gc of presentGated) {
+      let shape = null;
+      try { shape = await db.checkColumnShape(gc.table, gc.column); } catch (_) { shape = null; }
+      if (!shape) continue; // probe itself failed/unavailable — never a false mismatch
+      const typeOk = !gc.type || shape.type === gc.type;
+      const dimsOk = gc.dims == null || shape.dims === gc.dims;
+      if (!typeOk || !dimsOk) {
+        missing.push({
+          unit: gc.unit, table: gc.table, column: gc.column, reason: 'shape_mismatch',
+          expected: { type: gc.type, dims: gc.dims }, actual: { type: shape.type, dims: shape.dims },
+        });
+      }
+    }
+  }
+
   return { ok: missing.length === 0, vectorExtensionPresent, missing };
 }
 
@@ -2202,9 +2273,23 @@ async function checkPgvectorGatedObjects(db, manifest, units) {
  *
  * @param {object} db
  * @param {string} projectId
+ * @param {object} [opts]
+ * @param {boolean} [opts.precomputedGatedOk] — cm#185-schema-heal (adversary
+ *   finding #10, MINOR): when the CALLER already ran ensureSchemaCurrent
+ *   moments earlier in the SAME command and knows its result unambiguously
+ *   implies the gated-objects probe outcome (reason 'current'/'applied' ->
+ *   true, reason 'degraded' -> false), pass that boolean here to skip this
+ *   function's own classifySchemaFiles + checkPgvectorGatedObjects round
+ *   trip — avoids two separate DB reads of the identical fact within one
+ *   command (which, under READ COMMITTED, could otherwise observe two
+ *   different snapshots if a concurrent apply lands between them). Any
+ *   OTHER ensureSchemaCurrent outcome (classification_error, lock_acquire_
+ *   failed, ahead, unknown, ...) is genuinely ambiguous for this purpose —
+ *   omit the option and this function falls back to its own independent,
+ *   conservative probe exactly as before.
  * @returns {Promise<string>} one of the five states above
  */
-async function computeEmbeddingReadiness(db, projectId) {
+async function computeEmbeddingReadiness(db, projectId, { precomputedGatedOk } = {}) {
   if (db && typeof db.supportsEmbeddingColumns === 'function' && !db.supportsEmbeddingColumns()) {
     return 'N/A (sqlite backend)';
   }
@@ -2212,16 +2297,20 @@ async function computeEmbeddingReadiness(db, projectId) {
   const optedOut = await isEmbeddingsOptedOut(db, projectId);
   if (optedOut) return 'DEGRADED:opt-out';
 
-  try {
-    const classification = classifySchemaFiles({ engineRoot: _ENGINE_ROOT });
-    if (!classification.ok) return 'UNEMBEDDABLE:no-extension';
-    const rosterEntry = classification.manifest.units[db.schemaFileName];
-    const units = rosterEntry ? classification.unitsByDialect[rosterEntry.classification] : null;
-    if (!units || units.length === 0) return 'UNEMBEDDABLE:no-extension';
-    const gated = await checkPgvectorGatedObjects(db, classification.manifest, units);
-    if (!gated.ok) return 'UNEMBEDDABLE:no-extension';
-  } catch (_) {
-    return 'UNEMBEDDABLE:no-extension';
+  if (typeof precomputedGatedOk === 'boolean') {
+    if (!precomputedGatedOk) return 'UNEMBEDDABLE:no-extension';
+  } else {
+    try {
+      const classification = classifySchemaFiles({ engineRoot: _ENGINE_ROOT });
+      if (!classification.ok) return 'UNEMBEDDABLE:no-extension';
+      const rosterEntry = classification.manifest.units[db.schemaFileName];
+      const units = rosterEntry ? classification.unitsByDialect[rosterEntry.classification] : null;
+      if (!units || units.length === 0) return 'UNEMBEDDABLE:no-extension';
+      const gated = await checkPgvectorGatedObjects(db, classification.manifest, units);
+      if (!gated.ok) return 'UNEMBEDDABLE:no-extension';
+    } catch (_) {
+      return 'UNEMBEDDABLE:no-extension';
+    }
   }
 
   try {
@@ -2233,6 +2322,22 @@ async function computeEmbeddingReadiness(db, projectId) {
   }
 
   return 'READY';
+}
+
+/**
+ * cm#185-schema-heal (adversary finding #10 helper): derive the
+ * precomputedGatedOk boolean for computeEmbeddingReadiness from an
+ * ensureSchemaCurrent/ensureSchemaCurrentCore result object, when — and
+ * only when — that result unambiguously implies the gated-objects probe
+ * outcome. Returns `undefined` (never a guessed boolean) for every other
+ * reason, so callers can spread `{ precomputedGatedOk: ... }` and safely
+ * fall back to computeEmbeddingReadiness's own independent probe.
+ */
+function _gatedOkFromSchemaHealResult(result) {
+  if (!result) return undefined;
+  if (result.reason === 'current' || result.reason === 'applied') return true;
+  if (result.reason === 'degraded') return false;
+  return undefined;
 }
 
 /**
@@ -2274,12 +2379,28 @@ async function computeEmbeddingNullCounts(db, projectId) {
  * freshly successful apply). Returns `null` when nothing is gated-missing
  * (caller proceeds with its own normal success return); otherwise records
  * the persistent degradation and returns the final response object.
+ *
+ * @param {object} [opts.precomputedGated] — cm#185-schema-heal (adversary
+ *   finding #10): when the caller already has a fresh checkPgvectorGatedObjects
+ *   result from a moment earlier IN THE SAME call with no intervening writes,
+ *   pass it here to avoid a redundant round-trip re-querying the identical
+ *   fact. Never pass a result that could be stale relative to a write this
+ *   function's caller just performed — S4 requires the recorded row to
+ *   reflect the CURRENT probe.
  */
-async function reportPgvectorGatedDegradation(db, projectId, classification, units, { silent, applied, extraDetail } = {}) {
-  const gated = await checkPgvectorGatedObjects(db, classification.manifest, units);
+async function reportPgvectorGatedDegradation(db, projectId, classification, units, { silent, applied, extraDetail, precomputedGated } = {}) {
+  const gated = precomputedGated || await checkPgvectorGatedObjects(db, classification.manifest, units);
   if (gated.ok) return null;
   const detail = {
-    missing: gated.missing.map((m) => ({ unit: m.unit, table: m.table, column: m.column })),
+    // cm#185-schema-heal (finding #6): preserve reason/expected/actual when
+    // present (a shape_mismatch entry) rather than stripping to bare
+    // unit/table/column — the degraded row should say WHY, not just WHAT.
+    missing: gated.missing.map((m) => ({
+      unit: m.unit, table: m.table, column: m.column,
+      ...(m.reason ? { reason: m.reason } : {}),
+      ...(m.expected ? { expected: m.expected } : {}),
+      ...(m.actual ? { actual: m.actual } : {}),
+    })),
     vectorExtensionPresent: gated.vectorExtensionPresent,
     remedy:
       'Have a Postgres superuser run `CREATE EXTENSION vector;` on this database, then ask an operator ' +
@@ -2321,6 +2442,14 @@ async function reportPgvectorGatedDegradation(db, projectId, classification, uni
  * @returns {Promise<{applied:boolean, reason:string, detail?:object}>}
  */
 async function ensureSchemaCurrentCore(db, projectId, { silent } = {}) {
+  // cm#185-schema-heal (adversary finding #7, MAJOR): pin the canonical
+  // schema for this ENTIRE apply/verify lifecycle before anything else runs
+  // — see PostgresAdapter#pinCanonicalSchema's own doc for the full
+  // rationale (a maintenance role with a customized default search_path
+  // must resolve the SAME schema this call's own fingerprint/apply/verify/
+  // gated-check sequence does). No-op on SQLite; best-effort on Postgres.
+  await db.pinCanonicalSchema();
+
   // cm#185 review N5: classification (a non-recursive readdir, a `git
   // ls-files` spawn, and reading+parsing all ~5 small scripts/sql/*.sql files
   // for their header directives) now runs on EVERY call, including the
@@ -2372,14 +2501,215 @@ async function ensureSchemaCurrentCore(db, projectId, { silent } = {}) {
   const stored = rows.length > 0 ? rows[0].value : null;
   const cmp = _compareSchemaFingerprint(stored, currentFingerprint);
 
+  /** Accumulate the ungated expected_objects set from every active unit's manifest entry. */
+  function buildExpectedObjects() {
+    const expected = { tables: [], columns: [], indexes: [] };
+    for (const u of units) {
+      const eo = (classification.manifest.units[u.basename] || {}).expected_objects || {};
+      expected.tables.push(...(eo.tables || []));
+      expected.columns.push(...(eo.columns || []));
+      expected.indexes.push(...(eo.indexes || []));
+    }
+    return expected;
+  }
+
+  /**
+   * Shared lock + apply + verify + fingerprint + gated-check sequence.
+   *
+   * Used by:
+   *   - the classic 'absent'/'behind' fingerprint-mismatch path (no
+   *     `alreadyFixedCheck` — the post-lock recheck is the fingerprint
+   *     comparison itself, byte-identical to this engine's pre-cm#185-
+   *     schema-heal behavior).
+   *   - S1(b)/(d) (adversary finding #3, BLOCKER): a fingerprint-'current'
+   *     DB whose live catalog is missing an ungated object, or a gated
+   *     object whose gating extension is now present. Routes through this
+   *     SAME lock — never a standalone apply — so two concurrent touches
+   *     racing the identical gap can never both run applyAdditiveSchema.
+   *     `alreadyFixedCheck` re-probes the LIVE OBJECT the caller actually
+   *     cares about (never the fingerprint, which cannot detect either of
+   *     these gaps — that's the whole reason this path exists) immediately
+   *     after the lock is held; if a concurrent winner already fixed it,
+   *     this call is a clean no-op, mirroring the classic path's own
+   *     "someone already applied while we waited" semantics.
+   */
+  async function runSchemaApplySequence({ alreadyFixedCheck } = {}) {
+    const lockKey = 'schema_apply:' + projectId;
+    try {
+      await db.acquireSchemaApplyLock(lockKey);
+    } catch (lockErr) {
+      // cm#185 review N1: bounded acquire (db-seam.js SET lock_timeout) means a
+      // wedged/long-lived concurrent holder throws here instead of hanging this
+      // process forever. Treat exactly like any other apply-time failure: loud,
+      // non-fatal, retried on the next invocation.
+      await recordSchemaDegradation(db, projectId, 'lock_acquire_failed', { message: lockErr.message }, { silent });
+      return { applied: false, reason: 'lock_acquire_failed', detail: { message: lockErr.message } };
+    }
+    try {
+      if (alreadyFixedCheck) {
+        if (await alreadyFixedCheck()) {
+          const degraded = await reportPgvectorGatedDegradation(db, projectId, classification, units, { silent, applied: false });
+          return degraded || { applied: false, reason: 'current' };
+        }
+      } else {
+        // Re-check immediately after acquiring the lock — a concurrent process
+        // may have already applied and upserted while we were waiting; if so,
+        // this invocation is a clean no-op (R-8).
+        const { rows: rows2 } = await db.query(
+          'SELECT value FROM project_settings WHERE project_id = $1 AND key = $2',
+          [projectId, 'schema_fingerprint']
+        );
+        const stored2 = rows2.length > 0 ? rows2[0].value : null;
+        if (_compareSchemaFingerprint(stored2, currentFingerprint) === 'current') {
+          const degraded = await reportPgvectorGatedDegradation(db, projectId, classification, units, { silent, applied: false });
+          return degraded || { applied: false, reason: 'current' };
+        }
+      }
+
+      const applyResult = await applyAdditiveSchema(db, units, { silent });
+      if (!applyResult.ok) {
+        const detail = { failedUnit: applyResult.failedUnit, errorMsg: applyResult.errorMsg, appliedUnits: applyResult.appliedUnits };
+        await recordSchemaDegradation(db, projectId, 'apply_failed', detail, { silent });
+        return { applied: false, reason: 'apply_failed', detail };
+      }
+
+      const failedIndexes = applyResult.integrityResults.filter((r) => !r.ok);
+      if (failedIndexes.length > 0) {
+        // R-6: fingerprint MUST NOT be upserted when any integrity-index result
+        // is ok:false — the fingerprint records "verified present", never
+        // "apply did not throw".
+        await recordSchemaDegradation(db, projectId, 'integrity_index_failed', { failedIndexes }, { silent });
+        return { applied: false, reason: 'integrity_index_failed', detail: { failedIndexes } };
+      }
+
+      // Post-apply structural verification (S-13): derive the expected-objects
+      // set from the applied units' manifest entries (never by parsing SQL) and
+      // probe the live catalog. Only upsert the fingerprint when every expected
+      // object is confirmed present.
+      const expected = buildExpectedObjects();
+      const verify = await db.schemaObjectsExist(expected);
+      if (!verify.ok) {
+        await recordSchemaDegradation(db, projectId, 'verification_failed', { missing: verify.missing }, { silent });
+        return { applied: false, reason: 'verification_failed', detail: { missing: verify.missing } };
+      }
+
+      await recordSchemaFingerprint(db, projectId, currentFingerprint);
+
+      // cm#224 follow-up: the DDL itself applied and verified successfully
+      // (fingerprint upserted above), but a pgvector-gated column/index may
+      // still have been silently skipped — degraded, not a clean 'applied'.
+      // S1(d)/adversary finding #2 (BLOCKER): clears ONLY if this fresh
+      // post-apply probe passes; otherwise re-stamps with the current probe
+      // — never an unconditional clear just because an apply was attempted.
+      const degraded = await reportPgvectorGatedDegradation(db, projectId, classification, units, {
+        silent, applied: true,
+        extraDetail: { appliedUnits: applyResult.appliedUnits, fingerprint: currentFingerprint },
+      });
+      if (degraded) return degraded;
+
+      await clearSchemaDegradation(db, projectId);
+      return { applied: true, reason: 'applied', detail: { appliedUnits: applyResult.appliedUnits, fingerprint: currentFingerprint } };
+    } finally {
+      await db.releaseSchemaApplyLock(lockKey);
+    }
+  }
+
   if (cmp === 'current') {
-    // cm#224 follow-up: a fingerprint-current DB can still be silently
-    // missing a pgvector-gated column/index (stamped current before
-    // pgvector was ever installed, or the gap simply never surfaced) —
-    // check on every call, not just the one apply that first skipped it.
-    const degraded = await reportPgvectorGatedDegradation(db, projectId, classification, units, { silent, applied: false });
-    if (degraded) return degraded;
-    return { applied: false, reason: 'current' }; // no-op — the common case.
+    // ── S1: total classification of the fingerprint-'current' fast path ───
+    // (cm#185-schema-heal, all adversary amendments accepted). A fingerprint
+    // match only proves the SQL bytes are unchanged — it says nothing about
+    // whether the live catalog still has every object those bytes describe
+    // (a column dropped by hand, or a gating extension that only appeared
+    // AFTER this DB was first fingerprinted). Every reachable state below
+    // maps to exactly one branch; there is no default "looks fine" path.
+    const expected = buildExpectedObjects();
+    const ungatedProbe = await db.schemaObjectsExist(expected);
+
+    const probeErrors = (ungatedProbe.missing || []).filter((m) => m.type === 'error');
+    if (probeErrors.length > 0) {
+      // S1's own "any other -> BLOCK" branch: a probe FAILURE (e.g. a
+      // transient connection error inside schemaObjectsExist) is a
+      // different fact than "objects are genuinely missing" — routing it
+      // into the apply branch would attempt DDL right after failing to read
+      // from this same database. BLOCK, naming what the probe reported.
+      const detail = { missing: ungatedProbe.missing };
+      await recordSchemaDegradation(db, projectId, 'verification_probe_failed', detail, { silent });
+      return { applied: false, reason: 'verification_probe_failed', detail };
+    }
+
+    if (!ungatedProbe.ok) {
+      // S1(b): fingerprint says current, but the live catalog is missing an
+      // UNGATED object (e.g. a column dropped by hand) — BEHIND in every
+      // sense that matters even though the SQL bytes never changed. Routes
+      // through the SAME lock+apply+verify+fingerprint sequence as an
+      // absent/behind fingerprint (adversary finding #3) — never a
+      // standalone apply.
+      if (!silent) {
+        process.stderr.write(
+          '[handoff] schema drift detected on a fingerprint-current DB (missing objects) — running additive schema apply\n'
+        );
+      }
+      return await runSchemaApplySequence({
+        alreadyFixedCheck: async () => (await db.schemaObjectsExist(expected)).ok,
+      });
+    }
+
+    // Ungated objects are all present — now total-classify the gated
+    // (pgvector-dependent) objects. checkPgvectorGatedObjects always queries
+    // fresh (S4), so this single call is authoritative for every branch below.
+    const gated = await checkPgvectorGatedObjects(db, classification.manifest, units);
+    if (gated.ok) {
+      // S1(a): HEALED. Clearing a possibly-absent row is an idempotent
+      // no-op DELETE (clearSchemaDegradation), so calling it unconditionally
+      // here has the identical net effect to "clear only if a degraded row
+      // exists AND the re-probe passed", without an extra existence-probe
+      // round-trip on the common healthy-fast-path case.
+      await clearSchemaDegradation(db, projectId);
+      return { applied: false, reason: 'current' };
+    }
+
+    // finding #6 refinement: a shape_mismatch (column exists, wrong
+    // type/dims) can NEVER be fixed by re-running ADD COLUMN IF NOT EXISTS —
+    // that statement no-ops against an already-existing column regardless
+    // of its shape. Only an 'absent' entry is something an apply attempt
+    // could possibly resolve. A gated result made up ENTIRELY of
+    // shape_mismatch entries therefore always falls through to (c)'s
+    // report/re-stamp-only treatment, even when the extension is present —
+    // routing it into (d) would just retry a no-win apply on every touch.
+    const hasFixableAbsence = gated.missing.some((m) => m.reason !== 'shape_mismatch');
+
+    if (gated.vectorExtensionPresent === true && hasFixableAbsence) {
+      // Adversary finding #5 (MAJOR): an operator's explicit --no-embeddings
+      // opt-out must never be silently overridden by pgvector later
+      // appearing on a shared instance (e.g. another app on the same
+      // cluster installs it) — report/re-stamp only, exactly like (c),
+      // never an unsolicited ALTER TABLE/CREATE INDEX against a large table.
+      if (await isEmbeddingsOptedOut(db, projectId)) {
+        const degraded = await reportPgvectorGatedDegradation(db, projectId, classification, units, {
+          silent, applied: false, precomputedGated: gated,
+        });
+        return degraded || { applied: false, reason: 'current' };
+      }
+      // S1(d): extension now present but the gated column/index is still
+      // missing — apply now, through the SAME lock as (b)/behind (adversary
+      // finding #3: no standalone apply, no double-apply race — see
+      // runSchemaApplySequence's own doc). Clears ONLY if the post-apply
+      // re-probe (inside the shared sequence) passes; otherwise re-stamps
+      // with the current probe (adversary finding #2).
+      return await runSchemaApplySequence({
+        alreadyFixedCheck: async () => (await checkPgvectorGatedObjects(db, classification.manifest, units)).ok,
+      });
+    }
+
+    // S1(c): gated missing (or shape-mismatched with nothing fixable), and
+    // the extension's presence is either confirmed false OR itself
+    // unreadable (vectorExtensionPresent === null gets the same
+    // conservative "not confirmed true" treatment as false) — re-stamp with
+    // the CURRENT probe, never apply (there is nothing an apply could fix here).
+    const degraded = await reportPgvectorGatedDegradation(db, projectId, classification, units, {
+      silent, applied: false, precomputedGated: gated,
+    });
+    return degraded || { applied: false, reason: 'current' };
   }
 
   if (cmp === 'ahead') {
@@ -2398,86 +2728,7 @@ async function ensureSchemaCurrentCore(db, projectId, { silent } = {}) {
   if (!silent) {
     process.stderr.write('[handoff] schema drift detected — running additive schema apply\n');
   }
-
-  const lockKey = 'schema_apply:' + projectId;
-  try {
-    await db.acquireSchemaApplyLock(lockKey);
-  } catch (lockErr) {
-    // cm#185 review N1: bounded acquire (db-seam.js SET lock_timeout) means a
-    // wedged/long-lived concurrent holder throws here instead of hanging this
-    // process forever. Treat exactly like any other apply-time failure: loud,
-    // non-fatal, retried on the next invocation.
-    await recordSchemaDegradation(db, projectId, 'lock_acquire_failed', { message: lockErr.message }, { silent });
-    return { applied: false, reason: 'lock_acquire_failed', detail: { message: lockErr.message } };
-  }
-  try {
-    // Re-check immediately after acquiring the lock — a concurrent process
-    // may have already applied and upserted while we were waiting; if so,
-    // this invocation is a clean no-op (R-8).
-    const { rows: rows2 } = await db.query(
-      'SELECT value FROM project_settings WHERE project_id = $1 AND key = $2',
-      [projectId, 'schema_fingerprint']
-    );
-    const stored2 = rows2.length > 0 ? rows2[0].value : null;
-    if (_compareSchemaFingerprint(stored2, currentFingerprint) === 'current') {
-      const degraded = await reportPgvectorGatedDegradation(db, projectId, classification, units, { silent, applied: false });
-      if (degraded) return degraded;
-      return { applied: false, reason: 'current' };
-    }
-
-    const applyResult = await applyAdditiveSchema(db, units, { silent });
-    if (!applyResult.ok) {
-      const detail = { failedUnit: applyResult.failedUnit, errorMsg: applyResult.errorMsg, appliedUnits: applyResult.appliedUnits };
-      await recordSchemaDegradation(db, projectId, 'apply_failed', detail, { silent });
-      return { applied: false, reason: 'apply_failed', detail };
-    }
-
-    const failedIndexes = applyResult.integrityResults.filter((r) => !r.ok);
-    if (failedIndexes.length > 0) {
-      // R-6: fingerprint MUST NOT be upserted when any integrity-index result
-      // is ok:false — the fingerprint records "verified present", never
-      // "apply did not throw".
-      await recordSchemaDegradation(db, projectId, 'integrity_index_failed', { failedIndexes }, { silent });
-      return { applied: false, reason: 'integrity_index_failed', detail: { failedIndexes } };
-    }
-
-    // Post-apply structural verification (S-13): derive the expected-objects
-    // set from the applied units' manifest entries (never by parsing SQL) and
-    // probe the live catalog. Only upsert the fingerprint when every expected
-    // object is confirmed present.
-    const expected = { tables: [], columns: [], indexes: [] };
-    for (const u of units) {
-      const eo = (classification.manifest.units[u.basename] || {}).expected_objects || {};
-      expected.tables.push(...(eo.tables || []));
-      expected.columns.push(...(eo.columns || []));
-      expected.indexes.push(...(eo.indexes || []));
-    }
-    const verify = await db.schemaObjectsExist(expected);
-    if (!verify.ok) {
-      await recordSchemaDegradation(db, projectId, 'verification_failed', { missing: verify.missing }, { silent });
-      return { applied: false, reason: 'verification_failed', detail: { missing: verify.missing } };
-    }
-
-    await db.query(
-      `INSERT INTO project_settings (project_id, key, value) VALUES ($1, $2, $3)
-       ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
-      [projectId, 'schema_fingerprint', currentFingerprint]
-    );
-
-    // cm#224 follow-up: the DDL itself applied and verified successfully
-    // (fingerprint upserted above), but a pgvector-gated column/index may
-    // still have been silently skipped — degraded, not a clean 'applied'.
-    const degraded = await reportPgvectorGatedDegradation(db, projectId, classification, units, {
-      silent, applied: true,
-      extraDetail: { appliedUnits: applyResult.appliedUnits, fingerprint: currentFingerprint },
-    });
-    if (degraded) return degraded;
-
-    await clearSchemaDegradation(db, projectId);
-    return { applied: true, reason: 'applied', detail: { appliedUnits: applyResult.appliedUnits, fingerprint: currentFingerprint } };
-  } finally {
-    await db.releaseSchemaApplyLock(lockKey);
-  }
+  return await runSchemaApplySequence();
 }
 
 const INTENT_KEY_MIGRATION_SETTING_KEY = 'intent_key_migration_epoch';
@@ -2865,6 +3116,9 @@ async function cmdInit(args) {
     process.exit(1);
   }
   console.log(`  [OK]    Schema units resolved (${units.length}): ${units.map((u) => u.basename).join(', ')}`);
+  // cm#185-schema-heal (S2): computed once here, written to project_settings
+  // after a successful apply+verify below (see recordSchemaFingerprint call).
+  const currentFingerprint = _computeSchemaFingerprint(units);
 
   // Connect to target DB — adapter handles dialect-specific connection setup.
   let db;
@@ -2874,6 +3128,11 @@ async function cmdInit(args) {
     console.log(`  [FAIL]  DB connection failed — ${err.message}`);
     process.exit(1);
   }
+  // cm#185-schema-heal (adversary finding #7, MAJOR): pin the SAME canonical
+  // schema ensureSchemaCurrentCore pins for every later touch — see
+  // PostgresAdapter#pinCanonicalSchema's own doc. No-op on SQLite;
+  // best-effort on Postgres.
+  await db.pinCanonicalSchema();
 
   // ── init-embeddability: install pgvector BEFORE the gated schema DDL runs ──
   // Runs only after the SINGLE confirm gate above already covered this
@@ -3001,6 +3260,29 @@ async function cmdInit(args) {
   );
   await db.releaseSchemaApplyLock(initLockKey);
 
+  // cm#185-schema-heal (S2): record schema_fingerprint now that the ungated
+  // DDL is applied and verified — this is the "cmdInit never wrote
+  // schema_fingerprint" gap that left every fresh/re-init project BEHIND on
+  // its very first subsequent touch (status/resume/close would immediately
+  // re-detect drift and re-run the whole apply sequence again). Shares only
+  // the persistence PLUMBING (recordSchemaFingerprint — the literal INSERT)
+  // with ensureSchemaCurrentCore's apply path; the pass/fail POLICY around
+  // it stays entirely cmdInit's own (adversary finding #4/#8) — see the
+  // gated-column FATAL block a few lines below, which is UNCHANGED from
+  // before this fix.
+  //
+  // R-6 parity: mirrors ensureSchemaCurrentCore's own rule that the
+  // fingerprint records "verified present", never "apply did not throw" —
+  // skip the write when an integrity index failed to (re)create (the
+  // legacy-duplicate-corpus WARN case above), exactly as the sentinel path
+  // already refuses to upsert in that same condition.
+  if (failedIndexNames.size === 0) {
+    await recordSchemaFingerprint(db, projectId, currentFingerprint);
+    console.log(`  [OK]    schema_fingerprint recorded (epoch ${SCHEMA_EPOCH})`);
+  } else {
+    console.log(`  [NOTE]  schema_fingerprint NOT recorded — an integrity index failed to (re)create (see WARN above); will retry apply on next touch`);
+  }
+
   // ── init-embeddability spec extension table, row 2: "extension present,
   // gated columns still missing" → BLOCK if STILL missing after this run's
   // own apply. Since CREATE EXTENSION (above) runs BEFORE applyAdditiveSchema,
@@ -3008,9 +3290,20 @@ async function cmdInit(args) {
   // column/index in the SAME pass — this check only fires for a genuine
   // schema-apply bug (extension confirmed present, yet the gated DDL still
   // didn't take), not for the ordinary "extension was just installed" path.
+  //
+  // cm#185-schema-heal (S2, adversary finding #4, BLOCKER): cmdInit KEEPS
+  // its own fatal exit here — the touch path's non-fatal record-and-continue
+  // policy is deliberately NOT imported into init. Only the degraded-row
+  // PLUMBING (recordSchemaDegradation/clearSchemaDegradation, via
+  // reportPgvectorGatedDegradation) is shared, so a re-init of an
+  // already-marker'd project that still fails this check leaves `status`
+  // showing the real, current state (S4) instead of silence.
   if (!effectiveNoEmbeddings && initDialect !== 'sqlite') {
     const gatedCheck = await checkPgvectorGatedObjects(db, classification.manifest, units);
     if (!gatedCheck.ok) {
+      await reportPgvectorGatedDegradation(db, projectId, classification, units, {
+        silent: true, applied: true, precomputedGated: gatedCheck,
+      });
       await db.end();
       console.log(`  [FAIL]  pgvector extension is present but gated column(s)/index(es) are still missing after schema apply:`);
       for (const m of gatedCheck.missing) console.log(`          - ${m.table}.${m.column} (${m.unit})`);
@@ -3018,6 +3311,9 @@ async function cmdInit(args) {
       unwindFsLedger();
       process.exit(1);
     }
+    // A prior touch's degraded row (e.g. pgvector installed after an
+    // earlier init/apply left it gated-missing) is now resolved — clear it.
+    await clearSchemaDegradation(db, projectId);
   }
 
   // Step 7.5: seed a default embedding_providers row, or record an explicit
@@ -3357,6 +3653,29 @@ async function cmdStatus(args = []) {
     process.exit(1);
   }
 
+  // cm#185-schema-heal (S3): heal BEFORE classifying anything else this
+  // command reports — a fingerprint-current DB missing an ungated/gated
+  // object (S1) is fixed here, so every count/readiness value below already
+  // reflects the healed state rather than a stale one status would then
+  // have to explain away. Snapshot the pre-heal degraded-row presence first
+  // so the prose/--json output below can say what changed, not just what
+  // the state is now.
+  let hadDegradedBefore = false;
+  try {
+    const { rows: preDeg } = await db.query(
+      `SELECT 1 FROM project_settings WHERE project_id = $1 AND key = 'schema_apply_degraded'`,
+      [projectId]
+    );
+    hadDegradedBefore = preDeg.length > 0;
+  } catch (_) { /* non-fatal — heal/degraded reporting below still runs */ }
+
+  let schemaHealResult = null;
+  try {
+    schemaHealResult = await ensureSchemaCurrent(db, projectId, { silent: true });
+  } catch (schemaHealErr) {
+    process.stderr.write('[handoff] schema heal check failed (non-fatal): ' + schemaHealErr.message + '\n');
+  }
+
   // Counts — cm#232: getLiveCounts is the single shared query behind every
   // entity/assertion/edge count status reports (prose, --json, and the Done
   // line all derive from this one call — see getLiveCounts above).
@@ -3455,7 +3774,9 @@ async function cmdStatus(args = []) {
     }
   }
 
-  // cm#185 R-5: surface a current schema_apply_degraded row, if any.
+  // cm#185 R-5: surface a current schema_apply_degraded row, if any. This
+  // read runs AFTER the heal call above, so it already reflects whatever
+  // ensureSchemaCurrent just cleared/re-stamped/left behind.
   let schemaDegraded = null;
   try {
     const { rows: schemaDegRows } = await db.query(
@@ -3469,12 +3790,32 @@ async function cmdStatus(args = []) {
     // Non-fatal — status still reports the rest even if this probe fails.
   }
 
+  // cm#185-schema-heal (S3): what did the heal call above actually DO? Total
+  // classification of the observable transition, for the "what it healed"
+  // line — never a guess, only what hadDegradedBefore/schemaDegraded/
+  // schemaHealResult together actually prove happened in THIS invocation.
+  let schemaHealedLine = null;
+  if (hadDegradedBefore && !schemaDegraded) {
+    schemaHealedLine = 'HEALED — a prior schema_apply_degraded row was cleared';
+  } else if (schemaHealResult && schemaHealResult.reason === 'applied') {
+    const applied = (schemaHealResult.detail && schemaHealResult.detail.appliedUnits) || [];
+    schemaHealedLine = `applied schema drift (${applied.join(', ') || 'no units listed'})`;
+  } else if (hadDegradedBefore && schemaDegraded) {
+    schemaHealedLine = 're-stamped (still degraded — see schema_apply line below)';
+  }
+
   // init-embeddability spec (A3): loud, always-computed readiness state +
   // per-table NULL-embedding counts (printed only when nonzero).
+  // cm#185-schema-heal (adversary finding #10): reuse the heal call's own
+  // gated-objects verdict when it unambiguously implies one (never a guess —
+  // see _gatedOkFromSchemaHealResult) instead of a second, independent
+  // classifySchemaFiles + checkPgvectorGatedObjects round-trip for the same fact.
   let embeddingReadiness = 'UNEMBEDDABLE:no-extension';
   let embeddingNullCounts = { assertions: 0, decisions: 0 };
   try {
-    embeddingReadiness = await computeEmbeddingReadiness(db, projectId);
+    embeddingReadiness = await computeEmbeddingReadiness(db, projectId, {
+      precomputedGatedOk: _gatedOkFromSchemaHealResult(schemaHealResult),
+    });
     embeddingNullCounts = await computeEmbeddingNullCounts(db, projectId);
   } catch (_) {
     // Non-fatal — status still reports the rest even if this probe fails.
@@ -3521,6 +3862,7 @@ async function cmdStatus(args = []) {
       session_active: sipDisplay.active,
       session_id:     sipDisplay.id,
       packaging:      packagingState,
+      schema_heal:    schemaHealedLine,
       schema_apply_degraded: schemaDegraded,
       embedding_readiness: embeddingReadiness,
       embedding_null_counts: embeddingNullCounts,
@@ -3548,6 +3890,9 @@ async function cmdStatus(args = []) {
   console.log(`  contracts:        ${contracts}`);
   console.log(`  session_active:   ${sipDisplay.prose}`);
   if (packagingLine) console.log(packagingLine);
+  if (schemaHealedLine) {
+    console.log(`  schema_heal:      ${schemaHealedLine}`);
+  }
   if (schemaDegraded) {
     console.log(`  schema_apply:     DEGRADED (${schemaDegraded.reason || 'unknown'}) — see detail: ${JSON.stringify(schemaDegraded.detail)}`);
   }
@@ -3933,8 +4278,14 @@ async function cmdLoaderLoad(opts = {}) {
   // Deliverable A: auto-apply additive schema on drift (non-fatal).
   // Runs immediately after identity resolution, before retrieval_contract SELECT.
   // Any error here must NOT abort resume/load — wrap and continue.
+  // cm#185-schema-heal: the result is kept (not discarded) so the
+  // computeEmbeddingReadiness call further below (the resume-banner
+  // embedding-unreadiness check) can reuse its gated-objects verdict
+  // instead of a second, independent round-trip re-checking the same fact
+  // (adversary finding #10).
+  let schemaHealResult = null;
   try {
-    await ensureSchemaCurrent(db, projectId, { silent });
+    schemaHealResult = await ensureSchemaCurrent(db, projectId, { silent });
   } catch (schemaErr) {
     process.stderr.write('[handoff] schema auto-apply failed (non-fatal): ' + schemaErr.message + '\n');
   }
@@ -4021,7 +4372,9 @@ async function cmdLoaderLoad(opts = {}) {
   // unreadiness without running `status` separately. Silent for READY/N-A
   // (never noise on the common case).
   try {
-    const readiness = await computeEmbeddingReadiness(db, projectId);
+    const readiness = await computeEmbeddingReadiness(db, projectId, {
+      precomputedGatedOk: _gatedOkFromSchemaHealResult(schemaHealResult),
+    });
     // Only genuine UNEMBEDDABLE:* states warrant a resume nag — an explicit
     // opt-out (DEGRADED:opt-out) is an operator's deliberate, standing
     // choice and must stay silent on every subsequent resume, not repeat
@@ -9030,6 +9383,36 @@ async function cmdBackfillEmbeddings(args) {
     process.exit(1);
   }
 
+  // cm#185-schema-heal (S3): heal BEFORE classifying columns — this command
+  // was previously read-only w.r.t. schema drift (it just probed
+  // information_schema and refused loudly on `missing_embedding_columns`),
+  // which is exactly the pipeline_judge failure mode the PROBLEM statement
+  // names: a stale fingerprint + a stale degraded row can leave the gated
+  // columns permanently unhealed even after an operator fixes the extension,
+  // because nothing ever re-touches the schema before backfill classifies.
+  // Best-effort: resolveProjectId() requires a project marker/.git root,
+  // which this CLI has never required before (it can run against a raw
+  // HANDOFF_DB with no project context at all) — a resolution failure here
+  // skips the heal attempt rather than turning a previously-working
+  // invocation into a hard failure.
+  let backfillProjectId = null;
+  try { backfillProjectId = resolveProjectId(); } catch (_) { /* no project context resolvable */ }
+  if (backfillProjectId) {
+    try {
+      const healResult = await ensureSchemaCurrent(db, backfillProjectId, { silent: false });
+      if (healResult && healResult.reason === 'applied') {
+        const applied = (healResult.detail && healResult.detail.appliedUnits) || [];
+        console.log(`  [heal]  schema drift applied before backfill: ${applied.join(', ') || '(no units listed)'}`);
+      } else if (healResult && healResult.reason === 'degraded') {
+        console.log(`  [heal]  schema still degraded (${healResult.detail ? JSON.stringify(healResult.detail) : 'see status for detail'})`);
+      }
+    } catch (healErr) {
+      console.error(`  [heal]  schema heal check failed (non-fatal): ${healErr.message}`);
+    }
+  } else {
+    console.log('  [heal]  no project context resolved — skipping schema-heal check (backfill proceeds against the connected DB as-is)');
+  }
+
   let result;
   try {
     result = await runBackfillEmbeddings({
@@ -9163,6 +9546,10 @@ if (require.main === module) {
     checkPgvectorGatedObjects,
     reportPgvectorGatedDegradation,
     SCHEMA_EPOCH,
+    // cm#185-schema-heal — exposed for test/test-schema-heal.js (no test-side
+    // reimplementation of the fingerprint-persistence or readiness-reuse logic).
+    recordSchemaFingerprint,
+    _gatedOkFromSchemaHealResult,
     // cm#233: exposed for test coverage of the intent-key migration cutover
     // gate (ensureSchemaCurrentCore is the pre-wrapper core, for tests that
     // need to assert the wrapper's added side effect never changes the
