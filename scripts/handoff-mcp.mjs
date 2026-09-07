@@ -866,8 +866,12 @@ function buildServer() {
       description:
         'Runs `handoff.js status --json` for the given project and returns the parsed result: project_id, ' +
         'entity/assertion/edge counts, handoff.md path, last_close/days_since, contracts, session_active, ' +
-        'session_id, packaging state (e.g. "UNPACKAGED (dirty working tree)" or "clean"), embedding_readiness, ' +
-        'embedding_null_counts, last_embed_heal (the most recent heal-on-touch outcome: ' +
+        'session_id, packaging state (e.g. "UNPACKAGED (dirty working tree)" or "clean"), embedding_readiness ' +
+        '(the single classifier\'s verbatim state: DISABLED | UNEMBEDDABLE:no-extension | UNEMBEDDABLE:no-provider | ' +
+        'DEGRADED:probe-failed(<reason>) | HEALING(<n>) | READY | N/A (sqlite backend) — READY requires BOTH a zero ' +
+        'live+actionable NULL-embedding backlog AND a successful live provider probe), embedding_null_counts, backlog ' +
+        '(the live+actionable NULL count backing HEALING(<n>)), unembeddable_empty_text (empty-embed-text NULLs, never ' +
+        'counted toward backlog or blocking READY), last_embed_heal (the most recent heal-on-touch outcome: ' +
         '{ts, embedded, remaining, outcome} where outcome is one of healed/partial/disabled/provider_unready/' +
         'error:<short>, or null if it has never run for this project), and last_loader_stop ' +
         '(the most recent SessionEnd/loader-stop outcome: {ts, session_id, outcome} or null if it has never fired). ' +

@@ -268,19 +268,42 @@ this backend)" rather than an error.
 
 **Heal-on-touch (draining the backlog automatically).** Not every writer embeds inline at write
 time — a bulk migration (e.g. `migrate-08`) intentionally does not, and any future writer that
-forgets to could reintroduce a silent NULL backlog even while `/handoff:status` kept reading
-`embedding: READY`. To close that gap categorically rather than one manual `backfill-embeddings`
-run at a time, `ensureSchemaCurrent` (the shared entry every `status`/`resume`/`init`/`close`/
-`checkpoint` touch runs through) also runs a small, bounded embed-heal step after schema is
-confirmed healthy: up to `project_settings.embed_heal_batch` rows (default 250; set to `0` to
-disable) per touch, within a 2-second wall-clock budget, under a non-blocking advisory lock so
-concurrent touches never double-embed. The outcome (`healed`, `partial`, `disabled`,
-`provider_unready`, or `error:<short>`) is recorded to `project_settings.last_embed_heal` and
-surfaced by `/handoff:status` — a nonzero backlog on a READY project now renders as
-`embedding: READY (backlog N, healing ≤250/touch)` instead of a bare `READY`, with an
-`embedding heal: embedded X, remaining Y` line after a heal actually runs. This drains any backlog
-over a handful of touches without an operator ever running `backfill-embeddings --apply` by hand;
-the manual command remains available for an immediate, unbounded, one-shot drain.
+forgets to could reintroduce a silent NULL backlog. To close that gap categorically rather than
+one manual `backfill-embeddings` run at a time, `ensureSchemaCurrent` (the shared entry every
+`status`/`resume`/`init`/`close`/`checkpoint` touch runs through) also runs a small, bounded
+embed-heal step after schema is confirmed healthy: up to `project_settings.embed_heal_batch` rows
+(default 250; set to `0` to disable) per touch, within a 2-second wall-clock budget, under a
+non-blocking advisory lock so concurrent touches never double-embed. The outcome (`healed`,
+`partial`, `disabled`, `provider_unready`, or `error:<short>`) is recorded to
+`project_settings.last_embed_heal`. An operator-set `--no-embeddings` opt-out is checked FIRST,
+before touching any row — a heal touch on an opted-out project is a total no-op (outcome
+`disabled`), never a wasted dry-run count or lock acquisition. Heal-on-touch and
+`backfill-embeddings` both scope their candidate rows to **live** ones only (`suppressed = false
+AND invalid_at IS NULL`, on tables that carry those columns) — a suppressed or invalidated
+assertion's NULL embedding is never healed and never counted toward readiness, since nobody will
+ever retrieve it.
+
+**"READY should mean fully embedded."** `computeEmbeddingReadiness` (`scripts/handoff.js`) is the
+SINGLE classifier for "can this project embed anything right now", rendered verbatim (no
+per-surface re-derivation) by `/handoff:status` prose and `--json`, the MCP `handoff_status` tool,
+the resume banner, and the close/checkpoint Done line. Checked in this order: `DISABLED` (an
+explicit `init --no-embeddings` opt-out — a standing operator choice, not a degradation) →
+`UNEMBEDDABLE:no-extension` (pgvector absent or a gated column/index was skipped at schema-apply
+time) → `UNEMBEDDABLE:no-provider` (no `embedding_providers` row has `is_default=true`) →
+`DEGRADED:probe-failed(<reason>)` (a default provider row exists, but a LIVE preflight probe
+against it — connection/timeout/HTTP/dim-mismatch — failed; the probe result is cached a few
+seconds so repeated touches don't each pay a network round trip) → `HEALING(<n>)` (the probe
+succeeded, but `n` live, actionable — non-empty-text — rows across `assertions`+`decisions` still
+carry `embedding IS NULL`) → `READY` (`n === 0` AND the live probe succeeded). A project on
+SQLite (seam-test-only) reports `N/A (sqlite backend)` — SQLite carries no `embedding` column on
+any table, so it cannot embed at all and sits outside this 6-state enumeration by construction.
+Rows whose embed text is empty/whitespace-only never count toward `n` and never block `READY` —
+`/handoff:status --json` surfaces them separately as `unembeddable_empty_text`. The resume banner
+now warns on **any** state other than `READY` (previously silent through `DISABLED` and
+`HEALING`), and the close/checkpoint Done line always appends `embedding: <state>`. This drains
+any genuine backlog over a handful of touches without an operator ever running
+`backfill-embeddings --apply` by hand; the manual command remains available for an immediate,
+unbounded, one-shot drain.
 
 ---
 

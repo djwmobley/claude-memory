@@ -383,10 +383,31 @@ async function seedDefaultProvider(dbName, { nativeDims = 8, storedDims = 4, end
     out = runCli(['status', '--json'], { cwd: projectDir, env: { PROJECT_ROOT: projectDir, HANDOFF_DB: undefined } }).stdout || '';
     assert(out.includes('"embedding_readiness": "UNEMBEDDABLE:no-provider"'), `expected no-provider state, got:\n${out}`);
 
-    // Seed a default provider -> READY.
+    // Seed a default provider pointed at a NON-live endpoint (owner directive
+    // "READY should mean fully embedded" — E1 now requires a successful LIVE
+    // provider probe, so a row existing alone is no longer sufficient) ->
+    // DEGRADED:probe-failed, never a silent READY.
     await seedDefaultProvider(dbName);
     out = runCli(['status', '--json'], { cwd: projectDir, env: { PROJECT_ROOT: projectDir, HANDOFF_DB: undefined } }).stdout || '';
-    assert(out.includes('"embedding_readiness": "READY"'), `expected READY state, got:\n${out}`);
+    assert(out.includes('"embedding_readiness": "DEGRADED:probe-failed('), `expected DEGRADED:probe-failed state for a non-live endpoint, got:\n${out}`);
+
+    // Point the default provider at a REAL fake embed server (matching its
+    // seeded native/stored dims) -> the live probe now succeeds, and with
+    // zero actionable backlog the classifier converges to READY.
+    let fakeServer = null;
+    try {
+      fakeServer = await startFakeEmbedServerProcess(8, 0.1);
+      const dbFix = await pgConnect(dbName);
+      await dbFix.query(
+        `UPDATE embedding_providers SET endpoint = $1 WHERE name = 'test-provider'`,
+        [`http://127.0.0.1:${fakeServer.port}/v1/embeddings`]
+      );
+      await dbFix.end();
+      out = runCli(['status', '--json'], { cwd: projectDir, env: { PROJECT_ROOT: projectDir, HANDOFF_DB: undefined } }).stdout || '';
+      assert(out.includes('"embedding_readiness": "READY"'), `expected READY state with a live probe + no backlog, got:\n${out}`);
+    } finally {
+      if (fakeServer) { try { fakeServer.stop(); } catch (_) {} }
+    }
 
     await dropRawDb(dbName);
     fs.rmSync(projectDir, { recursive: true, force: true });

@@ -276,25 +276,52 @@ async function main() {
       pass(label);
     } catch (err) { fail('T5', err.message); }
 
-    // ── T6: status line rendering ───────────────────────────────────────────
+    // ── T6: embedding_readiness reflects live HEALING(n)->READY (E1/E3 owner
+    //    directive "READY should mean fully embedded" — supersedes the old
+    //    "READY (backlog N)" print-time override this test used to assert) ──
     try {
-      const label = 'T6: status --json reports embedding_readiness READY + null_counts; prose line shows backlog';
+      const label = 'T6: embedding_readiness is HEALING(n) with a live backlog, READY only once drained';
       await seedProvider(raw, endpoint, 4096, 4000);
-      await setBatch(raw, PID, 1); // deliberately small so a backlog persists after the touch's own heal
+      await setBatch(raw, PID, 1); // deliberately small so a backlog persists after one heal touch
       await seedNullAssertions(raw, PID, 4, 't6');
-      const projectDir = require('os').tmpdir();
-      // status runs against HANDOFF_DB=DB_NAME but resolves projectId from the
-      // marker/env — this suite calls computeEmbeddingReadiness/NullCounts
-      // directly (in-process) rather than spawning a subprocess with a full
-      // project marker fixture, to stay fast and avoid a second DB touch
-      // draining the very backlog this test is asserting on.
-      const readiness = await handoffModule.computeEmbeddingReadiness(adapter, PID, {});
+      const beforeReadiness = await handoffModule.computeEmbeddingReadiness(adapter, PID, {});
+      assertEqual(beforeReadiness, 'HEALING(4)', `expected HEALING(4) before heal, got ${beforeReadiness}`);
+      const healResult = await runEmbedHealIfNeeded(adapter, PID, { silent: true });
+      assertEqual(healResult.embedded, 1, `expected exactly 1 row healed (batch=1), got ${JSON.stringify(healResult)}`);
+      const afterOneTouch = await handoffModule.computeEmbeddingReadiness(adapter, PID, {});
+      assertEqual(afterOneTouch, 'HEALING(3)', `expected HEALING(3) after one heal touch, got ${afterOneTouch}`);
       const nullCounts = await handoffModule.computeEmbeddingNullCounts(adapter, PID);
-      assertEqual(readiness, 'READY', `expected READY, got ${readiness}`);
-      assertTrue(nullCounts.assertions > 0, `expected nonzero assertions NULL count, got ${nullCounts.assertions}`);
-      void projectDir;
+      assertTrue(nullCounts.assertions === 3, `expected exactly 3 remaining assertions NULL count, got ${nullCounts.assertions}`);
+      // Drain fully and confirm the classifier converges to READY.
+      await setBatch(raw, PID, 250);
+      await runEmbedHealIfNeeded(adapter, PID, { silent: true });
+      const finalReadiness = await handoffModule.computeEmbeddingReadiness(adapter, PID, {});
+      assertEqual(finalReadiness, 'READY', `expected READY after full drain, got ${finalReadiness}`);
       pass(label);
     } catch (err) { fail('T6', err.message); }
+
+    // ── T8: opt-out with a live backlog -> classifier DISABLED, heal is a
+    //    no-op (E4/E5) ───────────────────────────────────────────────────────
+    try {
+      const label = 'T8: embeddings_opt_out -> DISABLED (never HEALING/READY) and embed-heal touches nothing';
+      await raw.query(
+        `INSERT INTO project_settings (project_id, key, value) VALUES ($1, 'embeddings_opt_out', 'true')
+         ON CONFLICT (project_id, key) DO NOTHING`,
+        [PID]
+      );
+      await setBatch(raw, PID, 250);
+      await seedNullAssertions(raw, PID, 3, 't8');
+      const readiness = await handoffModule.computeEmbeddingReadiness(adapter, PID, {});
+      assertEqual(readiness, 'DISABLED', `expected DISABLED, got ${readiness}`);
+      const healResult = await runEmbedHealIfNeeded(adapter, PID, { silent: true });
+      assertEqual(healResult.outcome, 'disabled', `expected heal outcome disabled, got ${JSON.stringify(healResult)}`);
+      const after = await nullCount(raw, PID, 't8');
+      assertEqual(after, 3, 'expected t8 rows untouched — opt-out heal must be a total no-op');
+      await raw.query(`DELETE FROM project_settings WHERE project_id = $1 AND key = 'embeddings_opt_out'`, [PID]);
+      // Drain t8's rows so they don't bleed into later assertions.
+      await runEmbedHealIfNeeded(adapter, PID, { silent: true });
+      pass(label);
+    } catch (err) { fail('T8', err.message); }
 
     // ── T7: MCP assertionUpdate embeds at write time ────────────────────────
     try {
@@ -320,6 +347,51 @@ async function main() {
       assertTrue(rows[0].embedded_by_provider_id !== null, 'expected embedded_by_provider_id to be stamped');
       pass(label);
     } catch (err) { fail('T7', err.message); }
+
+    // ── T9: suppressed rows never count; empty-text NULLs never count
+    //    (E2/E5) — both are excluded from n, empty-text surfaced separately
+    //    as unembeddableEmptyText, and a zero-backlog project is READY even
+    //    with suppressed/empty-text NULL rows sitting untouched. ──────────
+    try {
+      const label = 'T9: suppressed rows and empty-text NULLs never inflate the backlog; READY once genuine backlog is 0';
+      await seedProvider(raw, endpoint, 4096, 4000);
+      await setBatch(raw, PID, 250);
+      // Drain any leftovers from earlier tests first so this test's counts are exact.
+      await runEmbedHealIfNeeded(adapter, PID, { silent: true });
+      const baseline = await handoffModule.computeEmbeddingReadiness(adapter, PID, {});
+      assertEqual(baseline, 'READY', `expected READY baseline before seeding t9 rows, got ${baseline}`);
+
+      // Suppressed row — must never count toward the backlog.
+      await raw.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, suppressed)
+         VALUES ($1, 't9-suppressed', 'chose', 'value', 5, 'user_stated', true)`,
+        [PID]
+      );
+      // Empty-text row (subject is NULL/blank) — must never count toward the
+      // backlog either, but IS surfaced via unembeddableEmptyText.
+      await raw.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
+         VALUES ($1, '', 'chose', 'value', 5, 'user_stated')`,
+        [PID]
+      );
+      const readinessAfterSeed = await handoffModule.computeEmbeddingReadiness(adapter, PID, {});
+      assertEqual(readinessAfterSeed, 'READY', `expected READY (suppressed + empty-text NULLs never block READY), got ${readinessAfterSeed}`);
+      const nullCounts = await handoffModule.computeEmbeddingNullCounts(adapter, PID);
+      assertEqual(nullCounts.assertions, 0, `expected 0 live+actionable assertions NULL count, got ${nullCounts.assertions}`);
+      assertTrue(nullCounts.unembeddableEmptyText.assertions >= 1, `expected >=1 empty-text NULL surfaced, got ${nullCounts.unembeddableEmptyText.assertions}`);
+
+      // A genuine actionable row DOES flip readiness -> HEALING (E5:
+      // "READY -> HEALING after an un-embedded write").
+      await raw.query(
+        `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source)
+         VALUES ($1, 't9-actionable', 'chose', 'value', 5, 'user_stated')`,
+        [PID]
+      );
+      const readinessAfterWrite = await handoffModule.computeEmbeddingReadiness(adapter, PID, {});
+      assertEqual(readinessAfterWrite, 'HEALING(1)', `expected HEALING(1) after an un-embedded write, got ${readinessAfterWrite}`);
+      await runEmbedHealIfNeeded(adapter, PID, { silent: true });
+      pass(label);
+    } catch (err) { fail('T9', err.message); }
 
   } finally {
     if (fakeServer) { try { fakeServer.stop(); } catch (_) {} }

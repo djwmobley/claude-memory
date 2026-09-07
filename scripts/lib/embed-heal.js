@@ -118,6 +118,29 @@ async function runEmbedHealIfNeeded(db, projectId, opts = {}) {
       return null;
     }
 
+    // E4 (owner directive "READY should mean fully embedded"): opt-out
+    // checked FIRST, before touching any row — an operator who ran `init
+    // --no-embeddings` gets outcome 'disabled' with NO row-touching work
+    // whatsoever (no dry-run count, no lock, no provider resolve/probe).
+    // Lazy require of handoff.js's isEmbeddingsOptedOut: handoff.js
+    // requires this module at its own top level, so a top-of-file require
+    // here would be circular and see handoff.js's module.exports mid-
+    // construction (empty). Safe as a lazy, in-function require because
+    // runEmbedHealIfNeeded only ever executes at runtime, long after both
+    // modules have finished loading and handoff.js's module.exports is
+    // fully populated.
+    try {
+      const { isEmbeddingsOptedOut } = require('../handoff.js');
+      if (typeof isEmbeddingsOptedOut === 'function' && await isEmbeddingsOptedOut(db, projectId)) {
+        return await _recordOutcome(db, projectId, 'disabled', 0, null, { reason: 'embeddings_opt_out' }, silent);
+      }
+    } catch (_) {
+      // If the opt-out probe itself fails for any reason, do not block
+      // healing on it — fall through to the normal branches below (a
+      // genuine DB error will surface again, loudly, in the very next
+      // branch's own setting read).
+    }
+
     const startedAt = Date.now();
     const deadlineAt = startedAt + TIME_BUDGET_MS;
 
@@ -140,7 +163,7 @@ async function runEmbedHealIfNeeded(db, projectId, opts = {}) {
     // on the common "nothing to heal" touch (the overwhelming majority).
     let dry;
     try {
-      dry = await runBackfillEmbeddings({ db, projectId, table: 'all', apply: false });
+      dry = await runBackfillEmbeddings({ db, projectId, table: 'all', apply: false, liveOnly: true });
     } catch (err) {
       return await _recordOutcome(db, projectId, `error:${_short(err.message)}`, 0, null, {}, silent);
     }
@@ -193,6 +216,7 @@ async function runEmbedHealIfNeeded(db, projectId, opts = {}) {
           batchSize: Math.min(25, batch),
           rowCap: batch,
           deadlineAt,
+          liveOnly: true,
         });
       } catch (err) {
         return await _recordOutcome(db, projectId, `error:${_short(err.message)}`, 0, actionableTotal, {}, silent);
@@ -212,7 +236,7 @@ async function runEmbedHealIfNeeded(db, projectId, opts = {}) {
       // pre-apply estimate if this second dry-run itself fails.
       let remaining = Math.max(0, actionableTotal - embedded);
       try {
-        const post = await runBackfillEmbeddings({ db, projectId, table: 'all', apply: false });
+        const post = await runBackfillEmbeddings({ db, projectId, table: 'all', apply: false, liveOnly: true });
         remaining = (post.tables || []).reduce((sum, t) => sum + (t.actionableNull || 0), 0);
       } catch (_) { /* keep the estimate */ }
 
