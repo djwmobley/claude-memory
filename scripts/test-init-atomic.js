@@ -143,7 +143,10 @@ function chmodDirEnforced() {
 function runInit(dbName, projectDir, extraEnv = {}) {
   return spawnSync(
     process.execPath,
-    [HANDOFF_SCRIPT, 'init', '-y'],
+    // init-embeddability spec: init now BLOCKs by default without a
+    // configured embed endpoint; this atomicity suite is not about
+    // embeddability, so opt out explicitly.
+    [HANDOFF_SCRIPT, 'init', '-y', '--no-embeddings'],
     {
       cwd:      PROJECT_ROOT,
       env: {

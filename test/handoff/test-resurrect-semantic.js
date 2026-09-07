@@ -285,7 +285,7 @@ function createProjectDir(suffix) {
  * (should not happen in normal operation but guards against test-env oddities).
  */
 async function bootstrapProject(db, projectDir) {
-  const initR = spawnSync(process.execPath, [HELPER, 'init', '-y'], {
+  const initR = spawnSync(process.execPath, [HELPER, 'init', '-y', '--no-embeddings'], {
     cwd:      REPO_ROOT,
     env: {
       ...process.env,

@@ -932,6 +932,16 @@ class SQLiteAdapter {
 
   get schemaFileName() { return 'handoff-sqlite-schema.sql'; }
 
+  /**
+   * init-embeddability spec: handoff-sqlite-schema.sql declares no
+   * `embedding` column on ANY table — capability, not a raw dialect check,
+   * so the engine (handoff.js) can ask "can this table store a vector?"
+   * without itself branching on db.dialect (the abstraction invariant
+   * test-sqlite-seam.js Section 13 enforces: zero db.dialect checks and
+   * exactly one dialect === conditional outside this composition root).
+   */
+  supportsEmbeddingColumns() { return false; }
+
   // ── Port methods: query building ──────────────────────────────────────────
 
   /**
@@ -1564,6 +1574,13 @@ class PostgresAdapter {
 
   get dialect() { return 'postgres'; }
 
+  /** See SQLiteAdapter#supportsEmbeddingColumns — Postgres tables carry the
+   * gated `embedding` column (present when pgvector was installed at
+   * schema-apply time; absent-but-still-true-capability otherwise — a
+   * write attempt against a genuinely gated-missing column is a separate,
+   * already-handled 42703 classification, not this method's concern). */
+  supportsEmbeddingColumns() { return true; }
+
   get schemaFileName() { return 'handoff-core-schema.sql'; }
 
   // ── Port methods: query building ──────────────────────────────────────────
@@ -2045,6 +2062,102 @@ async function _checkPgVersion(cfg, dbName) {
   }
 }
 
+/**
+ * probeInitEmbeddabilityState — init-embeddability spec, adversary finding
+ * #1 (BLOCKER): runs BEFORE the confirm-before-DDL gate, connecting
+ * directly to `targetDb` (never the 'postgres' system db) to answer, up
+ * front, whether `CREATE EXTENSION vector;` will be needed and whether
+ * this role can run it — so the SINGLE existing confirm gate's prompt text
+ * can be built conditionally, instead of either (a) discovering this fact
+ * only after the prompt already fired and running unattended DDL with no
+ * confirmation at all, or (b) opening a second, forbidden prompt. Also
+ * reads any already-persisted `project_settings.embeddings_opt_out` row in
+ * the SAME connection (adversary finding #5) so cmdInit can auto-honor a
+ * prior opt-out without a false re-BLOCK on a routine re-init.
+ *
+ * Total classification (every reachable state maps to exactly one branch):
+ *   DB_ABSENT                — targetDb does not exist yet. Extension state
+ *                              is deliberately NOT evaluated further — a
+ *                              freshly created Postgres database never has
+ *                              any extension installed, so the caller
+ *                              treats this the same as EXT_ABSENT once the
+ *                              DB is created later in the existing
+ *                              preflight step.
+ *   SERVER_UNREACHABLE       — connection failed for any OTHER reason
+ *                              (server down, auth failure, etc.) — NOT a
+ *                              pgvector finding. The EXISTING "Postgres
+ *                              reachable" fatal preflight check already
+ *                              covers this class; this function
+ *                              deliberately does not block on it, so the
+ *                              caller falls through to the default gate
+ *                              text and lets that existing check report
+ *                              the real problem with its own message.
+ *   EXT_PRESENT               — pg_extension already has a 'vector' row.
+ *   EXT_ABSENT_HAS_PRIVILEGE  — extension missing; current_user has CREATE
+ *                              privilege on this database (can install it).
+ *   EXT_ABSENT_NO_PRIVILEGE   — extension missing; current_user lacks
+ *                              privilege — BLOCK (spec's extension table).
+ *   PROBE_ERROR               — connected fine but the pg_extension/
+ *                              privilege queries themselves failed
+ *                              unexpectedly — BLOCK (spec's "unknown"
+ *                              default branch never proceeds silently).
+ *
+ * Never throws.
+ *
+ * @param {object} cfg
+ * @param {string} targetDb
+ * @param {string} projectId — used to scope the embeddings_opt_out read
+ * @returns {Promise<{ state: string, error?: Error, optOut: object|null }>}
+ */
+async function probeInitEmbeddabilityState(cfg, targetDb, projectId) {
+  const { Client } = require('pg');
+  const client = new Client({
+    host:     cfg.host,
+    port:     cfg.port,
+    database: targetDb,
+    user:     cfg.user,
+  });
+  try {
+    await client.connect();
+  } catch (err) {
+    if (err && err.code === '3D000') return { state: 'DB_ABSENT', optOut: null };
+    return { state: 'SERVER_UNREACHABLE', error: err, optOut: null };
+  }
+
+  // embeddings_opt_out is read best-effort — project_settings may not exist
+  // yet on a genuinely fresh DB (schema not yet applied); that is NOT a
+  // probe error, just "no opt-out on file."
+  let optOut = null;
+  try {
+    const { rows } = await client.query(
+      `SELECT value FROM project_settings WHERE project_id = $1 AND key = 'embeddings_opt_out'`,
+      [projectId]
+    );
+    if (rows.length > 0) {
+      try { optOut = JSON.parse(rows[0].value); } catch (_) { optOut = { reason: 'unknown' }; }
+    }
+  } catch (_) {
+    optOut = null; // table absent or unreadable — treated as "no opt-out"
+  }
+
+  try {
+    const { rows: extRows } = await client.query(`SELECT 1 FROM pg_extension WHERE extname = 'vector'`);
+    if (extRows.length > 0) {
+      await client.end();
+      return { state: 'EXT_PRESENT', optOut };
+    }
+    const { rows: privRows } = await client.query(
+      `SELECT has_database_privilege(current_user, current_database(), 'CREATE') AS has_create`
+    );
+    await client.end();
+    const hasCreate = privRows[0] && (privRows[0].has_create === true || privRows[0].has_create === 't');
+    return { state: hasCreate ? 'EXT_ABSENT_HAS_PRIVILEGE' : 'EXT_ABSENT_NO_PRIVILEGE', optOut };
+  } catch (err) {
+    try { await client.end(); } catch (_) { /* ignore */ }
+    return { state: 'PROBE_ERROR', error: err, optOut };
+  }
+}
+
 // ─── factory ─────────────────────────────────────────────────────────────────
 
 /**
@@ -2105,6 +2218,7 @@ module.exports = {
   createAdapter,
   createPostgresAdapter,
   createInitProbe,
+  probeInitEmbeddabilityState,
   rewriteForSQLite,           // exported for tests
   buildSQLiteGraphCTE,        // exported for tests
   resolveSQLiteDbPath,

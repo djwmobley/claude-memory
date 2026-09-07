@@ -305,7 +305,14 @@ function cleanupHandoffMd(projectId) {
  * Used by test-l0, test-l2, test-l3, test-l4.
  */
 async function setupProject(dbName, projectDir) {
-  const r = runHandoff('init', ['-y'], null, dbName, projectDir);
+  // init-embeddability spec: a fresh init now BLOCKs by default when no
+  // embed endpoint is configured (never a silent NOTE-and-continue). None
+  // of this shared helper's callers (test-l0/l2/l3/l4 and everything else
+  // that composes through setupProject) configure a live vLLM endpoint —
+  // CI has none available (EMBED_SKIP=1 convention) — so --no-embeddings
+  // opts these throwaway fixtures out explicitly, matching intent: these
+  // tests exercise unrelated engine behavior, not embeddability.
+  const r = runHandoff('init', ['-y', '--no-embeddings'], null, dbName, projectDir);
   if (r.status !== 0) {
     throw new Error(`cmdInit failed: ${r.stderr || r.stdout}`);
   }

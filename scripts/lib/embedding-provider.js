@@ -33,7 +33,14 @@
  * contract being DB-row-driven rather than env-driven.
  */
 
+const fs   = require('fs');
+const path = require('path');
 const { _vllmEmbedRaw, VllmHttpError, VllmTimeoutError, VllmNetworkError, _readPipelineYmlKey } = require('./embed');
+// resolveBaseDir is the engine's ONE existing user-scope config root
+// resolution (~/.claude, HANDOFF_BASE_DIR-overridable) — reused BY
+// REFERENCE for the user-scope embed-endpoint default file below, never a
+// second homedir literal (init-embeddability spec, "User-scope default").
+const { resolveBaseDir } = require('./handoff-paths');
 
 class EmbeddingProvider {
   /**
@@ -215,6 +222,25 @@ const PROBE_TEXT = 'preflight probe';
 // Row embeds NEVER see this constant -- only probeProvider() below.
 const DEFAULT_PROBE_TIMEOUT_MS = 10000;
 
+/**
+ * resolveDefaultTimeoutMs — ONE shared "what timeout applies" resolution,
+ * reused by probeProvider (below) AND write-time-embed.js's embedForWrite
+ * (adversary finding #2, cm#-init-embeddability BLOCKER): a production
+ * row-embed call that never sets a timeout can hang forever against a
+ * black-holed endpoint (TCP handshake completes, no HTTP response ever
+ * arrives) — that class of hang is now bounded the SAME way a preflight
+ * probe already is, rather than a second, independently-drifting timeout
+ * constant.
+ *
+ * @param {number|undefined} explicit — an opts.timeoutMs the caller supplied
+ * @returns {number}
+ */
+function resolveDefaultTimeoutMs(explicit) {
+  return explicit !== undefined
+    ? explicit
+    : (process.env.EMBED_PROBE_TIMEOUT_MS ? parseInt(process.env.EMBED_PROBE_TIMEOUT_MS, 10) : DEFAULT_PROBE_TIMEOUT_MS);
+}
+
 class ProviderProbeError extends Error {
   constructor(message, details) {
     super(message);
@@ -259,9 +285,7 @@ class ProviderProbeError extends Error {
  * @throws {ProviderProbeError}
  */
 async function probeProvider(provider, opts = {}) {
-  const timeoutMs = opts.timeoutMs !== undefined
-    ? opts.timeoutMs
-    : (process.env.EMBED_PROBE_TIMEOUT_MS ? parseInt(process.env.EMBED_PROBE_TIMEOUT_MS, 10) : DEFAULT_PROBE_TIMEOUT_MS);
+  const timeoutMs = resolveDefaultTimeoutMs(opts.timeoutMs);
 
   const providerLabel = provider.name || provider.modelLabel || '(unnamed)';
   const nativeDims = provider.nativeDims;
@@ -327,12 +351,75 @@ async function probeProvider(provider, opts = {}) {
 // caller that writes anything -- these functions never touch a DB or a
 // filesystem beyond the read-only pipeline.yml lookup.
 
+// User-scope default endpoint file (init-embeddability spec, "User-scope
+// default"): ${resolveBaseDir()}/handoff-embed.json, shape
+// {"vllm_embed_url": "http://127.0.0.1:8800"}. Lives beside handoff.md's own
+// base-dir resolution rather than inside pipeline.yml (A4) -- a per-project
+// config format and a user-wide default are deliberately kept distinct.
+const USER_SCOPE_EMBED_FILENAME = 'handoff-embed.json';
+
 /**
- * resolveConfiguredEmbedEndpoint — single-precedence resolution of the
- * embed endpoint URL, for INIT-TIME SEEDING purposes only. Precedence:
+ * _readUserScopeEmbedUrl — precedence step (c): read
+ * `${resolveBaseDir()}/handoff-embed.json`'s `vllm_embed_url` key.
+ *
+ * Total classification over the file's presence/parseability -- mirrors
+ * `_readPipelineYmlKey`'s own "never throw" contract (adversary finding #6,
+ * MAJOR): a corrupted/truncated/hand-typo'd JSON file is treated as
+ * EFFECTIVELY ABSENT (falls through to BLOCK/opt-out, same as no file at
+ * all) rather than letting a raw JSON.parse SyntaxError escape and crash
+ * the whole `init` run with a stack trace instead of routing through the
+ * designed classification. `corrupt: true` is still reported back so the
+ * caller can print a NOTE naming the file so an operator can fix it --
+ * "effectively absent" is a safe DEFAULT, not a silent one.
+ *
+ * @param {object} [opts]
+ * @param {object} [opts.env] -- env object (for HANDOFF_BASE_DIR resolution
+ *   by resolveBaseDir(), which itself reads process.env directly -- opts.env
+ *   is accepted here only for symmetry/testability of a caller that stubs
+ *   process.env.HANDOFF_BASE_DIR directly; resolveBaseDir has no injectable
+ *   env parameter of its own).
+ * @returns {{ url: string|null, corrupt: boolean, path: string }}
+ */
+function _readUserScopeEmbedUrl() {
+  let filePath;
+  try {
+    filePath = path.join(resolveBaseDir(), USER_SCOPE_EMBED_FILENAME);
+  } catch (_) {
+    // resolveBaseDir() itself threw (an invalid HANDOFF_BASE_DIR) -- that is
+    // a SEPARATE, already-loud failure surfaced elsewhere in the engine;
+    // here it just means "no user-scope file reachable."
+    return { url: null, corrupt: false, path: null };
+  }
+  if (!fs.existsSync(filePath)) {
+    return { url: null, corrupt: false, path: filePath };
+  }
+  let raw;
+  try {
+    raw = fs.readFileSync(filePath, 'utf8');
+  } catch (_) {
+    return { url: null, corrupt: false, path: filePath };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (_) {
+    return { url: null, corrupt: true, path: filePath };
+  }
+  const url = (parsed && typeof parsed.vllm_embed_url === 'string' && parsed.vllm_embed_url.trim())
+    ? parsed.vllm_embed_url.trim() : null;
+  return { url, corrupt: false, path: filePath };
+}
+
+/**
+ * resolveConfiguredEmbedEndpointDetailed — single-precedence resolution of
+ * the embed endpoint URL, for INIT-TIME SEEDING purposes only, ALSO
+ * returning which source won (so callers can log it — spec item 3/T3) and
+ * whether a user-scope file was found but unparseable (finding #6).
+ * Precedence:
  *   (a) .claude/pipeline.yml `knowledge.vllm_embed_url`, if set (opts.projectRoot)
  *   (b) env.VLLM_EMBED_URL, if set
- *   (c) NONE -- returns null.
+ *   (c) user-scope `${resolveBaseDir()}/handoff-embed.json` `vllm_embed_url`, if set
+ *   (d) NONE -- url: null.
  *
  * Deliberately NEVER falls back to shared.js/embed.js's own runtime default
  * ('http://localhost:8800') -- that default exists so the RUNTIME embed
@@ -340,20 +427,46 @@ async function probeProvider(provider, opts = {}) {
  * SEEDING a default provider row, an unconfigured endpoint must be treated
  * as unconfigured/INVALID, never silently assumed local. See classifyEmbedEndpoint.
  *
+ * IMPORTANT (adversary finding #4, BLOCKER): source (c)'s resolved URL is
+ * fed through the EXACT SAME classifyEmbedEndpoint()/seedLocalEmbeddingProvider
+ * LOCAL/REMOTE/INVALID branching as sources (a) and (b) — there is NO
+ * separate "just seed it" path for a user-scope value. A stale/shared
+ * handoff-embed.json pointing at a REMOTE host still BLOCKs unless
+ * --allow-remote-embed; INVALID still BLOCKs. This function only resolves
+ * WHICH url/source wins; classification and gating happen identically
+ * downstream regardless of source.
+ *
  * @param {object} [opts]
  * @param {string} [opts.projectRoot] -- project root to read .claude/pipeline.yml from
  * @param {object} [opts.env] -- env object to read VLLM_EMBED_URL from (default process.env)
- * @returns {string|null}
+ * @returns {{ url: string|null, source: 'pipeline_yml'|'env'|'user_scope'|null,
+ *             userScopeCorruptPath: string|null }}
  */
-function resolveConfiguredEmbedEndpoint(opts = {}) {
+function resolveConfiguredEmbedEndpointDetailed(opts = {}) {
   const { projectRoot } = opts;
   const env = opts.env || process.env;
   if (projectRoot) {
     const fromYml = _readPipelineYmlKey(projectRoot, 'vllm_embed_url');
-    if (fromYml) return fromYml;
+    if (fromYml) return { url: fromYml, source: 'pipeline_yml', userScopeCorruptPath: null };
   }
-  if (env.VLLM_EMBED_URL) return env.VLLM_EMBED_URL;
-  return null;
+  if (env.VLLM_EMBED_URL) return { url: env.VLLM_EMBED_URL, source: 'env', userScopeCorruptPath: null };
+  const userScope = _readUserScopeEmbedUrl();
+  if (userScope.url) return { url: userScope.url, source: 'user_scope', userScopeCorruptPath: null };
+  return { url: null, source: null, userScopeCorruptPath: userScope.corrupt ? userScope.path : null };
+}
+
+/**
+ * resolveConfiguredEmbedEndpoint — backward-compatible wrapper around
+ * resolveConfiguredEmbedEndpointDetailed returning just the resolved URL
+ * (or null). Existing callers/tests that only need the URL string keep
+ * working unchanged; cmdInit/seedLocalEmbeddingProvider use the detailed
+ * form above when they need to log/report the winning source.
+ *
+ * @param {object} [opts] — see resolveConfiguredEmbedEndpointDetailed
+ * @returns {string|null}
+ */
+function resolveConfiguredEmbedEndpoint(opts = {}) {
+  return resolveConfiguredEmbedEndpointDetailed(opts).url;
 }
 
 /**
@@ -412,6 +525,10 @@ const LOCAL_PROVIDER_MODEL_LABEL = 'Qwen/Qwen3-Embedding-8B';
 const LOCAL_PROVIDER_NATIVE_DIMS = 4096;
 const LOCAL_PROVIDER_STORED_DIMS = 4000;
 const LOCAL_PROVIDER_APPROVED_BY = 'handoff-init:local-endpoint';
+// Distinct provenance label for the explicit --allow-remote-embed path (A5:
+// a deliberate, narrow escape hatch for REMOTE classification only) — never
+// confused in an audit trail with a genuinely-local, fully-approved seed.
+const REMOTE_PROVIDER_APPROVED_BY = 'handoff-init:remote-endpoint-explicit-allow';
 
 /**
  * seedLocalEmbeddingProvider — cmdInit's (and `init --seed-provider`'s)
@@ -449,25 +566,47 @@ const LOCAL_PROVIDER_APPROVED_BY = 'handoff-init:local-endpoint';
  *   fallback for callers (tests) that pass a plain object without a real
  *   `.dialect` getter.
  * @param {'postgres'|'sqlite'} [opts.dialect] -- fallback, see above; ignored if `db.dialect` is set
- * @param {string} [opts.projectRoot] -- passed through to resolveConfiguredEmbedEndpoint
- * @param {object} [opts.env] -- passed through to resolveConfiguredEmbedEndpoint (default process.env)
- * @returns {Promise<{classification: string, endpoint: string|null, seeded: boolean, lines: string[]}>}
+ * @param {string} [opts.projectRoot] -- passed through to resolveConfiguredEmbedEndpointDetailed
+ * @param {object} [opts.env] -- passed through to resolveConfiguredEmbedEndpointDetailed (default process.env)
+ * @param {boolean} [opts.allowRemoteEmbed] -- A5: narrow escape hatch. When
+ *   true AND classification is REMOTE, seeds the row anyway with
+ *   data_egress_approved=false and prints the exact hand-edit SQL an
+ *   operator runs to flip it to true. Never bypasses the NONE/INVALID
+ *   branches — those still report unseeded regardless of this flag.
+ * @returns {Promise<{classification: string, endpoint: string|null, source: string|null, seeded: boolean, lines: string[]}>}
  *   `lines` are fully-formatted, ready to console.log() as-is (cmdInit's own
- *   "  [OK]    "/"  [NOTE]  " indentation convention).
+ *   "  [OK]    "/"  [NOTE]  " indentation convention). `source` is
+ *   'pipeline_yml'|'env'|'user_scope'|null (init-embeddability spec item 3).
  */
 async function seedLocalEmbeddingProvider(opts = {}) {
-  const { db, projectRoot, env } = opts;
+  const { db, projectRoot, env, allowRemoteEmbed } = opts;
   const dialect = (db && db.dialect) || opts.dialect;
   try {
-    const endpoint = resolveConfiguredEmbedEndpoint({ projectRoot, env });
+    const resolved = resolveConfiguredEmbedEndpointDetailed({ projectRoot, env });
+    const endpoint = resolved.url;
     const classification = endpoint ? classifyEmbedEndpoint(endpoint) : 'NONE';
+    const corruptNote = resolved.userScopeCorruptPath
+      ? [`  [NOTE]  user-scope embed-endpoint file is not valid JSON, treated as absent: ${resolved.userScopeCorruptPath}`]
+      : [];
 
-    if (classification === 'NONE' || classification === 'INVALID') {
+    if (classification === 'NONE') {
       return {
-        classification, endpoint, seeded: false,
+        classification, endpoint, source: resolved.source, seeded: false,
         lines: [
+          ...corruptNote,
           '  [NOTE]  embedding endpoint not configured/invalid — no default provider seeded; ' +
-          'set knowledge.vllm_embed_url in .claude/pipeline.yml',
+          'set knowledge.vllm_embed_url in .claude/pipeline.yml, VLLM_EMBED_URL, or ~/.claude/handoff-embed.json',
+        ],
+      };
+    }
+
+    if (classification === 'INVALID') {
+      return {
+        classification, endpoint, source: resolved.source, seeded: false,
+        lines: [
+          ...corruptNote,
+          `  [NOTE]  embedding endpoint value ${JSON.stringify(endpoint)} (source: ${resolved.source}) is not a valid ` +
+          'endpoint — no default provider seeded; expected shape: http(s)://host[:port]',
         ],
       };
     }
@@ -475,13 +614,52 @@ async function seedLocalEmbeddingProvider(opts = {}) {
     if (classification === 'REMOTE') {
       let host = endpoint;
       try { host = new URL(endpoint).hostname; } catch (_) { /* keep raw endpoint as fallback label */ }
-      return {
-        classification, endpoint, seeded: false,
-        lines: [
-          `  [NOTE]  embedding endpoint ${host} is not local — default provider requires explicit ` +
-          'owner attestation; insert an embedding_providers row with data_egress_approved set by hand',
-        ],
-      };
+
+      if (!allowRemoteEmbed) {
+        return {
+          classification, endpoint, source: resolved.source, seeded: false,
+          lines: [
+            `  [NOTE]  embedding endpoint ${host} (source: ${resolved.source}) is not local — default provider requires ` +
+            'explicit owner attestation; either insert an embedding_providers row with data_egress_approved ' +
+            'set by hand, or re-run init with --allow-remote-embed',
+          ],
+        };
+      }
+
+      // A5: explicit narrow escape hatch — seed the row anyway, but with
+      // data_egress_approved=false (an operator's own hand-edit, printed
+      // below, is what flips a REMOTE row to actually-approved).
+      const pg = dialect !== 'sqlite';
+      const boolTrue  = pg ? true : 1;
+      const boolFalse = pg ? false : 0;
+      const remoteSql = `INSERT INTO embedding_providers
+          (name, model_label, native_dims, stored_dims, endpoint, is_default, data_egress_approved, data_egress_approved_by, data_egress_approved_at)
+        VALUES
+          ($1, $2, $3, $4, $5, $6, $7, $8, now())
+        ON CONFLICT DO NOTHING`;
+      const remoteParams = [
+        LOCAL_PROVIDER_NAME,
+        LOCAL_PROVIDER_MODEL_LABEL,
+        LOCAL_PROVIDER_NATIVE_DIMS,
+        LOCAL_PROVIDER_STORED_DIMS,
+        endpoint,
+        boolTrue,
+        boolFalse,
+        REMOTE_PROVIDER_APPROVED_BY,
+      ];
+      const { rowCount: remoteRowCount } = await db.query(remoteSql, remoteParams);
+      if (remoteRowCount === 1) {
+        return {
+          classification, endpoint, source: resolved.source, seeded: true, remoteApproved: false,
+          lines: [
+            `  [OK]    seeded default provider ${LOCAL_PROVIDER_NAME} (${endpoint}) via --allow-remote-embed ` +
+            '(data_egress_approved=false — this endpoint has NOT been attested as approved)',
+            '  [NOTE]  to approve data egress to this remote endpoint, run by hand:',
+            `          UPDATE embedding_providers SET data_egress_approved = true, data_egress_approved_by = '<your-name>', data_egress_approved_at = now() WHERE name = '${LOCAL_PROVIDER_NAME}';`,
+          ],
+        };
+      }
+      return await _alreadyPresentLines(db, dialect, classification, endpoint, resolved.source);
     }
 
     // LOCAL — one statement, no check-then-insert. Untargeted ON CONFLICT
@@ -509,20 +687,56 @@ async function seedLocalEmbeddingProvider(opts = {}) {
     const { rowCount } = await db.query(sql, params);
     if (rowCount === 1) {
       return {
-        classification, endpoint, seeded: true,
-        lines: [`  [OK]    seeded default provider ${LOCAL_PROVIDER_NAME} (${endpoint})`],
+        classification, endpoint, source: resolved.source, seeded: true,
+        lines: [`  [OK]    seeded default provider ${LOCAL_PROVIDER_NAME} (${endpoint}) (source: ${resolved.source})`],
       };
     }
-    return {
-      classification, endpoint, seeded: false,
-      lines: [`  [NOTE]  provider ${LOCAL_PROVIDER_NAME} already present — left untouched`],
-    };
+    return await _alreadyPresentLines(db, dialect, classification, endpoint, resolved.source);
   } catch (err) {
     return {
-      classification: 'ERROR', endpoint: null, seeded: false,
+      classification: 'ERROR', endpoint: null, source: null, seeded: false,
       lines: [`  [NOTE]  default-provider seeding skipped (non-fatal): ${err.message}`],
     };
   }
+}
+
+/**
+ * _alreadyPresentLines — adversary finding #7 (MAJOR): rowCount 0 from the
+ * untargeted "ON CONFLICT DO NOTHING" absorbs TWO structurally different
+ * cases (a same-name row already exists, OR a DIFFERENT row already holds
+ * is_default=true) and previously reported BOTH via one identical, and in
+ * the second case factually wrong, "already present" line. Runs one cheap
+ * diagnostic SELECT to distinguish them; if that SELECT itself fails for
+ * any reason (e.g. a minimal test double that only stubs the INSERT), falls
+ * back to the original generic message rather than throwing — this
+ * diagnostic is a NOTE-line quality improvement, never a new failure mode.
+ *
+ * `alreadyPresent: true` on BOTH branches (init changes item 2 / cmdInit
+ * consumers): a default provider genuinely already exists in either case
+ * (same-name row, or a different provider entirely) — this is a benign,
+ * idempotent no-op, NEVER the same "unseedable" condition as NONE/INVALID/
+ * REMOTE-without-allow. Callers must check `seeded || alreadyPresent`
+ * before treating a `seeded:false` result as a BLOCK-worthy failure.
+ *
+ * @returns {Promise<{classification:string, endpoint:string|null, source:string|null, seeded:false, alreadyPresent:true, lines:string[]}>}
+ */
+async function _alreadyPresentLines(db, dialect, classification, endpoint, source) {
+  try {
+    const { rows } = await db.query(`SELECT name FROM embedding_providers WHERE is_default = ${dialect === 'sqlite' ? '1' : 'true'}`);
+    if (rows.length > 0 && rows[0].name !== LOCAL_PROVIDER_NAME) {
+      return {
+        classification, endpoint, source, seeded: false, alreadyPresent: true,
+        lines: [`  [NOTE]  a different provider ("${rows[0].name}") is already default — ${LOCAL_PROVIDER_NAME} NOT seeded`],
+      };
+    }
+  } catch (_) {
+    // Diagnostic SELECT failed (e.g. a minimal fake db that only implements
+    // the INSERT statement) — fall through to the generic message below.
+  }
+  return {
+    classification, endpoint, source, seeded: false, alreadyPresent: true,
+    lines: [`  [NOTE]  provider ${LOCAL_PROVIDER_NAME} already present — left untouched`],
+  };
 }
 
 module.exports = {
@@ -535,7 +749,11 @@ module.exports = {
   ProviderProbeError,
   PROBE_TEXT,
   DEFAULT_PROBE_TIMEOUT_MS,
+  resolveDefaultTimeoutMs,
   resolveConfiguredEmbedEndpoint,
+  resolveConfiguredEmbedEndpointDetailed,
+  _readUserScopeEmbedUrl,
+  USER_SCOPE_EMBED_FILENAME,
   classifyEmbedEndpoint,
   seedLocalEmbeddingProvider,
   LOCAL_PROVIDER_NAME,
@@ -543,4 +761,5 @@ module.exports = {
   LOCAL_PROVIDER_NATIVE_DIMS,
   LOCAL_PROVIDER_STORED_DIMS,
   LOCAL_PROVIDER_APPROVED_BY,
+  REMOTE_PROVIDER_APPROVED_BY,
 };

@@ -31,6 +31,8 @@ const PROJECT_ROOT = path.resolve(__dirname, '..');
 const {
   classifyEmbedEndpoint,
   resolveConfiguredEmbedEndpoint,
+  resolveConfiguredEmbedEndpointDetailed,
+  _readUserScopeEmbedUrl,
   seedLocalEmbeddingProvider,
   LOCAL_PROVIDER_NAME,
   LOCAL_PROVIDER_MODEL_LABEL,
@@ -73,7 +75,7 @@ function makeTmpProjectRoot(pipelineYmlBody) {
  * NOTHING" in the real SQL also absorbs as rowCount 0 — see
  * embedding_providers_is_default_unique_idx).
  */
-function fakeDb({ blockedByExistingDefault = false, dialect = 'postgres' } = {}) {
+function fakeDb({ blockedByExistingDefault = false, dialect = 'postgres', existingDefaultName = null } = {}) {
   const inserted = new Set();
   const calls = [];
   return {
@@ -88,6 +90,12 @@ function fakeDb({ blockedByExistingDefault = false, dialect = 'postgres' } = {})
         }
         inserted.add(name);
         return { rows: [], rowCount: 1 };
+      }
+      // Adversary finding #7's diagnostic SELECT (_alreadyPresentLines).
+      if (/^\s*SELECT name FROM embedding_providers WHERE is_default/i.test(sql)) {
+        if (existingDefaultName) return { rows: [{ name: existingDefaultName }], rowCount: 1 };
+        if (inserted.has(LOCAL_PROVIDER_NAME)) return { rows: [{ name: LOCAL_PROVIDER_NAME }], rowCount: 1 };
+        return { rows: [], rowCount: 0 };
       }
       throw new Error(`fakeDb: unexpected SQL: ${sql}`);
     },
@@ -183,20 +191,43 @@ knowledge:
     assertEqual(result, 'http://localhost:9002');
   });
 
-  await test('resolveConfiguredEmbedEndpoint: (c) NONE (null) when neither is set', () => {
-    const root = makeTmpProjectRoot(`
+  // Both tests below fall through to precedence step (c) — the user-scope
+  // ${resolveBaseDir()}/handoff-embed.json file — which reads the REAL
+  // process.env.HANDOFF_BASE_DIR (default ~/.claude) unless isolated here.
+  // Isolating this is required for hermetic CI correctness: if an operator's
+  // real machine ever has a genuine ~/.claude/handoff-embed.json (the whole
+  // point of this feature), these "must resolve to NONE" tests must not
+  // accidentally read it.
+  function withIsolatedBaseDir(fn) {
+    const saved = process.env.HANDOFF_BASE_DIR;
+    const isolatedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'embed-endpoint-basedir-'));
+    process.env.HANDOFF_BASE_DIR = isolatedDir;
+    try {
+      return fn();
+    } finally {
+      if (saved === undefined) delete process.env.HANDOFF_BASE_DIR; else process.env.HANDOFF_BASE_DIR = saved;
+      fs.rmSync(isolatedDir, { recursive: true, force: true });
+    }
+  }
+
+  await test('resolveConfiguredEmbedEndpoint: (c) NONE (null) when neither is set (isolated from any real user-scope file)', () => {
+    withIsolatedBaseDir(() => {
+      const root = makeTmpProjectRoot(`
 project:
   name: test
 `.trim());
-    const result = resolveConfiguredEmbedEndpoint({ projectRoot: root, env: {} });
-    assertEqual(result, null);
+      const result = resolveConfiguredEmbedEndpoint({ projectRoot: root, env: {} });
+      assertEqual(result, null);
+    });
   });
 
-  await test('resolveConfiguredEmbedEndpoint: NEVER falls back to the hardcoded localhost:8800 runtime default', () => {
-    // No projectRoot at all, no pipeline.yml, empty env — must be null, not
-    // the shared.js/embed.js runtime convenience default.
-    const result = resolveConfiguredEmbedEndpoint({ env: {} });
-    assertEqual(result, null);
+  await test('resolveConfiguredEmbedEndpoint: NEVER falls back to the hardcoded localhost:8800 runtime default (isolated from any real user-scope file)', () => {
+    withIsolatedBaseDir(() => {
+      // No projectRoot at all, no pipeline.yml, empty env — must be null, not
+      // the shared.js/embed.js runtime convenience default.
+      const result = resolveConfiguredEmbedEndpoint({ env: {} });
+      assertEqual(result, null);
+    });
   });
 
   await test('resolveConfiguredEmbedEndpoint: absent pipeline.yml file falls through to env', () => {
@@ -204,6 +235,76 @@ project:
     // No .claude directory at all.
     const result = resolveConfiguredEmbedEndpoint({ projectRoot: dir, env: { VLLM_EMBED_URL: 'http://localhost:8800' } });
     assertEqual(result, 'http://localhost:8800');
+  });
+
+  // ─── Section 2b: user-scope handoff-embed.json precedence (init-embeddability) ─
+
+  console.log('\n=== Section 2b: user-scope handoff-embed.json precedence + corruption handling ===');
+
+  await test('resolveConfiguredEmbedEndpointDetailed: (c) user-scope wins when neither pipeline.yml nor env is set', () => {
+    withIsolatedBaseDir(() => {
+      fs.writeFileSync(path.join(process.env.HANDOFF_BASE_DIR, 'handoff-embed.json'), JSON.stringify({ vllm_embed_url: 'http://127.0.0.1:8800' }), 'utf8');
+      const result = resolveConfiguredEmbedEndpointDetailed({ env: {} });
+      assertEqual(result.url, 'http://127.0.0.1:8800');
+      assertEqual(result.source, 'user_scope');
+    });
+  });
+
+  await test('resolveConfiguredEmbedEndpointDetailed: pipeline.yml (a) still wins over user-scope (c)', () => {
+    withIsolatedBaseDir(() => {
+      fs.writeFileSync(path.join(process.env.HANDOFF_BASE_DIR, 'handoff-embed.json'), JSON.stringify({ vllm_embed_url: 'http://127.0.0.1:9999' }), 'utf8');
+      const root = makeTmpProjectRoot(`
+knowledge:
+  vllm_embed_url: "http://localhost:9001"
+`.trim());
+      const result = resolveConfiguredEmbedEndpointDetailed({ projectRoot: root, env: {} });
+      assertEqual(result.url, 'http://localhost:9001');
+      assertEqual(result.source, 'pipeline_yml');
+    });
+  });
+
+  await test('resolveConfiguredEmbedEndpointDetailed: env (b) still wins over user-scope (c)', () => {
+    withIsolatedBaseDir(() => {
+      fs.writeFileSync(path.join(process.env.HANDOFF_BASE_DIR, 'handoff-embed.json'), JSON.stringify({ vllm_embed_url: 'http://127.0.0.1:9999' }), 'utf8');
+      const result = resolveConfiguredEmbedEndpointDetailed({ env: { VLLM_EMBED_URL: 'http://localhost:9002' } });
+      assertEqual(result.url, 'http://localhost:9002');
+      assertEqual(result.source, 'env');
+    });
+  });
+
+  await test('resolveConfiguredEmbedEndpointDetailed: a user-scope REMOTE value is returned as-is — classification/BLOCK gating happens downstream, never a separate unguarded path (adversary finding #4)', () => {
+    withIsolatedBaseDir(() => {
+      fs.writeFileSync(path.join(process.env.HANDOFF_BASE_DIR, 'handoff-embed.json'), JSON.stringify({ vllm_embed_url: 'http://0.0.0.0:8800' }), 'utf8');
+      const result = resolveConfiguredEmbedEndpointDetailed({ env: {} });
+      assertEqual(result.url, 'http://0.0.0.0:8800');
+      assertEqual(classifyEmbedEndpoint(result.url), 'REMOTE', 'the SAME classifyEmbedEndpoint downstream callers use — no bespoke user-scope classification');
+    });
+  });
+
+  await test('_readUserScopeEmbedUrl: absent file -> url:null, corrupt:false', () => {
+    withIsolatedBaseDir(() => {
+      const result = _readUserScopeEmbedUrl();
+      assertEqual(result.url, null);
+      assertEqual(result.corrupt, false);
+    });
+  });
+
+  await test('_readUserScopeEmbedUrl: corrupt JSON (adversary finding #6) -> url:null, corrupt:true, never throws', () => {
+    withIsolatedBaseDir(() => {
+      fs.writeFileSync(path.join(process.env.HANDOFF_BASE_DIR, 'handoff-embed.json'), '{ not: valid json,,', 'utf8');
+      const result = _readUserScopeEmbedUrl();
+      assertEqual(result.url, null);
+      assertEqual(result.corrupt, true);
+    });
+  });
+
+  await test('_readUserScopeEmbedUrl: valid JSON but missing/non-string vllm_embed_url -> url:null, corrupt:false', () => {
+    withIsolatedBaseDir(() => {
+      fs.writeFileSync(path.join(process.env.HANDOFF_BASE_DIR, 'handoff-embed.json'), JSON.stringify({ other_key: 123 }), 'utf8');
+      const result = _readUserScopeEmbedUrl();
+      assertEqual(result.url, null);
+      assertEqual(result.corrupt, false);
+    });
   });
 
   // ─── Section 3: seedLocalEmbeddingProvider against a FAKE db ─────────────
@@ -290,6 +391,56 @@ project:
     const db = fakeDb();
     await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://localhost:8800' } });
     assertEqual(db.calls.length, 1, 'exactly one db.query call total — no preceding SELECT/check');
+  });
+
+  await test('seedLocalEmbeddingProvider: INVALID endpoint message names the offending value and the expected shape', async () => {
+    const db = fakeDb();
+    const result = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'localhost:8800' } });
+    assertEqual(result.classification, 'INVALID');
+    assert(result.lines.some((l) => l.includes('localhost:8800')), `expected the offending value in the message, got: ${result.lines.join(' | ')}`);
+    assert(result.lines.some((l) => l.includes('http(s)://host')), `expected the expected-shape hint, got: ${result.lines.join(' | ')}`);
+  });
+
+  await test('seedLocalEmbeddingProvider: adversary finding #7 — a DIFFERENT default provider is distinguished from "same name already present"', async () => {
+    const db = fakeDb({ blockedByExistingDefault: true, existingDefaultName: 'some-other-provider' });
+    const result = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://localhost:8800' } });
+    assertEqual(result.seeded, false);
+    assert(result.lines.some((l) => l.includes('some-other-provider') && l.includes('NOT seeded')), `expected the distinguishing NOTE line, got: ${result.lines.join(' | ')}`);
+  });
+
+  await test('seedLocalEmbeddingProvider: adversary finding #7 — a SAME-name already-present row still reports the original "already present" message', async () => {
+    const db = fakeDb();
+    await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://localhost:8800' } });
+    const second = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://localhost:8800' } });
+    assert(second.lines.some((l) => l.includes('already present') && l.includes(LOCAL_PROVIDER_NAME) && !l.includes('a different provider')), `expected the plain "already present" line, got: ${second.lines.join(' | ')}`);
+  });
+
+  await test('seedLocalEmbeddingProvider: adversary finding #7 diagnostic SELECT failing (minimal fake db) falls back to the generic message, never throws', async () => {
+    // Same fakeDb as the pre-existing "an existing DIFFERENT default row" test
+    // above (no SELECT support) — the diagnostic SELECT throws internally and
+    // is caught, falling back to the pre-cm#-init-embeddability generic message.
+    const db = { dialect: 'postgres', calls: [], async query(sql) { this.calls.push(sql); if (/^\s*INSERT/i.test(sql)) return { rows: [], rowCount: 0 }; throw new Error('no SELECT support'); } };
+    const result = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://localhost:8800' } });
+    assertEqual(result.seeded, false);
+    assert(result.lines.some((l) => l.includes('already present')), 'must fall back to the generic message, never throw');
+  });
+
+  await test('seedLocalEmbeddingProvider: REMOTE + allowRemoteEmbed seeds with data_egress_approved=false and prints the hand-edit remedy (A5)', async () => {
+    const db = fakeDb();
+    const result = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', allowRemoteEmbed: true, env: { VLLM_EMBED_URL: 'http://0.0.0.0:8800' } });
+    assertEqual(result.classification, 'REMOTE');
+    assertEqual(result.seeded, true);
+    assertEqual(result.remoteApproved, false);
+    const { params } = db.calls[0];
+    assertEqual(params[6], false, 'data_egress_approved must be false for the --allow-remote-embed path');
+    assert(result.lines.some((l) => l.includes('UPDATE embedding_providers') && l.includes('data_egress_approved = true')), 'expected the exact hand-edit SQL remedy');
+  });
+
+  await test('seedLocalEmbeddingProvider: REMOTE WITHOUT allowRemoteEmbed still never writes (regression guard for A5 not weakening the existing BLOCK)', async () => {
+    const db = fakeDb();
+    const result = await seedLocalEmbeddingProvider({ db, dialect: 'postgres', env: { VLLM_EMBED_URL: 'http://0.0.0.0:8800' } });
+    assertEqual(result.seeded, false);
+    assertEqual(db.calls.length, 0);
   });
 
   console.log(`\n─── Results ──────────────────────────────────────`);

@@ -97,8 +97,24 @@ function parseStatusJson(stdout) {
   return JSON.parse(stdout.slice(start, end + 1));
 }
 
+/**
+ * init-embeddability spec: `init` now BLOCKs by default when no embed
+ * endpoint is configured. None of this suite's fixtures configure a live
+ * endpoint (CI has none available) and none of these tests are ABOUT
+ * embeddability (that's test-init-embeddability.js's job), so bare `init`
+ * calls auto-opt-out via --no-embeddings unless the caller already passed
+ * --seed-provider/--no-embeddings/--allow-remote-embed explicitly.
+ */
+function _initNoEmbeddingsDefault(sub, extraArgs) {
+  const args = extraArgs || [];
+  if (sub !== 'init') return args;
+  if (args.some((a) => a === '--seed-provider' || a === '--no-embeddings' || a === '--allow-remote-embed')) return args;
+  return [...args, '--no-embeddings'];
+}
+
 /** Run the handoff.js helper as a subprocess with a fake project root. */
 function runHelper(sub, extraArgs = [], opts = {}) {
+  extraArgs = _initNoEmbeddingsDefault(sub, extraArgs);
   // We fake the project root by pointing PROJECT_ROOT to a temp dir that has
   // a .git folder and a .claude/pipeline.yml so loadConfig() and findProjectRoot() work.
   const fakeRoot = opts.fakeRoot || global.__fakeRoot;
@@ -336,25 +352,61 @@ async function runTests() {
     for (const k of (opts.deleteEnv || [])) delete env[k];
     return execFileSync(
       process.execPath,
-      [HELPER, 'init', '--seed-provider'],
+      [HELPER, 'init', '--seed-provider', ...(opts.extraArgs || [])],
       { cwd: seedFakeRoot, env, encoding: 'utf8', timeout: 15000 }
     );
   }
 
-  await test('init --seed-provider: NONE (unconfigured) endpoint writes nothing (row count unchanged)', async () => {
+  // init-embeddability spec item 2: --seed-provider standalone mode now
+  // BLOCKs (exit 1) on an unseeded result (NONE/INVALID/REMOTE-without-
+  // --allow-remote-embed) — no marker/FS was ever written by this
+  // standalone path, so there is nothing to unwind. Pre-dates this PR's
+  // spec, these two cases used to report a successful Done line; that is a
+  // DELIBERATE behavior change (never a silent skip — see the spec's
+  // total-classification tables), not a regression.
+  await test('init --seed-provider: NONE (unconfigured) endpoint BLOCKs (exit 1), row count unchanged', async () => {
     const before = await countVllmLocalRows();
-    const out = runSeedProvider({ deleteEnv: ['VLLM_EMBED_URL'] });
+    let threw = null;
+    try {
+      runSeedProvider({ deleteEnv: ['VLLM_EMBED_URL'] });
+    } catch (err) {
+      threw = err;
+    }
+    assert.ok(threw, 'expected --seed-provider to exit non-zero for an unconfigured endpoint');
+    assert.strictEqual(threw.status, 1, `Expected exit code 1, got ${threw.status}`);
+    const out = (threw.stdout || '').toString();
     assert.ok(out.includes('[NOTE]') && out.includes('not configured/invalid'), `expected the NONE/INVALID NOTE line, got:\n${out}`);
-    assert.ok(out.includes('Done: handoff:init --seed-provider'), `expected a successful Done line, got:\n${out}`);
+    assert.ok(out.includes('FAILED'), `expected a FAILED Done line, got:\n${out}`);
     assert.strictEqual(await countVllmLocalRows(), before, 'NONE must never change the row count');
   });
 
-  await test('init --seed-provider: REMOTE endpoint writes nothing (row count unchanged) and names the host in the NOTE line', async () => {
+  await test('init --seed-provider: REMOTE endpoint (no --allow-remote-embed) BLOCKs (exit 1), row count unchanged, names the host', async () => {
     const before = await countVllmLocalRows();
-    const out = runSeedProvider({ extraEnv: { VLLM_EMBED_URL: 'http://0.0.0.0:8800' } });
+    let threw = null;
+    try {
+      runSeedProvider({ extraEnv: { VLLM_EMBED_URL: 'http://0.0.0.0:8800' } });
+    } catch (err) {
+      threw = err;
+    }
+    assert.ok(threw, 'expected --seed-provider to exit non-zero for a REMOTE endpoint without --allow-remote-embed');
+    assert.strictEqual(threw.status, 1, `Expected exit code 1, got ${threw.status}`);
+    const out = (threw.stdout || '').toString();
     assert.ok(out.includes('[NOTE]') && out.includes('0.0.0.0') && out.includes('data_egress_approved'), `expected the REMOTE attestation-required NOTE line, got:\n${out}`);
-    assert.ok(out.includes('Done: handoff:init --seed-provider'), `expected a successful Done line, got:\n${out}`);
     assert.strictEqual(await countVllmLocalRows(), before, 'REMOTE must never change the row count');
+  });
+
+  await test('init --seed-provider: REMOTE endpoint WITH --allow-remote-embed seeds (data_egress_approved=false)', async () => {
+    // Runs against whatever vllm-local state the prior tests left behind —
+    // if a row already exists (from the LOCAL test below, which runs later
+    // in file order but may have left state from a prior partial run), the
+    // untargeted ON CONFLICT DO NOTHING absorbs it as "already present"
+    // (still exit 0, still deterministic). We only assert on exit code and
+    // row-count-never-decreases here, matching this suite's existing
+    // "never delete/mutate a pre-existing row" convention.
+    const before = await countVllmLocalRows();
+    const out = runSeedProvider({ extraEnv: { VLLM_EMBED_URL: 'http://0.0.0.0:8800' }, extraArgs: ['--allow-remote-embed'] });
+    assert.ok(out.includes('Done: handoff:init --seed-provider'), `expected a successful Done line, got:\n${out}`);
+    assert.ok(await countVllmLocalRows() >= Math.max(before, 1), 'a row must exist afterward (either freshly seeded or already present)');
   });
 
   await test('init --seed-provider: LOCAL endpoint — seeds if absent, no-ops if already present, never duplicates', async () => {
@@ -1120,6 +1172,7 @@ async function runTests() {
   // runHelperBoth — like runHelper but captures both stdout and stderr.
   // Uses spawnSync so both streams are available regardless of exit code.
   function runHelperBoth(sub, extraArgs = [], opts = {}) {
+    extraArgs = _initNoEmbeddingsDefault(sub, extraArgs);
     const fakeRoot = opts.fakeRoot || global.__fakeRoot;
     const env = {
       ...process.env,
@@ -1410,7 +1463,7 @@ knowledge:
       // Run init on the temp git root.
       execFileSync(
         process.execPath,
-        [HELPER, 'init', '-y'],
+        [HELPER, 'init', '-y', '--no-embeddings'],
         {
           cwd: gitTestRoot,
           env: { ...process.env, PROJECT_ROOT: gitTestRoot },

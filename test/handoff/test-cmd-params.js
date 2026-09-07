@@ -91,8 +91,24 @@ async function countRows(client, table, projectId) {
   return parseInt(rows[0].n, 10);
 }
 
+/**
+ * init-embeddability spec: `init` now BLOCKs by default when no embed
+ * endpoint is configured. None of this suite's fixtures configure a live
+ * endpoint (CI has none available — EMBED_SKIP convention) and none of
+ * these tests are ABOUT embeddability, so bare `init` calls auto-opt-out
+ * via --no-embeddings unless the caller already passed
+ * --seed-provider/--no-embeddings/--allow-remote-embed explicitly.
+ */
+function _initNoEmbeddingsDefault(sub, extraArgs) {
+  const args = extraArgs || [];
+  if (sub !== 'init') return args;
+  if (args.some((a) => a === '--seed-provider' || a === '--no-embeddings' || a === '--allow-remote-embed')) return args;
+  return [...args, '--no-embeddings'];
+}
+
 /** Run the handoff.js helper as a subprocess. */
 function runHelper(sub, extraArgs = [], opts = {}) {
+  extraArgs = _initNoEmbeddingsDefault(sub, extraArgs);
   const fakeRoot = opts.fakeRoot || global.__fakeRoot;
   const env = {
     ...process.env,
@@ -118,6 +134,7 @@ function runHelper(sub, extraArgs = [], opts = {}) {
 
 /** Like runHelper but captures both stdout and stderr (never throws). */
 function runHelperBoth(sub, extraArgs = [], opts = {}) {
+  extraArgs = _initNoEmbeddingsDefault(sub, extraArgs);
   const fakeRoot = opts.fakeRoot || global.__fakeRoot;
   const env = {
     ...process.env,

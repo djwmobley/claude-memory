@@ -380,8 +380,22 @@ async function pgConnect(database = 'postgres') {
   return client;
 }
 
+/**
+ * init-embeddability spec: `init` now BLOCKs by default when no embed
+ * endpoint is configured; this smoke suite's fixtures configure none (CI
+ * has none available) and are not about embeddability, so bare `init`
+ * calls auto-opt-out via --no-embeddings unless already opted in.
+ */
+function _initNoEmbeddingsDefault(sub, extraArgs) {
+  const args = extraArgs || [];
+  if (sub !== 'init') return args;
+  if (args.some((a) => a === '--seed-provider' || a === '--no-embeddings' || a === '--allow-remote-embed')) return args;
+  return [...args, '--no-embeddings'];
+}
+
 /** Run `node scripts/handoff.js <sub> [...args]`, optionally piping stdin. */
 function runHandoff(sub, extraArgs = [], stdin = null, db = SMOKE_DB, projectDir = TEMP_PROJECT_DIR) {
+  extraArgs = _initNoEmbeddingsDefault(sub, extraArgs);
   const opts = {
     cwd:      PROJECT_ROOT,
     env:      makeEnv(db, projectDir),
@@ -1391,7 +1405,7 @@ async function hardenStep1_dbNameValidation() {
   try {
     // Use an invalid name with a double-quote in it.
     const badEnv = { ...process.env, HANDOFF_DB: 'bad"name', PROJECT_ROOT: TEMP_PROJECT_DIR_HARDEN };
-    const r = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'init', '-y'], {
+    const r = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'init', '-y', '--no-embeddings'], {
       cwd:      PROJECT_ROOT,
       env:      badEnv,
       encoding: 'utf8',
@@ -2368,7 +2382,7 @@ async function runW3Section() {
     // Run init so all base tables exist.
     const initR = spawnSync(
       process.execPath,
-      [HANDOFF_SCRIPT, 'init', '-y'],
+      [HANDOFF_SCRIPT, 'init', '-y', '--no-embeddings'],
       {
         cwd:      PROJECT_ROOT,
         env:      { ...process.env, HANDOFF_DB: W3_DB, PROJECT_ROOT: W3_PROJ_DIR },
@@ -2908,7 +2922,7 @@ async function runW4Section() {
     // Run init so all base tables (including W4 schema) exist.
     const initR = spawnSync(
       process.execPath,
-      [HANDOFF_SCRIPT, 'init', '-y'],
+      [HANDOFF_SCRIPT, 'init', '-y', '--no-embeddings'],
       {
         cwd:      PROJECT_ROOT,
         env:      { ...process.env, HANDOFF_DB: W4_DB, PROJECT_ROOT: W4_PROJ_DIR },
@@ -2987,7 +3001,7 @@ async function runW2Section() {
 
     const initR = spawnSync(
       process.execPath,
-      [path.join(PROJECT_ROOT, 'scripts', 'handoff.js'), 'init', '-y'],
+      [path.join(PROJECT_ROOT, 'scripts', 'handoff.js'), 'init', '-y', '--no-embeddings'],
       {
         cwd:      PROJECT_ROOT,
         env:      { ...process.env, HANDOFF_DB: W2_DB, PROJECT_ROOT: W2_PROJ_DIR },
@@ -3263,7 +3277,7 @@ async function runC1Section() {
     // Run init so all base tables (including outcome_bias) exist.
     const initR = spawnSync(
       process.execPath,
-      [HANDOFF_SCRIPT, 'init', '-y'],
+      [HANDOFF_SCRIPT, 'init', '-y', '--no-embeddings'],
       {
         cwd:      PROJECT_ROOT,
         env:      { ...process.env, HANDOFF_DB: C1_DB, PROJECT_ROOT: C1_PROJ_DIR },
@@ -3870,7 +3884,7 @@ async function runC2Section() {
     // Run init so all base tables exist.
     const initR = spawnSync(
       process.execPath,
-      [HANDOFF_SCRIPT, 'init', '-y'],
+      [HANDOFF_SCRIPT, 'init', '-y', '--no-embeddings'],
       {
         cwd:      PROJECT_ROOT,
         env:      { ...process.env, HANDOFF_DB: C2_DB, PROJECT_ROOT: C2_PROJ_DIR },
@@ -4470,7 +4484,7 @@ async function runC3Section() {
     // Run init so all base tables exist.
     const initR = spawnSync(
       process.execPath,
-      [HANDOFF_SCRIPT, 'init', '-y'],
+      [HANDOFF_SCRIPT, 'init', '-y', '--no-embeddings'],
       {
         cwd:      PROJECT_ROOT,
         env:      { ...process.env, HANDOFF_DB: C3_DB, PROJECT_ROOT: C3_PROJ_DIR },
@@ -4734,7 +4748,7 @@ async function rgStep7_writePathNonRegression() {
     // Init the schema.
     const initR = spawnSync(
       process.execPath,
-      [HANDOFF_SCRIPT, 'init', '-y'],
+      [HANDOFF_SCRIPT, 'init', '-y', '--no-embeddings'],
       {
         cwd:      PROJECT_ROOT,
         env:      { ...process.env, HANDOFF_DB: RG_DB, PROJECT_ROOT: RG_PROJ_DIR },
@@ -5264,7 +5278,7 @@ async function runQueueSection() {
     // Run init so all base tables (including extraction_queue) exist.
     const initR = spawnSync(
       process.execPath,
-      [HANDOFF_SCRIPT, 'init', '-y'],
+      [HANDOFF_SCRIPT, 'init', '-y', '--no-embeddings'],
       {
         cwd:      PROJECT_ROOT,
         env:      { ...process.env, HANDOFF_DB: Q_DB, PROJECT_ROOT: Q_PROJ_DIR },
@@ -5657,7 +5671,7 @@ async function runCollisionSection() {
     await createSmokeDb(COL_DB, PROJ_DIR);
     fs.writeFileSync(path.join(PROJ_DIR, 'CLAUDE.md'), '# collision-test\n\n## Durable facts\n- (none)\n', 'utf8');
 
-    const initR = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'init', '-y'],
+    const initR = spawnSync(process.execPath, [HANDOFF_SCRIPT, 'init', '-y', '--no-embeddings'],
       { cwd: PROJECT_ROOT, env: { ...process.env, HANDOFF_DB: COL_DB, PROJECT_ROOT: PROJ_DIR }, encoding: 'utf8', timeout: 30000 });
     if (initR.status !== 0) {
       console.log('[COLLISION] DB init failed — skipping DB-backed steps 1-4, 6-7');
@@ -5908,7 +5922,7 @@ async function runGraphSection() {
 
     const initR = spawnSync(
       process.execPath,
-      [HANDOFF_SCRIPT, 'init', '-y'],
+      [HANDOFF_SCRIPT, 'init', '-y', '--no-embeddings'],
       { cwd: PROJECT_ROOT, env: { ...process.env, HANDOFF_DB: GR_DB, PROJECT_ROOT: GR_PROJ_DIR }, encoding: 'utf8', timeout: 30000 }
     );
     if (initR.status !== 0) {
@@ -5964,7 +5978,7 @@ async function runDecaySection() {
 
     const initR = spawnSync(
       process.execPath,
-      [HANDOFF_SCRIPT, 'init', '-y'],
+      [HANDOFF_SCRIPT, 'init', '-y', '--no-embeddings'],
       { cwd: PROJECT_ROOT, env: { ...process.env, HANDOFF_DB: DC_DB, PROJECT_ROOT: DC_PROJ_DIR }, encoding: 'utf8', timeout: 30000 }
     );
     if (initR.status !== 0) {
@@ -6157,7 +6171,7 @@ async function runPruneSection() {
 
     const initR = spawnSync(
       process.execPath,
-      [HANDOFF_SCRIPT, 'init', '-y'],
+      [HANDOFF_SCRIPT, 'init', '-y', '--no-embeddings'],
       { cwd: PROJECT_ROOT, env: { ...process.env, HANDOFF_DB: PN_DB, PROJECT_ROOT: PN_PROJ_DIR }, encoding: 'utf8', timeout: 30000 }
     );
     if (initR.status !== 0) {

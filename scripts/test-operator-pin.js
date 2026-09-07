@@ -109,7 +109,7 @@ async function bootstrapDb(dbName, projectDir) {
     '# pin-test\n\n## Durable facts\n- (none)\n',
     'utf8'
   );
-  const initR = runHandoff('init', ['-y'], null, dbName, projectDir);
+  const initR = runHandoff('init', ['-y', '--no-embeddings'], null, dbName, projectDir);
   if (initR.status !== 0) {
     throw new Error(`init failed: ${(initR.stderr || initR.stdout || '').slice(0, 400)}`);
   }

@@ -201,19 +201,65 @@ as current. On every `/handoff:close` and `/handoff:resume` after that, a drift 
 a content hash of the applicable files against what's recorded for your project and re-applies
 additively if anything changed — you never run a manual migration step.
 
-**pgvector-gated columns.** `assertions.embedding` and `decisions.embedding` (plus their HNSW
-indexes) are wrapped in a `DO $$ ... EXCEPTION WHEN OTHERS $$` block so a target with no `vector`
-extension degrades gracefully rather than aborting the whole apply — no `CREATE EXTENSION` is ever
-issued by this engine (installing extensions is an operator/DBA action, out of scope for an
-additive schema apply). Every unit that carries such a column declares it in a `pgvector_gated`
-entry in `schema-manifest.json`; the drift sentinel checks these on **every** call (not just a
-fresh apply) and, if any are actually missing on your database, records a structured
-`project_settings.schema_apply_degraded` row (surfaced by `/handoff:status`) and returns
-`reason: 'degraded'` instead of silently claiming success. A live write against a missing
-embedding column gets a named, actionable error (naming pgvector and pointing at
-`schema_apply_degraded`) instead of a bare database error. This does **not** detect a `vector`
-extension that is installed but too old to provide the `halfvec` type — that case still shows up
-as a loud degradation (a column genuinely missing), just without a version-specific diagnosis.
+**pgvector-gated columns and embeddability (BLOCK-by-default).** `assertions.embedding` and
+`decisions.embedding` (plus their HNSW indexes) are wrapped in a `DO $$ ... EXCEPTION WHEN OTHERS
+$$` block so a target with no `vector` extension degrades gracefully at the DDL level rather than
+aborting the whole schema apply. Unlike the old degrade-and-continue behavior, `/handoff:init`
+itself no longer silently accepts an unembeddable project: before any DDL runs, it probes the
+target database's `pg_extension` state and this role's `CREATE` privilege, and total-classifies
+the result:
+
+- **Extension present** → proceeds normally.
+- **Extension absent, this role has `CREATE` privilege** → the existing single confirm-before-DDL
+  gate's prompt is extended to also cover `CREATE EXTENSION vector;` (never a second prompt); on
+  confirmation, the extension is installed before the gated schema DDL runs, so the gated
+  columns/indexes are created in the same pass.
+- **Extension absent, this role lacks privilege** → **BLOCKS**, printing the exact
+  `CREATE EXTENSION vector;` command for a superuser/owner to run, and exits non-zero with no
+  marker/`handoff.md` written.
+- **No embed endpoint configured anywhere** (`.claude/pipeline.yml`'s `knowledge.vllm_embed_url`,
+  then `VLLM_EMBED_URL`, then a user-scope `~/.claude/handoff-embed.json` — see below) → **BLOCKS**
+  with a distinct message, unless `--no-embeddings` is passed.
+- **Endpoint configured but classifies as REMOTE** (not loopback) → **BLOCKS** unless
+  `--allow-remote-embed` is passed, in which case the provider row is seeded with
+  `data_egress_approved=false` and the exact hand-edit `UPDATE` an operator runs to approve it is
+  printed.
+
+Pass `--no-embeddings` to proceed without embedding capability at all — this stamps a
+`project_settings.embeddings_opt_out` row so a later routine re-init (with the endpoint still
+unconfigured) auto-honors the opt-out instead of re-BLOCKing; pass `--clear-opt-out` to remove it.
+
+**User-scope default endpoint.** Besides the per-project `.claude/pipeline.yml` and the
+`VLLM_EMBED_URL` environment variable, `init` also checks a user-wide default file,
+`${HANDOFF_BASE_DIR:-~/.claude}/handoff-embed.json` (shape: `{"vllm_embed_url":
+"http://127.0.0.1:8800"}`), as the last precedence step before concluding no endpoint is
+configured. This value goes through the exact same LOCAL/REMOTE/INVALID classification as the
+other two sources — a stale or shared user-scope file pointing at a remote host still BLOCKs
+unless `--allow-remote-embed`.
+
+The drift sentinel (`ensureSchemaCurrent`) still checks the `pgvector_gated` entries in
+`schema-manifest.json` on **every** call (not just a fresh apply) for a database that was
+provisioned before this behavior existed, and records a structured
+`project_settings.schema_apply_degraded` row (surfaced by `/handoff:status`) if a gated object is
+still missing. A live write against a missing embedding column gets a named, actionable error
+(naming pgvector and pointing at `schema_apply_degraded`) instead of a bare database error. This
+does **not** detect a `vector` extension that is installed but too old to provide the `halfvec`
+type — that case still shows up as a loud degradation (a column genuinely missing), just without a
+version-specific diagnosis; nor does it verify the configured endpoint is actually *reachable* —
+see `/handoff:status`'s `embedding_readiness` field for the loud, always-computed structural
+readiness signal, and `backfill-embeddings` below for closing the gap after the fact.
+
+**Backfilling NULL embeddings.** Rows written while the provider was down, or written before an
+embedding provider was ever configured, keep a NULL `embedding` — this is fail-soft by design and
+backfillable, never a lost write. Run `node scripts/handoff.js backfill-embeddings` (dry-run by
+default; add `--apply` to write) to embed every `assertions`/`decisions` row whose `embedding` is
+still NULL, in batches, with catalog-driven provenance stamping. It refuses to write (loudly, no
+partial writes) if no default provider is configured, or if the target lacks the provenance
+columns; it also refuses if existing embedded rows were stamped by a *different* provider than the
+one currently resolved as default, unless `--force-mixed-provider` — mixing two incompatible
+embedding spaces in the same vector column would silently corrupt cosine-similarity retrieval. On
+SQLite (seam-test-only; see below) every table reports "0 embeddable rows (no embedding column on
+this backend)" rather than an error.
 
 ---
 
