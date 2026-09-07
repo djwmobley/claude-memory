@@ -94,8 +94,6 @@ const { embedQuery }                               = require('./lib/embed');
 const {
   seedLocalEmbeddingProvider,
   resolveConfiguredEmbedEndpointDetailed,
-  classifyEmbedEndpoint,
-  resolveDefaultProvider,
 } = require('./lib/embedding-provider');
 const { embedForWrite, classifyEmbeddingWriteError } = require('./lib/write-time-embed');
 const { runBackfillEmbeddings }                    = require('./lib/backfill-embeddings');
