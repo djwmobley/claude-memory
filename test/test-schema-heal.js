@@ -72,7 +72,8 @@ const { classifySchemaFiles } = require(path.join(PROJECT_ROOT, 'scripts', 'lib'
 // of which directory this test file itself is run from; a direct
 // `require('pg')` from test/ would NOT (same reason test-decisions-canon.js
 // and test-index-cap-md5.js never require('pg') directly either).
-const { pgConnect: _sharedPgConnect } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'test-pg-helpers.js'));
+const { pgConnect: _sharedPgConnect, startFakeEmbedServerProcess } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'test-pg-helpers.js'));
+const { LOCAL_PROVIDER_NATIVE_DIMS } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'embedding-provider.js'));
 
 let passed = 0;
 let failed = 0;
@@ -603,9 +604,17 @@ async function testT9() {
     const gitInit = spawnSync('git', ['-C', projDir, 'init', '-q'], { encoding: 'utf8' });
     if (gitInit.status !== 0) throw new Error(`git init failed: ${gitInit.stderr}`);
 
+    // CI-portability audit (review round 2): this run deterministically
+    // FATALs at the gated-column check, which runs strictly BEFORE Step 7.5
+    // (embedding_providers seeding) in cmdInit's own control flow — so it
+    // never actually reads HANDOFF_BASE_DIR/handoff-embed.json or needs a
+    // VLLM_EMBED_URL regardless of machine. HANDOFF_BASE_DIR is still
+    // pinned defensively (empty scratch dir) so this test can never
+    // accidentally depend on this machine's real user-scope config even if
+    // cmdInit's ordering ever changes.
     const result = runCli(['init', '-y'], {
       cwd: projDir,
-      env: { PROJECT_ROOT: projDir, HANDOFF_DB: dbName, CLAUDE_PLUGIN_ROOT: scratchEngineRoot },
+      env: { PROJECT_ROOT: projDir, HANDOFF_DB: dbName, CLAUDE_PLUGIN_ROOT: scratchEngineRoot, HANDOFF_BASE_DIR: scratchEngineRoot },
     });
     const out = (result.stdout || '') + (result.stderr || '');
     assertEqual(result.status, 1, `T9: init must still exit 1 (unchanged fatal policy), got ${result.status}. Output:\n${out.slice(0, 2000)}`);
@@ -641,20 +650,40 @@ async function testT10() {
 
   const dbName = `cm185heal_t10_${Date.now()}`;
   const projDir = path.join(os.tmpdir(), `cm185heal-t10-init-${Date.now()}`);
+  const baseDir = path.join(os.tmpdir(), `cm185heal-t10-base-${Date.now()}`);
+  let fakeServer = null;
   try {
     await createThrowawayDb(dbName);
     fs.mkdirSync(projDir, { recursive: true });
+    fs.mkdirSync(baseDir, { recursive: true });
     const gitInit = spawnSync('git', ['-C', projDir, 'init', '-q'], { encoding: 'utf8' });
     if (gitInit.status !== 0) throw new Error(`git init failed: ${gitInit.stderr}`);
+
+    // CI portability (review round 2): a real `init -y` without
+    // --no-embeddings runs Step 7.5 (seed embedding_providers), which reads
+    // ${HANDOFF_BASE_DIR}/handoff-embed.json / VLLM_EMBED_URL / pipeline.yml
+    // — none of which exist on a fresh CI runner. This test's own scenario
+    // (re-init clearing a stale degraded row) has nothing to do with
+    // embeddings, but it DOES need init to reach a full success (exit 0),
+    // so it needs *some* endpoint to resolve rather than BLOCK. Spin up a
+    // real (separate-process) fake embed server and point VLLM_EMBED_URL at
+    // it — deterministic on every machine, never dependent on this one's
+    // own ~/.claude/handoff-embed.json or a locally-running vLLM. HANDOFF_BASE_DIR
+    // is ALSO pinned to an empty scratch dir so a real user-scope
+    // handoff-embed.json (if one exists on the machine running this test)
+    // is never consulted at all.
+    fakeServer = await startFakeEmbedServerProcess(LOCAL_PROVIDER_NATIVE_DIMS, 0.1);
+    const embedEnv = {
+      PROJECT_ROOT: projDir, HANDOFF_DB: dbName,
+      VLLM_EMBED_URL: `http://127.0.0.1:${fakeServer.port}`,
+      HANDOFF_BASE_DIR: baseDir,
+    };
 
     // Step 1: a REAL, fully-successful first init — mints its OWN marker
     // UUID (never encodeCwd(projDir); that fallback belongs to
     // resolveProjectId()'s marker-LESS path used by status/resume, not to
     // init's own provisioning, which always mints or reuses a real marker).
-    const first = runCli(['init', '-y'], {
-      cwd: projDir,
-      env: { PROJECT_ROOT: projDir, HANDOFF_DB: dbName },
-    });
+    const first = runCli(['init', '-y'], { cwd: projDir, env: embedEnv });
     assertEqual(first.status, 0, `T10 precondition: first init must succeed, got ${first.status}. stdout:\n${first.stdout}\nstderr:\n${first.stderr}`);
 
     const { readMarker } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'project-marker.js'));
@@ -676,10 +705,7 @@ async function testT10() {
 
     // Step 3: re-init of the SAME (already-marked) project — reuses the
     // existing marker's UUID.
-    const second = runCli(['init', '-y'], {
-      cwd: projDir,
-      env: { PROJECT_ROOT: projDir, HANDOFF_DB: dbName },
-    });
+    const second = runCli(['init', '-y'], { cwd: projDir, env: embedEnv });
     assertEqual(second.status, 0, `T10: re-init must exit 0, got ${second.status}. stdout:\n${second.stdout}\nstderr:\n${second.stderr}`);
 
     const client = await pgConnect(dbName);
@@ -693,8 +719,10 @@ async function testT10() {
   } catch (err) {
     fail(label, err.message);
   } finally {
+    if (fakeServer) { try { fakeServer.stop(); } catch (_) {} }
     await dropThrowawayDb(dbName);
     try { fs.rmSync(projDir, { recursive: true, force: true }); } catch (_) {}
+    try { fs.rmSync(baseDir, { recursive: true, force: true }); } catch (_) {}
   }
 }
 
@@ -866,18 +894,13 @@ async function testT15() {
     const { adapter } = await bootstrapCurrentDb(client, PID, { withExtension: true });
     assertEqual(await getDegradedRow(client, PID), null, 'T15 precondition: clean baseline');
 
-    // Monkeypatch THIS INSTANCE's schemaObjectsExist to simulate a probe
-    // failure (e.g. a transient connection error) — instance-level, not
-    // module-level, so it affects only this adapter object, never any other
-    // test or the require() cache.
-    const realSchemaObjectsExist = adapter.schemaObjectsExist.bind(adapter);
-    let callCount = 0;
-    adapter.schemaObjectsExist = async (expected) => {
-      callCount++;
-      if (callCount === 1) {
-        return { ok: false, missing: [{ type: 'error', message: 'simulated transient connection error' }] };
-      }
-      return realSchemaObjectsExist(expected);
+    // Monkeypatch THIS INSTANCE's probeFastPathSchemaState (PR #262 perf
+    // follow-up: the fast path's combined catalog query) to simulate a
+    // probe failure (e.g. a transient connection error) — instance-level,
+    // not module-level, so it affects only this adapter object, never any
+    // other test or the require() cache.
+    adapter.probeFastPathSchemaState = async () => {
+      throw new Error('simulated transient connection error');
     };
 
     const result = await handoffModule.ensureSchemaCurrentCore(adapter, PID, { silent: true });

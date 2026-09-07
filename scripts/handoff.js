@@ -2083,14 +2083,23 @@ async function recordSchemaDegradation(db, projectId, reason, detail, { silent }
   }
 }
 
-/** Clear the schema_apply_degraded row (a later fully-verified apply succeeded). */
+/**
+ * Clear the schema_apply_degraded row (a later fully-verified apply
+ * succeeded). Returns whether a row actually existed to delete — lets a
+ * caller (cmdStatus's "what did this touch heal" line) report an accurate
+ * transition WITHOUT a separate pre-heal SELECT (PR #262 perf follow-up):
+ * the DELETE's own rowCount already answers "was there something to clear".
+ */
 async function clearSchemaDegradation(db, projectId) {
   try {
-    await db.query(
+    const result = await db.query(
       `DELETE FROM project_settings WHERE project_id = $1 AND key = 'schema_apply_degraded'`,
       [projectId]
     );
-  } catch (_) { /* best-effort */ }
+    return { cleared: typeof result?.rowCount === 'number' ? result.rowCount > 0 : false };
+  } catch (_) {
+    return { cleared: false };
+  }
 }
 
 /**
@@ -2178,7 +2187,13 @@ async function isEmbeddingsOptedOut(db, projectId) {
  * @param {Array<{basename:string}>} units — the active dialect's applicable unit set
  * @returns {Promise<{ok:boolean, vectorExtensionPresent:boolean|null, missing:Array<{unit:string,table:string,column:string}>}>}
  */
-async function checkPgvectorGatedObjects(db, manifest, units) {
+/**
+ * Collect every pgvector_gated column declared across the active unit set's
+ * own manifest entries. Pure/no-DB — shared by checkPgvectorGatedObjects
+ * (its own live probe) and the fast path's combined-query derivation
+ * (PR #262 perf follow-up), so the two never drift on WHAT counts as gated.
+ */
+function _collectGatedColumns(manifest, units) {
   const gatedColumns = [];
   for (const u of units) {
     const entry = manifest.units[u.basename];
@@ -2193,6 +2208,74 @@ async function checkPgvectorGatedObjects(db, manifest, units) {
       }
     }
   }
+  return gatedColumns;
+}
+
+/**
+ * Derive schemaObjectsExist's exact {ok, missing} shape for the UNGATED
+ * expected_objects set from an already-fetched probeFastPathSchemaState
+ * result — the fast path's PR #262 perf follow-up (one combined query
+ * instead of three separate tables/columns/indexes queries).
+ */
+function _deriveUngatedMissing(expected, probe) {
+  const missing = [];
+  for (const t of (expected.tables || [])) {
+    if (!probe.tablesFound.has(t)) missing.push({ type: 'table', table: t });
+  }
+  for (const c of (expected.columns || [])) {
+    if (!probe.columnsFound.has(`${c.table}.${c.column}`)) missing.push({ type: 'column', table: c.table, column: c.column });
+  }
+  for (const i of (expected.indexes || [])) {
+    if (!probe.indexesFound.has(i)) missing.push({ type: 'index', index: i });
+  }
+  return { ok: missing.length === 0, missing };
+}
+
+/**
+ * Derive checkPgvectorGatedObjects's exact {ok, missing} shape (absence +
+ * finding #6 shape-mismatch classification) from an already-fetched
+ * columnsFound/shapes probe result, instead of issuing live queries. Shared
+ * by checkPgvectorGatedObjects itself (fed from a fresh live probe) and the
+ * fast path (fed from probeFastPathSchemaState's combined-query result) —
+ * ONE classification rule, two data sources, per PR #262's perf follow-up.
+ *
+ * @param {Array} gatedColumns — from _collectGatedColumns
+ * @param {Set<string>} columnsFound — "table.column" strings confirmed to exist
+ * @param {Map<string,{type,dims}>} shapes — "table.column" -> actual shape, for columns that exist
+ */
+function _deriveGatedMissing(gatedColumns, columnsFound, shapes) {
+  const missing = [];
+  for (const gc of gatedColumns) {
+    const key = `${gc.table}.${gc.column}`;
+    if (!columnsFound.has(key)) {
+      missing.push({ unit: gc.unit, table: gc.table, column: gc.column, reason: 'absent' });
+      continue;
+    }
+    // Adversary finding #6 (MAJOR): existence alone does not prove SHAPE — a
+    // column present with the wrong type/dims (e.g. a hand-created
+    // `vector(1024)` instead of the manifest's intended `halfvec(4000)` —
+    // this project's own prior legacy-1024-dim-store incident class) passes
+    // the bare existence probe but is not the column the write path
+    // actually expects. Only checked for a manifest entry that DECLARES a
+    // type/dims (backward-compatible: an entry with neither behaves exactly
+    // as before this fix).
+    if (!gc.type && gc.dims == null) continue;
+    const shape = shapes.get(key);
+    if (!shape) continue; // probe itself found nothing here — never a false mismatch
+    const typeOk = !gc.type || shape.type === gc.type;
+    const dimsOk = gc.dims == null || shape.dims === gc.dims;
+    if (!typeOk || !dimsOk) {
+      missing.push({
+        unit: gc.unit, table: gc.table, column: gc.column, reason: 'shape_mismatch',
+        expected: { type: gc.type, dims: gc.dims }, actual: shape,
+      });
+    }
+  }
+  return missing;
+}
+
+async function checkPgvectorGatedObjects(db, manifest, units) {
+  const gatedColumns = _collectGatedColumns(manifest, units);
   if (gatedColumns.length === 0) return { ok: true, vectorExtensionPresent: null, missing: [] };
 
   let vectorExtensionPresent = null;
@@ -2207,43 +2290,26 @@ async function checkPgvectorGatedObjects(db, manifest, units) {
   const check = await db.schemaObjectsExist({
     columns: gatedColumns.map((gc) => ({ table: gc.table, column: gc.column })),
   });
-  const missingSet = new Set(
-    (check.missing || [])
-      .filter((m) => m.type === 'column')
-      .map((m) => `${m.table}.${m.column}`)
-  );
-  const missing = gatedColumns
-    .filter((gc) => missingSet.has(`${gc.table}.${gc.column}`))
-    .map((gc) => ({ unit: gc.unit, table: gc.table, column: gc.column, reason: 'absent' }));
+  const columnsFound = new Set();
+  for (const gc of gatedColumns) {
+    const key = `${gc.table}.${gc.column}`;
+    const isMissing = (check.missing || []).some((m) => m.type === 'column' && m.table === gc.table && m.column === gc.column);
+    if (!isMissing) columnsFound.add(key);
+  }
 
-  // Adversary finding #6 (MAJOR): existence alone does not prove SHAPE — a
-  // column present with the wrong type/dims (e.g. a hand-created
-  // `vector(1024)` instead of the manifest's intended `halfvec(4000)` — this
-  // project's own prior legacy-1024-dim-store incident class) passes the
-  // bare existence probe above but is not the column the write path
-  // actually expects. Only checked for a manifest entry that DECLARES a
-  // type/dims (backward-compatible: an entry with neither behaves exactly
-  // as before this fix) and only for columns that already passed the
-  // existence probe (an absent column is reported above; never double-counted).
-  const presentGated = gatedColumns.filter(
-    (gc) => !missingSet.has(`${gc.table}.${gc.column}`) && (gc.type || gc.dims != null)
-  );
-  if (presentGated.length > 0 && typeof db.checkColumnShape === 'function') {
-    for (const gc of presentGated) {
+  // Adversary finding #6 (MAJOR): shape (type/dims), for columns that exist
+  // and declare a shape — only queried for those, never for absent ones.
+  const shapes = new Map();
+  const presentShaped = gatedColumns.filter((gc) => columnsFound.has(`${gc.table}.${gc.column}`) && (gc.type || gc.dims != null));
+  if (presentShaped.length > 0 && typeof db.checkColumnShape === 'function') {
+    for (const gc of presentShaped) {
       let shape = null;
       try { shape = await db.checkColumnShape(gc.table, gc.column); } catch (_) { shape = null; }
-      if (!shape) continue; // probe itself failed/unavailable — never a false mismatch
-      const typeOk = !gc.type || shape.type === gc.type;
-      const dimsOk = gc.dims == null || shape.dims === gc.dims;
-      if (!typeOk || !dimsOk) {
-        missing.push({
-          unit: gc.unit, table: gc.table, column: gc.column, reason: 'shape_mismatch',
-          expected: { type: gc.type, dims: gc.dims }, actual: { type: shape.type, dims: shape.dims },
-        });
-      }
+      if (shape) shapes.set(`${gc.table}.${gc.column}`, shape);
     }
   }
 
+  const missing = _deriveGatedMissing(gatedColumns, columnsFound, shapes);
   return { ok: missing.length === 0, vectorExtensionPresent, missing };
 }
 
@@ -2442,14 +2508,6 @@ async function reportPgvectorGatedDegradation(db, projectId, classification, uni
  * @returns {Promise<{applied:boolean, reason:string, detail?:object}>}
  */
 async function ensureSchemaCurrentCore(db, projectId, { silent } = {}) {
-  // cm#185-schema-heal (adversary finding #7, MAJOR): pin the canonical
-  // schema for this ENTIRE apply/verify lifecycle before anything else runs
-  // — see PostgresAdapter#pinCanonicalSchema's own doc for the full
-  // rationale (a maintenance role with a customized default search_path
-  // must resolve the SAME schema this call's own fingerprint/apply/verify/
-  // gated-check sequence does). No-op on SQLite; best-effort on Postgres.
-  await db.pinCanonicalSchema();
-
   // cm#185 review N5: classification (a non-recursive readdir, a `git
   // ls-files` spawn, and reading+parsing all ~5 small scripts/sql/*.sql files
   // for their header directives) now runs on EVERY call, including the
@@ -2546,6 +2604,17 @@ async function ensureSchemaCurrentCore(db, projectId, { silent } = {}) {
       return { applied: false, reason: 'lock_acquire_failed', detail: { message: lockErr.message } };
     }
     try {
+      // cm#185-schema-heal (adversary finding #7, MAJOR; relocated here in
+      // the PR #262 perf follow-up): the fast path's OWN read no longer
+      // needs this pin at all (probeFastPathSchemaState hardcodes the
+      // literal 'public' schema directly in its query text — see that
+      // method's doc). This apply sequence's own DDL/verify statements are
+      // still schema-UNQUALIFIED (the SQL files never qualify a CREATE/
+      // ALTER TABLE target), so they DO still depend on session search_path
+      // — pinned here, once per actual apply attempt (rare), rather than on
+      // every fast-path touch (common).
+      await db.pinCanonicalSchema();
+
       if (alreadyFixedCheck) {
         if (await alreadyFixedCheck()) {
           const degraded = await reportPgvectorGatedDegradation(db, projectId, classification, units, { silent, applied: false });
@@ -2622,21 +2691,43 @@ async function ensureSchemaCurrentCore(db, projectId, { silent } = {}) {
     // (a column dropped by hand, or a gating extension that only appeared
     // AFTER this DB was first fingerprinted). Every reachable state below
     // maps to exactly one branch; there is no default "looks fine" path.
+    //
+    // PR #262 perf follow-up: this used to be pinCanonicalSchema (1 round
+    // trip) + schemaObjectsExist (3: tables/columns/indexes) +
+    // checkPgvectorGatedObjects (pg_extension + a columns query) + one
+    // checkColumnShape call PER shaped gated column — up to 7-8 round trips
+    // on EVERY touch, measured as a genuine p50 regression, not noise.
+    // db.probeFastPathSchemaState collapses all of that into ONE combined
+    // catalog query (tables/columns/indexes/extension/shape, hardcoding the
+    // canonical 'public' schema directly rather than relying on
+    // pinCanonicalSchema — see that method's own doc for why this is
+    // strictly SAFER for finding #7, not merely faster).
     const expected = buildExpectedObjects();
-    const ungatedProbe = await db.schemaObjectsExist(expected);
+    const gatedColumns = _collectGatedColumns(classification.manifest, units);
+    const shapeTargets = gatedColumns
+      .filter((gc) => gc.type || gc.dims != null)
+      .map((gc) => ({ table: gc.table, column: gc.column }));
 
-    const probeErrors = (ungatedProbe.missing || []).filter((m) => m.type === 'error');
-    if (probeErrors.length > 0) {
+    let probe;
+    try {
+      probe = await db.probeFastPathSchemaState({
+        tables: expected.tables,
+        columns: expected.columns.concat(gatedColumns.map((gc) => ({ table: gc.table, column: gc.column }))),
+        indexes: expected.indexes,
+        shapeTargets,
+      });
+    } catch (probeErr) {
       // S1's own "any other -> BLOCK" branch: a probe FAILURE (e.g. a
-      // transient connection error inside schemaObjectsExist) is a
-      // different fact than "objects are genuinely missing" — routing it
-      // into the apply branch would attempt DDL right after failing to read
-      // from this same database. BLOCK, naming what the probe reported.
-      const detail = { missing: ungatedProbe.missing };
+      // transient connection error) is a different fact than "objects are
+      // genuinely missing" — routing it into the apply branch would attempt
+      // DDL right after failing to read from this same database. BLOCK,
+      // naming what the probe reported.
+      const detail = { message: probeErr.message };
       await recordSchemaDegradation(db, projectId, 'verification_probe_failed', detail, { silent });
       return { applied: false, reason: 'verification_probe_failed', detail };
     }
 
+    const ungatedProbe = _deriveUngatedMissing(expected, probe);
     if (!ungatedProbe.ok) {
       // S1(b): fingerprint says current, but the live catalog is missing an
       // UNGATED object (e.g. a column dropped by hand) — BEHIND in every
@@ -2650,22 +2741,32 @@ async function ensureSchemaCurrentCore(db, projectId, { silent } = {}) {
         );
       }
       return await runSchemaApplySequence({
-        alreadyFixedCheck: async () => (await db.schemaObjectsExist(expected)).ok,
+        alreadyFixedCheck: async () => {
+          const p2 = await db.probeFastPathSchemaState({ tables: expected.tables, columns: expected.columns, indexes: expected.indexes, shapeTargets: [] });
+          return _deriveUngatedMissing(expected, p2).ok;
+        },
       });
     }
 
     // Ungated objects are all present — now total-classify the gated
-    // (pgvector-dependent) objects. checkPgvectorGatedObjects always queries
-    // fresh (S4), so this single call is authoritative for every branch below.
-    const gated = await checkPgvectorGatedObjects(db, classification.manifest, units);
+    // (pgvector-dependent) objects, from the SAME combined probe (S4: this
+    // probe just ran fresh, so it's authoritative for every branch below —
+    // no separate live re-query needed).
+    if (gatedColumns.length === 0) {
+      const clearResult = await clearSchemaDegradation(db, projectId);
+      return { applied: false, reason: 'current', ...(clearResult.cleared ? { detail: { healedDegradedRow: true } } : {}) };
+    }
+    const gatedMissing = _deriveGatedMissing(gatedColumns, probe.columnsFound, probe.shapes);
+    const gated = { ok: gatedMissing.length === 0, vectorExtensionPresent: probe.vectorExtensionPresent, missing: gatedMissing };
     if (gated.ok) {
-      // S1(a): HEALED. Clearing a possibly-absent row is an idempotent
-      // no-op DELETE (clearSchemaDegradation), so calling it unconditionally
-      // here has the identical net effect to "clear only if a degraded row
-      // exists AND the re-probe passed", without an extra existence-probe
-      // round-trip on the common healthy-fast-path case.
-      await clearSchemaDegradation(db, projectId);
-      return { applied: false, reason: 'current' };
+      // S1(a): HEALED. clearSchemaDegradation is an idempotent no-op DELETE
+      // when no row exists, so calling it unconditionally here has the
+      // identical net effect to "clear only if a degraded row exists AND
+      // the re-probe passed" — its own return value (rowCount-derived) is
+      // how the caller (cmdStatus) learns whether this was a real
+      // transition, without a separate pre-heal SELECT.
+      const clearResult = await clearSchemaDegradation(db, projectId);
+      return { applied: false, reason: 'current', ...(clearResult.cleared ? { detail: { healedDegradedRow: true } } : {}) };
     }
 
     // finding #6 refinement: a shape_mismatch (column exists, wrong
@@ -2697,7 +2798,12 @@ async function ensureSchemaCurrentCore(db, projectId, { silent } = {}) {
       // re-probe (inside the shared sequence) passes; otherwise re-stamps
       // with the current probe (adversary finding #2).
       return await runSchemaApplySequence({
-        alreadyFixedCheck: async () => (await checkPgvectorGatedObjects(db, classification.manifest, units)).ok,
+        alreadyFixedCheck: async () => {
+          const p2 = await db.probeFastPathSchemaState({
+            tables: [], columns: gatedColumns.map((gc) => ({ table: gc.table, column: gc.column })), indexes: [], shapeTargets,
+          });
+          return _deriveGatedMissing(gatedColumns, p2.columnsFound, p2.shapes).length === 0;
+        },
       });
     }
 
@@ -3657,18 +3763,14 @@ async function cmdStatus(args = []) {
   // command reports — a fingerprint-current DB missing an ungated/gated
   // object (S1) is fixed here, so every count/readiness value below already
   // reflects the healed state rather than a stale one status would then
-  // have to explain away. Snapshot the pre-heal degraded-row presence first
-  // so the prose/--json output below can say what changed, not just what
-  // the state is now.
-  let hadDegradedBefore = false;
-  try {
-    const { rows: preDeg } = await db.query(
-      `SELECT 1 FROM project_settings WHERE project_id = $1 AND key = 'schema_apply_degraded'`,
-      [projectId]
-    );
-    hadDegradedBefore = preDeg.length > 0;
-  } catch (_) { /* non-fatal — heal/degraded reporting below still runs */ }
-
+  // have to explain away.
+  //
+  // PR #262 perf follow-up: NO pre-heal SELECT here — that was a redundant
+  // extra round trip on every status call. "What did this call heal" is
+  // instead derived entirely from schemaHealResult's own return value
+  // (clearSchemaDegradation's rowCount-derived `detail.healedDegradedRow`,
+  // or `reason === 'applied'`) plus the ALREADY-NEEDED post-heal
+  // schema_apply_degraded read below (existing R-5 display feature, not new).
   let schemaHealResult = null;
   try {
     schemaHealResult = await ensureSchemaCurrent(db, projectId, { silent: true });
@@ -3792,15 +3894,23 @@ async function cmdStatus(args = []) {
 
   // cm#185-schema-heal (S3): what did the heal call above actually DO? Total
   // classification of the observable transition, for the "what it healed"
-  // line — never a guess, only what hadDegradedBefore/schemaDegraded/
-  // schemaHealResult together actually prove happened in THIS invocation.
+  // line — never a guess, only what schemaHealResult/schemaDegraded together
+  // actually prove happened in THIS invocation. PR #262 perf follow-up: no
+  // pre-heal read needed for any of these three branches —
+  // clearSchemaDegradation's own rowCount-derived `healedDegradedRow` flag
+  // (set only when a row genuinely existed to delete) replaces it; a
+  // schemaDegraded row still present after ANY ensureSchemaCurrent call was
+  // necessarily just (re-)written by THAT SAME call (S4: the gated check
+  // always re-stamps fresh on every touch it reaches), so its mere
+  // post-heal presence already proves "re-stamped just now", not merely
+  // "left over from before".
   let schemaHealedLine = null;
-  if (hadDegradedBefore && !schemaDegraded) {
+  if (schemaHealResult && schemaHealResult.detail && schemaHealResult.detail.healedDegradedRow) {
     schemaHealedLine = 'HEALED — a prior schema_apply_degraded row was cleared';
   } else if (schemaHealResult && schemaHealResult.reason === 'applied') {
     const applied = (schemaHealResult.detail && schemaHealResult.detail.appliedUnits) || [];
     schemaHealedLine = `applied schema drift (${applied.join(', ') || 'no units listed'})`;
-  } else if (hadDegradedBefore && schemaDegraded) {
+  } else if (schemaDegraded) {
     schemaHealedLine = 're-stamped (still degraded — see schema_apply line below)';
   }
 

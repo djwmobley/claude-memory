@@ -920,6 +920,51 @@ class SQLiteAdapter {
   async checkColumnShape(_table, _column) { return null; }
 
   /**
+   * cm#185-schema-heal review (PR #262 perf follow-up): combined fast-path
+   * catalog probe — tables/columns/indexes existence, pgvector extension
+   * presence, and gated-column shape, all in ONE call. SQLite is an
+   * embedded, in-process database (no network round trip exists to save),
+   * so this just delegates to the existing per-kind local checks rather
+   * than needing any real combining — present so the fast path's caller
+   * never branches on dialect.
+   *
+   * @param {{tables:string[], columns:Array<{table,column}>, indexes:string[], shapeTargets:Array<{table,column}>}} opts
+   * @returns {Promise<{tablesFound:Set<string>, columnsFound:Set<string>, indexesFound:Set<string>, vectorExtensionPresent:boolean, shapes:Map<string,{type,dims}>}>}
+   */
+  async probeFastPathSchemaState({ tables, columns, indexes }) {
+    const db = this._db;
+    if (!db) throw new Error('SQLiteAdapter: not connected');
+    const tablesFound = new Set();
+    const columnsFound = new Set();
+    const indexesFound = new Set();
+    const safeIdent = /^[A-Za-z_][A-Za-z0-9_]*$/;
+    for (const t of (tables || [])) {
+      let row = null;
+      try { row = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name = ?`).get(t); } catch (_) {}
+      if (row) tablesFound.add(t);
+    }
+    const byTable = {};
+    for (const c of (columns || [])) (byTable[c.table] = byTable[c.table] || []).push(c.column);
+    for (const [table, cols] of Object.entries(byTable)) {
+      let info = [];
+      if (safeIdent.test(table)) {
+        try { info = db.prepare(`PRAGMA table_info(${table})`).all(); } catch (_) {}
+      }
+      const found = new Set(info.map((r) => r.name));
+      for (const col of cols) if (found.has(col)) columnsFound.add(`${table}.${col}`);
+    }
+    for (const idx of (indexes || [])) {
+      let row = null;
+      try { row = db.prepare(`SELECT name FROM sqlite_master WHERE type='index' AND name = ?`).get(idx); } catch (_) {}
+      if (row) indexesFound.add(idx);
+    }
+    // SQLite's manifest unit declares zero pgvector_gated columns, so
+    // shapeTargets is always empty in practice here — no extension/shape
+    // concept exists on this dialect regardless.
+    return { tablesFound, columnsFound, indexesFound, vectorExtensionPresent: false, shapes: new Map() };
+  }
+
+  /**
    * Execute a SELECT query that may fail (e.g., table might not exist) without
    * aborting the surrounding transaction.
    *
@@ -1639,6 +1684,83 @@ class PostgresAdapter {
     } catch (_) {
       return null;
     }
+  }
+
+  /**
+   * cm#185-schema-heal review (PR #262 perf follow-up, BLOCKER): the fast
+   * path previously issued a SET search_path (pinCanonicalSchema) + a
+   * tables query + a columns query + an indexes query (schemaObjectsExist)
+   * + a pg_extension query + a checkColumnShape query PER gated column —
+   * up to 7-8 round trips on every single touch. This collapses ALL of
+   * that into ONE UNION ALL query (tables/columns/indexes/extension/shape,
+   * each tagged by `kind`), with the canonical schema hardcoded as the
+   * literal 'public' directly in each branch's WHERE clause / regclass
+   * cast — never `current_schema()` — so this probe's own correctness does
+   * NOT depend on pinCanonicalSchema having run first (adversary finding
+   * #7's guarantee holds independently of session state here), and the
+   * fast path no longer needs to call pinCanonicalSchema at all (it is
+   * still called once before an actual DDL apply, since the SQL files'
+   * own CREATE/ALTER statements are unqualified and DO rely on
+   * search_path).
+   *
+   * `columns` is accepted for interface parity with the SQLite adapter but
+   * NOT used to filter server-side — information_schema.columns is fetched
+   * unfiltered (same shape the original schemaObjectsExist always fetched)
+   * and matched against the caller's expected set in JS; this keeps the
+   * query text static (no variable-length column-name array needed for
+   * that branch) while table/index EXISTENCE checks and the shape lookup
+   * are still parameterized against the caller's specific expected names.
+   *
+   * @param {{tables:string[], columns:Array<{table,column}>, indexes:string[], shapeTargets:Array<{table,column}>}} opts
+   * @returns {Promise<{tablesFound:Set<string>, columnsFound:Set<string>, indexesFound:Set<string>, vectorExtensionPresent:boolean, shapes:Map<string,{type,dims}>}>}
+   */
+  async probeFastPathSchemaState({ tables, indexes, shapeTargets }) {
+    const shapeTables = (shapeTargets || []).map((s) => s.table);
+    const shapeCols   = (shapeTargets || []).map((s) => s.column);
+    const { rows } = await this._client.query(
+      `SELECT 'table'::text AS kind, table_name::text AS name, NULL::text AS col2, NULL::text AS type, NULL::int AS dims
+         FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = ANY($1::text[])
+       UNION ALL
+       SELECT 'column', table_name, column_name, NULL::text, NULL::int
+         FROM information_schema.columns
+        WHERE table_schema = 'public'
+       UNION ALL
+       SELECT 'index', indexname, NULL::text, NULL::text, NULL::int
+         FROM pg_indexes
+        WHERE schemaname = 'public' AND indexname = ANY($2::text[])
+       UNION ALL
+       SELECT 'extension', extname, NULL::text, NULL::text, NULL::int
+         FROM pg_extension
+        WHERE extname = 'vector'
+       UNION ALL
+       SELECT 'shape', shp.tbl, shp.col, ty.typname, a.atttypmod
+         FROM unnest($3::text[], $4::text[]) AS shp(tbl, col)
+         JOIN pg_attribute a ON a.attrelid = ('public.' || shp.tbl)::regclass
+                             AND a.attname = shp.col AND a.attnum > 0 AND NOT a.attisdropped
+         JOIN pg_type ty ON ty.oid = a.atttypid`,
+      [tables || [], indexes || [], shapeTables, shapeCols]
+    );
+    const tablesFound  = new Set();
+    const columnsFound = new Set();
+    const indexesFound = new Set();
+    const shapes = new Map();
+    let vectorExtensionPresent = false;
+    for (const r of rows) {
+      switch (r.kind) {
+        case 'table':     tablesFound.add(r.name); break;
+        case 'column':    columnsFound.add(`${r.name}.${r.col2}`); break;
+        case 'index':     indexesFound.add(r.name); break;
+        case 'extension': vectorExtensionPresent = true; break;
+        case 'shape': {
+          const typmod = parseInt(r.dims, 10);
+          shapes.set(`${r.name}.${r.col2}`, { type: r.type, dims: Number.isFinite(typmod) && typmod > 0 ? typmod : null });
+          break;
+        }
+        default: break;
+      }
+    }
+    return { tablesFound, columnsFound, indexesFound, vectorExtensionPresent, shapes };
   }
 
   get dialect() { return 'postgres'; }
