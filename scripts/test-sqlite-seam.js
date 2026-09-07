@@ -2324,6 +2324,44 @@ async function runSection20() {
   });
 }
 
+// ── Section 21: embedding-readiness classifier — UNSUPPORTED:sqlite (owner
+//    directive follow-up, PR #273 review gap) — total classification: a
+//    SQLite backend gets an explicit state, never a bare "N/A" string, and
+//    the resume banner's own warn-predicate treats it like DISABLED (a
+//    standing structural fact, never a recurring nag). ────────────────────
+async function runSection21() {
+  console.log('\n=== Section 21: embedding_readiness classifier -- UNSUPPORTED:sqlite, never a resume warning ===');
+
+  const handoffModule = require('./handoff.js');
+
+  await test('computeEmbeddingReadiness on a SQLite adapter returns the explicit UNSUPPORTED:sqlite state', async () => {
+    const db = new SQLiteAdapter(':memory:');
+    await db.connect();
+    try {
+      const schemaSql = fs.readFileSync(SCHEMA_FILE, 'utf8');
+      await db.runSchema(schemaSql);
+      const readiness = await handoffModule.computeEmbeddingReadiness(db, 'sqlite-seam-project', {});
+      assertEqual(readiness, 'UNSUPPORTED:sqlite', 'expected the explicit UNSUPPORTED:sqlite state, never a bare N/A string');
+    } finally { await db.end(); }
+  });
+
+  test('_shouldWarnOnResume(UNSUPPORTED:sqlite) is false -- the resume banner never emits a warning line for it', () => {
+    assertFalse(
+      handoffModule._shouldWarnOnResume('UNSUPPORTED:sqlite'),
+      'UNSUPPORTED:sqlite must be treated like DISABLED -- rendered, never warned about'
+    );
+  });
+
+  test('_shouldWarnOnResume(DISABLED) stays false -- unchanged reference behavior', () => {
+    assertFalse(handoffModule._shouldWarnOnResume('DISABLED'), 'DISABLED must still never warn');
+  });
+
+  test('_shouldWarnOnResume still warns on a genuine problem state (sanity check the predicate is not vacuous)', () => {
+    assertTrue(handoffModule._shouldWarnOnResume('HEALING(3)'), 'HEALING(<n>) must still warn on resume');
+    assertTrue(handoffModule._shouldWarnOnResume('UNEMBEDDABLE:no-provider'), 'UNEMBEDDABLE:* must still warn on resume');
+  });
+}
+
 // ── Run all sections ──────────────────────────────────────────────────────────
 (async () => {
   console.log(`\ntest-sqlite-seam.js (Node ${process.versions.node})\n`);
@@ -2348,6 +2386,7 @@ async function runSection20() {
   await runSection18();
   await runSection19();
   await runSection20();
+  await runSection21();
 
   console.log(`\n─── Results ──────────────────────────────────────`);
   console.log(`PASS ${passed}  FAIL ${failed}`);

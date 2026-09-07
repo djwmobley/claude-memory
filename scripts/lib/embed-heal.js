@@ -105,7 +105,7 @@ async function _recordOutcome(db, projectId, outcome, embedded, remaining, extra
  * @param {boolean} [opts.silent] — suppress stderr informational output
  * @returns {Promise<object|null>} the persisted last_embed_heal record, or
  *   `null` on the SQLite / no-embedding-column branch (nothing recorded —
- *   mirrors computeEmbeddingReadiness's own 'N/A (sqlite backend)' verdict,
+ *   mirrors computeEmbeddingReadiness's own 'UNSUPPORTED:sqlite' verdict,
  *   which likewise records nothing).
  */
 async function runEmbedHealIfNeeded(db, projectId, opts = {}) {

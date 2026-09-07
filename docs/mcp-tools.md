@@ -139,7 +139,7 @@ directive "READY should mean fully embedded") `embedding_readiness`
 (the single classifier's verbatim state — `DISABLED` |
 `UNEMBEDDABLE:no-extension` | `UNEMBEDDABLE:no-provider` |
 `DEGRADED:probe-failed(<reason>)` | `HEALING(<n>)` | `READY`, or
-`N/A (sqlite backend)`; `READY` now requires BOTH a zero live+actionable
+`UNSUPPORTED:sqlite`; `READY` now requires BOTH a zero live+actionable
 NULL-embedding backlog AND a successful live provider probe — a row
 existing in `embedding_providers` is no longer sufficient on its own),
 `backlog` (the live+actionable NULL count backing `HEALING(<n>)`), and

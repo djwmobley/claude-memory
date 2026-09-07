@@ -32,7 +32,7 @@ const __startNs = process.hrtime.bigint();
  *   status                  Read-only: show counts, last close, contract names, and
  *                           embedding_readiness (DISABLED | UNEMBEDDABLE:no-extension |
  *                           UNEMBEDDABLE:no-provider | DEGRADED:probe-failed(<reason>) |
- *                           HEALING(<n>) | READY | N/A (sqlite backend) — READY requires a
+ *                           HEALING(<n>) | READY | UNSUPPORTED:sqlite — READY requires a
  *                           zero live+actionable backlog AND a successful live provider probe).
  *   resume                  Inline SessionStart load (prints compact context summary).
  *   drop                    Zero all assertions, archive handoff.md, create fresh one.
@@ -2831,7 +2831,7 @@ async function _cachedProbeProvider(providerRow) {
  * classification — every reachable state maps to exactly one of the
  * branches below, checked in this order, never a default "looks fine":
  *
- *   N/A (sqlite backend)      — dialect-gated top branch (no embedding
+ *   UNSUPPORTED:sqlite      — dialect-gated top branch (no embedding
  *                               column on any SQLite table at all; out of
  *                               this spec's 6-state enumeration by
  *                               construction — SQLite cannot embed at all,
@@ -2888,7 +2888,7 @@ async function _cachedProbeProvider(providerRow) {
  */
 async function computeEmbeddingReadiness(db, projectId, { precomputedGatedOk } = {}) {
   if (db && typeof db.supportsEmbeddingColumns === 'function' && !db.supportsEmbeddingColumns()) {
-    return 'N/A (sqlite backend)';
+    return 'UNSUPPORTED:sqlite';
   }
 
   const optedOut = await isEmbeddingsOptedOut(db, projectId);
@@ -2940,6 +2940,20 @@ async function computeEmbeddingReadiness(db, projectId, { precomputedGatedOk } =
 
   if (backlogN > 0) return `HEALING(${backlogN})`;
   return 'READY';
+}
+
+/**
+ * _shouldWarnOnResume — the resume banner's own "is this state worth a
+ * RESUME WARNING" predicate, extracted so it is exercised by tests and the
+ * production banner from the SAME code path (never a re-derivation).
+ * DISABLED (an operator's deliberate --no-embeddings opt-out) and
+ * UNSUPPORTED:* (a backend that structurally cannot embed at all, e.g.
+ * SQLite) are standing facts, not degradations — never a recurring nag on
+ * every resume. Every other non-READY state (UNEMBEDDABLE:*,
+ * DEGRADED:probe-failed(...), HEALING(<n>)) warrants a warning.
+ */
+function _shouldWarnOnResume(readiness) {
+  return readiness !== 'READY' && readiness !== 'DISABLED' && !readiness.startsWith('UNSUPPORTED:');
 }
 
 /**
@@ -5257,17 +5271,19 @@ async function cmdLoaderLoad(opts = {}) {
   }
 
   // E3 (owner directive "READY should mean fully embedded"): render the
-  // classifier's return verbatim — warn on ANYTHING !== READY (was
+  // classifier's return verbatim — warn on any GENUINE problem state (was
   // previously narrowed to just `readiness.startsWith('UNEMBEDDABLE')`,
-  // which stayed silent through DISABLED/DEGRADED:probe-failed/HEALING —
-  // a resumed session now sees every non-READY state without running
-  // `status` separately, matching the schema-degradation banner's own
-  // loud-whenever-not-clean convention above).
+  // which stayed silent through DEGRADED:probe-failed/HEALING — a resumed
+  // session now sees those without running `status` separately, matching
+  // the schema-degradation banner's own loud-whenever-not-clean convention
+  // above). DISABLED and UNSUPPORTED:sqlite are standing, structural facts
+  // (an operator's deliberate opt-out; a backend that cannot embed at all)
+  // — never a recurring nag on every resume.
   try {
     const readiness = await computeEmbeddingReadiness(db, projectId, {
       precomputedGatedOk: _gatedOkFromSchemaHealResult(schemaHealResult),
     });
-    if (readiness !== 'READY') {
+    if (_shouldWarnOnResume(readiness)) {
       const bannerLine = `RESUME WARNING: embedding ${readiness} — run /handoff:status for detail`;
       if (!silent) {
         console.log(`\n  ${bannerLine}`);
@@ -7502,14 +7518,21 @@ async function cmdCheckpoint(args) {
       process.exit(1);
     }
 
+    // Every Done line carries embedding: <state> (PR #273 review gap) — read
+    // BEFORE db.end() below, non-fatal on any probe failure.
+    let noteEmbeddingState = 'UNKNOWN';
+    try {
+      noteEmbeddingState = await computeEmbeddingReadiness(db, projectId);
+    } catch (_) { /* non-fatal — Done line still prints */ }
+
     await db.end();
 
     if (written) {
       console.log(`\n  note captured: ${noteText}`);
-      console.log(`\nDone: handoff:checkpoint --note — project=${basename} marker=${projectId} — session_note written (session marker preserved)`);
+      console.log(`\nDone: handoff:checkpoint --note — project=${basename} marker=${projectId} — session_note written, embedding: ${noteEmbeddingState} (session marker preserved)`);
     } else {
       console.log(`\n  note skipped (predicate not recognized in strict mode): ${noteText}`);
-      console.log(`\nDone: handoff:checkpoint --note — project=${basename} marker=${projectId} — session_note skipped`);
+      console.log(`\nDone: handoff:checkpoint --note — project=${basename} marker=${projectId} — session_note skipped, embedding: ${noteEmbeddingState}`);
     }
     return;
   }
@@ -7627,9 +7650,14 @@ async function cmdCheckpoint(args) {
     // Clearing it at checkpoint time kills C2 attribution for any work done after
     // the checkpoint, defeating the entire purpose of mid-session saves.
 
+    let queuedEmbeddingState = 'UNKNOWN';
+    try {
+      queuedEmbeddingState = await computeEmbeddingReadiness(db, projectId);
+    } catch (_) { /* non-fatal — Done line still prints */ }
+
     await db.end();
 
-    console.log(`\nDone: handoff:checkpoint — project=${path.basename(root)} marker=${projectId} — payload queued for async extraction (session marker preserved for continued attribution)`);
+    console.log(`\nDone: handoff:checkpoint — project=${path.basename(root)} marker=${projectId} — payload queued for async extraction, embedding: ${queuedEmbeddingState} (session marker preserved for continued attribution)`);
     return;
   }
 
@@ -8071,6 +8099,11 @@ async function cmdClose(args) {
     // queue-drain) — always safe to clear here.
     await clearSessionMarkerForClose(db, projectId, payload);
 
+    let queuedCloseEmbeddingState = 'UNKNOWN';
+    try {
+      queuedCloseEmbeddingState = await computeEmbeddingReadiness(db, projectId);
+    } catch (_) { /* non-fatal — Done line still prints */ }
+
     await db.end();
 
     console.log(`\n  entities:    0 (queued)`);
@@ -8089,7 +8122,7 @@ async function cmdClose(args) {
       );
     }
 
-    console.log(`\nDone: handoff:close — project=${path.basename(root)} marker=${projectId} — payload queued for async extraction, session marker cleared`);
+    console.log(`\nDone: handoff:close — project=${path.basename(root)} marker=${projectId} — payload queued for async extraction, embedding: ${queuedCloseEmbeddingState}, session marker cleared`);
     return;
   }
 
@@ -8402,8 +8435,13 @@ async function cmdClose(args) {
     // Skipped subsystems.
     console.log('\n  skipped in dry-run: writeExtraction, handoff.md render, session_in_progress clear, C2, C3, L4 degraded record');
 
+    let dryRunEmbeddingState = 'UNKNOWN';
+    try {
+      dryRunEmbeddingState = await computeEmbeddingReadiness(db, projectId);
+    } catch (_) { /* non-fatal — Done line still prints */ }
+
     await db.end();
-    console.log(`\nDone: handoff:close --dry-run — project=${path.basename(root)} marker=${projectId} — no mutations performed`);
+    console.log(`\nDone: handoff:close --dry-run — project=${path.basename(root)} marker=${projectId} — no mutations performed, embedding: ${dryRunEmbeddingState} (dry-run)`);
     return;
   }
 
@@ -10655,6 +10693,7 @@ if (require.main === module) {
     // of the readiness/opt-out/backfill logic).
     computeEmbeddingReadiness,
     computeEmbeddingNullCounts,
+    _shouldWarnOnResume,
     isEmbeddingsOptedOut,
     cmdBackfillEmbeddings,
   };

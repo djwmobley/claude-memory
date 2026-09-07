@@ -868,7 +868,7 @@ function buildServer() {
         'entity/assertion/edge counts, handoff.md path, last_close/days_since, contracts, session_active, ' +
         'session_id, packaging state (e.g. "UNPACKAGED (dirty working tree)" or "clean"), embedding_readiness ' +
         '(the single classifier\'s verbatim state: DISABLED | UNEMBEDDABLE:no-extension | UNEMBEDDABLE:no-provider | ' +
-        'DEGRADED:probe-failed(<reason>) | HEALING(<n>) | READY | N/A (sqlite backend) — READY requires BOTH a zero ' +
+        'DEGRADED:probe-failed(<reason>) | HEALING(<n>) | READY | UNSUPPORTED:sqlite — READY requires BOTH a zero ' +
         'live+actionable NULL-embedding backlog AND a successful live provider probe), embedding_null_counts, backlog ' +
         '(the live+actionable NULL count backing HEALING(<n>)), unembeddable_empty_text (empty-embed-text NULLs, never ' +
         'counted toward backlog or blocking READY), last_embed_heal (the most recent heal-on-touch outcome: ' +

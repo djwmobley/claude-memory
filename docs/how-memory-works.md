@@ -295,7 +295,7 @@ against it — connection/timeout/HTTP/dim-mismatch — failed; the probe result
 seconds so repeated touches don't each pay a network round trip) → `HEALING(<n>)` (the probe
 succeeded, but `n` live, actionable — non-empty-text — rows across `assertions`+`decisions` still
 carry `embedding IS NULL`) → `READY` (`n === 0` AND the live probe succeeded). A project on
-SQLite (seam-test-only) reports `N/A (sqlite backend)` — SQLite carries no `embedding` column on
+SQLite (seam-test-only) reports `UNSUPPORTED:sqlite` — SQLite carries no `embedding` column on
 any table, so it cannot embed at all and sits outside this 6-state enumeration by construction.
 Rows whose embed text is empty/whitespace-only never count toward `n` and never block `READY` —
 `/handoff:status --json` surfaces them separately as `unembeddable_empty_text`. The resume banner
