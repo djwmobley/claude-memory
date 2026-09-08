@@ -242,7 +242,28 @@ function buildTableQuery(table) {
  *   injectable embedder seam (same rationale as write-time-embed.js's own
  *   `opts.embedder`) — production call sites never pass this; CI (no live
  *   vLLM) injects a deterministic mock.
- * @returns {Promise<{ hits: Array, tablesSearched: string[] }>}
+ * TABLE EXISTENCE (2026-09-08, PR #274 review): ALLOWED_TABLES is a closed
+ * ENUM of tables this module knows how to query — it says nothing about
+ * whether a given connected DB has actually applied the migration that
+ * creates a particular table (e.g. agent_exchange / migrate-13, or the
+ * migrate-14 seam tables, on a project DB that predates those migrations).
+ * Before running any per-table query, the candidate table list (whether
+ * caller-supplied via `args.tables` or defaulted to the full enum) is
+ * checked against the CONNECTED DB via the seam's own `schemaObjectsExist`
+ * (scripts/lib/db-seam.js — the same probe ensureSchemaCurrent's post-apply
+ * verification gate uses; not a second existence-check implementation).
+ * This is a TOTAL classification applied uniformly to every candidate table
+ * — never a special case naming any one table: present -> queried; absent
+ * -> skipped and reported in the result's `skippedTables`, never fatal to
+ * the whole search. An explicitly-requested table (`args.tables` names it)
+ * that turns out to be missing is skipped the same way, not thrown — only
+ * an UNKNOWN table name (outside the ALLOWED_TABLES enum entirely) is a
+ * hard error, unchanged from before. If every candidate table is missing,
+ * the embed call is skipped entirely (nothing to search) and an
+ * empty-hits result is returned with every candidate listed in
+ * `skippedTables`.
+ *
+ * @returns {Promise<{ hits: Array, tablesSearched: string[], skippedTables: string[] }>}
  * @throws {MemorySearchError} 'unknownTable' | 'validation'
  */
 async function memorySearch(client, args) {
@@ -255,14 +276,37 @@ async function memorySearch(client, args) {
   }
   const limit = Number.isInteger(args.limit) && args.limit > 0 ? args.limit : 10;
 
-  const tables = Array.isArray(args.tables) && args.tables.length ? args.tables : ALLOWED_TABLES.slice();
-  const unknown = tables.filter((t) => !ALLOWED_TABLES.includes(t));
+  const candidateTables = Array.isArray(args.tables) && args.tables.length ? args.tables : ALLOWED_TABLES.slice();
+  const unknown = candidateTables.filter((t) => !ALLOWED_TABLES.includes(t));
   if (unknown.length) {
     throw new MemorySearchError(
       'unknownTable',
       `memory_search: unknown table(s) [${unknown.join(', ')}] (allowed: ${ALLOWED_TABLES.join(', ')})`,
       { unknown }
     );
+  }
+
+  // Total-classification existence probe (see module-header note above).
+  // client.schemaObjectsExist is a db-seam.js PostgresAdapter/SQLiteAdapter
+  // method; guarded with a typeof check so a bare pg Client/Pool (no seam
+  // wrapper) degrades to "assume every candidate exists" rather than
+  // throwing — unchanged behavior for any such caller.
+  let tables = candidateTables;
+  let skippedTables = [];
+  if (typeof client.schemaObjectsExist === 'function') {
+    const { missing } = await client.schemaObjectsExist({ tables: candidateTables });
+    const missingSet = new Set(missing.filter((m) => m.type === 'table').map((m) => m.table));
+    if (missingSet.size > 0) {
+      skippedTables = candidateTables.filter((t) => missingSet.has(t));
+      tables = candidateTables.filter((t) => !missingSet.has(t));
+    }
+  }
+
+  if (tables.length === 0) {
+    // Every candidate table is missing from this DB — nothing to search.
+    // Skip the embed call entirely (no point embedding a query with no
+    // table to run it against) and report every candidate as skipped.
+    return { hits: [], tablesSearched: [], skippedTables };
   }
 
   const embedFn = args.embedder || embedQuery; // fail-loud by embed.js's own contract (or the injected mock)
@@ -299,6 +343,7 @@ async function memorySearch(client, args) {
       score: Number(r.score),
     })),
     tablesSearched: tables,
+    skippedTables,
   };
 }
 
