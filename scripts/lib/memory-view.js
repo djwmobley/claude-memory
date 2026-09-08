@@ -149,9 +149,19 @@ async function runRecencyQuery(client, projectId, q) {
   return rows;
 }
 
+/**
+ * runVectorQuery — delegates to memorySearch BY REFERENCE — never a second
+ * embedding/scoring implementation (§10.1/§10.3, M-19-style "one canonical
+ * path"). Returns memorySearch's `{hits, skippedTables}` verbatim (not just
+ * `hits`) so a table missing from the connected DB (2026-09-08, PR #274
+ * review) is visible to every caller of this function, not silently
+ * dropped — memorySearch's own total-classification existence probe means
+ * a single absent table (e.g. agent_exchange on a pre-migrate-13 DB) never
+ * fails the whole vector query.
+ *
+ * @returns {Promise<{hits: Array, skippedTables: string[]}>}
+ */
 async function runVectorQuery(client, projectId, q, embedder) {
-  // Delegates to memorySearch BY REFERENCE — never a second embedding/
-  // scoring implementation (§10.1/§10.3, M-19-style "one canonical path").
   const result = await memorySearch(client, {
     projectId,
     query: q.query || '',
@@ -159,7 +169,7 @@ async function runVectorQuery(client, projectId, q, embedder) {
     limit: q.limit || 10,
     embedder, // TEST-ONLY passthrough — see memory-search.js's own note
   });
-  return result.hits;
+  return { hits: result.hits, skippedTables: result.skippedTables || [] };
 }
 
 /**
@@ -183,11 +193,21 @@ async function memoryViewRun(client, { projectId, name }, opts) {
   for (const q of queries) {
     const type = q.type || q.kind;
     let rows;
+    let skippedTables;
     if (type === 'entity') rows = await runEntityQuery(client, projectId, q);
     else if (type === 'assertion') rows = await runAssertionQuery(client, projectId, q);
     else if (type === 'recency') rows = await runRecencyQuery(client, projectId, q);
-    else if (type === 'vector') rows = await runVectorQuery(client, projectId, q, opts && opts.embedder);
-    results.push({ type, rows });
+    else if (type === 'vector') {
+      const vr = await runVectorQuery(client, projectId, q, opts && opts.embedder);
+      rows = vr.hits;
+      skippedTables = vr.skippedTables;
+    }
+    const entry = { type, rows };
+    // skippedTables only attached for the vector kind (§10.1's own
+    // total-classification existence probe) — never present on the other
+    // 3 query types, which have no per-table fan-out to skip.
+    if (skippedTables !== undefined) entry.skippedTables = skippedTables;
+    results.push(entry);
   }
 
   return { viewId: view.id, name: view.name, version: view.version, results };

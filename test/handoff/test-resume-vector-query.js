@@ -32,6 +32,22 @@
  *   "— vector query unavailable: <reason>" fallback (not a crash, not a
  *   blank section), and leaves vectorCount at 0.
  *
+ * Test 3 (PR #274 review — missing table in a multi-table fan-out): a
+ *   default (`tables` omitted) vector query fans out to every ALLOWED_TABLES
+ *   member; this throwaway DB only has `assertions` (handoff-core-schema.sql
+ *   creates no seam-absorbed tables). Asserts memorySearch's per-table
+ *   existence probe skips the absent tables instead of letting one missing
+ *   relation kill the whole query — real hits from `assertions` still
+ *   render, and the skipped tables are named in a
+ *   "— skipped missing tables: ..." line, never a raw DB error.
+ *
+ * Test 4 (PR #274 review — every requested table missing): an explicit
+ *   `tables:['gotchas','findings']` filter where BOTH are absent from this
+ *   DB (neither is created by scripts/sql/*.sql — only by the migrate-14 JS
+ *   migration, never applied here). Asserts exit 0, a skip line naming both
+ *   tables, and vectorCount left at 0 — no raw "relation ... does not
+ *   exist" ever reaches stdout.
+ *
  * Usage: node test/handoff/test-resume-vector-query.js
  * Prerequisites: Postgres running (PGHOST/PGUSER/PGPASSWORD or defaults),
  * test/handoff/fixtures/embed-fixtures.json present (checked into the repo;
@@ -339,6 +355,122 @@ async function test2(db) {
   }
 }
 
+// ─── Test 3: missing table in the fan-out is skipped, not fatal (PR #274 review) ──
+//
+// Regression for the live-review finding: a contract vector query with NO
+// `tables` filter fans out to every ALLOWED_TABLES member (15 total). This
+// throwaway DB's schema (handoff-core-schema.sql only) has `assertions` but
+// NONE of the 14 seam-absorbed tables (decisions, gotchas, agent_exchange,
+// etc.) — exactly the shape the reviewer hit live against
+// claude_memory_eval_test (agent_exchange missing pre-migrate-13/14).
+// Before the fix, ONE missing table killed the whole query
+// ("relation \"agent_exchange\" does not exist" -> the generic catch ->
+// "vector query unavailable"). After the fix, memorySearch's own
+// total-classification existence probe skips absent tables per-table and
+// still returns real hits from the tables that DO exist.
+
+async function test3(db) {
+  const projectDir = createProjectDir('t3');
+  const projectId  = await bootstrapProject(projectDir);
+  try {
+    await insertAssertionWithEmbedding(db, projectId, {
+      subject: 'cache-backend', predicate: 'eviction_policy', object: 'LRU',
+      embedding: FIXTURE_VECS['_row:cache-backend:eviction_policy:LRU'],
+    });
+
+    // No `tables` filter -> defaults to the full ALLOWED_TABLES enum, most
+    // of which do not exist in this throwaway DB.
+    await setContract(db, projectId, [
+      { kind: 'vector', query: 'cache eviction policy', limit: 5 },
+    ]);
+
+    const r   = runLoader(DB_NAME, projectDir);
+    const out = r.stdout || '';
+
+    if (r.status === 0) {
+      pass('T3-1: loader exits 0 with a missing table in the default fan-out');
+    } else {
+      fail('T3-1: loader exits 0 with a missing table in the default fan-out',
+        `exit ${r.status}: ${(r.stderr || '').slice(0, 400)}\nstdout=${out.slice(0, 400)}`);
+    }
+
+    if (out.includes('cache-backend') && out.includes('LRU')) {
+      pass('T3-2: real hit from the PRESENT table (assertions) still renders');
+    } else {
+      fail('T3-2: real hit from the present table still renders', `stdout=${out.slice(0, 800)}`);
+    }
+
+    if (!out.includes('does not exist') && !out.includes('vector query unavailable')) {
+      pass('T3-3: the missing-table error never surfaces as a fatal/unavailable line');
+    } else {
+      fail('T3-3: the missing-table error never surfaces as a fatal/unavailable line', `stdout=${out.slice(0, 800)}`);
+    }
+
+    if (/— skipped missing tables: [^\n]*decisions/.test(out) || /skipped missing tables:/.test(out)) {
+      pass('T3-4: skipped tables reported in a "— skipped missing tables:" line');
+    } else {
+      fail('T3-4: skipped tables reported', `stdout=${out.slice(0, 1200)}`);
+    }
+
+    const count = extractVectorMatchCount(out);
+    if (count !== null && count > 0) {
+      pass(`T3-5: Done line reports vectorCount > 0 despite the missing tables (got ${count})`);
+    } else {
+      fail('T3-5: Done line reports vectorCount > 0 despite the missing tables', `parsed count=${count}; stdout tail=${out.slice(-300)}`);
+    }
+  } finally {
+    await cleanupProject(db, projectId, projectDir);
+  }
+}
+
+// ─── Test 4: every requested table is missing -> skip line, exit 0, no crash ──
+
+async function test4(db) {
+  const projectDir = createProjectDir('t4');
+  const projectId  = await bootstrapProject(projectDir);
+  try {
+    // Both explicitly-requested tables are absent from this throwaway DB.
+    // decisions IS created here (scripts/sql/decisions-base.sql is applied
+    // additively by init's ensureSchemaCurrent), so it is deliberately NOT
+    // used in this test — gotchas/findings come only from the migrate-14 JS
+    // migration, never applied to this throwaway DB.
+    await setContract(db, projectId, [
+      { kind: 'vector', query: 'cache eviction policy', tables: ['gotchas', 'findings'] },
+    ]);
+
+    const r   = runLoader(DB_NAME, projectDir);
+    const out = r.stdout || '';
+
+    if (r.status === 0) {
+      pass('T4-1: loader exits 0 when every requested table is missing');
+    } else {
+      fail('T4-1: loader exits 0 when every requested table is missing',
+        `exit ${r.status}: ${(r.stderr || '').slice(0, 400)}\nstdout=${out.slice(0, 400)}`);
+    }
+
+    if (out.includes('skipped missing tables: gotchas, findings') || out.includes('skipped missing tables: findings, gotchas')) {
+      pass('T4-2: both missing tables named in the skip line');
+    } else {
+      fail('T4-2: both missing tables named in the skip line', `stdout=${out.slice(0, 800)}`);
+    }
+
+    if (!out.includes('does not exist')) {
+      pass('T4-3: no raw DB error ("relation ... does not exist") ever reaches stdout');
+    } else {
+      fail('T4-3: no raw DB error reaches stdout', `stdout=${out.slice(0, 800)}`);
+    }
+
+    const count = extractVectorMatchCount(out);
+    if (count === 0) {
+      pass('T4-4: Done line reports vectorCount === 0 (no table was queryable)');
+    } else {
+      fail('T4-4: Done line reports vectorCount === 0', `parsed count=${count}; stdout tail=${out.slice(-300)}`);
+    }
+  } finally {
+    await cleanupProject(db, projectId, projectDir);
+  }
+}
+
 // ─── Main ──────────────────────────────────────────────────────────────────────
 
 (async () => {
@@ -350,6 +482,8 @@ async function test2(db) {
 
     await test1(db);
     await test2(db);
+    await test3(db);
+    await test4(db);
   } catch (err) {
     console.error(`FATAL: ${err.message}`);
     console.error(err.stack);

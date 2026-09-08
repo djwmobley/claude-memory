@@ -5739,7 +5739,17 @@ async function cmdLoaderLoad(opts = {}) {
       // increment it.
       const vectorQueryText = (q.query || '').trim();
       try {
-        const hits = await runVectorQuery(db, projectId, { ...q, query: vectorQueryText });
+        const { hits, skippedTables } = await runVectorQuery(db, projectId, { ...q, query: vectorQueryText });
+        // skippedTables (2026-09-08, PR #274 review): memorySearch's own
+        // total-classification existence probe means a table absent from
+        // THIS connected DB (e.g. agent_exchange pre-migrate-13) is skipped,
+        // never fatal to the whole query — surfaced here as one diagnostic
+        // line, appended after any bullets, so a missing table is visible
+        // rather than silently dropped or (the pre-fix bug) killing every
+        // hit from every OTHER table too.
+        const skipLine = (skippedTables && skippedTables.length)
+          ? `— skipped missing tables: ${skippedTables.join(', ')}` : null;
+
         if (hits.length) {
           // Accumulate hits one-at-a-time, bounded by sectionBudget — same
           // discipline as the ### Assertions / ### Recent assertions loops.
@@ -5753,11 +5763,21 @@ async function cmdLoaderLoad(opts = {}) {
             vectorCount += 1;
           }
           if (lineTexts.length) {
-            sections.push(`### Vector query (${vectorQueryText})\n${lineTexts.join('\n')}`);
+            let sectionText = `### Vector query (${vectorQueryText})\n${lineTexts.join('\n')}`;
+            if (skipLine) sectionText += `\n${skipLine}`;
+            tokensUsed += skipLine ? Math.ceil(skipLine.length / 4) : 0;
+            sections.push(sectionText);
           }
+        } else if (skipLine) {
+          // No hits AND at least one candidate table was skipped (up to and
+          // including every candidate) — never silently blank: render the
+          // header plus the skip line so the missing table(s) are visible.
+          const sectionText = `### Vector query (${vectorQueryText}) ${skipLine}`;
+          sections.push(sectionText);
+          tokensUsed += Math.ceil(sectionText.length / 4);
         }
-        // hits.length === 0: no matches — no section, mirrors the other
-        // kinds' `if (rows.length)` guard (no empty-section noise).
+        // hits.length === 0 && !skipLine: no matches, nothing skipped — no
+        // section, mirrors the other kinds' `if (rows.length)` guard.
       } catch (vectorErr) {
         const failLine = `### Vector query (${vectorQueryText}) — vector query unavailable: ${vectorErr.message}`;
         sections.push(failLine);
