@@ -93,6 +93,7 @@ const {
   resolvePromotionFilePath,
 } = require('./lib/handoff-paths');
 const { embedQuery }                               = require('./lib/embed');
+const { runVectorQuery }                            = require('./lib/memory-view');
 const {
   seedLocalEmbeddingProvider,
   resolveConfiguredEmbedEndpointDetailed,
@@ -5724,8 +5725,64 @@ async function cmdLoaderLoad(opts = {}) {
       }
 
     } else if (q.type === 'vector' || q.kind === 'vector') {
-      // Vector search requires vLLM — skip gracefully if unavailable.
-      sections.push(`### Vector query (${q.query || ''}) — skipped in loader (Phase 3.6 hook)`);
+      // Vector kind: runs the SAME canonical vector-search path the
+      // memory_view_run / memory_search MCP tools use — memory-view.js's
+      // runVectorQuery, which delegates BY REFERENCE to memory-search.js's
+      // memorySearch (no second embedding/scoring implementation).
+      //
+      // Fail-soft, total classification: an embedder/provider error (vLLM
+      // unreachable, endpoint unconfigured/NONE, mock-fixture miss, empty
+      // query text, etc.) is caught here and rendered as exactly ONE line
+      // in the same single-line style the pre-fix stub used — never a
+      // silent blank, never a thrown/uncaught error, never a partial
+      // section. vectorCount is left at 0 on that path; only real hits
+      // increment it.
+      const vectorQueryText = (q.query || '').trim();
+      try {
+        const { hits, skippedTables } = await runVectorQuery(db, projectId, { ...q, query: vectorQueryText });
+        // skippedTables (2026-09-08, PR #274 review): memorySearch's own
+        // total-classification existence probe means a table absent from
+        // THIS connected DB (e.g. agent_exchange pre-migrate-13) is skipped,
+        // never fatal to the whole query — surfaced here as one diagnostic
+        // line, appended after any bullets, so a missing table is visible
+        // rather than silently dropped or (the pre-fix bug) killing every
+        // hit from every OTHER table too.
+        const skipLine = (skippedTables && skippedTables.length)
+          ? `— skipped missing tables: ${skippedTables.join(', ')}` : null;
+
+        if (hits.length) {
+          // Accumulate hits one-at-a-time, bounded by sectionBudget — same
+          // discipline as the ### Assertions / ### Recent assertions loops.
+          const lineTexts = [];
+          for (const h of hits) {
+            const lineText = `- [${h.sourceTable}|score=${h.score.toFixed(3)}] ${h.label}: ${h.snippet}`;
+            const rowCost  = Math.ceil(lineText.length / 4);
+            if (tokensUsed + rowCost > sectionBudget) break;
+            lineTexts.push(lineText);
+            tokensUsed  += rowCost;
+            vectorCount += 1;
+          }
+          if (lineTexts.length) {
+            let sectionText = `### Vector query (${vectorQueryText})\n${lineTexts.join('\n')}`;
+            if (skipLine) sectionText += `\n${skipLine}`;
+            tokensUsed += skipLine ? Math.ceil(skipLine.length / 4) : 0;
+            sections.push(sectionText);
+          }
+        } else if (skipLine) {
+          // No hits AND at least one candidate table was skipped (up to and
+          // including every candidate) — never silently blank: render the
+          // header plus the skip line so the missing table(s) are visible.
+          const sectionText = `### Vector query (${vectorQueryText}) ${skipLine}`;
+          sections.push(sectionText);
+          tokensUsed += Math.ceil(sectionText.length / 4);
+        }
+        // hits.length === 0 && !skipLine: no matches, nothing skipped — no
+        // section, mirrors the other kinds' `if (rows.length)` guard.
+      } catch (vectorErr) {
+        const failLine = `### Vector query (${vectorQueryText}) — vector query unavailable: ${vectorErr.message}`;
+        sections.push(failLine);
+        tokensUsed += Math.ceil(failLine.length / 4);
+      }
     }
   }
 
