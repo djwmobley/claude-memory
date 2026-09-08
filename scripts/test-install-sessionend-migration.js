@@ -433,12 +433,21 @@ test('makeBackupPath: appends a numeric suffix when the timestamped name already
 // PART B — file-level: scope, dry-run diff, backup+atomic, safety, format
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Copy scripts/install.js + commands/handoff/*.md into a plain (non-worktree) temp dir. */
+/**
+ * Copy scripts/install.js + scripts/lib/ (install.js requires
+ * ./lib/host-target and, on the codex host path, ./lib/codex-install — both
+ * must travel with it for a standalone copy to run at all) + commands/
+ * handoff/*.md into a plain (non-worktree) temp dir.
+ */
 function setupEngineCopy(tmpBase) {
   const engineRoot = path.join(tmpBase, '_engine');
-  fs.mkdirSync(path.join(engineRoot, 'scripts'), { recursive: true });
+  fs.mkdirSync(path.join(engineRoot, 'scripts', 'lib'), { recursive: true });
   fs.mkdirSync(path.join(engineRoot, 'commands', 'handoff'), { recursive: true });
   fs.copyFileSync(REAL_INSTALL_JS, path.join(engineRoot, 'scripts', 'install.js'));
+  const libDir = path.join(path.dirname(REAL_INSTALL_JS), 'lib');
+  for (const f of fs.readdirSync(libDir)) {
+    if (f.endsWith('.js')) fs.copyFileSync(path.join(libDir, f), path.join(engineRoot, 'scripts', 'lib', f));
+  }
   for (const f of fs.readdirSync(COMMANDS_DIR)) {
     if (f.endsWith('.md')) fs.copyFileSync(path.join(COMMANDS_DIR, f), path.join(engineRoot, 'commands', 'handoff', f));
   }

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Codex CLI host support (codex-host-adapter)** — OpenAI Codex CLI is now a
+  first-class host alongside Claude Code. `node scripts/install.js --host
+  codex` registers the MCP server with `codex mcp add` (env var
+  `HANDOFF_PROMOTION_FILE=AGENTS.md`) and wires SessionStart/SessionEnd hooks
+  into `${CODEX_HOME:-~/.codex}/hooks.json` — no `~/.claude/` file is touched
+  by this path, and no slash commands are copied (Codex has no
+  slash-command surface). `handoff.js`'s `loader-hook`/`loader-stop` accept
+  and total-classify a new `--host <claude|codex>` flag (shared classifier:
+  `scripts/lib/host-target.js`); an unrecognized value refuses (exit 2)
+  before any other I/O. The durable-facts promotion file defaults to
+  `AGENTS.md` under Codex (`CLAUDE.md` under Claude, unchanged) via
+  `HANDOFF_PROMOTION_FILE`, still overridable by that env var either way.
+  `install.js`'s hook-identity match (`isOurs`/`OURS_RE`) is now keyed by
+  (verb, host) — a cross-host entry found in a host-specific file is flagged
+  `unrecognizedShape` and left untouched, never silently repointed. New docs:
+  [docs/hosts/codex.md](docs/hosts/codex.md); README gained a "Supported
+  hosts" section. New tests: `scripts/test-install-host.js` (the full
+  `--host`/MCP-registration/hooks.json matrix, against a hand-written codex
+  stub — no real `codex` binary was available to verify against, see that
+  doc's "verified against docs, not the binary" section for the resulting
+  blind spots), plus additions to `scripts/test-host-agnostic-naming.js` and
+  `scripts/test-loader-stop-gate.js`. Claude Code's own install/engine
+  behavior is unaffected — proven by a byte-identical-output regression test.
+
 ### Removed
 
 - **Agent-interaction guard hooks moved to the public judge repo** —

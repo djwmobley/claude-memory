@@ -75,7 +75,7 @@ const {
   mintUUID,
 } = require('./lib/project-marker');
 const { writeMarkerAtomic } = require('./lib/project-identity');
-const { resolveBaseDir, resolveHandoffMdPath, resolvePromotionFilePath, DEFAULT_PROMOTION_FILENAME } =
+const { resolveBaseDir, resolveHandoffMdPath, resolvePromotionFilePath, DEFAULT_PROMOTION_FILENAME, defaultPromotionFilenameForHost } =
   require('./lib/handoff-paths');
 
 // ── Tracking ───────────────────────────────────────────────────────────────────
@@ -822,6 +822,57 @@ function testP_caseCollisionReusesOnDiskCasing() {
   } finally { rmTempDir(dir); }
 }
 
+// ── P14-P15: codex-host-adapter — AGENTS.md default + no cosmetic CLAUDE.md
+// literal under codex (cm codex-host-adapter S4) ─────────────────────────────
+// Numbered P14/P15 (not P13/P14 as scoped) because P13 above already exists
+// in this file — see PR body for that note.
+
+function testP_agentsMdDefaultUnderCodexHost() {
+  const label = 'P14: HANDOFF_PROMOTION_FILE unset, host=codex — defaults to AGENTS.md';
+  const dir = makeTempDir('p14');
+  try {
+    withEnv({ HANDOFF_PROMOTION_FILE: undefined }, () => {
+      const got  = resolvePromotionFilePath(dir, defaultPromotionFilenameForHost('codex'));
+      const want = path.join(dir, 'AGENTS.md');
+      if (got !== want) { fail(label, `expected ${want}, got ${got}`); return; }
+      // Claude/absent host is unaffected — byte-for-byte the historical default.
+      const claudeGot = resolvePromotionFilePath(dir, defaultPromotionFilenameForHost('claude'));
+      const claudeWant = path.join(dir, DEFAULT_PROMOTION_FILENAME);
+      if (claudeGot !== claudeWant) { fail(label, `claude default regressed: expected ${claudeWant}, got ${claudeGot}`); return; }
+      pass(label);
+    });
+  } finally { rmTempDir(dir); }
+}
+
+function testP_envOverrideWinsOverCodexDefault() {
+  const label = 'P14b: HANDOFF_PROMOTION_FILE=NOTES.md, host=codex — env always wins over the host default';
+  const dir = makeTempDir('p14b');
+  try {
+    withEnv({ HANDOFF_PROMOTION_FILE: 'NOTES.md' }, () => {
+      const got  = resolvePromotionFilePath(dir, defaultPromotionFilenameForHost('codex'));
+      const want = path.join(dir, 'NOTES.md');
+      if (got !== want) { fail(label, `expected env override to win: ${want}, got ${got}`); return; }
+      pass(label);
+    });
+  } finally { rmTempDir(dir); }
+}
+
+function testP_noClaudeMdLiteralInHandoffJsSource() {
+  const label = 'P15: no hardcoded "CLAUDE.md" stderr literal remains in handoff.js (must use the resolved basename)';
+  const handoffJsPath = path.join(__dirname, 'handoff.js');
+  const src = fs.readFileSync(handoffJsPath, 'utf8');
+  // The exact incident pattern this guards against: a healKeyPathsSection
+  // note written via a hardcoded literal instead of the resolved promotion
+  // filename variable — would print "CLAUDE.md" even when running under
+  // codex (HANDOFF_PROMOTION_FILE=AGENTS.md), which is wrong.
+  const literalRe = /handoff: CLAUDE\.md Key paths:/;
+  if (literalRe.test(src)) {
+    fail(label, 'found a hardcoded "handoff: CLAUDE.md Key paths:" stderr literal in scripts/handoff.js');
+    return;
+  }
+  pass(label);
+}
+
 // ── D1-D3: Predicate migration collision-safety (Postgres) ───────────────────
 
 async function isPgAvailable() {
@@ -1016,6 +1067,9 @@ async function main() {
   testP_pathLikeValuesRejected();
   testP_dotDotPrefixedNonTraversalAccepted();
   testP_caseCollisionReusesOnDiskCasing();
+  testP_agentsMdDefaultUnderCodexHost();
+  testP_envOverrideWinsOverCodexDefault();
+  testP_noClaudeMdLiteralInHandoffJsSource();
 
   await runMigrationTests();
 

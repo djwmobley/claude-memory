@@ -957,6 +957,24 @@ jobs:
         #   B4  Every command file has the improved standalone error with both fix options
         # Pure Node — no Postgres or Ollama required; writes to OS temp dir only.
         run: node scripts/test-install-engine-path.js
+      - name: Run codex-host-adapter install tests
+        # scripts/test-install-host.js: --host <claude|codex> total-classification
+        # matrix, codex binary discovery + `codex mcp get/add` shell-out against a
+        # hand-written PATH-installed codex stub, CODEX_HOME validation, end-to-end
+        # `install.js --host codex` subprocess runs (not-found refusal, dry-run,
+        # register/skip/failure, fresh hooks.json with the SessionStart matcher),
+        # hooks.json merge/idempotency/cross-host-entry-refusal, space-in-path
+        # quoting, and a Claude-path byte-identical-output proof.
+        # Pure Node — no Postgres or Ollama required; writes to OS temp dir only.
+        run: node scripts/test-install-host.js
+      - name: Run install SessionEnd-migration tests
+        # scripts/test-install-sessionend-migration.js: mergeHooks() against Claude
+        # Code's real matcher-wrapped hooks schema — total-classification coverage
+        # (upgrade/move/dedupe/re-point/unrecognized-shape), F-1..F-10 adversary
+        # findings, plus file-level scope/dry-run-diff/backup/atomic-write/
+        # indent-EOL-BOM-preservation/worktree-refusal tests.
+        # Pure Node — no Postgres or Ollama required; writes to OS temp dir only.
+        run: node scripts/test-install-sessionend-migration.js
       - name: Run L4 degraded-close tests
         # Tests Lever L4: fail-loud, persist-to-DB, resume-visible skip record when
         # C2 (feedback bias) or C3 (contract evolution) skip due to unresolvable
