@@ -93,6 +93,7 @@ const {
   resolvePromotionFilePath,
 } = require('./lib/handoff-paths');
 const { embedQuery }                               = require('./lib/embed');
+const { runVectorQuery }                            = require('./lib/memory-view');
 const {
   seedLocalEmbeddingProvider,
   resolveConfiguredEmbedEndpointDetailed,
@@ -5724,8 +5725,44 @@ async function cmdLoaderLoad(opts = {}) {
       }
 
     } else if (q.type === 'vector' || q.kind === 'vector') {
-      // Vector search requires vLLM — skip gracefully if unavailable.
-      sections.push(`### Vector query (${q.query || ''}) — skipped in loader (Phase 3.6 hook)`);
+      // Vector kind: runs the SAME canonical vector-search path the
+      // memory_view_run / memory_search MCP tools use — memory-view.js's
+      // runVectorQuery, which delegates BY REFERENCE to memory-search.js's
+      // memorySearch (no second embedding/scoring implementation).
+      //
+      // Fail-soft, total classification: an embedder/provider error (vLLM
+      // unreachable, endpoint unconfigured/NONE, mock-fixture miss, empty
+      // query text, etc.) is caught here and rendered as exactly ONE line
+      // in the same single-line style the pre-fix stub used — never a
+      // silent blank, never a thrown/uncaught error, never a partial
+      // section. vectorCount is left at 0 on that path; only real hits
+      // increment it.
+      const vectorQueryText = (q.query || '').trim();
+      try {
+        const hits = await runVectorQuery(db, projectId, { ...q, query: vectorQueryText });
+        if (hits.length) {
+          // Accumulate hits one-at-a-time, bounded by sectionBudget — same
+          // discipline as the ### Assertions / ### Recent assertions loops.
+          const lineTexts = [];
+          for (const h of hits) {
+            const lineText = `- [${h.sourceTable}|score=${h.score.toFixed(3)}] ${h.label}: ${h.snippet}`;
+            const rowCost  = Math.ceil(lineText.length / 4);
+            if (tokensUsed + rowCost > sectionBudget) break;
+            lineTexts.push(lineText);
+            tokensUsed  += rowCost;
+            vectorCount += 1;
+          }
+          if (lineTexts.length) {
+            sections.push(`### Vector query (${vectorQueryText})\n${lineTexts.join('\n')}`);
+          }
+        }
+        // hits.length === 0: no matches — no section, mirrors the other
+        // kinds' `if (rows.length)` guard (no empty-section noise).
+      } catch (vectorErr) {
+        const failLine = `### Vector query (${vectorQueryText}) — vector query unavailable: ${vectorErr.message}`;
+        sections.push(failLine);
+        tokensUsed += Math.ceil(failLine.length / 4);
+      }
     }
   }
 

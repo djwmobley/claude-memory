@@ -200,4 +200,9 @@ module.exports = {
   memoryViewSet,
   memoryViewGet,
   memoryViewRun,
+  // Exported (2026-09-08, fix/resume-vector-query) so scripts/handoff.js's
+  // cmdLoaderLoad can run the SAME vector-kind interpreter the memory_view_run
+  // MCP tool uses — by reference, never a second implementation — instead of
+  // its own long-standing stub. See runVectorQuery's own doc comment above.
+  runVectorQuery,
 };
