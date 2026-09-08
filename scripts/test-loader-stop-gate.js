@@ -56,7 +56,33 @@ function runLoaderStop(stdin, opts = {}) {
   const start = Date.now();
   const result = spawnSync(
     process.execPath,
-    [HELPER, 'loader-stop'],
+    [HELPER, 'loader-stop', ...(opts.extraArgs || [])],
+    {
+      cwd: emptyDir,
+      env,
+      encoding: 'utf8',
+      timeout: 10000,
+      input: stdin === undefined ? undefined : stdin,
+    }
+  );
+  const elapsedMs = Date.now() - start;
+  fs.rmSync(emptyDir, { recursive: true, force: true });
+  return { ...result, elapsedMs };
+}
+
+/** Run `handoff.js loader-hook` as a subprocess (same unreachable-DB-host proof-of-firing shape). */
+function runLoaderHook(stdin, opts = {}) {
+  const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'loader-hook-gate-test-'));
+  const env = {
+    ...process.env,
+    PGHOST: UNREACHABLE_HOST,
+    PROJECT_ROOT: emptyDir,
+    ...opts.env,
+  };
+  const start = Date.now();
+  const result = spawnSync(
+    process.execPath,
+    [HELPER, 'loader-hook', ...(opts.extraArgs || [])],
     {
       cwd: emptyDir,
       env,
@@ -170,6 +196,55 @@ assertFastNoOp('T8: bare JSON primitive stdin is a fast zero-I/O no-op', '"just 
     fail(label, `hook_event_name=SessionEnd exited 0 in ${r.elapsedMs}ms — indistinguishable from the Stop no-op path; the gate may be over-matching`);
   } else {
     pass(`${label} (exit ${r.status}, signal ${r.signal}, ${r.elapsedMs}ms — attempted real work, as expected)`);
+  }
+}
+
+// ── H1-H6: codex-host-adapter --host classification on loader-hook/loader-stop
+// (S1) — validated BEFORE any I/O, exactly like the hook-event gate above. ──
+
+function assertHostRefusesFast(label, extraArgs) {
+  const r = runLoaderStop(undefined, { extraArgs });
+  if (r.status !== 2) {
+    fail(label, `expected exit 2, got ${r.status} (signal ${r.signal}); stderr: ${(r.stderr || '').slice(0, 300)}`);
+    return;
+  }
+  if (r.elapsedMs >= FAST_MS) {
+    fail(label, `expected a fast refusal (<${FAST_MS}ms), took ${r.elapsedMs}ms`);
+    return;
+  }
+  if (!/--host/.test(r.stderr || '')) {
+    fail(label, `expected stderr to mention --host, got: ${(r.stderr || '').slice(0, 200)}`);
+    return;
+  }
+  pass(`${label} (exit 2, ${r.elapsedMs}ms)`);
+}
+
+assertHostRefusesFast('H1: loader-stop --host codexx (unknown value) refuses fast, exit 2', ['--host', 'codexx']);
+assertHostRefusesFast('H2: loader-stop --host (bare, no value) refuses fast, exit 2', ['--host']);
+assertHostRefusesFast('H3: loader-stop --host= (empty value) refuses fast, exit 2', ['--host=']);
+assertHostRefusesFast('H4: loader-stop --host claude --host codex (conflicting repeats) refuses fast, exit 2', ['--host', 'claude', '--host', 'codex']);
+
+// H5: --host codex is ACCEPTED (proceeds past the gate, same fast-no-op shape as T1-T8).
+{
+  const r = runLoaderStop(undefined, { extraArgs: ['--host', 'codex'] });
+  if (r.status !== 0) {
+    fail('H5: loader-stop --host codex (valid) is accepted, proceeds to the normal fast no-op path', `expected exit 0, got ${r.status}; stderr: ${(r.stderr || '').slice(0, 300)}`);
+  } else if (r.elapsedMs >= FAST_MS) {
+    fail('H5: loader-stop --host codex (valid) is accepted, proceeds to the normal fast no-op path', `took ${r.elapsedMs}ms`);
+  } else {
+    pass(`H5: loader-stop --host codex (valid) is accepted, proceeds to the normal fast no-op path (exit 0, ${r.elapsedMs}ms)`);
+  }
+}
+
+// H6: same conflicting-value refusal, but on loader-hook (S1 applies to BOTH entry points).
+{
+  const r = runLoaderHook(undefined, { extraArgs: ['--host', 'bogus'] });
+  if (r.status !== 2) {
+    fail('H6: loader-hook --host bogus (unknown value) refuses fast, exit 2', `expected exit 2, got ${r.status}; stderr: ${(r.stderr || '').slice(0, 300)}`);
+  } else if (r.elapsedMs >= FAST_MS) {
+    fail('H6: loader-hook --host bogus (unknown value) refuses fast, exit 2', `took ${r.elapsedMs}ms`);
+  } else {
+    pass(`H6: loader-hook --host bogus (unknown value) refuses fast, exit 2 (${r.elapsedMs}ms)`);
   }
 }
 

@@ -209,6 +209,14 @@ function testP2() {
   const REALITY_CHECKS_FILE = path.join(SCRIPTS_DIR, 'lib', 'reality-checks.js');
   const SANCTIONED_MAX_IN_REALITY_CHECKS = 1;
 
+  // codex-install.js (codex-host-adapter): the SAME "shell:true is required
+  // to execute a .cmd/.bat wrapper on Windows" reasoning as reality-checks.js
+  // above — a real `codex` install is plausibly `codex.cmd` — applied inside
+  // ONE wrapper function (spawnSync) that every call site in the file reuses,
+  // so this is also count-capped at exactly 1 occurrence.
+  const CODEX_INSTALL_FILE = path.join(SCRIPTS_DIR, 'lib', 'codex-install.js');
+  const SANCTIONED_MAX_IN_CODEX_INSTALL = 1;
+
   // Count non-comment shell:true occurrences in reality-checks.js separately
   // before filtering them out of the main hit list.
   const realityChecksHits = findInFile(REALITY_CHECKS_FILE, shellTrueRe).filter((h) =>
@@ -223,6 +231,18 @@ function testP2() {
     return;
   }
 
+  const codexInstallHits = findInFile(CODEX_INSTALL_FILE, shellTrueRe).filter((h) =>
+    !h.text.startsWith('//') && !h.text.startsWith('*')
+  );
+  if (codexInstallHits.length > SANCTIONED_MAX_IN_CODEX_INSTALL) {
+    const detail = codexInstallHits.map((h) =>
+      `  ${path.relative(PROJECT_ROOT, CODEX_INSTALL_FILE)}:${h.line}: ${h.text}`
+    ).join('\n');
+    fail(label, `scripts/lib/codex-install.js has ${codexInstallHits.length} shell:true occurrence(s); ` +
+      `only ${SANCTIONED_MAX_IN_CODEX_INSTALL} is sanctioned (the spawnSync wrapper — codex.cmd on Windows):\n${detail}`);
+    return;
+  }
+
   const hits = findInFiles(allFiles, shellTrueRe).filter((h) => {
     // Skip comment lines.
     if (h.text.startsWith('//') || h.text.startsWith('*')) return false;
@@ -232,6 +252,8 @@ function testP2() {
     // Skip the sanctioned single occurrence in reality-checks.js (already
     // count-checked above; any second occurrence already failed P2).
     if (h.file === REALITY_CHECKS_FILE) return false;
+    // Skip the sanctioned single occurrence in codex-install.js (ditto).
+    if (h.file === CODEX_INSTALL_FILE) return false;
     return true;
   });
 
@@ -267,6 +289,21 @@ function testP3() {
   //     behavior by platform — but there is no way to express "what counts as absolute
   //     on this OS" without consulting process.platform, so it is sanctioned alongside
   //     runWinBin rather than folded into it (different function, different module).
+  //   - codex-install.js (codex-host-adapter): discovers the `codex` executable by
+  //     walking PATH + (on win32) PATHEXT to find ONE resolved candidate path, THEN
+  //     needs consistent .cmd/.bat spawn quoting for THAT single path across three
+  //     different subcommands (--version / mcp get / mcp add) via a non-throwing
+  //     spawnSync-style result (status/stdout/stderr) for user-facing refusal
+  //     messages. This is a materially different shape from runWinBin's throwing,
+  //     multiple-candidate-BINARY-NAME retry loop (execFileSync over a short list of
+  //     alternate names like "python3"/"python") — forcing it through that API would
+  //     mean re-deriving PATH/PATHEXT discovery around it anyway. Sanctioned as its
+  //     own site for the same reason handoff-paths.js is: no way to express "how do I
+  //     invoke a discovered binary on this OS" without consulting process.platform.
+  //   - test-install-host.js: mirrors the already-sanctioned test-staleness-
+  //     permutations.js pattern — builds a cross-platform `codex` stub (a plain
+  //     POSIX shell/node file with a shebang vs. a win32 .cmd wrapper) for the
+  //     codex-host-adapter test suite.
   //
   // We allowlist by file + approximate pattern.
   const ALLOWED = [
@@ -284,6 +321,16 @@ function testP3() {
     {
       file: HANDOFF_PATHS_JS,
       // resolveBaseDir(): HANDOFF_BASE_DIR absolute-path validation (see module header).
+      textRe: /process\.platform\s*===\s*['"]win32['"]/,
+    },
+    {
+      file: path.join(SCRIPTS_DIR, 'lib', 'codex-install.js'),
+      // discoverCodex() / the spawnSync wrapper — see justification above.
+      textRe: /process\.platform\s*===\s*['"]win32['"]/,
+    },
+    {
+      file: path.join(SCRIPTS_DIR, 'test-install-host.js'),
+      // makeCodexStub() / withStub() — cross-platform codex stub construction.
       textRe: /process\.platform\s*===\s*['"]win32['"]/,
     },
   ];

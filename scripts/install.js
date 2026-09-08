@@ -95,6 +95,12 @@ function resolveConfig() {
 
   if (showHelp) { console.log(USAGE); process.exit(0); }
 
+  // ── --host <claude|codex> (codex-host-adapter S1) ─────────────────────────
+  const { resolveHost } = require('./lib/host-target');
+  const hostResult = resolveHost(args, process.env);
+  if (!hostResult.ok) refuse(hostResult.reason);
+  const host = hostResult.host;
+
   const scopeFlagIdx = args.indexOf('--hooks-scope');
   let hooksScopeArg = 'auto';
   if (scopeFlagIdx !== -1) {
@@ -141,14 +147,31 @@ function resolveConfig() {
 
   // Hook commands — forward slashes everywhere (Claude Code settings files
   // accept them on all platforms and avoid JSON back-slash escape headaches).
-  const hookLoaderCmd = `node ${enginePathFwd} loader-hook`;
-  const hookStopCmd   = `node ${enginePathFwd} loader-stop`;
+  // Claude path: no --host suffix at all (byte-identical to pre-codex-host-
+  // adapter behavior — S1/S4 "absent -> claude" AND "Claude behavior must be
+  // byte-for-byte unchanged"). Codex path: explicit ` --host codex` suffix so
+  // scripts/handoff.js's loader-hook/loader-stop entry points (and this
+  // file's own isOurs()/OURS_RE identity check, S3) can key on host.
+  const hostSuffix = host === 'codex' ? ' --host codex' : '';
+  // Codex path only (S3): double-quote the engine path when it contains a
+  // space. The Claude path is left exactly as it has always been (no
+  // quoting) — S4's "byte-for-byte unchanged" requirement covers this file
+  // too, not only handoff.js.
+  const enginePathToken = (host === 'codex' && enginePathFwd.includes(' '))
+    ? `"${enginePathFwd}"`
+    : enginePathFwd;
+  const hookLoaderCmd = `node ${enginePathToken} loader-hook${hostSuffix}`;
+  const hookStopCmd   = `node ${enginePathToken} loader-stop${hostSuffix}`;
 
   // Engine path recorded for standalone installs so command files can find the
   // engine without CLAUDE_PLUGIN_ROOT. Always derived from THIS checkout (the
   // --engine-path override only affects the hooks-diff proof, never this file).
   const enginePathFile    = path.join(destDir, '.engine-path');
   const enginePathContent = `${repoRootFwd}/scripts/handoff.js`;
+
+  // MCP server entry point for the codex host (S2) — always derived from
+  // THIS checkout, same as enginePathContent above.
+  const mcpEnginePath = path.join(repoRoot, 'scripts', 'handoff-mcp.mjs');
 
   // Candidate settings files for the two hook scopes.
   const userSettingsPath    = path.join(os.homedir(), '.claude', 'settings.json');
@@ -166,9 +189,9 @@ function resolveConfig() {
   }
 
   return {
-    dryRun, force, hooksScopeArg, engineOverride,
+    dryRun, force, hooksScopeArg, engineOverride, host,
     repoRoot, repoRootFwd, srcDir, destDir,
-    enginePathFwd, hookLoaderCmd, hookStopCmd,
+    enginePathFwd, hookLoaderCmd, hookStopCmd, mcpEnginePath,
     enginePathFile, enginePathContent,
     userSettingsPath, projectSettingsPath,
   };
@@ -201,15 +224,26 @@ function normalizeCommand(cmd) {
   return s;
 }
 
-// Anchored identity pattern (S2): optional `HANDOFF_ENGINE=<nonspace> `
-// prefix, `node`/`node.exe`, a path token (optionally double-quoted) ending
-// in exactly `scripts/handoff.js`, then exactly `loader-hook` or
-// `loader-stop`, then end of string. No substring matching anywhere.
-const OURS_RE = /^(?:HANDOFF_ENGINE=(\S+) )?node(?:\.exe)? (?:"((?:[^"\\]|\\.)*)"|(\S+)) (loader-hook|loader-stop)$/;
+// Anchored identity pattern (S2, extended by codex-host-adapter S3): optional
+// `HANDOFF_ENGINE=<nonspace> ` prefix, `node`/`node.exe`, a path token
+// (optionally double-quoted) ending in exactly `scripts/handoff.js`, then
+// exactly `loader-hook` or `loader-stop`, then an OPTIONAL trailing
+// ` --host claude` / ` --host codex` group, then end of string. No substring
+// matching anywhere.
+const OURS_RE = /^(?:HANDOFF_ENGINE=(\S+) )?node(?:\.exe)? (?:"((?:[^"\\]|\\.)*)"|(\S+)) (loader-hook|loader-stop)(?: --host (claude|codex))?$/;
 
 /**
- * Return { verb: 'loader-hook' | 'loader-stop' } if `rawCommand` is one of
- * OUR hooks, else null. Exported for tests and reused by scope detection.
+ * Return `{ verb: 'loader-hook' | 'loader-stop' }` — plus a `host` key ONLY
+ * when the command carries an explicit trailing `--host <value>` (a bare
+ * command with no --host suffix is the historical Claude form and has no
+ * `host` key at all, so pre-existing callers/tests that deepStrictEqual
+ * against `{ verb }` are unaffected) — if `rawCommand` is one of OUR hooks,
+ * else null. Exported for tests and reused by scope detection.
+ *
+ * Callers that need a host to compare against MUST default a missing `host`
+ * key to `'claude'` themselves (see scanEntries below) — this function never
+ * invents that default internally, so its return shape for a plain command
+ * never changes.
  */
 function isOurs(rawCommand) {
   if (typeof rawCommand !== 'string') return null;
@@ -222,7 +256,7 @@ function isOurs(rawCommand) {
   // string ending in "handoff.js" (excludes vendor/handoff.js, and
   // wrapper-for-handoff.js-notifier.js which doesn't even end there).
   if (!/(^|\/)scripts\/handoff\.js$/.test(pathToken)) return null;
-  return { verb: m[4] };
+  return m[5] ? { verb: m[4], host: m[5] } : { verb: m[4] };
 }
 
 // ─── VALIDATION (S5 total classification) ────────────────────────────────────
@@ -277,8 +311,21 @@ const EVENT_FOR_VERB = { 'loader-hook': 'SessionStart', 'loader-stop': 'SessionE
  * Candidate shape:
  *   grouped: { kind:'grouped', event, groupRef, innerRef }
  *   flat:    { kind:'flat', event, ref }
+ *
+ * `targetHost` (default 'claude', codex-host-adapter S3): identity is keyed
+ * by (verb, host) — a plain command with no `--host` suffix is host='claude'
+ * (isOurs()'s missing-host default, applied HERE, never inside isOurs()
+ * itself). An entry that IS recognized as ours (right verb, right shape) but
+ * whose host does NOT match `targetHost` — e.g. a `--host codex` entry found
+ * while scanning the Claude-scope settings file, or a plain/`--host claude`
+ * entry found inside a Codex-scope hooks.json — is a cross-host entry: it is
+ * flagged unrecognizedShape and left completely untouched (never silently
+ * repointed, never merged as if it were ours). This is what lets the SAME
+ * settings/hooks file host entries for BOTH hosts side by side without
+ * either install path clobbering the other's entry.
  */
-function scanEntries(hooks) {
+function scanEntries(hooks, targetHost) {
+  targetHost = targetHost || 'claude';
   const candidates = { 'loader-hook': [], 'loader-stop': [] };
   const unrecognizedShape = [];
 
@@ -296,9 +343,21 @@ function scanEntries(hooks) {
         entry.hooks.forEach((inner) => {
           if (inner && typeof inner === 'object' && typeof inner.command === 'string') {
             const id = isOurs(inner.command);
-            if (id) {
+            if (!id) return; // some other tool's hook — never touched, never flagged.
+            const entryHost = id.host || 'claude';
+            if (entryHost === targetHost) {
               candidates[id.verb].push({ kind: 'grouped', event, groupRef: entry, innerRef: inner });
+            } else {
+              // Recognized as ours, but for the OTHER host — cross-host entry
+              // (S3): flag, never silently repoint into this host's slot.
+              unrecognizedShape.push({ event, index });
             }
+          } else {
+            // Malformed inner hook (not an object, or no string `command`) —
+            // parity with the flat-shape branch below: every shape maps to a
+            // branch, so a structurally broken inner hook is flagged too,
+            // not silently dropped.
+            unrecognizedShape.push({ event, index });
           }
         });
         return;
@@ -307,7 +366,12 @@ function scanEntries(hooks) {
         // Legacy flat entry.
         const id = isOurs(entry.command);
         if (id) {
-          candidates[id.verb].push({ kind: 'flat', event, ref: entry });
+          const entryHost = id.host || 'claude';
+          if (entryHost === targetHost) {
+            candidates[id.verb].push({ kind: 'flat', event, ref: entry });
+          } else {
+            unrecognizedShape.push({ event, index }); // cross-host (S3).
+          }
         } else {
           unrecognizedShape.push({ event, index });
         }
@@ -325,7 +389,15 @@ function scanEntries(hooks) {
  * Merge our loader-hook/loader-stop hooks into an already-validated settings
  * object (mutates `settings.hooks` in place; never rebuilds untouched keys).
  *
- * opts: { hookLoaderCmd, hookStopCmd } — the exact command strings to write.
+ * opts: { hookLoaderCmd, hookStopCmd, targetHost, matcherFor } —
+ *   hookLoaderCmd/hookStopCmd: the exact command strings to write.
+ *   targetHost (default 'claude'): identity scope passed through to
+ *     scanEntries — see its doc comment for the cross-host-entry rule (S3).
+ *   matcherFor: optional `{ 'loader-hook'?: string, 'loader-stop'?: string }`
+ *     — a `matcher` value to set on a NEWLY created group for that verb (the
+ *     Codex host path sets `{'loader-hook':'startup|resume'}`; the Claude
+ *     path omits this entirely, exactly as before — no matcher is invented
+ *     for Claude groups).
  *
  * Returns a report:
  *   { upgraded:[{verb,event}], moved:[{verb,from,to}], removed:[{event}],
@@ -334,6 +406,8 @@ function scanEntries(hooks) {
  */
 function mergeHooks(settings, opts) {
   opts = opts || {};
+  const targetHost = opts.targetHost || 'claude';
+  const matcherFor = opts.matcherFor || {};
   const cmdFor = { 'loader-hook': opts.hookLoaderCmd, 'loader-stop': opts.hookStopCmd };
 
   if (settings.hooks === null || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) {
@@ -351,7 +425,7 @@ function mergeHooks(settings, opts) {
     unrecognizedShape: [],
   };
 
-  const { candidates, unrecognizedShape } = scanEntries(hooks);
+  const { candidates, unrecognizedShape } = scanEntries(hooks, targetHost);
   report.unrecognizedShape = unrecognizedShape;
 
   const innerToRemove = new Set();
@@ -374,7 +448,9 @@ function mergeHooks(settings, opts) {
 
     if (list.length === 0) {
       // Nothing found anywhere for this verb — add fresh.
-      additions.push({ event: targetEvent, newGroup: { hooks: [{ type: 'command', command: cmd }] } });
+      const newGroup = { hooks: [{ type: 'command', command: cmd }] };
+      if (matcherFor[verb]) newGroup.matcher = matcherFor[verb];
+      additions.push({ event: targetEvent, newGroup });
       report.added.push(verb);
       continue;
     }
@@ -399,6 +475,7 @@ function mergeHooks(settings, opts) {
         const preserved = preserveExtra(keep.ref, ['command']);
         for (const k of Object.keys(keep.ref)) delete keep.ref[k];
         keep.ref.hooks = [{ type: 'command', command: cmd, ...preserved }];
+        if (matcherFor[verb] && keep.ref.matcher === undefined) keep.ref.matcher = matcherFor[verb];
         report.upgraded.push({ verb, event: targetEvent });
       } else if (keep.innerRef.command !== cmd) {
         keep.innerRef.command = cmd;
@@ -411,13 +488,17 @@ function mergeHooks(settings, opts) {
     if (keep.kind === 'flat') {
       topToRemove.add(keep.ref);
       const preserved = preserveExtra(keep.ref, ['command']);
-      additions.push({ event: targetEvent, newGroup: { hooks: [{ type: 'command', command: cmd, ...preserved }] } });
+      const newGroup = { hooks: [{ type: 'command', command: cmd, ...preserved }] };
+      if (matcherFor[verb]) newGroup.matcher = matcherFor[verb];
+      additions.push({ event: targetEvent, newGroup });
       report.upgraded.push({ verb, event: keep.event });
     } else {
       innerToRemove.add(keep.innerRef);
       groupsToCheckEmpty.add(keep.groupRef);
       const preserved = preserveExtra(keep.innerRef, ['command', 'type']);
-      additions.push({ event: targetEvent, newGroup: { hooks: [{ type: 'command', command: cmd, ...preserved }] } });
+      const newGroup = { hooks: [{ type: 'command', command: cmd, ...preserved }] };
+      if (matcherFor[verb]) newGroup.matcher = matcherFor[verb];
+      additions.push({ event: targetEvent, newGroup });
     }
     report.moved.push({ verb, from: keep.event, to: targetEvent });
   }
@@ -698,6 +779,16 @@ function printHooksSummary(report, scope, targetPath, backupPath) {
 // ─── MAIN ────────────────────────────────────────────────────────────────────
 
 async function main(cfg) {
+  // ── Codex host: entirely separate install path (S2 MCP registration + S3
+  // hooks.json) — no slash-command copy (S5), no ~/.claude/settings*.json
+  // touched at all. Delegates to lib/codex-install.js and returns; every
+  // line below this branch is the pre-existing, byte-for-byte-unchanged
+  // Claude Code install path.
+  if (cfg.host === 'codex') {
+    await mainCodex(cfg);
+    return;
+  }
+
   const {
     dryRun, force, hooksScopeArg,
     srcDir, destDir,
@@ -841,14 +932,96 @@ async function main(cfg) {
   console.log('');
 }
 
-if (require.main === module) {
-  const cfg = resolveConfig();
-  main(cfg).catch((err) => {
-    console.error('Error:', err.message);
-    process.exit(1);
-  });
+// ─── CODEX HOST PATH (S2 MCP registration + S3 hooks.json) ──────────────────
+
+/**
+ * `--host codex` install path: registers this checkout's MCP server with the
+ * `codex` CLI (S2) and wires the SessionStart/SessionEnd hooks.json entries
+ * (S3). No slash-command copy (S5) — Codex has no slash-command surface. No
+ * ~/.claude/settings*.json file is read or written by this path.
+ */
+async function mainCodex(cfg) {
+  const codexInstall = require('./lib/codex-install');
+  const { dryRun, enginePathFwd, mcpEnginePath, hookLoaderCmd, hookStopCmd } = cfg;
+
+  console.log('\nclaude-memory installer — host: codex');
+  if (dryRun) console.log('(dry-run — nothing will be written, except the codex --version discovery probe)');
+  console.log('');
+
+  // ── S2: MCP server registration ───────────────────────────────────────────
+  const discovery = codexInstall.discoverCodex(process.env);
+  if (!discovery.found) {
+    const argv   = codexInstall.buildMcpAddArgv(mcpEnginePath);
+    const stanza = codexInstall.buildMcpTomlStanza(mcpEnginePath);
+    console.error('Refusing: could not find a working `codex` executable on PATH.');
+    console.error('');
+    console.error('  Run this once `codex` is installed:');
+    console.error(`    codex ${argv.join(' ')}`);
+    console.error('');
+    console.error('  Or paste this into ${CODEX_HOME:-~/.codex}/config.toml by hand:');
+    console.error('');
+    for (const line of stanza.split('\n')) console.error(`    ${line}`);
+    console.error('');
+    process.exit(2);
+  }
+  console.log(`  [OK]    codex found: ${discovery.command} (${discovery.version || 'version unknown'})`);
+
+  const already = codexInstall.checkHandoffRegistered(discovery.command);
+  if (already.registered) {
+    console.log(`  [OK]    MCP server "${codexInstall.MCP_SERVER_NAME}" already registered — skipping.`);
+  } else if (dryRun) {
+    const argv = codexInstall.buildMcpAddArgv(mcpEnginePath);
+    console.log(`  [DRY]   would run: codex ${argv.join(' ')}`);
+  } else {
+    const argv = codexInstall.buildMcpAddArgv(mcpEnginePath);
+    console.log(`  Running: codex ${argv.join(' ')}`);
+    const result = codexInstall.registerHandoffMcp(discovery.command, mcpEnginePath);
+    if (!result.ok) {
+      console.error(`Refusing: \`codex mcp add\` failed (exit ${result.status ?? 'spawn error'}).`);
+      if (result.stderr) console.error(result.stderr.trim());
+      process.exit(2);
+    }
+    console.log(`  [OK]    MCP server "${codexInstall.MCP_SERVER_NAME}" registered.`);
+  }
+  console.log('');
+
+  // ── S3: hooks.json ────────────────────────────────────────────────────────
+  const codexHome = codexInstall.resolveCodexHome(process.env);
+  if (!codexHome.ok) refuse(codexHome.reason);
+  const hooksPath = path.join(codexHome.dir, 'hooks.json');
+
+  const hooksResult = codexInstall.installCodexHooks({ hooksPath, hookLoaderCmd, hookStopCmd, dryRun });
+  console.log(`  Hooks file:  ${hooksResult.hooksPath}`);
+  if (dryRun) {
+    printHooksSummary(hooksResult.report, 'codex', hooksResult.hooksPath, null);
+    if (hooksResult.diff) {
+      console.log('  Diff:');
+      console.log(hooksResult.diff.split('\n').map((l) => (l ? `  ${l}` : l)).join('\n'));
+    } else {
+      console.log('  Diff: (no changes)');
+    }
+    console.log('');
+    console.log('Dry-run complete. Re-run without --dry-run to apply.');
+  } else if (!hooksResult.wrote) {
+    console.log('    no changes; nothing written.');
+  } else {
+    printHooksSummary(hooksResult.report, 'codex', hooksResult.hooksPath, hooksResult.backupPath);
+    console.log('');
+    console.log('Done. Restart Codex (or start a fresh session) to pick up the changes.');
+  }
+  console.log('');
 }
 
+// module.exports MUST be assigned BEFORE the require.main guard below: the
+// codex host path (mainCodex -> lib/codex-install.js's installCodexHooks())
+// lazily requires THIS file back (`require('../install.js')`) to reuse
+// mergeHooks()/readSettingsFileOrRefuse()/etc. rather than duplicating them.
+// mainCodex() has no internal `await` before that require fires, so it runs
+// synchronously inside the SAME tick as `main(cfg)` below — if module.exports
+// were still the pre-assignment default `{}` at that point (i.e. if this
+// block were AFTER the require.main guard, as it was before the codex host
+// path existed), the circular require would resolve to an empty object and
+// every installLib.* call in installCodexHooks() would throw.
 module.exports = {
   mergeHooks,
   isOurs,
@@ -862,4 +1035,14 @@ module.exports = {
   diffLines,
   reconcileFormatting,
   makeBackupPath,
+  readSettingsFileOrRefuse,
+  refuse,
 };
+
+if (require.main === module) {
+  const cfg = resolveConfig();
+  main(cfg).catch((err) => {
+    console.error('Error:', err.message);
+    process.exit(1);
+  });
+}

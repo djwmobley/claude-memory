@@ -22,7 +22,24 @@ const path = require('path');
 const { MARKER_FILENAME, LEGACY_MARKER_FILENAME } = require('./project-marker');
 
 const DEFAULT_PROMOTION_FILENAME = 'CLAUDE.md';
+const CODEX_PROMOTION_FILENAME   = 'AGENTS.md';
 const HANDOFF_MD_FILENAME        = 'handoff.md';
+
+/**
+ * Map a resolved `--host` value (see scripts/lib/host-target.js) to the
+ * promotion file's DEFAULT basename — used only when HANDOFF_PROMOTION_FILE
+ * is unset (that env var always wins regardless of host; see
+ * resolvePromotionFilePath below). Total classification: 'codex' -> AGENTS.md,
+ * everything else (including 'claude' and any value this function has never
+ * seen) -> the historical default, CLAUDE.md — an unrecognized host string
+ * must never invent a third promotion filename.
+ *
+ * @param {string} [host]
+ * @returns {string}
+ */
+function defaultPromotionFilenameForHost(host) {
+  return host === 'codex' ? CODEX_PROMOTION_FILENAME : DEFAULT_PROMOTION_FILENAME;
+}
 
 /**
  * Resolve the base directory that houses `projects/<id>/handoff.md`.
@@ -177,16 +194,24 @@ function _reuseOnDiskCasing(root, filename) {
  *       case-insensitive match already exists at root.
  *
  * @param {string} root - Project root directory.
+ * @param {string} [defaultFilename] - basename to use when
+ *   HANDOFF_PROMOTION_FILE is unset (the env var always wins over this).
+ *   Defaults to DEFAULT_PROMOTION_FILENAME ('CLAUDE.md') so every pre-existing
+ *   call site is byte-for-byte unchanged; callers that know the resolved host
+ *   pass `defaultPromotionFilenameForHost(host)` instead.
  * @returns {string} absolute path to the promotion target file.
  * @throws {Error} on any of the HARD ERROR branches above.
  */
-function resolvePromotionFilePath(root) {
+function resolvePromotionFilePath(root, defaultFilename) {
   const raw     = process.env.HANDOFF_PROMOTION_FILE;
   const trimmed = typeof raw === 'string' ? raw.trim() : '';
+  const fallback = typeof defaultFilename === 'string' && defaultFilename !== ''
+    ? defaultFilename
+    : DEFAULT_PROMOTION_FILENAME;
 
   let filename;
   if (trimmed === '') {
-    filename = DEFAULT_PROMOTION_FILENAME;
+    filename = fallback;
   } else if (raw !== trimmed) {
     throw new Error(
       `HANDOFF_PROMOTION_FILE is set to ${JSON.stringify(raw)}, which has leading or trailing ` +
@@ -218,5 +243,7 @@ module.exports = {
   resolveBaseDir,           // exported for tests
   resolveHandoffMdPath,
   resolvePromotionFilePath,
+  defaultPromotionFilenameForHost,
   DEFAULT_PROMOTION_FILENAME, // exported for tests
+  CODEX_PROMOTION_FILENAME,   // exported for tests
 };

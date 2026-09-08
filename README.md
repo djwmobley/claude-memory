@@ -8,7 +8,8 @@ right now. This project sits on top of that built-in memory and manages it: it
 tracks when notes were written, scores them for freshness, lets old facts be
 marked as no longer true, and pulls up what's relevant to the current session
 rather than dumping everything at once. It does this with no extra LLM calls per
-write — the only model invocation is the Claude Code session you're already in.
+write — the only model invocation is the coding-agent session you're already in
+(Claude Code, or another supported host — see [Supported hosts](#supported-hosts)).
 And if you come back to a project after months away, it can bring the notes that
 matter for that project back to the surface — even ones that had gone quiet in
 the meantime.
@@ -76,6 +77,22 @@ Full version: [docs/how-memory-works.md](docs/how-memory-works.md).
 | `/handoff:purge [--yes] [--dry-run]` | Delete everything. No undo. Use with care. | `--yes` skip confirmation prompt; `--dry-run` preview row counts only | [commands/handoff/purge.md](commands/handoff/purge.md) |
 | `/handoff:promote <id>` or `--subject <s> --predicate <p>` | Bump a journal entry into `CLAUDE.md` so it's always loaded, not just "when relevant." | `<id>` assertion ID; `--subject/--predicate/--object` content match; `--demote <id>` reverse | [commands/handoff/promote.md](commands/handoff/promote.md) |
 | `/handoff:resurrect <topic> [--revive] [--limit=N] [--json]` | Pull decay-suppressed notes on a topic back to the surface; dry-run by default. | `<topic>` seed text; `--revive`/`-r` un-suppress; `--limit=N` cap candidate set | [commands/handoff/resurrect.md](commands/handoff/resurrect.md) |
+
+---
+
+## Supported hosts
+
+This engine isn't Claude-Code-only. Each host wires up whatever surface it
+actually has:
+
+| Host | Slash commands | Hooks (auto-load/auto-close) | MCP tools |
+|------|----------------|-------------------------------|-----------|
+| Claude Code | Yes — `/handoff:*` (see [The slash commands](#the-slash-commands)) | Yes — SessionStart/SessionEnd | Yes |
+| Codex CLI | No — Codex has no slash-command surface; use the MCP tools directly, or the prose recipes in [docs/hosts/codex.md](docs/hosts/codex.md) | Yes — SessionStart/SessionEnd | Yes |
+
+Install for Codex: `node scripts/install.js --host codex`. Full walkthrough,
+what it writes and where, and manual fallbacks for hooks-disabled setups:
+[docs/hosts/codex.md](docs/hosts/codex.md).
 
 ---
 

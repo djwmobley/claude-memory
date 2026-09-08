@@ -91,7 +91,9 @@ const {
 const {
   resolveHandoffMdPath,
   resolvePromotionFilePath,
+  defaultPromotionFilenameForHost,
 } = require('./lib/handoff-paths');
+const { resolveHost } = require('./lib/host-target');
 const { embedQuery }                               = require('./lib/embed');
 const { runVectorQuery }                            = require('./lib/memory-view');
 const {
@@ -4360,7 +4362,7 @@ async function cmdInit(args) {
       const existingContent = fs.readFileSync(claudeMdPath, 'utf8');
       const healResult = healKeyPathsSection(existingContent, process.env);
       for (const note of healResult.notes) {
-        process.stderr.write(`handoff: CLAUDE.md Key paths: ${note}\n`);
+        process.stderr.write(`handoff: ${promotionFilename} Key paths: ${note}\n`);
       }
       if (healResult.outcome === 'healed') {
         const tmpPath = `${claudeMdPath}.tmp-${process.pid}`;
@@ -6072,7 +6074,22 @@ async function cmdLoaderLoad(opts = {}) {
 
 // ── loader-hook (SessionStart hook entry point) ───────────────────────────────
 
-async function cmdLoaderHook() {
+async function cmdLoaderHook(args) {
+  // ── S1 (codex-host-adapter): --host total classification ─────────────────
+  // Codex's hooks.json entries invoke this with a trailing ` --host codex`
+  // (see scripts/lib/host-target.js / install.js S3) so the SAME flag the
+  // Claude Code hooks path never sends must still be recognized and validated
+  // here — a malformed --host is a refusal (exit 2), never silently ignored.
+  // This check runs BEFORE the "swallow errors, exit 0" convention below: a
+  // malformed invocation is a caller bug (bad hooks.json), not a runtime
+  // condition the hook should degrade gracefully around.
+  {
+    const hostResult = resolveHost(args || [], process.env);
+    if (!hostResult.ok) {
+      process.stderr.write(`handoff loader-hook: refusing — ${hostResult.reason}\n`);
+      process.exit(2);
+    }
+  }
   // All errors are swallowed and exit 0 — the hook must never break session start.
   // S3: read the SessionStart hook JSON (source / session_id) up front. This is
   // read-only and side-effect-free — safe to do before the handoff.md-existence
@@ -7957,6 +7974,17 @@ async function cmdClose(args) {
     process.exit(1);
   }
 
+  // ── S4 (codex-host-adapter): resolve the durable-facts promotion path ONCE
+  // here, at entry, and thread it as a parameter into every write site below
+  // (the --dry-run preview branch AND the real write branch) — rather than
+  // each branch independently re-calling resolvePromotionFilePath() (which
+  // reads HANDOFF_PROMOTION_FILE from process.env internally). Claude's own
+  // behavior is unaffected: resolvePromotionFilePath(root) with no second
+  // argument still resolves the historical default (CLAUDE.md unless
+  // HANDOFF_PROMOTION_FILE overrides it) exactly as before this change.
+  const promotionPath     = resolvePromotionFilePath(root);
+  const promotionFilename = path.basename(promotionPath);
+
   // ── Item 6: Idempotent legacy-settings reconciliation ────────────────────
   // Remove orphaned project_settings rows keyed to the legacy encodeCwd(root) id
   // for this project ONLY — strictly scoped, idempotent, snapshot-first.
@@ -8450,9 +8478,9 @@ async function cmdClose(args) {
     if (payload.quick_references) console.log(`  quick_reference:    would write (subject=${path.basename(root)})`);
 
     // Durable-facts promotion candidates (same query as real close — read-only).
-    // Target filename is configurable via HANDOFF_PROMOTION_FILE (default CLAUDE.md).
+    // Target filename resolved once above (`promotionFilename`) — never
+    // re-derived here (S4: single ambient-env read per process).
     try {
-      const dryPromotionFilename = path.basename(resolvePromotionFilePath(root));
       const dryMultiSessionPred = db.buildEpochSecondsDiffPredicate('last_reinforced', 'created_at', '>', 86400);
       const { rows: dryCandidates } = await db.query(
         `SELECT id, subject, predicate, object, confidence, tier
@@ -8467,7 +8495,7 @@ async function cmdClose(args) {
         [projectId]
       );
       if (dryCandidates.length > 0) {
-        console.log(`\n  ${dryPromotionFilename} promotion candidates (would be surfaced — NOT written in dry-run):`);
+        console.log(`\n  ${promotionFilename} promotion candidates (would be surfaced — NOT written in dry-run):`);
         for (const r of dryCandidates) {
           console.log(`    [conf=${r.confidence}] ${r.subject} ${r.predicate} ${r.object}`);
         }
@@ -8551,19 +8579,18 @@ async function cmdClose(args) {
      ORDER BY confidence DESC`,
     [projectId]
   );
-  const closePromotionPath     = resolvePromotionFilePath(root);
-  const closePromotionFilename = path.basename(closePromotionPath);
+  // promotionPath / promotionFilename resolved once above (S4).
   if (candidates.length > 0) {
-    console.log(`\n  ${closePromotionFilename} promotion candidates (confidence >= 9, user_stated, consolidated, multi-session):`);
+    console.log(`\n  ${promotionFilename} promotion candidates (confidence >= 9, user_stated, consolidated, multi-session):`);
     for (const row of candidates) {
       console.log(`    [conf=${row.confidence}] ${row.subject} ${row.predicate} ${row.object}`);
     }
-    console.log(`  Review and run /handoff:close with confirm_claude_md_promotion=true to write to ${closePromotionFilename}.`);
+    console.log(`  Review and run /handoff:close with confirm_claude_md_promotion=true to write to ${promotionFilename}.`);
   }
 
   // Write to the promotion file if requested and candidates exist.
   if (payload.confirm_claude_md_promotion && candidates.length > 0) {
-    const claudeMdPath = closePromotionPath;
+    const claudeMdPath = promotionPath;
     if (fs.existsSync(claudeMdPath)) {
       // heal-on-touch: heal a legacy/absolute "## Key paths" section before the
       // Durable-facts rewrite below — close writes the file anyway, so fold
@@ -8571,10 +8598,10 @@ async function cmdClose(args) {
       const rawExisting = fs.readFileSync(claudeMdPath, 'utf8');
       const healResult  = healKeyPathsSection(rawExisting, process.env);
       for (const note of healResult.notes) {
-        process.stderr.write(`handoff: CLAUDE.md Key paths: ${note}\n`);
+        process.stderr.write(`handoff: ${promotionFilename} Key paths: ${note}\n`);
       }
       if (healResult.outcome === 'healed') {
-        console.log(`  ${closePromotionFilename}: healed absolute Key paths bullet(s).`);
+        console.log(`  ${promotionFilename}: healed absolute Key paths bullet(s).`);
       }
       const existing  = healResult.text;
       const today     = new Date().toISOString().slice(0, 10);
@@ -8589,7 +8616,7 @@ async function cmdClose(args) {
             `## Durable facts\n${additions}\n`)
         : existing + `\n## Durable facts\n${additions}\n`;
       fs.writeFileSync(claudeMdPath, durableFacts, 'utf8');
-      console.log(`\n  ${closePromotionFilename} updated with ${candidates.length} durable fact(s).`);
+      console.log(`\n  ${promotionFilename} updated with ${candidates.length} durable fact(s).`);
     }
   }
 
@@ -8600,7 +8627,7 @@ async function cmdClose(args) {
       await setSetting(db, projectId, 'multi_author_detected', 'true');
     } catch (_) { /* non-fatal */ }
     process.stderr.write(
-      `[handoff] multi-author repo detected — see README#trust-model before relying on ${closePromotionFilename} auto-promotion\n`
+      `[handoff] multi-author repo detected — see README#trust-model before relying on ${promotionFilename} auto-promotion\n`
     );
   }
 
@@ -9425,7 +9452,18 @@ async function cmdPurge(args) {
  * cannot happen at all when there is no DB connection or no project id to
  * key the row on — see BLIND SPOTS in the PR description.
  */
-async function cmdLoaderStop() {
+async function cmdLoaderStop(args) {
+  // codex-host-adapter --host total classification — BEFORE any other I/O.
+  // Codex's SessionEnd hooks.json entry invokes this with a trailing
+  // ` --host codex` (see scripts/lib/host-target.js / install.js S3); a
+  // malformed value is a refusal (exit 2), never silently ignored.
+  {
+    const hostResult = resolveHost(args || [], process.env);
+    if (!hostResult.ok) {
+      process.stderr.write(`handoff loader-stop: refusing — ${hostResult.reason}\n`);
+      process.exit(2);
+    }
+  }
   // S1 — total classification BEFORE any file or DB I/O.
   const hookPayload = readHookStdinPermissive();
   if (!hookPayload || hookPayload.hook_event_name !== 'SessionEnd') {
@@ -10603,8 +10641,8 @@ async function main() {
     status:          () => cmdStatus(rest),
     resume:          () => cmdResume(),
     'loader-load':   () => cmdLoaderLoad(),
-    'loader-hook':   () => cmdLoaderHook(),
-    'loader-stop':   () => cmdLoaderStop(),
+    'loader-hook':   () => cmdLoaderHook(rest),
+    'loader-stop':   () => cmdLoaderStop(rest),
     drop:            () => cmdDrop(),
     checkpoint:      () => cmdCheckpoint(rest),
     close:           () => cmdClose(rest),

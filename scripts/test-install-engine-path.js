@@ -54,9 +54,15 @@ function resolveInstallScript() {
     return path.join(REPO_ROOT, 'scripts', 'install.js');
   }
   const engineRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'install-engine-path-copy-'));
-  fs.mkdirSync(path.join(engineRoot, 'scripts'), { recursive: true });
+  fs.mkdirSync(path.join(engineRoot, 'scripts', 'lib'), { recursive: true });
   fs.mkdirSync(path.join(engineRoot, 'commands', 'handoff'), { recursive: true });
   fs.copyFileSync(path.join(REPO_ROOT, 'scripts', 'install.js'), path.join(engineRoot, 'scripts', 'install.js'));
+  // install.js requires ./lib/host-target (and, on the codex host path,
+  // ./lib/codex-install) — both must travel with a standalone copy.
+  const libDir = path.join(REPO_ROOT, 'scripts', 'lib');
+  for (const f of fs.readdirSync(libDir)) {
+    if (f.endsWith('.js')) fs.copyFileSync(path.join(libDir, f), path.join(engineRoot, 'scripts', 'lib', f));
+  }
   for (const f of fs.readdirSync(COMMANDS_DIR)) {
     if (f.endsWith('.md')) fs.copyFileSync(path.join(COMMANDS_DIR, f), path.join(engineRoot, 'commands', 'handoff', f));
   }
