@@ -1452,19 +1452,67 @@ function formatSessionMarkersForStatus(markers) {
 }
 
 /**
+ * Resolve a session id from the two host environment variables — total
+ * classification over {CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID, host}:
+ *   neither set                             -> null
+ *   exactly one set                         -> that one, no ambiguity
+ *   both set and EQUAL                      -> that value, no ambiguity
+ *   both set, DIFFERENT, host === 'codex'   -> CODEX_THREAD_ID (notice printed)
+ *   both set, DIFFERENT, host === 'claude'  -> CLAUDE_CODE_SESSION_ID (notice printed)
+ *   both set, DIFFERENT, host absent/null   -> CLAUDE_CODE_SESSION_ID (default; notice printed)
+ *
+ * `host` is the value already resolved by resolveHost() ('claude' | 'codex'),
+ * or null/undefined for a call site that has no --host signal at all (e.g.
+ * the MCP-invoked close/checkpoint paths, which never receive --host —
+ * MCP registration always shells out the same `node handoff-mcp.mjs`
+ * regardless of host).
+ *
+ * CODEX_THREAD_ID (a UUIDv7-style id) was verified set by a real interactive
+ * Codex session on 2026-09-09; that same session did NOT set
+ * CLAUDE_CODE_SESSION_ID. The Codex hook payload's own `session_id` field and
+ * CODEX_THREAD_ID are EXPECTED to carry the same id — stated as an
+ * expectation here, not verified against a captured fixture pairing both.
+ *
+ * Each env var is trimmed before use; a whitespace-only value (" ") is
+ * treated as absent, same as unset — an env var accidentally set to blank
+ * space by a wrapper script must not count as "set" here.
+ */
+function resolveSessionIdFromEnv(host) {
+  const claudeRaw = process.env.CLAUDE_CODE_SESSION_ID;
+  const codexRaw  = process.env.CODEX_THREAD_ID;
+  const claudeId  = typeof claudeRaw === 'string' ? claudeRaw.trim() : '';
+  const codexId   = typeof codexRaw  === 'string' ? codexRaw.trim()  : '';
+  const hasClaudeId = claudeId.length > 0;
+  const hasCodexId  = codexId.length > 0;
+
+  if (!hasClaudeId && !hasCodexId) return null;
+  if (hasClaudeId && !hasCodexId) return claudeId;
+  if (!hasClaudeId && hasCodexId) return codexId;
+  if (claudeId === codexId) return claudeId;
+
+  const preferCodex = host === 'codex';
+  const chosen      = preferCodex ? codexId : claudeId;
+  const chosenName  = preferCodex ? 'CODEX_THREAD_ID' : 'CLAUDE_CODE_SESSION_ID';
+  const otherName   = preferCodex ? 'CLAUDE_CODE_SESSION_ID' : 'CODEX_THREAD_ID';
+  process.stderr.write(
+    `handoff: CLAUDE_CODE_SESSION_ID and CODEX_THREAD_ID are both set and differ — ` +
+    `using ${chosenName} (${host ? `--host ${host}` : 'no --host'}), ignoring ${otherName}.\n`
+  );
+  return chosen;
+}
+
+/**
  * Resolve the current session id from a Claude Code hook stdin payload
- * (already parsed — see readHookStdinPermissive), falling back to the
- * CLAUDE_CODE_SESSION_ID env var. Returns null when neither is available
+ * (already parsed — see readHookStdinPermissive), falling back to
+ * resolveSessionIdFromEnv(host). Returns null when neither is available
  * (never fabricates an id here — loader-hook's fresh-marker write is the
  * only place a random fallback id is appropriate; see cmdLoaderHook).
  */
-function resolveHookSessionId(hookPayload) {
+function resolveHookSessionId(hookPayload, host) {
   if (hookPayload && typeof hookPayload.session_id === 'string' && hookPayload.session_id.length > 0) {
     return hookPayload.session_id;
   }
-  const envId = process.env.CLAUDE_CODE_SESSION_ID;
-  if (typeof envId === 'string' && envId.length > 0) return envId;
-  return null;
+  return resolveSessionIdFromEnv(host || null);
 }
 
 /**
@@ -6083,12 +6131,14 @@ async function cmdLoaderHook(args) {
   // This check runs BEFORE the "swallow errors, exit 0" convention below: a
   // malformed invocation is a caller bug (bad hooks.json), not a runtime
   // condition the hook should degrade gracefully around.
+  let host = 'claude';
   {
     const hostResult = resolveHost(args || [], process.env);
     if (!hostResult.ok) {
       process.stderr.write(`handoff loader-hook: refusing — ${hostResult.reason}\n`);
       process.exit(2);
     }
+    host = hostResult.host;
   }
   // All errors are swallowed and exit 0 — the hook must never break session start.
   // S3: read the SessionStart hook JSON (source / session_id) up front. This is
@@ -6192,7 +6242,7 @@ async function cmdLoaderHook(args) {
     // markers are stale" and "fresh marker written" that two separate locked
     // transactions would otherwise leave open.
     const hookSource       = (hookPayload && typeof hookPayload.source === 'string') ? hookPayload.source : null;
-    const currentSessionId = resolveHookSessionId(hookPayload) || crypto.randomUUID();
+    const currentSessionId = resolveHookSessionId(hookPayload, host) || crypto.randomUUID();
     let lateCloseDivergenceLines = [];
 
     if (markerDb) {
@@ -6304,7 +6354,7 @@ async function cmdResume() {
       markerDb = null;
     }
     if (markerDb) {
-      const resumeSessionId = resolveHookSessionId(null) || crypto.randomUUID();
+      const resumeSessionId = resolveHookSessionId(null, null) || crypto.randomUUID();
       await addSessionMarker(markerDb, projectId, resumeSessionId, new Date().toISOString());
       if (markerDbOwned) await markerDb.end();
     }
@@ -7811,7 +7861,10 @@ async function cmdCheckpoint(args) {
 //
 // Resolve the session id for cmdClose attribution in priority order:
 //   1. payload.session_id  — explicit value supplied by the skill
-//   2. process.env.CLAUDE_CODE_SESSION_ID  — set by the Claude Code harness at runtime
+//   2. resolveSessionIdFromEnv(null) — CLAUDE_CODE_SESSION_ID, then
+//      CODEX_THREAD_ID (this call site never receives --host: the MCP server
+//      shells out `node handoff-mcp.mjs` identically regardless of host, so
+//      host is always treated as absent here — see resolveSessionIdFromEnv)
 //   3. DB marker 'session_in_progress'  — seeded by cmdResume / SessionStart hook
 //
 // The env var fallback exists because the heredoc pattern used in close.md is
@@ -7823,10 +7876,8 @@ async function resolveSessionId(db, projectId, payload) {
   if (typeof payload.session_id === 'string' && payload.session_id.length > 0) {
     return payload.session_id;
   }
-  const envSessionId = process.env.CLAUDE_CODE_SESSION_ID;
-  if (typeof envSessionId === 'string' && envSessionId.length > 0) {
-    return envSessionId;
-  }
+  const envSessionId = resolveSessionIdFromEnv(null);
+  if (envSessionId) return envSessionId;
   // S3: session_in_progress is now a JSON array of per-session markers — resolve
   // to the single most-recently-written one (see latestSessionMarker's header comment).
   const markers = await getSessionMarkers(db, projectId);
@@ -7859,9 +7910,7 @@ async function clearSessionMarkerForClose(db, projectId, payload) {
   const currentSessionId =
     (typeof payload.session_id === 'string' && payload.session_id.length > 0)
       ? payload.session_id
-      : (typeof process.env.CLAUDE_CODE_SESSION_ID === 'string' && process.env.CLAUDE_CODE_SESSION_ID.length > 0)
-        ? process.env.CLAUDE_CODE_SESSION_ID
-        : null;
+      : resolveSessionIdFromEnv(null);
   const cleared = await withSessionMarkerLock(db, projectId, async () => {
     const markers = await getSessionMarkers(db, projectId);
     const idx = findMatchingMarkerIndex(markers, currentSessionId);
@@ -9457,12 +9506,14 @@ async function cmdLoaderStop(args) {
   // Codex's SessionEnd hooks.json entry invokes this with a trailing
   // ` --host codex` (see scripts/lib/host-target.js / install.js S3); a
   // malformed value is a refusal (exit 2), never silently ignored.
+  let host = 'claude';
   {
     const hostResult = resolveHost(args || [], process.env);
     if (!hostResult.ok) {
       process.stderr.write(`handoff loader-stop: refusing — ${hostResult.reason}\n`);
       process.exit(2);
     }
+    host = hostResult.host;
   }
   // S1 — total classification BEFORE any file or DB I/O.
   const hookPayload = readHookStdinPermissive();
@@ -9470,7 +9521,7 @@ async function cmdLoaderStop(args) {
     process.exit(0);
   }
 
-  const currentSessionId = resolveHookSessionId(hookPayload);
+  const currentSessionId = resolveHookSessionId(hookPayload, host);
 
   let db = null;
   let projectId = null;
@@ -10776,6 +10827,12 @@ if (require.main === module) {
     writeAssertionWithSupersession,
     getSetting,
     resolveSessionId,
+    // codex-host-adapter hardening: CODEX_THREAD_ID/CLAUDE_CODE_SESSION_ID
+    // fallback-chain classification — exported for scripts/test-loader-stop-
+    // gate.js's direct unit coverage of every branch (no subprocess spawn
+    // needed to exercise the pure classification logic).
+    resolveHookSessionId,
+    resolveSessionIdFromEnv,
     ASSERTION_TIER_PROBATIONARY,
     ASSERTION_TIER_CONSOLIDATED,
     // Session-marker concurrency hardening — exposed for

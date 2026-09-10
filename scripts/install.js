@@ -966,22 +966,67 @@ async function mainCodex(cfg) {
   }
   console.log(`  [OK]    codex found: ${discovery.command} (${discovery.version || 'version unknown'})`);
 
-  const already = codexInstall.checkHandoffRegistered(discovery.command);
-  if (already.registered) {
-    console.log(`  [OK]    MCP server "${codexInstall.MCP_SERVER_NAME}" already registered — skipping.`);
-  } else if (dryRun) {
-    const argv = codexInstall.buildMcpAddArgv(mcpEnginePath);
-    console.log(`  [DRY]   would run: codex ${argv.join(' ')}`);
-  } else {
-    const argv = codexInstall.buildMcpAddArgv(mcpEnginePath);
-    console.log(`  Running: codex ${argv.join(' ')}`);
-    const result = codexInstall.registerHandoffMcp(discovery.command, mcpEnginePath);
-    if (!result.ok) {
-      console.error(`Refusing: \`codex mcp add\` failed (exit ${result.status ?? 'spawn error'}).`);
-      if (result.stderr) console.error(result.stderr.trim());
+  const codexHomeForBackup = codexInstall.resolveCodexHome(process.env);
+  const registration = codexInstall.ensureHandoffRegistered({
+    codexCommand: discovery.command,
+    enginePath: mcpEnginePath,
+    codexHomeDir: codexHomeForBackup.ok ? codexHomeForBackup.dir : os.homedir(),
+    dryRun,
+  });
+
+  switch (registration.action) {
+    case 'skip': {
+      const note = registration.state === 'REGISTERED_UNVERIFIED' ? ' (unverified — see note below)' : '';
+      console.log(`  [OK]    MCP server "${codexInstall.MCP_SERVER_NAME}" already registered${note} — skipping.`);
+      if (registration.state === 'REGISTERED_UNVERIFIED') console.log(`          ${registration.detail}`);
+      break;
+    }
+    case 'would-add': {
+      const argv = codexInstall.buildMcpAddArgv(mcpEnginePath);
+      console.log(`  [DRY]   ${registration.detail}`);
+      console.log(`  [DRY]   would run: codex ${argv.join(' ')}`);
+      break;
+    }
+    case 'added': {
+      const argv = registration.addResult.argv;
+      if (registration.before && registration.before.state === 'NEEDS_REPAIR') {
+        console.log(`  [FIX]   registration pointed at a different path — repairing.`);
+        console.log(`            old: ${registration.before.oldCommand} ${JSON.stringify(registration.before.oldArgs)}`);
+        console.log(`            new: node ${registration.before.newEnginePath}`);
+      }
+      console.log(`  [WARN]  \`codex mcp add\` rewrites the entire config.toml (key order, array format, ` +
+        `and unrelated entries can shift) — not a targeted patch.`);
+      if (registration.backup.skipped) {
+        console.log(`  [INFO]  ${registration.backup.reason}`);
+      } else {
+        console.log(`  [OK]    config.toml backed up to ${registration.backup.backupPath}`);
+      }
+      console.log(`  Running: codex ${argv.join(' ')}`);
+      const note = registration.state === 'REGISTERED_UNVERIFIED' ? ' (unverified — see note below)' : '';
+      console.log(`  [OK]    MCP server "${codexInstall.MCP_SERVER_NAME}" registered${note}.`);
+      if (registration.state === 'REGISTERED_UNVERIFIED') console.log(`          ${registration.detail}`);
+      break;
+    }
+    case 'add-failed': {
+      console.error(`Refusing: \`codex mcp add\` ran but post-add verification did not confirm registration ` +
+        `(state: ${registration.state}).`);
+      console.error(registration.detail);
+      if (registration.addResult && registration.addResult.stderr) console.error(registration.addResult.stderr.trim());
+      if (registration.backup && !registration.backup.skipped) {
+        console.error(`config.toml backup is available at: ${registration.backup.backupPath}`);
+      }
+      process.exit(1);
+      break;
+    }
+    case 'abort':
+    default: {
+      console.error(`Refusing: could not determine whether "${codexInstall.MCP_SERVER_NAME}" is registered ` +
+        `(state: ${registration.state}).`);
+      console.error(registration.detail);
+      if (registration.stdout) console.error(`stdout: ${registration.stdout.trim()}`);
+      if (registration.stderr) console.error(`stderr: ${registration.stderr.trim()}`);
       process.exit(2);
     }
-    console.log(`  [OK]    MCP server "${codexInstall.MCP_SERVER_NAME}" registered.`);
   }
   console.log('');
 
