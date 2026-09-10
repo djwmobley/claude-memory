@@ -331,12 +331,28 @@ async function toolHandoffResume({ projectRoot }) {
   return textResult({ context: stdout, stderr_tail: stderr ? stderrTail(stderr, 20) : null });
 }
 
-async function runPayloadSubcommand(subcommand, { projectRoot, payload }) {
+// fix(close): sessionId is optional and, when a non-blank string is passed,
+// wins over anything the child process would otherwise resolve from its own
+// environment — this MCP server always shells out `node handoff-mcp.mjs`
+// with only PROJECT_ROOT forwarded (see runNode), so the closing session's
+// true identity (CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID from the CALLER's
+// environment) never reaches the engine unless a caller places it here. A
+// blank/whitespace-only sessionId is treated as "not supplied" (same
+// trim-then-empty-is-absent rule the engine's own resolver uses) so it falls
+// through to the payload's own session_id, if any, unchanged.
+function applySessionId(payload, sessionId) {
+  const trimmed = typeof sessionId === 'string' ? sessionId.trim() : '';
+  if (trimmed.length === 0) return payload;
+  return { ...payload, session_id: trimmed };
+}
+
+async function runPayloadSubcommand(subcommand, { projectRoot, payload, sessionId }) {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
     return toolError(`payload must be a plain JSON object (not array or primitive) for handoff ${subcommand}.`);
   }
 
-  const tempFile = writeTempJson(`handoff-mcp-${subcommand}`, payload);
+  const effectivePayload = applySessionId(payload, sessionId);
+  const tempFile = writeTempJson(`handoff-mcp-${subcommand}`, effectivePayload);
   try {
     const stdinText = fs.readFileSync(tempFile, 'utf8');
     const { code, stdout, stderr } = await runNode({
@@ -362,6 +378,16 @@ async function toolHandoffCheckpoint(args) {
 async function toolHandoffClose(args) {
   return runPayloadSubcommand('close', args);
 }
+
+// fix(close): shared description snippet for the optional sessionId param on
+// both handoff_checkpoint and handoff_close — see applySessionId.
+const SESSION_ID_PARAM_DESCRIPTION =
+  'Optional explicit session id for this close/checkpoint\'s attribution and session_in_progress-marker ' +
+  'reconciliation. When supplied it is placed into the payload\'s session_id BEFORE the write, taking priority ' +
+  'over any value the engine subprocess would otherwise resolve from its own environment (this MCP server never ' +
+  'forwards the caller\'s CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID to the child process). Codex callers SHOULD pass ' +
+  'their CODEX_THREAD_ID here so a close truthfully reports whether it cleared ITS OWN session_in_progress marker ' +
+  'rather than a sibling session\'s.';
 
 async function toolHandoffInit({ projectRoot, name }) {
   const args = name ? ['init', name, '-y'] : ['init', '-y'];
@@ -934,6 +960,7 @@ function buildServer() {
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         payload: z.record(z.string(), z.any()).describe('Extraction payload object — see description for allowed keys and field types.'),
+        sessionId: z.string().optional().describe(SESSION_ID_PARAM_DESCRIPTION),
       },
     },
     async (args) => {
@@ -972,6 +999,7 @@ function buildServer() {
           'COMPLETE extraction payload object — same field shapes as handoff_checkpoint, but close is single-pass: ' +
           'entities/assertions/edges should be populated in this one call, not deferred to a follow-up close.'
         ),
+        sessionId: z.string().optional().describe(SESSION_ID_PARAM_DESCRIPTION),
       },
     },
     async (args) => {
