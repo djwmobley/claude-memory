@@ -1,5 +1,8 @@
 # Quickstart
 
+Using OpenAI Codex? Start at
+[docs/hosts/codex-quickstart.md](docs/hosts/codex-quickstart.md).
+
 Claude already has memory across sessions — it reads `CLAUDE.md` and per-project memory files every time it starts. The problem is those files get stale: notes pile up, old facts stay even after they stop being true, and when the file gets long enough Claude can't reliably surface what's actually relevant right now. This project sits on top of that built-in memory and manages it: it tracks when notes were written, scores them for freshness, lets old facts be marked as no longer true, and pulls up what's relevant to the current session rather than dumping everything at once. And if you come back to a project after months away, it can bring the notes that matter for that project back to the surface — even ones that had gone quiet in the meantime.
 
 > Before you start, check [PREREQS.md](PREREQS.md) to make sure Node.js and Postgres are installed and running.
