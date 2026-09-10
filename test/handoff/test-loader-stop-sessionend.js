@@ -510,6 +510,147 @@ async function runTests() {
     assert.strictEqual(rec.outcome, 'explicit_close_present', `got: ${JSON.stringify(rec)}`);
   });
 
+  // ── PR4: marker identity hardening — nested-child env-inheritance defect ──
+  // Reproduces the confirmed root cause: a nested `claude -p` child inherits
+  // an ancestor's CODEX_THREAD_ID while also having its own distinct
+  // CLAUDE_CODE_SESSION_ID, and the hook payload itself carries no
+  // session_id. Under the OLD host-based tie-break this misattributed the
+  // child's SessionEnd to the PARENT's identity and deleted the parent's
+  // real marker. Under the fix, this must resolve to `null` (unresolved) and
+  // persist outcome=session_id_unresolved — BOTH markers survive untouched,
+  // regardless of --host. Deliberately placed BEFORE T13/T14: T14 turns
+  // handoffPath into a directory, which would make writeImplicitClose throw
+  // for the tests below that DO expect an implicit close to run.
+  async function runNestedChildCase(hostArgs, label) {
+    await clearSettingRaw(db, projectId, 'last_loader_stop');
+    await clearMarkerRaw(db, projectId);
+    const parentId = `codex-thread-parent-${label}`;
+    const childId  = `claude-session-child-${label}`;
+    const parentTs = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const childTs  = new Date().toISOString();
+    await setMarkerRaw(db, projectId, [
+      { session_id: parentId, ts: parentTs },
+      { session_id: childId, ts: childTs },
+    ]);
+
+    const env = {
+      ...process.env,
+      PROJECT_ROOT: fakeRoot,
+      CODEX_THREAD_ID: parentId,        // inherited from the parent process
+      CLAUDE_CODE_SESSION_ID: childId,  // the child's own, real identity
+    };
+    const r = spawnSync(
+      process.execPath,
+      [HELPER, 'loader-stop', ...hostArgs],
+      { cwd: fakeRoot, env, encoding: 'utf8', timeout: 15000, input: JSON.stringify({ hook_event_name: 'SessionEnd' }) }
+    );
+    assert.strictEqual(r.status, 0, `expected exit 0, got ${r.status}; stderr: ${r.stderr}`);
+
+    const rec = await getLastLoaderStop(db, projectId);
+    assert.ok(rec, 'expected a last_loader_stop row to be persisted');
+    assert.strictEqual(rec.outcome, 'session_id_unresolved', `${label}: got ${JSON.stringify(rec)}`);
+
+    const markers = await getMarkerRaw(db, projectId);
+    assert.ok((markers || []).some((m) => m.session_id === parentId), `${label}: parent marker must survive`);
+    assert.ok((markers || []).some((m) => m.session_id === childId), `${label}: child marker must survive`);
+  }
+
+  await test('PR4: nested child, --host codex, no payload session_id -> session_id_unresolved, both markers survive (reproduces the confirmed defect)', async () => {
+    await runNestedChildCase(['--host', 'codex'], 'codex');
+  });
+  await test('PR4: nested child, --host claude, no payload session_id -> session_id_unresolved, both markers survive', async () => {
+    await runNestedChildCase(['--host', 'claude'], 'claude');
+  });
+  await test('PR4: nested child, no --host at all, no payload session_id -> session_id_unresolved, both markers survive', async () => {
+    await runNestedChildCase([], 'nohost');
+  });
+
+  await test('PR4: payload.session_id wins over an ambiguous env pair (and a whitespace-only payload id is treated as absent)', async () => {
+    await clearSettingRaw(db, projectId, 'last_loader_stop');
+    await clearMarkerRaw(db, projectId);
+    const targetId = 'sess-payload-wins';
+    await setMarkerRaw(db, projectId, [{ session_id: targetId, ts: new Date().toISOString() }]);
+    const env = { ...process.env, PROJECT_ROOT: fakeRoot, CODEX_THREAD_ID: 'env-a', CLAUDE_CODE_SESSION_ID: 'env-b' };
+
+    const r = spawnSync(process.execPath, [HELPER, 'loader-stop', '--host', 'codex'], {
+      cwd: fakeRoot, env, encoding: 'utf8', timeout: 15000,
+      input: JSON.stringify({ hook_event_name: 'SessionEnd', session_id: targetId }),
+    });
+    assert.strictEqual(r.status, 0, `expected exit 0, got ${r.status}; stderr: ${r.stderr}`);
+    const rec = await getLastLoaderStop(db, projectId);
+    assert.strictEqual(rec.outcome, 'implicit_close_recorded', `got: ${JSON.stringify(rec)}`);
+    const markers = await getMarkerRaw(db, projectId);
+    assert.ok(markers === null || markers.length === 0, 'the targeted marker must be cleared');
+
+    // Whitespace-only payload session_id is treated as absent -> falls through
+    // to the still-ambiguous env pair -> session_id_unresolved, not a crash.
+    await clearSettingRaw(db, projectId, 'last_loader_stop');
+    await setMarkerRaw(db, projectId, [{ session_id: targetId, ts: new Date().toISOString() }]);
+    const r2 = spawnSync(process.execPath, [HELPER, 'loader-stop', '--host', 'codex'], {
+      cwd: fakeRoot, env, encoding: 'utf8', timeout: 15000,
+      input: JSON.stringify({ hook_event_name: 'SessionEnd', session_id: '   ' }),
+    });
+    assert.strictEqual(r2.status, 0, `expected exit 0, got ${r2.status}; stderr: ${r2.stderr}`);
+    const rec2 = await getLastLoaderStop(db, projectId);
+    assert.strictEqual(rec2.outcome, 'session_id_unresolved', `whitespace payload id must be treated as absent; got: ${JSON.stringify(rec2)}`);
+    const markers2 = await getMarkerRaw(db, projectId);
+    assert.ok((markers2 || []).some((m) => m.session_id === targetId), 'marker must survive when payload id is whitespace-only and env is ambiguous');
+  });
+
+  await test('PR4: CLAUDE_CODE_SESSION_ID and CODEX_THREAD_ID both set and EQUAL -> resolves normally, implicit close runs', async () => {
+    await clearSettingRaw(db, projectId, 'last_loader_stop');
+    await clearMarkerRaw(db, projectId);
+    const sid = 'sess-equal-env';
+    await setMarkerRaw(db, projectId, [{ session_id: sid, ts: new Date().toISOString() }]);
+    const env = { ...process.env, PROJECT_ROOT: fakeRoot, CLAUDE_CODE_SESSION_ID: sid, CODEX_THREAD_ID: sid };
+    const r = spawnSync(process.execPath, [HELPER, 'loader-stop'], {
+      cwd: fakeRoot, env, encoding: 'utf8', timeout: 15000,
+      input: JSON.stringify({ hook_event_name: 'SessionEnd' }),
+    });
+    assert.strictEqual(r.status, 0, `expected exit 0, got ${r.status}; stderr: ${r.stderr}`);
+    const rec = await getLastLoaderStop(db, projectId);
+    assert.strictEqual(rec.outcome, 'implicit_close_recorded', `got: ${JSON.stringify(rec)}`);
+    const markers = await getMarkerRaw(db, projectId);
+    assert.ok(markers === null || markers.length === 0, 'the marker must be cleared when both env vars agree');
+  });
+
+  await test('PR4 §3: null-wildcard rescoped at loader-stop — a legacy null marker coexisting with a real, non-matching marker is left in place (no auto-claim)', async () => {
+    await clearSettingRaw(db, projectId, 'last_loader_stop');
+    await clearMarkerRaw(db, projectId);
+    await setMarkerRaw(db, projectId, [
+      { session_id: null, ts: new Date().toISOString() },
+      { session_id: 'sess-owner-2', ts: new Date().toISOString() },
+    ]);
+    const r = runHook('loader-stop', { hook_event_name: 'SessionEnd', session_id: 'sess-caller-no-match' }, { fakeRoot });
+    assert.strictEqual(r.status, 0, `expected exit 0, got ${r.status}; stderr: ${r.stderr}`);
+    const markers = await getMarkerRaw(db, projectId);
+    assert.strictEqual((markers || []).length, 2, 'both entries (including the null one) must survive — no wildcard auto-claim');
+  });
+
+  await test('PR4 R4: SessionStart add-time with an ambiguous env pair and no payload session_id mints a fresh UUID and APPENDS (never dedupe-overwrites a sibling)', async () => {
+    await clearMarkerRaw(db, projectId);
+    const siblingTs = new Date(Date.now() - 1 * HOUR).toISOString(); // fresh, below the 24h stale threshold
+    await setMarkerRaw(db, projectId, [{ session_id: 'sess-sibling-addtime', ts: siblingTs }]);
+    const env = { ...process.env, PROJECT_ROOT: fakeRoot, CLAUDE_CODE_SESSION_ID: 'env-add-a', CODEX_THREAD_ID: 'env-add-b' };
+    const r = spawnSync(process.execPath, [HELPER, 'loader-hook'], {
+      cwd: fakeRoot, env, encoding: 'utf8', timeout: 15000,
+      input: JSON.stringify({ hook_event_name: 'SessionStart', source: 'startup' }),
+    });
+    assert.strictEqual(r.status, 0, `expected exit 0, got ${r.status}; stderr: ${r.stderr}`);
+
+    const markers = await getMarkerRaw(db, projectId);
+    const sibling = (markers || []).find((m) => m.session_id === 'sess-sibling-addtime');
+    assert.ok(sibling, 'the sibling marker must still be present');
+    assert.strictEqual(sibling.ts, siblingTs, 'the sibling marker must be untouched (same timestamp), never dedupe-overwritten');
+
+    const others = (markers || []).filter((m) => m.session_id !== 'sess-sibling-addtime');
+    assert.strictEqual(others.length, 1, `expected exactly one freshly-minted marker appended, got: ${JSON.stringify(markers)}`);
+    assert.ok(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(others[0].session_id),
+      `appended marker session_id should be a fresh UUID mint, not an ambiguous env value, got: ${others[0].session_id}`
+    );
+  });
+
   // ── T13: handoff:status renders the last_loader_stop line ────────────────
   // (Deliberately BEFORE T14: T14 turns handoffPath into a directory, which
   // would make handoff:status itself throw EISDIR reading it.)
