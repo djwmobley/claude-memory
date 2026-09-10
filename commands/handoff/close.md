@@ -340,7 +340,7 @@ echo '<JSON_PAYLOAD>' | PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" clos
   "tldr": "3–5 sentences summarizing session state.",
   "open_threads": ["pending decision 1", "blocked task 2"],
   "quick_references": "telegraphic: named handles, file paths, line refs — function words stripped",
-  "session_id": "optional — engine resolves in order: (1) this value, (2) CLAUDE_CODE_SESSION_ID env var, (3) session_in_progress DB marker; omit unless you know the actual session id",
+  "session_id": "optional — engine resolves in order: (1) this value, (2) CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID env vars, (3) session_in_progress DB marker; omit unless you know the actual session id. This value ALSO determines which session_in_progress marker gets cleared (clearSessionMarkerForClose): if omitted and CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID are both set but DIFFER, the engine refuses to guess — no marker is cleared and the close reports 'session id unresolved' rather than risking a sibling session's marker.",
   "confirm_claude_md_promotion": false
 }
 ```

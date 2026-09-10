@@ -77,9 +77,24 @@ function runNode({ scriptPath, args, cwd, env, stdin }) {
   return new Promise((resolve) => {
     let child;
     try {
+      // PR4 R5: never let THIS MCP server's own ambient session-identity env
+      // vars leak into the engine subprocess. This server process can itself
+      // be running inside a Claude Code or Codex session (inheriting
+      // CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID from ITS OWN parent) — the
+      // prior code here spread `...process.env` unfiltered, which forwarded
+      // those ambient values to every child regardless of whose close/
+      // checkpoint call it actually was. The engine's session resolvers
+      // (resolveClearSessionId / resolveHookSessionId) must only ever see a
+      // session id that a caller supplied explicitly (payload.session_id via
+      // applySessionId below), never one inherited through this process's
+      // own environment. An explicit `env` override passed by a caller (if
+      // any) is spread AFTER this and still wins.
+      const baseEnv = { ...process.env };
+      delete baseEnv.CLAUDE_CODE_SESSION_ID;
+      delete baseEnv.CODEX_THREAD_ID;
       child = spawn(process.execPath, [scriptPath, ...args], {
         cwd: cwd || path.dirname(scriptPath),
-        env: { ...process.env, ...env },
+        env: { ...baseEnv, ...env },
         windowsHide: true,
       });
     } catch (err) {
@@ -331,13 +346,13 @@ async function toolHandoffResume({ projectRoot }) {
   return textResult({ context: stdout, stderr_tail: stderr ? stderrTail(stderr, 20) : null });
 }
 
-// fix(close): sessionId is optional and, when a non-blank string is passed,
-// wins over anything the child process would otherwise resolve from its own
-// environment — this MCP server always shells out `node handoff-mcp.mjs`
-// with only PROJECT_ROOT forwarded (see runNode), so the closing session's
-// true identity (CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID from the CALLER's
-// environment) never reaches the engine unless a caller places it here. A
-// blank/whitespace-only sessionId is treated as "not supplied" (same
+// fix(close), hardened by PR4 R5: sessionId is optional and, when a
+// non-blank string is passed, wins over anything the child process would
+// otherwise resolve from its own environment — runNode now strips
+// CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID from the spawned env unconditionally,
+// so the closing session's true identity (this server's OWN ambient env, or
+// the CALLER's) never reaches the engine except via payload.session_id, set
+// here. A blank/whitespace-only sessionId is treated as "not supplied" (same
 // trim-then-empty-is-absent rule the engine's own resolver uses) so it falls
 // through to the payload's own session_id, if any, unchanged.
 function applySessionId(payload, sessionId) {
@@ -384,10 +399,11 @@ async function toolHandoffClose(args) {
 const SESSION_ID_PARAM_DESCRIPTION =
   'Optional explicit session id for this close/checkpoint\'s attribution and session_in_progress-marker ' +
   'reconciliation. When supplied it is placed into the payload\'s session_id BEFORE the write, taking priority ' +
-  'over any value the engine subprocess would otherwise resolve from its own environment (this MCP server never ' +
-  'forwards the caller\'s CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID to the child process). Codex callers SHOULD pass ' +
-  'their CODEX_THREAD_ID here so a close truthfully reports whether it cleared ITS OWN session_in_progress marker ' +
-  'rather than a sibling session\'s.';
+  'over any value the engine subprocess would otherwise resolve from its own environment (this MCP server\'s ' +
+  'spawned child never receives CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID — this server\'s own ambient values are ' +
+  'stripped before spawn, so a caller\'s true identity must be passed here or it will not reach the engine at ' +
+  'all). Codex callers SHOULD pass their CODEX_THREAD_ID here so a close truthfully reports whether it cleared ' +
+  'ITS OWN session_in_progress marker rather than a sibling session\'s.';
 
 async function toolHandoffInit({ projectRoot, name }) {
   const args = name ? ['init', name, '-y'] : ['init', '-y'];

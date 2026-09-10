@@ -1433,18 +1433,41 @@ async function addSessionMarker(db, projectId, sessionId, ts) {
 }
 
 /**
- * Find the index of the marker matching currentSessionId: an exact
- * session_id match, OR (S4) a legacy bare marker (session_id === null),
- * which carries no identity and is therefore treated as matching any
- * session. Returns -1 when no marker belongs to the current session —
- * sibling sessions' own markers are never matched.
+ * PR4 (marker identity hardening): find the index of the marker matching
+ * currentSessionId. Total classification — replaces the former "null
+ * session_id is a wildcard whenever no exact match exists" behavior (S4),
+ * which let ANY session (real or unresolved) claim a legacy marker even
+ * when OTHER, real-identity markers coexisted in the same list — see the
+ * spec's H2 finding.
+ *
+ *   1. An exact session_id match (marker.session_id === currentSessionId,
+ *      currentSessionId non-null) always wins first.
+ *   2. Otherwise, the legacy single-entry exception: if the ENTIRE list has
+ *      EXACTLY ONE entry and that entry's session_id is null, it is claimed
+ *      REGARDLESS of currentSessionId (null or a real, non-matching id) —
+ *      the true pre-S3 legacy single-session shape, where "any session
+ *      closing" is provably correct (there is no sibling to misattribute
+ *      against), not a guess.
+ *   3. Otherwise -1 (no match). In particular, two or more entries — even
+ *      with a null entry present — NEVER auto-claim the null entry as a
+ *      wildcard; the caller must report "unresolved legacy marker present"
+ *      and leave everything in place (see cmdLoaderStop /
+ *      clearSessionMarkerForClose).
+ *
+ * Returns -1 when no marker belongs to the current session — sibling
+ * sessions' own markers are never matched.
  */
 function findMatchingMarkerIndex(list, currentSessionId) {
   if (currentSessionId) {
     const exact = list.findIndex((m) => m.session_id === currentSessionId);
     if (exact !== -1) return exact;
   }
-  return list.findIndex((m) => m.session_id === null);
+  // Legacy single-entry exception applies REGARDLESS of currentSessionId
+  // (null or a real, non-matching id) — see the header comment above: there
+  // is no sibling to misattribute against when the entire list is one
+  // opaque legacy marker, so "any session closing" is provably correct.
+  if (list.length === 1 && list[0].session_id === null) return 0;
+  return -1;
 }
 
 /**
@@ -1567,6 +1590,85 @@ function resolveHookSessionId(hookPayload, host) {
     return hookPayload.session_id;
   }
   return resolveSessionIdFromEnv(host || null);
+}
+
+/**
+ * PR4 (marker identity hardening): host-independent session id resolution
+ * used everywhere a marker is ADDED (dedupe key: cmdLoaderHook's SessionStart
+ * write, cmdResume's fresh marker) or CLEARED (cmdLoaderStop's SessionEnd
+ * match, clearSessionMarkerForClose's explicit-close match). `host` is never
+ * consulted — see the spec at
+ * C:\Users\djwmo\Downloads\pr4-marker-identity-spec-2026-09-09.md section 2
+ * for the reproduced defect this replaces: resolveHookSessionId/
+ * resolveSessionIdFromEnv's host-based tie-break, applied at CLEAR time,
+ * let a nested child process (which inherits an ancestor's CODEX_THREAD_ID
+ * while also carrying its own distinct CLAUDE_CODE_SESSION_ID) resolve to
+ * the PARENT's real identity and delete the parent's own marker. Guessing
+ * which of two live, differing env values is "the current invocation" is
+ * never safe — at ADD time a wrong guess merely creates a harmless extra
+ * marker (self-correcting once that session closes properly); at CLEAR time
+ * it deletes another session's live state (not self-correcting). This
+ * resolver therefore refuses to guess in both directions, uniformly.
+ *
+ * Total classification over {payload.session_id, CLAUDE_CODE_SESSION_ID,
+ * CODEX_THREAD_ID}:
+ *   payload.session_id present (trimmed, non-empty)          -> that value
+ *   else both env vars unset                                  -> null
+ *   else exactly one env var set                               -> that one
+ *   else both set and EQUAL (exact `===`, case-sensitive)      -> that value
+ *   else both set and DIFFERENT                                -> null
+ *     (unresolved — never guesses; see isAmbiguousSessionEnvPair, which
+ *     names this exact branch for outcome reporting).
+ *
+ * All comparisons are exact string equality (`===`), case-sensitive; neither
+ * this function nor its env-only helper performs any format validation on
+ * the id itself (a malformed-looking string from payload or a single
+ * unambiguous env var is still used as-is).
+ *
+ * A caller that needs a fresh id when this returns null (add-time only —
+ * never at clear time, see the spec's "refusal is correct, not minting, for
+ * clear specifically") does so itself: `resolveClearSessionId(p) ||
+ * crypto.randomUUID()`.
+ */
+function resolveClearSessionId(hookPayload) {
+  const rawPayloadId = (hookPayload && typeof hookPayload.session_id === 'string')
+    ? hookPayload.session_id.trim()
+    : '';
+  if (rawPayloadId.length > 0) return rawPayloadId;
+
+  const claudeRaw = process.env.CLAUDE_CODE_SESSION_ID;
+  const codexRaw  = process.env.CODEX_THREAD_ID;
+  const claudeId  = typeof claudeRaw === 'string' ? claudeRaw.trim() : '';
+  const codexId   = typeof codexRaw  === 'string' ? codexRaw.trim()  : '';
+  const hasClaudeId = claudeId.length > 0;
+  const hasCodexId  = codexId.length > 0;
+
+  if (!hasClaudeId && !hasCodexId) return null;
+  if (hasClaudeId && !hasCodexId) return claudeId;
+  if (!hasClaudeId && hasCodexId) return codexId;
+  if (claudeId === codexId) return claudeId;
+  // Both set and differ — refuse to guess. Unlike resolveSessionIdFromEnv,
+  // host is never consulted and no notice is printed here; the caller
+  // decides whether/how to surface "unresolved" (see cmdLoaderStop's
+  // session_id_unresolved outcome and clearSessionMarkerForClose's branch E).
+  return null;
+}
+
+/**
+ * True iff CLAUDE_CODE_SESSION_ID and CODEX_THREAD_ID are both set (after
+ * trim) and differ — the exact env shape that makes resolveClearSessionId's
+ * env fallback return null when the hook payload itself carried no usable
+ * session_id. Used only to distinguish, for outcome reporting, "unresolved
+ * because both env vars disagree" from "unresolved because neither is set"
+ * — both resolve to the same `null` from resolveClearSessionId, but only
+ * the former is the PR4 ambiguity case (session_id_unresolved).
+ */
+function isAmbiguousSessionEnvPair() {
+  const claudeRaw = process.env.CLAUDE_CODE_SESSION_ID;
+  const codexRaw  = process.env.CODEX_THREAD_ID;
+  const claudeId  = typeof claudeRaw === 'string' ? claudeRaw.trim() : '';
+  const codexId   = typeof codexRaw  === 'string' ? codexRaw.trim()  : '';
+  return claudeId.length > 0 && codexId.length > 0 && claudeId !== codexId;
 }
 
 /**
@@ -6345,7 +6447,10 @@ async function cmdLoaderHook(args) {
     // markers are stale" and "fresh marker written" that two separate locked
     // transactions would otherwise leave open.
     const hookSource       = (hookPayload && typeof hookPayload.source === 'string') ? hookPayload.source : null;
-    const currentSessionId = resolveHookSessionId(hookPayload, host) || crypto.randomUUID();
+    // PR4 R4: host-independent add-time resolution (never guesses across an
+    // ambiguous env pair) — an unresolved env pair mints a fresh id and
+    // APPENDS rather than dedupe-overwriting a sibling's real marker.
+    const currentSessionId = resolveClearSessionId(hookPayload) || crypto.randomUUID();
     let lateCloseDivergenceLines = [];
 
     if (markerDb) {
@@ -6457,7 +6562,8 @@ async function cmdResume() {
       markerDb = null;
     }
     if (markerDb) {
-      const resumeSessionId = resolveHookSessionId(null, null) || crypto.randomUUID();
+      // PR4 R4: host-independent add-time resolution (see resolveClearSessionId).
+      const resumeSessionId = resolveClearSessionId(null) || crypto.randomUUID();
       await addSessionMarker(markerDb, projectId, resumeSessionId, new Date().toISOString());
       if (markerDbOwned) await markerDb.end();
     }
@@ -7991,8 +8097,12 @@ async function resolveSessionId(db, projectId, payload) {
 /**
  * S4: clear THIS session's own marker on an explicit /handoff:close — never a
  * sibling session's. Uses the TRUE session identity (payload.session_id,
- * trimmed, then resolveSessionIdFromEnv). If no marker belongs to this
- * session, nothing is cleared — a sibling session's marker is left in place
+ * trimmed, then resolveClearSessionId's host-independent env fallback — see
+ * PR4: this call site never threaded --host through, by design (MCP-invoked
+ * close never receives it), and now the ambiguous-env case is also refused
+ * rather than defaulted, matching the strict clear-time rule everywhere
+ * else). If no marker belongs to this session, nothing is cleared — a
+ * sibling session's marker is left in place
  * (see clearSessionMarkerForClose's own doc comment below for the full
  * branch-by-branch classification of every outcome, fix(close)).
  * Lock-guarded (withSessionMarkerLock) — same read-modify-write race as
@@ -8024,27 +8134,40 @@ function formatOwnerIds(ids) {
 }
 
 /**
- * fix(close): total classification of the close-time marker-clear outcome,
- * over S (the resolved current session id — explicit payload.session_id
- * first, trimmed; else resolveSessionIdFromEnv(null)) and M (the parsed
- * marker list — parseSessionMarkersDetailed's `markers`, IDENTICAL to what
- * every other caller of parseSessionMarkers sees; see that function's header
- * comment for the dropped/coerced distinction, which is close-only reporting
- * and never changes which entries are in `markers`).
+ * fix(close), narrowed by PR4 §3: total classification of the close-time
+ * marker-clear outcome, over S (the resolved current session id — explicit
+ * payload.session_id first, trimmed; else resolveClearSessionId's
+ * host-independent env fallback, which now refuses an ambiguous env pair
+ * rather than defaulting) and M (the parsed marker list —
+ * parseSessionMarkersDetailed's `markers`, IDENTICAL to what every other
+ * caller of parseSessionMarkers sees; see that function's header comment for
+ * the dropped/coerced distinction, which is close-only reporting and never
+ * changes which entries are in `markers`).
  * Exactly one branch fires; every branch returns a TRUE outcome — the two
  * Done-line call sites print result.text verbatim instead of a hardcoded
  * "session marker cleared" string, so a close from a session that does NOT
  * own the live marker can never claim it cleared one.
  *
- *   A. S non-null, >=1 exact session_id match  -> delete ALL exact matches.
- *   B. S non-null, no exact, >=1 null-id entry -> delete ALL null-id entries
- *      (legacy markers carry no identity and cannot be attributed to S;
- *      clearing them preserves the pre-identity behavior every legacy
- *      marker was written under — a coerced-to-null entry is indistinguishable
+ *   A. S non-null, >=1 exact session_id match       -> delete ALL exact matches.
+ *   B. S non-null, no exact, list is the legacy
+ *      single-entry null-id shape (length===1)      -> delete that one entry
+ *      (the pre-S3 single-session format carries no identity at all — "any
+ *      session closing" is provably correct here, since there is no sibling
+ *      to misattribute against; a coerced-to-null entry is indistinguishable
  *      from a true legacy marker here, matching main).
- *   C. S non-null, no exact, no null, non-empty -> delete nothing; report owners.
- *   D. S null, >=1 null-id entry               -> delete all null-id entries.
- *   E. S null, no null entry, non-empty        -> delete nothing; report owners.
+ *   C. S non-null, no exact, list not the legacy
+ *      single-entry shape, non-empty                -> delete nothing;
+ *      report owners. PR4 §3: when a null-session_id entry is ALSO present
+ *      among >=2 total entries, this is real multi-session concurrency
+ *      colliding with a legacy marker — the null entry is NEVER
+ *      auto-claimed here (no wildcard); text additionally reports
+ *      "unresolved legacy marker present".
+ *   D. S null, list is the legacy single-entry
+ *      null-id shape (length===1)                   -> delete that one entry.
+ *   E. S null, list not the legacy single-entry
+ *      shape, non-empty                              -> delete nothing;
+ *      report owners (same "unresolved legacy marker present" addendum as C
+ *      when a null entry is present among >=2 total entries).
  *   F. list empty (after excluding dropped entries)  -> nothing to clear.
  *   G. the marker store itself is unreadable (a real DB/read error, not a
  *      value-level parse outcome — those are all handled inside
@@ -8059,11 +8182,7 @@ function formatOwnerIds(ids) {
  * Returns { branch, deleted, ownedBy, dropped, coerced, text } — never throws.
  */
 async function clearSessionMarkerForClose(db, projectId, payload) {
-  const rawPayloadSessionId =
-    (payload && typeof payload.session_id === 'string') ? payload.session_id.trim() : '';
-  const currentSessionId = rawPayloadSessionId.length > 0
-    ? rawPayloadSessionId
-    : resolveSessionIdFromEnv(null);
+  const currentSessionId = resolveClearSessionId(payload);
 
   let result;
   try {
@@ -8078,32 +8197,38 @@ async function clearSessionMarkerForClose(db, projectId, payload) {
         return { branch: 'F', deleted: 0, ownedBy: [], dropped, coerced, text: `no session marker present${suffix}` };
       }
 
-      const exactMatches = currentSessionId ? markers.filter((m) => m.session_id === currentSessionId) : [];
-      const nullMatches   = markers.filter((m) => m.session_id === null);
+      const exactMatches   = currentSessionId ? markers.filter((m) => m.session_id === currentSessionId) : [];
+      // PR4 §3: a null-session_id marker is only ever auto-claimed when it is
+      // the SOLE entry in the entire list (the true pre-S3 legacy shape).
+      // Two-or-more entries with a null present is never a wildcard match —
+      // see findMatchingMarkerIndex's identical rule for cmdLoaderStop.
+      const isSingleLegacy = markers.length === 1 && markers[0].session_id === null;
+      const hasUnclaimedLegacyEntry = !isSingleLegacy && markers.some((m) => m.session_id === null);
+      const legacyNote = hasUnclaimedLegacyEntry ? '; unresolved legacy marker present' : '';
 
       let branch, toDelete, ownedBy = [], text;
       if (currentSessionId && exactMatches.length > 0) {
         branch = 'A';
         toDelete = exactMatches;
         text = `session marker cleared (session ${currentSessionId})${suffix}`;
-      } else if (currentSessionId && nullMatches.length > 0) {
+      } else if (currentSessionId && isSingleLegacy) {
         branch = 'B';
-        toDelete = nullMatches;
+        toDelete = markers;
         text = `legacy session marker cleared (marker had no session id)${suffix}`;
       } else if (currentSessionId) {
         branch = 'C';
         toDelete = [];
         ownedBy = formatOwnerIds(markers.map((m) => m.session_id));
-        text = `session marker left in place (owned by ${ownedBy})${suffix}`;
-      } else if (nullMatches.length > 0) {
+        text = `session marker left in place (owned by ${ownedBy}${legacyNote})${suffix}`;
+      } else if (isSingleLegacy) {
         branch = 'D';
-        toDelete = nullMatches;
+        toDelete = markers;
         text = `session marker cleared (session id unresolved; marker had no session id)${suffix}`;
       } else {
         branch = 'E';
         toDelete = [];
         ownedBy = formatOwnerIds(markers.map((m) => m.session_id));
-        text = `session marker left in place (session id unresolved; owned by ${ownedBy})${suffix}`;
+        text = `session marker left in place (session id unresolved; owned by ${ownedBy}${legacyNote})${suffix}`;
       }
 
       if (toDelete.length > 0) {
@@ -9711,6 +9836,15 @@ async function cmdPurge(args) {
  *                                 close breadcrumb either (loader-hook never
  *                                 fired for this session, project not
  *                                 provisioned, or implicit_close=disabled).
+ *   'session_id_unresolved'    — PR4: the hook payload carried no usable
+ *                                 session_id AND CLAUDE_CODE_SESSION_ID /
+ *                                 CODEX_THREAD_ID were both set and
+ *                                 DIFFERED — resolveClearSessionId refused
+ *                                 to guess (see its header comment). Distinct
+ *                                 from no_marker: here identity itself could
+ *                                 not be established, so no marker lookup
+ *                                 was even meaningful, vs. no_marker's
+ *                                 "identity known, nothing matched it".
  *   'error:<short>'            — an exception was caught before an outcome
  *                                 could be determined.
  * Persistence is fail-soft end to end (see persistOutcome): a failure to
@@ -9738,7 +9872,12 @@ async function cmdLoaderStop(args) {
     process.exit(0);
   }
 
-  const currentSessionId = resolveHookSessionId(hookPayload, host);
+  // PR4 R1: strict, host-independent clear-time resolution — `host` (used
+  // only for the earlier --host argv gate above) is never consulted here.
+  // See resolveClearSessionId's header comment for the reproduced defect
+  // this replaces (a nested child inheriting an ancestor's CODEX_THREAD_ID
+  // under --host codex, misattributed to the parent's real identity).
+  const currentSessionId = resolveClearSessionId(hookPayload);
 
   let db = null;
   let projectId = null;
@@ -9814,6 +9953,21 @@ async function cmdLoaderStop(args) {
     });
 
     if (!acted) {
+      // PR4 R3: an ambiguous env pair (CLAUDE_CODE_SESSION_ID and
+      // CODEX_THREAD_ID both set and differing, with no usable payload
+      // session_id) resolved currentSessionId to null via
+      // resolveClearSessionId — distinct from "no marker was ever set".
+      // Truthfully record that resolution failed rather than folding it
+      // into no_marker (fix(close)'s truthfulness rule, PR #278).
+      const payloadHadId = !!(hookPayload
+        && typeof hookPayload.session_id === 'string'
+        && hookPayload.session_id.trim().length > 0);
+      if (currentSessionId === null && !payloadHadId && isAmbiguousSessionEnvPair()) {
+        await persistOutcome('session_id_unresolved');
+        await endDb();
+        process.exit(0);
+      }
+
       // Disambiguate "explicit close already ran this session" from "no
       // marker was ever set" via the clearSessionMarkerForClose breadcrumb.
       let outcome = 'no_marker';
@@ -11050,6 +11204,8 @@ if (require.main === module) {
     // needed to exercise the pure classification logic).
     resolveHookSessionId,
     resolveSessionIdFromEnv,
+    resolveClearSessionId,
+    isAmbiguousSessionEnvPair,
     ASSERTION_TIER_PROBATIONARY,
     ASSERTION_TIER_CONSOLIDATED,
     // Session-marker concurrency hardening — exposed for

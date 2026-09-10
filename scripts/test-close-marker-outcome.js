@@ -50,6 +50,9 @@ const {
   clearSessionMarkerForClose,
   formatOwnerIds,
   getSetting,
+  resolveClearSessionId,
+  isAmbiguousSessionEnvPair,
+  findMatchingMarkerIndex,
 } = require('./handoff.js');
 
 let passed = 0;
@@ -279,6 +282,104 @@ async function run() {
     assert.strictEqual(formatOwnerIds(ids), 'a, b, c, d, e +1 more');
   });
 
+  // ── PR4 R1: resolveClearSessionId — total classification, host-independent ──
+
+  await test('R1: payload.session_id wins over everything, trimmed', async () => {
+    await withEnv({ CLAUDE_CODE_SESSION_ID: undefined, CODEX_THREAD_ID: undefined }, async () => {
+      assert.strictEqual(resolveClearSessionId({ session_id: '  payload-id  ' }), 'payload-id');
+    });
+  });
+
+  await test('R1: whitespace-only payload.session_id is treated as absent', async () => {
+    await withEnv({ CLAUDE_CODE_SESSION_ID: 'claude-id', CODEX_THREAD_ID: undefined }, async () => {
+      assert.strictEqual(resolveClearSessionId({ session_id: '   ' }), 'claude-id');
+    });
+  });
+
+  await test('R1: both env vars unset, no payload -> null', async () => {
+    await withEnv({ CLAUDE_CODE_SESSION_ID: undefined, CODEX_THREAD_ID: undefined }, async () => {
+      assert.strictEqual(resolveClearSessionId({}), null);
+      assert.strictEqual(resolveClearSessionId(null), null);
+    });
+  });
+
+  await test('R1: only CLAUDE_CODE_SESSION_ID set -> that value', async () => {
+    await withEnv({ CLAUDE_CODE_SESSION_ID: 'claude-only', CODEX_THREAD_ID: undefined }, async () => {
+      assert.strictEqual(resolveClearSessionId({}), 'claude-only');
+    });
+  });
+
+  await test('R1: only CODEX_THREAD_ID set -> that value', async () => {
+    await withEnv({ CLAUDE_CODE_SESSION_ID: undefined, CODEX_THREAD_ID: 'codex-only' }, async () => {
+      assert.strictEqual(resolveClearSessionId({}), 'codex-only');
+    });
+  });
+
+  await test('R1: both set and EQUAL -> that value (no ambiguity)', async () => {
+    await withEnv({ CLAUDE_CODE_SESSION_ID: 'same-id', CODEX_THREAD_ID: 'same-id' }, async () => {
+      assert.strictEqual(resolveClearSessionId({}), 'same-id');
+    });
+  });
+
+  await test('R1: both set and DIFFERENT -> null, regardless of a --host-like caller intent (host is never a parameter)', async () => {
+    await withEnv({ CLAUDE_CODE_SESSION_ID: 'claude-value', CODEX_THREAD_ID: 'codex-value' }, async () => {
+      assert.strictEqual(resolveClearSessionId({}), null);
+      assert.strictEqual(resolveClearSessionId(undefined), null);
+    });
+  });
+
+  await test('R3: isAmbiguousSessionEnvPair false when both unset', async () => {
+    await withEnv({ CLAUDE_CODE_SESSION_ID: undefined, CODEX_THREAD_ID: undefined }, async () => {
+      assert.strictEqual(isAmbiguousSessionEnvPair(), false);
+    });
+  });
+  await test('R3: isAmbiguousSessionEnvPair false when only one set', async () => {
+    await withEnv({ CLAUDE_CODE_SESSION_ID: 'x', CODEX_THREAD_ID: undefined }, async () => {
+      assert.strictEqual(isAmbiguousSessionEnvPair(), false);
+    });
+  });
+  await test('R3: isAmbiguousSessionEnvPair false when both set and EQUAL', async () => {
+    await withEnv({ CLAUDE_CODE_SESSION_ID: 'x', CODEX_THREAD_ID: 'x' }, async () => {
+      assert.strictEqual(isAmbiguousSessionEnvPair(), false);
+    });
+  });
+  await test('R3: isAmbiguousSessionEnvPair TRUE when both set and DIFFER', async () => {
+    await withEnv({ CLAUDE_CODE_SESSION_ID: 'x', CODEX_THREAD_ID: 'y' }, async () => {
+      assert.strictEqual(isAmbiguousSessionEnvPair(), true);
+    });
+  });
+
+  // ── PR4 R2: findMatchingMarkerIndex — exact-only for non-null, single-legacy-only for null ──
+
+  await test('R2: non-null currentSessionId matches ONLY an exact session_id (no null-wildcard fallback)', async () => {
+    const list = [{ session_id: null, ts: 't1' }, { session_id: 'sess-b', ts: 't2' }];
+    assert.strictEqual(findMatchingMarkerIndex(list, 'sess-caller-with-no-exact-match'), -1,
+      'a real, non-matching session id must NEVER fall back to claiming a null-id entry');
+    assert.strictEqual(findMatchingMarkerIndex(list, 'sess-b'), 1, 'an exact match is still found');
+  });
+
+  await test('R2: null currentSessionId matches the sole entry when it is the ONLY entry and is null (legacy single-session shape)', async () => {
+    const list = [{ session_id: null, ts: 't1' }];
+    assert.strictEqual(findMatchingMarkerIndex(list, null), 0);
+  });
+
+  await test('R2: a REAL, non-matching currentSessionId can ALSO claim the sole legacy null entry (regardless of currentSessionId, per spec §3)', async () => {
+    const list = [{ session_id: null, ts: 't1' }];
+    assert.strictEqual(findMatchingMarkerIndex(list, 'sess-some-real-session'), 0,
+      'the true pre-S3 single-session shape has no sibling to misattribute against, so any resolvable id may claim it');
+  });
+
+  await test('R2: null currentSessionId does NOT match when >=2 entries exist, even with a null entry present', async () => {
+    const list = [{ session_id: null, ts: 't1' }, { session_id: 'sess-b', ts: 't2' }];
+    assert.strictEqual(findMatchingMarkerIndex(list, null), -1,
+      'two-or-more-entry lists must never auto-claim a null entry as a wildcard');
+  });
+
+  await test('R2: null currentSessionId does not match when the list is non-empty and has no null entry', async () => {
+    const list = [{ session_id: 'sess-a', ts: 't1' }];
+    assert.strictEqual(findMatchingMarkerIndex(list, null), -1);
+  });
+
   // ── clearSessionMarkerForClose — branches A-G ─────────────────────────────
 
   await withEnv({ CLAUDE_CODE_SESSION_ID: undefined, CODEX_THREAD_ID: undefined }, async () => {
@@ -440,6 +541,62 @@ async function run() {
       const breadcrumbRaw = await getSetting(db, PROJECT_ID, 'last_explicit_close', null);
       assert.strictEqual(breadcrumbRaw, null);
     });
+
+    // ── PR4 §3: null-wildcard rescoping — branches C/E with a null entry
+    //    coexisting alongside real-identity entries (>=2 total) must NEVER
+    //    auto-claim the null entry; they now report "unresolved legacy
+    //    marker present" instead of silently clearing it.
+
+    await test('C (rescoped): non-null S, no exact, null entry among >=2 entries -> nothing deleted, "unresolved legacy marker present" reported', async () => {
+      const db = new FakeDb();
+      db.seedMarker(JSON.stringify([
+        { session_id: null, ts: '2026-01-01T00:00:00.000Z' },
+        { session_id: 'sess-owner', ts: '2026-01-01T00:00:01.000Z' },
+      ]));
+      const r = await clearSessionMarkerForClose(db, PROJECT_ID, { session_id: 'sess-caller' });
+      assert.strictEqual(r.branch, 'C');
+      assert.strictEqual(r.deleted, 0);
+      assert.ok(r.text.includes('unresolved legacy marker present'), `expected legacy-note in text, got: ${r.text}`);
+      assert.strictEqual(r.text, 'session marker left in place (owned by sess-owner; unresolved legacy marker present)');
+      assert.strictEqual(JSON.parse(db.markerValue()).length, 2, 'both entries, including the null one, must survive untouched');
+    });
+
+    await test('E (rescoped): session id unresolved, null entry among >=2 entries -> nothing deleted, "unresolved legacy marker present" reported', async () => {
+      const db = new FakeDb();
+      db.seedMarker(JSON.stringify([
+        { session_id: null, ts: '2026-01-01T00:00:00.000Z' },
+        { session_id: 'sess-owner', ts: '2026-01-01T00:00:01.000Z' },
+      ]));
+      const r = await clearSessionMarkerForClose(db, PROJECT_ID, {});
+      assert.strictEqual(r.branch, 'E');
+      assert.strictEqual(r.deleted, 0);
+      assert.strictEqual(r.text, 'session marker left in place (session id unresolved; owned by sess-owner; unresolved legacy marker present)');
+      assert.strictEqual(JSON.parse(db.markerValue()).length, 2);
+    });
+
+    await test('D still fires for the TRUE single-entry legacy shape when S is unresolved (regression guard vs. the rescoping above)', async () => {
+      const db = new FakeDb();
+      db.seedMarker('smoketest_legacy_marker'); // single entry, session_id null
+      const r = await clearSessionMarkerForClose(db, PROJECT_ID, {});
+      assert.strictEqual(r.branch, 'D');
+      assert.strictEqual(r.deleted, 1);
+      assert.strictEqual(db.markerValue(), undefined);
+    });
+  });
+
+  // ── PR4 R5: MCP runNode must strip session-identity env vars before spawn ──
+
+  await test('MCP: runNode strips CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID from the spawned child env, never spreads raw process.env', async () => {
+    const src = require('fs').readFileSync(require('path').join(__dirname, 'handoff-mcp.mjs'), 'utf8');
+    const fnStart = src.indexOf('function runNode(');
+    assert.ok(fnStart !== -1, 'runNode not found');
+    let fnEnd = src.indexOf('\nfunction stderrTail', fnStart);
+    if (fnEnd === -1) fnEnd = fnStart + 2500;
+    const fnBody = src.slice(fnStart, fnEnd);
+    assert.ok(/delete\s+baseEnv\.CLAUDE_CODE_SESSION_ID/.test(fnBody), 'runNode must delete CLAUDE_CODE_SESSION_ID from the base env before spawn');
+    assert.ok(/delete\s+baseEnv\.CODEX_THREAD_ID/.test(fnBody), 'runNode must delete CODEX_THREAD_ID from the base env before spawn');
+    assert.ok(!/env:\s*\{\s*\.\.\.\s*process\.env\s*,\s*\.\.\.\s*env\s*\}/.test(fnBody),
+      'runNode must not spread raw process.env directly into the spawned child env');
   });
 
   // ── MCP schema + payload pass-through (unit-level, stubbed child spawn) ───
