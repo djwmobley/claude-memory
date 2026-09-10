@@ -351,22 +351,23 @@ async function main() {
     console.log('\nSTEP 3 — Apply schema');
 
     try {
+      // Invoke psql directly (no shell): execFileSync with shell:false (the
+      // default) passes SETUP_SQL and EVAL_DB_NAME as discrete argv elements,
+      // so neither value is ever re-parsed as a shell command line. A prior
+      // Windows fallback routed the same args through `cmd.exe /c`, which
+      // reconstructs and re-parses them as a single shell string — flagged by
+      // CodeQL js/shell-command-injection-from-environment (alert #2) because
+      // EVAL_DB_NAME (env-derived) and SETUP_SQL (path-derived) could contain
+      // shell metacharacters. Removed rather than hardened: execFileSync
+      // already resolves psql.exe on PATH without a shell on Windows, so the
+      // fallback added risk without adding capability.
       execFileSync('psql', ['-d', EVAL_DB_NAME, '-f', SETUP_SQL], {
         stdio: 'pipe',
         encoding: 'utf8',
       });
       step('setup.sql applied (idempotent)', true);
     } catch (err) {
-      // On Windows, psql may be invoked differently
-      try {
-        execFileSync('cmd.exe', ['/d', '/s', '/c', 'psql', '-d', EVAL_DB_NAME, '-f', SETUP_SQL], {
-          stdio: 'pipe',
-          encoding: 'utf8',
-        });
-        step('setup.sql applied via cmd.exe (idempotent)', true);
-      } catch (err2) {
-        infraFail(`psql schema apply failed: ${err2.message}\n  Ensure psql is on PATH and DB exists.`);
-      }
+      infraFail(`psql schema apply failed: ${err.message}\n  Ensure psql is on PATH and DB exists.`);
     }
 
     // ── Step 4: Truncate tables ──────────────────────────────────────────────
