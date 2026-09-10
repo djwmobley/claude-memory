@@ -1280,27 +1280,54 @@ async function setSetting(db, projectId, key, value) {
 // here — legacy = "not JSON", full stop — is what keeps those callers correct
 // after this fix; see latestSessionMarker's handling of an unparseable ts.
 
-function parseSessionMarkers(raw) {
-  if (raw === null || raw === undefined || raw === '') return [];
+// fix(close): a malformed array element (ts not a string, session_id not
+// string|null, or the element itself not a plain object) used to be
+// silently dropped by parseSessionMarkers's .filter() — an allow-list-shaped
+// predicate whose failure mode is silent data loss. clearSessionMarkerForClose
+// needs to REPORT that loss rather than hide it (a close that silently
+// ignored a corrupt marker entry and then declared "session marker cleared"
+// would itself be an untruthful report), so parseSessionMarkersDetailed below
+// is the total classification: every array element is either a valid marker
+// or counted as malformed — never both, never neither. parseSessionMarkers
+// keeps its original signature (array only) for every pre-existing caller
+// that only ever wanted the clean list.
+function parseSessionMarkersDetailed(raw) {
+  if (raw === null || raw === undefined || raw === '') return { markers: [], malformed: 0 };
   try {
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed)) {
-      return parsed
-        .filter((e) => e && typeof e === 'object' && typeof e.ts === 'string')
-        .map((e) => ({
+      const markers = [];
+      let malformed = 0;
+      for (const e of parsed) {
+        const isPlainObject = e !== null && typeof e === 'object' && !Array.isArray(e);
+        const tsOk  = isPlainObject && typeof e.ts === 'string';
+        const sidOk = isPlainObject && (e.session_id === null || e.session_id === undefined || typeof e.session_id === 'string');
+        if (!isPlainObject || !tsOk || !sidOk) {
+          malformed++;
+          continue;
+        }
+        markers.push({
           session_id: (typeof e.session_id === 'string' && e.session_id.length > 0) ? e.session_id : null,
           ts: e.ts,
-        }));
+        });
+      }
+      return { markers, malformed };
     }
-    return [];
+    // valid JSON, not an array -> [] (never produced by this code; fail open,
+    // not treated as "malformed" — there is no per-element structure to count).
+    return { markers: [], malformed: 0 };
   } catch (_) {
     // Not JSON — legacy marker (pre-S3 format). Accepted as-is regardless of
     // whether it happens to be a parseable date (see note above).
     if (typeof raw === 'string' && raw.length > 0) {
-      return [{ session_id: null, ts: raw }];
+      return { markers: [{ session_id: null, ts: raw }], malformed: 0 };
     }
-    return [];
+    return { markers: [], malformed: 0 };
   }
+}
+
+function parseSessionMarkers(raw) {
+  return parseSessionMarkersDetailed(raw).markers;
 }
 
 /** Read all in-flight session markers for a project. See parseSessionMarkers. */
@@ -7887,13 +7914,11 @@ async function resolveSessionId(db, projectId, payload) {
 
 /**
  * S4: clear THIS session's own marker on an explicit /handoff:close — never a
- * sibling session's. Uses the TRUE session identity (payload.session_id, then
- * CLAUDE_CODE_SESSION_ID) rather than resolveSessionId's marker-fallback tier
- * (which would be circular here — matching a marker against content read from
- * that same marker proves nothing about identity). A legacy bare marker
- * (session_id: null) still matches, per findMatchingMarkerIndex/S4. If no
- * marker belongs to this session, nothing is cleared — a sibling session's
- * marker is left for the SessionEnd/late-close paths to reconcile.
+ * sibling session's. Uses the TRUE session identity (payload.session_id,
+ * trimmed, then resolveSessionIdFromEnv). If no marker belongs to this
+ * session, nothing is cleared — a sibling session's marker is left in place
+ * (see clearSessionMarkerForClose's own doc comment below for the full
+ * branch-by-branch classification of every outcome, fix(close)).
  * Lock-guarded (withSessionMarkerLock) — same read-modify-write race as
  * every other marker mutation site.
  *
@@ -7906,20 +7931,119 @@ async function resolveSessionId(db, projectId, payload) {
  * not one row per session — no unbounded growth. Fail-soft: a failure to
  * stamp the breadcrumb never blocks or fails the close itself.
  */
+/**
+ * fix(close): dedupe (exact string equality) + cap a list of session ids for
+ * display, so a "left in place (owned by ...)" text never grows unbounded
+ * when many sibling sessions are live. Order preserved (first-seen); capped
+ * at 5 with a "+<k> more" suffix naming how many additional UNIQUE owners
+ * were elided.
+ */
+function formatOwnerIds(ids) {
+  const unique = [];
+  for (const id of ids) {
+    if (id && !unique.includes(id)) unique.push(id);
+  }
+  if (unique.length <= 5) return unique.join(', ');
+  return `${unique.slice(0, 5).join(', ')} +${unique.length - 5} more`;
+}
+
+/**
+ * fix(close): total classification of the close-time marker-clear outcome,
+ * over S (the resolved current session id — explicit payload.session_id
+ * first, trimmed; else resolveSessionIdFromEnv(null)) and M (the parsed
+ * marker list, malformed entries excluded — see parseSessionMarkersDetailed).
+ * Exactly one branch fires; every branch returns a TRUE outcome — the two
+ * Done-line call sites print result.text verbatim instead of a hardcoded
+ * "session marker cleared" string, so a close from a session that does NOT
+ * own the live marker can never claim it cleared one.
+ *
+ *   A. S non-null, >=1 exact session_id match  -> delete ALL exact matches.
+ *   B. S non-null, no exact, >=1 null-id entry -> delete ALL null-id entries
+ *      (legacy markers carry no identity and cannot be attributed to S;
+ *      clearing them preserves the pre-identity behavior every legacy
+ *      marker was written under).
+ *   C. S non-null, no exact, no null, non-empty -> delete nothing; report owners.
+ *   D. S null, >=1 null-id entry               -> delete all null-id entries.
+ *   E. S null, no null entry, non-empty        -> delete nothing; report owners.
+ *   F. list empty (after excluding malformed)  -> nothing to clear.
+ *   G. the marker store itself is unreadable (a real DB/read error, not a
+ *      value-level parse outcome — those are all handled inside
+ *      parseSessionMarkersDetailed's own fail-open total classification)
+ *      -> delete nothing, report the error, never throw out of close.
+ *
+ * Read-modify-write happens ENTIRELY inside withSessionMarkerLock (branch
+ * decision and delete share one lock acquisition) — deciding the branch
+ * from a read taken outside the lock would reopen the exact TOCTOU race the
+ * lock exists to close.
+ *
+ * Returns { branch, deleted, ownedBy, malformed, text } — never throws.
+ */
 async function clearSessionMarkerForClose(db, projectId, payload) {
-  const currentSessionId =
-    (typeof payload.session_id === 'string' && payload.session_id.length > 0)
-      ? payload.session_id
-      : resolveSessionIdFromEnv(null);
-  const cleared = await withSessionMarkerLock(db, projectId, async () => {
-    const markers = await getSessionMarkers(db, projectId);
-    const idx = findMatchingMarkerIndex(markers, currentSessionId);
-    if (idx === -1) return false;
-    const remaining = markers.filter((_, i) => i !== idx);
-    await setSessionMarkers(db, projectId, remaining);
-    return true;
-  });
-  if (cleared) {
+  const rawPayloadSessionId =
+    (payload && typeof payload.session_id === 'string') ? payload.session_id.trim() : '';
+  const currentSessionId = rawPayloadSessionId.length > 0
+    ? rawPayloadSessionId
+    : resolveSessionIdFromEnv(null);
+
+  let result;
+  try {
+    result = await withSessionMarkerLock(db, projectId, async () => {
+      const raw = await getSetting(db, projectId, 'session_in_progress', null);
+      const { markers, malformed } = parseSessionMarkersDetailed(raw);
+      const malformedSuffix = malformed > 0
+        ? `; ${malformed} malformed marker entr${malformed === 1 ? 'y' : 'ies'} ignored`
+        : '';
+
+      if (markers.length === 0) {
+        return { branch: 'F', deleted: 0, ownedBy: [], malformed, text: `no session marker present${malformedSuffix}` };
+      }
+
+      const exactMatches = currentSessionId ? markers.filter((m) => m.session_id === currentSessionId) : [];
+      const nullMatches   = markers.filter((m) => m.session_id === null);
+
+      let branch, toDelete, ownedBy = [], text;
+      if (currentSessionId && exactMatches.length > 0) {
+        branch = 'A';
+        toDelete = exactMatches;
+        text = `session marker cleared (session ${currentSessionId})${malformedSuffix}`;
+      } else if (currentSessionId && nullMatches.length > 0) {
+        branch = 'B';
+        toDelete = nullMatches;
+        text = `legacy session marker cleared (marker had no session id)${malformedSuffix}`;
+      } else if (currentSessionId) {
+        branch = 'C';
+        toDelete = [];
+        ownedBy = formatOwnerIds(markers.map((m) => m.session_id));
+        text = `session marker left in place (owned by ${ownedBy})${malformedSuffix}`;
+      } else if (nullMatches.length > 0) {
+        branch = 'D';
+        toDelete = nullMatches;
+        text = `session marker cleared (session id unresolved; marker had no session id)${malformedSuffix}`;
+      } else {
+        branch = 'E';
+        toDelete = [];
+        ownedBy = formatOwnerIds(markers.map((m) => m.session_id));
+        text = `session marker left in place (session id unresolved; owned by ${ownedBy})${malformedSuffix}`;
+      }
+
+      if (toDelete.length > 0) {
+        const remaining = markers.filter((m) => !toDelete.includes(m));
+        await setSessionMarkers(db, projectId, remaining);
+      }
+
+      return { branch, deleted: toDelete.length, ownedBy, malformed, text };
+    });
+  } catch (err) {
+    result = {
+      branch: 'G',
+      deleted: 0,
+      ownedBy: [],
+      malformed: 0,
+      text: `session marker unreadable (${err && err.message ? err.message : 'read failed'}); left as-is`,
+    };
+  }
+
+  if (result.deleted > 0) {
     try {
       await setSetting(db, projectId, 'last_explicit_close', JSON.stringify({
         session_id: currentSessionId || null,
@@ -7927,6 +8051,8 @@ async function clearSessionMarkerForClose(db, projectId, payload) {
       }));
     } catch (_) { /* fail-soft: breadcrumb loss never blocks close */ }
   }
+
+  return result;
 }
 
 // ── close ─────────────────────────────────────────────────────────────────────
@@ -8234,8 +8360,9 @@ async function cmdClose(args) {
 
     // Clear this session's session_in_progress marker (S4). No divergence signal
     // exists at enqueue time (the payload's own persistence happens later, in
-    // queue-drain) — always safe to clear here.
-    await clearSessionMarkerForClose(db, projectId, payload);
+    // queue-drain) — always safe to attempt here. fix(close): the outcome is
+    // reported verbatim on the Done line below, not assumed.
+    const markerOutcome = await clearSessionMarkerForClose(db, projectId, payload);
 
     let queuedCloseEmbeddingState = 'UNKNOWN';
     try {
@@ -8260,7 +8387,7 @@ async function cmdClose(args) {
       );
     }
 
-    console.log(`\nDone: handoff:close — project=${path.basename(root)} marker=${projectId} — payload queued for async extraction, embedding: ${queuedCloseEmbeddingState}, session marker cleared`);
+    console.log(`\nDone: handoff:close — project=${path.basename(root)} marker=${projectId} — payload queued for async extraction, embedding: ${queuedCloseEmbeddingState}, ${markerOutcome.text}`);
     return;
   }
 
@@ -9307,12 +9434,20 @@ async function cmdClose(args) {
   // safety net: this session's work was not fully persisted, so the implicit-
   // close paths (SessionEnd / late-close) get a chance to catch it later
   // rather than the close silently declaring itself done.
+  let markerOutcome;
   if (intentDivergenceLines.length === 0) {
-    await clearSessionMarkerForClose(db, projectId, payload);
+    markerOutcome = await clearSessionMarkerForClose(db, projectId, payload);
   } else {
     process.stderr.write(
       `[handoff] close: session_in_progress marker NOT cleared — ${intentDivergenceLines.length} DIVERGENCE line(s) present\n`
     );
+    markerOutcome = {
+      branch: 'DIVERGENCE',
+      deleted: 0,
+      ownedBy: [],
+      malformed: 0,
+      text: `session marker left in place (${intentDivergenceLines.length} DIVERGENCE line(s) present)`,
+    };
   }
 
   // Run reranker gate (informational)
@@ -9357,7 +9492,7 @@ async function cmdClose(args) {
     );
   }
 
-  console.log(`\nDone: handoff:close — project=${path.basename(root)} marker=${projectId} — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written, decisions: ${decisionsWritten}${embedWarnSuffix}, embedding: ${closeEmbeddingState}, session marker cleared`);
+  console.log(`\nDone: handoff:close — project=${path.basename(root)} marker=${projectId} — ${entitiesWritten}e/${assertionsWritten}a/${edgesWritten}ed written, decisions: ${decisionsWritten}${embedWarnSuffix}, embedding: ${closeEmbeddingState}, ${markerOutcome.text}`);
 
   // L4: Exit-code gate — 'strict' mode exits 3 when any subsystem ran degraded.
   if (_degradedSubsystems.length > 0 && closeDegradedExitMode === 'strict') {
@@ -10844,6 +10979,14 @@ if (require.main === module) {
     withSessionMarkerLock,
     findMatchingMarkerIndex,
     latestSessionMarker,
+    // fix(close): close-marker-outcome-truthful — exposed for
+    // scripts/test-close-marker-outcome.js's direct unit coverage of every
+    // branch (no test-side reimplementation of the lock/read-modify-write or
+    // the total classification's branch logic).
+    parseSessionMarkersDetailed,
+    clearSessionMarkerForClose,
+    formatOwnerIds,
+    setSetting,
     // init-embeddability spec — exposed for test/test-init-embeddability.js
     // and test/test-embed-endpoint-classify.js (no test-side reimplementation
     // of the readiness/opt-out/backfill logic).

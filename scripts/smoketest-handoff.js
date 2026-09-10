@@ -763,15 +763,32 @@ async function step8_cmdClose() {
     );
     await db.end();
 
+    // fix(close): pass an explicit session_id distinct from the seeded
+    // legacy marker (a bare string carries no session_id — see
+    // parseSessionMarkersDetailed's legacy branch) so the resolved close
+    // session id is deterministic regardless of the ambient
+    // CLAUDE_CODE_SESSION_ID a local dev shell may have set (this smoketest
+    // subprocess inherits process.env via makeEnv) — this exercises branch B
+    // (no exact match, legacy null-id marker present -> cleared as legacy)
+    // the same way every environment, local or CI.
     const payload = JSON.stringify({
       tldr: 'Smoketest session closed',
       open_threads: ['nothing open'],
       quick_references: 'smoketest-ref',
+      session_id: 'smoketest_close_caller_session',
     });
 
     const r = runHandoff('close', ['--json', '-'], payload);
     if (r.status !== 0) {
       lcFail(8, label, `exit ${r.status}: ${(r.stderr || r.stdout || '').split('\n')[0]}`);
+      return false;
+    }
+
+    // fix(close): the Done line now reports the ACTUAL marker outcome
+    // (never a hardcoded "session marker cleared") — assert the specific
+    // legacy-marker-cleared text for this scenario.
+    if (!r.stdout.includes('legacy session marker cleared (marker had no session id)')) {
+      lcFail(8, label, `Done line did not report the expected legacy marker-cleared text: ${(r.stdout || '').split('\n').filter((l) => l.includes('Done:')).join(' | ')}`);
       return false;
     }
 
