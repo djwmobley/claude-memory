@@ -1093,11 +1093,19 @@ function buildServer() {
         'session_chunks (M-14). memory_entry_chunks is DELIBERATELY EXCLUDED — its embedding column is a ' +
         'different pgvector type/dimension (vector(1024), a legacy provider) incompatible with every other ' +
         'table\'s halfvec(4000) column. An unknown table name is a hard tool error. `tables` omitted searches ' +
-        'ALL 15 allowed tables — but note that a table is only actually searched if it EXISTS in this ' +
-        'project\'s database; the set of allowed tables is a closed enum, not a guarantee every table is present ' +
-        '(a fresh or narrowly-migrated project may have only a handful, e.g. assertions and decisions), and that ' +
-        'existence is probed at call time rather than assumed. Returns the top `limit` hits (default 10) merged ' +
-        'and re-sorted across every table actually searched.',
+        'ALL 15 allowed tables; an explicit `tables: []` searches NONE (not the same as omitted) and returns ' +
+        'immediately with empty results. A table is only actually searched if it EXISTS in this project\'s ' +
+        'database WITH every column this tool needs (id/label/snippet columns, the embedding column, and — for ' +
+        'the 4 FTS-enabled tables — fts_vec) in the expected pgvector shape; a table failing any of that is ' +
+        'skipped, never fatal to the rest of the call, and reported in `skippedTables` as ' +
+        '`{table, reason, detail}` with `reason` one of `table_missing` (the table itself is absent), ' +
+        '`column_missing` (a required column is absent, or present with the wrong type/dimension — ' +
+        '`detail.subReason: "type_mismatch"`), or `query_error` (the table passed the schema gate but its live ' +
+        'query still threw — SQLSTATE in `detail.sqlstate`, `detail.subReason: "extension_absent"` when the ' +
+        'pgvector extension itself appears to be missing). `allSkipped: true` means every requested table was ' +
+        'skipped and `hits` is empty. A connection-level failure (not a per-table schema gap) is a thrown tool ' +
+        'error instead of a wall of per-table skips. Returns the top `limit` hits (default 10) merged and ' +
+        're-sorted across every table actually searched (`tablesSearched`).',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         query: z.string().describe('Free-text query.'),
