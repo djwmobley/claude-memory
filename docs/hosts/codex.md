@@ -181,10 +181,23 @@ current registration state. The installer's classification:
 | Zero exit, `handoff` present, `enginePath` matches this checkout | Already registered, correct | Skips re-add, reports `[OK] … skipping` |
 | Zero exit, `handoff` present, `enginePath` points elsewhere | Registered to a different checkout | Backs up `config.toml`, re-runs `mcp add` to repoint it here |
 | Zero exit but output doesn't parse, or `get` itself errors ambiguously | Indeterminate | Refuses — never guesses; prints the raw output for you to resolve by hand |
+| Zero exit, entry registered via an HTTP/SSE `url` transport | Not something this installer can manage (it only writes a stdio `node` command) | Reported the same way as "registered to a different checkout" — backs up and re-runs `mcp add` |
+| Zero exit, `enginePath` matches, but the entry's `HANDOFF_HOST` env var is set to something other than `codex` | Registered but misrouted | Backs up `config.toml`, re-runs `mcp add` to repoint it |
 
 This exact-word / whole-token matching on the server name (`isHandoffToken`)
 is intentional: a server named e.g. `handoff-staging` must never be treated
 as a match for `handoff`.
+
+**Real `codex mcp get --json` output nests `command`/`args`/`url`/`type`/`env`
+under a `transport` object** (e.g. `{"transport":{"type":"stdio","command":
+"node","args":[...]}}`), rather than at the entry's top level. The installer
+reads `entry.transport` when it's a usable object (carries at least one of
+`command`/`args`/`url`/`type` — an empty `transport: {}` is ignored and every
+field falls back to the entry's top level); when both `entry.command` and
+`transport.command` are present and disagree, `transport`'s value wins. Args
+may also arrive as a single whitespace-joined string instead of an array
+(both are handled), and a `cmd /c node <enginePath>` shell-wrapper command is
+unwrapped before the node/engine-path check runs.
 
 ---
 

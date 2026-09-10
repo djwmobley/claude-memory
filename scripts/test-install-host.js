@@ -406,6 +406,121 @@ classify('Z17: exit 0, no JSON at all in stdout -> UNKNOWN',
   'UNKNOWN');
 
 // ═══════════════════════════════════════════════════════════════════════════
+// T1-T11 — transport-nesting fix (adversary findings folded from
+// project_codex_reinstall_fix_spec_2026_09_10.md): real `codex mcp get
+// <name> --json` output nests command/args/url/type/env under a `transport`
+// object; before this fix, resolveEntry/entryMatchesEngine only ever read
+// top-level fields, so a correctly-installed real-shape entry was reported
+// NEEDS_REPAIR. Each label below names the adversary finding it covers.
+// ═══════════════════════════════════════════════════════════════════════════
+
+classify('T1 (finding: real transport-nested shape) exit 0, command/args nested under transport, type stdio -> REGISTERED',
+  [{ status: 0, stdout: JSON.stringify({ transport: { type: 'stdio', command: 'node', args: [ENGINE] }, startup_timeout_sec: 10 }), stderr: '' }],
+  'REGISTERED');
+
+classify('T2 (finding: empty transport {}) transport is {} (no marker keys) -> falls back entirely to entry-level fields -> REGISTERED',
+  [{ status: 0, stdout: JSON.stringify({ transport: {}, command: 'node', args: [ENGINE] }), stderr: '' }],
+  'REGISTERED');
+
+classify('T3 (finding: command conflict transport vs entry) entry.command="python" and transport.command="node" disagree -> transport wins -> REGISTERED, conflict recorded',
+  [{ status: 0, stdout: JSON.stringify({ command: 'python', transport: { type: 'stdio', command: 'node', args: [ENGINE] } }), stderr: '' }],
+  'REGISTERED',
+  (r) => {
+    if (!r.transportConflict) return 'expected transportConflict to be recorded';
+    if (r.transportConflict.entryCommand !== 'python' || r.transportConflict.transportCommand !== 'node') {
+      return `unexpected transportConflict shape: ${JSON.stringify(r.transportConflict)}`;
+    }
+    return null;
+  });
+
+classify('T4 (finding: joined-string args) transport.args is a single whitespace-joined string, not an array -> whitespace-split and matched -> REGISTERED',
+  [{ status: 0, stdout: JSON.stringify({ transport: { type: 'stdio', command: 'node', args: ENGINE } }), stderr: '' }],
+  'REGISTERED');
+
+classify('T5 (finding: cmd /c node wrapper) command="cmd", args=["/c","node",enginePath] -> unwrapped and matched -> REGISTERED',
+  [{ status: 0, stdout: JSON.stringify({ transport: { type: 'stdio', command: 'cmd', args: ['/c', 'node', ENGINE] } }), stderr: '' }],
+  'REGISTERED');
+
+classify('T5b (finding: cmd /c node wrapper, joined-string form) command="cmd.exe", args as one joined string -> unwrapped and matched -> REGISTERED',
+  [{ status: 0, stdout: JSON.stringify({ transport: { type: 'stdio', command: 'cmd.exe', args: `/c node ${ENGINE}` } }), stderr: '' }],
+  'REGISTERED');
+
+classify('T6 (finding: node.exe variant) transport.command is an absolute path ending in node.exe -> REGISTERED',
+  [{ status: 0, stdout: JSON.stringify({ transport: { type: 'stdio', command: 'C:\\\\nodejs\\\\node.exe', args: [ENGINE] } }), stderr: '' }],
+  'REGISTERED');
+
+classify('T6b (finding: nodejs variant) transport.command is the bare name "nodejs" -> REGISTERED',
+  [{ status: 0, stdout: JSON.stringify({ transport: { type: 'stdio', command: 'nodejs', args: [ENGINE] } }), stderr: '' }],
+  'REGISTERED');
+
+const ENGINE_ABS_FOR_RELATIVE = path.join(process.cwd(), 'fake-relative-test-engine', 'handoff-mcp.mjs');
+
+(function () {
+  const label = 'T7 (finding: relative path match) an args token that is relative resolves against cwd and matches -> REGISTERED';
+  const relEngine = path.relative(process.cwd(), ENGINE_ABS_FOR_RELATIVE);
+  const r = codexInstall.checkHandoffRegistered('codex', ENGINE_ABS_FOR_RELATIVE, {
+    spawnSyncImpl: mockSpawn([{ status: 0, stdout: JSON.stringify({ transport: { type: 'stdio', command: 'node', args: [relEngine] } }), stderr: '' }]),
+  });
+  if (r.state !== 'REGISTERED') fail(label, `expected REGISTERED, got ${r.state} (${r.detail})`);
+  else pass(label);
+})();
+
+if (process.platform === 'win32') {
+  (function () {
+    const label = 'T8 (finding: 8.3 short name / symlink path, win32-only) an 8.3 short-name args token realpath-resolves to the same file as enginePath -> REGISTERED';
+    const dir = makeTempDir('codex-shortname-t8-');
+    try {
+      const longName = path.join(dir, 'a-long-directory-name-for-8-3-testing');
+      fs.mkdirSync(longName, { recursive: true });
+      const realEngine = path.join(longName, 'handoff-mcp.mjs');
+      fs.writeFileSync(realEngine, '// stub engine\n', 'utf8');
+      // fs has no built-in short-name API; use the real realpath.native round
+      // trip as the adversary-relevant proof instead: a symlink pointing at
+      // the same file, which realpathSync.native also resolves through.
+      const symlinkPath = path.join(dir, 'engine-symlink.mjs');
+      let symlinkOk = true;
+      try { fs.symlinkSync(realEngine, symlinkPath, 'file'); } catch (_) { symlinkOk = false; }
+      if (!symlinkOk) {
+        pass(label + ' (skipped: symlink creation not permitted in this environment)');
+        return;
+      }
+      const r = codexInstall.checkHandoffRegistered('codex', realEngine, {
+        spawnSyncImpl: mockSpawn([{ status: 0, stdout: JSON.stringify({ transport: { type: 'stdio', command: 'node', args: [symlinkPath] } }), stderr: '' }]),
+      });
+      if (r.state !== 'REGISTERED') fail(label, `expected REGISTERED (symlink resolves to same real file), got ${r.state} (${r.detail})`);
+      else pass(label);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  })();
+} else {
+  pass('T8 (finding: 8.3 short name / symlink path) skipped on non-win32 platform, guarded per spec');
+}
+
+classify('T9 (finding: HTTP branch symmetry) transport.type="streamable_http" with a url -> NEEDS_REPAIR (never REGISTERED, reported like STDIO NEEDS_REPAIR)',
+  [{ status: 0, stdout: JSON.stringify({ transport: { type: 'streamable_http', url: 'https://example.invalid/mcp' } }), stderr: '' }],
+  'NEEDS_REPAIR',
+  (r) => (r.oldUrl === 'https://example.invalid/mcp' && r.newEnginePath === ENGINE) ? null : `expected oldUrl+newEnginePath symmetry fields, got ${JSON.stringify(r)}`);
+
+classify('T9b (finding: HTTP branch symmetry, sse type) transport.type="sse" -> NEEDS_REPAIR, same shape as T9',
+  [{ status: 0, stdout: JSON.stringify({ transport: { type: 'sse', url: 'https://example.invalid/sse' } }), stderr: '' }],
+  'NEEDS_REPAIR');
+
+classify('T9c (finding: HTTP branch, bare url field with no type) url present, no type at all -> HTTP -> NEEDS_REPAIR',
+  [{ status: 0, stdout: JSON.stringify({ url: 'https://example.invalid/mcp' }), stderr: '' }],
+  'NEEDS_REPAIR');
+
+classify('T10 (finding: HANDOFF_HOST wrong value) entry matches engine path but HANDOFF_HOST env is set to a different host -> NEEDS_REPAIR (misrouted)',
+  [{ status: 0, stdout: JSON.stringify({ transport: { type: 'stdio', command: 'node', args: [ENGINE], env: { HANDOFF_HOST: 'claude' } } }), stderr: '' }],
+  'NEEDS_REPAIR');
+
+classify('T11 (HANDOFF_HOST missing is a note, not a repair trigger) entry matches engine path, env object present but no HANDOFF_HOST key -> REGISTERED',
+  [{ status: 0, stdout: JSON.stringify({ transport: { type: 'stdio', command: 'node', args: [ENGINE], env: { SOME_OTHER_VAR: '1' } } }), stderr: '' }],
+  'REGISTERED');
+
+classify('T12 (total classification default branch) transport carries only an unrecognized type, no command, no url -> UNKNOWN',
+  [{ status: 0, stdout: JSON.stringify({ transport: { type: 'carrier-pigeon' } }), stderr: '' }],
+  'UNKNOWN');
+
+// ═══════════════════════════════════════════════════════════════════════════
 // BK1-BK3 — backupConfigTomlIfPresent()
 // ═══════════════════════════════════════════════════════════════════════════
 
