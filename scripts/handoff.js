@@ -112,7 +112,7 @@ const { REALITY_CHECKS, runVerifyDispatch }        = require('./lib/reality-chec
 // (and, before this fix, only-validated-never-written) entry point onto
 // this one write path.
 const { validateDecisionRows, persistDecisionRow } = require('./lib/decisions-writer');
-const { renderKeyPathsBullets, healKeyPathsSection, resolvePromotionHost, resolvePromotionTarget, looksLikeFindReplaceCopy } = require('./lib/claude-md-key-paths');
+const { renderKeyPathsBullets, healKeyPathsSection, resolvePromotionHost, resolvePromotionTarget, looksLikeFindReplaceCopy, resolveProjectDisplayName } = require('./lib/claude-md-key-paths');
 
 process.on('exit', () => {
   const ms = Number(process.hrtime.bigint() - __startNs) / 1e6;
@@ -4733,9 +4733,19 @@ async function cmdInit(args) {
   const promotionTemplate = promotionHost === 'codex' ? PROJECT_AGENTS_MD_TEMPLATE : PROJECT_CLAUDE_MD_TEMPLATE;
   const forcePromotion = args.includes('--force-promotion');
 
-  function writeFreshPromotionFile() {
-    const projectName = args.find((a) => !a.startsWith('-')) || path.basename(root);
-    return renderFreshPromotionContent({ root, projectName, promotionTemplate, host: promotionHost, env: process.env });
+  // Project display name — resolved via the SAME shared resolver
+  // cmdPromoteRegenerate uses (resolveProjectDisplayName,
+  // scripts/lib/claude-md-key-paths.js), instead of falling back to
+  // `path.basename(root)` locally (the PR #290 bug: a worktree checkout's
+  // disposable directory name leaked into a fresh CLAUDE.md's H1).
+  // `existingFileContent` is passed only for the --force-promotion
+  // regenerate branch below, where a prior file's H1 (N1) can be reused;
+  // the brand-new-file branch has no prior content, so N1 naturally falls
+  // through to N2/N3.
+  function writeFreshPromotionFile(existingFileContent) {
+    const explicitName = args.find((a) => !a.startsWith('-'));
+    const nameResolution = resolveProjectDisplayName({ root, explicitName, existingFileContent });
+    return renderFreshPromotionContent({ root, projectName: nameResolution.name, promotionTemplate, host: promotionHost, env: process.env });
   }
 
   if (fs.existsSync(claudeMdPath)) {
@@ -4750,7 +4760,7 @@ async function cmdInit(args) {
       try {
         const backupPath = `${claudeMdPath}.bak-${Date.now()}-${process.hrtime.bigint()}-${process.pid}`;
         fs.copyFileSync(claudeMdPath, backupPath);
-        const content = writeFreshPromotionFile();
+        const content = writeFreshPromotionFile(existingContent);
         const tmpPath = `${claudeMdPath}.tmp-${process.pid}`;
         fs.writeFileSync(tmpPath, content, 'utf8');
         fs.renameSync(tmpPath, claudeMdPath);
@@ -10195,7 +10205,7 @@ async function cmdLoaderStop(args) {
  * (since this path never touches assertion rows) no DB row is ever mutated
  * either way — only the reachability precondition connects to the DB at all.
  */
-async function cmdPromoteRegenerate({ dryRun }) {
+async function cmdPromoteRegenerate({ dryRun, projectName }) {
   // ── Preconditions ────────────────────────────────────────────────────────
   const root = findProjectRoot();
 
@@ -10256,9 +10266,11 @@ async function cmdPromoteRegenerate({ dryRun }) {
   let eol = '\n';
   let factLines = [];
   let sectionParseable = true;
+  let existingContentForName;
 
   if (targetKind === 'file') {
     const existingContent = fs.readFileSync(claudeMdPath, 'utf8');
+    existingContentForName = existingContent;
     eol = detectDominantEol(existingContent);
     const parsed = parseDurableFactsSection(existingContent);
     if (parsed === null) {
@@ -10270,12 +10282,23 @@ async function cmdPromoteRegenerate({ dryRun }) {
 
   const carriedCount = factLines.filter((l) => !/^<!--/.test(l.trim())).length;
 
+  // Project display name — SAME shared resolver cmdInit uses (see PR #290:
+  // this call site used to fall back to `path.basename(root)` directly,
+  // which is exactly what leaked a worktree's disposable directory name
+  // into a fresh CLAUDE.md's H1 when regenerate ran from
+  // `.claude/worktrees/agent-<hex>`).
+  const nameResolution = resolveProjectDisplayName({
+    root,
+    explicitName: projectName,
+    existingFileContent: existingContentForName,
+  });
+
   // Normalize to LF regardless of the template file's own on-disk EOL (which
   // varies by checkout platform — e.g. core.autocrlf on Windows — since
   // .gitattributes only pins *.sql to LF, not *.tpl). insertCarriedDurableFacts'
   // heading/placeholder match is LF-literal, so it must run on normalized text;
   // convertEol() re-emits the actually-desired EOL afterward.
-  const freshRaw    = renderFreshPromotionContent({ root, promotionTemplate, host: promotionTargetResult.host, env: process.env });
+  const freshRaw    = renderFreshPromotionContent({ root, projectName: nameResolution.name, promotionTemplate, host: promotionTargetResult.host, env: process.env });
   const freshLf     = freshRaw.replace(/\r\n/g, '\n');
   const withFacts   = insertCarriedDurableFacts(freshLf, factLines);
   const finalContent = convertEol(withFacts, eol);
@@ -10284,6 +10307,7 @@ async function cmdPromoteRegenerate({ dryRun }) {
   if (dryRun) {
     console.log(`promote --regenerate (dry-run): would target ${claudeMdPath}`);
     console.log(`  target-state:      ${targetKind}`);
+    console.log(`  project name:      ${nameResolution.name} (branch ${nameResolution.branch})`);
     console.log(`  would back up:     ${targetKind === 'file' ? 'yes' : 'no'}`);
     console.log(`  would-be bytes:    ${bytes}`);
     console.log(`  facts that would carry: ${carriedCount}`);
@@ -10333,31 +10357,49 @@ async function cmdPromote(args) {
   //   promote <id>                          — promote by integer id (original)
   //   promote --subject S [--predicate P] [--object O]  — promote by content
   //   promote --demote <id>                 — reverse a prior promote
-  //   promote --regenerate [--dry-run]      — rewrite the promotion file from
+  //   promote --regenerate [--dry-run] [--project-name <name>]
+  //                                          — rewrite the promotion file from
   //                                            the template (no `init --force-promotion`
   //                                            DB/FS side effects)
 
-  // ── --regenerate [--dry-run] ─────────────────────────────────────────────────
+  // ── --regenerate [--dry-run] [--project-name <name>] ─────────────────────
   //
   // TOTAL classification of this branch's own argument space: once
-  // `--regenerate` is present, the ONLY other token this command recognizes
-  // is `--dry-run`. Anything else — a positional (bare id), a flag that
+  // `--regenerate` is present, the ONLY other tokens this command recognizes
+  // are `--dry-run` and `--project-name <name>` (that flag's value token
+  // consumed with it). Anything else — a positional (bare id), a flag that
   // belongs to one of the other three invocation forms (--demote, --subject,
   // --predicate, --object), or a genuinely unknown flag — is rejected the
   // same way (exit 2). This is deliberately not an allow-list of "known
-  // other-form flags to reject": every non-{--regenerate,--dry-run} token is
-  // rejected, so a future flag added to another form never silently slips
-  // through here uncaught.
+  // other-form flags to reject": every non-{--regenerate,--dry-run,
+  // --project-name,<its value>} token is rejected, so a future flag added to
+  // another form never silently slips through here uncaught.
   if (args.includes('--regenerate')) {
-    const extra = args.filter((a) => a !== '--regenerate' && a !== '--dry-run');
+    const projectNameIdx = args.indexOf('--project-name');
+    let explicitProjectName;
+    if (projectNameIdx !== -1) {
+      explicitProjectName = args[projectNameIdx + 1];
+      if (!explicitProjectName || explicitProjectName.startsWith('--')) {
+        console.error(
+          `promote --regenerate --project-name requires a value. ` +
+          `Usage: node scripts/handoff.js promote --regenerate [--dry-run] [--project-name <name>]`
+        );
+        process.exit(2);
+      }
+    }
+    const extra = args.filter((a, i) => {
+      if (a === '--regenerate' || a === '--dry-run') return false;
+      if (projectNameIdx !== -1 && (i === projectNameIdx || i === projectNameIdx + 1)) return false;
+      return true;
+    });
     if (extra.length > 0) {
       console.error(
-        `promote --regenerate takes no other arguments (got: ${extra.join(' ')}). ` +
-        `Usage: node scripts/handoff.js promote --regenerate [--dry-run]`
+        `promote --regenerate takes no other arguments except --project-name <name> (got: ${extra.join(' ')}). ` +
+        `Usage: node scripts/handoff.js promote --regenerate [--dry-run] [--project-name <name>]`
       );
       process.exit(2);
     }
-    await cmdPromoteRegenerate({ dryRun: args.includes('--dry-run') });
+    await cmdPromoteRegenerate({ dryRun: args.includes('--dry-run'), projectName: explicitProjectName });
     return;
   }
 

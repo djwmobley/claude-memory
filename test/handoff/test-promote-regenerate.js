@@ -98,6 +98,49 @@ function listTmpFiles(fakeRoot) {
   return fs.readdirSync(fakeRoot).filter((e) => /^CLAUDE\.md\.tmp-/.test(e));
 }
 
+/**
+ * Build a REAL git worktree checkout (PR #290 regression coverage): a fake
+ * "main checkout" repo with a pre-minted marker and a committed
+ * `.claude/pipeline.yml` pointing at TARGET_DB, plus a `git worktree add`
+ * checkout under `<mainRoot>/.claude/worktrees/agent-deadbeef01` — the exact
+ * shape `resolveProjectDisplayName`'s N2 branch (scripts/lib/claude-md-key-paths.js)
+ * detects via `git rev-parse --git-common-dir`. The worktree checkout
+ * inherits the committed `.claude/pipeline.yml` automatically (same tracked
+ * content as the main checkout), so `PROJECT_ROOT=<worktreePath>` resolves a
+ * usable DB config with no separate copy step. The `.memory-engine` marker
+ * lives only in `mainRoot` (never committed/tracked) and is found by
+ * `findProjectRootByMarker`'s upward walk from the worktree path.
+ */
+function makeWorktreeFixture() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'promote-regen-wt-'));
+  const wtMainRoot = path.join(tmp, 'fake-main-checkout');
+  fs.mkdirSync(path.join(wtMainRoot, '.claude'), { recursive: true });
+  fs.writeFileSync(path.join(wtMainRoot, '.claude', 'pipeline.yml'), `
+project:
+  name: promote-regen-wt-test
+
+knowledge:
+  tier: "postgres"
+  host: "localhost"
+  port: 5432
+  database: "${TARGET_DB}"
+  user: "postgres"
+`.trim(), 'utf8');
+  execFileSync('git', ['init', '-q'], { cwd: wtMainRoot });
+  execFileSync('git', ['add', '.'], { cwd: wtMainRoot });
+  execFileSync(
+    'git',
+    ['-c', 'user.email=test@example.com', '-c', 'user.name=test', 'commit', '-q', '-m', 'init'],
+    { cwd: wtMainRoot }
+  );
+  writeMarker(wtMainRoot);
+  const worktreesDir = path.join(wtMainRoot, '.claude', 'worktrees');
+  fs.mkdirSync(worktreesDir, { recursive: true });
+  const worktreePath = path.join(worktreesDir, 'agent-deadbeef01');
+  execFileSync('git', ['worktree', 'add', worktreePath, '-b', 'promote-regen-wt-branch'], { cwd: wtMainRoot });
+  return { tmp, wtMainRoot, worktreePath };
+}
+
 function buildFixture({ hasSection, factLines, eol }) {
   const NL = eol === 'crlf' ? '\r\n' : '\n';
   const parts = [
@@ -322,6 +365,69 @@ async function runTests() {
     assert.ok(/dry-run/i.test(out), 'output should identify itself as a dry run');
     assert.ok(/would-be bytes:\s*\d+/.test(out), `expected "would-be bytes: N" in output, got: ${out}`);
     assert.ok(/facts that would carry:\s*1/.test(out), `expected "facts that would carry: 1" in output, got: ${out}`);
+    // buildFixture()'s H1 is `# old-project-name` — a legit, non-placeholder,
+    // non-worktree-shaped heading — so resolveProjectDisplayName's N1 branch
+    // picks it up over the N3 basename fallback.
+    assert.ok(
+      /project name:\s*old-project-name \(branch N1\)/.test(out),
+      `expected "project name: old-project-name (branch N1)" in output, got: ${out}`
+    );
+  });
+
+  test('--project-name overrides all inference (N0), even when the existing file has a usable H1', () => {
+    cleanPromotionArtifacts(fakeRoot);
+    const original = buildFixture({ hasSection: true, factLines: ['- [conf=5] A b C'] });
+    fs.writeFileSync(claudeMdPath(fakeRoot), original, 'utf8');
+
+    const out = runHelper('promote', ['--regenerate', '--project-name', 'Custom Explicit Name']);
+
+    const regenerated = fs.readFileSync(claudeMdPath(fakeRoot), 'utf8');
+    assert.ok(
+      regenerated.startsWith('# Custom Explicit Name'),
+      `expected --project-name to override the H1, got: ${regenerated.split('\n')[0]}`
+    );
+    assert.ok(!regenerated.includes('old-project-name'), '--project-name must not fall back to the existing H1');
+  });
+
+  test('--project-name requires a value: exit 2, nothing written', () => {
+    cleanPromotionArtifacts(fakeRoot);
+    let threw;
+    try {
+      runHelper('promote', ['--regenerate', '--project-name']);
+    } catch (err) {
+      threw = err;
+    }
+    assert.ok(threw, 'expected promote --regenerate --project-name (no value) to fail');
+    assert.strictEqual(threw.status, 2, `expected exit 2, got ${threw.status}`);
+    assert.ok(!fs.existsSync(claudeMdPath(fakeRoot)), 'nothing should be written on a rejected invocation');
+  });
+
+  test('--project-name combined with --dry-run: dry-run line reports the N0 override', () => {
+    cleanPromotionArtifacts(fakeRoot);
+    const out = runHelper('promote', ['--regenerate', '--dry-run', '--project-name', 'Dry Run Name']);
+    assert.ok(!fs.existsSync(claudeMdPath(fakeRoot)), 'dry-run must still write nothing');
+    assert.ok(
+      /project name:\s*Dry Run Name \(branch N0\)/.test(out),
+      `expected "project name: Dry Run Name (branch N0)" in output, got: ${out}`
+    );
+  });
+
+  test('run from a git worktree checkout: fresh render uses the main checkout basename, never the worktree dirname', () => {
+    const { tmp, wtMainRoot, worktreePath } = makeWorktreeFixture();
+    try {
+      runHelper('promote', ['--regenerate'], { fakeRoot: worktreePath });
+      const wtClaudeMdPath = claudeMdPath(worktreePath);
+      assert.ok(fs.existsSync(wtClaudeMdPath), 'CLAUDE.md should be created inside the worktree checkout');
+      const content = fs.readFileSync(wtClaudeMdPath, 'utf8');
+      const mainBasename = path.basename(wtMainRoot);
+      assert.ok(
+        content.startsWith(`# ${mainBasename}`),
+        `expected H1 to be the main checkout's basename "${mainBasename}", got: ${content.split('\n')[0]}`
+      );
+      assert.ok(!content.includes('agent-deadbeef01'), 'the worktree\'s own disposable directory name must never leak into the rendered content (PR #290 regression)');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
   test('CRLF file: regenerated output preserves CRLF, carries facts', () => {

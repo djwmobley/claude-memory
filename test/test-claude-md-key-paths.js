@@ -31,11 +31,13 @@ const os   = require('os');
 const path = require('path');
 
 const PROJECT_ROOT = path.resolve(__dirname, '..');
+const { execFileSync } = require('child_process');
 const {
   renderKeyPathsBullets,
   healKeyPathsSection,
   isAbsolutePath,
   isPortableForm,
+  resolveProjectDisplayName,
 } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'claude-md-key-paths.js'));
 // renderTemplate() — the SAME {{KEY}}-substitution function cmdInit uses to
 // write both handoff.md and the CLAUDE.md promotion file — exposed by
@@ -376,6 +378,148 @@ test('engine-shaped via marker alone (bullets absent) with no absolute path: noo
   const r = healKeyPathsSection(fixture, {});
   assertEqual(r.outcome, 'noop');
   assertEqual(r.text, fixture);
+});
+
+// ─── resolveProjectDisplayName() — N0-N3 total classification (PR #290) ────
+//
+// Incident: `promote --regenerate` run from a worktree checkout wrote
+// `# agent-a0979417bd522838e` (the worktree's own disposable directory
+// name) as the fresh CLAUDE.md's H1. resolveProjectDisplayName() is the ONE
+// shared resolver cmdInit and cmdPromoteRegenerate both call instead of
+// independently falling back to `path.basename(root)`.
+
+// N0 — explicit name always wins, regardless of root/content.
+test('N0: explicit name wins over everything else', () => {
+  const r = resolveProjectDisplayName({
+    root: '/x',
+    explicitName: '  My Explicit Name  ',
+    existingFileContent: '# some-other-name\n',
+  });
+  assertEqual(r.name, 'My Explicit Name');
+  assertEqual(r.branch, 'N0');
+});
+
+test('N0: whitespace-only explicit name does not count as N0 (falls through)', () => {
+  const r = resolveProjectDisplayName({ root: '/x', explicitName: '   ' });
+  assert(r.branch !== 'N0', `whitespace-only explicitName must not win as N0, got branch ${r.branch}`);
+});
+
+// N1 — first H1 of existing file content.
+test('N1: good H1 with inline markup is stripped and collapsed', () => {
+  const r = resolveProjectDisplayName({
+    root: '/x',
+    existingFileContent: '#   **My**   `Cool`   _Project_  \n\nbody text\n',
+  });
+  assertEqual(r.name, 'My Cool Project');
+  assertEqual(r.branch, 'N1');
+});
+
+test('N1: markup-wrapped H1 with an HTML tag is stripped', () => {
+  const r = resolveProjectDisplayName({
+    root: '/x',
+    existingFileContent: '# <b>pwa-etl</b>\n',
+  });
+  assertEqual(r.name, 'pwa-etl');
+  assertEqual(r.branch, 'N1');
+});
+
+test('N1: placeholder H1 "# Project" is rejected (falls through to N3 here)', () => {
+  const r = resolveProjectDisplayName({ root: '/some/root/myproj', existingFileContent: '# Project\n' });
+  assert(r.branch !== 'N1', `placeholder H1 must not be accepted as N1, got branch ${r.branch}`);
+  assertEqual(r.name, 'myproj');
+  assertEqual(r.branch, 'N3');
+});
+
+test('N1: worktree-shaped H1 "# agent-<hex>" is rejected (an already-broken prior render is not carried forward)', () => {
+  const r = resolveProjectDisplayName({
+    root: '/some/root/myproj',
+    existingFileContent: '# agent-a0979417bd522838e\n',
+  });
+  assert(r.branch !== 'N1', `worktree-shaped H1 must not be accepted as N1, got branch ${r.branch}`);
+  assertEqual(r.name, 'myproj');
+  assertEqual(r.branch, 'N3');
+});
+
+test('N1: path-like H1 ("# foo/bar") is rejected', () => {
+  const r = resolveProjectDisplayName({ root: '/some/root/myproj', existingFileContent: '# foo/bar\n' });
+  assert(r.branch !== 'N1', `path-like H1 must not be accepted as N1, got branch ${r.branch}`);
+  assertEqual(r.name, 'myproj');
+});
+
+test('N1: "##" (level-2 heading) is not mistaken for an H1', () => {
+  const r = resolveProjectDisplayName({
+    root: '/some/root/myproj',
+    existingFileContent: '## Not An H1\n\n# Real Title\n',
+  });
+  assertEqual(r.name, 'Real Title');
+  assertEqual(r.branch, 'N1');
+});
+
+test('N1: no H1 at all falls through past N1', () => {
+  const r = resolveProjectDisplayName({ root: '/some/root/myproj', existingFileContent: 'no heading here\n' });
+  assert(r.branch !== 'N1', `content with no H1 must not produce N1, got branch ${r.branch}`);
+});
+
+// N2 — git worktree checkout resolution (git-backed, not naming-convention-based).
+function makeGitWorktreeFixture() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-n2-worktree-'));
+  const mainRoot = path.join(tmp, 'fake-main-checkout');
+  fs.mkdirSync(mainRoot, { recursive: true });
+  execFileSync('git', ['init', '-q'], { cwd: mainRoot });
+  fs.writeFileSync(path.join(mainRoot, '.memory-engine'), '{}', 'utf8');
+  fs.writeFileSync(path.join(mainRoot, 'placeholder.txt'), 'x', 'utf8');
+  execFileSync('git', ['add', '.'], { cwd: mainRoot });
+  execFileSync('git', ['-c', 'user.email=test@example.com', '-c', 'user.name=test', 'commit', '-q', '-m', 'init'], { cwd: mainRoot });
+  const worktreesDir = path.join(mainRoot, '.claude', 'worktrees');
+  fs.mkdirSync(worktreesDir, { recursive: true });
+  const worktreePath = path.join(worktreesDir, 'agent-deadbeef01');
+  execFileSync('git', ['worktree', 'add', worktreePath, '-b', 'cm-n2-test-branch'], { cwd: mainRoot });
+  return { tmp, mainRoot, worktreePath };
+}
+
+test('N2: root under .claude/worktrees resolves to the main checkout basename via git', () => {
+  const { tmp, mainRoot, worktreePath } = makeGitWorktreeFixture();
+  try {
+    const r = resolveProjectDisplayName({ root: worktreePath });
+    assertEqual(r.name, path.basename(mainRoot));
+    assertEqual(r.branch, 'N2');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('N2: git failure (bogus PATH) is caught non-throwing and falls through to N3', () => {
+  const { tmp, worktreePath } = makeGitWorktreeFixture();
+  const savedPath = process.env.PATH;
+  try {
+    process.env.PATH = path.join(tmp, 'definitely-not-a-real-bin-dir');
+    const r = resolveProjectDisplayName({ root: worktreePath }); // must not throw
+    assertEqual(r.branch, 'N3');
+    assertEqual(r.name, path.basename(worktreePath));
+  } finally {
+    process.env.PATH = savedPath;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// N3 — basename(root) fallback, including the drive-letter-only literal-project case.
+test('N3: normal root basenames cleanly with no git/worktree signal', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-n3-plain-'));
+  const plainRoot = path.join(tmp, 'my-plain-project');
+  fs.mkdirSync(plainRoot, { recursive: true });
+  try {
+    const r = resolveProjectDisplayName({ root: plainRoot });
+    assertEqual(r.name, 'my-plain-project');
+    assertEqual(r.branch, 'N3');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('N3: bare Windows drive-letter root falls back to the literal "project"', () => {
+  const r = resolveProjectDisplayName({ root: 'C:' });
+  assertEqual(r.name, 'project');
+  assertEqual(r.branch, 'N3');
 });
 
 // ─── integration-style: init-on-existing write path (no DB required) ──────

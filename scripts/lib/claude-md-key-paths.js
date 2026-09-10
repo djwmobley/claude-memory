@@ -1,6 +1,8 @@
 'use strict';
 
 const path = require('node:path');
+const fs   = require('node:fs');
+const { execFileSync } = require('node:child_process');
 const { resolvePromotionFilePath, defaultPromotionFilenameForHost } = require('./handoff-paths');
 
 /**
@@ -189,6 +191,248 @@ function resolvePromotionTarget(root, env) {
     filename: path.basename(filePath),
     warning: hostResult.warning,
   };
+}
+
+// ─── project display name resolution ────────────────────────────────────────
+//
+// Incident (PR #290): a `handoff promote --regenerate` run from a git
+// worktree checkout (e.g. `.claude/worktrees/agent-a0979417bd522838e`) wrote
+// `# agent-a0979417bd522838e` as the fresh CLAUDE.md's H1 — cmdInit's
+// writeFreshPromotionFile() and cmdPromoteRegenerate() each independently
+// fell back to `path.basename(root)` with no shared resolution logic, so the
+// worktree's own disposable directory name leaked into the durable-facts
+// file. resolveProjectDisplayName() is the ONE shared resolver both callers
+// must use instead of restating `path.basename(root)` locally.
+//
+// TOTAL classification, first hit wins, every branch non-throwing:
+//   N0 — an explicit name was given (cmdInit's positional arg; promote
+//        --regenerate's --project-name flag), trimmed non-empty.
+//   N1 — the FIRST H1 line (`# ...`, not `##`) of an already-existing
+//        promotion file's content, after stripping inline markdown/HTML
+//        markup and collapsing whitespace — rejected if empty, path-like, a
+//        known placeholder, or itself worktree-shaped (an already-broken
+//        prior render must not be carried forward into the next one).
+//   N2 — root is a git worktree checkout: the main checkout's directory
+//        name, resolved via `git rev-parse --git-common-dir` (never the
+//        worktree's own disposable basename) and gated on that directory
+//        actually looking like a project root.
+//   N3 — `path.basename(root)`, or the literal `'project'` when that is
+//        empty or a bare Windows drive letter (e.g. root === 'C:\\').
+//
+// Every branch returns a plain string or falls through — none of them
+// throw. A caller-supplied bad explicitName (e.g. whitespace-only) is not an
+// error, it just fails N0's non-empty check and falls through to N1.
+
+const PLACEHOLDER_PROJECT_NAMES = new Set(['project', 'claude.md', 'agents.md', 'handoff']);
+
+// Matches the disposable worktree-checkout directory names this engine (and
+// Claude Code more generally) mints, e.g. `agent-a0979417bd522838e` — the
+// exact shape that leaked into PR #290's CLAUDE.md. Applied to a candidate
+// name from ANY branch (not just N2) so an already-broken prior render is
+// never carried forward by N1.
+const WORKTREE_SHAPED_NAME_RE = /^agent-[0-9a-f]{8,}$/i;
+
+// N2 deliberately does NOT gate on install.js:146's path-shape regex
+// (`/^(.*)\/\.claude\/worktrees\/[^/]+\/?$/i`, applied there only to that
+// script's own repoRoot). Matching root against a `.claude/worktrees/`
+// naming convention would only tell us root LOOKS like a worktree — it
+// can't tell us where the main checkout actually lives, and would miss any
+// worktree created under a different naming scheme. `git rev-parse
+// --git-common-dir` (below) answers both questions authoritatively and
+// non-throwing (caught on failure), so it is tried unconditionally
+// (excepting the degenerate-root guard just below) rather than gated behind
+// a naming heuristic.
+//
+/**
+ * Strip inline markdown/HTML markup from a heading's text: HTML tags
+ * (`<...>`) removed first (so `<b>*text*</b>` doesn't leave stray `*`
+ * behind from a tag's own attributes), then the literal `*`, `_`, and
+ * backtick characters, then trim and collapse internal whitespace runs to a
+ * single space.
+ *
+ * @param {string} s
+ * @returns {string}
+ */
+function _stripInlineMarkup(s) {
+  return s
+    .replace(/<[^>]*>/g, '')
+    .replace(/[*_`]/g, '')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+/**
+ * Return the text of the first level-1 heading line (`# ...`, not `##` or
+ * deeper) in `text`, or null if none exists. Line-based, not regex-`/m`
+ * multiline matching against the whole blob, so CRLF/LF/CR line endings are
+ * all handled uniformly via a manual split.
+ *
+ * @param {string} text
+ * @returns {string | null}
+ */
+function _firstH1Text(text) {
+  if (typeof text !== 'string' || text === '') return null;
+  for (const rawLine of text.split(/\r\n|\r|\n/)) {
+    const trimmed = rawLine.trim();
+    const m = trimmed.match(/^#(?!#)\s*(.*)$/);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+/**
+ * A candidate name is rejected (regardless of which branch produced it) if
+ * it is empty, contains a path separator, is a known placeholder
+ * (case-insensitive), or is itself worktree-shaped. Shared by N1's
+ * heading-extraction result.
+ *
+ * @param {string} candidate - already stripped/trimmed
+ * @returns {boolean}
+ */
+function _isRejectedCandidateName(candidate) {
+  if (candidate === '') return true;
+  if (/[\\/]/.test(candidate)) return true;
+  if (PLACEHOLDER_PROJECT_NAMES.has(candidate.toLowerCase())) return true;
+  if (WORKTREE_SHAPED_NAME_RE.test(candidate)) return true;
+  return false;
+}
+
+/**
+ * N1: extract a usable project name from an already-existing promotion
+ * file's content (its first H1), or null if none is usable.
+ *
+ * @param {string} [existingFileContent]
+ * @returns {string | null}
+ */
+function _resolveFromExistingContent(existingFileContent) {
+  const raw = _firstH1Text(existingFileContent);
+  if (raw === null) return null;
+  const cleaned = _stripInlineMarkup(raw);
+  if (_isRejectedCandidateName(cleaned)) return null;
+  return cleaned;
+}
+
+/**
+ * N2: resolve the main checkout's directory name for a `root` that is a git
+ * worktree checkout. Authoritative mechanism is `git rev-parse
+ * --git-common-dir` (its resolved absolute path's PARENT is the main
+ * checkout root for any worktree, regardless of naming convention or
+ * nesting depth — unlike parsing WORKTREE_PATH_RE's match, which would only
+ * tell us root LOOKS like a worktree, not where the main checkout actually
+ * lives). `git` failing (not installed, not a repo, timeout, or a bogus
+ * PATH) is caught and treated as "no worktree resolvable" — never thrown.
+ *
+ * The resolved candidate directory is accepted only if it actually looks
+ * like a project root (carries `.memory-engine`, the legacy
+ * `.claude-memory` marker, or `.git`) and has a non-empty basename —
+ * otherwise this returns null and the caller falls through to N3.
+ *
+ * @param {string} root
+ * @returns {string | null}
+ */
+function _resolveFromWorktree(root) {
+  let candidate = null;
+  try {
+    const out = execFileSync('git', ['-C', root, 'rev-parse', '--git-common-dir'], {
+      encoding: 'utf8',
+      timeout: 5000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    if (out) {
+      const gitCommonDirAbs = path.isAbsolute(out) ? out : path.resolve(root, out);
+      const parent = path.dirname(gitCommonDirAbs);
+      if (parent !== root) candidate = parent;
+    }
+  } catch (_) {
+    candidate = null; // git absent, not a repo, timeout, bogus PATH — no worktree resolvable.
+  }
+
+  if (candidate === null) return null;
+
+  const base = path.basename(candidate);
+  if (base === '') return null;
+
+  const hasProjectMarker = ['.memory-engine', '.claude-memory', '.git'].some((name) => {
+    try {
+      return fs.existsSync(path.join(candidate, name));
+    } catch (_) {
+      return false;
+    }
+  });
+  if (!hasProjectMarker) return null;
+
+  return base;
+}
+
+/**
+ * N3: `path.basename(root)`, or the literal `'project'` fallback when that
+ * is empty or a bare Windows drive letter (`root === 'C:\\'` basenames to
+ * `''`; `root === 'C:'` basenames to `'C:'` itself — both covered).
+ *
+ * @param {string} root
+ * @returns {string}
+ */
+function _resolveFromBasename(root) {
+  const base = path.basename(root).trim();
+  if (base === '' || /^[A-Za-z]:$/.test(base)) return 'project';
+  return base;
+}
+
+/**
+ * True when `root` is degenerate enough that N2's git-based worktree lookup
+ * must not even be attempted. A bare Windows drive-letter reference (`C:`,
+ * with no trailing separator) is drive-RELATIVE, not drive-rooted — passing
+ * it to `git -C <root>` resolves relative to the current process's cwd on
+ * that drive (a genuine Windows path-resolution quirk, not a git bug),
+ * which could silently attribute an unrelated repository to a garbage
+ * `root` value. Same emptiness/drive-letter-only shapes N3 already treats
+ * as "no real basename" — skip straight to N3 rather than run git against
+ * an ambiguous cwd.
+ *
+ * @param {string} root
+ * @returns {boolean}
+ */
+function _isDegenerateRoot(root) {
+  if (typeof root !== 'string') return true;
+  const base = path.basename(root).trim();
+  return base === '' || /^[A-Za-z]:$/.test(base);
+}
+
+/**
+ * The ONE shared project-display-name resolver — cmdInit and
+ * cmdPromoteRegenerate (scripts/handoff.js) both call this instead of
+ * independently falling back to `path.basename(root)`. See the block
+ * comment above for the full N0-N3 total classification.
+ *
+ * @param {object} opts
+ * @param {string} opts.root                    - project root.
+ * @param {string} [opts.explicitName]           - caller-supplied override
+ *   (cmdInit's positional arg; promote --regenerate's --project-name flag).
+ * @param {string} [opts.existingFileContent]    - the promotion file's
+ *   current content, if it already exists on disk (used for N1's heading
+ *   extraction). Omit/undefined when the target is fresh/absent.
+ * @returns {{name: string, branch: 'N0'|'N1'|'N2'|'N3'}}
+ */
+function resolveProjectDisplayName(opts) {
+  const { root, explicitName, existingFileContent } = opts || {};
+
+  if (typeof explicitName === 'string' && explicitName.trim() !== '') {
+    return { name: explicitName.trim(), branch: 'N0' };
+  }
+
+  const fromContent = _resolveFromExistingContent(existingFileContent);
+  if (fromContent !== null) {
+    return { name: fromContent, branch: 'N1' };
+  }
+
+  if (!_isDegenerateRoot(root)) {
+    const fromWorktree = _resolveFromWorktree(root);
+    if (fromWorktree !== null) {
+      return { name: fromWorktree, branch: 'N2' };
+    }
+  }
+
+  return { name: _resolveFromBasename(root), branch: 'N3' };
 }
 
 // ─── find-and-replace-copy detection (B) ────────────────────────────────────
@@ -423,4 +667,7 @@ module.exports = {
   resolvePromotionHost,
   resolvePromotionTarget,
   looksLikeFindReplaceCopy,
+  // Project display name resolution — shared by cmdInit and
+  // cmdPromoteRegenerate (scripts/handoff.js)
+  resolveProjectDisplayName,
 };
