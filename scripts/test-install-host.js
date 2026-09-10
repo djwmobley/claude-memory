@@ -446,7 +446,13 @@ classify('T5b (finding: cmd /c node wrapper, joined-string form) command="cmd.ex
   'REGISTERED');
 
 classify('T6 (finding: node.exe variant) transport.command is an absolute path ending in node.exe -> REGISTERED',
-  [{ status: 0, stdout: JSON.stringify({ transport: { type: 'stdio', command: 'C:\\\\nodejs\\\\node.exe', args: [ENGINE] } }), stderr: '' }],
+  // Built with path.join (OS-native separator) rather than a hardcoded
+  // backslash literal: a literal '\\' is only a path separator when Node
+  // itself is actually running on win32 — on a POSIX CI runner, path.basename
+  // treats a hardcoded 'C:\\nodejs\\node.exe' as one un-splittable segment
+  // (no basename match), which is a test-portability bug, not a real
+  // cross-platform behavior difference in the production code under test.
+  [{ status: 0, stdout: JSON.stringify({ transport: { type: 'stdio', command: path.join(path.sep, 'nodejs-install-dir', 'node.exe'), args: [ENGINE] } }), stderr: '' }],
   'REGISTERED');
 
 classify('T6b (finding: nodejs variant) transport.command is the bare name "nodejs" -> REGISTERED',
