@@ -1,6 +1,7 @@
 'use strict';
 
 const path = require('node:path');
+const { resolvePromotionFilePath, defaultPromotionFilenameForHost } = require('./handoff-paths');
 
 /**
  * claude-md-key-paths.js — portable "## Key paths" bullet rendering for the
@@ -90,27 +91,104 @@ function isPortableForm(p) {
 
 // ─── promotion-file host resolution (B) ─────────────────────────────────────
 //
-// Total classification: env.HANDOFF_HOST, when SET AT ALL (any value,
-// including ''), must be exactly 'claude' or 'codex' — anything else is a
-// refusal (never coerced to a default), matching the same "unset is the only
-// default branch" doctrine used by scripts/lib/host-target.js's --host flag.
-// Only when HANDOFF_HOST is genuinely undefined does resolution fall back to
-// inferring the host from HANDOFF_PROMOTION_FILE's basename.
+// Total classification of the (HANDOFF_HOST, HANDOFF_PROMOTION_FILE) env pair
+// — every combination maps to exactly one branch:
+//
+//   1. neither set                         -> host 'claude' (default)
+//   2. HANDOFF_HOST only                   -> host = env value (validated
+//                                              below; unrecognized -> refusal)
+//   3. HANDOFF_PROMOTION_FILE only         -> host inferred from the env
+//                                              value's basename, compared
+//                                              CASE-INSENSITIVELY: 'agents.md'
+//                                              (any case) -> 'codex'; anything
+//                                              else, including 'claude.md' and
+//                                              every basename this function
+//                                              has never seen -> 'claude'
+//                                              (the historical default; NOT
+//                                              an allow-list of known-good
+//                                              names).
+//   4. both set                            -> host = HANDOFF_HOST (it always
+//                                              wins); if the basename-derived
+//                                              host disagrees, `warning`
+//                                              carries a one-line message
+//                                              naming both — the caller
+//                                              prints it to stderr exactly
+//                                              once and proceeds with
+//                                              HANDOFF_HOST regardless.
+//
+// env.HANDOFF_HOST, when SET AT ALL (any value, including ''), must be
+// exactly 'claude' or 'codex' — anything else is a refusal (never coerced to
+// a default), matching the same "unset is the only default branch" doctrine
+// used by scripts/lib/host-target.js's --host flag.
+//
+// Case-insensitivity note: only the basename-inference step (rows 3 and the
+// mismatch check in row 4) is case-insensitive — this matches Windows/NTFS
+// case-insensitive filesystem semantics for HANDOFF_PROMOTION_FILE. The
+// on-disk-casing reuse in resolvePromotionFilePath (handoff-paths.js) is
+// unaffected and unrelated: that logic reuses whatever casing already exists
+// on disk, independent of host inference.
+
+function _inferHostFromPromotionFileBasename(promotionFile) {
+  const value = typeof promotionFile === 'string' && promotionFile !== '' ? promotionFile : 'CLAUDE.md';
+  const base = path.basename(value).toLowerCase();
+  return base === 'agents.md' ? 'codex' : 'claude';
+}
 
 function resolvePromotionHost(env) {
   env = env || process.env;
   const rawHost = env.HANDOFF_HOST;
+  const rawFile = env.HANDOFF_PROMOTION_FILE;
+  const fileIsSet = typeof rawFile === 'string' && rawFile !== '';
 
   if (rawHost !== undefined) {
-    if (rawHost === 'claude' || rawHost === 'codex') return { ok: true, host: rawHost };
-    return { ok: false, reason: `HANDOFF_HOST must be exactly one of: claude, codex (got ${JSON.stringify(rawHost)})` };
+    if (rawHost !== 'claude' && rawHost !== 'codex') {
+      return { ok: false, reason: `HANDOFF_HOST must be exactly one of: claude, codex (got ${JSON.stringify(rawHost)})` };
+    }
+    let warning;
+    if (fileIsSet) {
+      const inferredHost = _inferHostFromPromotionFileBasename(rawFile);
+      if (inferredHost !== rawHost) {
+        warning = `handoff: HANDOFF_HOST=${rawHost} but HANDOFF_PROMOTION_FILE=${JSON.stringify(rawFile)} implies host '${inferredHost}' by basename — proceeding with HANDOFF_HOST=${rawHost}.`;
+      }
+    }
+    return { ok: true, host: rawHost, warning };
   }
 
-  const promotionFile = typeof env.HANDOFF_PROMOTION_FILE === 'string' && env.HANDOFF_PROMOTION_FILE !== ''
-    ? env.HANDOFF_PROMOTION_FILE
-    : 'CLAUDE.md';
-  const base = path.basename(promotionFile);
-  return { ok: true, host: base === 'AGENTS.md' ? 'codex' : 'claude' };
+  return { ok: true, host: _inferHostFromPromotionFileBasename(rawFile) };
+}
+
+/**
+ * resolvePromotionTarget — the ONE shared entry point every caller (cmdInit,
+ * cmdClose, cmdPromote) must use to get a mutually-consistent (host,
+ * filePath) pair, instead of independently calling resolvePromotionFilePath()
+ * with no default (which always resolves to CLAUDE.md regardless of host)
+ * and separately calling resolvePromotionHost() for template selection —
+ * the split that let `HANDOFF_HOST=codex` with `HANDOFF_PROMOTION_FILE`
+ * unset write AGENTS-flavored content into a file literally named CLAUDE.md.
+ *
+ * Host is always resolved FIRST (from the raw env pair — see
+ * resolvePromotionHost above), then the filename default is derived from
+ * that host via defaultPromotionFilenameForHost() and handed to
+ * resolvePromotionFilePath() as its default — env.HANDOFF_PROMOTION_FILE, if
+ * set, still wins over that default exactly as resolvePromotionFilePath()
+ * already documents.
+ *
+ * @param {string} root
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {{ok:true, host:'claude'|'codex', filePath:string, filename:string, warning?:string} | {ok:false, reason:string}}
+ */
+function resolvePromotionTarget(root, env) {
+  env = env || process.env;
+  const hostResult = resolvePromotionHost(env);
+  if (!hostResult.ok) return hostResult;
+  const filePath = resolvePromotionFilePath(root, defaultPromotionFilenameForHost(hostResult.host));
+  return {
+    ok: true,
+    host: hostResult.host,
+    filePath,
+    filename: path.basename(filePath),
+    warning: hostResult.warning,
+  };
 }
 
 // ─── find-and-replace-copy detection (B) ────────────────────────────────────
@@ -343,5 +421,6 @@ module.exports = {
   isPortableForm,
   // Promotion-file host resolution (B)
   resolvePromotionHost,
+  resolvePromotionTarget,
   looksLikeFindReplaceCopy,
 };

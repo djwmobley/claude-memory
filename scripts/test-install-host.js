@@ -1734,6 +1734,153 @@ const handoffLib = require('./handoff.js');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// P16-P22 — resolvePromotionHost / resolvePromotionTarget total classification
+// of the (HANDOFF_HOST, HANDOFF_PROMOTION_FILE) env pair (fix/promotion-host-
+// filename-resolution). Rows 1-4 of the classification table plus the
+// case-insensitive-basename fix and the row-4 mismatch warning.
+// ═══════════════════════════════════════════════════════════════════════════
+
+{
+  // Row 1: neither set -> host claude, filename CLAUDE.md.
+  const label = 'P16: row1 — neither HANDOFF_HOST nor HANDOFF_PROMOTION_FILE set -> host=claude, file=CLAUDE.md';
+  const savedHost = process.env.HANDOFF_HOST;
+  const savedFile = process.env.HANDOFF_PROMOTION_FILE;
+  const dir = makeTempDir('p16-');
+  try {
+    delete process.env.HANDOFF_HOST;
+    delete process.env.HANDOFF_PROMOTION_FILE;
+    const r = claudeMdKeyPaths.resolvePromotionTarget(dir, process.env);
+    if (!r.ok || r.host !== 'claude' || r.filename !== 'CLAUDE.md' || r.warning !== undefined) {
+      fail(label, `expected ok host=claude file=CLAUDE.md no-warning, got ${JSON.stringify(r)}`);
+    } else pass(label);
+  } finally {
+    restoreEnv('HANDOFF_HOST', savedHost); restoreEnv('HANDOFF_PROMOTION_FILE', savedFile);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+{
+  // Row 2: HANDOFF_HOST only -> host = env value, filename = the host's default.
+  const label = 'P17: row2 — HANDOFF_HOST=codex only -> host=codex, file DEFAULTS to AGENTS.md (not CLAUDE.md)';
+  const savedHost = process.env.HANDOFF_HOST;
+  const savedFile = process.env.HANDOFF_PROMOTION_FILE;
+  const dir = makeTempDir('p17-');
+  try {
+    process.env.HANDOFF_HOST = 'codex';
+    delete process.env.HANDOFF_PROMOTION_FILE;
+    const r = claudeMdKeyPaths.resolvePromotionTarget(dir, process.env);
+    if (!r.ok || r.host !== 'codex' || r.filename !== 'AGENTS.md' || r.filePath !== path.join(dir, 'AGENTS.md') || r.warning !== undefined) {
+      fail(label, `expected ok host=codex file=AGENTS.md no-warning, got ${JSON.stringify(r)}`);
+    } else pass(label);
+  } finally {
+    restoreEnv('HANDOFF_HOST', savedHost); restoreEnv('HANDOFF_PROMOTION_FILE', savedFile);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+{
+  // Row 3: HANDOFF_PROMOTION_FILE only -> filename = env value, host derived
+  // from its basename case-INSENSITIVELY (the casing bug this PR fixes).
+  const label = 'P18: row3 — HANDOFF_PROMOTION_FILE=agents.md (lowercase) only -> host=codex (case-insensitive basename)';
+  const savedHost = process.env.HANDOFF_HOST;
+  const savedFile = process.env.HANDOFF_PROMOTION_FILE;
+  const dir = makeTempDir('p18-');
+  try {
+    delete process.env.HANDOFF_HOST;
+    process.env.HANDOFF_PROMOTION_FILE = 'agents.md';
+    const hostResult = claudeMdKeyPaths.resolvePromotionHost(process.env);
+    const r = claudeMdKeyPaths.resolvePromotionTarget(dir, process.env);
+    if (!hostResult.ok || hostResult.host !== 'codex') {
+      fail(label, `resolvePromotionHost: expected host=codex, got ${JSON.stringify(hostResult)}`);
+    } else if (!r.ok || r.host !== 'codex' || r.filename !== 'agents.md' || r.warning !== undefined) {
+      fail(label, `resolvePromotionTarget: expected ok host=codex file=agents.md no-warning, got ${JSON.stringify(r)}`);
+    } else pass(label);
+  } finally {
+    restoreEnv('HANDOFF_HOST', savedHost); restoreEnv('HANDOFF_PROMOTION_FILE', savedFile);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+{
+  // Row 3 variant: an unrecognized basename (neither agents.md nor claude.md,
+  // any case) must fall through to the historical default 'claude' — never a
+  // third invented host.
+  const label = 'P19: row3 — HANDOFF_PROMOTION_FILE=NOTES.md (unrecognized basename) -> host=claude (default branch, not an allow-list)';
+  const savedHost = process.env.HANDOFF_HOST;
+  const savedFile = process.env.HANDOFF_PROMOTION_FILE;
+  try {
+    delete process.env.HANDOFF_HOST;
+    process.env.HANDOFF_PROMOTION_FILE = 'NOTES.md';
+    const r = claudeMdKeyPaths.resolvePromotionHost(process.env);
+    if (!r.ok || r.host !== 'claude') fail(label, `expected ok host=claude, got ${JSON.stringify(r)}`);
+    else pass(label);
+  } finally { restoreEnv('HANDOFF_HOST', savedHost); restoreEnv('HANDOFF_PROMOTION_FILE', savedFile); }
+}
+
+{
+  // Row 4: both set, agreeing -> host = HANDOFF_HOST, filename = HANDOFF_PROMOTION_FILE, no warning.
+  const label = 'P20: row4 — HANDOFF_HOST=codex + HANDOFF_PROMOTION_FILE=AGENTS.md (agree) -> no warning';
+  const savedHost = process.env.HANDOFF_HOST;
+  const savedFile = process.env.HANDOFF_PROMOTION_FILE;
+  const dir = makeTempDir('p20-');
+  try {
+    process.env.HANDOFF_HOST = 'codex';
+    process.env.HANDOFF_PROMOTION_FILE = 'AGENTS.md';
+    const r = claudeMdKeyPaths.resolvePromotionTarget(dir, process.env);
+    if (!r.ok || r.host !== 'codex' || r.filename !== 'AGENTS.md' || r.warning !== undefined) {
+      fail(label, `expected ok host=codex file=AGENTS.md no-warning, got ${JSON.stringify(r)}`);
+    } else pass(label);
+  } finally {
+    restoreEnv('HANDOFF_HOST', savedHost); restoreEnv('HANDOFF_PROMOTION_FILE', savedFile);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+{
+  // Row 4: both set, DISAGREEING by basename -> host = HANDOFF_HOST (wins),
+  // filename = HANDOFF_PROMOTION_FILE (wins), and exactly one warning naming both.
+  const label = 'P21: row4 — HANDOFF_HOST=codex + HANDOFF_PROMOTION_FILE=CLAUDE.md (disagree) -> proceeds with HANDOFF_HOST, one warning naming both';
+  const savedHost = process.env.HANDOFF_HOST;
+  const savedFile = process.env.HANDOFF_PROMOTION_FILE;
+  const dir = makeTempDir('p21-');
+  try {
+    process.env.HANDOFF_HOST = 'codex';
+    process.env.HANDOFF_PROMOTION_FILE = 'CLAUDE.md';
+    const r = claudeMdKeyPaths.resolvePromotionTarget(dir, process.env);
+    if (!r.ok || r.host !== 'codex' || r.filename !== 'CLAUDE.md') {
+      fail(label, `expected ok host=codex (winner) file=CLAUDE.md (winner), got ${JSON.stringify(r)}`);
+    } else if (typeof r.warning !== 'string' || !r.warning.includes('codex') || !r.warning.includes('CLAUDE.md') || !r.warning.includes('claude')) {
+      fail(label, `expected exactly one warning naming both HANDOFF_HOST=codex and HANDOFF_PROMOTION_FILE=CLAUDE.md, got ${JSON.stringify(r.warning)}`);
+    } else pass(label);
+  } finally {
+    restoreEnv('HANDOFF_HOST', savedHost); restoreEnv('HANDOFF_PROMOTION_FILE', savedFile);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+{
+  // The exact incident this PR fixes, expressed as a resolvePromotionTarget
+  // assertion: HANDOFF_HOST=codex with HANDOFF_PROMOTION_FILE UNSET must
+  // never resolve to a file literally named CLAUDE.md.
+  const label = 'P22: regression — HANDOFF_HOST=codex, HANDOFF_PROMOTION_FILE unset -> filePath must NOT be CLAUDE.md';
+  const savedHost = process.env.HANDOFF_HOST;
+  const savedFile = process.env.HANDOFF_PROMOTION_FILE;
+  const dir = makeTempDir('p22-');
+  try {
+    process.env.HANDOFF_HOST = 'codex';
+    delete process.env.HANDOFF_PROMOTION_FILE;
+    const r = claudeMdKeyPaths.resolvePromotionTarget(dir, process.env);
+    if (!r.ok) fail(label, `expected ok, got ${JSON.stringify(r)}`);
+    else if (path.basename(r.filePath) === 'CLAUDE.md') fail(label, `regression: AGENTS-flavored content would be written into a file named CLAUDE.md: ${r.filePath}`);
+    else if (r.filename !== 'AGENTS.md') fail(label, `expected AGENTS.md, got ${r.filename}`);
+    else pass(label);
+  } finally {
+    restoreEnv('HANDOFF_HOST', savedHost); restoreEnv('HANDOFF_PROMOTION_FILE', savedFile);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 
 console.log('');
 console.log(`Results: ${passed} passed, ${failed} failed`);
