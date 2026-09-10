@@ -33,6 +33,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scripts/test-loader-stop-gate.js`. Claude Code's own install/engine
   behavior is unaffected — proven by a byte-identical-output regression test.
 
+- **`promote --regenerate [--dry-run]`** — rewrite the durable-facts
+  promotion file (`CLAUDE.md`/`AGENTS.md`) from its template without running
+  `init --force-promotion`, which bundles ~9 unrelated DB/FS writes.
+  Preconditions (project marker resolvable, DB reachable) are checked before
+  anything is touched. Target-state total classification: absent writes
+  fresh with no backup; a regular file is backed up
+  (`<name>.bak-<Date.now()>-<hrtime>-<pid>`, no `:` so it's Windows-safe)
+  then regenerated, carrying forward any parseable `## Durable facts`
+  fact lines from the old file (an unparseable section still regenerates,
+  with a `[WARN]` that prior content was not carried but remains recoverable
+  in the backup); a directory/symlink/other target exits 1 with nothing
+  written. `--regenerate` is exclusive of every other promote
+  flag/positional (exit 2). `--dry-run` performs reads only. The regenerated
+  file's line endings (LF/CRLF) match whichever dominated the file it
+  replaced. See [commands/handoff/promote.md](commands/handoff/promote.md).
+
 ### Removed
 
 - **Agent-interaction guard hooks moved to the public judge repo** —

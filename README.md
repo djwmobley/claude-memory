@@ -78,7 +78,7 @@ Full version: [docs/how-memory-works.md](docs/how-memory-works.md).
 | `/handoff:resume` | Force-load prior context even if it's been a long time since the last session. | — | [commands/handoff/resume.md](commands/handoff/resume.md) |
 | `/handoff:drop` | Archive the current journal and start fresh. Use when a project phase is truly over. | — | [commands/handoff/drop.md](commands/handoff/drop.md) |
 | `/handoff:purge [--yes] [--dry-run]` | Delete everything. No undo. Use with care. | `--yes` skip confirmation prompt; `--dry-run` preview row counts only | [commands/handoff/purge.md](commands/handoff/purge.md) |
-| `/handoff:promote <id>` or `--subject <s> --predicate <p>` | Bump a journal entry into `CLAUDE.md` so it's always loaded, not just "when relevant." | `<id>` assertion ID; `--subject/--predicate/--object` content match; `--demote <id>` reverse | [commands/handoff/promote.md](commands/handoff/promote.md) |
+| `/handoff:promote <id>` or `--subject <s> --predicate <p>` or `--regenerate` | Bump a journal entry into `CLAUDE.md` so it's always loaded, not just "when relevant." | `<id>` assertion ID; `--subject/--predicate/--object` content match; `--demote <id>` reverse; `--regenerate [--dry-run]` rewrite the file from its template | [commands/handoff/promote.md](commands/handoff/promote.md) |
 | `/handoff:resurrect <topic> [--revive] [--limit=N] [--json]` | Pull decay-suppressed notes on a topic back to the surface; dry-run by default. | `<topic>` seed text; `--revive`/`-r` un-suppress; `--limit=N` cap candidate set | [commands/handoff/resurrect.md](commands/handoff/resurrect.md) |
 
 ---

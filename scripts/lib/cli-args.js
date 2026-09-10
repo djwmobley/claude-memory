@@ -81,12 +81,20 @@ const SPECS = {
     },
   },
   promote: {
-    summary: 'Explicitly promote (or --demote) an assertion to durable-facts (CLAUDE.md).',
+    summary: 'Explicitly promote (or --demote) an assertion to durable-facts (CLAUDE.md); or --regenerate the promotion file from its template.',
     flags: {
-      '--demote':    { kind: 'value', desc: 'Reverse a prior promote for assertion_id.' },
-      '--subject':   { kind: 'value', desc: 'Promote by subject (optionally narrowed by --predicate/--object).' },
-      '--predicate': { kind: 'value', desc: 'Narrow --subject lookup by predicate.' },
-      '--object':    { kind: 'value', desc: 'Narrow --subject lookup by object.' },
+      '--demote':      { kind: 'value',   desc: 'Reverse a prior promote for assertion_id.' },
+      '--subject':     { kind: 'value',   desc: 'Promote by subject (optionally narrowed by --predicate/--object).' },
+      '--predicate':   { kind: 'value',   desc: 'Narrow --subject lookup by predicate.' },
+      '--object':      { kind: 'value',   desc: 'Narrow --subject lookup by object.' },
+      // Declared here only so the token classifies as a KNOWN promote flag —
+      // this module never validates flag *combinations*. cmdPromote's own
+      // total classification (scripts/handoff.js, top of cmdPromote) is what
+      // rejects --regenerate combined with any of the flags above, or with a
+      // positional; this gate would otherwise accept e.g. `--regenerate
+      // --demote 5` as two individually-known flags.
+      '--regenerate':  { kind: 'boolean', desc: 'Rewrite the promotion file from the template (no init --force-promotion DB/FS side effects). Exclusive of every other promote flag/positional.' },
+      '--dry-run':     { kind: 'boolean', desc: 'With --regenerate: report what would change; write nothing.' },
     },
     positionals: { max: 1, desc: 'assertion_id (integer) — original promote-by-id form.' },
   },

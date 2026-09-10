@@ -1503,6 +1503,19 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run promote --regenerate tests
+        # Coverage for `promote --regenerate [--dry-run]`: target-state total
+        # classification (absent/file/directory), "## Durable facts"
+        # carry-forward (parseable and unparseable sections), argument
+        # total classification (--regenerate exclusive of every other
+        # promote flag/positional), --dry-run writes nothing, CRLF
+        # preservation, and Windows-safe backup filenames.
+        # Reuses claude_memory_eval_test (created by Create handoff test database step above).
+        run: node test/handoff/test-promote-regenerate.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run serve-time staleness tests
         # Tests the serve-time reality re-probe (categorical staleness fix):
         #   (a) Frozen 'verified' row annotated [STALE:] in served output on mismatch

@@ -312,6 +312,154 @@ function writeHandoffMd(handoffPath, vars) {
 }
 
 /**
+ * Render a FRESH promotion file (CLAUDE.md / AGENTS.md) from scratch. Pulled
+ * out of cmdInit's `writeFreshPromotionFile` closure (cm#promote-regenerate)
+ * so cmdPromote's `--regenerate` path can render the exact same content
+ * cmdInit would write for a brand-new project, without duplicating the
+ * PROJECT_DESCRIPTION / KEY_PATHS interpolation logic.
+ *
+ * Renders from the template ONLY — it does not read any already-promoted
+ * facts from an existing file (that carry-forward, when wanted, is the
+ * caller's job — see cmdPromote's `--regenerate` handling below).
+ *
+ * `host` is accepted for documentation/logging parity with the caller's own
+ * host resolution (resolvePromotionHost) — it plays no role in this function
+ * since `promotionTemplate` already encodes which template (claude/codex) to
+ * render; it is not required to be correct here.
+ *
+ * @param {object} opts
+ * @param {string} opts.root              - project root (used only for the
+ *                                           basename fallback below).
+ * @param {string} [opts.projectName]     - defaults to path.basename(root).
+ * @param {string} opts.promotionTemplate - absolute path to the .tpl file.
+ * @param {string} [opts.host]            - 'claude' | 'codex' (informational).
+ * @param {object} [opts.env]             - defaults to process.env.
+ * @returns {string} the rendered file content, with whatever line endings
+ *   the template happens to carry on disk (LF in the git blob, but this
+ *   varies by checkout platform — e.g. Windows core.autocrlf — since
+ *   .gitattributes does not pin *.tpl files to LF the way it does *.sql).
+ *   Callers needing a specific EOL must normalize themselves.
+ */
+function renderFreshPromotionContent(opts) {
+  const { root, promotionTemplate } = opts;
+  const projectName = opts.projectName || path.basename(root);
+  const env          = opts.env || process.env;
+  const projectDesc  = `Memory and retrieval infrastructure project.`;
+  const keyPathsBullets = renderKeyPathsBullets(env);
+  return renderTemplate(promotionTemplate, {
+    PROJECT_NAME:          projectName,
+    PROJECT_DESCRIPTION:   projectDesc,
+    KEY_PATHS_HANDOFF_PATH: keyPathsBullets.handoffPath,
+    KEY_PATHS_HELPER_PATH:  keyPathsBullets.helperPath,
+  });
+}
+
+/**
+ * Thin atomic-write helper for a promotion file: render-to-tmp then rename,
+ * same pattern as writeHandoffMd() above. Extracted so cmdPromote's
+ * `--regenerate` write step doesn't hand-roll its own tmp+rename.
+ */
+function writePromotionFileAtomic(targetPath, content) {
+  const tmpPath = `${targetPath}.tmp-${process.pid}`;
+  fs.writeFileSync(tmpPath, content, 'utf8');
+  fs.renameSync(tmpPath, targetPath);
+}
+
+/**
+ * Parse the "## Durable facts" section of an already-rendered promotion file
+ * and return its non-placeholder content lines (annotation comments and fact
+ * bullets, in original order) for carry-forward into a freshly regenerated
+ * file. Tolerant of both LF and CRLF line endings (unlike the plain "\n"
+ * literal cmdPromote's append-path regex uses, since a regenerate target may
+ * be a CRLF file end-to-end).
+ *
+ * Returns:
+ *   - `null` if no "## Durable facts" heading is found at all (section not
+ *     parseable — caller should warn that prior content is not carried).
+ *   - an array of content lines (possibly empty) if the heading IS found —
+ *     an empty array means the section existed but had nothing but the
+ *     placeholder line (or was itself empty), which is not a warning case:
+ *     there was nothing to lose.
+ */
+function parseDurableFactsSection(text) {
+  const m = text.match(/## Durable facts\r?\n([\s\S]*?)(?:\r?\n(?=##)|$)/);
+  if (!m) return null;
+  const body = m[1];
+  const lines = [];
+  for (const rawLine of body.split(/\r?\n/)) {
+    const line = rawLine.replace(/\r$/, '');
+    if (line.trim() === '') continue;
+    if (/^-\s*\(No durable facts promoted yet/i.test(line.trim())) continue;
+    lines.push(line);
+  }
+  return lines;
+}
+
+/**
+ * Detect the dominant line-ending style of a piece of text by counting CRLF
+ * vs bare-LF terminators (mirrors dominantEol() in
+ * scripts/lib/claude-md-key-paths.js, duplicated here rather than imported
+ * since that helper works on the {content,term} record shape produced by its
+ * own splitLines(), not a raw string).
+ */
+function detectDominantEol(text) {
+  let crlf = 0, lf = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '\n') {
+      if (i > 0 && text[i - 1] === '\r') crlf++; else lf++;
+    }
+  }
+  return crlf > lf ? '\r\n' : '\n';
+}
+
+/** Normalize `text` to LF-only, then re-emit with the requested `eol`. */
+function convertEol(text, eol) {
+  const normalized = text.replace(/\r\n/g, '\n');
+  return eol === '\r\n' ? normalized.replace(/\n/g, '\r\n') : normalized;
+}
+
+/**
+ * Splice carried-forward "## Durable facts" content lines into a freshly
+ * rendered promotion file, replacing the single placeholder bullet the
+ * template ships with. No-op (returns freshContent unchanged) when there is
+ * nothing to carry.
+ */
+function insertCarriedDurableFacts(freshContent, factLines) {
+  if (!factLines || factLines.length === 0) return freshContent;
+  // Both templates put a blank line between the "## Durable facts" heading
+  // and the placeholder bullet — preserve that blank line, replacing only
+  // the placeholder bullet itself with the carried-forward lines.
+  return freshContent.replace(
+    /(## Durable facts\n)(\n*)- \(No durable facts[^\n]*\)\n/,
+    (_, heading, blanks) => `${heading}${blanks}${factLines.join('\n')}\n`
+  );
+}
+
+/**
+ * Total classification of a promotion-file regenerate TARGET path's on-disk
+ * state, via lstat (so a symlink is detected as itself, never resolved
+ * through). Every possible state maps to exactly one branch:
+ *   'absent'    - ENOENT
+ *   'file'      - regular file
+ *   'directory' - a directory
+ *   'symlink'   - a symbolic link (regardless of what it points to)
+ *   'other'     - any other node type (FIFO, socket, block/char device, ...)
+ */
+function classifyPromotionRegenerateTarget(targetPath) {
+  let st;
+  try {
+    st = fs.lstatSync(targetPath);
+  } catch (err) {
+    if (err.code === 'ENOENT') return 'absent';
+    throw err;
+  }
+  if (st.isSymbolicLink()) return 'symlink';
+  if (st.isDirectory())    return 'directory';
+  if (st.isFile())         return 'file';
+  return 'other';
+}
+
+/**
  * Check whether a git object (commit, blob, tree, tag) exists in the repo.
  * Fail-open: returns true on any error (git unavailable, not a repo, timeout)
  * so that C-6 is never fired falsely when git is broken.
@@ -4587,14 +4735,7 @@ async function cmdInit(args) {
 
   function writeFreshPromotionFile() {
     const projectName = args.find((a) => !a.startsWith('-')) || path.basename(root);
-    const projectDesc = `Memory and retrieval infrastructure project.`;
-    const keyPathsBullets = renderKeyPathsBullets(process.env);
-    return renderTemplate(promotionTemplate, {
-      PROJECT_NAME:          projectName,
-      PROJECT_DESCRIPTION:   projectDesc,
-      KEY_PATHS_HANDOFF_PATH: keyPathsBullets.handoffPath,
-      KEY_PATHS_HELPER_PATH:  keyPathsBullets.helperPath,
-    });
+    return renderFreshPromotionContent({ root, projectName, promotionTemplate, host: promotionHost, env: process.env });
   }
 
   if (fs.existsSync(claudeMdPath)) {
@@ -10031,6 +10172,153 @@ async function cmdLoaderStop(args) {
 // ── promote ───────────────────────────────────────────────────────────────────
 
 /**
+ * `promote --regenerate [--dry-run]` — rewrite the promotion file (CLAUDE.md /
+ * AGENTS.md) from the template, without running `init --force-promotion`
+ * (which bundles ~9 unrelated DB/FS writes).
+ *
+ * Preconditions (checked before anything is touched): the project marker
+ * must be resolvable, and the DB must be reachable. Either failing exits 1
+ * with nothing written — no backup, no regenerated file.
+ *
+ * Target-state total classification (via classifyPromotionRegenerateTarget):
+ *   'absent'                    → write fresh, no backup.
+ *   'file'                      → back up, then write fresh (with carry-forward).
+ *   'directory'/'symlink'/'other' → exit 1, nothing written.
+ *
+ * Carry-forward: when the target is a regular file, its "## Durable facts"
+ * section (if parseable) is re-inserted into the fresh render, replacing the
+ * placeholder line. An unparseable section still regenerates the file (the
+ * old content is fully preserved in the backup) but prints a warning that
+ * nothing was carried forward.
+ *
+ * --dry-run performs reads only: no backup is made, no file is written, and
+ * (since this path never touches assertion rows) no DB row is ever mutated
+ * either way — only the reachability precondition connects to the DB at all.
+ */
+async function cmdPromoteRegenerate({ dryRun }) {
+  // ── Preconditions ────────────────────────────────────────────────────────
+  const root = findProjectRoot();
+
+  const startDir  = process.env.PROJECT_ROOT || process.cwd();
+  let markerOk = false;
+  try {
+    const markerRoot = findProjectRootByMarker(startDir);
+    if (markerRoot) {
+      const marker = readMarker(markerRoot);
+      markerOk = !!(marker && marker.uuid);
+    }
+  } catch (_) {
+    markerOk = false; // corrupt/dual marker — not resolvable, not fatal to detect
+  }
+  if (!markerOk) {
+    console.error(
+      `promote --regenerate: project marker not resolvable (no ${MARKER_FILENAME} found above ${startDir}) — nothing written`
+    );
+    process.exit(1);
+  }
+
+  // Shared resolution (same as cmdInit/cmdClose/cmdPromote's own top) — host
+  // resolved first, then the filename default derived from that host, so
+  // HANDOFF_HOST=codex with HANDOFF_PROMOTION_FILE unset targets AGENTS.md
+  // here too, never CLAUDE.md.
+  const promotionTargetResult = resolvePromotionTarget(root, process.env);
+  if (!promotionTargetResult.ok) {
+    // Same failure shape/exit code as cmdInit's own resolvePromotionTarget() gate.
+    console.error(`promote --regenerate: ${promotionTargetResult.reason}`);
+    process.exit(2);
+  }
+  if (promotionTargetResult.warning) {
+    process.stderr.write(promotionTargetResult.warning + '\n');
+  }
+  const claudeMdPath       = promotionTargetResult.filePath;
+  const promotionFilename  = promotionTargetResult.filename;
+  const promotionTemplate  = promotionTargetResult.host === 'codex' ? PROJECT_AGENTS_MD_TEMPLATE : PROJECT_CLAUDE_MD_TEMPLATE;
+
+  let db;
+  try {
+    db = await connectHandoff();
+  } catch (err) {
+    console.error(`promote --regenerate: DB connection failed: ${err.message} — nothing written`);
+    process.exit(1);
+  }
+  await db.end(); // reachability is the only thing this command needs the DB for
+
+  // ── Target-state classification ─────────────────────────────────────────
+  const targetKind = classifyPromotionRegenerateTarget(claudeMdPath);
+
+  if (targetKind === 'directory' || targetKind === 'symlink' || targetKind === 'other') {
+    console.error(
+      `promote --regenerate: ${claudeMdPath} is a ${targetKind}, not a regular file or absent — refusing to write. Nothing written.`
+    );
+    process.exit(1);
+  }
+
+  let eol = '\n';
+  let factLines = [];
+  let sectionParseable = true;
+
+  if (targetKind === 'file') {
+    const existingContent = fs.readFileSync(claudeMdPath, 'utf8');
+    eol = detectDominantEol(existingContent);
+    const parsed = parseDurableFactsSection(existingContent);
+    if (parsed === null) {
+      sectionParseable = false;
+    } else {
+      factLines = parsed;
+    }
+  }
+
+  const carriedCount = factLines.filter((l) => !/^<!--/.test(l.trim())).length;
+
+  // Normalize to LF regardless of the template file's own on-disk EOL (which
+  // varies by checkout platform — e.g. core.autocrlf on Windows — since
+  // .gitattributes only pins *.sql to LF, not *.tpl). insertCarriedDurableFacts'
+  // heading/placeholder match is LF-literal, so it must run on normalized text;
+  // convertEol() re-emits the actually-desired EOL afterward.
+  const freshRaw    = renderFreshPromotionContent({ root, promotionTemplate, host: promotionTargetResult.host, env: process.env });
+  const freshLf     = freshRaw.replace(/\r\n/g, '\n');
+  const withFacts   = insertCarriedDurableFacts(freshLf, factLines);
+  const finalContent = convertEol(withFacts, eol);
+  const bytes         = Buffer.byteLength(finalContent, 'utf8');
+
+  if (dryRun) {
+    console.log(`promote --regenerate (dry-run): would target ${claudeMdPath}`);
+    console.log(`  target-state:      ${targetKind}`);
+    console.log(`  would back up:     ${targetKind === 'file' ? 'yes' : 'no'}`);
+    console.log(`  would-be bytes:    ${bytes}`);
+    console.log(`  facts that would carry: ${carriedCount}`);
+    if (targetKind === 'file' && !sectionParseable) {
+      console.log(
+        `  [WARN]  existing ${promotionFilename} has no parseable "## Durable facts" section — ` +
+        `prior content would NOT be carried forward (it would remain recoverable in the backup).`
+      );
+    }
+    console.log(`\nDone: handoff:promote --regenerate (dry-run) — no changes written`);
+    return;
+  }
+
+  let backupPath = null;
+  if (targetKind === 'file') {
+    backupPath = `${claudeMdPath}.bak-${Date.now()}-${process.hrtime.bigint()}-${process.pid}`;
+    fs.copyFileSync(claudeMdPath, backupPath);
+  }
+
+  writePromotionFileAtomic(claudeMdPath, finalContent);
+
+  if (targetKind === 'file' && !sectionParseable) {
+    console.log(
+      `  [WARN]  existing ${promotionFilename} had no parseable "## Durable facts" section — ` +
+      `prior content was NOT carried forward; it is preserved in the backup: ${backupPath}`
+    );
+  }
+  console.log(`  path:          ${claudeMdPath}`);
+  console.log(`  bytes:         ${bytes}`);
+  console.log(`  backup:        ${backupPath || 'none'}`);
+  console.log(`  facts carried: ${carriedCount}`);
+  console.log(`\nDone: handoff:promote --regenerate — ${promotionFilename} regenerated`);
+}
+
+/**
  * Explicitly promote a single assertion to the durable-facts promotion file
  * (default CLAUDE.md; configurable via HANDOFF_PROMOTION_FILE).
  * Idempotent: re-running on an already-promoted assertion prints a notice and exits 0.
@@ -10041,10 +10329,37 @@ async function cmdLoaderStop(args) {
 async function cmdPromote(args) {
   // ── Parse flags ─────────────────────────────────────────────────────────────
   //
-  // Three invocation forms:
+  // Four invocation forms:
   //   promote <id>                          — promote by integer id (original)
   //   promote --subject S [--predicate P] [--object O]  — promote by content
   //   promote --demote <id>                 — reverse a prior promote
+  //   promote --regenerate [--dry-run]      — rewrite the promotion file from
+  //                                            the template (no `init --force-promotion`
+  //                                            DB/FS side effects)
+
+  // ── --regenerate [--dry-run] ─────────────────────────────────────────────────
+  //
+  // TOTAL classification of this branch's own argument space: once
+  // `--regenerate` is present, the ONLY other token this command recognizes
+  // is `--dry-run`. Anything else — a positional (bare id), a flag that
+  // belongs to one of the other three invocation forms (--demote, --subject,
+  // --predicate, --object), or a genuinely unknown flag — is rejected the
+  // same way (exit 2). This is deliberately not an allow-list of "known
+  // other-form flags to reject": every non-{--regenerate,--dry-run} token is
+  // rejected, so a future flag added to another form never silently slips
+  // through here uncaught.
+  if (args.includes('--regenerate')) {
+    const extra = args.filter((a) => a !== '--regenerate' && a !== '--dry-run');
+    if (extra.length > 0) {
+      console.error(
+        `promote --regenerate takes no other arguments (got: ${extra.join(' ')}). ` +
+        `Usage: node scripts/handoff.js promote --regenerate [--dry-run]`
+      );
+      process.exit(2);
+    }
+    await cmdPromoteRegenerate({ dryRun: args.includes('--dry-run') });
+    return;
+  }
 
   const root        = findProjectRoot();
   const projectId   = resolveProjectId();
