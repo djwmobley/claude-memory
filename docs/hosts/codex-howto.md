@@ -63,6 +63,37 @@ per-row persistence failure is never silent — it shows up as a `DIVERGENCE:
 
 ---
 
+## Session identity
+
+The engine needs a session id to attribute writes and to resolve the
+`session_in_progress` marker. It resolves one, in order: an explicit
+argument passed by the caller, then the `CLAUDE_CODE_SESSION_ID` environment
+variable, then `CODEX_THREAD_ID` (PR #276) — each candidate is trimmed, and
+an empty or whitespace-only value is treated as absent, not as a valid id.
+
+Codex sets `CODEX_THREAD_ID` for the life of a session, and every hook
+payload (`SessionStart`/`SessionEnd`) also carries its own `session_id`
+field — under Codex, `CLAUDE_CODE_SESSION_ID` is never set, so
+`CODEX_THREAD_ID` is what the fallback chain actually resolves to.
+
+`handoff_close` and `handoff_checkpoint` accept an optional `sessionId`
+argument that overrides the fallback chain entirely; a Codex caller should
+pass `CODEX_THREAD_ID` explicitly rather than relying on environment
+resolution alone. *(shipping in the companion PR, #278 — not yet merged.)*
+
+**Marker caveat.** The active-session marker (`project_settings.session_in_
+progress`) is a single slot per project — a nested session (a `codex exec`
+launched from inside an interactive session, or a second host touching the
+same project) overwrites it. This does not affect explicit closes: each one
+records its own session id append-only regardless of what the marker
+currently holds. Today, close's summary can claim the marker was cleared
+even when a later status check shows it still set (see item 10 in
+[Known real-world defects and quirks](#known-real-world-defects-and-quirks));
+close reporting the true marker outcome ships in the companion PR referenced
+there.
+
+---
+
 ## Reading the graph
 
 Beyond resume/checkpoint/close, the MCP surface exposes direct reads and
