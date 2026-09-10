@@ -244,7 +244,7 @@ function testNormalizeTextNfcFirst() {
 // ── Main ─────────────────────────────────────────────────────────────────
 
 async function main() {
-  await run('A1', 'Fresh full-stack apply through migrate-15 -> verify-20-mcp-surface all-green (28 checks + MCP registration)', testFreshApplyAllGreen);
+  await run('A1', 'Fresh full-stack apply through migrate-15 -> verify-20-mcp-surface all-green (29 checks + MCP registration)', testFreshApplyAllGreen);
   await run('A2', 'verify-20-mcp-surface refuses when migrate-15-mcp-addenda has not been applied, naming it as the fix', testPrereqMissing);
   await run('A3', 'migrate-15-mcp-addenda.js is idempotent on re-apply', testMigrate15IdempotentReapply);
 

@@ -450,7 +450,10 @@ async function probeTableAvailability(client, tables) {
  *   every ALLOWED_TABLES entry is a candidate. An explicit `[]` is NOT the
  *   same as omitted — it means zero candidates, and returns immediately
  *   with `hits: []`, `allSkipped: false` (nothing was skipped; nothing was
- *   asked for either).
+ *   asked for either). Duplicate entries (`["decisions","decisions"]`) are
+ *   collapsed to one candidate, first-occurrence order preserved, after the
+ *   unknown-table validation and before the `[]` emptiness check — a
+ *   duplicate never queries its table twice or double-counts hits.
  * @param {number} [args.limit] — default 10, applied per-table AND to the
  *   final merged result (see module header for why fetching `limit` per
  *   table is sufficient to recover the true global top-`limit`)
@@ -502,6 +505,17 @@ async function memorySearch(client, args) {
       { unknown }
     );
   }
+
+  // De-duplicate AFTER the unknown-table rejection above (so a duplicate of
+  // an invalid name still surfaces in the 'unknownTable' error) and BEFORE
+  // the `tables: []` short-circuit below (so the emptiness check operates on
+  // the deduped list, not the raw one — a request of `["x","x"]` never
+  // reaches the empty-candidates branch, and `[]` still does). Duplicates
+  // otherwise query the same table twice and return duplicate hits — a
+  // requester's `tables: ["decisions","decisions"]` is understood as
+  // "search decisions", not "search decisions twice at double weight".
+  // Order is first-occurrence order (Set preserves insertion order).
+  candidateTables = [...new Set(candidateTables)];
 
   if (candidateTables.length === 0) {
     // Explicit `tables: []` — zero candidates is not "everything" and not
