@@ -159,7 +159,7 @@ async function runRecencyQuery(client, projectId, q) {
  * a single absent table (e.g. agent_exchange on a pre-migrate-13 DB) never
  * fails the whole vector query.
  *
- * @returns {Promise<{hits: Array, skippedTables: string[]}>}
+ * @returns {Promise<{hits: Array, skippedTables: Array<{table:string, reason:string, detail?:object}>}>}
  */
 async function runVectorQuery(client, projectId, q, embedder) {
   const result = await memorySearch(client, {

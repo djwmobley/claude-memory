@@ -5893,15 +5893,21 @@ async function cmdLoaderLoad(opts = {}) {
       const vectorQueryText = (q.query || '').trim();
       try {
         const { hits, skippedTables } = await runVectorQuery(db, projectId, { ...q, query: vectorQueryText });
-        // skippedTables (2026-09-08, PR #274 review): memorySearch's own
-        // total-classification existence probe means a table absent from
-        // THIS connected DB (e.g. agent_exchange pre-migrate-13) is skipped,
-        // never fatal to the whole query — surfaced here as one diagnostic
-        // line, appended after any bullets, so a missing table is visible
-        // rather than silently dropped or (the pre-fix bug) killing every
-        // hit from every OTHER table too.
+        // skippedTables (2026-09-08, PR #274 review; reshaped 2026-09-09 by
+        // the per-table availability gate PR): memorySearch's own total-
+        // classification probe means a table absent from THIS connected DB
+        // (e.g. agent_exchange pre-migrate-13), missing/shape-mismatched
+        // columns (e.g. a degraded schema with embedding skipped at apply
+        // time), or a per-table live-query error is skipped, never fatal to
+        // the whole query — surfaced here as one diagnostic line, appended
+        // after any bullets, so a missing table is visible rather than
+        // silently dropped or (the pre-fix bug) killing every hit from every
+        // OTHER table too. skippedTables entries are now `{table, reason,
+        // detail}` objects (was a bare table-name string) — this render only
+        // ever named the table, so it maps `.table` out; a bare string
+        // survives unchanged (defensive — no known caller passes one today).
         const skipLine = (skippedTables && skippedTables.length)
-          ? `— skipped missing tables: ${skippedTables.join(', ')}` : null;
+          ? `— skipped missing tables: ${skippedTables.map((s) => (typeof s === 'string' ? s : s.table)).join(', ')}` : null;
 
         if (hits.length) {
           // Accumulate hits one-at-a-time, bounded by sectionBudget — same
