@@ -1,4 +1,4 @@
-# agent-a0979417bd522838e
+# claude-memory
 
 Memory and retrieval infrastructure project.
 
