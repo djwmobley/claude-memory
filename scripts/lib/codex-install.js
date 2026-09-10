@@ -39,12 +39,19 @@
  *     default. https://learn.chatgpt.com/docs/agent-configuration/agents-md
  */
 
-const fs   = require('node:fs');
-const path = require('node:path');
-const os   = require('node:os');
+const fs     = require('node:fs');
+const path   = require('node:path');
+const os     = require('node:os');
+const crypto = require('node:crypto');
 const { spawnSync: nodeSpawnSync } = require('node:child_process');
 
 const MCP_SERVER_NAME = 'handoff';
+
+// The dispatcher skill's name — a foreign `handoff` skill at this exact
+// target path would keep firing on every bare `handoff` utterance, so its
+// user-authored case ((d), see installSkills below) is a BLOCKING error
+// rather than a skip, unless --force-skills is given.
+const DISPATCHER_SKILL_NAME = 'handoff';
 
 // HARDENED AGAIN (2026-09-09, independent-reviewer finding on PR #276):
 // shell:true was previously used UNCONDITIONALLY for every spawn in this
@@ -255,7 +262,12 @@ function probeVersion(command) {
 
 /** Build the exact `codex mcp add ...` argv (excluding the `codex` token itself). */
 function buildMcpAddArgv(enginePath) {
-  return ['mcp', 'add', MCP_SERVER_NAME, '--env', 'HANDOFF_PROMOTION_FILE=AGENTS.md', '--', 'node', enginePath];
+  return [
+    'mcp', 'add', MCP_SERVER_NAME,
+    '--env', 'HANDOFF_PROMOTION_FILE=AGENTS.md',
+    '--env', 'HANDOFF_HOST=codex',
+    '--', 'node', enginePath,
+  ];
 }
 
 /** The manual-paste TOML stanza printed when `codex` cannot be found. */
@@ -268,6 +280,7 @@ function buildMcpTomlStanza(enginePath) {
     '',
     `[mcp_servers.${MCP_SERVER_NAME}.env]`,
     `HANDOFF_PROMOTION_FILE = "AGENTS.md"`,
+    `HANDOFF_HOST = "codex"`,
   ].join('\n');
 }
 
@@ -705,8 +718,252 @@ function installCodexHooks({ hooksPath, hookLoaderCmd, hookStopCmd, dryRun }) {
   return { hooksPath, report, wrote: true, backupPath, diff };
 }
 
+// ─── Codex skills install (A) ────────────────────────────────────────────────
+//
+// Installs adapter-owned skills from templates/codex-skills/<name>/SKILL.md
+// (the source of truth, rendered by scripts/gen-codex-skills — kept as
+// static files so their content is reviewable in a diff like any other
+// template) to the Codex skills discovery directory
+// (HANDOFF_CODEX_SKILLS_DIR if set, else ~/.agents/skills).
+//
+// Every managed skill file carries a marker line right after the closing
+// frontmatter `---`:
+//   <!-- managed-by: claude-memory handoff-skills v1 sha256:<hash> -->
+// where <hash> = sha256 of the LF-normalized, BOM-stripped, trailing-
+// newline-trimmed file body EXCLUDING the marker line itself. This lets the
+// installer distinguish "our file, unchanged" / "our file, needs upgrading"
+// from "a human wrote something here" without ever comparing raw bytes
+// (a byte compare would treat trivial re-wrapping as "changed" and a stale
+// old marker as new content — hash-of-normalized-body avoids both).
+
+const SKILL_MARKER_LINE_RE = /^<!--\s*managed-by:\s*claude-memory handoff-skills v1 sha256:([0-9a-f]{64})\s*-->\s*$/;
+
+/** Strip BOM, normalize CRLF/CR to LF, and trim trailing newline(s). */
+function normalizeForHash(text) {
+  const noBOM = String(text).replace(/^﻿/, '');
+  return noBOM.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n+$/, '');
+}
+
+/** Remove every line matching the marker pattern, then normalize. */
+function stripMarkerLine(text) {
+  const noBOM = String(text).replace(/^﻿/, '');
+  const lf = noBOM.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const kept = lf.split('\n').filter((line) => !SKILL_MARKER_LINE_RE.test(line));
+  return kept.join('\n').replace(/\n+$/, '');
+}
+
+/** sha256 hex digest of a skill file's body, marker line excluded. */
+function computeSkillBodyHash(text) {
+  return crypto.createHash('sha256').update(stripMarkerLine(text), 'utf8').digest('hex');
+}
+
+/** Extract the hash recorded in an existing file's marker line, or null if absent. */
+function extractSkillMarkerHash(text) {
+  const noBOM = String(text).replace(/^﻿/, '');
+  const lf = noBOM.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  for (const line of lf.split('\n')) {
+    const m = line.match(SKILL_MARKER_LINE_RE);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+/**
+ * Build the final SKILL.md text for one skill: frontmatter, then the marker
+ * line (hash computed over frontmatter+body with no marker present yet),
+ * then the body. Exported so a generator script and tests share the exact
+ * same construction the installer's comparison logic expects.
+ */
+function buildSkillFileText(name, description, body) {
+  const frontmatter = `---\nname: ${name}\ndescription: ${description}\n---\n`;
+  const withoutMarker = frontmatter + body;
+  const hash = crypto.createHash('sha256').update(normalizeForHash(withoutMarker), 'utf8').digest('hex');
+  const marker = `<!-- managed-by: claude-memory handoff-skills v1 sha256:${hash} -->\n`;
+  return frontmatter + marker + body;
+}
+
+/** HANDOFF_CODEX_SKILLS_DIR resolution: unset/empty -> default; relative -> refused. */
+function resolveCodexSkillsDir(env) {
+  env = env || process.env;
+  const raw = env.HANDOFF_CODEX_SKILLS_DIR;
+  if (typeof raw !== 'string' || raw.trim() === '') {
+    return { ok: true, dir: path.join(os.homedir(), '.agents', 'skills') };
+  }
+  if (!path.isAbsolute(raw)) {
+    return { ok: false, reason: `HANDOFF_CODEX_SKILLS_DIR ('${raw}') must be an absolute path — relative values are refused.` };
+  }
+  return { ok: true, dir: raw };
+}
+
+function statNoThrow(p) {
+  try { return fs.lstatSync(p); } catch (_) { return null; }
+}
+
+function makeTimestampedBackupPath(targetPath) {
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const stamp = `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}` +
+    `T${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}`;
+  return `${targetPath}.bak-${stamp}-${Date.now()}-${process.pid}`;
+}
+
+/**
+ * Classify one skill's install target — TOTAL CLASSIFICATION over every
+ * filesystem shape fs.stat/fs.lstat can report (never a path-string
+ * compare, so this is correct on case-insensitive filesystems too):
+ *
+ *   write             — (a) neither <dir>/<name>/ nor its SKILL.md exists.
+ *   unchanged         — (b) SKILL.md exists, carries our marker, hash equal.
+ *   overwrite         — (c) SKILL.md exists, carries our marker, hash differs.
+ *   skip              — (d) SKILL.md exists, no marker (user-authored).
+ *   blocked           — (d) for the dispatcher name specifically: same as
+ *                       skip, but callers must treat this as a hard error.
+ *   force-overwrite   — (f) --force-skills flag turns skip/blocked into a
+ *                       backup-then-overwrite.
+ *   error             — (e) <dir>/<name> exists and is not a directory (or
+ *                       is a symlink/junction), OR its SKILL.md exists and
+ *                       is not a regular file (or is a symlink).
+ */
+function classifySkillTarget({ targetDir, name, desiredContent, force }) {
+  const skillDir = path.join(targetDir, name);
+  const skillFile = path.join(skillDir, 'SKILL.md');
+
+  const dirStat = statNoThrow(skillDir);
+  if (dirStat !== null) {
+    if (dirStat.isSymbolicLink()) {
+      return { action: 'error', skillDir, skillFile, reason: `${skillDir} is a symlink/junction — refusing to install through it.` };
+    }
+    if (!dirStat.isDirectory()) {
+      return { action: 'error', skillDir, skillFile, reason: `${skillDir} exists and is not a directory.` };
+    }
+  }
+
+  const fileStat = statNoThrow(skillFile);
+  if (fileStat === null) {
+    return { action: 'write', skillDir, skillFile };
+  }
+  if (fileStat.isSymbolicLink()) {
+    return { action: 'error', skillDir, skillFile, reason: `${skillFile} is a symlink — refusing to install through it.` };
+  }
+  if (!fileStat.isFile()) {
+    return { action: 'error', skillDir, skillFile, reason: `${skillFile} exists and is not a regular file.` };
+  }
+
+  const existingContent = fs.readFileSync(skillFile, 'utf8');
+  const existingHash = extractSkillMarkerHash(existingContent);
+  const desiredHash = extractSkillMarkerHash(desiredContent);
+
+  if (existingHash === null) {
+    if (force) {
+      return { action: 'force-overwrite', skillDir, skillFile, existingContent };
+    }
+    if (name === DISPATCHER_SKILL_NAME) {
+      return {
+        action: 'blocked', skillDir, skillFile,
+        reason: `${skillFile} is user-authored (no managed-by marker) — a foreign "${DISPATCHER_SKILL_NAME}" skill here ` +
+          `would keep firing on every bare "${DISPATCHER_SKILL_NAME}" utterance. Re-run with --force-skills to overwrite it (a .bak copy is made first).`,
+      };
+    }
+    return {
+      action: 'skip', skillDir, skillFile,
+      reason: `${skillFile} is user-authored (no managed-by marker); use --force-skills to overwrite.`,
+    };
+  }
+
+  if (existingHash === desiredHash) {
+    return { action: 'unchanged', skillDir, skillFile };
+  }
+  return { action: 'overwrite', skillDir, skillFile, oldHash: existingHash, newHash: desiredHash };
+}
+
+/** Atomic write: temp file + rename, in the same directory as the target. */
+function atomicWriteFile(targetPath, content) {
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  const tmpPath = `${targetPath}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmpPath, content, 'utf8');
+  fs.renameSync(tmpPath, targetPath);
+}
+
+// Stale pre-adapter artifacts: Codex auto-migrated ~/.claude/commands into
+// ~/.agents/skills/source-command-handoff-* for users who had Claude Code
+// installed. These are never touched (never followed if a symlink, never
+// deleted) — only reported, since removing another tool's auto-migrated
+// content is out of scope and risky.
+const STALE_SOURCE_COMMAND_RE = /^source-command-handoff-/i;
+
+function findStaleSourceCommandSkills(targetDir) {
+  let entries;
+  try { entries = fs.readdirSync(targetDir, { withFileTypes: true }); } catch (_) { return []; }
+  const stale = [];
+  for (const entry of entries) {
+    if (!STALE_SOURCE_COMMAND_RE.test(entry.name)) continue;
+    const full = path.join(targetDir, entry.name);
+    const isSymlink = statNoThrow(full)?.isSymbolicLink() === true;
+    stale.push({ name: entry.name, path: full, isSymlink });
+  }
+  return stale;
+}
+
+/**
+ * Install every skill in `skills` ([{ name, content }]) into `targetDir`.
+ * Never throws — every per-skill outcome is collected into `results`, and
+ * the caller decides exit code (any 'error' or 'blocked' result -> exit 1).
+ * `dryRun` classifies and reports without writing or backing up anything.
+ */
+function installSkills({ targetDir, skills, dryRun, force }) {
+  const results = [];
+  for (const skill of skills) {
+    const plan = classifySkillTarget({ targetDir, name: skill.name, desiredContent: skill.content, force });
+
+    if (dryRun) {
+      results.push({ ...plan, name: skill.name, wrote: false });
+      continue;
+    }
+
+    switch (plan.action) {
+      case 'write': {
+        atomicWriteFile(plan.skillFile, skill.content);
+        results.push({ ...plan, name: skill.name, wrote: true });
+        break;
+      }
+      case 'overwrite': {
+        atomicWriteFile(plan.skillFile, skill.content);
+        results.push({ ...plan, name: skill.name, wrote: true });
+        break;
+      }
+      case 'force-overwrite': {
+        const backupPath = makeTimestampedBackupPath(plan.skillFile);
+        fs.copyFileSync(plan.skillFile, backupPath);
+        atomicWriteFile(plan.skillFile, skill.content);
+        results.push({ ...plan, name: skill.name, wrote: true, backupPath });
+        break;
+      }
+      case 'unchanged':
+      case 'skip':
+      case 'blocked':
+      case 'error':
+      default: {
+        results.push({ ...plan, name: skill.name, wrote: false });
+        break;
+      }
+    }
+  }
+
+  const stale = findStaleSourceCommandSkills(targetDir);
+
+  const summary = {
+    written: results.filter((r) => r.action === 'write' || r.action === 'overwrite' || r.action === 'force-overwrite').length,
+    unchanged: results.filter((r) => r.action === 'unchanged').length,
+    skipped: results.filter((r) => r.action === 'skip').length,
+    errors: results.filter((r) => r.action === 'error' || r.action === 'blocked').length,
+  };
+
+  return { results, stale, summary };
+}
+
 module.exports = {
   MCP_SERVER_NAME,
+  DISPATCHER_SKILL_NAME,
   isHandoffToken,
   discoverCodex,
   buildMcpAddArgv,
@@ -731,4 +988,14 @@ module.exports = {
   classifyAndQuoteWin32,
   quoteShellArgPosix,
   spawnSync,
+  // Codex skills install (A)
+  computeSkillBodyHash,
+  extractSkillMarkerHash,
+  buildSkillFileText,
+  resolveCodexSkillsDir,
+  classifySkillTarget,
+  installSkills,
+  findStaleSourceCommandSkills,
+  makeTimestampedBackupPath,
+  atomicWriteFile,
 };

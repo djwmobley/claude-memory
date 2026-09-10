@@ -56,7 +56,8 @@ const os   = require('node:os');
 
 const USAGE = `
 Usage: node scripts/install.js [--dry-run] [--force] [--non-interactive]
-                                [--hooks-scope user|project|auto] [--help|-h]
+                                [--hooks-scope user|project|auto]
+                                [--host claude|codex] [--force-skills] [--help|-h]
 
 Copies /handoff:* slash commands to ~/.claude/commands/handoff/ and wires
 SessionStart + SessionEnd hooks into a Claude Code settings file. Existing
@@ -69,6 +70,11 @@ Flags:
   --force            Skip confirmation; overwrite existing command files.
   --non-interactive  Same as --force (for CI / scripted setups).
   --hooks-scope      user | project | auto (default: auto).
+  --host             claude | codex (default: claude). codex registers the MCP
+                      server + hooks.json and installs skills instead of the
+                      Claude Code slash-command/settings.json path.
+  --force-skills     (codex host only) overwrite a user-authored skill file
+                      that lacks the managed-by marker, after backing it up.
   --help, -h         Print this message and exit.
 `.trim();
 
@@ -88,10 +94,17 @@ function refuse(reason) {
  * its exported functions (tests) never touches argv, cwd, or process.exit.
  */
 function resolveConfig() {
-  const args     = process.argv.slice(2);
-  const showHelp = args.includes('--help') || args.includes('-h');
-  const dryRun   = args.includes('--dry-run');
-  const force    = args.includes('--force') || args.includes('--non-interactive');
+  const args        = process.argv.slice(2);
+  const showHelp    = args.includes('--help') || args.includes('-h');
+  const dryRun      = args.includes('--dry-run');
+  const force       = args.includes('--force') || args.includes('--non-interactive');
+  // Codex-only (A/f): turns a user-authored-skill skip/block into a
+  // backup-then-overwrite. Deliberately separate from --force above, which
+  // governs slash-command file overwrite and confirmation-skip on the
+  // Claude path — a Codex install should not silently accept clobbering a
+  // hand-authored skill just because --force/--non-interactive was passed
+  // for CI convenience.
+  const forceSkills = args.includes('--force-skills');
 
   if (showHelp) { console.log(USAGE); process.exit(0); }
 
@@ -189,7 +202,7 @@ function resolveConfig() {
   }
 
   return {
-    dryRun, force, hooksScopeArg, engineOverride, host,
+    dryRun, force, forceSkills, hooksScopeArg, engineOverride, host,
     repoRoot, repoRootFwd, srcDir, destDir,
     enginePathFwd, hookLoaderCmd, hookStopCmd, mcpEnginePath,
     enginePathFile, enginePathContent,
@@ -942,7 +955,7 @@ async function main(cfg) {
  */
 async function mainCodex(cfg) {
   const codexInstall = require('./lib/codex-install');
-  const { dryRun, enginePathFwd, mcpEnginePath, hookLoaderCmd, hookStopCmd } = cfg;
+  const { dryRun, forceSkills, enginePathFwd, mcpEnginePath, hookLoaderCmd, hookStopCmd, repoRoot } = cfg;
 
   console.log('\nclaude-memory installer — host: codex');
   if (dryRun) console.log('(dry-run — nothing will be written, except the codex --version discovery probe)');
@@ -1055,6 +1068,67 @@ async function mainCodex(cfg) {
     console.log('Done. Restart Codex (or start a fresh session) to pick up the changes.');
   }
   console.log('');
+
+  // ── S4/A: install adapter-owned skills ────────────────────────────────────
+  const skillsDirResult = codexInstall.resolveCodexSkillsDir(process.env);
+  if (!skillsDirResult.ok) refuse(skillsDirResult.reason);
+  const skillsDir = skillsDirResult.dir;
+
+  const skills = loadCodexSkillTemplates(repoRoot);
+
+  console.log(`  Skills dir: ${skillsDir}`);
+  const skillsResult = codexInstall.installSkills({ targetDir: skillsDir, skills, dryRun, force: forceSkills });
+
+  for (const r of skillsResult.results) {
+    switch (r.action) {
+      case 'write':
+        console.log(`    [${dryRun ? 'DRY' : 'OK'}]    ${r.name}: ${dryRun ? 'would write' : 'wrote'} ${r.skillFile}`);
+        break;
+      case 'unchanged':
+        console.log(`    [OK]    ${r.name}: unchanged`);
+        break;
+      case 'overwrite':
+        console.log(`    [${dryRun ? 'DRY' : 'OK'}]    ${r.name}: ${dryRun ? 'would overwrite' : 'overwrote'} (${r.oldHash} -> ${r.newHash})`);
+        break;
+      case 'force-overwrite':
+        console.log(`    [${dryRun ? 'DRY' : 'OK'}]    ${r.name}: ${dryRun ? 'would force-overwrite' : `force-overwrote (backup: ${r.backupPath})`}`);
+        break;
+      case 'skip':
+        console.log(`    [SKIP]  ${r.name}: ${r.reason}`);
+        break;
+      case 'blocked':
+        console.error(`    [FAIL]  ${r.name}: ${r.reason}`);
+        break;
+      case 'error':
+        console.error(`    [FAIL]  ${r.name}: ${r.reason}`);
+        break;
+      default:
+        break;
+    }
+  }
+  for (const s of skillsResult.stale) {
+    console.error(`    [WARN]  stale pre-adapter skill found: ${s.path}${s.isSymlink ? ' (symlink — not followed)' : ''} — delete by hand.`);
+  }
+  console.log(`  Skills summary: written=${skillsResult.summary.written} unchanged=${skillsResult.summary.unchanged} ` +
+    `skipped=${skillsResult.summary.skipped} errors=${skillsResult.summary.errors}`);
+  console.log('');
+
+  if (!dryRun && skillsResult.summary.errors > 0) {
+    process.exitCode = 1;
+  }
+}
+
+/** Load every templates/codex-skills/<name>/SKILL.md as { name, content }. */
+function loadCodexSkillTemplates(repoRoot) {
+  const skillsSrcDir = path.join(repoRoot, 'templates', 'codex-skills');
+  const names = fs.readdirSync(skillsSrcDir, { withFileTypes: true })
+    .filter((d) => d.isDirectory())
+    .map((d) => d.name)
+    .sort();
+  return names.map((name) => ({
+    name,
+    content: fs.readFileSync(path.join(skillsSrcDir, name, 'SKILL.md'), 'utf8'),
+  }));
 }
 
 // module.exports MUST be assigned BEFORE the require.main guard below: the
@@ -1082,6 +1156,7 @@ module.exports = {
   makeBackupPath,
   readSettingsFileOrRefuse,
   refuse,
+  loadCodexSkillTemplates,
 };
 
 if (require.main === module) {

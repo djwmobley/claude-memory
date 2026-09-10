@@ -1,5 +1,7 @@
 'use strict';
 
+const path = require('node:path');
+
 /**
  * claude-md-key-paths.js — portable "## Key paths" bullet rendering for the
  * generated project CLAUDE.md (templates/project-claude-md.tpl).
@@ -84,6 +86,44 @@ function isPortableForm(p) {
     p.startsWith('$CLAUDE_PLUGIN_ROOT') ||
     p.startsWith('<engine-root>')
   );
+}
+
+// ─── promotion-file host resolution (B) ─────────────────────────────────────
+//
+// Total classification: env.HANDOFF_HOST, when SET AT ALL (any value,
+// including ''), must be exactly 'claude' or 'codex' — anything else is a
+// refusal (never coerced to a default), matching the same "unset is the only
+// default branch" doctrine used by scripts/lib/host-target.js's --host flag.
+// Only when HANDOFF_HOST is genuinely undefined does resolution fall back to
+// inferring the host from HANDOFF_PROMOTION_FILE's basename.
+
+function resolvePromotionHost(env) {
+  env = env || process.env;
+  const rawHost = env.HANDOFF_HOST;
+
+  if (rawHost !== undefined) {
+    if (rawHost === 'claude' || rawHost === 'codex') return { ok: true, host: rawHost };
+    return { ok: false, reason: `HANDOFF_HOST must be exactly one of: claude, codex (got ${JSON.stringify(rawHost)})` };
+  }
+
+  const promotionFile = typeof env.HANDOFF_PROMOTION_FILE === 'string' && env.HANDOFF_PROMOTION_FILE !== ''
+    ? env.HANDOFF_PROMOTION_FILE
+    : 'CLAUDE.md';
+  const base = path.basename(promotionFile);
+  return { ok: true, host: base === 'AGENTS.md' ? 'codex' : 'claude' };
+}
+
+// ─── find-and-replace-copy detection (B) ────────────────────────────────────
+//
+// Detects the specific known-bad shape: a hand-made find-and-replace copy of
+// a Claude CLAUDE.md that swapped strings but kept wrong paths (the real
+// AGENTS.md this PR replaces said "~/.Codex/" — wrong casing, wrong host —
+// and "# Codex-memory" as a heading). This is a diagnostic warning only,
+// never a gate — regeneration requires the explicit --force-promotion flag.
+
+function looksLikeFindReplaceCopy(text) {
+  if (typeof text !== 'string') return false;
+  return text.includes('~/.Codex/') || text.includes('# Codex-memory');
 }
 
 // ─── healKeyPathsSection — heal an already-generated CLAUDE.md (heal-on-touch) ────
@@ -221,11 +261,12 @@ function healKeyPathsSection(text, env) {
   }
 
   let markerPresent = false;
+  let markerCount = 0;
   let handoffMatch = null; // { index, prefix, path }
   let helperMatch  = null;
   for (let i = headingIndex; i < sectionEnd; i++) {
     const raw = lines[i].content;
-    if (KEY_PATHS_MARKER_RE.test(raw)) markerPresent = true;
+    if (KEY_PATHS_MARKER_RE.test(raw)) { markerPresent = true; markerCount++; }
     if (!handoffMatch) {
       const m = raw.match(HANDOFF_BULLET_LINE_RE);
       if (m && HANDOFF_PATH_CONTENT_RE.test(m[2])) {
@@ -238,6 +279,11 @@ function healKeyPathsSection(text, env) {
         helperMatch = { index: i, prefix: m[1], path: m[2] };
       }
     }
+  }
+
+  if (markerCount >= 2) {
+    notes.push(`Key paths: ${markerCount} managed-by markers found in one section — malformed/duplicated, left unchanged.`);
+    return { text, outcome: 'ambiguous', notes };
   }
 
   const bothBulletsFound = !!(handoffMatch && helperMatch);
@@ -295,4 +341,7 @@ module.exports = {
   // exported for tests / callers that need to classify a rendered bullet
   isAbsolutePath,
   isPortableForm,
+  // Promotion-file host resolution (B)
+  resolvePromotionHost,
+  looksLikeFindReplaceCopy,
 };

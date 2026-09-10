@@ -82,6 +82,8 @@ const REPO_ROOT     = path.resolve(__dirname, '..');
 const COMMANDS_DIR  = path.join(REPO_ROOT, 'commands', 'handoff');
 const REAL_INSTALL  = path.join(REPO_ROOT, 'scripts', 'install.js');
 const REAL_LIB_DIR  = path.join(REPO_ROOT, 'scripts', 'lib');
+const TEMPLATES_DIR = path.join(REPO_ROOT, 'templates');
+const CODEX_SKILLS_SRC_DIR = path.join(TEMPLATES_DIR, 'codex-skills');
 
 let passed = 0;
 let failed = 0;
@@ -489,7 +491,7 @@ withStub((command) => {
   try {
     const enginePath = '/abs/path/scripts/handoff-mcp.mjs';
     const result = codexInstall.registerHandoffMcp(command, enginePath);
-    const expectedArgv = ['mcp', 'add', 'handoff', '--env', 'HANDOFF_PROMOTION_FILE=AGENTS.md', '--', 'node', enginePath];
+    const expectedArgv = ['mcp', 'add', 'handoff', '--env', 'HANDOFF_PROMOTION_FILE=AGENTS.md', '--env', 'HANDOFF_HOST=codex', '--', 'node', enginePath];
     if (!result.ok) { fail(label, `expected ok:true, got ${JSON.stringify(result)}`); return; }
     if (JSON.stringify(result.argv) !== JSON.stringify(expectedArgv)) {
       fail(label, `argv mismatch: expected ${JSON.stringify(expectedArgv)}, got ${JSON.stringify(result.argv)}`);
@@ -711,6 +713,15 @@ function setupEngineCopy() {
   for (const f of fs.readdirSync(COMMANDS_DIR)) {
     if (f.endsWith('.md')) fs.copyFileSync(path.join(COMMANDS_DIR, f), path.join(engineRoot, 'commands', 'handoff', f));
   }
+  // Codex skills source templates (A) — install.js's loadCodexSkillTemplates()
+  // reads templates/codex-skills/<name>/SKILL.md relative to the (copied)
+  // engine root, so the E-series --host codex subprocess runs need these too.
+  const skillsSrc = path.join(TEMPLATES_DIR, 'codex-skills');
+  const skillsDest = path.join(engineRoot, 'templates', 'codex-skills');
+  for (const name of fs.readdirSync(skillsSrc)) {
+    fs.mkdirSync(path.join(skillsDest, name), { recursive: true });
+    fs.copyFileSync(path.join(skillsSrc, name, 'SKILL.md'), path.join(skillsDest, name, 'SKILL.md'));
+  }
   return { engineRoot, installScript: path.join(engineRoot, 'scripts', 'install.js') };
 }
 
@@ -795,7 +806,7 @@ function runInstall({ installScript, args, stubDir, codexHome, homeDir, extraEnv
     const addCall = lines.find((a) => a[0] === 'mcp' && a[1] === 'add');
     if (!addCall) { fail(label, `no mcp add call recorded; calls: ${JSON.stringify(lines)}`); return; }
     const enginePathArg = addCall[addCall.length - 1];
-    const expected = ['mcp', 'add', 'handoff', '--env', 'HANDOFF_PROMOTION_FILE=AGENTS.md', '--', 'node', enginePathArg];
+    const expected = ['mcp', 'add', 'handoff', '--env', 'HANDOFF_PROMOTION_FILE=AGENTS.md', '--env', 'HANDOFF_HOST=codex', '--', 'node', enginePathArg];
     if (JSON.stringify(addCall) !== JSON.stringify(expected)) {
       fail(label, `unexpected argv: ${JSON.stringify(addCall)}`);
       return;
@@ -1062,6 +1073,14 @@ function runInstall({ installScript, args, stubDir, codexHome, homeDir, extraEnv
   for (const f of fs.readdirSync(COMMANDS_DIR)) {
     if (f.endsWith('.md')) fs.copyFileSync(path.join(COMMANDS_DIR, f), path.join(engineRoot, 'commands', 'handoff', f));
   }
+  {
+    const skillsSrc = CODEX_SKILLS_SRC_DIR;
+    const skillsDest = path.join(engineRoot, 'templates', 'codex-skills');
+    for (const name of fs.readdirSync(skillsSrc)) {
+      fs.mkdirSync(path.join(skillsDest, name), { recursive: true });
+      fs.copyFileSync(path.join(skillsSrc, name, 'SKILL.md'), path.join(skillsDest, name, 'SKILL.md'));
+    }
+  }
   const installScript = path.join(engineRoot, 'scripts', 'install.js');
   const stubDir = path.join(engineRoot, '_bin');
   makeCodexStub(stubDir);
@@ -1100,6 +1119,404 @@ function runInstall({ installScript, args, stubDir, codexHome, homeDir, extraEnv
     }
     pass(label);
   } finally { fs.rmSync(homeDir, { recursive: true, force: true }); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// S1-S16 — Codex skills install (A): hash/marker scheme + total classification
+// ═══════════════════════════════════════════════════════════════════════════
+
+function makeSkillsTempDir() {
+  return makeTempDir('install-host-skills-');
+}
+
+{
+  const label = 'S1: computeSkillBodyHash is stable across CRLF and BOM variants of the same body';
+  const lf = codexInstall.buildSkillFileText('demo', 'desc', 'line one\nline two\n');
+  const withCRLF = lf.replace(/\n/g, '\r\n');
+  const withBOM = '﻿' + lf;
+  const h1 = codexInstall.computeSkillBodyHash(lf);
+  const h2 = codexInstall.computeSkillBodyHash(withCRLF);
+  const h3 = codexInstall.computeSkillBodyHash(withBOM);
+  if (h1 !== h2 || h1 !== h3) fail(label, `expected equal hashes, got ${h1} / ${h2} / ${h3}`);
+  else pass(label);
+}
+
+{
+  const label = 'S2: extractSkillMarkerHash round-trips through buildSkillFileText for every real skill template';
+  let names;
+  try { names = fs.readdirSync(CODEX_SKILLS_SRC_DIR); } catch (err) { fail(label, `cannot list ${CODEX_SKILLS_SRC_DIR}: ${err.message}`); names = []; }
+  let ok = names.length === 8;
+  for (const name of names) {
+    const text = fs.readFileSync(path.join(CODEX_SKILLS_SRC_DIR, name, 'SKILL.md'), 'utf8');
+    const marker = codexInstall.extractSkillMarkerHash(text);
+    const recomputed = codexInstall.computeSkillBodyHash(text);
+    if (marker === null || marker !== recomputed) { ok = false; break; }
+  }
+  if (!ok) fail(label, `expected 8 skill templates each with a self-consistent marker hash, got names=${JSON.stringify(names)}`);
+  else pass(label);
+}
+
+{
+  const label = 'S3 (a): absent target -> write';
+  const dir = makeSkillsTempDir();
+  try {
+    const content = codexInstall.buildSkillFileText('demo', 'd', 'body\n');
+    const plan = codexInstall.classifySkillTarget({ targetDir: dir, name: 'demo', desiredContent: content, force: false });
+    if (plan.action !== 'write') fail(label, `expected write, got ${plan.action}`);
+    else pass(label);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+{
+  const label = 'S4 (b): present with marker, equal hash -> unchanged';
+  const dir = makeSkillsTempDir();
+  try {
+    const content = codexInstall.buildSkillFileText('demo', 'd', 'body\n');
+    fs.mkdirSync(path.join(dir, 'demo'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'demo', 'SKILL.md'), content, 'utf8');
+    const plan = codexInstall.classifySkillTarget({ targetDir: dir, name: 'demo', desiredContent: content, force: false });
+    if (plan.action !== 'unchanged') fail(label, `expected unchanged, got ${plan.action}`);
+    else pass(label);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+{
+  const label = 'S5 (c): present with marker, different hash -> overwrite (old->new reported)';
+  const dir = makeSkillsTempDir();
+  try {
+    const oldContent = codexInstall.buildSkillFileText('demo', 'd', 'old body\n');
+    const newContent = codexInstall.buildSkillFileText('demo', 'd', 'new body\n');
+    fs.mkdirSync(path.join(dir, 'demo'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'demo', 'SKILL.md'), oldContent, 'utf8');
+    const plan = codexInstall.classifySkillTarget({ targetDir: dir, name: 'demo', desiredContent: newContent, force: false });
+    if (plan.action !== 'overwrite') fail(label, `expected overwrite, got ${plan.action}`);
+    else if (!plan.oldHash || !plan.newHash || plan.oldHash === plan.newHash) fail(label, `expected distinct oldHash/newHash, got ${JSON.stringify(plan)}`);
+    else pass(label);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+{
+  const label = 'S6 (d): present, no marker, non-dispatcher name -> skip';
+  const dir = makeSkillsTempDir();
+  try {
+    fs.mkdirSync(path.join(dir, 'demo'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'demo', 'SKILL.md'), '---\nname: demo\ndescription: hand-authored\n---\nmy own content\n', 'utf8');
+    const content = codexInstall.buildSkillFileText('demo', 'd', 'body\n');
+    const plan = codexInstall.classifySkillTarget({ targetDir: dir, name: 'demo', desiredContent: content, force: false });
+    if (plan.action !== 'skip') fail(label, `expected skip, got ${plan.action}`);
+    else pass(label);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+{
+  const label = 'S7 (d, dispatcher): present, no marker, name="handoff" -> blocked (never a bare skip)';
+  const dir = makeSkillsTempDir();
+  try {
+    fs.mkdirSync(path.join(dir, 'handoff'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'handoff', 'SKILL.md'), '---\nname: handoff\ndescription: foreign\n---\nsomething else entirely\n', 'utf8');
+    const content = codexInstall.buildSkillFileText('handoff', 'd', 'body\n');
+    const plan = codexInstall.classifySkillTarget({ targetDir: dir, name: 'handoff', desiredContent: content, force: false });
+    if (plan.action !== 'blocked') fail(label, `expected blocked, got ${plan.action}`);
+    else if (!/handoff/.test(plan.reason) || !plan.reason.includes(path.join(dir, 'handoff', 'SKILL.md'))) fail(label, `expected reason to name the path, got: ${plan.reason}`);
+    else pass(label);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+{
+  const label = 'S8 (e): <dir>/<name> exists and is a regular file, not a directory -> error';
+  const dir = makeSkillsTempDir();
+  try {
+    fs.writeFileSync(path.join(dir, 'demo'), 'not a directory', 'utf8');
+    const content = codexInstall.buildSkillFileText('demo', 'd', 'body\n');
+    const plan = codexInstall.classifySkillTarget({ targetDir: dir, name: 'demo', desiredContent: content, force: false });
+    if (plan.action !== 'error') fail(label, `expected error, got ${plan.action}`);
+    else pass(label);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+{
+  const label = 'S9 (e): SKILL.md path exists but is a directory, not a regular file -> error';
+  const dir = makeSkillsTempDir();
+  try {
+    fs.mkdirSync(path.join(dir, 'demo', 'SKILL.md'), { recursive: true });
+    const content = codexInstall.buildSkillFileText('demo', 'd', 'body\n');
+    const plan = codexInstall.classifySkillTarget({ targetDir: dir, name: 'demo', desiredContent: content, force: false });
+    if (plan.action !== 'error') fail(label, `expected error, got ${plan.action}`);
+    else pass(label);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+{
+  const label = 'S10 (f): --force-skills turns a user-authored skip into force-overwrite with a .bak copy';
+  const dir = makeSkillsTempDir();
+  try {
+    const original = '---\nname: demo\ndescription: hand-authored\n---\nmy own content\n';
+    fs.mkdirSync(path.join(dir, 'demo'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'demo', 'SKILL.md'), original, 'utf8');
+    const content = codexInstall.buildSkillFileText('demo', 'd', 'body\n');
+    const result = codexInstall.installSkills({ targetDir: dir, skills: [{ name: 'demo', content }], dryRun: false, force: true });
+    const r = result.results[0];
+    if (r.action !== 'force-overwrite') { fail(label, `expected force-overwrite, got ${r.action}`); return; }
+    if (!r.backupPath || !fs.existsSync(r.backupPath)) { fail(label, `expected a .bak backup to exist, got backupPath=${r.backupPath}`); return; }
+    if (fs.readFileSync(r.backupPath, 'utf8') !== original) { fail(label, 'backup content does not match original'); return; }
+    if (fs.readFileSync(path.join(dir, 'demo', 'SKILL.md'), 'utf8') !== content) { fail(label, 'target was not overwritten with the new content'); return; }
+    pass(label);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+{
+  const label = 'S11 (f, dispatcher): --force-skills also flips the dispatcher\'s blocked case to force-overwrite';
+  const dir = makeSkillsTempDir();
+  try {
+    fs.mkdirSync(path.join(dir, 'handoff'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'handoff', 'SKILL.md'), '---\nname: handoff\ndescription: foreign\n---\nfoo\n', 'utf8');
+    const content = codexInstall.buildSkillFileText('handoff', 'd', 'body\n');
+    const result = codexInstall.installSkills({ targetDir: dir, skills: [{ name: 'handoff', content }], dryRun: false, force: true });
+    if (result.results[0].action !== 'force-overwrite') fail(label, `expected force-overwrite, got ${result.results[0].action}`);
+    else pass(label);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+{
+  const label = 'S12: --dry-run classifies without writing anything';
+  const dir = makeSkillsTempDir();
+  try {
+    const content = codexInstall.buildSkillFileText('demo', 'd', 'body\n');
+    const result = codexInstall.installSkills({ targetDir: dir, skills: [{ name: 'demo', content }], dryRun: true, force: false });
+    if (result.results[0].action !== 'write') { fail(label, `expected planned action write, got ${result.results[0].action}`); return; }
+    if (fs.existsSync(path.join(dir, 'demo', 'SKILL.md'))) { fail(label, 'dry-run must not write the file'); return; }
+    pass(label);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+{
+  const label = 'S13: summary counts written/unchanged/skipped/errors correctly across a mixed batch';
+  const dir = makeSkillsTempDir();
+  try {
+    const writeContent = codexInstall.buildSkillFileText('a', 'd', 'x\n');
+    const unchangedContent = codexInstall.buildSkillFileText('b', 'd', 'y\n');
+    fs.mkdirSync(path.join(dir, 'b'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'b', 'SKILL.md'), unchangedContent, 'utf8');
+    const skipContent = codexInstall.buildSkillFileText('c', 'd', 'z\n');
+    fs.mkdirSync(path.join(dir, 'c'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'c', 'SKILL.md'), 'user authored, no marker\n', 'utf8');
+    fs.writeFileSync(path.join(dir, 'd'), 'blocks the dir', 'utf8');
+    const errContent = codexInstall.buildSkillFileText('d', 'd', 'w\n');
+    const result = codexInstall.installSkills({
+      targetDir: dir, dryRun: false, force: false,
+      skills: [
+        { name: 'a', content: writeContent },
+        { name: 'b', content: unchangedContent },
+        { name: 'c', content: skipContent },
+        { name: 'd', content: errContent },
+      ],
+    });
+    const s = result.summary;
+    if (s.written !== 1 || s.unchanged !== 1 || s.skipped !== 1 || s.errors !== 1) {
+      fail(label, `expected {written:1,unchanged:1,skipped:1,errors:1}, got ${JSON.stringify(s)}`);
+    } else pass(label);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+{
+  const label = 'S14: stale source-command-handoff-* entries are reported (case-insensitive), never followed/deleted';
+  const dir = makeSkillsTempDir();
+  try {
+    fs.mkdirSync(path.join(dir, 'source-command-handoff-status'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'SOURCE-COMMAND-HANDOFF-CLOSE'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'not-stale'), { recursive: true });
+    const stale = codexInstall.findStaleSourceCommandSkills(dir);
+    const names = stale.map((s) => s.name).sort();
+    if (names.length !== 2 || names[0] !== 'SOURCE-COMMAND-HANDOFF-CLOSE' || names[1] !== 'source-command-handoff-status') {
+      fail(label, `expected exactly the two stale dirs flagged, got ${JSON.stringify(names)}`);
+    } else if (fs.existsSync(path.join(dir, 'source-command-handoff-status'))) {
+      // still present (not deleted) -- this is the expected/desired state, confirming non-destructive behavior.
+      pass(label);
+    } else {
+      fail(label, 'stale entry was removed — must only be reported, never deleted');
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+{
+  const label = 'S15: HANDOFF_CODEX_SKILLS_DIR resolution — unset/empty -> default, relative -> refused, absolute -> accepted';
+  const savedDir = process.env.HANDOFF_CODEX_SKILLS_DIR;
+  try {
+    delete process.env.HANDOFF_CODEX_SKILLS_DIR;
+    const unset = codexInstall.resolveCodexSkillsDir(process.env);
+    process.env.HANDOFF_CODEX_SKILLS_DIR = '';
+    const empty = codexInstall.resolveCodexSkillsDir(process.env);
+    process.env.HANDOFF_CODEX_SKILLS_DIR = 'relative/path';
+    const relative = codexInstall.resolveCodexSkillsDir(process.env);
+    const absoluteVal = path.join(os.tmpdir(), 'some-abs-skills-dir');
+    process.env.HANDOFF_CODEX_SKILLS_DIR = absoluteVal;
+    const absolute = codexInstall.resolveCodexSkillsDir(process.env);
+    if (!unset.ok || !unset.dir.endsWith(path.join('.agents', 'skills'))) fail(label, `unset case wrong: ${JSON.stringify(unset)}`);
+    else if (!empty.ok || !empty.dir.endsWith(path.join('.agents', 'skills'))) fail(label, `empty case wrong: ${JSON.stringify(empty)}`);
+    else if (relative.ok) fail(label, `relative path should be refused, got ok: ${JSON.stringify(relative)}`);
+    else if (!absolute.ok || absolute.dir !== absoluteVal) fail(label, `absolute case wrong: ${JSON.stringify(absolute)}`);
+    else pass(label);
+  } finally { restoreEnv('HANDOFF_CODEX_SKILLS_DIR', savedDir); }
+}
+
+{
+  const label = 'S16: a symlink at <dir>/<name> is classified as an error, not silently treated as absent or present';
+  const dir = makeSkillsTempDir();
+  try {
+    const realTarget = path.join(dir, 'real-target');
+    fs.mkdirSync(realTarget, { recursive: true });
+    const linkPath = path.join(dir, 'demo');
+    try {
+      fs.symlinkSync(realTarget, linkPath, 'junction');
+    } catch (err) {
+      console.log(`SKIP  ${label}: cannot create a symlink/junction in this environment (${err.message})`);
+      passed++; // count as non-blocking rather than a hard failure — environment-dependent privilege
+      return;
+    }
+    const content = codexInstall.buildSkillFileText('demo', 'd', 'body\n');
+    const plan = codexInstall.classifySkillTarget({ targetDir: dir, name: 'demo', desiredContent: content, force: false });
+    if (plan.action !== 'error') fail(label, `expected error for a symlinked skill dir, got ${plan.action}`);
+    else pass(label);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// P1-P8 — Promotion-file host resolution (B)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const claudeMdKeyPaths = require('./lib/claude-md-key-paths');
+const handoffLib = require('./handoff.js');
+
+{
+  const label = 'P1: HANDOFF_HOST and HANDOFF_PROMOTION_FILE both unset -> claude (default)';
+  const savedHost = process.env.HANDOFF_HOST;
+  const savedFile = process.env.HANDOFF_PROMOTION_FILE;
+  try {
+    delete process.env.HANDOFF_HOST;
+    delete process.env.HANDOFF_PROMOTION_FILE;
+    const r = claudeMdKeyPaths.resolvePromotionHost(process.env);
+    if (!r.ok || r.host !== 'claude') fail(label, `expected ok host=claude, got ${JSON.stringify(r)}`);
+    else pass(label);
+  } finally { restoreEnv('HANDOFF_HOST', savedHost); restoreEnv('HANDOFF_PROMOTION_FILE', savedFile); }
+}
+
+{
+  const label = 'P2: HANDOFF_HOST unset, HANDOFF_PROMOTION_FILE basename AGENTS.md -> codex';
+  const savedHost = process.env.HANDOFF_HOST;
+  const savedFile = process.env.HANDOFF_PROMOTION_FILE;
+  try {
+    delete process.env.HANDOFF_HOST;
+    process.env.HANDOFF_PROMOTION_FILE = 'AGENTS.md';
+    const r = claudeMdKeyPaths.resolvePromotionHost(process.env);
+    if (!r.ok || r.host !== 'codex') fail(label, `expected ok host=codex, got ${JSON.stringify(r)}`);
+    else pass(label);
+  } finally { restoreEnv('HANDOFF_HOST', savedHost); restoreEnv('HANDOFF_PROMOTION_FILE', savedFile); }
+}
+
+{
+  const label = 'P3: HANDOFF_HOST=codex wins even when HANDOFF_PROMOTION_FILE says CLAUDE.md';
+  const savedHost = process.env.HANDOFF_HOST;
+  const savedFile = process.env.HANDOFF_PROMOTION_FILE;
+  try {
+    process.env.HANDOFF_HOST = 'codex';
+    process.env.HANDOFF_PROMOTION_FILE = 'CLAUDE.md';
+    const r = claudeMdKeyPaths.resolvePromotionHost(process.env);
+    if (!r.ok || r.host !== 'codex') fail(label, `expected ok host=codex, got ${JSON.stringify(r)}`);
+    else pass(label);
+  } finally { restoreEnv('HANDOFF_HOST', savedHost); restoreEnv('HANDOFF_PROMOTION_FILE', savedFile); }
+}
+
+{
+  const label = 'P4: HANDOFF_HOST=<invalid> -> refused (total classification, never coerced)';
+  const savedHost = process.env.HANDOFF_HOST;
+  try {
+    process.env.HANDOFF_HOST = 'bogus';
+    const r = claudeMdKeyPaths.resolvePromotionHost(process.env);
+    if (r.ok) fail(label, `expected a refusal, got ok host=${r.host}`);
+    else pass(label);
+  } finally { restoreEnv('HANDOFF_HOST', savedHost); }
+}
+
+{
+  const label = 'P5: HANDOFF_HOST="" (explicitly set empty) -> refused, not treated as unset';
+  const savedHost = process.env.HANDOFF_HOST;
+  try {
+    process.env.HANDOFF_HOST = '';
+    const r = claudeMdKeyPaths.resolvePromotionHost(process.env);
+    if (r.ok) fail(label, `expected a refusal, got ok host=${r.host}`);
+    else pass(label);
+  } finally { restoreEnv('HANDOFF_HOST', savedHost); }
+}
+
+{
+  const label = 'P6: looksLikeFindReplaceCopy detects the known-bad shape, not unrelated text';
+  const bad1 = claudeMdKeyPaths.looksLikeFindReplaceCopy('some prose ~/.Codex/ more prose');
+  const bad2 = claudeMdKeyPaths.looksLikeFindReplaceCopy('# Codex-memory\n\nbody');
+  const good = claudeMdKeyPaths.looksLikeFindReplaceCopy('# my-project\n\n~/.claude/projects/x/handoff.md');
+  if (!bad1 || !bad2 || good) fail(label, `expected true,true,false — got ${bad1},${bad2},${good}`);
+  else pass(label);
+}
+
+{
+  const label = 'P7: healKeyPathsSection reports ambiguous when a Key Paths section carries 2+ managed-by markers';
+  const doc = [
+    '## Key paths',
+    '',
+    '<!-- memory-engine:key-paths v2 -->',
+    '<!-- memory-engine:key-paths v2 -->',
+    '- Handoff file: `~/.claude/projects/x/handoff.md`',
+    '- Helper script: `<engine-root>/scripts/handoff.js`',
+    '',
+  ].join('\n');
+  const r = claudeMdKeyPaths.healKeyPathsSection(doc, {});
+  if (r.outcome !== 'ambiguous') fail(label, `expected ambiguous, got ${r.outcome}`);
+  else pass(label);
+}
+
+{
+  const label = 'P8: Claude host template rendering is byte-identical to the pinned pre-adapter fixture (sha256 pin)';
+  const claudeTpl = path.join(TEMPLATES_DIR, 'project-claude-md.tpl');
+  const savedBase = process.env.HANDOFF_BASE_DIR;
+  const savedPlugin = process.env.CLAUDE_PLUGIN_ROOT;
+  try {
+    delete process.env.HANDOFF_BASE_DIR;
+    delete process.env.CLAUDE_PLUGIN_ROOT;
+    const bullets = claudeMdKeyPaths.renderKeyPathsBullets(process.env);
+    const out = handoffLib.renderTemplate(claudeTpl, {
+      PROJECT_NAME: 'my-project',
+      PROJECT_DESCRIPTION: 'Memory and retrieval infrastructure project.',
+      KEY_PATHS_HANDOFF_PATH: bullets.handoffPath,
+      KEY_PATHS_HELPER_PATH: bullets.helperPath,
+    });
+    // LF-normalize before hashing — checkout line endings vary by platform
+    // (core.autocrlf on Windows vs. a plain LF checkout on Linux CI) and are
+    // not part of what this test is pinning; only the substituted CONTENT
+    // must be byte-identical to today.
+    const normalized = out.replace(/\r\n/g, '\n');
+    const hash = require('crypto').createHash('sha256').update(normalized, 'utf8').digest('hex');
+    const EXPECTED = '5c9e6685573b0d209fc3cb277b92e0f6625b01e5d29af967e981a478ad639bde';
+    if (hash !== EXPECTED) fail(label, `Claude template output changed — expected sha256 ${EXPECTED}, got ${hash}. If this change is intentional, this test's pin must be updated deliberately, never silently.`);
+    else pass(label);
+  } finally { restoreEnv('HANDOFF_BASE_DIR', savedBase); restoreEnv('CLAUDE_PLUGIN_ROOT', savedPlugin); }
+}
+
+{
+  const label = 'P9: the codex (AGENTS.md) template renders successfully and differs from the Claude template';
+  const agentsTpl = path.join(TEMPLATES_DIR, 'project-agents-md.tpl');
+  const bullets = claudeMdKeyPaths.renderKeyPathsBullets({});
+  const out = handoffLib.renderTemplate(agentsTpl, {
+    PROJECT_NAME: 'my-project',
+    PROJECT_DESCRIPTION: 'Memory and retrieval infrastructure project.',
+    KEY_PATHS_HANDOFF_PATH: bullets.handoffPath,
+    KEY_PATHS_HELPER_PATH: bullets.helperPath,
+  });
+  if (!out.includes('mcp__handoff__handoff_close') || out.includes('/handoff:close')) {
+    fail(label, 'expected the AGENTS.md template to mention the MCP tool name and NOT use /handoff:* slash syntax');
+  } else if (!out.includes('# my-project')) {
+    fail(label, 'expected the AGENTS.md template title to be the project name, not a fixed "Codex-memory" title');
+  } else {
+    pass(label);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
