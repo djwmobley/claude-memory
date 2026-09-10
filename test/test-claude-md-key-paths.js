@@ -423,6 +423,26 @@ test('N1: markup-wrapped H1 with an HTML tag is stripped', () => {
   assertEqual(r.branch, 'N1');
 });
 
+// CodeQL js/incomplete-multi-character-sanitization regression: a single
+// non-fixed-point `.replace(/<[^>]*>/g, '')` pass can leave a live tag
+// behind when the input nests one tag boundary inside another (e.g. a naive
+// single pass over `<scr<script>ipt>pwa-etl` removes only the outer
+// `<scr<script>` span, leaving the now-exposed `ipt>` fragment — no intact
+// tag survives that specific case either way, but the general class of bug
+// is "a single pass can re-expose a tag boundary that was hidden by an
+// outer one"). The invariant that must hold regardless of nesting depth is
+// "no `<` character survives" (with no opening bracket, no tag can ever be
+// reconstructed downstream) — asserted here via a fixed-point loop that
+// keeps stripping until a pass makes no further change.
+test('N1: nested-tag adversarial H1 has no leftover "<" after stripping (CodeQL regression)', () => {
+  const r = resolveProjectDisplayName({
+    root: '/x',
+    existingFileContent: '# <scr<script>ipt>pwa-etl\n',
+  });
+  assert(!r.name.includes('<'), `expected no leftover "<" in resolved name, got: ${JSON.stringify(r.name)}`);
+  assertEqual(r.name, 'ipt>pwa-etl');
+});
+
 test('N1: placeholder H1 "# Project" is rejected (falls through to N3 here)', () => {
   const r = resolveProjectDisplayName({ root: '/some/root/myproj', existingFileContent: '# Project\n' });
   assert(r.branch !== 'N1', `placeholder H1 must not be accepted as N1, got branch ${r.branch}`);

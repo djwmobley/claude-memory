@@ -250,12 +250,26 @@ const WORKTREE_SHAPED_NAME_RE = /^agent-[0-9a-f]{8,}$/i;
  * backtick characters, then trim and collapse internal whitespace runs to a
  * single space.
  *
+ * The tag-strip runs to a FIXED POINT (repeat until a pass makes no further
+ * change) rather than a single `.replace(/<[^>]*>/g, '')` pass — a single
+ * pass is an "incomplete multi-character sanitization" (CodeQL
+ * js/incomplete-multi-character-sanitization): a crafted nested input like
+ * `<scr<script>ipt>` can leave a live `<script>` behind after exactly one
+ * pass, because removing the inner match exposes a new tag boundary. Since
+ * this only ever strips (never rewrites) characters, the string is
+ * monotonically non-growing and the loop always terminates.
+ *
  * @param {string} s
  * @returns {string}
  */
 function _stripInlineMarkup(s) {
-  return s
-    .replace(/<[^>]*>/g, '')
+  let out = s;
+  let prev;
+  do {
+    prev = out;
+    out = out.replace(/<[^>]*>/g, '');
+  } while (out !== prev);
+  return out
     .replace(/[*_`]/g, '')
     .trim()
     .replace(/\s+/g, ' ');
