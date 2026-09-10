@@ -39,10 +39,11 @@ requirement:
 node scripts/install.js --host codex
 ```
 
-Use `--dry-run` first to preview both steps below (MCP registration and the
-hooks.json diff) without writing anything.
+Use `--dry-run` first to preview all three steps below (MCP registration,
+the hooks.json diff, and the skill-install classification) without writing
+anything.
 
-This does two things, neither of which touches `~/.claude/`:
+This does three things, none of which touch `~/.claude/`:
 
 ### 1. MCP server registration
 
