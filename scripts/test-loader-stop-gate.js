@@ -248,6 +248,55 @@ assertHostRefusesFast('H4: loader-stop --host claude --host codex (conflicting r
   }
 }
 
+// ── CX1-CX2: real Codex SessionStart/SessionEnd hook payload shapes, verified
+// against a real codex-cli 0.153.4 process this session — Codex injects NO
+// PROJECT_ROOT env var into hooks (the engine resolves via cwd instead), and
+// its payload field sets differ from Claude Code's own (SessionStart carries
+// model/permission_mode/source instead of Claude's fields; SessionEnd
+// carries `reason` instead of Claude's fields). These prove the gate's
+// stdin classification is keyed on hook_event_name alone and tolerates an
+// unfamiliar field set without crashing, on BOTH entry points. ──────────────
+
+// CX1: real Codex SessionStart payload via loader-hook -- accepted, no crash,
+// same fast-no-op shape as an empty/uninitialized project.
+{
+  const label = 'CX1: real Codex SessionStart payload (model/permission_mode/source fields) on loader-hook is accepted, fast no-op on an empty project';
+  const stdin = JSON.stringify({
+    session_id: 'cx-sess-1',
+    hook_event_name: 'SessionStart',
+    model: 'gpt-5-codex',
+    permission_mode: 'auto',
+    source: 'startup',
+  });
+  const r = runLoaderHook(stdin, { extraArgs: ['--host', 'codex'] });
+  if (r.status !== 0) {
+    fail(label, `expected exit 0, got ${r.status} (signal ${r.signal}); stderr: ${(r.stderr || '').slice(0, 300)}`);
+  } else if (r.elapsedMs >= FAST_MS) {
+    fail(label, `expected a fast no-op (<${FAST_MS}ms), took ${r.elapsedMs}ms`);
+  } else {
+    pass(`${label} (exit 0, ${r.elapsedMs}ms)`);
+  }
+}
+
+// CX2: real Codex SessionEnd payload via loader-stop -- accepted, no crash,
+// same fast-no-op shape as T1-T8 (empty project, no handoff.md provisioned).
+{
+  const label = 'CX2: real Codex SessionEnd payload (reason field, no cwd/transcript_path) on loader-stop is accepted, fast no-op on an empty project';
+  const stdin = JSON.stringify({
+    session_id: 'cx-sess-1',
+    hook_event_name: 'SessionEnd',
+    reason: 'other',
+  });
+  const r = runLoaderStop(stdin, { extraArgs: ['--host', 'codex'] });
+  if (r.status !== 0) {
+    fail(label, `expected exit 0, got ${r.status} (signal ${r.signal}); stderr: ${(r.stderr || '').slice(0, 300)}`);
+  } else if (r.elapsedMs >= FAST_MS) {
+    fail(label, `expected a fast no-op (<${FAST_MS}ms), took ${r.elapsedMs}ms`);
+  } else {
+    pass(`${label} (exit 0, ${r.elapsedMs}ms)`);
+  }
+}
+
 // ── Summary ───────────────────────────────────────────────────────────────────
 
 console.log('');
