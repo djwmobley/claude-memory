@@ -220,6 +220,9 @@ const LEGIT_INVOCATIONS = [
   { cmd: 'promote',    argv: ['--subject', 'vLLM', '--predicate', 'is_model', '--object', 'Qwen3-Embedding-8B'], cite: 'commands/handoff/promote.md:68' },
   { cmd: 'promote',    argv: ['--subject', 'vLLM', '--predicate', 'is_model'], cite: 'commands/handoff/promote.md:71' },
   { cmd: 'promote',    argv: ['--demote', '42'],    cite: 'commands/handoff/promote.md:74' },
+  { cmd: 'promote',    argv: ['--regenerate'],       cite: 'commands/handoff/promote.md:82' },
+  { cmd: 'promote',    argv: ['--regenerate', '--dry-run'], cite: 'commands/handoff/promote.md:85' },
+  { cmd: 'promote',    argv: ['--regenerate', '--project-name', 'My Project'], cite: 'commands/handoff/promote.md:88' },
   { cmd: 'queue-drain', argv: [],                   cite: 'commands/handoff/close.md:17' },
 
   // (c) .github/workflows/test.yml-run scripts/test-*.js and test/**/*.js
