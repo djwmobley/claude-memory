@@ -140,6 +140,39 @@ SessionEnd:
 
 ---
 
+## Session id: CODEX_THREAD_ID vs. CLAUDE_CODE_SESSION_ID
+
+A real interactive Codex session sets `CODEX_THREAD_ID` (a UUIDv7-style id,
+e.g. `01a0884c-306e-7182-851c-74d81482720b`) in the environment, and does
+**not** set `CLAUDE_CODE_SESSION_ID` — verified 2026-09-09. The engine's
+session-id resolution (hooks, `/handoff:resume`, and the MCP-invoked
+close/checkpoint paths) falls back through:
+
+1. an explicit `session_id` already present on the hook payload / MCP call
+   arguments — always wins, no env var is consulted;
+2. otherwise, the environment: `CLAUDE_CODE_SESSION_ID` and
+   `CODEX_THREAD_ID`, resolved by a small total classification — exactly one
+   set is used with no ambiguity; both set and equal is used with no
+   ambiguity; both set and **different** is resolved by which host is
+   running (`--host codex` prefers `CODEX_THREAD_ID`, `--host claude` or no
+   `--host` signal at all prefers `CLAUDE_CODE_SESSION_ID`), with a one-line
+   notice printed to stderr naming which one was ignored;
+3. otherwise, the existing fallback (a DB session marker, or a freshly
+   generated id, depending on the call site).
+
+The MCP-invoked close/checkpoint paths never receive a `--host` flag (MCP
+registration shells out the identical `node handoff-mcp.mjs` regardless of
+host), so step 2 always resolves as if `--host` were absent there —
+`CLAUDE_CODE_SESSION_ID` is preferred by default if both happen to be set.
+
+The Codex hook payload's own `session_id` field and `CODEX_THREAD_ID` are
+**expected** to carry the same id for a given session — this is stated as an
+expectation based on how Codex is documented to identify a running thread,
+not verified against a captured fixture pairing both values from the same
+live session.
+
+---
+
 ## MCP registration states
 
 `node scripts/install.js --host codex` classifies the current registration

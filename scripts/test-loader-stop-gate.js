@@ -28,6 +28,7 @@ const os                      = require('os');
 const fs                      = require('fs');
 const { writeMarker }         = require('./lib/project-marker');
 const { resolveHandoffMdPath } = require('./lib/handoff-paths');
+const { resolveHookSessionId, resolveSessionIdFromEnv } = require('./handoff.js');
 
 const HELPER = path.resolve(__dirname, 'handoff.js');
 
@@ -296,6 +297,82 @@ assertHostRefusesFast('H4: loader-stop --host claude --host codex (conflicting r
     pass(`${label} (exit 0, ${r.elapsedMs}ms)`);
   }
 }
+
+// ── SID1-SID9: CODEX_THREAD_ID/CLAUDE_CODE_SESSION_ID fallback-chain total
+// classification (resolveSessionIdFromEnv / resolveHookSessionId), exercised
+// directly (pure logic, no subprocess). CODEX_THREAD_ID (a UUIDv7-style id)
+// was verified set by a real interactive Codex session on 2026-09-09; that
+// same session did NOT set CLAUDE_CODE_SESSION_ID. ─────────────────────────
+
+/** process.env.X = undefined coerces to the literal string "undefined" — always delete instead. */
+function restoreEnvVar(key, savedValue) {
+  if (savedValue === undefined) delete process.env[key];
+  else process.env[key] = savedValue;
+}
+
+function withEnv(vars, fn) {
+  const saved = {};
+  for (const k of Object.keys(vars)) saved[k] = process.env[k];
+  for (const k of Object.keys(vars)) {
+    if (vars[k] === undefined) delete process.env[k];
+    else process.env[k] = vars[k];
+  }
+  try { fn(); } finally { for (const k of Object.keys(vars)) restoreEnvVar(k, saved[k]); }
+}
+
+withEnv({ CLAUDE_CODE_SESSION_ID: undefined, CODEX_THREAD_ID: undefined }, () => {
+  const label = 'SID1: neither CLAUDE_CODE_SESSION_ID nor CODEX_THREAD_ID set -> null';
+  const r = resolveSessionIdFromEnv(null);
+  if (r !== null) fail(label, `expected null, got ${JSON.stringify(r)}`); else pass(label);
+});
+
+withEnv({ CLAUDE_CODE_SESSION_ID: 'claude-sess-1', CODEX_THREAD_ID: undefined }, () => {
+  const label = 'SID2: only CLAUDE_CODE_SESSION_ID set -> that value';
+  const r = resolveSessionIdFromEnv(null);
+  if (r !== 'claude-sess-1') fail(label, `expected claude-sess-1, got ${JSON.stringify(r)}`); else pass(label);
+});
+
+withEnv({ CLAUDE_CODE_SESSION_ID: undefined, CODEX_THREAD_ID: '01a0884c-306e-7182-851c-74d81482720b' }, () => {
+  const label = 'SID3: only CODEX_THREAD_ID set -> that value';
+  const r = resolveSessionIdFromEnv(null);
+  if (r !== '01a0884c-306e-7182-851c-74d81482720b') fail(label, `expected the codex thread id, got ${JSON.stringify(r)}`); else pass(label);
+});
+
+withEnv({ CLAUDE_CODE_SESSION_ID: 'same-id', CODEX_THREAD_ID: 'same-id' }, () => {
+  const label = 'SID4: both set and EQUAL -> that value, no ambiguity';
+  const r = resolveSessionIdFromEnv('codex');
+  if (r !== 'same-id') fail(label, `expected same-id, got ${JSON.stringify(r)}`); else pass(label);
+});
+
+withEnv({ CLAUDE_CODE_SESSION_ID: 'claude-sess', CODEX_THREAD_ID: 'codex-thread' }, () => {
+  const label = "SID5: both set, DIFFERENT, host='codex' -> CODEX_THREAD_ID";
+  const r = resolveSessionIdFromEnv('codex');
+  if (r !== 'codex-thread') fail(label, `expected codex-thread, got ${JSON.stringify(r)}`); else pass(label);
+});
+
+withEnv({ CLAUDE_CODE_SESSION_ID: 'claude-sess', CODEX_THREAD_ID: 'codex-thread' }, () => {
+  const label = "SID6: both set, DIFFERENT, host='claude' -> CLAUDE_CODE_SESSION_ID";
+  const r = resolveSessionIdFromEnv('claude');
+  if (r !== 'claude-sess') fail(label, `expected claude-sess, got ${JSON.stringify(r)}`); else pass(label);
+});
+
+withEnv({ CLAUDE_CODE_SESSION_ID: 'claude-sess', CODEX_THREAD_ID: 'codex-thread' }, () => {
+  const label = 'SID7: both set, DIFFERENT, host absent/null -> CLAUDE_CODE_SESSION_ID (default)';
+  const r = resolveSessionIdFromEnv(null);
+  if (r !== 'claude-sess') fail(label, `expected claude-sess (default), got ${JSON.stringify(r)}`); else pass(label);
+});
+
+withEnv({ CLAUDE_CODE_SESSION_ID: 'claude-sess', CODEX_THREAD_ID: 'codex-thread' }, () => {
+  const label = 'SID8: resolveHookSessionId prefers an explicit payload.session_id over any env var';
+  const r = resolveHookSessionId({ session_id: 'payload-sess' }, 'codex');
+  if (r !== 'payload-sess') fail(label, `expected payload-sess, got ${JSON.stringify(r)}`); else pass(label);
+});
+
+withEnv({ CLAUDE_CODE_SESSION_ID: undefined, CODEX_THREAD_ID: 'codex-thread-only' }, () => {
+  const label = 'SID9: resolveHookSessionId falls back to resolveSessionIdFromEnv(host) when payload has no session_id';
+  const r = resolveHookSessionId({ hook_event_name: 'SessionEnd' }, 'codex');
+  if (r !== 'codex-thread-only') fail(label, `expected codex-thread-only, got ${JSON.stringify(r)}`); else pass(label);
+});
 
 // ── Summary ───────────────────────────────────────────────────────────────────
 
