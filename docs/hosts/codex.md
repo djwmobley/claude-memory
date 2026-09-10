@@ -9,10 +9,9 @@ guided first run, start at
 defects, see [codex-howto.md](codex-howto.md).
 
 Codex has no slash-command surface, so there is no `/handoff:*` equivalent
-under Codex — everything below is MCP tools and hooks. (A companion PR adds
-`~/.agents/skills` entries that give Codex a skill-based approximation of the
-slash commands — see the "Skills (shipping in the companion PR)" section
-below.)
+under Codex — the installer's [Skills](#skills) step gives Codex a
+skill-based approximation instead, alongside the MCP tools and hooks
+documented throughout this page.
 
 Verified against codex-cli 0.153.4 (2026-09-09/2026-09-10) except where noted
 in the [Verified vs. unverified](#verified-vs-unverified) table.
@@ -117,6 +116,13 @@ not already ours (see `scripts/install.js`'s anchored identity regex,
 `CODEX_HOME` is honored if set (must resolve to an absolute, writable path);
 otherwise `~/.codex` is used.
 
+### 3. Skill install
+
+The installer also writes 8 skill files into `~/.agents/skills`
+(`HANDOFF_CODEX_SKILLS_DIR` if set — must be an absolute path) — see
+[Skills](#skills) below for the full list, the managed-by marker/hash
+scheme, and `--force-skills`.
+
 ---
 
 ## Trust
@@ -196,23 +202,45 @@ If you run `handoff.js` directly (not through the MCP server) and want the
 same behavior, set `HANDOFF_PROMOTION_FILE=AGENTS.md` in that process's
 environment yourself.
 
-A companion PR renders a Codex-flavored `AGENTS.md` template (MCP tool hints,
-correct key paths) via `--force-promotion`; that template's shape is not
-covered here — see that PR's own docs when it lands.
+`handoff.js init` renders a Codex-flavored `AGENTS.md` from
+`templates/project-agents-md.tpl` the first time it writes the promotion
+file — project name/description, an MCP tool-call cheatsheet
+(`mcp__handoff__*` tool names), the same host-agnostic Key-paths marker
+section `CLAUDE.md` carries, and a durable-facts placeholder.
+
+**Host selection:** `HANDOFF_HOST` wins if set (must be exactly `claude` or
+`codex` — any other value is a hard error); otherwise the host is inferred
+from the promotion filename's basename (`AGENTS.md` -> codex, anything else
+-> claude). The Codex adapter always passes `HANDOFF_HOST=codex` on the MCP
+server's own environment, so a fresh `handoff_init` call under Codex renders
+`AGENTS.md` correctly even if the promotion-filename argument were ever
+omitted.
+
+**Regenerating a bad `AGENTS.md`:** if an existing `AGENTS.md` looks like a
+hand-made find-and-replace copy of the old Claude template (it contains the
+literal text `~/.Codex/` or a `# Codex-memory` heading), `init` prints a
+warning suggesting `--force-promotion` but does not overwrite it
+automatically. `--force-promotion` backs up the existing file
+(`AGENTS.md.bak-<epochMs>-<hrtime>-<pid>`) and unconditionally regenerates it
+from the current template — use it for that stale-copy case, or any time you
+want a clean re-render regardless of cause.
 
 ---
 
-## Environment variables
+## Environment variables and flags
 
-| Variable | Set by | Effect |
+| Variable / flag | Set by | Effect |
 |---|---|---|
 | `HANDOFF_PROMOTION_FILE` | Installer, on the MCP server's own env (`HANDOFF_PROMOTION_FILE=AGENTS.md`) | Durable-facts target file for promote/init/close-promotion. Set it yourself if invoking `handoff.js` directly outside the MCP server. |
-| `HANDOFF_HOST` | Companion PR (skills install), set on the MCP server's env | Declares the host to the engine explicitly. *(shipping in the companion PR)* |
+| `HANDOFF_HOST` | Installer, on the MCP server's own env (`HANDOFF_HOST=codex`) | Selects which promotion-file template `handoff.js init` renders on a fresh write: must be exactly `claude` or `codex` (any other value is a hard error). Unset falls back to inferring the host from the promotion filename's basename. See [AGENTS.md, not CLAUDE.md](#agentsmd-not-claudemd) above. |
 | `CODEX_HOME` | You, in your shell | Overrides `~/.codex` as the root for `config.toml` and `hooks.json`. Must be an absolute, writable path or the installer refuses. |
 | `HANDOFF_CODEX_BIN` | You, in your shell | Overrides the `codex` binary the installer/engine discover and invoke, instead of searching `PATH`/`PATHEXT`. Use this when `codex` isn't the name of your binary or isn't on `PATH`. |
-| `HANDOFF_CODEX_SKILLS_DIR` | You, in your shell | Overrides `~/.agents/skills` as the install target for the Codex skill set. *(shipping in the companion PR)* |
+| `HANDOFF_CODEX_SKILLS_DIR` | You, in your shell | Overrides `~/.agents/skills` as the install target for the Codex skill set. Must be an absolute path — a relative value is refused with a visible error. |
 | `CODEX_THREAD_ID` | Codex itself, per session | The session identity the engine resolves against when `CLAUDE_CODE_SESSION_ID` is absent — see [Session identity](codex-howto.md#session-identity) in the how-to. |
 | `PROJECT_ROOT` | You / a wrapper script | Overrides project-root detection for a direct `handoff.js` invocation. Not set automatically by Codex hooks — see the note below. |
+| `--force-skills` | You, on `node scripts/install.js --host codex --force-skills` | Turns a `skip`/`blocked` skill-install outcome into a force-overwrite, after copying the existing file to a timestamped `.bak-<YYYYMMDDTHHMMSS>-<epochMs>-<pid>` path. Needed to reclaim a hand-edited skill file or to evict a foreign `handoff` dispatcher skill that would otherwise hard-block install. See [Skills](#skills) below. |
+| `--force-promotion` | You, on `node scripts/handoff.js init ... --force-promotion` | Unconditionally backs up and regenerates the promotion file (`AGENTS.md` under Codex) from the current template, regardless of its current content. See [AGENTS.md, not CLAUDE.md](#agentsmd-not-claudemd) above. |
+| `--dry-run` | You, on `node scripts/install.js --host codex --dry-run` | Previews MCP registration, the hooks.json diff, and skill-install classification without writing anything (the `codex --version` discovery probe still runs for real). |
 
 **No `PROJECT_ROOT` in hook payloads.** Unlike some CI wrappers, Codex does
 not inject `PROJECT_ROOT` into the hook's environment — the engine resolves
@@ -222,20 +250,61 @@ set `PROJECT_ROOT` explicitly to avoid resolving the wrong project.
 
 ---
 
-## Skills (shipping in the companion PR)
+## Skills
 
-A companion PR installs a Codex skill set into `~/.agents/skills` (override
-via `HANDOFF_CODEX_SKILLS_DIR`; `--force-skills` to overwrite): a `handoff`
-dispatcher (bare invocation runs `handoff_status` and lists sub-skills — it
-never closes on its own), plus `handoff-status`, `handoff-resume`,
-`handoff-checkpoint`, `handoff-close`, `handoff-query`, `handoff-init`, and
-`handoff-promote`. Each managed skill file carries a hash marker so the
-installer can tell a managed file from a hand-edited one, and warns about
-stale `source-command-handoff-*` skills left over from Codex's own
-auto-migration (see
-[Known real-world defects and quirks](codex-howto.md#known-real-world-defects-and-quirks)
-in the how-to). *(shipping in the companion PR — not present in this repo's
-current `main` at the time this page was written.)*
+`node scripts/install.js --host codex` installs 8 skill files into
+`~/.agents/skills/<name>/SKILL.md` (override the target directory with
+`HANDOFF_CODEX_SKILLS_DIR`, which must be an absolute path):
+
+| Skill | Purpose |
+|---|---|
+| `handoff` | Project memory dispatcher: with no argument, shows status and lists the sub-skills below; with an argument, defers to the matching handoff-* sub-skill. Never closes a session on its own. |
+| `handoff-status` | Read-only project memory status: last close time, entity/assertion/edge counts, embedding readiness. |
+| `handoff-resume` | Force-load prior-session context when it was not loaded automatically. |
+| `handoff-checkpoint` | Mid-session save of an extraction payload without ending the session. |
+| `handoff-close` | End-of-session extraction: entities, assertions, edges, and a contract update. Ends the session. |
+| `handoff-query` | Search project memory (assertions, decisions, and other stored tables) by free-text query. |
+| `handoff-init` | First-run provisioning for a project: schema, handoff file, and promotion file. |
+| `handoff-promote` | Promote a specific stored assertion to the durable-facts section of the project promotion file. |
+
+Each installed `SKILL.md` carries a managed-by marker line immediately after
+the closing frontmatter `---`:
+
+```
+<!-- managed-by: claude-memory handoff-skills v1 sha256:<hash> -->
+```
+
+`<hash>` is a sha256 digest of the file's LF-normalized, BOM-stripped,
+trailing-newline-trimmed body with the marker line itself excluded. On every
+install run, the installer classifies each target with `fs.stat`/`fs.lstat`
+(never a path-string compare) into exactly one outcome:
+
+- **write** — nothing exists yet at that path.
+- **unchanged** — the file exists, carries the marker, and the hash matches — left alone.
+- **overwrite** — the file exists, carries the marker, and the hash differs (a newer skill body) — rewritten in place.
+- **skip** — the file exists with no marker at all (hand-edited or hand-authored) — left alone; re-run with `--force-skills` to reclaim it.
+- **blocked** — the same no-marker case, but specifically for the `handoff` dispatcher name: a foreign `handoff` skill there would keep firing on every bare `handoff` utterance, so this is a hard error rather than a skip, unless `--force-skills` is given.
+- **error** — the target path is a symlink/junction, or exists as something other than a directory/regular file — never installed through.
+
+**`--force-skills`** turns a `skip` or `blocked` outcome into a
+force-overwrite: it copies the existing file to a timestamped
+`.bak-<YYYYMMDDTHHMMSS>-<epochMs>-<pid>` path first, then writes the new
+content.
+
+**Dispatcher rule:** a bare `handoff` invocation always runs
+`handoff_status` and lists the sub-skills above — it never calls
+`handoff_close` on its own, so an accidental bare invocation can't end a
+session or lose unsaved work.
+
+**Stale migrated skills:** Codex auto-migrates a user's pre-existing
+`~/.claude/commands` into `~/.agents/skills/source-command-handoff-*`
+entries the first time it sees them. The installer detects and reports these
+(`[WARN] stale pre-adapter skill found: ...`) but never touches, follows (if
+a symlink), or deletes them — removing another tool's auto-migrated content
+is out of scope. Delete them by hand if they conflict with the skills this
+installer manages (see
+[Known real-world defects and quirks, item 5](codex-howto.md#known-real-world-defects-and-quirks)
+in the how-to).
 
 ---
 
@@ -296,7 +365,10 @@ agnostic and survives switching hosts or reinstalling.
 | Skills discovery path `~/.agents/skills/<name>/SKILL.md` | **Verified** against real codex-cli 0.153.4. |
 | Windows `PATH`/`PATHEXT` resolution order for a real `codex.exe`/`codex.cmd` | **Unverified** — the installer's discovery logic was only exercised against a hand-written stub binary in this repo's test suite, never a real Windows Codex install. |
 | Hook-invocation shell quoting on the real Codex host process | **Unverified beyond** Node's own `spawnSync`/`cmd.exe` behavior in this repo's tests — not confirmed against however Codex itself launches hook commands end-to-end. |
-| Companion-PR skills/`HANDOFF_HOST`/`AGENTS.md` template behavior | **Not yet shipped on `main`** at the time this page was written — described above for forward reference only. |
+| `HANDOFF_HOST` resolution, `--force-promotion`, `AGENTS.md` template rendering, skill-install classification (write/unchanged/overwrite/skip/blocked/force-overwrite/error) | **Verified** in `scripts/lib/codex-install.js`/`scripts/handoff.js` source and by `test-install-host.js` (101/101) and `test-host-agnostic-naming.js` (45/45) — these are unit/subprocess tests, not exercised against a live `codex` session by this docs PR. |
+| The 8 skill files parsing and dispatching correctly under a real Codex skill loader | **Unverified** — no real `codex` binary was run against these files this session; matches the shipping PR's own blind-spot disclosure. |
+| Frontmatter tolerance of the managed-by marker line (sits immediately after the closing `---`) | **Unverified** — assumed compatible with YAML-frontmatter parsers generally, not proven against Codex's specific loader. |
+| Bare `handoff` utterance dispatching to the `handoff` skill (vs. a slash/prefix trigger) | **Unverified** — the dispatcher's argument-parsing logic is exercised only by unit tests, never a live invocation. |
 
 Sources: https://learn.chatgpt.com/docs/extend/mcp,
 https://learn.chatgpt.com/docs/hooks,
