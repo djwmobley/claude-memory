@@ -271,6 +271,32 @@ async function runMockedUnitTests() {
     assert(threw instanceof MemorySearchError);
     assertEq(threw.code, 'unknownTable');
   });
+
+  await check('duplicate table names collapse to one query and one set of hits, first-occurrence order preserved', async () => {
+    const queriedTables = [];
+    const client = makeMockClient({
+      queryImpl: (sql) => {
+        // buildTableQuery embeds the table name in the generated SQL text,
+        // so recover which table this call was for from the query count
+        // rather than parsing sql — order of invocation is what matters.
+        queriedTables.push(sql);
+        return { rows: [{ source_table: 'tasks', id: '1', label: 'l', snippet: 's', score: 0.5 }] };
+      },
+    });
+    const result = await memorySearch(client, {
+      projectId: 'p1',
+      query: 'x',
+      tables: ['tasks', 'research', 'tasks', 'research', 'tasks'],
+      embedder: async () => [0.1],
+    });
+    assertEq(queriedTables.length, 2, 'each distinct table queried exactly once, duplicates dropped');
+    assertEq(result.tablesSearched.length, 2, 'tablesSearched has one entry per distinct table');
+    assertEq(result.tablesSearched[0], 'tasks', 'first-occurrence order preserved (tasks before research)');
+    assertEq(result.tablesSearched[1], 'research', 'first-occurrence order preserved (tasks before research)');
+    // One row per distinct table queried (the mock returns one row per call)
+    // — a duplicate must not double the hit count for the same table.
+    assertEq(result.hits.length, 2, 'duplicates do not double-count hits');
+  });
 }
 
 // ── (C) Live-Postgres integration (best-effort; skips cleanly if no local PG) ──
