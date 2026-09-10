@@ -10217,22 +10217,22 @@ async function cmdPromoteRegenerate({ dryRun }) {
     process.exit(1);
   }
 
-  let claudeMdPath;
-  try {
-    claudeMdPath = resolvePromotionFilePath(root);
-  } catch (err) {
-    console.error(`promote --regenerate: ${err.message}`);
-    process.exit(1);
-  }
-  const promotionFilename = path.basename(claudeMdPath);
-
-  const promotionHostResult = resolvePromotionHost(process.env);
-  if (!promotionHostResult.ok) {
-    // Same failure shape/exit code as cmdInit's own resolvePromotionHost() gate.
-    console.error(`promote --regenerate: ${promotionHostResult.reason}`);
+  // Shared resolution (same as cmdInit/cmdClose/cmdPromote's own top) — host
+  // resolved first, then the filename default derived from that host, so
+  // HANDOFF_HOST=codex with HANDOFF_PROMOTION_FILE unset targets AGENTS.md
+  // here too, never CLAUDE.md.
+  const promotionTargetResult = resolvePromotionTarget(root, process.env);
+  if (!promotionTargetResult.ok) {
+    // Same failure shape/exit code as cmdInit's own resolvePromotionTarget() gate.
+    console.error(`promote --regenerate: ${promotionTargetResult.reason}`);
     process.exit(2);
   }
-  const promotionTemplate = promotionHostResult.host === 'codex' ? PROJECT_AGENTS_MD_TEMPLATE : PROJECT_CLAUDE_MD_TEMPLATE;
+  if (promotionTargetResult.warning) {
+    process.stderr.write(promotionTargetResult.warning + '\n');
+  }
+  const claudeMdPath       = promotionTargetResult.filePath;
+  const promotionFilename  = promotionTargetResult.filename;
+  const promotionTemplate  = promotionTargetResult.host === 'codex' ? PROJECT_AGENTS_MD_TEMPLATE : PROJECT_CLAUDE_MD_TEMPLATE;
 
   let db;
   try {
@@ -10275,7 +10275,7 @@ async function cmdPromoteRegenerate({ dryRun }) {
   // .gitattributes only pins *.sql to LF, not *.tpl). insertCarriedDurableFacts'
   // heading/placeholder match is LF-literal, so it must run on normalized text;
   // convertEol() re-emits the actually-desired EOL afterward.
-  const freshRaw    = renderFreshPromotionContent({ root, promotionTemplate, host: promotionHostResult.host, env: process.env });
+  const freshRaw    = renderFreshPromotionContent({ root, promotionTemplate, host: promotionTargetResult.host, env: process.env });
   const freshLf     = freshRaw.replace(/\r\n/g, '\n');
   const withFacts   = insertCarriedDurableFacts(freshLf, factLines);
   const finalContent = convertEol(withFacts, eol);
