@@ -36,6 +36,7 @@ const SPECS = {
       '--force':              { kind: 'boolean', desc: 'Skip the confirmation prompt (alias of --yes).' },
       '--no-embeddings':      { kind: 'boolean', desc: 'Opt this project out of embedding backfill.' },
       '--clear-opt-out':      { kind: 'boolean', desc: 'Clear a previously-set embeddings opt-out.' },
+      '--force-promotion':    { kind: 'boolean', desc: 'Backup and unconditionally regenerate the durable-facts promotion file (CLAUDE.md/AGENTS.md) from its template.' },
     },
     // scripts/handoff.js:4273 — `args.find((a) => !a.startsWith('-'))`: the
     // first non-flag token is an OPTIONAL project-name override (falls back

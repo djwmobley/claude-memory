@@ -1065,8 +1065,11 @@ function buildServer() {
         'session_chunks (M-14). memory_entry_chunks is DELIBERATELY EXCLUDED — its embedding column is a ' +
         'different pgvector type/dimension (vector(1024), a legacy provider) incompatible with every other ' +
         'table\'s halfvec(4000) column. An unknown table name is a hard tool error. `tables` omitted searches ' +
-        'ALL 15 allowed tables. Returns the top `limit` hits (default 10) merged and re-sorted across every ' +
-        'searched table.',
+        'ALL 15 allowed tables — but note that a table is only actually searched if it EXISTS in this ' +
+        'project\'s database; the set of allowed tables is a closed enum, not a guarantee every table is present ' +
+        '(a fresh or narrowly-migrated project may have only a handful, e.g. assertions and decisions), and that ' +
+        'existence is probed at call time rather than assumed. Returns the top `limit` hits (default 10) merged ' +
+        'and re-sorted across every table actually searched.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         query: z.string().describe('Free-text query.'),

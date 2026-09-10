@@ -114,7 +114,7 @@ const { REALITY_CHECKS, runVerifyDispatch }        = require('./lib/reality-chec
 // (and, before this fix, only-validated-never-written) entry point onto
 // this one write path.
 const { validateDecisionRows, persistDecisionRow } = require('./lib/decisions-writer');
-const { renderKeyPathsBullets, healKeyPathsSection } = require('./lib/claude-md-key-paths');
+const { renderKeyPathsBullets, healKeyPathsSection, resolvePromotionHost, looksLikeFindReplaceCopy } = require('./lib/claude-md-key-paths');
 
 process.on('exit', () => {
   const ms = Number(process.hrtime.bigint() - __startNs) / 1e6;
@@ -172,6 +172,7 @@ const _ENGINE_ROOT = process.env.CLAUDE_PLUGIN_ROOT
 
 const HANDOFF_TEMPLATE = path.join(_ENGINE_ROOT, 'templates', 'handoff.md.tpl');
 const PROJECT_CLAUDE_MD_TEMPLATE = path.join(_ENGINE_ROOT, 'templates', 'project-claude-md.tpl');
+const PROJECT_AGENTS_MD_TEMPLATE = path.join(_ENGINE_ROOT, 'templates', 'project-agents-md.tpl');
 
 // ─── OPERATING CANON (hardcoded trusted preamble) ─────────────────────────────
 // Emitted unconditionally before the untrusted retrieved-context block so every
@@ -4400,40 +4401,89 @@ async function cmdInit(args) {
   // Step 11: Write the durable-facts promotion file (only if all DB steps
   // succeeded). Filename is configurable via HANDOFF_PROMOTION_FILE (default
   // CLAUDE.md) — resolvePromotionFilePath() already validated it above.
+  // Host resolution (B): env HANDOFF_HOST wins if set (must be 'claude' or
+  // 'codex'); otherwise inferred from the promotion filename's basename
+  // ('AGENTS.md' -> codex, everything else -> claude). This selects which
+  // template renders a FRESH file, and gates the find-and-replace-copy
+  // warning below — it never changes healKeyPathsSection()'s behavior,
+  // which stays host-agnostic (it heals whichever file is actually there).
   const promotionFilename = path.basename(claudeMdPath);
+  const promotionHostResult = resolvePromotionHost(process.env);
+  if (!promotionHostResult.ok) {
+    console.log(`  [FAIL]  ${promotionHostResult.reason}`);
+    unwindFsLedger();
+    process.exit(2);
+  }
+  const promotionHost = promotionHostResult.host;
+  const promotionTemplate = promotionHost === 'codex' ? PROJECT_AGENTS_MD_TEMPLATE : PROJECT_CLAUDE_MD_TEMPLATE;
+  const forcePromotion = args.includes('--force-promotion');
+
+  function writeFreshPromotionFile() {
+    const projectName = args.find((a) => !a.startsWith('-')) || path.basename(root);
+    const projectDesc = `Memory and retrieval infrastructure project.`;
+    const keyPathsBullets = renderKeyPathsBullets(process.env);
+    return renderTemplate(promotionTemplate, {
+      PROJECT_NAME:          projectName,
+      PROJECT_DESCRIPTION:   projectDesc,
+      KEY_PATHS_HANDOFF_PATH: keyPathsBullets.handoffPath,
+      KEY_PATHS_HELPER_PATH:  keyPathsBullets.helperPath,
+    });
+  }
+
   if (fs.existsSync(claudeMdPath)) {
-    // heal-on-touch: heal a legacy/absolute "## Key paths" section on touch, rather
-    // than a bare skip. Total classification in healKeyPathsSection() — only
-    // the 'healed' outcome writes; every other outcome leaves the file as-is
-    // (with a diagnostic note on stderr for 'ambiguous'/'unrecognized').
-    try {
-      const existingContent = fs.readFileSync(claudeMdPath, 'utf8');
-      const healResult = healKeyPathsSection(existingContent, process.env);
-      for (const note of healResult.notes) {
-        process.stderr.write(`handoff: ${promotionFilename} Key paths: ${note}\n`);
-      }
-      if (healResult.outcome === 'healed') {
+    const existingContent = fs.readFileSync(claudeMdPath, 'utf8');
+
+    // --force-promotion: unconditional backup + regenerate, bypassing the
+    // heal-on-touch path entirely. Intended for the specific known-bad shape
+    // a hand-made find-and-replace copy left behind (see
+    // looksLikeFindReplaceCopy), but not gated on that detection — an
+    // explicit --force-promotion is honored regardless of why it was given.
+    if (forcePromotion) {
+      try {
+        const backupPath = `${claudeMdPath}.bak-${Date.now()}-${process.hrtime.bigint()}-${process.pid}`;
+        fs.copyFileSync(claudeMdPath, backupPath);
+        const content = writeFreshPromotionFile();
         const tmpPath = `${claudeMdPath}.tmp-${process.pid}`;
-        fs.writeFileSync(tmpPath, healResult.text, 'utf8');
+        fs.writeFileSync(tmpPath, content, 'utf8');
         fs.renameSync(tmpPath, claudeMdPath);
-        console.log(`  [OK]    ${promotionFilename} already exists — healed absolute Key paths bullet(s): ${claudeMdPath}`);
-      } else {
-        console.log(`  [OK]    ${promotionFilename} already exists — skipped (Key paths: ${healResult.outcome}): ${claudeMdPath}`);
+        console.log(`  [OK]    ${promotionFilename} regenerated via --force-promotion (backup: ${backupPath}): ${claudeMdPath}`);
+      } catch (err) {
+        console.log(`  [FAIL]  Could not regenerate ${promotionFilename} via --force-promotion — ${err.message}`);
+        unwindFsLedger();
+        process.exit(1);
       }
-    } catch (err) {
-      console.log(`  [WARN]  ${promotionFilename} Key paths heal check failed (non-fatal): ${err.message}`);
+    } else {
+      if (looksLikeFindReplaceCopy(existingContent)) {
+        process.stderr.write(
+          `handoff: ${promotionFilename} looks like a find-and-replace copy of a Claude template ` +
+          `(contains "~/.Codex/" or "# Codex-memory") — re-run \`init\` with --force-promotion to regenerate it ` +
+          `from the correct template (a backup is made first).\n`
+        );
+      }
+      // heal-on-touch: heal a legacy/absolute "## Key paths" section on touch, rather
+      // than a bare skip. Total classification in healKeyPathsSection() — only
+      // the 'healed' outcome writes; every other outcome leaves the file as-is
+      // (with a diagnostic note on stderr for 'ambiguous'/'unrecognized').
+      try {
+        const healResult = healKeyPathsSection(existingContent, process.env);
+        for (const note of healResult.notes) {
+          process.stderr.write(`handoff: ${promotionFilename} Key paths: ${note}\n`);
+        }
+        if (healResult.outcome === 'healed') {
+          const tmpPath = `${claudeMdPath}.tmp-${process.pid}`;
+          fs.writeFileSync(tmpPath, healResult.text, 'utf8');
+          fs.renameSync(tmpPath, claudeMdPath);
+          console.log(`  [OK]    ${promotionFilename} already exists — healed absolute Key paths bullet(s): ${claudeMdPath}`);
+        } else {
+          console.log(`  [OK]    ${promotionFilename} already exists — skipped (Key paths: ${healResult.outcome}): ${claudeMdPath}`);
+        }
+      } catch (err) {
+        console.log(`  [WARN]  ${promotionFilename} Key paths heal check failed (non-fatal): ${err.message}`);
+      }
     }
   } else {
     try {
-      const projectName = args.find((a) => !a.startsWith('-')) || path.basename(root);
-      const projectDesc = `Memory and retrieval infrastructure project.`;
-      const keyPathsBullets = renderKeyPathsBullets(process.env);
-      const content = renderTemplate(PROJECT_CLAUDE_MD_TEMPLATE, {
-        PROJECT_NAME:          projectName,
-        PROJECT_DESCRIPTION:   projectDesc,
-        KEY_PATHS_HANDOFF_PATH: keyPathsBullets.handoffPath,
-        KEY_PATHS_HELPER_PATH:  keyPathsBullets.helperPath,
-      });
+      const content = writeFreshPromotionFile();
       fs.writeFileSync(claudeMdPath, content, 'utf8');
       fsLedger.push(claudeMdPath);
       console.log(`  [OK]    ${promotionFilename} created: ${claudeMdPath}`);
