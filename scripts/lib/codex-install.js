@@ -422,26 +422,184 @@ function resolveEntry(jsonValue, name) {
   return null;
 }
 
+/**
+ * Node-executable match: basename of `cmd` (path stripped, case-folded on
+ * win32 only) is one of the known node executable names. Bare ('node') and
+ * absolute/relative paths ('/usr/bin/node', 'C:\\...\\node.exe') all match —
+ * only the basename matters, never whether the command is itself absolute.
+ */
 function commandLooksLikeNode(cmd) {
   if (typeof cmd !== 'string' || cmd.length === 0) return false;
-  if (cmd === 'node') return true;
-  if (!path.isAbsolute(cmd)) return false;
-  return /node(\.exe)?$/i.test(path.basename(cmd));
+  const base = path.basename(cmd);
+  const normalized = process.platform === 'win32' ? base.toLowerCase() : base;
+  return normalized === 'node' || normalized === 'node.exe' || normalized === 'nodejs';
 }
 
-/** Forward-slash, win32-case-insensitive normalization for path comparison. */
+/**
+ * Forward-slash, win32-case-insensitive, trailing-separator-stripped
+ * normalization for path STRING comparison (the fallback path when a
+ * realpath comparison isn't available — see pathTokenMatchesEngine).
+ */
 function normalizeForCompare(p) {
-  const s = String(p).replace(/\\/g, '/');
+  let s = String(p).replace(/\\/g, '/').replace(/\/+$/, '');
   return process.platform === 'win32' ? s.toLowerCase() : s;
 }
 
-/** Does `entry` (command + args) already point at this checkout's engine? */
+/** Resolve a possibly-relative path against `cwd` (absolute paths pass through unchanged). */
+function resolvePathForCwd(p, cwd) {
+  if (typeof p !== 'string' || p.length === 0) return p;
+  return path.isAbsolute(p) ? p : path.resolve(cwd || process.cwd(), p);
+}
+
+/**
+ * Does one args-array token (already resolved against `cwd` for relative
+ * inputs) refer to the same file as `enginePath`? If BOTH sides exist on
+ * disk, compares `fs.realpathSync.native` of each (resolves 8.3 short names
+ * and symlinks to their real target — two different-looking paths can be the
+ * same file). Otherwise falls back to normalized-string compare (handles the
+ * common case where the checkout path doesn't exist yet, e.g. under test).
+ */
+function pathTokenMatchesEngine(token, enginePath, cwd) {
+  if (typeof token !== 'string' || token.length === 0) return false;
+  const a = resolvePathForCwd(token, cwd);
+  const b = resolvePathForCwd(enginePath, cwd);
+  let existsA = false, existsB = false;
+  try { existsA = fs.existsSync(a); } catch (_) { existsA = false; }
+  try { existsB = fs.existsSync(b); } catch (_) { existsB = false; }
+  if (existsA && existsB) {
+    try {
+      const realA = fs.realpathSync.native(a);
+      const realB = fs.realpathSync.native(b);
+      return normalizeForCompare(realA) === normalizeForCompare(realB);
+    } catch (_) {
+      // fall through to normalized-string compare below
+    }
+  }
+  return normalizeForCompare(a) === normalizeForCompare(b);
+}
+
+/** Args field -> array of string tokens. An array passes through; a single joined string is whitespace-split. */
+function argsArrayFrom(args) {
+  if (Array.isArray(args)) return args;
+  if (typeof args === 'string') return args.split(/\s+/).filter(Boolean);
+  return [];
+}
+
+// A win32 `cmd /c node <enginePath>` wrapper (the common shape when Codex's
+// own registration UI or a hand-edited config.toml routes through the
+// Windows shell): unwrap it so node-match and engine-path-match operate on
+// the REAL command/args after the `/c`, not on `cmd` itself. Detection is
+// case-folded unconditionally (this compares literal command-name/flag
+// tokens, not filesystem paths, so it is safe and deterministic on every
+// platform this test suite runs on, not just win32).
+function isCmdShellWrapper(command) {
+  if (typeof command !== 'string') return false;
+  const base = path.basename(command).toLowerCase();
+  return base === 'cmd' || base === 'cmd.exe';
+}
+
+/**
+ * If `command` is a cmd.exe shell wrapper and `argsArr` contains a `/c`
+ * token, returns the unwrapped { command, args } taken from the tokens after
+ * `/c` (the token immediately after `/c` becomes the effective command, the
+ * rest become its args). Otherwise returns { command, args: argsArr }
+ * unchanged. Total classification over the wrapper shape: no `/c` token, or
+ * `/c` with nothing after it, both fall through to "not a wrapper" rather
+ * than guessing.
+ */
+function unwrapCmdShellWrapper(command, argsArr) {
+  if (!isCmdShellWrapper(command)) return { command, args: argsArr };
+  const idx = argsArr.findIndex((a) => typeof a === 'string' && a.toLowerCase() === '/c');
+  if (idx === -1 || idx + 1 >= argsArr.length) return { command, args: argsArr };
+  return { command: argsArr[idx + 1], args: argsArr.slice(idx + 2) };
+}
+
+/**
+ * Resolve the effective transport fields out of a `codex mcp get --json`
+ * entry. Real codex-cli nests command/args/url/type/env under an
+ * entry.transport object; a hand-written config.toml stanza (or this
+ * installer's own manual-paste fallback) keeps them at the entry's top
+ * level. Per-field fallback (NOT a wholesale either/or): for each of
+ * command/args/url/type/env, use transport's value when transport itself is
+ * a usable object (has its own command/args/url/or type key — an empty
+ * `transport: {}` is NOT usable and every field falls back to the entry
+ * level) AND transport carries that specific key; otherwise fall back to the
+ * entry-level value for that key. When both entry.command and
+ * transport.command exist and disagree, transport wins and the disagreement
+ * is recorded in `commandConflict` for callers that want to report it.
+ */
+function resolveTransportFields(entry) {
+  const e = entry && typeof entry === 'object' ? entry : {};
+  const t = e.transport;
+  const isUsableTransport = t !== null && typeof t === 'object' && !Array.isArray(t) &&
+    ['command', 'args', 'url', 'type'].some((k) => Object.prototype.hasOwnProperty.call(t, k));
+
+  const pick = (key) => (isUsableTransport && Object.prototype.hasOwnProperty.call(t, key)) ? t[key] : e[key];
+
+  const transportCommand = (isUsableTransport && Object.prototype.hasOwnProperty.call(t, 'command')) ? t.command : undefined;
+  const commandConflict = (typeof e.command === 'string' && typeof transportCommand === 'string' && e.command !== transportCommand)
+    ? { entryCommand: e.command, transportCommand }
+    : null;
+
+  return {
+    command: pick('command'),
+    args: pick('args'),
+    url: pick('url'),
+    type: pick('type'),
+    env: pick('env'),
+    fromTransport: isUsableTransport,
+    commandConflict,
+  };
+}
+
+// Total classification over transport shape — every combination of
+// {url, type, command} maps to exactly one branch, never an allow-list of
+// "known-good" type strings alone: a url string, or a type naming one of the
+// known HTTP-family transports, is HTTP; a string command (any type, or no
+// type at all — most stdio entries carry no explicit "type" field) is STDIO;
+// anything else (no usable command AND no url/HTTP-type) is UNKNOWN.
+const HTTP_TRANSPORT_TYPES = new Set(['http', 'streamable_http', 'sse']);
+
+function classifyTransportShape(fields) {
+  if (typeof fields.url === 'string') return 'HTTP';
+  if (typeof fields.type === 'string' && HTTP_TRANSPORT_TYPES.has(fields.type)) return 'HTTP';
+  if (typeof fields.command === 'string') return 'STDIO';
+  return 'UNKNOWN';
+}
+
+/**
+ * HANDOFF_HOST env-var classification on a resolved transport env object.
+ * Total classification: absent entirely -> 'missing' (a note, not a repair
+ * trigger — an older registration predating this env var is still fine);
+ * present and exactly 'codex' -> 'ok'; present and anything else -> 'wrong'
+ * (misrouted — NEEDS_REPAIR).
+ */
+function checkHandoffHostEnv(env) {
+  if (!env || typeof env !== 'object' || !Object.prototype.hasOwnProperty.call(env, 'HANDOFF_HOST')) {
+    return { status: 'missing', value: undefined };
+  }
+  const value = env.HANDOFF_HOST;
+  return { status: value === 'codex' ? 'ok' : 'wrong', value };
+}
+
+/**
+ * Does `entry` (command + args, transport-nested or entry-level per
+ * resolveTransportFields) already point at this checkout's engine? Only a
+ * STDIO-shaped entry can ever match (an HTTP/SSE or UNKNOWN-shaped entry
+ * never does, regardless of any command-shaped leftover field) — a node
+ * command basename match, after unwrapping a `cmd /c` shell wrapper, plus at
+ * least one args token that resolves to the same file as `enginePath`.
+ */
 function entryMatchesEngine(entry, enginePath) {
   if (!entry || typeof entry !== 'object') return false;
-  if (!commandLooksLikeNode(entry.command)) return false;
-  const args = Array.isArray(entry.args) ? entry.args : [];
-  const want = normalizeForCompare(enginePath);
-  return args.some((a) => typeof a === 'string' && normalizeForCompare(a) === want);
+  const fields = resolveTransportFields(entry);
+  if (classifyTransportShape(fields) !== 'STDIO') return false;
+
+  const unwrapped = unwrapCmdShellWrapper(fields.command, argsArrayFrom(fields.args));
+  if (!commandLooksLikeNode(unwrapped.command)) return false;
+
+  const cwd = process.cwd();
+  return unwrapped.args.some((a) => pathTokenMatchesEngine(a, enginePath, cwd));
 }
 
 // ─── `codex mcp get <name> [--json]` total classification (S2 hardening) ────
@@ -510,14 +668,55 @@ function checkHandoffRegistered(codexCommand, enginePath, opts) {
   if (entry.name !== undefined && entry.name !== name) {
     return { state: 'UNKNOWN', detail: `resolved entry's own name ('${entry.name}') disagrees with expected '${name}'.`, exit, stdout, stderr, entry };
   }
-  if (entryMatchesEngine(entry, enginePath)) {
-    return { state: 'REGISTERED', detail: 'already registered and pointing at this checkout.', exit, stdout, stderr, entry };
+
+  const fields = resolveTransportFields(entry);
+  const shape  = classifyTransportShape(fields);
+
+  if (shape === 'HTTP') {
+    // Reported symmetrically to the STDIO NEEDS_REPAIR case below (same
+    // state, same oldCommand/oldArgs/newEnginePath shape) — an HTTP/SSE
+    // transport is never REGISTERED by this installer, since it only ever
+    // registers a stdio `node <enginePath>` command.
+    return {
+      state: 'NEEDS_REPAIR',
+      detail: 'registered via an HTTP/SSE transport (url-based) — this installer only manages a stdio node transport; re-run `codex mcp add` to repoint it.',
+      exit, stdout, stderr, entry,
+      oldCommand: fields.command, oldArgs: fields.args, oldUrl: fields.url,
+      newEnginePath: enginePath,
+      transportConflict: fields.commandConflict,
+    };
   }
+  if (shape === 'UNKNOWN') {
+    return {
+      state: 'UNKNOWN',
+      detail: 'resolved entry has neither a usable command string nor a url — cannot classify its transport.',
+      exit, stdout, stderr, entry,
+    };
+  }
+
+  // shape === 'STDIO' from here on.
+  const hostCheck = checkHandoffHostEnv(fields.env);
+  const matches = entryMatchesEngine(entry, enginePath);
+
+  if (matches && hostCheck.status !== 'wrong') {
+    return {
+      state: 'REGISTERED',
+      detail: hostCheck.status === 'missing'
+        ? 'already registered and pointing at this checkout (note: HANDOFF_HOST env var is not set on the entry).'
+        : 'already registered and pointing at this checkout.',
+      exit, stdout, stderr, entry,
+      transportConflict: fields.commandConflict,
+    };
+  }
+
   return {
     state: 'NEEDS_REPAIR',
-    detail: 'registered but command/args point at a different path than this checkout.',
+    detail: !matches
+      ? 'registered but command/args point at a different path than this checkout.'
+      : `registered and pointing at this checkout, but HANDOFF_HOST is set to '${hostCheck.value}' instead of 'codex' — misrouted.`,
     exit, stdout, stderr, entry,
-    oldCommand: entry.command, oldArgs: entry.args, newEnginePath: enginePath,
+    oldCommand: fields.command, oldArgs: fields.args, newEnginePath: enginePath,
+    transportConflict: fields.commandConflict,
   };
 }
 
@@ -981,6 +1180,17 @@ module.exports = {
   entryMatchesEngine,
   notFound,
   looksLikeJsonFlagUnsupported,
+  // Exported for direct unit testing of the transport-nesting resolution
+  // (fix for resolveEntry/entryMatchesEngine reading top-level fields only).
+  resolveTransportFields,
+  classifyTransportShape,
+  checkHandoffHostEnv,
+  commandLooksLikeNode,
+  normalizeForCompare,
+  argsArrayFrom,
+  isCmdShellWrapper,
+  unwrapCmdShellWrapper,
+  pathTokenMatchesEngine,
   // Exported for direct, platform-independent unit testing of the shell-
   // quoting/classification internals (PR #276 review finding) — pure string
   // functions, safe to call regardless of the CURRENT process.platform.
