@@ -11,10 +11,25 @@
  * Done lines printed that text unconditionally, and clearSessionMarkerForClose
  * returned a boolean the callers ignored. This file pins the fixed behavior:
  * clearSessionMarkerForClose now returns a structured
- * { branch, deleted, ownedBy, malformed, text } outcome covering every
- * combination of "resolved session id present/absent" x "marker list
+ * { branch, deleted, ownedBy, dropped, coerced, text } outcome covering
+ * every combination of "resolved session id present/absent" x "marker list
  * state" (branches A-G), and the two Done-line call sites print that text
  * verbatim instead of a hardcoded string.
+ *
+ * Reviewer-amended (round 2): an independent reviewer proved, main vs PR
+ * side by side, that the first version of this PR's parseSessionMarkers
+ * regressed every OTHER caller (status, loader-stop, resume) by silently
+ * dropping entries whose session_id was some non-string/non-null value
+ * (e.g. a stray numeric session_id) that main used to accept (coercing it to
+ * null, same as a legacy marker). The PARITY block below locks
+ * parseSessionMarkers to byte-identical output vs. a copy of main's original
+ * implementation, over a fixture set covering every shape the reviewer
+ * named. parseSessionMarkersDetailed still reports the two failure shapes
+ * SEPARATELY (`dropped` for entries that never become a marker at all —
+ * bad/missing ts or non-object; `coerced` for entries that DO become a
+ * marker but had a non-string/non-null session_id forced to null) — but
+ * these counts are close-only reporting layered on top of the SAME
+ * `markers` list main would have produced, never a filter that changes it.
  *
  * No real Postgres is used — a minimal in-memory FakeDb stands in for the
  * one table (project_settings) and lock primitive
@@ -30,6 +45,7 @@
 
 const assert = require('assert');
 const {
+  parseSessionMarkers,
   parseSessionMarkersDetailed,
   clearSessionMarkerForClose,
   formatOwnerIds,
@@ -110,54 +126,141 @@ class FakeDb {
   markerValue() { return this.rows.get(`${PROJECT_ID}::session_in_progress`); }
 }
 
-async function run() {
-  // ── parseSessionMarkersDetailed — malformed counting ──────────────────────
+/**
+ * Byte-for-byte copy of main's ORIGINAL parseSessionMarkers (pre-this-PR) —
+ * the reference implementation the parity block below checks the live
+ * parseSessionMarkers against. Do NOT "fix" or simplify this copy; its only
+ * job is to be what main actually did.
+ */
+function mainParseSessionMarkers(raw) {
+  if (raw === null || raw === undefined || raw === '') return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return parsed
+        .filter((e) => e && typeof e === 'object' && typeof e.ts === 'string')
+        .map((e) => ({
+          session_id: (typeof e.session_id === 'string' && e.session_id.length > 0) ? e.session_id : null,
+          ts: e.ts,
+        }));
+    }
+    return [];
+  } catch (_) {
+    if (typeof raw === 'string' && raw.length > 0) {
+      return [{ session_id: null, ts: raw }];
+    }
+    return [];
+  }
+}
 
-  await test('detailed: well-formed array -> markers, malformed=0', async () => {
-    const { markers, malformed } = parseSessionMarkersDetailed(JSON.stringify([
+// Fixture set naming every shape the reviewer's finding turned on, plus the
+// existing well-formed/empty/non-array baseline cases.
+const PARITY_FIXTURES = [
+  { label: 'numeric session_id',        raw: JSON.stringify([{ session_id: 42, ts: '2026-01-01T00:00:00.000Z' }]) },
+  { label: 'object session_id',         raw: JSON.stringify([{ session_id: { nested: true }, ts: '2026-01-01T00:00:00.000Z' }]) },
+  { label: 'missing session_id',        raw: JSON.stringify([{ ts: '2026-01-01T00:00:00.000Z' }]) },
+  { label: 'numeric ts',                raw: JSON.stringify([{ session_id: 'a', ts: 12345 }]) },
+  { label: 'missing ts',                raw: JSON.stringify([{ session_id: 'a' }]) },
+  { label: 'legacy string marker',      raw: 'smoketest_legacy_marker' },
+  { label: 'well-formed entry',         raw: JSON.stringify([{ session_id: 'a', ts: '2026-01-01T00:00:00.000Z' }]) },
+  { label: 'empty array',               raw: '[]' },
+  { label: 'non-array (valid JSON)',    raw: JSON.stringify({ foo: 1 }) },
+  { label: 'mixed batch (all shapes)',  raw: JSON.stringify([
+      { session_id: 42, ts: '2026-01-01T00:00:00.000Z' },
+      { session_id: { x: 1 }, ts: '2026-01-01T00:00:01.000Z' },
+      { ts: '2026-01-01T00:00:02.000Z' },
+      { session_id: 'a', ts: 12345 },
+      { session_id: 'b' },
+      { session_id: 'c', ts: '2026-01-01T00:00:03.000Z' },
+    ]) },
+];
+
+async function run() {
+  // ── PARITY: parseSessionMarkers must match main's original output exactly ─
+
+  for (const { label, raw } of PARITY_FIXTURES) {
+    await test(`parity: parseSessionMarkers(${label}) matches main byte-for-byte`, async () => {
+      const expected = mainParseSessionMarkers(raw);
+      const actual = parseSessionMarkers(raw);
+      assert.deepStrictEqual(actual, expected);
+    });
+  }
+
+  // ── parseSessionMarkersDetailed — dropped vs coerced counted separately ───
+
+  await test('detailed: well-formed array -> markers, dropped=0, coerced=0', async () => {
+    const { markers, dropped, coerced } = parseSessionMarkersDetailed(JSON.stringify([
       { session_id: 'a', ts: '2026-01-01T00:00:00.000Z' },
       { session_id: null, ts: '2026-01-02T00:00:00.000Z' },
     ]));
     assert.strictEqual(markers.length, 2);
-    assert.strictEqual(malformed, 0);
+    assert.strictEqual(dropped, 0);
+    assert.strictEqual(coerced, 0);
   });
 
-  await test('detailed: ts not a string -> malformed, excluded', async () => {
-    const { markers, malformed } = parseSessionMarkersDetailed(JSON.stringify([
+  await test('detailed: ts not a string -> dropped (never becomes a marker)', async () => {
+    const { markers, dropped, coerced } = parseSessionMarkersDetailed(JSON.stringify([
       { session_id: 'a', ts: 12345 },
       { session_id: 'b', ts: '2026-01-02T00:00:00.000Z' },
     ]));
     assert.strictEqual(markers.length, 1);
     assert.strictEqual(markers[0].session_id, 'b');
-    assert.strictEqual(malformed, 1);
+    assert.strictEqual(dropped, 1);
+    assert.strictEqual(coerced, 0);
   });
 
-  await test('detailed: session_id not string|null -> malformed, excluded', async () => {
-    const { markers, malformed } = parseSessionMarkersDetailed(JSON.stringify([
+  await test('detailed: numeric session_id -> KEPT as a marker (session_id coerced to null), counted coerced', async () => {
+    const { markers, dropped, coerced } = parseSessionMarkersDetailed(JSON.stringify([
       { session_id: 42, ts: '2026-01-01T00:00:00.000Z' },
     ]));
-    assert.strictEqual(markers.length, 0);
-    assert.strictEqual(malformed, 1);
+    assert.strictEqual(markers.length, 1, 'main keeps this entry — must not be dropped');
+    assert.strictEqual(markers[0].session_id, null);
+    assert.strictEqual(markers[0].ts, '2026-01-01T00:00:00.000Z');
+    assert.strictEqual(dropped, 0);
+    assert.strictEqual(coerced, 1);
   });
 
-  await test('detailed: non-object array element -> malformed, excluded', async () => {
-    const { markers, malformed } = parseSessionMarkersDetailed(JSON.stringify([
+  await test('detailed: object session_id -> KEPT as a marker (coerced to null), counted coerced', async () => {
+    const { markers, dropped, coerced } = parseSessionMarkersDetailed(JSON.stringify([
+      { session_id: { x: 1 }, ts: '2026-01-01T00:00:00.000Z' },
+    ]));
+    assert.strictEqual(markers.length, 1);
+    assert.strictEqual(markers[0].session_id, null);
+    assert.strictEqual(dropped, 0);
+    assert.strictEqual(coerced, 1);
+  });
+
+  await test('detailed: missing session_id -> KEPT, null, NOT counted as coerced (already-nullish is not a coercion)', async () => {
+    const { markers, dropped, coerced } = parseSessionMarkersDetailed(JSON.stringify([
+      { ts: '2026-01-01T00:00:00.000Z' },
+    ]));
+    assert.strictEqual(markers.length, 1);
+    assert.strictEqual(markers[0].session_id, null);
+    assert.strictEqual(dropped, 0);
+    assert.strictEqual(coerced, 0);
+  });
+
+  await test('detailed: non-object array element -> dropped, excluded', async () => {
+    const { markers, dropped, coerced } = parseSessionMarkersDetailed(JSON.stringify([
       'not-an-object',
       { session_id: 'a', ts: '2026-01-01T00:00:00.000Z' },
     ]));
     assert.strictEqual(markers.length, 1);
-    assert.strictEqual(malformed, 1);
+    assert.strictEqual(dropped, 1);
+    assert.strictEqual(coerced, 0);
   });
 
-  await test('detailed: mixed malformed count is exact', async () => {
-    const { markers, malformed } = parseSessionMarkersDetailed(JSON.stringify([
-      { session_id: 'a', ts: '2026-01-01T00:00:00.000Z' },
-      { ts: 1 },
-      null,
-      { session_id: [], ts: '2026-01-02T00:00:00.000Z' },
+  await test('detailed: mixed dropped/coerced counts are exact and independent', async () => {
+    const { markers, dropped, coerced } = parseSessionMarkersDetailed(JSON.stringify([
+      { session_id: 'a', ts: '2026-01-01T00:00:00.000Z' }, // kept, clean
+      { ts: 1 },                                            // dropped (bad ts)
+      null,                                                 // dropped (not an object)
+      { session_id: [], ts: '2026-01-02T00:00:00.000Z' },   // kept, coerced (array session_id)
+      { session_id: 7, ts: '2026-01-03T00:00:00.000Z' },    // kept, coerced (numeric session_id)
     ]));
-    assert.strictEqual(markers.length, 1);
-    assert.strictEqual(malformed, 3);
+    assert.strictEqual(markers.length, 3);
+    assert.strictEqual(dropped, 2);
+    assert.strictEqual(coerced, 2);
   });
 
   // ── formatOwnerIds — dedupe + cap ──────────────────────────────────────────
@@ -222,6 +325,16 @@ async function run() {
       assert.strictEqual(db.markerValue(), undefined);
     });
 
+    await test('B: a coerced (non-string session_id) marker is cleared as legacy, same as main', async () => {
+      const db = new FakeDb();
+      db.seedMarker(JSON.stringify([{ session_id: 42, ts: '2026-01-01T00:00:00.000Z' }]));
+      const r = await clearSessionMarkerForClose(db, PROJECT_ID, { session_id: 'sess-other' });
+      assert.strictEqual(r.branch, 'B');
+      assert.strictEqual(r.deleted, 1);
+      assert.strictEqual(r.coerced, 1);
+      assert.strictEqual(r.text, 'legacy session marker cleared (marker had no session id); 1 marker entry had a non-string session id (treated as no id)');
+    });
+
     await test('C: no exact, no null, list non-empty -> nothing deleted, owners reported', async () => {
       const db = new FakeDb();
       db.seedMarker(JSON.stringify([{ session_id: 'sess-owner', ts: '2026-01-01T00:00:00.000Z' }]));
@@ -258,16 +371,17 @@ async function run() {
       assert.strictEqual(r.text, 'no session marker present');
     });
 
-    await test('F + malformed: empty-after-exclusion list still reports the malformed count', async () => {
+    await test('F + dropped: empty-after-exclusion list still reports the dropped count', async () => {
       const db = new FakeDb();
       db.seedMarker(JSON.stringify([{ ts: 1 }, 'garbage']));
       const r = await clearSessionMarkerForClose(db, PROJECT_ID, { session_id: 'sess-A' });
       assert.strictEqual(r.branch, 'F');
-      assert.strictEqual(r.malformed, 2);
+      assert.strictEqual(r.dropped, 2);
+      assert.strictEqual(r.coerced, 0);
       assert.strictEqual(r.text, 'no session marker present; 2 malformed marker entries ignored');
     });
 
-    await test('A + malformed suffix: singular "entry" wording for malformed=1', async () => {
+    await test('A + dropped suffix: singular "entry" wording for dropped=1', async () => {
       const db = new FakeDb();
       db.seedMarker(JSON.stringify([
         { session_id: 'sess-A', ts: '2026-01-01T00:00:00.000Z' },
@@ -275,8 +389,26 @@ async function run() {
       ]));
       const r = await clearSessionMarkerForClose(db, PROJECT_ID, { session_id: 'sess-A' });
       assert.strictEqual(r.branch, 'A');
-      assert.strictEqual(r.malformed, 1);
+      assert.strictEqual(r.dropped, 1);
+      assert.strictEqual(r.coerced, 0);
       assert.strictEqual(r.text, 'session marker cleared (session sess-A); 1 malformed marker entry ignored');
+    });
+
+    await test('A + both dropped and coerced suffixes appear together', async () => {
+      const db = new FakeDb();
+      db.seedMarker(JSON.stringify([
+        { session_id: 'sess-A', ts: '2026-01-01T00:00:00.000Z' },
+        { ts: 999 },                                          // dropped
+        { session_id: 42, ts: '2026-01-02T00:00:00.000Z' },   // coerced (and irrelevant to matching)
+      ]));
+      const r = await clearSessionMarkerForClose(db, PROJECT_ID, { session_id: 'sess-A' });
+      assert.strictEqual(r.branch, 'A');
+      assert.strictEqual(r.dropped, 1);
+      assert.strictEqual(r.coerced, 1);
+      assert.strictEqual(
+        r.text,
+        'session marker cleared (session sess-A); 1 malformed marker entry ignored; 1 marker entry had a non-string session id (treated as no id)'
+      );
     });
 
     await test('G: an unreadable store never throws — reports the error and leaves state as-is', async () => {
