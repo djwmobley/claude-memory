@@ -7,6 +7,7 @@ Quick health check. Shows the project name and marker uuid, when the last sessio
 ## What this shows
 
 - `project_name` (human-readable, `path.basename` of the project root) and `project_id` (marker uuid) — shown together so a status summary read out of context can't be misread as belonging to another project (cm#232).
+- `host` (`claude` | `codex`, or `null` if unresolvable) and `promotion_file` (the absolute path of the durable-facts file that host targets — `CLAUDE.md` under `claude`, `AGENTS.md` under `codex` — or `null` if unresolvable), resolved via the SAME shared resolver `promote`/`close` use (`resolvePromotionTarget`, `scripts/lib/claude-md-key-paths.js`), honoring `HANDOFF_HOST`/`HANDOFF_PROMOTION_FILE`. This is how to confirm which host/file `promote` and `close` will actually target under Codex or Claude Code.
 - `last_close` timestamp from `handoff.md` frontmatter and days since close.
 - Live-row counts for `entities`, `assertions`, `edges`, scoped to this project. **Live** means `suppressed = false` (entities/edges) or `suppressed = false AND invalid_at IS NULL` (assertions — the bi-temporal predicate). The `assertions` figure also breaks out `suppressed` and `invalidated` counts alongside it so nothing is silently folded in (cm#232 — before this fix, `assertions` was a raw `COUNT(*)` that included suppressed rows).
 - Current retrieval contract names stored in `retrieval_contract`.
@@ -24,7 +25,7 @@ Flags may be combined freely: `--json --breakdown --stale-pointers` emits a sing
 
 ## Preferred path — MCP
 
-If the `mcp__handoff__handoff_status` tool is available in this session, call it directly — it returns the same structured fields as `status --json` (project_id, project_name, live entity/assertion/edge counts plus assertions_suppressed/assertions_invalidated/assertions_total, handoff.md path, last_close/days_since, contracts, session_active, session_id, packaging) without a shell round-trip. Read-only — makes no writes.
+If the `mcp__handoff__handoff_status` tool is available in this session, call it directly — it returns the same structured fields as `status --json` (project_id, project_name, host, promotion_file, live entity/assertion/edge counts plus assertions_suppressed/assertions_invalidated/assertions_total, handoff.md path, last_close/days_since, contracts, session_active, session_id, packaging) without a shell round-trip. Read-only — makes no writes.
 
 ```
 ToolSearch({ query: "select:mcp__handoff__handoff_status" })
@@ -102,6 +103,8 @@ Running: handoff:status
   === handoff status ===
   project_name:     my-project
   project_id:       C--Users-username-dev-my-project
+  host:             claude
+  promotion_file:   /home/username/dev/my-project/CLAUDE.md
   last_close:       2026-05-14T22:30:00Z (1 day(s) ago)
   handoff.md:       ~/.claude/projects/C--Users-username-dev-my-project/handoff.md
   entities:         23
@@ -118,6 +121,8 @@ Done: handoff:status — project=my-project marker=C--Users-username-dev-my-proj
 {
   "project_id": "C--Users-username-dev-my-project",
   "project_name": "my-project",
+  "host": "claude",
+  "promotion_file": "/home/username/dev/my-project/CLAUDE.md",
   "db": "connected",
   "handoff_md": "/home/username/.claude/projects/.../handoff.md",
   "last_close": "2026-05-14T22:30:00Z",

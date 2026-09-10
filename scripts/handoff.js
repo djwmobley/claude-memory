@@ -4919,10 +4919,39 @@ async function cmdStatus(args = []) {
   const projectId   = resolveProjectId();
   const handoffPath = resolveHandoffMdPath(projectId);
   const fm          = readHandoffFrontmatter(handoffPath);
+  const root        = findProjectRoot();
   // cm#232: human-readable project name, distinct from the marker uuid
   // (projectId) — surfaced so a status/close summary read out of context
   // (e.g. pasted into chat) can't be misread as belonging to another project.
-  const projectName = path.basename(findProjectRoot());
+  const projectName = path.basename(root);
+
+  // cm(status-host-fields): host + promotion_file — SAME shared resolver
+  // cmdInit/cmdPromote/cmdClose use (resolvePromotionTarget,
+  // scripts/lib/claude-md-key-paths.js), so status can never report a value
+  // that disagrees with what promote/close actually targeted. Note: unlike
+  // cmdLoaderStop, promote/cmdPromote never parse a --host argv flag at
+  // all — resolvePromotionTarget reads HANDOFF_HOST/HANDOFF_PROMOTION_FILE
+  // from process.env only — so status deliberately does the same rather
+  // than inventing a --host flag promote itself doesn't accept.
+  // Non-fatal: an unresolvable pair (e.g. HANDOFF_HOST set to an invalid
+  // value) surfaces as null fields + a stderr note, never a crash — status
+  // stays read-only and always prints the rest of the report.
+  let statusHost = null;
+  let statusPromotionFile = null;
+  try {
+    const promotionTargetResult = resolvePromotionTarget(root, process.env);
+    if (promotionTargetResult.ok) {
+      statusHost = promotionTargetResult.host;
+      statusPromotionFile = promotionTargetResult.filePath;
+      if (promotionTargetResult.warning) {
+        process.stderr.write(promotionTargetResult.warning + '\n');
+      }
+    } else {
+      process.stderr.write(`handoff status: host/promotion_file unresolved — ${promotionTargetResult.reason}\n`);
+    }
+  } catch (err) {
+    process.stderr.write(`handoff status: host/promotion_file resolution failed (non-fatal): ${err.message}\n`);
+  }
 
   let db;
   try {
@@ -5157,6 +5186,8 @@ async function cmdStatus(args = []) {
     const out = {
       project_id:     projectId,
       project_name:   projectName,
+      host:           statusHost,
+      promotion_file: statusPromotionFile,
       db:             'connected',
       handoff_md:     fs.existsSync(handoffPath) ? handoffPath : null,
       last_close:     lastClose,
@@ -5198,6 +5229,8 @@ async function cmdStatus(args = []) {
   console.log('\n  === handoff status ===');
   console.log(`  project_name:     ${projectName}`);
   console.log(`  project_id:       ${projectId}`);
+  console.log(`  host:             ${statusHost || '(unresolved)'}`);
+  console.log(`  promotion_file:   ${statusPromotionFile || '(unresolved)'}`);
   console.log(`  last_close:       ${lastClose} (${daysStr})`);
   console.log(`  handoff.md:       ${fs.existsSync(handoffPath) ? handoffPath : '(missing)'}`);
   console.log(`  entities:         ${liveCounts.entities}`);

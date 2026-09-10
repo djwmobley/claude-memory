@@ -907,8 +907,11 @@ function buildServer() {
       title: 'Read-only handoff project memory status',
       description:
         'Runs `handoff.js status --json` for the given project and returns the parsed result: project_id, ' +
-        'entity/assertion/edge counts, handoff.md path, last_close/days_since, contracts, session_active, ' +
-        'session_id, packaging state (e.g. "UNPACKAGED (dirty working tree)" or "clean"), embedding_readiness ' +
+        'host (\'claude\' | \'codex\', or null if unresolvable — resolved via the SAME shared resolver ' +
+        '`promote`/`close` use, honoring HANDOFF_HOST/HANDOFF_PROMOTION_FILE) and promotion_file (the absolute ' +
+        'path of the durable-facts file that host targets — CLAUDE.md under claude, AGENTS.md under codex — or ' +
+        'null if unresolvable), entity/assertion/edge counts, handoff.md path, last_close/days_since, contracts, ' +
+        'session_active, session_id, packaging state (e.g. "UNPACKAGED (dirty working tree)" or "clean"), embedding_readiness ' +
         '(the single classifier\'s verbatim state: DISABLED | UNEMBEDDABLE:no-extension | UNEMBEDDABLE:no-provider | ' +
         'DEGRADED:probe-failed(<reason>) | HEALING(<n>) | READY | UNSUPPORTED:sqlite — READY requires BOTH a zero ' +
         'live+actionable NULL-embedding backlog AND a successful live provider probe), embedding_null_counts, backlog ' +
