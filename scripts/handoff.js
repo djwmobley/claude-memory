@@ -90,8 +90,6 @@ const {
 } = require('./lib/project-identity');
 const {
   resolveHandoffMdPath,
-  resolvePromotionFilePath,
-  defaultPromotionFilenameForHost,
 } = require('./lib/handoff-paths');
 const { resolveHost } = require('./lib/host-target');
 const { embedQuery }                               = require('./lib/embed');
@@ -114,7 +112,7 @@ const { REALITY_CHECKS, runVerifyDispatch }        = require('./lib/reality-chec
 // (and, before this fix, only-validated-never-written) entry point onto
 // this one write path.
 const { validateDecisionRows, persistDecisionRow } = require('./lib/decisions-writer');
-const { renderKeyPathsBullets, healKeyPathsSection, resolvePromotionHost, looksLikeFindReplaceCopy } = require('./lib/claude-md-key-paths');
+const { renderKeyPathsBullets, healKeyPathsSection, resolvePromotionHost, resolvePromotionTarget, looksLikeFindReplaceCopy } = require('./lib/claude-md-key-paths');
 
 process.on('exit', () => {
   const ms = Number(process.hrtime.bigint() - __startNs) / 1e6;
@@ -3994,7 +3992,10 @@ async function cmdInit(args) {
   }
 
   const handoffPath  = resolveHandoffMdPath(projectId);
-  const claudeMdPath = resolvePromotionFilePath(root);
+  // claudeMdPath / promotionHost are resolved together, later, via
+  // resolvePromotionTarget() (see Step 11) — host must be known BEFORE the
+  // filename default is picked (HANDOFF_HOST=codex with
+  // HANDOFF_PROMOTION_FILE unset must resolve to AGENTS.md, not CLAUDE.md).
   // -y / --yes / --force all bypass the confirmation gate and enable DB auto-create.
   const autoCreate   = args.includes('-y') || args.includes('--yes') || args.includes('--force');
 
@@ -4554,22 +4555,33 @@ async function cmdInit(args) {
   }
 
   // Step 11: Write the durable-facts promotion file (only if all DB steps
-  // succeeded). Filename is configurable via HANDOFF_PROMOTION_FILE (default
-  // CLAUDE.md) — resolvePromotionFilePath() already validated it above.
-  // Host resolution (B): env HANDOFF_HOST wins if set (must be 'claude' or
-  // 'codex'); otherwise inferred from the promotion filename's basename
-  // ('AGENTS.md' -> codex, everything else -> claude). This selects which
-  // template renders a FRESH file, and gates the find-and-replace-copy
-  // warning below — it never changes healKeyPathsSection()'s behavior,
-  // which stays host-agnostic (it heals whichever file is actually there).
-  const promotionFilename = path.basename(claudeMdPath);
-  const promotionHostResult = resolvePromotionHost(process.env);
-  if (!promotionHostResult.ok) {
-    console.log(`  [FAIL]  ${promotionHostResult.reason}`);
+  // succeeded). Host AND filename are resolved TOGETHER via
+  // resolvePromotionTarget() (scripts/lib/claude-md-key-paths.js) — the
+  // single shared classification of the (HANDOFF_HOST, HANDOFF_PROMOTION_FILE)
+  // env pair. Host resolution: env HANDOFF_HOST wins if set (must be 'claude'
+  // or 'codex'); otherwise inferred from the promotion filename's basename
+  // ('AGENTS.md', case-insensitively -> codex, everything else -> claude).
+  // The resolved host then supplies the filename DEFAULT (CLAUDE.md vs
+  // AGENTS.md) used only when HANDOFF_PROMOTION_FILE is unset — this is what
+  // fixes the prior bug where HANDOFF_HOST=codex with HANDOFF_PROMOTION_FILE
+  // unset still resolved the path to CLAUDE.md while selecting the AGENTS.md
+  // template, writing AGENTS-flavored content into a file named CLAUDE.md.
+  // Host also selects which template renders a FRESH file, and gates the
+  // find-and-replace-copy warning below — it never changes
+  // healKeyPathsSection()'s behavior, which stays host-agnostic (it heals
+  // whichever file is actually there).
+  const promotionTargetResult = resolvePromotionTarget(root, process.env);
+  if (!promotionTargetResult.ok) {
+    console.log(`  [FAIL]  ${promotionTargetResult.reason}`);
     unwindFsLedger();
     process.exit(2);
   }
-  const promotionHost = promotionHostResult.host;
+  if (promotionTargetResult.warning) {
+    process.stderr.write(promotionTargetResult.warning + '\n');
+  }
+  const claudeMdPath = promotionTargetResult.filePath;
+  const promotionFilename = promotionTargetResult.filename;
+  const promotionHost = promotionTargetResult.host;
   const promotionTemplate = promotionHost === 'codex' ? PROJECT_AGENTS_MD_TEMPLATE : PROJECT_CLAUDE_MD_TEMPLATE;
   const forcePromotion = args.includes('--force-promotion');
 
@@ -8364,13 +8376,22 @@ async function cmdClose(args) {
   // ── S4 (codex-host-adapter): resolve the durable-facts promotion path ONCE
   // here, at entry, and thread it as a parameter into every write site below
   // (the --dry-run preview branch AND the real write branch) — rather than
-  // each branch independently re-calling resolvePromotionFilePath() (which
-  // reads HANDOFF_PROMOTION_FILE from process.env internally). Claude's own
-  // behavior is unaffected: resolvePromotionFilePath(root) with no second
-  // argument still resolves the historical default (CLAUDE.md unless
-  // HANDOFF_PROMOTION_FILE overrides it) exactly as before this change.
-  const promotionPath     = resolvePromotionFilePath(root);
-  const promotionFilename = path.basename(promotionPath);
+  // each branch independently re-calling resolvePromotionFilePath(). Uses the
+  // SAME shared resolvePromotionTarget() as cmdInit/cmdPromote so host and
+  // filename are always mutually consistent (HANDOFF_HOST=codex with
+  // HANDOFF_PROMOTION_FILE unset resolves to AGENTS.md here too, not
+  // CLAUDE.md). Claude's own behavior is unaffected: with neither env var
+  // set this still resolves the historical default (CLAUDE.md).
+  const promotionTargetResult = resolvePromotionTarget(root, process.env);
+  if (!promotionTargetResult.ok) {
+    process.stderr.write(`[handoff] ${promotionTargetResult.reason}\n`);
+    process.exit(1);
+  }
+  if (promotionTargetResult.warning) {
+    process.stderr.write(promotionTargetResult.warning + '\n');
+  }
+  const promotionPath     = promotionTargetResult.filePath;
+  const promotionFilename = promotionTargetResult.filename;
 
   // ── Item 6: Idempotent legacy-settings reconciliation ────────────────────
   // Remove orphaned project_settings rows keyed to the legacy encodeCwd(root) id
@@ -10027,8 +10048,19 @@ async function cmdPromote(args) {
 
   const root        = findProjectRoot();
   const projectId   = resolveProjectId();
-  const claudeMdPath = resolvePromotionFilePath(root);
-  const promoteFilename = path.basename(claudeMdPath);
+  // Shared resolution (same as cmdInit/cmdClose) — host resolved first, then
+  // the filename default is derived from that host, so HANDOFF_HOST=codex
+  // with HANDOFF_PROMOTION_FILE unset targets AGENTS.md here too.
+  const promotionTargetResult = resolvePromotionTarget(root, process.env);
+  if (!promotionTargetResult.ok) {
+    console.error(`promote: ${promotionTargetResult.reason}`);
+    process.exit(2);
+  }
+  if (promotionTargetResult.warning) {
+    process.stderr.write(promotionTargetResult.warning + '\n');
+  }
+  const claudeMdPath = promotionTargetResult.filePath;
+  const promoteFilename = promotionTargetResult.filename;
 
   let db;
   try {
