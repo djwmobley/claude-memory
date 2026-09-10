@@ -14,15 +14,18 @@
  *   P2 — no `shell: true` and no shell-string child_process anywhere in
  *        scripts/, scripts/lib/, hooks/, test/ — every spawn/exec uses an argv
  *        array (makes the suite bash/PowerShell-agnostic).
- *   P3 — the sanctioned platform branches are runWinBin, the test-staleness-
- *        permutations.js cross-platform shim, and handoff-paths.js's
+ *   P3 — every process.platform === 'win32' / os.platform() branch outside a
+ *        pure comment must be one of the sites in this file's ALLOWED list
+ *        (see below): shared.js's runWinBin; the test-staleness-permutations.js
+ *        and test-install-host.js cross-platform test shims; handoff-paths.js's
  *        HANDOFF_BASE_DIR absolute-path validation (#135 — this one validates
  *        an env var's format against the current OS's path semantics, which
  *        cannot be done without consulting process.platform; a naive
  *        path.isAbsolute() check would accept the MSYS-style '/c/Users/x' trap
- *        on Windows) — the ONLY process.platform === 'win32' / os.platform()
- *        sites are those three (plus the non-branching renameSync comment in
- *        project-identity.js).
+ *        on Windows); codex-install.js's `codex` executable discovery/spawn
+ *        quoting; and install.js's isOurs() case-insensitive-on-win32 path
+ *        suffix match (codex-reinstall-fix-spec-2026-09-10). Each site carries
+ *        its own justification comment at its ALLOWED entry below.
  *   P4 — marker/handoff writes are LF-only: project-marker.js and project-identity.js
  *        terminate marker writes with literal '\n' (not '\r\n'), and a physically
  *        written marker contains zero \r bytes.
@@ -331,6 +334,17 @@ function testP3() {
     {
       file: path.join(SCRIPTS_DIR, 'test-install-host.js'),
       // makeCodexStub() / withStub() — cross-platform codex stub construction.
+      textRe: /process\.platform\s*===\s*['"]win32['"]/,
+    },
+    {
+      file: path.join(SCRIPTS_DIR, 'install.js'),
+      // isOurs() (codex-reinstall-fix-spec-2026-09-10): the trailing
+      // "scripts/handoff.js" path-suffix check is case-insensitive on
+      // win32 (case-preserving, case-INsensitive filesystem — a legacy
+      // entry spelled "Scripts/HandOff.JS" is still ours there) and
+      // case-sensitive elsewhere. An optional `platformOverride` param lets
+      // tests exercise both branches deterministically; every real call
+      // site omits it and this line's `process.platform === 'win32'` fires.
       textRe: /process\.platform\s*===\s*['"]win32['"]/,
     },
   ];

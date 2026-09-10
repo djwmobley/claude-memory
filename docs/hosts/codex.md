@@ -165,6 +165,11 @@ database: if the 3-second clamp is hit mid-transaction, treat the implicit
 close as unreliable for that session and confirm state with `handoff_status`
 before trusting it.
 
+The installer itself writes `"timeout": 3` for this hook (never 30, the
+Claude-path convention) so the config file's number matches what Codex
+actually enforces — including when it upgrades a legacy entry from an older
+install that had written 30.
+
 SessionStart has no such clamp in the sources this integration was built
 from; treat that difference as intentional, not an oversight.
 

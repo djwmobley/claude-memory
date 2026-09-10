@@ -158,6 +158,20 @@ test('isOurs: non-string / null / number never throws, returns null', () => {
   assert.strictEqual(isOurs(42), null);
 });
 
+test('isOurs (host-adapter adversary: case-differing legacy path): a mixed-case "Scripts/HandOff.JS" path matches on win32 (case-preserving, case-insensitive filesystem), but NOT on a POSIX platform where case is significant', () => {
+  const cmd = 'node C:/Repo/Scripts/HandOff.JS loader-hook';
+  assert.deepStrictEqual(isOurs(cmd, 'win32'), { verb: 'loader-hook' });
+  assert.strictEqual(isOurs(cmd, 'linux'), null);
+});
+
+test('isOurs: platform param defaults to process.platform when omitted (no behavior change for existing 1-arg callers)', () => {
+  assert.deepStrictEqual(isOurs('node /repo/scripts/handoff.js loader-hook'), { verb: 'loader-hook' });
+});
+
+test('isOurs (adversary: trailing separator): a path token with a stray trailing slash before the verb is still ours', () => {
+  assert.deepStrictEqual(isOurs('node /repo/scripts/handoff.js/ loader-stop'), { verb: 'loader-stop' });
+});
+
 // ── S5 validation total classification (F-3, F-4) ─────────────────────────────
 
 test('validateHooksSection: absent hooks key is ok', () => {
@@ -314,6 +328,145 @@ test('unknown entry shape (neither hooks[] nor command string) is left untouched
   assert.strictEqual(settings.hooks.SessionStart.length, 2);
   assert.deepStrictEqual(settings.hooks.SessionStart[0], { matcher: 'x' });
   assert.deepStrictEqual(r.unrecognizedShape, [{ event: 'SessionStart', index: 0 }]);
+});
+
+// ── host-adapter S3 adversary findings (codex-reinstall-fix-spec-2026-09-10) ──
+
+test('adversary: orphaned Codex entry (--host codex suffix) found inside the CLAUDE settings file is reported and left untouched, never treated as ours for Claude', () => {
+  const settings = { hooks: { SessionStart: [{ hooks: [
+    { type: 'command', command: 'node /repo/scripts/handoff.js loader-hook --host codex' },
+  ] }] } };
+  const before = JSON.stringify(settings);
+  const r = mergeHooks(settings, CMD); // targetHost defaults to 'claude'
+  assert.deepStrictEqual(r.unrecognizedShape, [{ event: 'SessionStart', index: 0 }]);
+  assert.ok(r.added.includes('loader-hook'), 'a fresh claude-scoped loader-hook is added since the only match found belongs to codex');
+  assert.strictEqual(
+    JSON.stringify(JSON.parse(before).hooks.SessionStart[0]),
+    JSON.stringify(settings.hooks.SessionStart[0]),
+    'the orphaned codex entry itself is byte-identical, never repointed or removed'
+  );
+});
+
+test('adversary: a matcher-wrapped group with a REAL matcher shared with a foreign sibling hook — in-place upgrade never rewrites the matcher or touches the sibling', () => {
+  const settings = { hooks: { SessionStart: [{ matcher: 'startup|resume', hooks: [
+    { type: 'command', command: 'node /repo/scripts/handoff.js loader-hook', timeout: 30 },
+    { type: 'command', command: 'node /some/foreign/tool.js' },
+  ] }] } };
+  mergeHooks(settings, CMD);
+  assert.strictEqual(settings.hooks.SessionStart.length, 1, 'no second group created');
+  assert.strictEqual(settings.hooks.SessionStart[0].matcher, 'startup|resume', 'shared matcher left byte-for-byte untouched');
+  assert.strictEqual(settings.hooks.SessionStart[0].hooks.length, 2, 'foreign sibling preserved, no group split');
+  assert.ok(settings.hooks.SessionStart[0].hooks.some((h) => h.command === 'node /some/foreign/tool.js'), 'foreign sibling command untouched');
+});
+
+test('adversary: SCOPE is a caller-supplied opt, never inferred/hardcoded from a file path or shape — mergeHooks({targetHost:"codex"}) applies Codex identity rules to an arbitrary in-memory object', () => {
+  const settings = { hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'node /repo/scripts/handoff.js loader-hook' }] }] } };
+  const codexCmd = {
+    hookLoaderCmd: 'node /repo/scripts/handoff.js loader-hook --host codex',
+    hookStopCmd:   'node /repo/scripts/handoff.js loader-stop --host codex',
+    targetHost: 'codex',
+  };
+  const r = mergeHooks(settings, codexCmd);
+  assert.ok(!r.added.includes('loader-hook'), 'the legacy no-suffix entry must be recognized as ours for the SCOPE the caller passed, not re-added as a duplicate');
+  assert.strictEqual(settings.hooks.SessionStart.length, 1, 'no duplicate group');
+  assert.strictEqual(settings.hooks.SessionStart[0].hooks.length, 1, 'no duplicate inner hook');
+  assert.strictEqual(settings.hooks.SessionStart[0].hooks[0].command, codexCmd.hookLoaderCmd, 'repointed to the --host codex form');
+});
+
+test('adversary: SessionEnd timeout persists as 3 for codex/loader-stop (Codex runtime clamp), NOT the stale 30 a legacy/Claude-style entry carried; a non-codex/non-loader-stop pair is never forced', () => {
+  const settings = { hooks: { SessionEnd: [{ hooks: [
+    { type: 'command', command: 'node /repo/scripts/handoff.js loader-stop', timeout: 30 },
+  ] }] } };
+  const codexCmd = {
+    hookLoaderCmd: 'node /repo/scripts/handoff.js loader-hook --host codex',
+    hookStopCmd:   'node /repo/scripts/handoff.js loader-stop --host codex',
+    targetHost: 'codex',
+  };
+  const r = mergeHooks(settings, codexCmd);
+  assert.strictEqual(settings.hooks.SessionEnd[0].hooks[0].timeout, 3, 'forced to Codex\'s own runtime clamp');
+  assert.deepStrictEqual(r.upgraded, [{ verb: 'loader-stop', event: 'SessionEnd' }]);
+
+  // Contrast: the SAME stale-30 legacy entry, merged for the CLAUDE scope, keeps its timeout untouched.
+  const claudeSettings = { hooks: { SessionEnd: [{ hooks: [
+    { type: 'command', command: 'node /repo/scripts/handoff.js loader-stop', timeout: 30 },
+  ] }] } };
+  mergeHooks(claudeSettings, CMD); // targetHost defaults to 'claude' — no override table entry
+  assert.strictEqual(claudeSettings.hooks.SessionEnd[0].hooks[0].timeout, 30, 'claude-file timeout is never forced');
+});
+
+test('F-owner-fixture (real hooks.json shape, sanitized): dry-run classification over the owner\'s actual hook layout yields upgraded:2, added:0 — the exact acceptance bar for the double-fire fix', () => {
+  // Mirrors C:\\Users\\djwmo\\AppData\\Local\\Temp\\codex-reinstall-2026-09-10\\hooks.json.orig
+  // (read-only source), trimmed to the structurally load-bearing groups and
+  // with the absolute user path replaced by a placeholder engine path.
+  const ENGINE = '/placeholder/checkout/scripts/handoff.js';
+  const ownerShapeFixture = () => ({
+    hooks: {
+      PreToolUse: [
+        { matcher: 'Bash', hooks: [
+          { type: 'command', command: "node '/placeholder/.codex/hooks/pr-independence.js'" },
+          { type: 'command', command: "node '/placeholder/.codex/hooks/bash-powershell-guard.js'" },
+        ] },
+        { matcher: 'Agent|SendMessage', hooks: [
+          { type: 'command', command: "node '/placeholder/.codex/hooks/agent-adversary-floor.js'" },
+        ] },
+      ],
+      PostToolUse: [
+        { matcher: 'Write|Edit', hooks: [
+          { type: 'command', command: 'node /placeholder/dataverse-linter/hooks/posttool-lint.js', timeout: 60, statusMessage: 'dataverse-linter (.ps1 only)' },
+        ] },
+      ],
+      SessionStart: [{ hooks: [
+        { type: 'command', command: "node '/placeholder/.codex/hooks/pg-module-repair.js'", timeout: 90, statusMessage: 'pg-module-repair' },
+        { type: 'command', command: `node ${ENGINE} loader-hook`, timeout: 30, statusMessage: 'handoff:loader-hook' },
+      ] }],
+      SessionEnd: [{ hooks: [
+        { type: 'command', command: `node ${ENGINE} loader-stop`, timeout: 30, statusMessage: 'handoff:loader-stop' },
+        { type: 'command', command: "node '/placeholder/.codex/hooks/session-end-worktree-guard.js'", timeout: 30 },
+      ] }],
+      Stop: [{ hooks: [
+        { type: 'command', command: "node '/placeholder/.codex/hooks/no-punt-guard.js'" },
+      ] }],
+    },
+  });
+
+  const codexCmd = {
+    hookLoaderCmd: `node ${ENGINE} loader-hook --host codex`,
+    hookStopCmd:   `node ${ENGINE} loader-stop --host codex`,
+    targetHost: 'codex',
+    matcherFor: { 'loader-hook': 'startup|resume' },
+  };
+
+  const settings = ownerShapeFixture();
+  const r = mergeHooks(settings, codexCmd);
+
+  assert.strictEqual(r.added.length, 0, 'no duplicate/second entry added — the double-fire bug this PR fixes');
+  assert.strictEqual(r.upgraded.length, 2, 'both loader-hook and loader-stop recognized as ours and upgraded in place');
+  assert.strictEqual(r.moved.length, 0);
+  assert.strictEqual(r.deduped.length, 0);
+  assert.deepStrictEqual(r.unrecognizedShape, [], 'foreign sibling hooks are simply skipped, never flagged');
+
+  // Every foreign sibling group/hook (PreToolUse, PostToolUse, Stop) survives byte-identical.
+  const after = settings.hooks;
+  const before = ownerShapeFixture().hooks;
+  assert.deepStrictEqual(after.PreToolUse, before.PreToolUse);
+  assert.deepStrictEqual(after.PostToolUse, before.PostToolUse);
+  assert.deepStrictEqual(after.Stop, before.Stop);
+
+  // loader-hook: repointed to --host codex, timeout untouched (no override for loader-hook).
+  assert.strictEqual(after.SessionStart.length, 1);
+  assert.strictEqual(after.SessionStart[0].hooks.length, 2, 'pg-module-repair sibling preserved');
+  const loaderHook = after.SessionStart[0].hooks.find((h) => /loader-hook/.test(h.command));
+  assert.strictEqual(loaderHook.command, codexCmd.hookLoaderCmd);
+  assert.strictEqual(loaderHook.timeout, 30, 'loader-hook timeout is not part of the override table');
+
+  // loader-stop: repointed to --host codex AND timeout normalized 30 -> 3.
+  assert.strictEqual(after.SessionEnd.length, 1);
+  assert.strictEqual(after.SessionEnd[0].hooks.length, 2, 'session-end-worktree-guard sibling preserved');
+  const loaderStop = after.SessionEnd[0].hooks.find((h) => /loader-stop/.test(h.command));
+  assert.strictEqual(loaderStop.command, codexCmd.hookStopCmd);
+  assert.strictEqual(loaderStop.timeout, 3, 'stale 30s normalized to Codex\'s own SessionEnd clamp');
+  const sibling = after.SessionEnd[0].hooks.find((h) => /session-end-worktree-guard/.test(h.command));
+  assert.strictEqual(sibling.timeout, 30, 'foreign sibling timeout untouched');
 });
 
 test('dedupe: two loader-stop entries (one in Stop, one already in SessionEnd) collapse to exactly one', () => {
