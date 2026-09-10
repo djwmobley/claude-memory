@@ -1,5 +1,8 @@
 # claude-memory
 
+Using OpenAI Codex? Start at
+[docs/hosts/codex-quickstart.md](docs/hosts/codex-quickstart.md).
+
 Claude Code already has memory across sessions — it reads `CLAUDE.md` and
 per-project memory files every time it starts. The problem is those files get
 stale: notes pile up, old facts stay even after they stop being true, and when
