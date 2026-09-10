@@ -204,6 +204,39 @@ compare or restore.
 
 ---
 
+## Shell safety, and the `HANDOFF_CODEX_BIN` override
+
+Every `codex` subprocess this installer runs (`--version`, `mcp get`,
+`mcp add`) is resolved to a single absolute path first (via the PATH/PATHEXT
+walk, or `HANDOFF_CODEX_BIN` below) and, whenever possible, spawned directly
+with no shell involved at all — Windows `CreateProcess` and POSIX `execve`
+both take arguments as discrete strings with no shell metacharacter parsing,
+so nothing needs escaping.
+
+The one exception is a `codex.cmd`/`codex.bat` shim on Windows (the common
+shape for an npm-installed global CLI) — Windows cannot launch a batch file
+without routing through `cmd.exe`. In that one case, every argument is
+quoted unconditionally per the documented cmd.exe/CRT rules, and an argument
+containing `%`, `!`, or a newline is refused outright with a visible error,
+since cmd.exe expands those even inside quotes and no quoting can neutralize
+them. (An earlier version of this quoting was verified broken: an argument
+containing `&`/`|`/etc. but no whitespace was passed unquoted and cmd.exe
+ran the remainder as a second command — fixed, and covered by a real spawned
+injection-safety test suite.)
+
+If you hit that refusal (a `%`/`!`/newline in your checkout path), or if
+`codex` isn't on `PATH` at all, set `HANDOFF_CODEX_BIN` to an absolute path
+to the `codex` executable — this bypasses PATH/PATHEXT discovery entirely
+(no fallback to a PATH search if the override doesn't work) and, if it
+resolves to a real executable rather than a `.cmd`/`.bat` shim, also avoids
+the cmd.exe shell fallback altogether:
+
+```
+HANDOFF_CODEX_BIN=/path/to/codex node scripts/install.js --host codex
+```
+
+---
+
 ## Manual fallback (hooks disabled)
 
 If you run Codex with hooks disabled, or just want to drive the engine by

@@ -1472,12 +1472,18 @@ function formatSessionMarkersForStatus(markers) {
  * CLAUDE_CODE_SESSION_ID. The Codex hook payload's own `session_id` field and
  * CODEX_THREAD_ID are EXPECTED to carry the same id — stated as an
  * expectation here, not verified against a captured fixture pairing both.
+ *
+ * Each env var is trimmed before use; a whitespace-only value (" ") is
+ * treated as absent, same as unset — an env var accidentally set to blank
+ * space by a wrapper script must not count as "set" here.
  */
 function resolveSessionIdFromEnv(host) {
-  const claudeId = process.env.CLAUDE_CODE_SESSION_ID;
-  const codexId  = process.env.CODEX_THREAD_ID;
-  const hasClaudeId = typeof claudeId === 'string' && claudeId.length > 0;
-  const hasCodexId  = typeof codexId  === 'string' && codexId.length > 0;
+  const claudeRaw = process.env.CLAUDE_CODE_SESSION_ID;
+  const codexRaw  = process.env.CODEX_THREAD_ID;
+  const claudeId  = typeof claudeRaw === 'string' ? claudeRaw.trim() : '';
+  const codexId   = typeof codexRaw  === 'string' ? codexRaw.trim()  : '';
+  const hasClaudeId = claudeId.length > 0;
+  const hasCodexId  = codexId.length > 0;
 
   if (!hasClaudeId && !hasCodexId) return null;
   if (hasClaudeId && !hasCodexId) return claudeId;

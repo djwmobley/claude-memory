@@ -374,6 +374,18 @@ withEnv({ CLAUDE_CODE_SESSION_ID: undefined, CODEX_THREAD_ID: 'codex-thread-only
   if (r !== 'codex-thread-only') fail(label, `expected codex-thread-only, got ${JSON.stringify(r)}`); else pass(label);
 });
 
+withEnv({ CLAUDE_CODE_SESSION_ID: '   ', CODEX_THREAD_ID: 'codex-thread-2' }, () => {
+  const label = 'SID10: a whitespace-only CLAUDE_CODE_SESSION_ID is trimmed to absent, falls through to CODEX_THREAD_ID';
+  const r = resolveSessionIdFromEnv(null);
+  if (r !== 'codex-thread-2') fail(label, `expected codex-thread-2 (whitespace-only treated as absent), got ${JSON.stringify(r)}`); else pass(label);
+});
+
+withEnv({ CLAUDE_CODE_SESSION_ID: '  claude-sess-padded  ', CODEX_THREAD_ID: undefined }, () => {
+  const label = 'SID11: a padded CLAUDE_CODE_SESSION_ID value is trimmed before being returned';
+  const r = resolveSessionIdFromEnv(null);
+  if (r !== 'claude-sess-padded') fail(label, `expected trimmed value, got ${JSON.stringify(r)}`); else pass(label);
+});
+
 // ── Summary ───────────────────────────────────────────────────────────────────
 
 console.log('');

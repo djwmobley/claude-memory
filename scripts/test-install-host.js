@@ -269,6 +269,40 @@ function restoreEnv(key, savedValue) {
     else pass(label);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
+{
+  const label = 'D3: HANDOFF_CODEX_BIN override bypasses PATH discovery entirely and is probed directly';
+  const dir = makeTempDir('codex-stub-d3-');
+  try {
+    makeCodexStub(dir);
+    const command = process.platform === 'win32' ? path.join(dir, 'codex.cmd') : path.join(dir, 'codex');
+    // Empty PATH proves the override, not a PATH walk, found this binary.
+    const r = codexInstall.discoverCodex({ PATH: '', HANDOFF_CODEX_BIN: command });
+    if (!r.found || r.command !== command) fail(label, `expected found at ${command}, got ${JSON.stringify(r)}`);
+    else pass(label);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+{
+  const label = 'D4: HANDOFF_CODEX_BIN pointing at a nonexistent path -> not found, no fallback to PATH';
+  const dir = makeTempDir('codex-stub-d4-');
+  try {
+    makeCodexStub(dir);
+    // A WORKING codex is on PATH, but HANDOFF_CODEX_BIN points at garbage —
+    // must NOT silently fall back to the PATH-found binary.
+    const r = codexInstall.discoverCodex({ PATH: dir, PATHEXT: process.env.PATHEXT, HANDOFF_CODEX_BIN: path.join(dir, 'does-not-exist') });
+    if (r.found) fail(label, `expected not found (override must not fall back to PATH), got ${JSON.stringify(r)}`);
+    else pass(label);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+{
+  const label = 'D5: HANDOFF_CODEX_BIN set to whitespace-only -> treated as unset, normal PATH discovery proceeds';
+  const dir = makeTempDir('codex-stub-d5-');
+  try {
+    makeCodexStub(dir);
+    const r = codexInstall.discoverCodex({ PATH: dir, PATHEXT: process.env.PATHEXT, HANDOFF_CODEX_BIN: '   ' });
+    if (!r.found) fail(label, `expected found via normal PATH discovery, got ${JSON.stringify(r)}`);
+    else pass(label);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Z1-Z17 — checkHandoffRegistered() TOTAL CLASSIFICATION via spawnSyncImpl
@@ -489,6 +523,142 @@ withStub((command) => {
     restoreEnv('CODEX_STUB_ADD_STDERR', savedErr);
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// QW1-QW10 — classifyAndQuoteWin32()/needsCmdShell(): pure, platform-
+// independent unit coverage of the shell-quoting/classification internals
+// (PR #276 review finding: a real spawned `codex mcp add` with an argument
+// containing "&" but no whitespace was passed UNQUOTED under the old
+// conditional-quoting scheme and cmd.exe executed the remainder as a second
+// command). These are pure string functions with no OS calls, so they are
+// exercised directly regardless of the CURRENT process.platform.
+// ═══════════════════════════════════════════════════════════════════════════
+
+function quoteOk(label, input, checkFn) {
+  const r = codexInstall.classifyAndQuoteWin32(input);
+  if (!r.ok) { fail(label, `expected ok:true (a safe quoting), got refusal: ${r.reason}`); return; }
+  if (checkFn) {
+    const err = checkFn(r.quoted);
+    if (err) { fail(label, err); return; }
+  }
+  pass(label);
+}
+
+function quoteRefused(label, input) {
+  const r = codexInstall.classifyAndQuoteWin32(input);
+  if (r.ok) { fail(label, `expected a refusal, got ok:true quoted=${JSON.stringify(r.quoted)}`); return; }
+  pass(label);
+}
+
+quoteOk('QW1: classifyAndQuoteWin32("a&b") quotes successfully — "&" is safe once inside quotes', 'a&b',
+  (q) => (q === '"a&b"') ? null : `expected "a&b" (quoted verbatim), got ${JSON.stringify(q)}`);
+quoteOk('QW2: classifyAndQuoteWin32("a|b") quotes successfully — "|" is safe once inside quotes', 'a|b',
+  (q) => (q === '"a|b"') ? null : `expected "a|b", got ${JSON.stringify(q)}`);
+quoteOk('QW3: classifyAndQuoteWin32("a^b") quotes successfully — "^" is safe once inside quotes', 'a^b',
+  (q) => (q === '"a^b"') ? null : `expected "a^b", got ${JSON.stringify(q)}`);
+quoteOk('QW4: classifyAndQuoteWin32("x(y)") quotes successfully — "(", ")" are safe once inside quotes', 'x(y)',
+  (q) => (q === '"x(y)"') ? null : `expected "x(y)", got ${JSON.stringify(q)}`);
+quoteOk('QW5: classifyAndQuoteWin32("a<b>c") quotes successfully — "<", ">" are safe once inside quotes', 'a<b>c',
+  (q) => (q === '"a<b>c"') ? null : `expected "a<b>c", got ${JSON.stringify(q)}`);
+quoteOk('QW6: classifyAndQuoteWin32("a b") quotes an argument with no special chars UNCONDITIONALLY (not just when it "needs" it)', 'a b',
+  (q) => (q === '"a b"') ? null : `expected "a b", got ${JSON.stringify(q)}`);
+quoteOk('QW7: classifyAndQuoteWin32(\'a"b\') doubles the preceding backslash count and escapes the embedded quote', 'a"b',
+  (q) => (q === '"a\\"b"') ? null : `expected "a\\"b" (as a JS string: a\\"b wrapped in quotes), got ${JSON.stringify(q)}`);
+quoteRefused('QW8: classifyAndQuoteWin32("a%TEMP%b") is REFUSED — cmd.exe expands %VAR% even inside quotes', 'a%TEMP%b');
+quoteRefused('QW9: classifyAndQuoteWin32("a!VAR!b") is REFUSED — cmd.exe expands !VAR! under delayed expansion even inside quotes', 'a!VAR!b');
+quoteRefused('QW10: classifyAndQuoteWin32("a\\nb") (embedded newline) is REFUSED', 'a\nb');
+
+{
+  const label = 'QW11: needsCmdShell(".cmd"/".bat") is true ONLY on win32; ".exe" and extensionless are always false';
+  const isWin = process.platform === 'win32';
+  const cases = [
+    ['C:/dev/codex.cmd', isWin],
+    ['C:/dev/codex.CMD', isWin], // case-insensitive extension match
+    ['C:/dev/codex.bat', isWin],
+    ['/usr/local/bin/codex', false],
+    ['C:/dev/codex.exe', false],
+  ];
+  let ok = true;
+  for (const [input, expected] of cases) {
+    const got = codexInstall.needsCmdShell(input);
+    if (got !== expected) { ok = false; fail(label, `needsCmdShell(${JSON.stringify(input)}) expected ${expected}, got ${got}`); break; }
+  }
+  if (ok) pass(label);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INJ1-INJ5 — end-to-end shell-injection-safety proof via a REAL spawned
+// stub process: an engine path containing shell metacharacters must reach
+// the child as ONE unmangled argv token, and — the actual proof, not just an
+// argv-integrity check — an injected side-effect command embedded in that
+// path must NEVER execute (no marker file appears). Runs through whichever
+// mechanism the CURRENT platform actually uses (shell:false + argv array
+// on POSIX and for a non-.cmd/.bat win32 executable; the quoted cmd.exe
+// shell fallback for the .cmd stub withStub() builds on win32) — both are
+// exercised for real by CI (ubuntu-latest) and by a Windows dev run.
+// ═══════════════════════════════════════════════════════════════════════════
+
+function runInjectionCase(label, buildDangerousSegment) {
+  withStub((command) => {
+    const dir = makeTempDir('inj-');
+    const argvFile   = path.join(dir, 'argv.log');
+    const markerFile = path.join(dir, 'PWNED.txt');
+    const savedArgvFile = process.env.CODEX_STUB_ARGV_FILE;
+    process.env.CODEX_STUB_ARGV_FILE = argvFile;
+    try {
+      const dangerousSegment = buildDangerousSegment(markerFile);
+      // The dangerous segment does not need to exist on disk — it is never
+      // opened, only passed through argv to the (stub) codex process.
+      const enginePath = `${dir}${path.sep}${dangerousSegment}${path.sep}handoff-mcp.mjs`;
+      const result = codexInstall.registerHandoffMcp(command, enginePath);
+      if (fs.existsSync(markerFile)) {
+        fail(label, `INJECTION SUCCEEDED — marker file was created at ${markerFile}`);
+        return;
+      }
+      if (!result.ok) {
+        // A refusal is an acceptable, SAFE outcome for a %/!/newline case —
+        // covered independently by the QW8-QW10 pure unit tests above.
+        pass(`${label} (refused safely rather than risk it: ${String(result.stderr).slice(0, 160)})`);
+        return;
+      }
+      const lines = fs.existsSync(argvFile)
+        ? fs.readFileSync(argvFile, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
+        : [];
+      const addCall = lines.find((a) => a[0] === 'mcp' && a[1] === 'add');
+      if (!addCall) { fail(label, `no mcp add call recorded; result=${JSON.stringify(result)}`); return; }
+      const gotEnginePath = addCall[addCall.length - 1];
+      if (gotEnginePath !== enginePath) {
+        fail(label, `argv split/mangled — expected exactly one token ${JSON.stringify(enginePath)}, got ${JSON.stringify(gotEnginePath)} (full argv: ${JSON.stringify(addCall)})`);
+        return;
+      }
+      pass(label);
+    } finally {
+      restoreEnv('CODEX_STUB_ARGV_FILE', savedArgvFile);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+runInjectionCase(
+  'INJ1: engine path containing "a&echo INJ>marker&b" reaches the child as ONE argv token — no command injection, no marker file',
+  (markerFile) => `a&echo INJ>${markerFile}&b`
+);
+runInjectionCase(
+  'INJ2: engine path containing "a|whoami|b" reaches the child as ONE argv token — no pipe injection, no marker file',
+  (markerFile) => `a|whoami>${markerFile}|b`
+);
+runInjectionCase(
+  'INJ3: engine path containing "a^b" reaches the child as ONE argv token unmangled',
+  () => 'a^b'
+);
+runInjectionCase(
+  'INJ4: engine path containing "x(y)" reaches the child as ONE argv token unmangled',
+  () => 'x(y)'
+);
+runInjectionCase(
+  'INJ5: engine path containing a space reaches the child as ONE argv token unmangled (real-spawn re-proof alongside Q1)',
+  () => 'a b'
+);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // K1-K4 — resolveCodexHome()

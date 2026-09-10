@@ -46,86 +46,130 @@ const { spawnSync: nodeSpawnSync } = require('node:child_process');
 
 const MCP_SERVER_NAME = 'handoff';
 
-// shell:true is required on Windows to execute a .cmd/.bat wrapper (the
-// common shape for an npm-installed global CLI like a real `codex` install —
-// Windows cannot directly CreateProcess a .bat/.cmd file; this is also the
-// SAME reason scripts/lib/reality-checks.js's probePrState() takes shell:true
-// for `gh.cmd`, sanctioned in test-os-portability.js's P2 check). On POSIX
-// this simply routes through /bin/sh, harmless for the fixed, code-constructed
-// argv this file ever builds (mcp/add/get/--version — never user-supplied
-// shell text). `command` is quoted here whenever it contains whitespace:
-// shell:true builds the shell command line by joining `command` and `args`
-// with spaces and does NOT quote `command` itself even if it contains one
-// (verified empirically — an unquoted space-containing command under
-// shell:true is parsed by cmd.exe as two separate tokens and fails with
-// "... is not recognized as an internal or external command"); `args`
-// elements never need this treatment here since spawnSync's array form
-// quotes each of THEM correctly on its own.
+// HARDENED AGAIN (2026-09-09, independent-reviewer finding on PR #276):
+// shell:true was previously used UNCONDITIONALLY for every spawn in this
+// file, with args quoted only when they contained whitespace/a quote. Two
+// real, verified holes in that approach:
+//   1. An argument containing `&`, `|`, `^`, `(`, `)`, `<`, or `>` but no
+//      whitespace (e.g. a checkout path like `C:\dev\a&b\...\handoff-mcp.mjs`)
+//      was passed UNQUOTED and cmd.exe parsed the remainder as a second
+//      shell command — arbitrary command injection via a maliciously- or
+//      even just unluckily-named directory.
+//   2. Even when quoted, cmd.exe expands `%VAR%` and (with delayed expansion
+//      enabled) `!VAR!` tokens INSIDE double quotes — quoting cannot
+//      neutralize those, only refusing to run can.
 //
-// Every spawnSync call in this file goes through this one wrapper — the
-// single call site test-os-portability.js's P2 check counts against its
-// sanctioned-exception cap for this file.
+// The fix has two parts:
+//   A. AVOID THE SHELL WHENEVER POSSIBLE. The `codex` executable is always a
+//      single already-resolved path (from discoverCodex's PATH/PATHEXT walk,
+//      or the HANDOFF_CODEX_BIN override) — never itself untrusted shell
+//      text. A real executable (win32: anything that isn't `.cmd`/`.bat`;
+//      POSIX: always, since exec() there needs no shell to parse special
+//      characters out of an argv array) is spawned with shell:false and a
+//      plain argv array — Windows CreateProcess and POSIX execve both take
+//      arguments as discrete strings with NO shell metacharacter parsing at
+//      all, so `&`, `|`, spaces, quotes, `%`, none of it needs escaping.
+//   B. Only a win32 `.cmd`/`.bat` (the common shape for an npm-installed
+//      global CLI, and the sole reason shell:true is needed anywhere in this
+//      file — Windows cannot directly CreateProcess a batch file) falls back
+//      to shell:true, and in that path EVERY argument (never conditionally)
+//      is quoted per the documented cmd.exe/CRT rules, AND classified first:
+//      an argument containing `%`, `!`, or a newline/CR is refused outright
+//      (visible error naming the offending argument), since cmd.exe expands
+//      those regardless of quoting — there is no safe quoting for them.
 //
-// VERIFIED (2026-09-09, real codex-cli 0.153.4 + a space-containing
-// checkout path): the original comment above claiming "`args` elements
-// never need [quoting] treatment ... since spawnSync's array form quotes
-// each of THEM correctly on its own" is FALSE under shell:true. With
-// shell:true on Windows, Node flattens `command` + `args` into a single
-// command-line string joined by plain spaces with NO per-argument quoting;
-// an args element containing an embedded space (e.g. this checkout's own
-// engine path, if it lives under a directory with a space in its name) is
-// silently split into two separate argv entries by the time the child
-// process parses it — verified via a real spawned `codex mcp add` and
-// inspecting the child's own `process.argv`. Every args element that needs
-// it is now quoted here, alongside the pre-existing `command` quoting.
+// Every spawn in this file goes through spawnCodex() below — the single
+// remaining shell:true call site (inside the .cmd/.bat fallback branch)
+// counts against test-os-portability.js's P2 sanctioned-exception cap for
+// this file, same as before.
+
+/** win32 only: does this resolved path need the cmd.exe shell fallback? */
+function needsCmdShell(command) {
+  if (process.platform === 'win32') return /\.(cmd|bat)$/i.test(String(command));
+  return false;
+}
+
+// cmd.exe expands these regardless of quoting (%VAR%, !VAR! under delayed
+// expansion, and a literal CR/LF would terminate/split the command line) —
+// there is no safe quoting strategy for them, so an argument containing any
+// of these is refused rather than passed through unsafely.
+const CMD_UNQUOTABLE_RE = /[%!\r\n]/;
+
 /**
- * Quote a single argv token for inclusion in a shell:true command line.
- * Naively wrapping in double quotes and escaping only embedded quotes (the
- * first cut at this fix) is an INCOMPLETE escape on Windows: a run of
- * backslashes immediately preceding a quote (or the end of the string, since
- * the whole token is itself wrapped in a trailing quote) must be doubled, or
- * the CRT command-line parser used by cmd.exe/node.exe collapses them and
- * can shift or drop the closing quote — this is the same algorithm Node's
- * own child_process uses internally to quote argv entries (see
- * child_process.js's `_convertToValidWin32ArgIfNecessary`), needed here
- * because shell:true bypasses that internal path entirely.
+ * Unconditionally quote one token for a win32 cmd.exe command line — wraps
+ * in double quotes NO MATTER WHAT (never conditional on whitespace/quote
+ * presence, so `&`, `|`, `^`, `(`, `)`, `<`, `>` are always safely inside
+ * quotes) and doubles a run of backslashes immediately preceding a quote or
+ * the token's end (the same algorithm Node's own child_process uses
+ * internally — see child_process.js's `_convertToValidWin32ArgIfNecessary`
+ * — needed here because shell:true bypasses that internal path entirely).
+ * Returns { ok:false, reason } instead of a string when the token contains
+ * an unquotable character (see CMD_UNQUOTABLE_RE).
  */
-function quoteShellArgWin32(s) {
-  if (!/[\s"]/.test(s)) return s;
+function classifyAndQuoteWin32(token) {
+  const s = String(token);
+  if (CMD_UNQUOTABLE_RE.test(s)) {
+    return {
+      ok: false,
+      reason: `argument contains %, !, or a newline — cmd.exe expands these even inside quotes, so it cannot be passed safely: ${JSON.stringify(s)}. ` +
+        `Workaround: rename the offending path, or set HANDOFF_CODEX_BIN to an absolute path to the codex executable (bypasses this .cmd/.bat shell fallback entirely).`,
+    };
+  }
   let result = '"';
   let backslashes = 0;
   for (const ch of s) {
-    if (ch === '\\') {
-      backslashes++;
-      continue;
-    }
-    if (ch === '"') {
-      result += '\\'.repeat(backslashes * 2 + 1) + '"';
-      backslashes = 0;
-      continue;
-    }
+    if (ch === '\\') { backslashes++; continue; }
+    if (ch === '"') { result += '\\'.repeat(backslashes * 2 + 1) + '"'; backslashes = 0; continue; }
     result += '\\'.repeat(backslashes) + ch;
     backslashes = 0;
   }
   result += '\\'.repeat(backslashes * 2) + '"';
-  return result;
+  return { ok: true, quoted: result };
 }
 
-/** POSIX /bin/sh quoting: single-quote wrapping, embedded quotes escaped via '\''. */
-function quoteShellArgPosix(s) {
-  if (!/[\s"'$`\\]/.test(s)) return s;
+/**
+ * POSIX /bin/sh single-quote wrapping, UNCONDITIONAL (never conditional on
+ * content) — embedded single quotes escaped via the standard '\'' idiom.
+ * In practice this path should be unreachable (needsCmdShell() is always
+ * false on POSIX — shell:false with a plain argv array is always used
+ * instead, see spawnCodex), kept only as a defensive fallback.
+ */
+function quoteShellArgPosix(token) {
+  const s = String(token);
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
-function quoteShellArg(token) {
-  const s = String(token);
-  return process.platform === 'win32' ? quoteShellArgWin32(s) : quoteShellArgPosix(s);
-}
-
+/**
+ * Spawn the resolved `codex` command. Avoids the shell entirely (shell:false,
+ * plain argv array — no quoting needed or possible to get wrong) unless
+ * `command` is a win32 `.cmd`/`.bat`, in which case every token (command AND
+ * every arg) is unconditionally quoted and classified per the rules above;
+ * a refusal from that classification is surfaced as `result.error` (the
+ * same shape a real spawn error takes — every caller in this file already
+ * checks `result.error` first).
+ */
 function spawnSync(command, args, opts) {
-  const cmd = (/\s/.test(command) && !/^".*"$/.test(command)) ? `"${command}"` : command;
-  const quotedArgs = Array.isArray(args) ? args.map(quoteShellArg) : args;
-  return nodeSpawnSync(cmd, quotedArgs, {
+  const argv = Array.isArray(args) ? args : [];
+
+  if (!needsCmdShell(command)) {
+    return nodeSpawnSync(command, argv, {
+      windowsHide: true,
+      ...opts,
+      shell: false,
+    });
+  }
+
+  const quotedCommand = classifyAndQuoteWin32(command);
+  if (!quotedCommand.ok) return { error: new Error(quotedCommand.reason) };
+
+  const quotedArgs = [];
+  for (const a of argv) {
+    const q = classifyAndQuoteWin32(a);
+    if (!q.ok) return { error: new Error(q.reason) };
+    quotedArgs.push(q.quoted);
+  }
+
+  return nodeSpawnSync(quotedCommand.quoted, quotedArgs, {
     windowsHide: true,
     ...opts,
     shell: true,
@@ -151,10 +195,29 @@ function isHandoffToken(text) {
  * Windows), confirmed by a synchronous `codex --version` probe. A nonzero
  * exit, a spawn error, or a thrown exception at any point means "not found"
  * — never throws itself.
+ *
+ * HANDOFF_CODEX_BIN (an absolute path to the codex executable), when set to
+ * a non-empty (post-trim) value, BYPASSES the PATH/PATHEXT walk entirely —
+ * it is probed directly, and the result (found or not) is returned as-is
+ * with no fallback to a PATH search. This exists for two reasons: (1) an
+ * escape hatch when `codex` isn't on PATH at all, and (2) a way to point at
+ * a real `codex.exe`/binary directly when a `.cmd`/`.bat` shim on PATH would
+ * otherwise force every spawn in this file through the cmd.exe shell
+ * fallback (see spawnSync's header comment) — pointing HANDOFF_CODEX_BIN at
+ * the underlying executable avoids that shell entirely.
  * @returns {{ found: boolean, command: string|null, version: string|null }}
  */
 function discoverCodex(env) {
   env = env || process.env;
+
+  const overrideRaw = typeof env.HANDOFF_CODEX_BIN === 'string' ? env.HANDOFF_CODEX_BIN.trim() : '';
+  if (overrideRaw.length > 0) {
+    const probe = probeVersion(overrideRaw);
+    return probe.ok
+      ? { found: true, command: overrideRaw, version: probe.version }
+      : { found: false, command: null, version: null };
+  }
+
   const pathVar = env.PATH || env.Path || '';
   const dirs = String(pathVar).split(path.delimiter).filter(Boolean);
   const isWin = process.platform === 'win32';
@@ -661,4 +724,11 @@ module.exports = {
   entryMatchesEngine,
   notFound,
   looksLikeJsonFlagUnsupported,
+  // Exported for direct, platform-independent unit testing of the shell-
+  // quoting/classification internals (PR #276 review finding) — pure string
+  // functions, safe to call regardless of the CURRENT process.platform.
+  needsCmdShell,
+  classifyAndQuoteWin32,
+  quoteShellArgPosix,
+  spawnSync,
 };
