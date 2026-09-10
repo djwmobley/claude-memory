@@ -1,4 +1,6 @@
 name: Tests
+permissions:
+  contents: read
 # Runs on every pull request to catch regressions before merge.
 # Postgres image is pinned to pg16 to match production instance.
 # Update the image tag AND this comment when upgrading.
