@@ -16,8 +16,9 @@ and exits 0 without rewriting CLAUDE.md.
 | `--predicate <p>` | optional | Narrow content-match by predicate. Required when multiple live assertions share the same subject. |
 | `--object <o>` | optional | Narrow content-match by object value. |
 | `--demote <id>` | (one form required) | Reverse a prior promote: clear the `promoted` flag and remove the corresponding line from `CLAUDE.md`. |
-| `--regenerate` | (one form required) | Rewrite `CLAUDE.md`/`AGENTS.md` from its template — the lightweight alternative to `init --force-promotion` (which bundles ~9 unrelated DB/FS writes). Exclusive of every other promote flag/positional; the only other token accepted alongside it is `--dry-run`. |
-| `--dry-run` | optional | With `--regenerate` only: report what would change (target state, backup y/n, would-be byte count, facts that would carry) without writing anything. |
+| `--regenerate` | (one form required) | Rewrite `CLAUDE.md`/`AGENTS.md` from its template — the lightweight alternative to `init --force-promotion` (which bundles ~9 unrelated DB/FS writes). Exclusive of every other promote flag/positional; the only other tokens accepted alongside it are `--dry-run` and `--project-name`. |
+| `--dry-run` | optional | With `--regenerate` only: report what would change (target state, project name + resolution branch, backup y/n, would-be byte count, facts that would carry) without writing anything. |
+| `--project-name <name>` | optional | With `--regenerate` only: explicit project display name override — wins over every other source (an existing file's heading, worktree detection, directory name). See "Project display name resolution" below. |
 
 ## How to invoke
 
@@ -82,6 +83,9 @@ PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" promote --regenerate
 
 # Preview a regenerate without writing anything:
 PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" promote --regenerate --dry-run
+
+# Regenerate with an explicit project display name (skips H1/worktree/basename inference):
+PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" promote --regenerate --project-name "My Project"
 ```
 
 ## Expected output
@@ -147,6 +151,7 @@ Done: handoff:promote --regenerate — CLAUDE.md regenerated
 ```
 promote --regenerate (dry-run): would target /repo/CLAUDE.md
   target-state:      file
+  project name:      my-project (branch N1)
   would back up:     yes
   would-be bytes:    1284
   facts that would carry: 2
@@ -170,7 +175,20 @@ Each promoted fact is written as two lines under `## Durable facts`:
 - **Backup naming:** `<name>.bak-<Date.now()>-<process.hrtime.bigint()>-<pid>` — no `:` characters, so it's safe on Windows.
 - **Line endings:** the regenerated file matches whichever EOL style (LF vs CRLF) dominated the file it replaced; a brand-new file uses whatever the template ships with.
 - **`--dry-run`** performs reads only — no backup, no write, no DB mutation.
-- `--regenerate` is mutually exclusive with every other promote form — no id, `--demote`, `--subject`/`--predicate`/`--object`, or unrecognized flag may appear alongside it (exit 2).
+- `--regenerate` is mutually exclusive with every other promote form — no id, `--demote`, `--subject`/`--predicate`/`--object`, or unrecognized flag may appear alongside it (exit 2); `--dry-run` and `--project-name <name>` are the only exceptions.
+
+### Project display name resolution
+
+The rendered file's title (`# <name>`) is resolved by a single shared function (`resolveProjectDisplayName`), used by both `init` and `promote --regenerate`, via a total classification — first hit wins:
+
+| Branch | Source |
+|--------|--------|
+| N0 | `--project-name <name>` (or, for `init`, its positional project-name argument), trimmed non-empty |
+| N1 | The first `# ...` heading of an already-existing promotion file, after stripping inline markdown/HTML markup — rejected if empty, path-like, a placeholder (`project`, `CLAUDE.md`, `AGENTS.md`, `Handoff`), or itself worktree-shaped |
+| N2 | If the project root is a git worktree checkout: the main checkout's directory name (resolved via `git rev-parse --git-common-dir`, never the worktree's own disposable directory name) |
+| N3 | `path.basename(root)`, or the literal `project` when that's empty or a bare Windows drive letter |
+
+This exists because a `promote --regenerate` run from a worktree checkout (e.g. `.claude/worktrees/agent-a0979417bd522838e`) used to write the worktree's own disposable directory name as the file's title — `--project-name` or a properly-titled existing file both take precedence over that.
 
 ## Exit codes
 

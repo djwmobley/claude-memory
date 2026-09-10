@@ -93,8 +93,16 @@ const SPECS = {
       // rejects --regenerate combined with any of the flags above, or with a
       // positional; this gate would otherwise accept e.g. `--regenerate
       // --demote 5` as two individually-known flags.
-      '--regenerate':  { kind: 'boolean', desc: 'Rewrite the promotion file from the template (no init --force-promotion DB/FS side effects). Exclusive of every other promote flag/positional.' },
+      '--regenerate':  { kind: 'boolean', desc: 'Rewrite the promotion file from the template (no init --force-promotion DB/FS side effects). Exclusive of every other promote flag/positional except --dry-run and --project-name.' },
       '--dry-run':     { kind: 'boolean', desc: 'With --regenerate: report what would change; write nothing.' },
+      // With --regenerate only: explicit project display name override, fed
+      // to resolveProjectDisplayName() (scripts/lib/claude-md-key-paths.js)
+      // as its N0 branch — skips the H1/worktree/basename inference chain
+      // entirely. Declared here only so the token classifies as KNOWN;
+      // cmdPromoteRegenerate's own combination check (scripts/handoff.js,
+      // top of cmdPromote's --regenerate branch) is what actually accepts
+      // it alongside --regenerate/--dry-run and rejects it everywhere else.
+      '--project-name': { kind: 'value', desc: 'With --regenerate: explicit project display name override.' },
     },
     positionals: { max: 1, desc: 'assertion_id (integer) — original promote-by-id form.' },
   },
