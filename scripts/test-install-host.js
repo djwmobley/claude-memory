@@ -1881,6 +1881,91 @@ const handoffLib = require('./handoff.js');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// P23-P25 — `handoff.js status` surfaces host/promotion_file (status-host-
+// fields). cmdStatus (scripts/handoff.js) resolves these via the SAME shared
+// resolvePromotionTarget() exercised by P16-P22 above — it does not
+// re-implement host/env parsing, so these tests confirm (a) the resolver
+// itself still returns the expected (host, filePath) pair for the two env
+// shapes status must report, and (b) cmdStatus's own source actually calls
+// that shared resolver (never a second, independent implementation) and
+// emits both fields on both the --json and prose paths. Running cmdStatus
+// end-to-end needs a live Postgres connection this file does not set up, so
+// (b) is a structural source check rather than a subprocess run — the same
+// trade-off P16-P22 already make by calling the resolver directly instead of
+// going through a CLI subprocess.
+//
+// Note on the "--host flag" scenario named in this change's spec: unlike
+// install.js/cmdLoaderStop, `handoff.js promote` never parses a --host argv
+// flag at all — resolvePromotionTarget reads only HANDOFF_HOST /
+// HANDOFF_PROMOTION_FILE from process.env (see P16-P22). Status must match
+// promote's own contract exactly, so it likewise accepts no --host flag;
+// P25 below asserts cmdStatus's source has no such flag-parsing of its own
+// ahead of its resolvePromotionTarget() call.
+// ═══════════════════════════════════════════════════════════════════════════
+
+{
+  const label = 'P23: status host/promotion_file resolver — HANDOFF_HOST/HANDOFF_PROMOTION_FILE both unset -> claude + CLAUDE.md';
+  const savedHost = process.env.HANDOFF_HOST;
+  const savedFile = process.env.HANDOFF_PROMOTION_FILE;
+  const dir = makeTempDir('p23-');
+  try {
+    delete process.env.HANDOFF_HOST;
+    delete process.env.HANDOFF_PROMOTION_FILE;
+    const r = claudeMdKeyPaths.resolvePromotionTarget(dir, process.env);
+    if (!r.ok || r.host !== 'claude' || r.filename !== 'CLAUDE.md') {
+      fail(label, `expected ok host=claude file=CLAUDE.md, got ${JSON.stringify(r)}`);
+    } else pass(label);
+  } finally {
+    restoreEnv('HANDOFF_HOST', savedHost); restoreEnv('HANDOFF_PROMOTION_FILE', savedFile);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+{
+  const label = 'P24: status host/promotion_file resolver — HANDOFF_HOST=codex env -> codex + AGENTS.md';
+  const savedHost = process.env.HANDOFF_HOST;
+  const savedFile = process.env.HANDOFF_PROMOTION_FILE;
+  const dir = makeTempDir('p24-');
+  try {
+    process.env.HANDOFF_HOST = 'codex';
+    delete process.env.HANDOFF_PROMOTION_FILE;
+    const r = claudeMdKeyPaths.resolvePromotionTarget(dir, process.env);
+    if (!r.ok || r.host !== 'codex' || r.filename !== 'AGENTS.md' || r.filePath !== path.join(dir, 'AGENTS.md')) {
+      fail(label, `expected ok host=codex file=AGENTS.md, got ${JSON.stringify(r)}`);
+    } else pass(label);
+  } finally {
+    restoreEnv('HANDOFF_HOST', savedHost); restoreEnv('HANDOFF_PROMOTION_FILE', savedFile);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+{
+  const label = 'P25: cmdStatus source — calls the shared resolvePromotionTarget(root, process.env) (no re-implementation, no --host flag of its own) and emits host/promotion_file on both --json and prose paths';
+  const src = fs.readFileSync(path.join(__dirname, 'handoff.js'), 'utf8');
+  const cmdStatusStart = src.indexOf('async function cmdStatus(');
+  const cmdStatusEnd = src.indexOf('\nasync function ', cmdStatusStart + 1);
+  if (cmdStatusStart === -1 || cmdStatusEnd === -1 || cmdStatusEnd <= cmdStatusStart) {
+    fail(label, `could not locate cmdStatus function body (start=${cmdStatusStart}, end=${cmdStatusEnd})`);
+  } else {
+    const body = src.slice(cmdStatusStart, cmdStatusEnd);
+    const usesSharedResolver = /resolvePromotionTarget\(\s*root\s*,\s*process\.env\s*\)/.test(body);
+    const emitsJsonHost = /host:\s*statusHost/.test(body);
+    const emitsJsonFile = /promotion_file:\s*statusPromotionFile/.test(body);
+    const emitsProseHost = /host:\s*\$\{statusHost/.test(body);
+    const emitsProseFile = /promotion_file:\s*\$\{statusPromotionFile/.test(body);
+    if (!usesSharedResolver) {
+      fail(label, 'cmdStatus does not call the shared resolvePromotionTarget(root, process.env) — possible re-implementation');
+    } else if (!emitsJsonHost || !emitsJsonFile) {
+      fail(label, `cmdStatus --json output missing host/promotion_file fields (jsonHost=${emitsJsonHost}, jsonFile=${emitsJsonFile})`);
+    } else if (!emitsProseHost || !emitsProseFile) {
+      fail(label, `cmdStatus prose output missing host/promotion_file lines (proseHost=${emitsProseHost}, proseFile=${emitsProseFile})`);
+    } else {
+      pass(label);
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 
 console.log('');
 console.log(`Results: ${passed} passed, ${failed} failed`);
