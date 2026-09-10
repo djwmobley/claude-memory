@@ -45,12 +45,19 @@
  *           no matcher on SessionEnd; a pre-existing config.toml IS backed up
  *           before add runs; `mcp add` reports success but a post-add
  *           re-verify still can't confirm registration -> refuse exit 1.
- *   H1-H3   hooks.json merge preserves unrelated hooks; idempotent re-run
+ *   H1-H5   hooks.json merge preserves unrelated hooks; idempotent re-run
  *           (registration persists via the stateful stub, so the second run
  *           sees REGISTERED and skips add) is byte-identical with no new
- *           backup; a cross-host (`--host claude`, i.e. no --host suffix)
- *           entry found inside hooks.json is flagged unrecognizedShape and
- *           left untouched, never repointed.
+ *           backup; a genuine cross-host (`--host claude`, an EXPLICIT
+ *           mismatched suffix) entry found inside hooks.json is flagged
+ *           unrecognizedShape and left untouched, never repointed; a legacy
+ *           entry with NO --host suffix (the pre-`--host`-flag form every
+ *           host's installer used to write) is recognized as OURS for the
+ *           Codex scope and upgraded in place — never left untouched, never
+ *           duplicated as a second, double-firing entry (the bug this PR
+ *           fixes); two duplicate same-host entries (one tagged `--host
+ *           codex`, one untagged legacy) collapse to the tagged one, the
+ *           untagged one is removed.
  *   Q1      Engine path containing a space is double-quoted in the emitted
  *           hook commands (S3).
  *   K1-K4   CODEX_HOME: unset defaults to ~/.codex; relative -> refuse;
@@ -1156,7 +1163,7 @@ function runInstall({ installScript, args, stubDir, codexHome, homeDir, extraEnv
 }
 
 {
-  const label = 'H3: a cross-host entry (no --host suffix, i.e. host=claude) inside hooks.json is flagged unrecognizedShape and left untouched, never repointed';
+  const label = 'H3: a genuine cross-host entry (EXPLICIT --host claude suffix) inside hooks.json is flagged unrecognizedShape and left untouched, never repointed';
   const { engineRoot, installScript } = setupEngineCopy();
   const stubDir = path.join(engineRoot, '_bin');
   makeCodexStub(stubDir);
@@ -1165,7 +1172,7 @@ function runInstall({ installScript, args, stubDir, codexHome, homeDir, extraEnv
   const stateFile = path.join(homeDir, 'codex-state.json');
   fs.mkdirSync(codexHome, { recursive: true });
   const hooksPath = path.join(codexHome, 'hooks.json');
-  const claudeStyleCmd = `node ${path.join(engineRoot, 'scripts', 'handoff.js').replace(/\\/g, '/')} loader-hook`; // no --host suffix
+  const claudeStyleCmd = `node ${path.join(engineRoot, 'scripts', 'handoff.js').replace(/\\/g, '/')} loader-hook --host claude`; // EXPLICIT mismatched host
   const before = { hooks: { SessionStart: [{ hooks: [{ type: 'command', command: claudeStyleCmd }] }] } };
   fs.writeFileSync(hooksPath, JSON.stringify(before, null, 2) + '\n', 'utf8');
   try {
@@ -1178,6 +1185,92 @@ function runInstall({ installScript, args, stubDir, codexHome, homeDir, extraEnv
     const crossHostSurvived = after.hooks.SessionStart.some((g) => (g.hooks || []).some((h) => h.command === claudeStyleCmd));
     if (!crossHostSurvived) { fail(label, `cross-host entry was repointed/removed instead of left untouched: ${JSON.stringify(after)}`); return; }
     if (!/unrecognized_shape: 1/.test(r.stdout)) { fail(label, `expected the summary to flag 1 unrecognized_shape entry; stdout: ${r.stdout.slice(0, 500)}`); return; }
+    pass(label);
+  } finally { fs.rmSync(homeDir, { recursive: true, force: true }); }
+}
+
+{
+  const label = 'H4 (bug fix): a legacy entry with NO --host suffix inside hooks.json is recognized as ours for the Codex scope and UPGRADED IN PLACE, not left untouched or duplicated';
+  const { engineRoot, installScript } = setupEngineCopy();
+  const stubDir = path.join(engineRoot, '_bin');
+  makeCodexStub(stubDir);
+  const homeDir = makeTempDir('install-host-h4-home-');
+  const codexHome = path.join(homeDir, '.codex');
+  const stateFile = path.join(homeDir, 'codex-state.json');
+  fs.mkdirSync(codexHome, { recursive: true });
+  const hooksPath = path.join(codexHome, 'hooks.json');
+  const enginePathFwd = path.join(engineRoot, 'scripts', 'handoff.js').replace(/\\/g, '/');
+  const legacyLoaderHook = `node ${enginePathFwd} loader-hook`; // pre-`--host`-flag legacy form
+  const legacyLoaderStop = `node ${enginePathFwd} loader-stop`; // pre-`--host`-flag legacy form, stale 30s timeout
+  const before = {
+    hooks: {
+      SessionStart: [{ hooks: [{ type: 'command', command: legacyLoaderHook, timeout: 30 }] }],
+      SessionEnd: [{ hooks: [
+        { type: 'command', command: legacyLoaderStop, timeout: 30 },
+        { type: 'command', command: 'node /some/other/tool.js', timeout: 30 },
+      ] }],
+    },
+  };
+  fs.writeFileSync(hooksPath, JSON.stringify(before, null, 2) + '\n', 'utf8');
+  try {
+    const r = runInstall({
+      installScript, args: ['--host', 'codex', '--force'], stubDir, codexHome, homeDir,
+      extraEnv: { CODEX_STUB_STATE_FILE: stateFile },
+    });
+    if (r.status !== 0) { fail(label, `expected exit 0, got ${r.status}; stderr: ${(r.stderr || '').slice(0, 500)}`); return; }
+    if (!/upgraded:\s*2/.test(r.stdout)) { fail(label, `expected "upgraded: 2" in summary; stdout: ${r.stdout.slice(0, 800)}`); return; }
+    if (!/added:\s*0/.test(r.stdout)) { fail(label, `expected "added: 0" in summary (no duplicate entry); stdout: ${r.stdout.slice(0, 800)}`); return; }
+    const after = JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
+    if (after.hooks.SessionStart.length !== 1 || after.hooks.SessionStart[0].hooks.length !== 1) {
+      fail(label, `expected exactly one SessionStart group with one hook (no duplicate): ${JSON.stringify(after.hooks.SessionStart)}`);
+      return;
+    }
+    if (!/--host codex$/.test(after.hooks.SessionStart[0].hooks[0].command)) {
+      fail(label, `expected the legacy entry to be repointed with --host codex: ${after.hooks.SessionStart[0].hooks[0].command}`);
+      return;
+    }
+    if (after.hooks.SessionEnd.length !== 1 || after.hooks.SessionEnd[0].hooks.length !== 2) {
+      fail(label, `expected exactly one SessionEnd group with 2 hooks (ours + foreign sibling, no duplicate): ${JSON.stringify(after.hooks.SessionEnd)}`);
+      return;
+    }
+    const ours = after.hooks.SessionEnd[0].hooks.find((h) => /loader-stop/.test(h.command));
+    if (!ours || !/--host codex$/.test(ours.command)) { fail(label, `expected loader-stop repointed with --host codex: ${JSON.stringify(ours)}`); return; }
+    if (ours.timeout !== 3) { fail(label, `expected the stale 30s timeout normalized to 3 (Codex's own SessionEnd clamp), got ${ours.timeout}`); return; }
+    const sibling = after.hooks.SessionEnd[0].hooks.find((h) => h.command === 'node /some/other/tool.js');
+    if (!sibling || sibling.timeout !== 30) { fail(label, `expected the foreign sibling hook's timeout left untouched at 30: ${JSON.stringify(sibling)}`); return; }
+    pass(label);
+  } finally { fs.rmSync(homeDir, { recursive: true, force: true }); }
+}
+
+{
+  const label = 'H5: duplicate same-host entries (one tagged --host codex, one untagged legacy) collapse to the tagged one';
+  const { engineRoot, installScript } = setupEngineCopy();
+  const stubDir = path.join(engineRoot, '_bin');
+  makeCodexStub(stubDir);
+  const homeDir = makeTempDir('install-host-h5-home-');
+  const codexHome = path.join(homeDir, '.codex');
+  const stateFile = path.join(homeDir, 'codex-state.json');
+  fs.mkdirSync(codexHome, { recursive: true });
+  const hooksPath = path.join(codexHome, 'hooks.json');
+  const enginePathFwd = path.join(engineRoot, 'scripts', 'handoff.js').replace(/\\/g, '/');
+  const taggedCmd   = `node ${enginePathFwd} loader-hook --host codex`;
+  const untaggedCmd = `node /some/other/old/checkout/scripts/handoff.js loader-hook`; // legacy, untagged, stale path
+  const before = { hooks: { SessionStart: [{ hooks: [
+    { type: 'command', command: untaggedCmd },
+    { type: 'command', command: taggedCmd },
+  ] }] } };
+  fs.writeFileSync(hooksPath, JSON.stringify(before, null, 2) + '\n', 'utf8');
+  try {
+    const r = runInstall({
+      installScript, args: ['--host', 'codex', '--force'], stubDir, codexHome, homeDir,
+      extraEnv: { CODEX_STUB_STATE_FILE: stateFile },
+    });
+    if (r.status !== 0) { fail(label, `expected exit 0, got ${r.status}; stderr: ${(r.stderr || '').slice(0, 500)}`); return; }
+    if (!/deduped:\s*1/.test(r.stdout)) { fail(label, `expected "deduped: 1" in summary; stdout: ${r.stdout.slice(0, 800)}`); return; }
+    const after = JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
+    const cmds = after.hooks.SessionStart[0].hooks.map((h) => h.command);
+    if (cmds.length !== 1) { fail(label, `expected exactly one surviving loader-hook entry, got ${JSON.stringify(cmds)}`); return; }
+    if (!/--host codex$/.test(cmds[0])) { fail(label, `expected the host-tagged entry to survive, got ${cmds[0]}`); return; }
     pass(label);
   } finally { fs.rmSync(homeDir, { recursive: true, force: true }); }
 }

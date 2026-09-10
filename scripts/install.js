@@ -248,27 +248,46 @@ const OURS_RE = /^(?:HANDOFF_ENGINE=(\S+) )?node(?:\.exe)? (?:"((?:[^"\\]|\\.)*)
 /**
  * Return `{ verb: 'loader-hook' | 'loader-stop' }` — plus a `host` key ONLY
  * when the command carries an explicit trailing `--host <value>` (a bare
- * command with no --host suffix is the historical Claude form and has no
- * `host` key at all, so pre-existing callers/tests that deepStrictEqual
- * against `{ verb }` are unaffected) — if `rawCommand` is one of OUR hooks,
- * else null. Exported for tests and reused by scope detection.
+ * command with no --host suffix is the historical, host-agnostic legacy
+ * form and has no `host` key at all, so pre-existing callers/tests that
+ * deepStrictEqual against `{ verb }` are unaffected) — if `rawCommand` is
+ * one of OUR hooks, else null. Exported for tests and reused by scope
+ * detection.
  *
  * Callers that need a host to compare against MUST default a missing `host`
- * key to `'claude'` themselves (see scanEntries below) — this function never
- * invents that default internally, so its return shape for a plain command
- * never changes.
+ * key to the SCOPE they are scanning (see scanEntries below) — never to a
+ * hardcoded value — this function never invents that default internally,
+ * so its return shape for a plain command never changes.
+ *
+ * `platform` (default `process.platform`, overridable for tests) governs
+ * whether the trailing `scripts/handoff.js` path-suffix check is
+ * case-insensitive: Windows paths are case-preserving but case-INsensitive
+ * at the filesystem, so a legacy entry spelled `Scripts/Handoff.js` is still
+ * ours there; on a POSIX checkout case is significant and a mismatch is a
+ * real miss (excludes vendor/handoff.js, and wrapper-for-handoff.js-
+ * notifier.js which doesn't even end there).
  */
-function isOurs(rawCommand) {
+function isOurs(rawCommand, platformOverride) {
   if (typeof rawCommand !== 'string') return null;
+  // Sanctioned platform branch (test-os-portability.js P3 allowlist): whether
+  // the trailing "scripts/handoff.js" suffix check below is case-insensitive.
+  // `platformOverride` exists ONLY so tests can exercise both branches
+  // deterministically regardless of the machine actually running them (see
+  // test-install-sessionend-migration.js's case-differing-legacy-path case);
+  // every real call site (scanEntries, detectOursPresent) omits it and gets
+  // the real process.platform.
+  const isWin32 = platformOverride ? platformOverride === 'win32' : process.platform === 'win32';
   const cmd = normalizeCommand(rawCommand);
   const m = cmd.match(OURS_RE);
   if (!m) return null;
-  const pathToken = m[2] !== undefined ? m[2] : m[3];
+  let pathToken = m[2] !== undefined ? m[2] : m[3];
   if (typeof pathToken !== 'string' || pathToken.length === 0) return null;
-  // Last two segments must be literally "scripts/handoff.js" — not merely a
-  // string ending in "handoff.js" (excludes vendor/handoff.js, and
-  // wrapper-for-handoff.js-notifier.js which doesn't even end there).
-  if (!/(^|\/)scripts\/handoff\.js$/.test(pathToken)) return null;
+  pathToken = pathToken.replace(/\/+$/, ''); // strip trailing separator(s), if any
+  if (pathToken.length === 0) return null;
+  const suffixRe = isWin32
+    ? /(^|\/)scripts\/handoff\.js$/i
+    : /(^|\/)scripts\/handoff\.js$/;
+  if (!suffixRe.test(pathToken)) return null;
   return m[5] ? { verb: m[4], host: m[5] } : { verb: m[4] };
 }
 
@@ -317,6 +336,25 @@ function validateHooksSection(settings) {
 
 const EVENT_FOR_VERB = { 'loader-hook': 'SessionStart', 'loader-stop': 'SessionEnd' };
 
+// Per-(host,verb) timeout override applied to every hook entry mergeHooks()
+// writes for that host+verb — on fresh add, in-place upgrade, AND event-move
+// — regardless of what a legacy/pre-existing entry carried. Codex's own
+// hook runtime hard-clamps a SessionEnd hook's timeout to 3s regardless of
+// the configured value (see docs/hosts/codex.md and lib/codex-install.js's
+// header comment); a stale 30s value inherited from an older install (or
+// copy-pasted from the Claude-path convention) is corrected here rather
+// than left as a misleading number in the config file. No other host/verb
+// pair is overridden — the Claude path never wrote a timeout for a fresh
+// install and continues not to; an EXISTING Claude-file timeout is still
+// preserved untouched via preserveExtra(), exactly as before this fix.
+const TIMEOUT_OVERRIDE = { codex: { 'loader-stop': 3 } };
+
+/** Forced timeout for this (targetHost, verb) pair, or undefined if none applies. */
+function forcedTimeoutFor(targetHost, verb) {
+  const byHost = TIMEOUT_OVERRIDE[targetHost];
+  return byHost && Object.prototype.hasOwnProperty.call(byHost, verb) ? byHost[verb] : undefined;
+}
+
 /**
  * Scan settings.hooks once (no mutation) and classify every entry.
  * Returns { candidates: { 'loader-hook': [...], 'loader-stop': [...] },
@@ -325,17 +363,35 @@ const EVENT_FOR_VERB = { 'loader-hook': 'SessionStart', 'loader-stop': 'SessionE
  *   grouped: { kind:'grouped', event, groupRef, innerRef }
  *   flat:    { kind:'flat', event, ref }
  *
- * `targetHost` (default 'claude', codex-host-adapter S3): identity is keyed
- * by (verb, host) — a plain command with no `--host` suffix is host='claude'
- * (isOurs()'s missing-host default, applied HERE, never inside isOurs()
- * itself). An entry that IS recognized as ours (right verb, right shape) but
- * whose host does NOT match `targetHost` — e.g. a `--host codex` entry found
- * while scanning the Claude-scope settings file, or a plain/`--host claude`
- * entry found inside a Codex-scope hooks.json — is a cross-host entry: it is
- * flagged unrecognizedShape and left completely untouched (never silently
- * repointed, never merged as if it were ours). This is what lets the SAME
- * settings/hooks file host entries for BOTH hosts side by side without
- * either install path clobbering the other's entry.
+ * `targetHost` (default 'claude', codex-host-adapter S3, hardened for the
+ * legacy-no-flag-entry fix): SCOPE for this scan — always the host of the
+ * file actually being edited, passed in by the caller (install.js's Claude
+ * path omits it, defaulting to 'claude'; the codex path passes 'codex' —
+ * see installCodexHooks() in lib/codex-install.js). Identity is keyed by
+ * (verb, host). A plain command with no `--host` suffix carries NO host
+ * opinion of its own (isOurs() returns no `host` key for it) — it is the
+ * historical, pre-`--host`-flag form that every host's installer used to
+ * write, so it defaults to THIS SCAN's SCOPE, never to a hardcoded value.
+ * That is what makes a legacy loader-hook/loader-stop entry sitting in the
+ * Codex hooks.json — written before `--host` existed — recognized as ours
+ * for the Codex scan and upgraded in place, instead of being misread as a
+ * foreign Claude entry and left to accumulate a second, double-firing
+ * Codex-scoped entry alongside it.
+ *
+ * An entry that IS recognized as ours (right verb, right shape) but carries
+ * an EXPLICIT `--host` suffix that does NOT match `targetHost` — e.g. a
+ * `--host codex` entry found while scanning the Claude-scope settings file,
+ * or a `--host claude` entry found inside a Codex-scope hooks.json — is a
+ * genuine cross-host entry: it is flagged unrecognizedShape and left
+ * completely untouched (never silently repointed, never merged as if it
+ * were ours, never duplicated). This is what lets the SAME settings/hooks
+ * file host entries for BOTH hosts side by side without either install path
+ * clobbering the other's entry.
+ *
+ * Each candidate carries `hasHostSuffix` (true only when the source command
+ * had an explicit `--host <value>` suffix) so mergeHooks() can prefer a
+ * host-tagged duplicate over an untagged legacy one when collapsing >1 ours
+ * entry for the same verb+host (see mergeHooks()'s `keep` selection).
  */
 function scanEntries(hooks, targetHost) {
   targetHost = targetHost || 'claude';
@@ -357,12 +413,16 @@ function scanEntries(hooks, targetHost) {
           if (inner && typeof inner === 'object' && typeof inner.command === 'string') {
             const id = isOurs(inner.command);
             if (!id) return; // some other tool's hook — never touched, never flagged.
-            const entryHost = id.host || 'claude';
+            const entryHost = id.host || targetHost; // no --host suffix -> this scan's SCOPE, never hardcoded.
             if (entryHost === targetHost) {
-              candidates[id.verb].push({ kind: 'grouped', event, groupRef: entry, innerRef: inner });
+              candidates[id.verb].push({
+                kind: 'grouped', event, groupRef: entry, innerRef: inner,
+                hasHostSuffix: id.host !== undefined,
+              });
             } else {
-              // Recognized as ours, but for the OTHER host — cross-host entry
-              // (S3): flag, never silently repoint into this host's slot.
+              // Recognized as ours, but for the OTHER host (an EXPLICIT
+              // mismatched --host suffix) — cross-host entry (S3): flag,
+              // never silently repoint into this host's slot.
               unrecognizedShape.push({ event, index });
             }
           } else {
@@ -379,11 +439,11 @@ function scanEntries(hooks, targetHost) {
         // Legacy flat entry.
         const id = isOurs(entry.command);
         if (id) {
-          const entryHost = id.host || 'claude';
+          const entryHost = id.host || targetHost; // no --host suffix -> this scan's SCOPE, never hardcoded.
           if (entryHost === targetHost) {
-            candidates[id.verb].push({ kind: 'flat', event, ref: entry });
+            candidates[id.verb].push({ kind: 'flat', event, ref: entry, hasHostSuffix: id.host !== undefined });
           } else {
-            unrecognizedShape.push({ event, index }); // cross-host (S3).
+            unrecognizedShape.push({ event, index }); // cross-host (S3): explicit mismatched --host suffix.
           }
         } else {
           unrecognizedShape.push({ event, index });
@@ -411,6 +471,14 @@ function scanEntries(hooks, targetHost) {
  *     Codex host path sets `{'loader-hook':'startup|resume'}`; the Claude
  *     path omits this entirely, exactly as before — no matcher is invented
  *     for Claude groups).
+ *
+ * A per-(targetHost,verb) timeout override (see TIMEOUT_OVERRIDE /
+ * forcedTimeoutFor() above) is applied to every hook object this function
+ * writes for that pair — add, in-place upgrade, or event-move alike —
+ * overriding whatever a legacy entry carried. Currently only
+ * codex/loader-stop is overridden (forced to 3, matching Codex's own
+ * runtime clamp); every other pair is unaffected and an existing timeout is
+ * preserved via preserveExtra() exactly as before.
  *
  * Returns a report:
  *   { upgraded:[{verb,event}], moved:[{verb,from,to}], removed:[{event}],
@@ -458,17 +526,26 @@ function mergeHooks(settings, opts) {
     const targetEvent = EVENT_FOR_VERB[verb];
     const cmd = cmdFor[verb];
     const list = candidates[verb];
+    const forcedTimeout = forcedTimeoutFor(targetHost, verb);
 
     if (list.length === 0) {
       // Nothing found anywhere for this verb — add fresh.
-      const newGroup = { hooks: [{ type: 'command', command: cmd }] };
+      const hookObj = { type: 'command', command: cmd };
+      if (forcedTimeout !== undefined) hookObj.timeout = forcedTimeout;
+      const newGroup = { hooks: [hookObj] };
       if (matcherFor[verb]) newGroup.matcher = matcherFor[verb];
       additions.push({ event: targetEvent, newGroup });
       report.added.push(verb);
       continue;
     }
 
-    const keep = list.find((c) => c.event === targetEvent) || list[0];
+    // >1 ours entry for this verb+host: keep the one carrying an explicit
+    // --host suffix over an untagged legacy one (a host-tagged entry is
+    // never ambiguous about which install path owns it); among ties, prefer
+    // whichever already sits at the correct event.
+    const hostTagged = list.filter((c) => c.hasHostSuffix);
+    const pool = hostTagged.length > 0 ? hostTagged : list;
+    const keep = pool.find((c) => c.event === targetEvent) || pool[0];
 
     for (const c of list) {
       if (c === keep) continue;
@@ -487,12 +564,27 @@ function mergeHooks(settings, opts) {
         // Upgrade in place: same object reference, same array position.
         const preserved = preserveExtra(keep.ref, ['command']);
         for (const k of Object.keys(keep.ref)) delete keep.ref[k];
-        keep.ref.hooks = [{ type: 'command', command: cmd, ...preserved }];
+        const hookObj = { type: 'command', command: cmd, ...preserved };
+        if (forcedTimeout !== undefined) hookObj.timeout = forcedTimeout;
+        keep.ref.hooks = [hookObj];
         if (matcherFor[verb] && keep.ref.matcher === undefined) keep.ref.matcher = matcherFor[verb];
         report.upgraded.push({ verb, event: targetEvent });
-      } else if (keep.innerRef.command !== cmd) {
-        keep.innerRef.command = cmd;
-        report.repointed.push({ verb, event: targetEvent });
+      } else {
+        // Already-grouped ours entry at the correct event — mutate ONLY the
+        // inner hook's command/timeout, never the shared groupRef (its
+        // `matcher` and any foreign sibling hooks inside `groupRef.hooks`
+        // are left byte-for-byte untouched even when a group is shared).
+        let changed = false;
+        if (keep.innerRef.command !== cmd) {
+          keep.innerRef.command = cmd;
+          report.repointed.push({ verb, event: targetEvent });
+          changed = true;
+        }
+        if (forcedTimeout !== undefined && keep.innerRef.timeout !== forcedTimeout) {
+          keep.innerRef.timeout = forcedTimeout;
+          changed = true;
+        }
+        if (changed) report.upgraded.push({ verb, event: targetEvent });
       }
       continue;
     }
@@ -501,7 +593,9 @@ function mergeHooks(settings, opts) {
     if (keep.kind === 'flat') {
       topToRemove.add(keep.ref);
       const preserved = preserveExtra(keep.ref, ['command']);
-      const newGroup = { hooks: [{ type: 'command', command: cmd, ...preserved }] };
+      const hookObj = { type: 'command', command: cmd, ...preserved };
+      if (forcedTimeout !== undefined) hookObj.timeout = forcedTimeout;
+      const newGroup = { hooks: [hookObj] };
       if (matcherFor[verb]) newGroup.matcher = matcherFor[verb];
       additions.push({ event: targetEvent, newGroup });
       report.upgraded.push({ verb, event: keep.event });
@@ -509,7 +603,9 @@ function mergeHooks(settings, opts) {
       innerToRemove.add(keep.innerRef);
       groupsToCheckEmpty.add(keep.groupRef);
       const preserved = preserveExtra(keep.innerRef, ['command', 'type']);
-      const newGroup = { hooks: [{ type: 'command', command: cmd, ...preserved }] };
+      const hookObj = { type: 'command', command: cmd, ...preserved };
+      if (forcedTimeout !== undefined) hookObj.timeout = forcedTimeout;
+      const newGroup = { hooks: [hookObj] };
       if (matcherFor[verb]) newGroup.matcher = matcherFor[verb];
       additions.push({ event: targetEvent, newGroup });
     }
