@@ -16,6 +16,8 @@ and exits 0 without rewriting CLAUDE.md.
 | `--predicate <p>` | optional | Narrow content-match by predicate. Required when multiple live assertions share the same subject. |
 | `--object <o>` | optional | Narrow content-match by object value. |
 | `--demote <id>` | (one form required) | Reverse a prior promote: clear the `promoted` flag and remove the corresponding line from `CLAUDE.md`. |
+| `--regenerate` | (one form required) | Rewrite `CLAUDE.md`/`AGENTS.md` from its template — the lightweight alternative to `init --force-promotion` (which bundles ~9 unrelated DB/FS writes). Exclusive of every other promote flag/positional; the only other token accepted alongside it is `--dry-run`. |
+| `--dry-run` | optional | With `--regenerate` only: report what would change (target state, backup y/n, would-be byte count, facts that would carry) without writing anything. |
 
 ## How to invoke
 
@@ -72,6 +74,14 @@ PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" promote --subject "vLLM" --p
 
 # Demote (reverse a prior promote):
 PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" promote --demote 42
+
+# Regenerate CLAUDE.md/AGENTS.md from the template (backs up the existing
+# file first; carries forward any "## Durable facts" lines it can parse out
+# of it):
+PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" promote --regenerate
+
+# Preview a regenerate without writing anything:
+PROJECT_ROOT="$PROJECT_ROOT" node "$HANDOFF_ENGINE" promote --regenerate --dry-run
 ```
 
 ## Expected output
@@ -112,6 +122,38 @@ demoted: - [conf=9] vLLM embedding_model is Qwen3-Embedding-8B
 Done: handoff:promote --demote — assertion id=42 demotion complete
 ```
 
+**Regenerate (target was a regular file, 2 facts carried):**
+```
+  path:          /repo/CLAUDE.md
+  bytes:         1284
+  backup:        /repo/CLAUDE.md.bak-1799999999999-123456789-4242
+  facts carried: 2
+
+Done: handoff:promote --regenerate — CLAUDE.md regenerated
+```
+
+**Regenerate — target had no parseable "## Durable facts" section:**
+```
+  [WARN]  existing CLAUDE.md had no parseable "## Durable facts" section — prior content was NOT carried forward; it is preserved in the backup: /repo/CLAUDE.md.bak-1799999999999-123456789-4242
+  path:          /repo/CLAUDE.md
+  bytes:         1194
+  backup:        /repo/CLAUDE.md.bak-1799999999999-123456789-4242
+  facts carried: 0
+
+Done: handoff:promote --regenerate — CLAUDE.md regenerated
+```
+
+**Regenerate --dry-run:**
+```
+promote --regenerate (dry-run): would target /repo/CLAUDE.md
+  target-state:      file
+  would back up:     yes
+  would-be bytes:    1284
+  facts that would carry: 2
+
+Done: handoff:promote --regenerate (dry-run) — no changes written
+```
+
 ## What gets written to CLAUDE.md
 
 Each promoted fact is written as two lines under `## Durable facts`:
@@ -120,12 +162,22 @@ Each promoted fact is written as two lines under `## Durable facts`:
 
 `--demote` removes both lines by matching the `source_assertion=<id>` annotation.
 
+## `--regenerate` details
+
+- **Preconditions** (checked before anything is touched): the project marker must be resolvable and the DB must be reachable. Either failing exits 1 with nothing written.
+- **Target-state handling:** absent → write fresh, no backup. Regular file → back up, then write fresh. Directory, symlink, or anything else → exit 1, nothing written.
+- **Carry-forward:** if the existing file has a parseable `## Durable facts` section, its fact lines (and their `<!-- promoted: ... -->` annotations) are re-inserted into the fresh render in place of the placeholder line. If the section isn't parseable, the file still regenerates (old content is fully recoverable from the backup) but a `[WARN]` line is printed.
+- **Backup naming:** `<name>.bak-<Date.now()>-<process.hrtime.bigint()>-<pid>` — no `:` characters, so it's safe on Windows.
+- **Line endings:** the regenerated file matches whichever EOL style (LF vs CRLF) dominated the file it replaced; a brand-new file uses whatever the template ships with.
+- **`--dry-run`** performs reads only — no backup, no write, no DB mutation.
+- `--regenerate` is mutually exclusive with every other promote form — no id, `--demote`, `--subject`/`--predicate`/`--object`, or unrecognized flag may appear alongside it (exit 2).
+
 ## Exit codes
 
 | Code | Meaning |
 |------|---------|
-| 0 | Success (promote or demote), or idempotent (already promoted / not promoted) |
-| 1 | DB connection error or CLAUDE.md not found |
-| 2 | Bad usage (missing id, zero content matches, multiple content matches) |
+| 0 | Success (promote, demote, or regenerate — including `--dry-run`), or idempotent (already promoted / not promoted) |
+| 1 | DB connection error, CLAUDE.md not found, project marker not resolvable (`--regenerate`), or regenerate target is a directory/symlink/other non-file type |
+| 2 | Bad usage (missing id, zero content matches, multiple content matches, `--regenerate` combined with any other argument, or an unrecognized flag) |
 
 > Done: handoff:promote — assertion promoted to CLAUDE.md
