@@ -1583,9 +1583,13 @@ class PostgresAdapter {
       const missing = [];
       const client = this._client;
       if (expected.tables && expected.tables.length) {
+        // memory-search.js cm#8-gate finding #2: filter to BASE TABLE only —
+        // a same-named VIEW must not satisfy an "is this table present"
+        // check (every caller of schemaObjectsExist expects a real,
+        // directly queryable relation, never a view standing in for one).
         const { rows } = await client.query(
           `SELECT table_name FROM information_schema.tables
-            WHERE table_schema = current_schema() AND table_name = ANY($1::text[])`,
+            WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' AND table_name = ANY($1::text[])`,
           [expected.tables]
         );
         const found = new Set(rows.map((r) => r.table_name));

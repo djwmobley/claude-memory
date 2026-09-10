@@ -270,6 +270,27 @@ async function runChecks(client, prefix) {
     assert(!memorySearchLib.ALLOWED_TABLES.includes('memory_entry_chunks'), 'memory_entry_chunks deliberately excluded (vector(1024) vs halfvec(4000))');
   });
 
+  // cm#8-gate S6-ii: the per-table availability gate (2026-09-09 rewrite)
+  // means every ALLOWED_TABLES entry's buildTableQuery SQL must actually
+  // EXECUTE against a fully-migrated target, not just the 2 tables (decisions/
+  // assertions) check 9 exercises above. This is the live-query counterpart
+  // to memory-search-gate.js's static drift test (which only proves the
+  // declared requiredColumns list is internally consistent, never that the
+  // real SQL runs). Every table is expected to reach the 'ok' branch here —
+  // this target has migrate-13/14/15 fully applied (checkPrerequisites
+  // above already refused to proceed otherwise) — so a table landing in
+  // skippedTables is itself a test failure, not an accepted degraded state.
+  await check(14, 'memory-search: every one of the 15 ALLOWED_TABLES executes its real per-table SQL once (S6-ii live smoke)', async () => {
+    const result = await memorySearchLib.memorySearch(client, {
+      projectId: projectA, query: 'live smoke query text', tables: memorySearchLib.ALLOWED_TABLES.slice(), limit: 1, embedder: EMBEDDER,
+    });
+    assertEq(result.skippedTables.length, 0, `expected zero skips on a fully-migrated target, got: ${JSON.stringify(result.skippedTables)}`);
+    assertEq(result.allSkipped, false, 'allSkipped false — every table queried');
+    const searched = new Set(result.tablesSearched);
+    const missing = memorySearchLib.ALLOWED_TABLES.filter((t) => !searched.has(t));
+    assert(missing.length === 0, `tables never reached tablesSearched: ${missing.join(', ')}`);
+  });
+
   // ── entity CRUD + near-match + revival (M-4/M-12/M-13) ──────────────
   await check(11, 'entity-graph-crud: entityCreate surfaces exact + fuzzy near-matches, never auto-merges', async () => {
     const e1 = await entityCrud.entityCreate(client, { projectId: projectA, name: `${prefix}-Widget`, entityType: 'component' });

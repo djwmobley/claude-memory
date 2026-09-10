@@ -12,7 +12,9 @@
  * (no live vLLM in CI — verify-20-mcp-surface.js injects a deterministic
  * mock embedder under that env var, mirroring verify-19-seams-smoke.js's
  * own mockEmbedder() precedent): fresh full-stack apply -> exit 0 +
- * SMOKE20_RESULT: PASS with all 28 checks (cm#231: was 27) + the MCP-registration check
+ * SMOKE20_RESULT: PASS with all 29 checks (cm#231: was 27->28; memory-search
+ * per-table-gate PR: 28->29, S6-ii live smoke across all 15 ALLOWED_TABLES)
+ * + the MCP-registration check
  * green; prerequisite-missing (migrate-15 not yet applied) -> FAIL naming
  * migrate-15-mcp-addenda.js.
  *
@@ -160,7 +162,11 @@ async function testFreshApplyAllGreen() {
   // new cm#231 regression checks were added there (assertionCreate's
   // supersession + tier/valid_at defaults, and assertionSuppress's
   // invalid_at/suppression_kind defaults): net -1 (moved) + 2 (new) = +1.
-  assert(passCount === 28, `expected all 28 numbered checks to PASS, got ${passCount}`);
+  // memory-search per-table-gate PR (2026-09-09): 29 (was 28) — a new check
+  // 14 (the id the cm#231 move vacated) proves every one of the 15
+  // ALLOWED_TABLES executes its real per-table SQL once against this
+  // fully-migrated target (S6-ii live smoke).
+  assert(passCount === 29, `expected all 29 numbered checks to PASS, got ${passCount}`);
   assert(/mcp-registration\] PASS/.test(r20.stdout), 'expected the MCP-registration check to PASS');
   assert(/residue scan: clean \(0 rows\)/.test(r20.stdout), `expected a clean residue scan. stdout=${r20.stdout}`);
 }

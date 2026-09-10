@@ -59,12 +59,87 @@
  * WITHIN r's own source can outscore it, meaning r is always within that
  * source's own local top-K. Hence global top-K subset-of union of local
  * top-K, for every K.
+ *
+ * ── PER-TABLE AVAILABILITY GATE (adversary review, 2026-09-09) ────────────
+ * The original existence probe (schemaObjectsExist({tables})) was TABLE-only
+ * — it never checked that the columns buildTableQuery's SQL text actually
+ * references (the embedding column above all) are present. A "degraded"
+ * schema (cm#224/#225: table created, but a pgvector-gated column/index was
+ * skipped at apply time because the `vector` extension was unavailable) has
+ * the table present and every referenced column absent, so the OLD probe
+ * reported "present" and buildTableQuery's SQL then threw 42703
+ * (undefined_column) at client.query — failing the WHOLE memory_search call
+ * for every table, not just the degraded one. Eight findings drove this
+ * rewrite (also enumerated in the authoring PR body):
+ *   1. type mismatch — a column can exist with the wrong pgvector type/dims
+ *      (checkColumnShape, not just existence).
+ *   2. view vs table — schemaObjectsExist's tables probe never filtered by
+ *      table_type, so a same-named VIEW would have satisfied "present".
+ *   3. extension absent — pgvector missing surfaces as 42704/42883
+ *      (undefined_object/undefined_function) from the live query, a THIRD
+ *      degraded shape beyond "table missing" and "column missing".
+ *   4. connection fan-out — a dead/degraded connection must not turn into
+ *      15 misleading per-table "query_error" skips.
+ *   5. `tables: []` — an explicit empty array is NOT "everything"; it was
+ *      silently coerced to the full default enum by `array.length ?` truthy
+ *      checks below.
+ *   6. `allSkipped` — callers had no single boolean to check "did this
+ *      search actually run against anything".
+ *   7. declared-list drift — a descriptor's expression strings and its
+ *      declared `requiredColumns` list can silently diverge as the SQL
+ *      text is edited; enforced by a static test, not at runtime.
+ *   8. probe/query session — the probe and the live query must resolve
+ *      identifiers against the SAME schema. This module's client is always
+ *      a single-connection `pg.Client` (never a `Pool` — see db-seam.js's
+ *      PostgresAdapter/connectForRoot, the only production caller), so the
+ *      probe's `current_schema()` and the query's unqualified table names
+ *      already resolve against the identical session with no code change
+ *      required here; documented rather than re-implemented via an explicit
+ *      schema-qualification, since there is no code path in this codebase
+ *      where memorySearch's `client` argument is backed by a connection
+ *      pool.
+ *
+ * TOTAL CLASSIFICATION — every candidate table lands in exactly one of:
+ *   (a) table_missing   — schemaObjectsExist reports the BASE TABLE absent.
+ *   (b) column_missing  — a `requiredColumns` entry is absent, OR a shape
+ *                          check (embedding/FTS column) reports a mismatch
+ *                          (`detail.subReason === 'type_mismatch'`).
+ *   (c) queried          — present and shape-correct; the live SELECT runs.
+ * A table that reaches (c) but whose live query still throws lands in a
+ * FOURTH bucket, `query_error` (SQLSTATE attached; `subReason:
+ * 'extension_absent'` for 42704/42883), UNLESS the error is connection-class
+ * (SQLSTATE class 08/28) or an identical SQLSTATE has now recurred on ≥2
+ * tables — either escalates to a call-level throw instead of a per-table
+ * skip, so a dead connection is reported once, not fanned out.
  */
 
 const { embedQuery } = require('./embed.js');
 
+// Every table's embedding column has the identical name and pgvector shape
+// (halfvec(4000), Qwen3-Embedding-8B's output dimension) — see the
+// memory_entry_chunks exclusion note above for the one table that does NOT
+// share this shape (and is therefore not in TABLE_DESCRIPTORS at all).
+const EMBEDDING_COLUMN = 'embedding';
+const EMBEDDING_SHAPE = Object.freeze({ type: 'halfvec', dims: 4000 });
+const FTS_COLUMN = 'fts_vec';
+const FTS_SHAPE_TYPE = 'tsvector';
+
+// SQLSTATE classes (first two chars) that mean "the connection/session
+// itself is the problem", never "this one table's schema is the problem":
+// class 08 = connection_exception, class 28 = invalid_authorization_specification.
+const CONNECTION_ERROR_CLASSES = new Set(['08', '28']);
+// undefined_object (extension-provided type, e.g. halfvec, missing) /
+// undefined_function (extension-provided operator, e.g. <=>, missing) — the
+// live-query signature of "pgvector extension not installed on this DB",
+// distinct from a plain missing-column 42703.
+const EXTENSION_ABSENT_SQLSTATES = new Set(['42704', '42883']);
+
 // ── M-14 closed enum (total classification — unknown table names are a hard
 // tool error, mirroring S-1's "table param is a closed enum" precedent). ──
+// `requiredColumns` lists EVERY column referenced anywhere in this table's
+// idExpr/labelExpr/snippetExpr/whereExtra/embedding/FTS — enforced against
+// drift by a static test (parses the expression strings; never trusted at
+// runtime — the declared list here is authoritative for the probe).
 const TABLE_DESCRIPTORS = Object.freeze({
   assertions: {
     idExpr: 'id',
@@ -72,6 +147,7 @@ const TABLE_DESCRIPTORS = Object.freeze({
     snippetExpr: `substring(coalesce(object,''), 1, 300)`,
     hasFts: false,
     whereExtra: 'suppressed = false AND invalid_at IS NULL',
+    requiredColumns: ['id', 'subject', 'object', 'suppressed', 'invalid_at', 'project_id', EMBEDDING_COLUMN],
   },
   agent_exchange: {
     idExpr: 'id',
@@ -79,6 +155,7 @@ const TABLE_DESCRIPTORS = Object.freeze({
     snippetExpr: `substring(coalesce(body_caveman,''), 1, 300)`,
     hasFts: false,
     whereExtra: null,
+    requiredColumns: ['id', 'agent_id', 'body_caveman', 'project_id', EMBEDDING_COLUMN],
   },
   decisions: {
     idExpr: 'id',
@@ -86,6 +163,7 @@ const TABLE_DESCRIPTORS = Object.freeze({
     snippetExpr: `substring(coalesce(decision,''), 1, 300)`,
     hasFts: true,
     whereExtra: null,
+    requiredColumns: ['id', 'topic', 'decision', 'project_id', EMBEDDING_COLUMN, FTS_COLUMN],
   },
   gotchas: {
     idExpr: 'id',
@@ -93,6 +171,7 @@ const TABLE_DESCRIPTORS = Object.freeze({
     snippetExpr: `substring(coalesce(rule,''), 1, 300)`,
     hasFts: true,
     whereExtra: null,
+    requiredColumns: ['id', 'issue', 'rule', 'project_id', EMBEDDING_COLUMN, FTS_COLUMN],
   },
   findings: {
     idExpr: 'id',
@@ -100,6 +179,7 @@ const TABLE_DESCRIPTORS = Object.freeze({
     snippetExpr: `substring(coalesce(description,''), 1, 300)`,
     hasFts: true,
     whereExtra: null,
+    requiredColumns: ['id', 'description', 'project_id', EMBEDDING_COLUMN, FTS_COLUMN],
   },
   research: {
     idExpr: 'id',
@@ -107,6 +187,7 @@ const TABLE_DESCRIPTORS = Object.freeze({
     snippetExpr: `substring(coalesce(body,''), 1, 300)`,
     hasFts: false,
     whereExtra: null,
+    requiredColumns: ['id', 'title', 'body', 'project_id', EMBEDDING_COLUMN],
   },
   incidents: {
     idExpr: 'id',
@@ -114,6 +195,7 @@ const TABLE_DESCRIPTORS = Object.freeze({
     snippetExpr: `substring(coalesce(what_happened,''), 1, 300)`,
     hasFts: false,
     whereExtra: null,
+    requiredColumns: ['id', 'title', 'what_happened', 'project_id', EMBEDDING_COLUMN],
   },
   code_index: {
     idExpr: 'id',
@@ -121,6 +203,7 @@ const TABLE_DESCRIPTORS = Object.freeze({
     snippetExpr: `substring(coalesce(description,''), 1, 300)`,
     hasFts: true,
     whereExtra: null,
+    requiredColumns: ['id', 'path', 'description', 'project_id', EMBEDDING_COLUMN, FTS_COLUMN],
   },
   tasks: {
     idExpr: 'id',
@@ -128,6 +211,7 @@ const TABLE_DESCRIPTORS = Object.freeze({
     snippetExpr: `substring(coalesce(title,''), 1, 300)`,
     hasFts: false,
     whereExtra: null,
+    requiredColumns: ['id', 'title', 'project_id', EMBEDDING_COLUMN],
   },
   checklist_items: {
     idExpr: 'id',
@@ -135,6 +219,7 @@ const TABLE_DESCRIPTORS = Object.freeze({
     snippetExpr: `substring(coalesce(description, title, ''), 1, 300)`,
     hasFts: false,
     whereExtra: null,
+    requiredColumns: ['id', 'title', 'description', 'project_id', EMBEDDING_COLUMN],
   },
   corpus_files: {
     idExpr: 'id',
@@ -142,6 +227,7 @@ const TABLE_DESCRIPTORS = Object.freeze({
     snippetExpr: `substring(coalesce(summary, path, ''), 1, 300)`,
     hasFts: false,
     whereExtra: null,
+    requiredColumns: ['id', 'path', 'summary', 'project_id', EMBEDDING_COLUMN],
   },
   workflow_discovery: {
     idExpr: 'id',
@@ -149,6 +235,7 @@ const TABLE_DESCRIPTORS = Object.freeze({
     snippetExpr: `substring(coalesce(detail, title, ''), 1, 300)`,
     hasFts: false,
     whereExtra: null,
+    requiredColumns: ['id', 'title', 'detail', 'project_id', EMBEDDING_COLUMN],
   },
   agent_rewrites: {
     idExpr: 'id',
@@ -156,6 +243,7 @@ const TABLE_DESCRIPTORS = Object.freeze({
     snippetExpr: `substring(coalesce(gap, as_is, ''), 1, 300)`,
     hasFts: false,
     whereExtra: null,
+    requiredColumns: ['id', 'agent_name', 'gap', 'as_is', 'project_id', EMBEDDING_COLUMN],
   },
   policy_sections: {
     idExpr: 'id',
@@ -163,6 +251,7 @@ const TABLE_DESCRIPTORS = Object.freeze({
     snippetExpr: `substring(coalesce(content,''), 1, 300)`,
     hasFts: false,
     whereExtra: null,
+    requiredColumns: ['id', 'section_title', 'doc_id', 'content', 'project_id', EMBEDDING_COLUMN],
   },
   session_chunks: {
     idExpr: 'id',
@@ -170,6 +259,7 @@ const TABLE_DESCRIPTORS = Object.freeze({
     snippetExpr: `substring(coalesce(content,''), 1, 300)`,
     hasFts: false,
     whereExtra: null,
+    requiredColumns: ['id', 'chunk_kind', 'content', 'project_id', EMBEDDING_COLUMN],
   },
 });
 
@@ -179,7 +269,8 @@ class MemorySearchError extends Error {
   constructor(code, message, details) {
     super(message);
     this.name = 'MemorySearchError';
-    this.code = code; // 'unknownTable' | 'validation'
+    // 'unknownTable' | 'validation' | 'connectionError'
+    this.code = code;
     this.details = details || null;
   }
 }
@@ -228,13 +319,138 @@ function buildTableQuery(table) {
 }
 
 /**
+ * classifyQueryError — sorts a thrown client.query() error into the S4
+ * total classification: connection-class (escalate, never a per-table
+ * skip) vs. ordinary query error (per-table skip), and tags the
+ * extension-absent sub-case.
+ */
+function classifyQueryError(err) {
+  const code = err && typeof err.code === 'string' ? err.code : null;
+  const errClass = code ? code.slice(0, 2) : null;
+  return {
+    code,
+    isConnectionClass: errClass !== null && CONNECTION_ERROR_CLASSES.has(errClass),
+    isExtensionAbsent: code !== null && EXTENSION_ABSENT_SQLSTATES.has(code),
+  };
+}
+
+/**
+ * probeTableAvailability — the S1-S2 per-table gate. For each candidate
+ * table, resolves exactly one of 'table_missing' | 'column_missing' | 'ok'.
+ *
+ * Runs on the SAME `client` the live queries below run on (see module
+ * header §8: this codebase's only production `client` is a single
+ * `pg.Client`, never a `Pool`), so `schemaObjectsExist`'s
+ * `current_schema()` and `checkColumnShape`'s `::regclass` resolution
+ * already share the live queries' session/search_path with no additional
+ * schema-qualification needed.
+ *
+ * A bare pg Client/Pool with neither `schemaObjectsExist` nor
+ * `checkColumnShape` (no db-seam.js wrapper) degrades to "assume every
+ * candidate exists, skip shape checks" — unchanged legacy behavior for any
+ * such caller, same as before this rewrite.
+ *
+ * @returns {Promise<Map<string, {status:'ok'|'table_missing'|'column_missing', detail?:object}>>}
+ */
+async function probeTableAvailability(client, tables) {
+  const result = new Map();
+
+  if (typeof client.schemaObjectsExist !== 'function') {
+    for (const t of tables) result.set(t, { status: 'ok' });
+    return result;
+  }
+
+  const columnsExpected = [];
+  for (const t of tables) {
+    for (const c of TABLE_DESCRIPTORS[t].requiredColumns) columnsExpected.push({ table: t, column: c });
+  }
+
+  const { missing } = await client.schemaObjectsExist({ tables, columns: columnsExpected });
+
+  // schemaObjectsExist's own documented contract is "never throws" — a
+  // probe-level failure (e.g. a dead connection) is instead reported as a
+  // synthetic {type:'error'} entry. Fanning THAT out as 15 per-table
+  // column_missing skips would be exactly the misleading behavior S4
+  // forbids for live-query connection errors, so it is treated the same
+  // way here: escalate to a call-level throw.
+  const probeError = missing.find((m) => m.type === 'error');
+  if (probeError) {
+    throw new MemorySearchError(
+      'connectionError',
+      `memory_search: the schema existence probe itself failed (${probeError.message}) — treating as a dead/degraded ` +
+        `connection rather than reporting every candidate table as column_missing`,
+      { message: probeError.message }
+    );
+  }
+
+  const missingTables = new Set(missing.filter((m) => m.type === 'table').map((m) => m.table));
+  const missingColsByTable = new Map();
+  for (const m of missing) {
+    if (m.type !== 'column') continue;
+    if (!missingColsByTable.has(m.table)) missingColsByTable.set(m.table, []);
+    missingColsByTable.get(m.table).push(m.column);
+  }
+
+  const shapeCandidates = [];
+  for (const t of tables) {
+    if (missingTables.has(t)) { result.set(t, { status: 'table_missing' }); continue; }
+    const missingCols = missingColsByTable.get(t);
+    if (missingCols && missingCols.length) {
+      result.set(t, { status: 'column_missing', detail: { columns: missingCols.slice() } });
+      continue;
+    }
+    shapeCandidates.push(t);
+  }
+
+  if (typeof client.checkColumnShape === 'function') {
+    for (const t of shapeCandidates) {
+      const d = TABLE_DESCRIPTORS[t];
+      const mismatchedColumns = [];
+
+      const embShape = await client.checkColumnShape(t, EMBEDDING_COLUMN);
+      // checkColumnShape returns null on ANY probe failure (including
+      // "column does not exist", already ruled out above by the column
+      // existence probe) — per its own contract, null is NEVER treated as
+      // a mismatch, only an actual shape disagreement is.
+      if (embShape && (embShape.type !== EMBEDDING_SHAPE.type || embShape.dims !== EMBEDDING_SHAPE.dims)) {
+        mismatchedColumns.push({ column: EMBEDDING_COLUMN, expected: EMBEDDING_SHAPE, actual: embShape });
+      }
+
+      if (d.hasFts) {
+        const ftsShape = await client.checkColumnShape(t, FTS_COLUMN);
+        if (ftsShape && ftsShape.type !== FTS_SHAPE_TYPE) {
+          mismatchedColumns.push({ column: FTS_COLUMN, expected: { type: FTS_SHAPE_TYPE }, actual: ftsShape });
+        }
+      }
+
+      if (mismatchedColumns.length) {
+        result.set(t, {
+          status: 'column_missing',
+          detail: { columns: mismatchedColumns.map((m) => m.column), subReason: 'type_mismatch', mismatches: mismatchedColumns },
+        });
+      } else {
+        result.set(t, { status: 'ok' });
+      }
+    }
+  } else {
+    for (const t of shapeCandidates) result.set(t, { status: 'ok' });
+  }
+
+  return result;
+}
+
+/**
  * memorySearch — §8/§10.1/§10.3.
  *
  * @param {object} client — pg client/pool
  * @param {object} args
  * @param {string} args.projectId
  * @param {string} args.query — free-text query
- * @param {string[]} [args.tables] — subset of ALLOWED_TABLES; default = all
+ * @param {string[]} [args.tables] — subset of ALLOWED_TABLES. Omitted ->
+ *   every ALLOWED_TABLES entry is a candidate. An explicit `[]` is NOT the
+ *   same as omitted — it means zero candidates, and returns immediately
+ *   with `hits: []`, `allSkipped: false` (nothing was skipped; nothing was
+ *   asked for either).
  * @param {number} [args.limit] — default 10, applied per-table AND to the
  *   final merged result (see module header for why fetching `limit` per
  *   table is sufficient to recover the true global top-`limit`)
@@ -242,29 +458,18 @@ function buildTableQuery(table) {
  *   injectable embedder seam (same rationale as write-time-embed.js's own
  *   `opts.embedder`) — production call sites never pass this; CI (no live
  *   vLLM) injects a deterministic mock.
- * TABLE EXISTENCE (2026-09-08, PR #274 review): ALLOWED_TABLES is a closed
- * ENUM of tables this module knows how to query — it says nothing about
- * whether a given connected DB has actually applied the migration that
- * creates a particular table (e.g. agent_exchange / migrate-13, or the
- * migrate-14 seam tables, on a project DB that predates those migrations).
- * Before running any per-table query, the candidate table list (whether
- * caller-supplied via `args.tables` or defaulted to the full enum) is
- * checked against the CONNECTED DB via the seam's own `schemaObjectsExist`
- * (scripts/lib/db-seam.js — the same probe ensureSchemaCurrent's post-apply
- * verification gate uses; not a second existence-check implementation).
- * This is a TOTAL classification applied uniformly to every candidate table
- * — never a special case naming any one table: present -> queried; absent
- * -> skipped and reported in the result's `skippedTables`, never fatal to
- * the whole search. An explicitly-requested table (`args.tables` names it)
- * that turns out to be missing is skipped the same way, not thrown — only
- * an UNKNOWN table name (outside the ALLOWED_TABLES enum entirely) is a
- * hard error, unchanged from before. If every candidate table is missing,
- * the embed call is skipped entirely (nothing to search) and an
- * empty-hits result is returned with every candidate listed in
- * `skippedTables`.
  *
- * @returns {Promise<{ hits: Array, tablesSearched: string[], skippedTables: string[] }>}
- * @throws {MemorySearchError} 'unknownTable' | 'validation'
+ * AVAILABILITY GATE — see module header. Every candidate table lands in
+ * exactly one of: queried (tablesSearched) | table_missing | column_missing
+ * | query_error (skippedTables, each `{table, reason, detail}`). A
+ * connection-class query error (SQLSTATE class 08/28), a probe-level
+ * failure, or an identical SQLSTATE recurring on ≥2 tables escalates to a
+ * thrown MemorySearchError('connectionError', ...) instead of fanning out
+ * per-table skips — never fatal for an ordinary per-table schema gap, but
+ * NOT silently swallowed when the connection itself is the problem.
+ *
+ * @returns {Promise<{ hits: Array, tablesSearched: string[], skippedTables: Array<{table:string, reason:string, detail?:object}>, allSkipped: boolean }>}
+ * @throws {MemorySearchError} 'unknownTable' | 'validation' | 'connectionError'
  */
 async function memorySearch(client, args) {
   const { projectId, query } = args || {};
@@ -276,7 +481,19 @@ async function memorySearch(client, args) {
   }
   const limit = Number.isInteger(args.limit) && args.limit > 0 ? args.limit : 10;
 
-  const candidateTables = Array.isArray(args.tables) && args.tables.length ? args.tables : ALLOWED_TABLES.slice();
+  // Total classification of `args.tables`: omitted -> full enum; an array
+  // (including an explicit empty one) -> exactly that array; anything else
+  // -> a hard validation error. `tables: []` is deliberately NOT coerced to
+  // the full enum (S3/finding #5) — it is zero candidates, reported below.
+  let candidateTables;
+  if (args.tables === undefined) {
+    candidateTables = ALLOWED_TABLES.slice();
+  } else if (Array.isArray(args.tables)) {
+    candidateTables = args.tables.slice();
+  } else {
+    throw new MemorySearchError('validation', 'memory_search: tables, when provided, must be an array of table names');
+  }
+
   const unknown = candidateTables.filter((t) => !ALLOWED_TABLES.includes(t));
   if (unknown.length) {
     throw new MemorySearchError(
@@ -286,27 +503,27 @@ async function memorySearch(client, args) {
     );
   }
 
-  // Total-classification existence probe (see module-header note above).
-  // client.schemaObjectsExist is a db-seam.js PostgresAdapter/SQLiteAdapter
-  // method; guarded with a typeof check so a bare pg Client/Pool (no seam
-  // wrapper) degrades to "assume every candidate exists" rather than
-  // throwing — unchanged behavior for any such caller.
-  let tables = candidateTables;
-  let skippedTables = [];
-  if (typeof client.schemaObjectsExist === 'function') {
-    const { missing } = await client.schemaObjectsExist({ tables: candidateTables });
-    const missingSet = new Set(missing.filter((m) => m.type === 'table').map((m) => m.table));
-    if (missingSet.size > 0) {
-      skippedTables = candidateTables.filter((t) => missingSet.has(t));
-      tables = candidateTables.filter((t) => !missingSet.has(t));
-    }
+  if (candidateTables.length === 0) {
+    // Explicit `tables: []` — zero candidates is not "everything" and not
+    // a degraded search either; nothing was requested, so nothing was
+    // skipped.
+    return { hits: [], tablesSearched: [], skippedTables: [], allSkipped: false };
+  }
+
+  const skippedTables = [];
+  const availability = await probeTableAvailability(client, candidateTables);
+  const tables = [];
+  for (const t of candidateTables) {
+    const a = availability.get(t) || { status: 'ok' };
+    if (a.status === 'ok') tables.push(t);
+    else skippedTables.push({ table: t, reason: a.status, detail: a.detail || null });
   }
 
   if (tables.length === 0) {
-    // Every candidate table is missing from this DB — nothing to search.
-    // Skip the embed call entirely (no point embedding a query with no
-    // table to run it against) and report every candidate as skipped.
-    return { hits: [], tablesSearched: [], skippedTables };
+    // Every candidate table is missing or shape-mismatched — nothing to
+    // search. Skip the embed call entirely (no point embedding a query with
+    // no table to run it against) and report every candidate as skipped.
+    return { hits: [], tablesSearched: [], skippedTables, allSkipped: true };
   }
 
   const embedFn = args.embedder || embedQuery; // fail-loud by embed.js's own contract (or the injected mock)
@@ -324,11 +541,48 @@ async function memorySearch(client, args) {
   // (flatten + re-sort + slice) is unchanged.
   const valuesByKey = { vector: vectorLiteral, query, projectId, limit };
   const perTableResults = [];
+  const tablesSearched = [];
+  const codeOccurrences = new Map();
   for (const table of tables) {
     const { sql, paramKeys } = buildTableQuery(table);
     const values = paramKeys.map((k) => valuesByKey[k]);
-    const { rows } = await client.query(sql, values);
-    perTableResults.push(rows);
+    try {
+      const { rows } = await client.query(sql, values);
+      perTableResults.push(rows);
+      tablesSearched.push(table);
+    } catch (err) {
+      const { code, isConnectionClass, isExtensionAbsent } = classifyQueryError(err);
+      if (isConnectionClass) {
+        throw new MemorySearchError(
+          'connectionError',
+          `memory_search: connection-class error (SQLSTATE ${code || 'unknown'}) on table "${table}" aborted the ` +
+            `whole call rather than being reported as a per-table skip: ${err.message}`,
+          { table, code, message: err.message }
+        );
+      }
+      if (code) {
+        const occurrences = (codeOccurrences.get(code) || 0) + 1;
+        codeOccurrences.set(code, occurrences);
+        if (occurrences >= 2) {
+          throw new MemorySearchError(
+            'connectionError',
+            `memory_search: SQLSTATE ${code} recurred on ${occurrences} tables — treating this as a dead/degraded ` +
+              `connection or missing shared dependency (e.g. the pgvector extension) rather than fanning out a ` +
+              `per-table skip for every remaining table: ${err.message}`,
+            { table, code, message: err.message, occurrences }
+          );
+        }
+      }
+      skippedTables.push({
+        table,
+        reason: 'query_error',
+        detail: {
+          sqlstate: code,
+          message: err.message,
+          ...(isExtensionAbsent ? { subReason: 'extension_absent' } : {}),
+        },
+      });
+    }
   }
 
   const allHits = perTableResults.flat();
@@ -342,15 +596,20 @@ async function memorySearch(client, args) {
       snippet: r.snippet,
       score: Number(r.score),
     })),
-    tablesSearched: tables,
+    tablesSearched,
     skippedTables,
+    allSkipped: candidateTables.length > 0 && tablesSearched.length === 0,
   };
 }
 
 module.exports = {
   TABLE_DESCRIPTORS,
   ALLOWED_TABLES,
+  EMBEDDING_COLUMN,
+  FTS_COLUMN,
   MemorySearchError,
   buildTableQuery,
+  probeTableAvailability,
+  classifyQueryError,
   memorySearch,
 };

@@ -817,8 +817,9 @@ jobs:
         # to the shared verifyAddenda derivation layer entirely — cm#208 — and
         # are now derived + verified there too, decisions_project_topic_unique
         # with a unique:true flag; migrate-15's own checkIndexByName calls stay,
-        # belt-and-braces) and scripts/migrations/verify-20-mcp-surface.js (28
-        # checks (cm#231: was 27) covering every new §8 direct-pg tool's underlying library
+        # belt-and-braces) and scripts/migrations/verify-20-mcp-surface.js (29
+        # checks (cm#231: was 27->28; memory-search per-table-gate PR: 28->29)
+        # covering every new §8 direct-pg tool's underlying library
         # function, plus a real stdio MCP round-trip proving all 30
         # handoff-mcp.mjs tools register and one is independently callable
         # end-to-end through mcp-db-connect.js + ensureProjectIdentity against a
@@ -831,7 +832,8 @@ jobs:
         # live vLLM (Qwen3-Embedding-8B) locally before authoring this fallback.
         # Covers: fresh full-stack apply (migrate-01 -> addenda -> migrate-13 ->
         # migrate-14 -> migrate-13 re-apply -> migrate-15) -> verify-20 exit 0 +
-        # SMOKE20_RESULT: PASS with all 28 numbered checks (cm#231: was 27) + the MCP-registration
+        # SMOKE20_RESULT: PASS with all 29 numbered checks (cm#231: was 27->28; memory-search
+        # per-table-gate PR: 28->29) + the MCP-registration
         # check green, clean residue scan; migrate-15 not yet applied -> verify-20
         # refusal naming migrate-15-mcp-addenda.js; migrate-15 idempotent
         # re-apply; plus 6 DB-free pure-unit Group B checks (memory_search's
@@ -842,6 +844,28 @@ jobs:
         # Creates/drops its own _staging-suffixed scratch DBs; never touches
         # claude_memory_eval_test/memory_manager_staging.
         run: node test/migrations/test-verify-20.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: Run memory-search per-table availability gate tests (2026-09-09)
+        # scripts/test-memory-search-gate.js — regression coverage for the
+        # memory_search per-table gate rewrite: (A) a static drift test
+        # proving every TABLE_DESCRIPTORS entry's requiredColumns is a
+        # superset of every column its own expression strings reference;
+        # (B) mocked-client unit tests for tables:[] (explicit-empty is not
+        # "everything"), column_missing (incl. checkColumnShape
+        # type_mismatch), table_missing, query_error (incl. the
+        # extension_absent sub-case), connection-class-error and
+        # identical-SQLSTATE-recurrence escalation to a call-level throw
+        # (never a 15-way per-table skip fan-out), and allSkipped; (C) a
+        # live-Postgres reproduction of the actual cm#224/#225 degraded-
+        # schema bug this PR fixes (handoff-core-schema.sql applied WITHOUT
+        # pgvector leaves assertions.embedding absent) plus the pgvector-
+        # enabled "ok" path for contrast. Creates/drops its own
+        # cm_msearch_gate_*-prefixed scratch databases; never touches
+        # claude_memory_eval_test/memory_manager_staging.
+        run: node scripts/test-memory-search-gate.js
         env:
           PGHOST: localhost
           PGUSER: postgres
