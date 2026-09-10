@@ -1488,8 +1488,13 @@ const handoffLib = require('./handoff.js');
       KEY_PATHS_HANDOFF_PATH: bullets.handoffPath,
       KEY_PATHS_HELPER_PATH: bullets.helperPath,
     });
-    const hash = require('crypto').createHash('sha256').update(out, 'utf8').digest('hex');
-    const EXPECTED = '263f74b838d5b488554e3df65d3c68246add617883f5ed80a7d6ef63731ea9f6';
+    // LF-normalize before hashing — checkout line endings vary by platform
+    // (core.autocrlf on Windows vs. a plain LF checkout on Linux CI) and are
+    // not part of what this test is pinning; only the substituted CONTENT
+    // must be byte-identical to today.
+    const normalized = out.replace(/\r\n/g, '\n');
+    const hash = require('crypto').createHash('sha256').update(normalized, 'utf8').digest('hex');
+    const EXPECTED = '5c9e6685573b0d209fc3cb277b92e0f6625b01e5d29af967e981a478ad639bde';
     if (hash !== EXPECTED) fail(label, `Claude template output changed — expected sha256 ${EXPECTED}, got ${hash}. If this change is intentional, this test's pin must be updated deliberately, never silently.`);
     else pass(label);
   } finally { restoreEnv('HANDOFF_BASE_DIR', savedBase); restoreEnv('CLAUDE_PLUGIN_ROOT', savedPlugin); }
