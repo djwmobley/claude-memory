@@ -78,10 +78,48 @@ const MCP_SERVER_NAME = 'handoff';
 // process parses it — verified via a real spawned `codex mcp add` and
 // inspecting the child's own `process.argv`. Every args element that needs
 // it is now quoted here, alongside the pre-existing `command` quoting.
+/**
+ * Quote a single argv token for inclusion in a shell:true command line.
+ * Naively wrapping in double quotes and escaping only embedded quotes (the
+ * first cut at this fix) is an INCOMPLETE escape on Windows: a run of
+ * backslashes immediately preceding a quote (or the end of the string, since
+ * the whole token is itself wrapped in a trailing quote) must be doubled, or
+ * the CRT command-line parser used by cmd.exe/node.exe collapses them and
+ * can shift or drop the closing quote — this is the same algorithm Node's
+ * own child_process uses internally to quote argv entries (see
+ * child_process.js's `_convertToValidWin32ArgIfNecessary`), needed here
+ * because shell:true bypasses that internal path entirely.
+ */
+function quoteShellArgWin32(s) {
+  if (!/[\s"]/.test(s)) return s;
+  let result = '"';
+  let backslashes = 0;
+  for (const ch of s) {
+    if (ch === '\\') {
+      backslashes++;
+      continue;
+    }
+    if (ch === '"') {
+      result += '\\'.repeat(backslashes * 2 + 1) + '"';
+      backslashes = 0;
+      continue;
+    }
+    result += '\\'.repeat(backslashes) + ch;
+    backslashes = 0;
+  }
+  result += '\\'.repeat(backslashes * 2) + '"';
+  return result;
+}
+
+/** POSIX /bin/sh quoting: single-quote wrapping, embedded quotes escaped via '\''. */
+function quoteShellArgPosix(s) {
+  if (!/[\s"'$`\\]/.test(s)) return s;
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
 function quoteShellArg(token) {
   const s = String(token);
-  if (!/[\s"]/.test(s)) return s;
-  return `"${s.replace(/"/g, '\\"')}"`;
+  return process.platform === 'win32' ? quoteShellArgWin32(s) : quoteShellArgPosix(s);
 }
 
 function spawnSync(command, args, opts) {
