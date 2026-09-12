@@ -37,7 +37,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 // annotations/schema, never the handler code itself. Importing the module
 // this way does NOT start a stdio server (see handoff-mcp.mjs's isDirectRun
 // guard at the bottom of that file).
-import { buildServer } from './handoff-mcp.mjs';
+import { buildServer, actionableUsageSchemaError, libToolError } from './handoff-mcp.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -198,42 +198,122 @@ async function runUsageTelemetryChecks() {
 
   const stamp = Date.now();
 
-  // migrate-11-usage-telemetry.sql (schema-setup-only, idempotent
-  // `CREATE TABLE IF NOT EXISTS`, no FK dependencies) is NOT part of the
-  // base schema-manifest.json this repo ships today -- a freshly-`init`ed
-  // throwaway project genuinely lacks turn_usage/session_usage out of the
-  // box, which is exactly check (a)'s real-world reproduction (no DROP TABLE
-  // needed at all). Checks (b)/(c)/(d) need a DB that DOES have turn_usage,
-  // so they apply this migration SQL directly to their own throwaway DB --
-  // running an existing migration file's SQL against a scratch fixture, same
-  // as test-pg-helpers.js's own applySchema() does for the base schema, never
-  // editing scripts/migrations/* (that tree is out of scope for this PR).
+  // usage-telemetry-schema.sql (schema-setup-only, idempotent `CREATE TABLE
+  // IF NOT EXISTS`, no FK dependencies) -- PR #298 (feat(schema): telemetry
+  // + feature_usage DDL in schema manifest, epoch 5) moved this file from
+  // scripts/migrations/sql/migrate-11-usage-telemetry.sql to scripts/sql/
+  // and registered it in scripts/sql/schema-manifest.json so
+  // ensureSchemaCurrent's init/heal-on-touch path now applies it to every
+  // live project DB directly -- it is no longer a standalone migration file
+  // outside the base schema (path fixed here, fix/usage-record-marker-
+  // fallback: the stale scripts/migrations/sql path this block referenced
+  // pre-#298 no longer exists, which made every usage-telemetry check in
+  // this file ENOENT before even connecting to a DB). Checks (b)/(c)/(d)/(g)
+  // apply this SQL directly to their own throwaway DB the same way
+  // test-pg-helpers.js's own applySchema() does for the base schema, so
+  // they still exercise a DB with turn_usage even if a future schema-
+  // manifest change makes it redundant with `setupProject`'s own init.
   const USAGE_MIGRATION_SQL = fs.readFileSync(
-    path.join(__dirname, 'migrations', 'sql', 'migrate-11-usage-telemetry.sql'),
+    path.join(__dirname, 'sql', 'usage-telemetry-schema.sql'),
     'utf8'
   );
 
-  // (a) usage_query against a freshly-init'ed DB, which genuinely lacks
-  // turn_usage (see above) -> actionable error text, never a raw pg stack
-  // trace ("at Client..." frames).
+  // (a) fix/usage-record-marker-fallback (2026-09-12): PR #298 registered
+  // usage-telemetry-schema.sql in the base scripts/sql/schema-manifest.json
+  // (epoch 5), so ensureSchemaCurrent's init/heal-on-touch path (run by
+  // withProjectDb on EVERY §8/§18 tool call, before the tool's own query
+  // ever executes) now recreates turn_usage/session_usage/feature_usage on
+  // any live engine DB behind epoch 5, INCLUDING one this test just DROPped
+  // the table from -- the "a DB genuinely lacking turn_usage" premise UT-A
+  // used to test is no longer reachable through a live MCP call on a
+  // current engine (heal-on-touch wins the race every time; verified: this
+  // exact DROP-then-call sequence went from FAIL to a false PASS once #298
+  // shipped, because usage_query started succeeding with an empty result
+  // instead of erroring). The 42P01 mapping (actionableUsageSchemaError,
+  // exported by handoff-mcp.mjs) is now a backstop for engines behind epoch
+  // 5 or mid-race, not a live path this selftest can drive end-to-end --
+  // so UT-A1..UT-A6 below test that mapping DIRECTLY with synthetic error
+  // objects (no DB, no MCP round-trip), and UT-A7 replaces the old live
+  // scenario with the actual current behavior: a fresh engine DB answers
+  // usage_query cleanly, never erroring, never healing mid-call.
+  //
+  // UT-A1..UT-A3: each usage-telemetry relation maps to actionable text
+  // that names the relation and points at the remedy ("init") -- never a
+  // raw pg stack frame.
   {
-    const dbName = `test_usage_mcp_missing_${stamp}`;
-    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-mcp-missing-'));
-    const label = 'UT-A: usage_query against a DB lacking turn_usage returns the actionable string, no raw pg stack';
+    const cases = [
+      ['turn_usage', 'UT-A1'],
+      ['session_usage', 'UT-A2'],
+      ['feature_usage', 'UT-A3'],
+    ];
+    for (const [relation, id] of cases) {
+      const label = `${id}: synthetic 42P01 on "${relation}" maps to actionable text (names the relation, points at init, no raw stack frame)`;
+      const err = { code: '42P01', message: `relation "${relation}" does not exist` };
+      const mapped = actionableUsageSchemaError(err, { database: 'ut-a-synthetic-db', schemaReason: 'current' });
+      const namesRelation = typeof mapped.message === 'string' && mapped.message.includes(relation);
+      const pointsAtRemedy = typeof mapped.message === 'string' && (mapped.message.includes('epoch') || mapped.message.includes('init'));
+      const noRawStackFrame = typeof mapped.message === 'string' && !mapped.message.includes('at Client');
+      check(label, mapped !== err && namesRelation && pointsAtRemedy && noRawStackFrame);
+    }
+  }
+
+  // UT-A4: a 42P01 on a relation this helper does NOT own (project_settings)
+  // is passed through completely unchanged -- adversary G5, never fabricate
+  // a schema-behind remedy for an unrecognized relation.
+  {
+    const label = 'UT-A4: synthetic 42P01 on "project_settings" (not a usage-telemetry relation) passes through unchanged';
+    const err = { code: '42P01', message: 'relation "project_settings" does not exist' };
+    const mapped = actionableUsageSchemaError(err, { database: 'ut-a-synthetic-db', schemaReason: 'current' });
+    check(label, mapped === err);
+  }
+
+  // UT-A5: a non-42P01 pg error code is left completely unchanged.
+  {
+    const label = 'UT-A5: synthetic 23505 (unique_violation) passes through unchanged';
+    const err = { code: '23505' };
+    const mapped = actionableUsageSchemaError(err, { database: 'ut-a-synthetic-db', schemaReason: 'current' });
+    check(label, mapped === err);
+  }
+
+  // UT-A6: libToolError renders a named-but-codeless lib error (usage-
+  // telemetry.js's CostOutOfRangeError -- no `.code`, name set on the
+  // instance rather than via a real subclass) by its actual name, never
+  // falls through to a generic "[undefined]"-shaped stack dump.
+  {
+    const label = 'UT-A6: libToolError renders a CostOutOfRangeError by name, not "[undefined]"';
+    const err = new Error('cost 999.99 exceeds configured ceiling');
+    err.name = 'CostOutOfRangeError';
+    const result = libToolError(err);
+    const text = result.content[0].text;
+    check(label, result.isError === true && text.includes('CostOutOfRangeError') && !text.includes('[undefined]'));
+  }
+
+  // UT-A7 (replaces the old live UT-A scenario): the REAL post-#298
+  // behavior -- a fresh engine DB provisioned by ensureSchemaCurrent (via
+  // setupProject's `handoff.js init`, epoch 5) already has feature_usage,
+  // so usage_query at granularity="feature" against it never errors and
+  // never needs a heal-on-touch mid-call; it answers with an empty result
+  // because no feature_usage rows exist yet on this brand-new DB.
+  {
+    const dbName = `test_usage_mcp_fresh_${stamp}`;
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-mcp-fresh-'));
+    const label = 'UT-A7: usage_query granularity="feature" against a fresh engine DB returns an empty result, no error';
     try {
       await pgHelpers.createTestDb(dbName, projectDir);
       await pgHelpers.setupProject(dbName, projectDir);
 
       await withMcpClient({ HANDOFF_DB: dbName, CLAUDE_CODE_SESSION_ID: undefined, CODEX_THREAD_ID: undefined }, async (client) => {
-        // sessionId given -> the turn_usage-scoped path (usageQuerySessionScoped),
-        // so the missing relation is turn_usage specifically, not session_usage's
-        // rollup path (sessionId omitted would hit session_usage instead -- also
-        // covered by this same helper, just a different relation name).
-        const result = await client.callTool({ name: 'usage_query', arguments: { projectRoot: projectDir, sessionId: 'ut-a-session' } });
-        const text = result.content[0].text;
-        const hasActionableText = text.includes('turn_usage is missing in') && text.includes('ensureSchemaCurrent reason=');
-        const hasRawStackFrame = text.includes('at Client');
-        check(label, result.isError === true && hasActionableText && !hasRawStackFrame);
+        const result = await client.callTool({
+          name: 'usage_query',
+          arguments: { projectRoot: projectDir, granularity: 'feature' },
+        });
+        let rows;
+        try {
+          rows = result.isError ? null : JSON.parse(result.content[0].text).rows;
+        } catch {
+          rows = null;
+        }
+        check(label, result.isError !== true && Array.isArray(rows) && rows.length === 0);
       });
     } catch {
       check(label, false);
@@ -352,8 +432,119 @@ async function runUsageTelemetryChecks() {
           }
         );
       }
+
+      // (g) fix/usage-record-marker-fallback: sessionId omitted, NEITHER env
+      // id set, but a live project session_in_progress marker IS present ->
+      // writes under the marker's session_id. This is the real Codex e2e
+      // gap this PR fixes -- Codex's MCP server env carries no
+      // CODEX_THREAD_ID at all (config.toml's `env` table for this server
+      // only ever sets HANDOFF_HOST/HANDOFF_PROMOTION_FILE), so the marker
+      // fallback (resolveSessionIdFromMarker, scripts/lib/session-identity.js)
+      // is the path that actually serves Codex here -- same marker
+      // handoff.js's own resolveSessionId and handoff_status already share.
+      // Boolean-only assertion below (CodeQL js/clear-text-logging) -- the
+      // marker session id is never logged, only compared.
+      {
+        // Codex review C1 (fix/usage-record-marker-fallback follow-up): this
+        // case now also asserts session_id_source === "marker" -- the
+        // provenance field the strict marker default (C1) added to every
+        // usage_record result, distinguishing "resolved from env" from
+        // "resolved from a project marker" without ever logging the id
+        // itself (CodeQL js/clear-text-logging -- the boolean-only
+        // assertion pattern below is unchanged).
+        const label = 'UT-G: usage_record with no sessionId and no env ids, marker present -> row written under the marker id, source=marker';
+        const markerSessionId = 'marker-sess-ut-g';
+        const projectId = pgHelpers.resolveProjectId(projectDir);
+        const markerDb = await pgHelpers.pgConnect(dbName);
+        try {
+          await pgHelpers.setSetting(
+            markerDb, projectId, 'session_in_progress',
+            JSON.stringify([{ session_id: markerSessionId, ts: new Date().toISOString(), host: 'codex' }])
+          );
+        } finally {
+          await markerDb.end();
+        }
+        try {
+          await withMcpClient(
+            { HANDOFF_DB: dbName, HANDOFF_HOST: undefined, CLAUDE_CODE_SESSION_ID: undefined, CODEX_THREAD_ID: undefined },
+            async (client) => {
+              const result = await client.callTool({
+                name: 'usage_record',
+                arguments: { projectRoot: projectDir, turnIdx: 6, agentRole: 'ut-role', tokensIn: 10, tokensOut: 5 },
+              });
+              const row = result.isError ? null : JSON.parse(result.content[0].text);
+              check(
+                label,
+                !result.isError && row.sessionId === markerSessionId &&
+                  row.session_id_source === 'marker' && typeof row.marker_ts === 'string'
+              );
+            }
+          );
+        } finally {
+          // Clear the marker so it never leaks into a later check sharing this DB.
+          const cleanupDb = await pgHelpers.pgConnect(dbName);
+          try {
+            await cleanupDb.query(
+              `DELETE FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'`,
+              [projectId]
+            );
+          } finally {
+            await cleanupDb.end();
+          }
+        }
+      }
+
+      // (h) Codex review C1: TWO live project markers -> the strict marker
+      // default refuses to guess between them (ambiguous), a hard error
+      // naming only the count -- never a session id (CodeQL js/clear-text-
+      // logging: the assertion below checks for the fixed literal substring
+      // "ambiguous session markers (2)" and the ABSENCE of either marker id
+      // in the error text, never logs an id itself).
+      {
+        const label = 'UT-H: usage_record with no sessionId, no env ids, TWO project markers -> ambiguous hard error, no id leaked';
+        const markerIdA = 'marker-sess-ut-h-a';
+        const markerIdB = 'marker-sess-ut-h-b';
+        const projectId = pgHelpers.resolveProjectId(projectDir);
+        const markerDb = await pgHelpers.pgConnect(dbName);
+        try {
+          await pgHelpers.setSetting(
+            markerDb, projectId, 'session_in_progress',
+            JSON.stringify([
+              { session_id: markerIdA, ts: new Date().toISOString(), host: 'claude' },
+              { session_id: markerIdB, ts: new Date().toISOString(), host: 'codex' },
+            ])
+          );
+        } finally {
+          await markerDb.end();
+        }
+        try {
+          await withMcpClient(
+            { HANDOFF_DB: dbName, HANDOFF_HOST: undefined, CLAUDE_CODE_SESSION_ID: undefined, CODEX_THREAD_ID: undefined },
+            async (client) => {
+              const result = await client.callTool({
+                name: 'usage_record',
+                arguments: { projectRoot: projectDir, turnIdx: 7, agentRole: 'ut-role', tokensIn: 10, tokensOut: 5 },
+              });
+              const text = result.content[0]?.text ?? '';
+              const rejectedProperly = result.isError === true && text.includes('ambiguous session markers (2)');
+              const leaked = text.includes(markerIdA) || text.includes(markerIdB);
+              check(label, rejectedProperly && !leaked);
+            }
+          );
+        } finally {
+          const cleanupDb = await pgHelpers.pgConnect(dbName);
+          try {
+            await cleanupDb.query(
+              `DELETE FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'`,
+              [projectId]
+            );
+          } finally {
+            await cleanupDb.end();
+          }
+        }
+      }
     } catch {
-      check('UT-BCD: setup/execution', false);
+      check('UT-BCDEFGH: setup/execution', false);
     } finally {
       await pgHelpers.dropTestDb(dbName, projectDir);
     }

@@ -41,7 +41,13 @@ const { ensureProjectIdentity } = require('./lib/project-identity.js');
 // CLAUDE_CODE_SESSION_ID -> CODEX_THREAD_ID, host='codex' preferring
 // CODEX_THREAD_ID on a differing pair) — never a second hand-rolled
 // implementation for the MCP path (adversary G2).
-const { resolveSessionIdFromEnv } = require('./lib/session-identity.js');
+// resolveUsageRecordMarkerDefault (Codex review C1/C2, fix/usage-record-
+// marker-fallback follow-up): the STRICT, usage_record-ONLY marker default
+// — total classification over host-filtered candidate markers, distinct
+// from resolveSessionIdFromMarker (which stays handoff.js's own unchanged
+// third fallback and is no longer used by this file below). See
+// scripts/lib/session-identity.js's header comment for the full rule.
+const { resolveSessionIdFromEnv, resolveUsageRecordMarkerDefault } = require('./lib/session-identity.js');
 // cm#224 (decisions canon fix): the SAME ensureSchemaCurrent handoff.js itself
 // calls from cmdLoaderLoad/cmdClose/cmdInit — never a second implementation.
 // Requiring handoff.js here does NOT run its CLI router: handoff.js's own
@@ -256,7 +262,14 @@ function libErrorTypeName(err) {
  * `.schemaApplyDegraded` record (a gated-column failure during a
  * 'degraded' schema state), it is appended so the MCP caller sees the full
  * degradation record alongside the error, not just the bare message. */
-function libToolError(err) {
+// Exported (fix/usage-record-marker-fallback selftest hardening) so
+// handoff-mcp-selftest.mjs can unit-test the 42P01 mapping and the
+// CostOutOfRangeError name-rendering directly against synthetic error
+// objects, in-process — see that file's "actionableUsageSchemaError /
+// libToolError unit checks" section. This does NOT start a stdio server
+// (see buildServer's own isDirectRun guard at the bottom of this file);
+// importing these two functions is side-effect-free.
+export function libToolError(err) {
   const namedCodes = new Set([
     'MemoryUpsertError', 'MemorySearchError', 'EntityGraphCrudError',
     'MemoryViewError', 'ExchangeLogError', 'RoutingProfileError',
@@ -297,7 +310,7 @@ const USAGE_TELEMETRY_RELATIONS = new Set(['turn_usage', 'session_usage', 'featu
  * 3rd fn argument) -- reused here rather than re-derived, so the message
  * reports the exact classification the engine used, not a guess.
  */
-function actionableUsageSchemaError(err, { database, schemaReason }) {
+export function actionableUsageSchemaError(err, { database, schemaReason }) {
   if (!err || err.code !== '42P01') return err;
   const match = /relation "([^"]+)" does not exist/.exec(err.message || '');
   const relation = match ? match[1] : null;
@@ -895,13 +908,34 @@ async function toolUsageRecord(args) {
       // resolveSessionIdFromEnv (lib/session-identity.js), the SAME
       // CLAUDE_CODE_SESSION_ID -> CODEX_THREAD_ID precedence handoff.js
       // uses everywhere else, keyed off this server's OWN HANDOFF_HOST env
-      // (see resolveHandoffHost() above) -- never a second precedence.
+      // (see resolveHandoffHost() above). If THAT also resolves to nothing,
+      // fall back to resolveUsageRecordMarkerDefault(db, projectId, host) --
+      // Codex review C1 (2026-09-12): the PRIOR marker fallback here
+      // (resolveSessionIdFromMarker, handoff.js's own third fallback)
+      // accepted ANY live project marker, including one written by a
+      // different host or long stale, as a total-classification gap. This
+      // MCP-only stricter rule (see scripts/lib/session-identity.js) parses
+      // markers strictly (malformed JSON excluded, never legacy-parsed),
+      // filters by this server's own HANDOFF_HOST when the surviving
+      // markers carry a host field, and requires EXACTLY ONE surviving
+      // candidate -- zero or more-than-one is a named, ids-never-logged
+      // actionable error -- before giving up. This is still the engine's
+      // overall precedence shape (explicit -> env -> marker), just a
+      // stricter LAST step, and handoff.js's own resolveSessionId /
+      // resolveSessionIdFromMarker are UNTOUCHED by this change (2026-09-12
+      // Codex e2e evidence: Codex's MCP server env carries no
+      // CODEX_THREAD_ID at all -- config.toml's `env` table for this server
+      // only ever sets HANDOFF_HOST/HANDOFF_PROMOTION_FILE -- so the marker
+      // fallback is the path that actually serves Codex here, matching how
+      // handoff_status already resolved a session_id in the same failing
+      // run).
       //
       // Codex review F2 (2026-09-12), total classification (every possible
       // sessionId value maps to exactly one branch, no allow-list):
       //   - sessionId === undefined (the property is genuinely ABSENT from
       //     the call, distinct from a caller-supplied blank) -> default from
-      //     host env, hard error if no env default resolves either.
+      //     host env, then the project session marker, hard error if
+      //     neither resolves.
       //   - sessionId is a string that is empty or whitespace-only (an
       //     EXPLICIT blank value, not an omission) -> reject with the SAME
       //     validation error usage-telemetry.js's own requireNonEmptyString
@@ -913,25 +947,40 @@ async function toolUsageRecord(args) {
       //     "" as falsy and silently substituted the env default here --
       //     fixed.
       //   - sessionId is any other non-blank string -> used verbatim.
+      //
+      // sessionIdSource/markerTs (C1): every branch below records how the
+      // id was resolved, surfaced on the returned row as session_id_source
+      // ("explicit"|"env"|"marker") and, for the marker branch only,
+      // marker_ts -- provenance for callers, never a second identity rule.
       let resolvedSessionId;
+      let sessionIdSource;
+      let markerTs = null;
       if (sessionId === undefined) {
         resolvedSessionId = resolveSessionIdFromEnv(resolveHandoffHost());
-        if (!resolvedSessionId) {
-          throw new Error(
-            'usage_record: sessionId was omitted and no default could be resolved from this MCP server ' +
-            'process\'s own CLAUDE_CODE_SESSION_ID or CODEX_THREAD_ID env vars -- pass sessionId explicitly.'
-          );
+        if (resolvedSessionId) {
+          sessionIdSource = 'env';
+        } else {
+          const markerDefault = await resolveUsageRecordMarkerDefault(db, projectId, resolveHandoffHost());
+          if (markerDefault.error) {
+            throw new Error(markerDefault.error);
+          }
+          resolvedSessionId = markerDefault.sessionId;
+          markerTs = markerDefault.markerTs;
+          sessionIdSource = 'marker';
         }
       } else if (typeof sessionId !== 'string' || sessionId.trim().length === 0) {
         throw new Error(`usage-telemetry: "sessionId" must be a non-empty string (got ${JSON.stringify(sessionId)})`);
       } else {
         resolvedSessionId = sessionId;
+        sessionIdSource = 'explicit';
       }
       try {
         const result = await usageTelemetryLib.usageRecord(db, {
           projectId, sessionId: resolvedSessionId, turnIdx, agentRole, tokensIn, tokensOut, cacheReadTokens, cacheWriteTokens,
           costUsd, modelId, provider, outcome, sourceModel, agentId,
         });
+        result.session_id_source = sessionIdSource;
+        if (sessionIdSource === 'marker') result.marker_ts = markerTs;
         return textResult(result);
       } catch (err) {
         throw actionableUsageSchemaError(err, { database: resolveTargetDbForRoot(projectRoot).name, schemaReason });
@@ -2026,18 +2075,34 @@ export function buildServer() {
         'created (the common resolve-first-measure-after case), or upserts a fresh row if usage is recorded ' +
         'without route_resolve having run first. costUsd omitted computes server-side from model_registry rates ' +
         '(fails soft to NULL, never a guessed price, when the model or its rates are unregistered). ' +
-        'sessionId is optional: OMITTED (the property genuinely absent from the call) defaults to this MCP ' +
-        'server process\'s own CLAUDE_CODE_SESSION_ID env var, then CODEX_THREAD_ID (same precedence handoff.js ' +
-        'uses everywhere else — see scripts/lib/session-identity.js), with CODEX_THREAD_ID preferred when both ' +
-        'are set and differ AND this server\'s own HANDOFF_HOST env var is "codex". An explicit sessionId ' +
-        'always wins over any env default. A tool call that has neither an explicit sessionId nor a resolvable ' +
-        'env default is a hard error, never a fabricated id. An explicit "" or whitespace-only sessionId is NOT ' +
-        'treated as omitted — it is a hard error (the same non-empty-string validation usage-telemetry.js\'s ' +
-        'own write path raises), never silently replaced by the env default.',
+        'sessionId is optional: OMITTED (the property genuinely absent from the call) defaults through the ' +
+        'engine\'s precedence — explicit sessionId (always wins, checked first) -> this MCP server ' +
+        'process\'s own CLAUDE_CODE_SESSION_ID env var, then CODEX_THREAD_ID (same precedence handoff.js uses ' +
+        'everywhere else — see scripts/lib/session-identity.js), with CODEX_THREAD_ID preferred when both are ' +
+        'set and differ AND this server\'s own HANDOFF_HOST env var is "codex" -> if neither env var resolves, ' +
+        'a STRICT project-marker default (resolveUsageRecordMarkerDefault in scripts/lib/session-identity.js — ' +
+        'a rule distinct from, and stricter than, handoff.js\'s own resolveSessionId marker fallback): markers ' +
+        'are parsed strictly (malformed marker JSON is excluded, never legacy-parsed), then filtered by this ' +
+        'server\'s own HANDOFF_HOST when at least one surviving marker carries a host field (an absent-host ' +
+        'marker only loses to a real host match when some marker IS host-tagged), then classified — exactly ' +
+        'one surviving candidate is used (its blank/whitespace-only session id is itself a hard error, C2), ' +
+        'zero is the "no marker" hard error below, and more than one is an "ambiguous session markers (N)" ' +
+        'hard error naming only the count and each candidate\'s host (never a session id). NOTE for Codex ' +
+        'callers: Codex does NOT pass CODEX_THREAD_ID into this MCP server\'s own process env (config.toml\'s ' +
+        '`env` table for this server carries only HANDOFF_HOST/HANDOFF_PROMOTION_FILE — verified against a ' +
+        'real Codex e2e run, 2026-09-12), so the project session marker is the path that actually serves Codex ' +
+        'here, not the env-var default. A tool call that has neither an explicit sessionId nor a resolvable ' +
+        'env or marker default is a hard error, never a fabricated id. An explicit "" or whitespace-only ' +
+        'sessionId is NOT treated as omitted — it is a hard error (the same non-empty-string validation ' +
+        'usage-telemetry.js\'s own write path raises), never silently replaced by any default. The returned ' +
+        'row always carries session_id_source ("explicit"|"env"|"marker") and, only when it is "marker", ' +
+        'marker_ts — provenance for the id actually used.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         sessionId: z.string().optional().describe(
-          'Defaults to this server\'s own CLAUDE_CODE_SESSION_ID env var, then CODEX_THREAD_ID, when omitted — see the tool description.'
+          'Defaults to this server\'s own CLAUDE_CODE_SESSION_ID env var, then CODEX_THREAD_ID, then a strict, ' +
+          'host-filtered project session marker (the path Codex actually uses; ambiguous or zero candidates ' +
+          'are a hard error), when omitted — see the tool description.'
         ),
         turnIdx: z.number().int().min(0),
         agentRole: z.string(),
