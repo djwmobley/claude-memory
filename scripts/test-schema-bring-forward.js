@@ -48,9 +48,33 @@
  *     absent, and cmdInit never writes schema_fingerprint at all (so R-6's
  *     "never upsert on integrity failure" invariant holds identically on
  *     both the init path and the ensureSchemaCurrent sentinel path).
+ * T11 Manifest lint (PR-A fix-what-you-flag categorical guard, 2026-09-12):
+ *     (a) every unit with classification "postgres" that declares a
+ *     non-empty expected_objects.tables must also declare a non-empty
+ *     expected_objects.columns (a totally-empty columns list on a unit with
+ *     real tables is exactly the F2-class gap Codex review flagged for the
+ *     telemetry units -- a dropped base column is invisible to the
+ *     fingerprint-'current' fast path forever), and every column named in
+ *     that list must textually appear in the unit's own SQL file (manifest/
+ *     DDL identifier parity, mirrors schema-classify.js's own check but in
+ *     the missing-coverage direction that check does not cover); (b) every
+ *     table in a required_roster postgres unit whose own DDL declares an
+ *     ANONYMOUS table-level UNIQUE constraint (not a named CREATE UNIQUE
+ *     INDEX, not a PRIMARY KEY) must have a matching expected_uniques entry
+ *     -- a table whose only uniqueness guarantee is its PRIMARY KEY needs no
+ *     further manifest tracking (this manifest format has no
+ *     expected_primary_keys field), and a table with neither a PK nor an
+ *     anonymous UNIQUE in its own DDL (e.g. retrieval_event_assertions, an
+ *     observability-only join table by design) is out of this check's scope
+ *     entirely, never a false failure. Pure, no DB required. Fixture proof:
+ *     a fixture unit with "columns": [] must fail (a); the live manifest,
+ *     after this same commit populates app-retrieval-events-schema.sql's
+ *     previously-empty columns list and handoff-core-schema.sql's
+ *     previously-untracked retrieval_contract UNIQUE (project_id, name),
+ *     must pass both (a) and (b).
  *
  * Requires Postgres (PGHOST/PGUSER/PGPASSWORD, defaults localhost/postgres/postgres).
- * T4 is pure and runs with no DB. Exit 0 = all run tests passed.
+ * T4 and T11 are pure and run with no DB. Exit 0 = all run tests passed.
  */
 
 const fs   = require('fs');
@@ -841,6 +865,188 @@ function testT10() {
 
 function assertFalse(v, msg) { if (v !== false) throw new Error(msg || `expected false, got ${JSON.stringify(v)}`); }
 
+// ── T11: manifest lint — every postgres unit's tables carry non-empty,
+//     DDL-backed columns; every required-roster table's anonymous DDL
+//     UNIQUE is tracked in expected_uniques ─────────────────────────────────
+
+function _escapeRegExpT11(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// Cheap textual sanity check — NOT a DDL parser (mirrors schema-classify.js's
+// own internal _identifierAppearsInSQL, reimplemented here rather than
+// exported from that module since this file has no other reason to import
+// its private surface).
+function _identifierInSqlT11(sql, identifier) {
+  if (typeof identifier !== 'string' || identifier.length === 0) return false;
+  return new RegExp('\\b' + _escapeRegExpT11(identifier) + '\\b', 'i').test(sql);
+}
+
+// Extracts the column-list text between a CREATE TABLE [IF NOT EXISTS]
+// <table> ( ... ) statement's own outer parens, via paren-depth counting (so
+// nested CHECK(...)/DEFAULT now() parens don't terminate the scan early).
+// Returns null if no CREATE TABLE for `table` is found in `sqlText`.
+function _createTableBlockT11(sqlText, table) {
+  const re = new RegExp('CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?' + _escapeRegExpT11(table) + '\\s*\\(', 'i');
+  const m = re.exec(sqlText);
+  if (!m) return null;
+  let depth = 1;
+  let i = m.index + m[0].length;
+  const start = i;
+  while (i < sqlText.length && depth > 0) {
+    if (sqlText[i] === '(') depth++;
+    else if (sqlText[i] === ')') depth--;
+    i++;
+  }
+  return sqlText.slice(start, i - 1);
+}
+
+// True iff `table`'s own CREATE TABLE block declares an ANONYMOUS table-level
+// UNIQUE constraint (`UNIQUE (...)` inside the column list) — deliberately
+// excludes a standalone `CREATE UNIQUE INDEX ...` (outside the block, tracked
+// instead via expected_index_defs/indexes) and a column-level `... UNIQUE`
+// modifier folded into a PRIMARY KEY (a bare PK needs no expected_uniques
+// entry — this manifest format has no expected_primary_keys field at all).
+function _ddlHasAnonUniqueT11(sqlText, table) {
+  const block = _createTableBlockT11(sqlText, table);
+  if (block == null) return false;
+  return /(?:^|[,\n])\s*UNIQUE\s*\(/i.test(block);
+}
+
+function _lintManifestT11(manifest, sqlDir) {
+  const errors = [];
+  const units = manifest.units || {};
+  const roster = new Set(manifest.required_roster || []);
+
+  for (const [basename, unit] of Object.entries(units)) {
+    if (unit.classification !== 'postgres') continue;
+    const eo = unit.expected_objects || {};
+    const tables = Array.isArray(eo.tables) ? eo.tables : [];
+    if (tables.length === 0) continue; // nothing to check (excluded/roster-less units land here too)
+
+    const columns = Array.isArray(eo.columns) ? eo.columns : [];
+    if (columns.length === 0) {
+      errors.push(
+        `${basename}: expected_objects.tables is non-empty (${tables.join(', ')}) but expected_objects.columns ` +
+        `is EMPTY — every classification:postgres unit with tables must declare its columns (T11 categorical guard)`
+      );
+      continue; // no columns to identifier-parity-check
+    }
+
+    let sqlText = null;
+    try { sqlText = fs.readFileSync(path.join(sqlDir, basename), 'utf8'); } catch (_) { /* reported below */ }
+    if (sqlText == null) {
+      errors.push(`${basename}: expected_objects.columns declared but the unit's own SQL file could not be read for identifier-parity checking`);
+      continue;
+    }
+
+    for (const c of columns) {
+      if (!c || typeof c.column !== 'string' || !_identifierInSqlT11(sqlText, c.column)) {
+        errors.push(
+          `${basename}: expected_objects.columns entry "${c && c.table}.${c && c.column}" has no textual match ` +
+          `in ${basename}'s own SQL file — manifest/DDL desync`
+        );
+      }
+    }
+
+    // (b) required-roster uniques-or-PK coverage — scoped to roster units
+    // only (the required-roster is the set schema-classify.js's own F3 fix
+    // treats as mandatory; a non-roster postgres unit's uniqueness tracking
+    // is not this guard's concern).
+    if (roster.has(basename)) {
+      const uniques = Array.isArray(unit.expected_uniques) ? unit.expected_uniques : [];
+      for (const table of tables) {
+        if (!_ddlHasAnonUniqueT11(sqlText, table)) continue; // no anonymous UNIQUE for this table — nothing to track (a bare PK, or neither, is out of scope)
+        const tracked = uniques.some((u) => u && u.table === table);
+        if (!tracked) {
+          errors.push(
+            `${basename}: required-roster table "${table}" declares an anonymous UNIQUE constraint in its own DDL ` +
+            `with no matching expected_uniques entry — untracked constraint would go un-healed if dropped`
+          );
+        }
+      }
+    }
+  }
+
+  return errors;
+}
+
+function testT11() {
+  const label = 'T11: manifest lint — every postgres unit with tables declares non-empty, DDL-identifier-parity-checked columns; every required-roster anonymous-UNIQUE table is tracked in expected_uniques';
+  try {
+    const sqlDir = path.join(PROJECT_ROOT, 'scripts', 'sql');
+
+    // (1) Fixture: a unit with non-empty tables but columns: [] must FAIL —
+    // the exact shape app-retrieval-events-schema.sql had before this commit.
+    const fixtureManifest = {
+      required_roster: [],
+      units: {
+        'usage-telemetry-schema.sql': {
+          classification: 'postgres',
+          expected_objects: { tables: ['turn_usage', 'session_usage'], columns: [], indexes: [] },
+        },
+      },
+    };
+    const fixtureErrors = _lintManifestT11(fixtureManifest, sqlDir);
+    assertTrue(
+      fixtureErrors.some((e) => e.includes('usage-telemetry-schema.sql') && e.includes('EMPTY')),
+      `T11(1): fixture unit with columns: [] must be flagged — got ${JSON.stringify(fixtureErrors)}`
+    );
+
+    // (2) Fixture: a bogus column name (no textual match in the real SQL
+    // file) must FAIL identifier parity.
+    const fixtureDesync = {
+      required_roster: [],
+      units: {
+        'usage-telemetry-schema.sql': {
+          classification: 'postgres',
+          expected_objects: {
+            tables: ['turn_usage'],
+            columns: [{ table: 'turn_usage', column: 'this_column_does_not_exist_xyz' }],
+            indexes: [],
+          },
+        },
+      },
+    };
+    const desyncErrors = _lintManifestT11(fixtureDesync, sqlDir);
+    assertTrue(
+      desyncErrors.some((e) => e.includes('this_column_does_not_exist_xyz') && e.includes('manifest/DDL desync')),
+      `T11(2): fixture with a phantom column name must be flagged as manifest/DDL desync — got ${JSON.stringify(desyncErrors)}`
+    );
+
+    // (3) Fixture: a required-roster table with an anonymous DDL UNIQUE and
+    // no expected_uniques entry must FAIL (b).
+    const fixtureUnique = {
+      required_roster: ['usage-telemetry-schema.sql'],
+      units: {
+        'usage-telemetry-schema.sql': {
+          classification: 'postgres',
+          expected_objects: {
+            tables: ['turn_usage', 'session_usage'],
+            columns: [{ table: 'turn_usage', column: 'project_id' }, { table: 'session_usage', column: 'project_id' }],
+            indexes: [],
+          },
+          expected_uniques: [],
+        },
+      },
+    };
+    const uniqueErrors = _lintManifestT11(fixtureUnique, sqlDir);
+    assertTrue(
+      uniqueErrors.some((e) => e.includes('turn_usage') && e.includes('anonymous UNIQUE')),
+      `T11(3): fixture with an untracked anonymous DDL UNIQUE on a required-roster table must be flagged — got ${JSON.stringify(uniqueErrors)}`
+    );
+
+    // (4) The live manifest, after this same commit's fixes, passes BOTH
+    // checks cleanly — zero errors, not merely "fewer" errors.
+    const liveManifestPath = path.join(sqlDir, 'schema-manifest.json');
+    const liveManifest = JSON.parse(fs.readFileSync(liveManifestPath, 'utf8'));
+    const liveErrors = _lintManifestT11(liveManifest, sqlDir);
+    assertEqual(liveErrors.length, 0, `T11(4): live schema-manifest.json must pass the lint cleanly — got ${JSON.stringify(liveErrors)}`);
+
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -855,6 +1061,7 @@ async function main() {
   await testT8();
   await testT9();
   testT10();
+  testT11();
 
   console.log('');
   console.log(`Results: ${passed} passed, ${failed} failed`);

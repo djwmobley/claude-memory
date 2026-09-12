@@ -88,7 +88,8 @@
       ],
       "expected_uniques": [
         { "_doc": "entities: UNIQUE (project_id, name).", "table": "entities", "columns": ["project_id", "name"] },
-        { "_doc": "embedding_providers: name TEXT NOT NULL UNIQUE.", "table": "embedding_providers", "columns": ["name"] }
+        { "_doc": "embedding_providers: name TEXT NOT NULL UNIQUE.", "table": "embedding_providers", "columns": ["name"] },
+        { "_doc": "PR-A manifest-lint follow-up (T11, 2026-09-12): retrieval_contract: UNIQUE (project_id, name) -- anonymous table-level UNIQUE, previously untracked here (found by the new required-roster uniques-or-PK lint).", "table": "retrieval_contract", "columns": ["project_id", "name"] }
       ],
       "expected_not_nulls": [
         { "table": "assertions", "column": "confidence" },
@@ -196,12 +197,24 @@
     "app-retrieval-events-schema.sql": {
       "classification": "postgres",
       "order": 20,
+      "_doc_columns": "PR-A manifest-lint follow-up (test-schema-bring-forward.js T11, 2026-09-12): every non-id column of retrieval_events and retrieval_event_assertions, captured by name directly from this unit's own CREATE TABLE text (same rationale as usage-telemetry-schema.sql's own _doc_columns -- a bare CREATE TABLE IF NOT EXISTS with no later ALTER-added columns, so a dropped base column would otherwise never be probed by schemaObjectsExist() at all). This closes the same class of gap T11 lints for categorically: this unit previously declared expected_objects.columns: [] despite having non-empty expected_objects.tables.",
       "expected_objects": {
         "tables": [
           "retrieval_events",
           "retrieval_event_assertions"
         ],
-        "columns": [],
+        "columns": [
+          { "table": "retrieval_events", "column": "project_id" },
+          { "table": "retrieval_events", "column": "query_text" },
+          { "table": "retrieval_events", "column": "retrieved_at" },
+          { "table": "retrieval_events", "column": "outcome" },
+          { "table": "retrieval_events", "column": "outcome_at" },
+          { "table": "retrieval_events", "column": "outcome_signal" },
+          { "table": "retrieval_events", "column": "session_id" },
+          { "table": "retrieval_events", "column": "notes" },
+          { "table": "retrieval_event_assertions", "column": "event_id" },
+          { "table": "retrieval_event_assertions", "column": "assertion_id" }
+        ],
         "indexes": [
           "retrieval_events_project_idx",
           "retrieval_events_outcome_idx",
