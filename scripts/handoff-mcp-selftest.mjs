@@ -185,19 +185,16 @@ async function runUsageTelemetryChecks() {
   console.log('\n== usage_record / usage_query MCP checks (throwaway DBs) ==');
   let passed = 0;
   let failed = 0;
-  const pass = (label) => { console.log(`PASS  ${label}`); passed++; };
-  // CodeQL js/clear-text-logging (alert #21): several checks below round-trip
+  // CodeQL js/clear-text-logging (alert #21, #22): several checks below round-trip
   // CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID fixtures through the MCP tool
-  // response. reason must never carry that value (or raw response text that
-  // could echo it) — only a fixed diagnostic string or boolean, enforced here
-  // so a future call site can't silently reintroduce the leak.
-  const fail = (label, reason) => {
-    if (typeof reason !== 'string' && typeof reason !== 'boolean') {
-      throw new TypeError(`fail() reason must be a literal string or boolean, got ${typeof reason}`);
-    }
-    console.log(`FAIL  ${label}: ${reason}`);
-    failed++;
-  };
+  // response. check() takes only a pre-computed boolean plus a fixed literal
+  // label -- a tool-response string, an env-derived session id, or a caught
+  // error's message must never reach console.log here, directly or via any
+  // string built from them.
+  function check(label, condition) {
+    if (condition) { console.log(`PASS  ${label}`); passed++; }
+    else { console.log(`FAIL  ${label}`); failed++; }
+  }
 
   const stamp = Date.now();
 
@@ -236,13 +233,10 @@ async function runUsageTelemetryChecks() {
         const text = result.content[0].text;
         const hasActionableText = text.includes('turn_usage is missing in') && text.includes('ensureSchemaCurrent reason=');
         const hasRawStackFrame = text.includes('at Client');
-        if (!result.isError) fail(label, `expected isError=true, got false (textLength=${text.length})`);
-        else if (!hasActionableText) fail(label, `actionable text markers not found (textLength=${text.length})`);
-        else if (hasRawStackFrame) fail(label, 'a raw pg stack frame leaked into the message');
-        else pass(label);
+        check(label, result.isError === true && hasActionableText && !hasRawStackFrame);
       });
-    } catch (err) {
-      fail(label, err.stack || String(err));
+    } catch {
+      check(label, false);
     } finally {
       await pgHelpers.dropTestDb(dbName, projectDir);
     }
@@ -275,10 +269,8 @@ async function runUsageTelemetryChecks() {
               name: 'usage_record',
               arguments: { projectRoot: projectDir, turnIdx: 1, agentRole: 'ut-role', tokensIn: 10, tokensOut: 5 },
             });
-            if (result.isError) { fail(label, `unexpected isError=true (textLength=${result.content[0].text.length})`); return; }
-            const row = JSON.parse(result.content[0].text);
-            if (row.sessionId !== codexId) fail(label, `sessionId mismatch (matched=false)`);
-            else pass(label);
+            const row = result.isError ? null : JSON.parse(result.content[0].text);
+            check(label, !result.isError && row.sessionId === codexId);
           }
         );
       }
@@ -293,10 +285,8 @@ async function runUsageTelemetryChecks() {
               name: 'usage_record',
               arguments: { projectRoot: projectDir, turnIdx: 2, agentRole: 'ut-role', tokensIn: 10, tokensOut: 5 },
             });
-            if (result.isError) { fail(label, `unexpected isError=true (textLength=${result.content[0].text.length})`); return; }
-            const row = JSON.parse(result.content[0].text);
-            if (row.sessionId !== 'claude-sess-ut-c') fail(label, `sessionId mismatch (matched=false)`);
-            else pass(label);
+            const row = result.isError ? null : JSON.parse(result.content[0].text);
+            check(label, !result.isError && row.sessionId === 'claude-sess-ut-c');
           }
         );
       }
@@ -311,10 +301,8 @@ async function runUsageTelemetryChecks() {
               name: 'usage_record',
               arguments: { projectRoot: projectDir, sessionId: 'explicit-sess-ut-d', turnIdx: 3, agentRole: 'ut-role', tokensIn: 10, tokensOut: 5 },
             });
-            if (result.isError) { fail(label, `unexpected isError=true (textLength=${result.content[0].text.length})`); return; }
-            const row = JSON.parse(result.content[0].text);
-            if (row.sessionId !== 'explicit-sess-ut-d') fail(label, `sessionId mismatch (matched=false)`);
-            else pass(label);
+            const row = result.isError ? null : JSON.parse(result.content[0].text);
+            check(label, !result.isError && row.sessionId === 'explicit-sess-ut-d');
           }
         );
       }
@@ -335,10 +323,9 @@ async function runUsageTelemetryChecks() {
               arguments: { projectRoot: projectDir, sessionId: '', turnIdx: 4, agentRole: 'ut-role', tokensIn: 10, tokensOut: 5 },
             });
             const text = result.content[0]?.text ?? '';
-            if (!result.isError) fail(label, `expected isError=true, got false (textLength=${text.length})`);
-            else if (!text.includes('must be a non-empty string')) fail(label, `unexpected error text (textLength=${text.length})`);
-            else if (text.includes('codex-thread-ut-e')) fail(label, 'env-derived id leaked into the error/row (leaked=true)');
-            else pass(label);
+            const rejectedProperly = result.isError === true && text.includes('must be a non-empty string');
+            const leaked = text.includes('codex-thread-ut-e');
+            check(label, rejectedProperly && !leaked);
           }
         );
       }
@@ -359,15 +346,14 @@ async function runUsageTelemetryChecks() {
               arguments: { projectRoot: projectDir, sessionId: '   ', turnIdx: 5, agentRole: 'ut-role', tokensIn: 10, tokensOut: 5 },
             });
             const text = result.content[0]?.text ?? '';
-            if (!result.isError) fail(label, `expected isError=true, got false (textLength=${text.length})`);
-            else if (!text.includes('must be a non-empty string')) fail(label, `unexpected error text (textLength=${text.length})`);
-            else if (text.includes('codex-thread-ut-f')) fail(label, 'env-derived id leaked into the error/row (leaked=true)');
-            else pass(label);
+            const rejectedProperly = result.isError === true && text.includes('must be a non-empty string');
+            const leaked = text.includes('codex-thread-ut-f');
+            check(label, rejectedProperly && !leaked);
           }
         );
       }
-    } catch (err) {
-      fail('UT-BCD: setup/execution', err.stack || String(err));
+    } catch {
+      check('UT-BCD: setup/execution', false);
     } finally {
       await pgHelpers.dropTestDb(dbName, projectDir);
     }
