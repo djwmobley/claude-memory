@@ -1637,8 +1637,22 @@ export function buildServer() {
   server.registerTool(
     'assertion_suppress',
     {
-      // idempotentHint:true -- retiring an already-retired row converges.
-      annotations: { readOnlyHint: false, idempotentHint: true },
+      // Codex review P2 (2026-09-12, round 2): idempotentHint:false, NOT
+      // true. assertionSuppress (entity-graph-crud.js) sets
+      // `invalid_at = now()` on every call whose WHERE matches the row --
+      // it does not exclude already-suppressed rows, so a second call on an
+      // already-retired row moves invalid_at forward again. The row's
+      // suppressed flag converges, but invalid_at does not: repeat calls
+      // are NOT side-effect-free repeats of the same write. Audited
+      // against the other *_suppress/*_update tools for the same
+      // now()-per-call pattern: entity_suppress and edge_suppress set only
+      // `suppressed = true` (no now()) -- idempotentHint:true stands for
+      // both. entity_update/edge_update are plain COALESCE overwrites (no
+      // now(), no bi-temporal column) -- unaffected, left as-is.
+      // assertion_update already carries idempotentHint:false (it also
+      // sets invalid_at=now() on the superseded row AND inserts a second
+      // new row every call) -- already consistent, left as-is.
+      annotations: { readOnlyHint: false, idempotentHint: false },
       title: 'Suppress an assertion (retract, no supersession)',
       description: 'Sets suppressed=true, invalid_at=now(), suppression_kind=\'retired\' (cm#231 — matches the ' +
         'seed/close path\'s own operator-retirement vocabulary) without inserting a replacement — use ' +

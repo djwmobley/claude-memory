@@ -387,7 +387,72 @@ async function runAnnotationsPresenceCheck() {
   return ok;
 }
 
+// ── Codex review P2 (2026-09-12, round 2): idempotentHint audit for every
+// *_suppress and *_update tool ──────────────────────────────────────────
+//
+// assertion_suppress was idempotentHint:true despite its underlying write
+// (entity-graph-crud.js's assertionSuppress) setting `invalid_at = now()`
+// on every matching call, including a second call on an already-suppressed
+// row -- the row's stored invalid_at differs per call, so repeat calls are
+// NOT side-effect-free. This asserts the audited, consistent expectation
+// for all six *_suppress/*_update tools in one place: a *_suppress or
+// *_update tool that writes a now()-based bi-temporal column on every call
+// is idempotentHint:false; one whose write is a plain flag/COALESCE set
+// with no such column is left at its existing value. Before the P2 fix
+// this fails on assertion_suppress (expected false, found true); after the
+// fix all six match.
+const IDEMPOTENT_HINT_EXPECTED = {
+  entity_update: false,   // plain COALESCE overwrite, no now() column -- unaffected by the audit
+  entity_suppress: true,  // `suppressed = true` only, no now() column -- repeat calls converge
+  assertion_update: false, // supersession: invalid_at=now() on old row + a NEW inserted row every call
+  assertion_suppress: false, // P2: invalid_at=now() on every call, even an already-suppressed row
+  edge_update: false,     // plain COALESCE overwrite, no now() column -- unaffected by the audit
+  edge_suppress: true,    // `suppressed = true` only, no now() column -- repeat calls converge
+};
+
+async function runIdempotentHintAuditCheck() {
+  console.log('\n== idempotentHint audit: *_suppress / *_update tools (P2) ==');
+  let ok = true;
+  await withMcpClient({}, async (client) => {
+    const toolsList = await client.listTools();
+    const byName = new Map(toolsList.tools.map((t) => [t.name, t]));
+    for (const [name, expected] of Object.entries(IDEMPOTENT_HINT_EXPECTED)) {
+      const tool = byName.get(name);
+      if (!tool) {
+        console.log(`FAIL  tool "${name}" is not registered — cannot audit its idempotentHint`);
+        ok = false;
+        continue;
+      }
+      const actual = tool.annotations && tool.annotations.idempotentHint;
+      if (actual !== expected) {
+        console.log(`FAIL  tool "${name}" idempotentHint=${actual}, expected ${expected}`);
+        ok = false;
+      }
+    }
+    if (ok) {
+      console.log(
+        `PASS  all ${Object.keys(IDEMPOTENT_HINT_EXPECTED).length} audited *_suppress/*_update tools carry the ` +
+        'expected idempotentHint (now()-per-call write => false; plain flag/COALESCE set => unchanged)'
+      );
+    }
+  });
+  return ok;
+}
+
 // ── Codex review F1 (2026-09-12): readOnlyHint mechanical trace check ──────
+// ── Codex review P1 (2026-09-12, round 2): the brace-balanced scan below
+//    used to start from the FIRST `{` after the function-name match. Every
+//    toolXxx handler in this codebase is declared as
+//    `async function toolXxx({ projectRoot, ... }) { ... }` -- a destructured
+//    parameter object. The first `{` after the name match is THAT
+//    destructuring brace, not the function body's opening brace, so the old
+//    scan balanced to the destructure's own closing `}` and returned only
+//    "async function toolXxx({ projectRoot, ... }" -- the signature, with
+//    the entire body (and therefore any withProjectDb call inside it)
+//    silently discarded. This is now fixed by first balancing the
+//    PARENTHESES of the parameter list (handles nested parens too, e.g. a
+//    default value that calls a function) to find where the parameter list
+//    actually ends, THEN scanning for the body's opening `{` after that.
 //
 // Extracts the full source text of a named top-level `async function
 // <fnName>(...) { ... }` declaration from `fileText` via brace-balanced
@@ -398,7 +463,23 @@ function extractFunctionSource(fileText, fnName) {
   const re = new RegExp(`\\basync function ${fnName}\\s*\\(`);
   const m = re.exec(fileText);
   if (!m) return '';
-  const braceStart = fileText.indexOf('{', m.index);
+  const parenStart = fileText.indexOf('(', m.index);
+  if (parenStart === -1) return '';
+  // First balance the parameter list's own parens -- this is what a naive
+  // "find the next {" got wrong (P1): the parameter list is very often a
+  // destructured object (`{ projectRoot, ... }`), whose OWN brace is not
+  // the function body's brace.
+  let pdepth = 0;
+  let k = parenStart;
+  for (; k < fileText.length; k++) {
+    if (fileText[k] === '(') pdepth++;
+    else if (fileText[k] === ')') {
+      pdepth--;
+      if (pdepth === 0) { k++; break; }
+    }
+  }
+  if (pdepth !== 0) return ''; // unbalanced parens -- cannot resolve safely
+  const braceStart = fileText.indexOf('{', k);
   if (braceStart === -1) return '';
   let depth = 0;
   let j = braceStart;
@@ -409,6 +490,7 @@ function extractFunctionSource(fileText, fnName) {
       if (depth === 0) { j++; break; }
     }
   }
+  if (depth !== 0) return ''; // unbalanced braces -- cannot resolve safely
   return fileText.slice(m.index, j);
 }
 
@@ -427,8 +509,44 @@ function extractFunctionSource(fileText, fnName) {
 // meaningful at all.
 const HEAL_PATH_TERMS = ['withProjectDb', 'ensureSchemaCurrent', 'ensureProjectIdentity'];
 
+// Traces one (name, registeredToolEntry) pair against serverSource and
+// returns { ok, foundTerms, unresolved, delegateName }. Pulled out of
+// runReadOnlyHintTraceCheck (P1) so the fixture check below can drive the
+// exact same trace logic against a synthetic mutated entry without touching
+// disk or the real registered-tools map.
+//
+// P1 also requires: when the handler's own source cannot be resolved to
+// real text (a bound/wrapped function whose toString() is a native-code
+// stub, or an empty string) OR the handler delegates to a toolXxx name that
+// extractFunctionSource could not find/balance in the server source, a
+// readOnlyHint:true tool FAILS the check rather than silently passing on
+// whatever partial text happened to be available.
+function traceToolReadOnlyHint(name, entry, serverSource) {
+  const handlerSrc = typeof entry.handler === 'function' ? entry.handler.toString() : '';
+  const handlerUnresolved = handlerSrc.trim() === '' || handlerSrc.includes('[native code]');
+
+  const delegateMatch = handlerUnresolved ? null : /\b(tool[A-Za-z0-9_]+)\s*\(/.exec(handlerSrc);
+  let delegateSrc = '';
+  let delegateUnresolved = false;
+  if (delegateMatch) {
+    delegateSrc = extractFunctionSource(serverSource, delegateMatch[1]);
+    delegateUnresolved = delegateSrc === '';
+  }
+
+  const unresolved = handlerUnresolved || delegateUnresolved;
+  const combinedSrc = handlerSrc + (delegateSrc ? '\n' + delegateSrc : '');
+  const foundTerms = HEAL_PATH_TERMS.filter((term) => combinedSrc.includes(term));
+
+  return {
+    ok: !unresolved && foundTerms.length === 0,
+    foundTerms,
+    unresolved,
+    delegateName: delegateMatch ? delegateMatch[1] : null,
+  };
+}
+
 async function runReadOnlyHintTraceCheck() {
-  console.log('\n== readOnlyHint mechanical trace check (F1) ==');
+  console.log('\n== readOnlyHint mechanical trace check (F1/P1) ==');
   const serverSource = fs.readFileSync(SERVER_PATH, 'utf8');
   const server = buildServer();
   const registered = server._registeredTools;
@@ -449,17 +567,18 @@ async function runReadOnlyHintTraceCheck() {
     }
     if (entry.annotations.readOnlyHint === true) {
       trueCount++;
-      const handlerSrc = typeof entry.handler === 'function' ? entry.handler.toString() : '';
-      let combinedSrc = handlerSrc;
-      const delegateMatch = /\b(tool[A-Za-z0-9_]+)\s*\(/.exec(handlerSrc);
-      if (delegateMatch) {
-        combinedSrc += '\n' + extractFunctionSource(serverSource, delegateMatch[1]);
-      }
-      const found = HEAL_PATH_TERMS.filter((term) => combinedSrc.includes(term));
-      if (found.length > 0) {
+      const trace = traceToolReadOnlyHint(name, entry, serverSource);
+      if (trace.unresolved) {
+        console.log(
+          `FAIL  tool "${name}" is readOnlyHint:true but its handler source could not be mechanically ` +
+          `resolved (traced through ${trace.delegateName || '<inline handler>'}) -- failing closed rather ` +
+          'than passing on an unverifiable trace'
+        );
+        ok = false;
+      } else if (trace.foundTerms.length > 0) {
         console.log(
           `FAIL  tool "${name}" is readOnlyHint:true but its handler (traced through ` +
-          `${delegateMatch ? delegateMatch[1] : '<inline handler>'}) contains: ${found.join(', ')}`
+          `${trace.delegateName || '<inline handler>'}) contains: ${trace.foundTerms.join(', ')}`
         );
         ok = false;
       }
@@ -472,15 +591,66 @@ async function runReadOnlyHintTraceCheck() {
   if (ok) {
     console.log(
       'PASS  every readOnlyHint:true tool\'s handler (traced through its delegate, if any) is free of ' +
-      'withProjectDb/ensureSchemaCurrent/ensureProjectIdentity'
+      'withProjectDb/ensureSchemaCurrent/ensureProjectIdentity, and every trace resolved to real source'
     );
   }
   return ok;
 }
 
+// ── Codex review P1 fixture (2026-09-12, round 2) ──────────────────────────
+// Regression coverage for the exact bug P1 found: clones the REAL memory_get
+// registered-tool entry (never mutates the live server or disk), forces its
+// annotations.readOnlyHint to true, and re-runs the SAME traceToolReadOnlyHint
+// logic used above against toolMemoryGet's real source in handoff-mcp.mjs.
+// toolMemoryGet unconditionally calls withProjectDb, so this MUST fail the
+// trace. Before the P1 fix, extractFunctionSource sliced at the destructured
+// parameter list's own brace and returned only the signature -- the trace
+// found no heal-path terms and incorrectly reported ok:true. If this fixture
+// ever again reports ok:true, the mechanical trace has regressed back to
+// being vacuous against the one handler shape every tool in this file uses.
+async function runReadOnlyHintFixtureCheck() {
+  console.log('\n== readOnlyHint mechanical trace fixture check (P1 regression) ==');
+  const serverSource = fs.readFileSync(SERVER_PATH, 'utf8');
+  const server = buildServer();
+  const registered = server._registeredTools;
+  if (!registered || typeof registered !== 'object' || !registered.memory_get) {
+    console.log('FAIL  could not reach registered "memory_get" tool entry to build the fixture');
+    return false;
+  }
+
+  const realEntry = registered.memory_get;
+  const fixtureEntry = {
+    ...realEntry,
+    annotations: { ...realEntry.annotations, readOnlyHint: true },
+  };
+
+  const trace = traceToolReadOnlyHint('memory_get (fixture: forced readOnlyHint:true)', fixtureEntry, serverSource);
+  if (trace.ok) {
+    console.log(
+      'FAIL  fixture regression: forcing memory_get\'s readOnlyHint to true was NOT caught by the mechanical ' +
+      'trace (toolMemoryGet calls withProjectDb; the trace should have found it and failed) -- the extractor ' +
+      'has regressed to the P1 bug (slicing at the destructured-parameter brace instead of the function body)'
+    );
+    return false;
+  }
+  if (trace.unresolved) {
+    console.log(
+      'FAIL  fixture could not resolve toolMemoryGet\'s source at all (extractFunctionSource returned \'\') -- ' +
+      'expected a resolved trace that finds withProjectDb, not an unresolved one'
+    );
+    return false;
+  }
+  console.log(
+    `PASS  forcing memory_get's readOnlyHint to true is correctly caught by the trace (found: ${trace.foundTerms.join(', ')})`
+  );
+  return true;
+}
+
 async function runAll() {
   const annotationsOk = await runAnnotationsPresenceCheck();
+  const idempotentHintAuditOk = await runIdempotentHintAuditCheck();
   const readOnlyHintTraceOk = await runReadOnlyHintTraceCheck();
+  const readOnlyHintFixtureOk = await runReadOnlyHintFixtureCheck();
   const usageOk = await runUsageTelemetryChecks();
 
   if (PROJECT_ROOT && PROJECT_ROOT.trim()) {
@@ -493,7 +663,7 @@ async function runAll() {
     );
   }
 
-  if (!annotationsOk || !readOnlyHintTraceOk || !usageOk) {
+  if (!annotationsOk || !idempotentHintAuditOk || !readOnlyHintTraceOk || !readOnlyHintFixtureOk || !usageOk) {
     console.error('\nselftest FAILED: one or more checks failed (see PASS/FAIL lines above).');
     process.exit(1);
   }

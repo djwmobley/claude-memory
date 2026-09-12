@@ -174,9 +174,20 @@ describes both a server-level default approval behavior and a per-tool
 `approval_mode` value of `"writes"` (distinct from `"approve"`) as parts of
 its approval model; whether either of those, rather than the tools.\*
 entry's mere presence, explains the reject/allow split above has not been
-verified against Codex's source or a controlled test in this project — only
-the two stanzas below are confirmed (by this observation) to make a tool
-run without prompting under a `never` policy.
+verified against Codex's source or a controlled test in this project.
+
+**What was actually observed, exactly, and nothing more:** `usage_query`
+with no `tools.*` entry was rejected under an approval policy of `never`;
+`handoff_status` with an `approval_mode = "approve"` entry ran without
+prompting. That is the whole experiment — two tools, two configs, two
+outcomes. The `usage_query` stanza below is the direct counterfactual for
+the exact case that was rejected (same tool, same config difference, other
+direction) — it was not, itself, separately run and confirmed to succeed.
+The `usage_record` stanza below is weaker still: `usage_record` was not
+part of this experiment in either configuration. It is included here
+expected by symmetry with `usage_query` and `handoff_status` — both write
+paths, both plausibly needing the same `approval_mode = "approve"` entry —
+not because it was separately observed to work.
 
 The stanza shape, one sub-table per tool:
 
