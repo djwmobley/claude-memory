@@ -154,17 +154,29 @@ interactive session with fresh eyes.
 
 ## Non-interactive approval for MCP tools
 
-`codex exec` (non-interactive/scripted invocation) with an approval policy
-of `never` does **not** reject an MCP tool call just because that tool has
-no per-tool approval entry in `config.toml`. Observed 2026-09-12: a scripted
-run rejected `usage_query` ("MCP tool call requires approval, but approval
-policy is never") while `handoff_status` — which has an explicit
-`approval_mode = "approve"` entry — ran without prompting. The distinguishing
-factor is not read-vs-write; it's whether the specific tool name has a
-`[mcp_servers.handoff.tools.<name>]` sub-table in `config.toml` at all. A
-tool with no such entry falls back to Codex's own per-tool default, which a
-`never` policy does not always resolve the same way `handoff_status`'s
-explicit entry does.
+Observed 2026-09-12, under an approval policy of `never`: a scripted
+`codex exec` run rejected `usage_query` ("MCP tool call requires approval,
+but approval policy is never") — `usage_query` had no
+`[mcp_servers.handoff.tools.usage_query]` sub-table in `config.toml` at that
+point — while `handoff_status`, which DOES have an explicit
+`approval_mode = "approve"` entry, ran without prompting. That is the full
+extent of what was observed: two tools, two outcomes, one config
+difference (entry present vs. absent).
+
+**Do not read more into this than the observation supports.** In
+particular, this project's own `readOnlyHint` tool annotation (see
+`scripts/handoff-mcp.mjs`) is NOT known to be what Codex's approval engine
+keys on — no test here has isolated `readOnlyHint` as a variable, and at
+the time of this observation `usage_query` and `handoff_status` also
+differed in whether they had a `config.toml` entry at all, which is a
+confound this project has not controlled for. Codex's own documentation
+describes both a server-level default approval behavior and a per-tool
+`approval_mode` value of `"writes"` (distinct from `"approve"`) as parts of
+its approval model; whether either of those, rather than the tools.\*
+entry's mere presence, explains the reject/allow split above has not been
+verified against Codex's source or a controlled test in this project — only
+the two stanzas below are confirmed (by this observation) to make a tool
+run without prompting under a `never` policy.
 
 The stanza shape, one sub-table per tool:
 

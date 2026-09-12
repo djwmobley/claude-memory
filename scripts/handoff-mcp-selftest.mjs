@@ -30,6 +30,14 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+// Codex review F1 (2026-09-12): buildServer is exported by handoff-mcp.mjs
+// specifically so this selftest can inspect real registered-tool handler
+// FUNCTION OBJECTS in-process (fn.toString()) -- the stdio wire protocol
+// (used everywhere else in this file) only ever serializes name/description/
+// annotations/schema, never the handler code itself. Importing the module
+// this way does NOT start a stdio server (see handoff-mcp.mjs's isDirectRun
+// guard at the bottom of that file).
+import { buildServer } from './handoff-mcp.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -301,6 +309,54 @@ async function runUsageTelemetryChecks() {
           }
         );
       }
+
+      // (e) Codex review F2: an EXPLICIT sessionId:"" must NOT be treated as
+      // omitted -- it must be rejected with the same non-empty-string
+      // validation error usage-telemetry.js's own write path raises, never
+      // silently replaced by the CODEX_THREAD_ID env default (the bug: the
+      // prior `sessionId || resolveSessionIdFromEnv(...)` form treated ""
+      // as falsy and defaulted it).
+      {
+        const label = 'UT-E: explicit sessionId="" is rejected, never silently defaulted from env';
+        await withMcpClient(
+          { HANDOFF_DB: dbName, HANDOFF_HOST: 'codex', CODEX_THREAD_ID: 'codex-thread-ut-e', CLAUDE_CODE_SESSION_ID: undefined },
+          async (client) => {
+            const result = await client.callTool({
+              name: 'usage_record',
+              arguments: { projectRoot: projectDir, sessionId: '', turnIdx: 4, agentRole: 'ut-role', tokensIn: 10, tokensOut: 5 },
+            });
+            const text = result.content[0]?.text ?? '';
+            if (!result.isError) fail(label, `expected isError=true, got false (text: ${text.slice(0, 200)})`);
+            else if (!text.includes('must be a non-empty string')) fail(label, `unexpected error text: ${text.slice(0, 300)}`);
+            else if (text.includes('codex-thread-ut-e')) fail(label, `env default leaked into the error/row: ${text.slice(0, 300)}`);
+            else pass(label);
+          }
+        );
+      }
+
+      // (f) Codex review F2: an explicit whitespace-only sessionId is
+      // likewise an EXPLICIT blank value, not an omission -- same rejection,
+      // never a silent env default. requireNonEmptyString's own zero-length
+      // check would NOT catch this case (length > 0), which is exactly why
+      // the MCP-layer guard (not usage-telemetry.js, out of scope for this
+      // PR) has to trim before checking.
+      {
+        const label = 'UT-F: explicit whitespace-only sessionId is rejected, never silently defaulted from env';
+        await withMcpClient(
+          { HANDOFF_DB: dbName, HANDOFF_HOST: 'codex', CODEX_THREAD_ID: 'codex-thread-ut-f', CLAUDE_CODE_SESSION_ID: undefined },
+          async (client) => {
+            const result = await client.callTool({
+              name: 'usage_record',
+              arguments: { projectRoot: projectDir, sessionId: '   ', turnIdx: 5, agentRole: 'ut-role', tokensIn: 10, tokensOut: 5 },
+            });
+            const text = result.content[0]?.text ?? '';
+            if (!result.isError) fail(label, `expected isError=true, got false (text: ${text.slice(0, 200)})`);
+            else if (!text.includes('must be a non-empty string')) fail(label, `unexpected error text: ${text.slice(0, 300)}`);
+            else if (text.includes('codex-thread-ut-f')) fail(label, `env default leaked into the error/row: ${text.slice(0, 300)}`);
+            else pass(label);
+          }
+        );
+      }
     } catch (err) {
       fail('UT-BCD: setup/execution', err.stack || String(err));
     } finally {
@@ -331,8 +387,100 @@ async function runAnnotationsPresenceCheck() {
   return ok;
 }
 
+// ── Codex review F1 (2026-09-12): readOnlyHint mechanical trace check ──────
+//
+// Extracts the full source text of a named top-level `async function
+// <fnName>(...) { ... }` declaration from `fileText` via brace-balanced
+// scanning (never regex-bounded -- nested braces inside the function body,
+// e.g. the withProjectDb callback's own `{ ... }`, would truncate a naive
+// non-greedy match). Returns '' when no such declaration is found.
+function extractFunctionSource(fileText, fnName) {
+  const re = new RegExp(`\\basync function ${fnName}\\s*\\(`);
+  const m = re.exec(fileText);
+  if (!m) return '';
+  const braceStart = fileText.indexOf('{', m.index);
+  if (braceStart === -1) return '';
+  let depth = 0;
+  let j = braceStart;
+  for (; j < fileText.length; j++) {
+    if (fileText[j] === '{') depth++;
+    else if (fileText[j] === '}') {
+      depth--;
+      if (depth === 0) { j++; break; }
+    }
+  }
+  return fileText.slice(m.index, j);
+}
+
+// Every registered tool's handler in handoff-mcp.mjs is a thin dispatch
+// wrapper of the form `async (args) => toolXxx(args)` -- the wrapper's OWN
+// fn.toString() never literally contains "withProjectDb" even when toolXxx
+// unconditionally calls it. Scanning ONLY the wrapper (naive fn.toString())
+// would make this check vacuous against exactly the pattern every tool here
+// uses, so this resolves ONE level of delegation: it finds the `toolXxx(`
+// call inside the wrapper's own source, then pulls toolXxx's full body out
+// of the server file's source text (extractFunctionSource) and scans BOTH
+// texts. A handler with no such delegate (an inline arrow body) is scanned
+// as-is. This is a regression floor, not a full call-graph analysis --
+// scope matches F1's mechanical-trace instruction exactly (fn.toString()),
+// extended the one hop this file's own architecture requires to be
+// meaningful at all.
+const HEAL_PATH_TERMS = ['withProjectDb', 'ensureSchemaCurrent', 'ensureProjectIdentity'];
+
+async function runReadOnlyHintTraceCheck() {
+  console.log('\n== readOnlyHint mechanical trace check (F1) ==');
+  const serverSource = fs.readFileSync(SERVER_PATH, 'utf8');
+  const server = buildServer();
+  const registered = server._registeredTools;
+  if (!registered || typeof registered !== 'object') {
+    console.log('FAIL  could not reach McpServer._registeredTools (SDK internal shape changed?)');
+    return false;
+  }
+
+  let ok = true;
+  let trueCount = 0;
+  let falseCount = 0;
+
+  for (const [name, entry] of Object.entries(registered)) {
+    if (!entry.annotations || typeof entry.annotations.readOnlyHint !== 'boolean') {
+      console.log(`FAIL  tool "${name}" is missing an annotations.readOnlyHint boolean`);
+      ok = false;
+      continue;
+    }
+    if (entry.annotations.readOnlyHint === true) {
+      trueCount++;
+      const handlerSrc = typeof entry.handler === 'function' ? entry.handler.toString() : '';
+      let combinedSrc = handlerSrc;
+      const delegateMatch = /\b(tool[A-Za-z0-9_]+)\s*\(/.exec(handlerSrc);
+      if (delegateMatch) {
+        combinedSrc += '\n' + extractFunctionSource(serverSource, delegateMatch[1]);
+      }
+      const found = HEAL_PATH_TERMS.filter((term) => combinedSrc.includes(term));
+      if (found.length > 0) {
+        console.log(
+          `FAIL  tool "${name}" is readOnlyHint:true but its handler (traced through ` +
+          `${delegateMatch ? delegateMatch[1] : '<inline handler>'}) contains: ${found.join(', ')}`
+        );
+        ok = false;
+      }
+    } else {
+      falseCount++;
+    }
+  }
+
+  console.log(`readOnlyHint tally: ${trueCount} true, ${falseCount} false (${trueCount + falseCount} total registered tools)`);
+  if (ok) {
+    console.log(
+      'PASS  every readOnlyHint:true tool\'s handler (traced through its delegate, if any) is free of ' +
+      'withProjectDb/ensureSchemaCurrent/ensureProjectIdentity'
+    );
+  }
+  return ok;
+}
+
 async function runAll() {
   const annotationsOk = await runAnnotationsPresenceCheck();
+  const readOnlyHintTraceOk = await runReadOnlyHintTraceCheck();
   const usageOk = await runUsageTelemetryChecks();
 
   if (PROJECT_ROOT && PROJECT_ROOT.trim()) {
@@ -345,7 +493,7 @@ async function runAll() {
     );
   }
 
-  if (!annotationsOk || !usageOk) {
+  if (!annotationsOk || !readOnlyHintTraceOk || !usageOk) {
     console.error('\nselftest FAILED: one or more checks failed (see PASS/FAIL lines above).');
     process.exit(1);
   }
