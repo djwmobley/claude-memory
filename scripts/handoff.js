@@ -6572,10 +6572,21 @@ async function cmdLoaderHook(args) {
           // Write the fresh marker for THIS session so a true SessionEnd
           // (loader-stop) knows a close is still needed — inline rather than
           // via addSessionMarker (which would attempt a nested BEGIN here).
+          // Codex review C1 (fix/usage-record-marker-fallback follow-up):
+          // stamp `host` ('claude'|'codex', resolved from --host above) onto
+          // the marker so scripts/lib/session-identity.js's
+          // resolveUsageRecordMarkerDefault — used ONLY by the MCP
+          // usage_record tool's sessionId default, never by this file's own
+          // resolveSessionId — can filter out a stale marker from a
+          // different host instead of accepting any live project marker.
+          // Backward compatible: a marker written before this change (or by
+          // /handoff:resume, which does not stamp host) simply has no host
+          // field — parseSessionMarkersStrict/filterMarkersByHost treat that
+          // as "unknown", never as a crash or a schema change here.
           const filtered = currentSessionId
             ? markers.filter((m) => m.session_id !== currentSessionId)
             : markers;
-          filtered.push({ session_id: currentSessionId || null, ts: new Date().toISOString() });
+          filtered.push({ session_id: currentSessionId || null, ts: new Date().toISOString(), host });
           await setSessionMarkers(markerDb, projectId, filtered);
         });
       } catch (markerErr) {

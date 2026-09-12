@@ -231,10 +231,158 @@ async function resolveSessionIdFromMarker(db, projectId) {
   return latest ? (latest.session_id || latest.ts) : null;
 }
 
+// ── usage_record-only strict marker default (Codex review C1/C2, fix/usage- ─
+// record-marker-fallback follow-up) ─────────────────────────────────────────
+//
+// resolveSessionIdFromMarker (above) is handoff.js's OWN third fallback,
+// unchanged, and stays the one implementation handoff.js's resolveSessionId
+// and handoff_status both use — this PR's task scope forbids touching that
+// behavior. The MCP usage_record tool's sessionId default needed a STRICTER
+// rule than "any project marker, however stale or cross-host" (Codex review
+// C1: usage_record's prior marker fallback accepted ANY live marker for the
+// project, including one written by a different host or long stale), so it
+// gets its OWN function here rather than a behavior change to the shared one.
+//
+// parseSessionMarkersStrict(raw) — a total classification distinct from
+// parseSessionMarkersDetailed's (legacy-tolerant) one:
+//   - absent / null / ''                -> { markers: [], excludedCount: 0 }
+//   - malformed (non-JSON) raw string   -> { markers: [], excludedCount: 1 }
+//     (C2: NEVER legacy-parsed as a bare-string marker on this path — that
+//     legacy fallback is parseSessionMarkersDetailed's own behavior, kept
+//     there unchanged for handoff.js, but this strict parser excludes it.)
+//   - valid JSON, not an array           -> { markers: [], excludedCount: 1 }
+//   - valid JSON array                   -> each element without a string
+//     .ts is excluded (counted); a surviving element's session_id/host are
+//     each normalized to a non-empty string or null (an empty string counts
+//     as absent; anything else, e.g. whitespace-only, is kept verbatim so
+//     the trim/non-empty check below can reject it explicitly rather than
+//     silently substituting ts).
+function parseSessionMarkersStrict(raw) {
+  if (raw === null || raw === undefined || raw === '') return { markers: [], excludedCount: 0 };
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (_) {
+    return { markers: [], excludedCount: 1 };
+  }
+  if (!Array.isArray(parsed)) {
+    return { markers: [], excludedCount: 1 };
+  }
+  const markers = [];
+  let excludedCount = 0;
+  for (const e of parsed) {
+    const isObjectLike = Boolean(e) && typeof e === 'object';
+    const tsOk = isObjectLike && typeof e.ts === 'string';
+    if (!tsOk) { excludedCount++; continue; }
+    const sidIsUsableString = typeof e.session_id === 'string' && e.session_id.length > 0;
+    const hostIsUsableString = typeof e.host === 'string' && e.host.length > 0;
+    markers.push({
+      session_id: sidIsUsableString ? e.session_id : null,
+      ts: e.ts,
+      host: hostIsUsableString ? e.host : null,
+    });
+  }
+  return { markers, excludedCount };
+}
+
+/**
+ * Host filter, backward-compatible with markers that predate the `host`
+ * field (loader-hook only started writing it in this PR):
+ *   - handoffHost falsy (HANDOFF_HOST unset)         -> every marker stays a
+ *     candidate, no filtering at all.
+ *   - handoffHost set, but NO surviving marker has a
+ *     non-empty host field                            -> every marker stays
+ *     a candidate — an absent host is "unknown", never treated as
+ *     non-matching when there is nothing host-tagged to lose to.
+ *   - handoffHost set AND at least one marker carries
+ *     a host field                                     -> keep ONLY markers
+ *     whose host === handoffHost; a host-absent marker in this case IS
+ *     treated as non-matching (it is competing against a real host-tagged
+ *     signal, so "unknown" must not silently win).
+ */
+function filterMarkersByHost(markers, handoffHost) {
+  if (!handoffHost) return markers;
+  const anyHostTagged = markers.some((m) => typeof m.host === 'string' && m.host.length > 0);
+  if (!anyHostTagged) return markers;
+  return markers.filter((m) => m.host === handoffHost);
+}
+
+/**
+ * resolveUsageRecordMarkerDefault(db, projectId, handoffHost) — the ONLY
+ * caller of this is scripts/handoff-mcp.mjs's toolUsageRecord (C1). Total
+ * classification over the candidate marker count AFTER strict parsing +
+ * host filtering:
+ *   - zero candidates      -> { sessionId: null, markerTs: null, error }
+ *     (error text unchanged from the pre-existing "no marker" message).
+ *   - exactly one candidate -> its session_id (falling back to its ts only
+ *     when session_id itself was never present/usable — see
+ *     parseSessionMarkersStrict), trim/non-empty validated (C2): a
+ *     resulting blank/whitespace-only id is ALSO an actionable error, never
+ *     silently substituted with ts.
+ *   - more than one candidate -> an "ambiguous session markers (N)" error
+ *     naming only the surviving count and each candidate's host (a
+ *     host-absent candidate is reported as "unknown") — NEVER a session id,
+ *     per this PR's task scope (ids must not appear in error text).
+ *
+ * Returns { sessionId, markerTs, error }: sessionId/markerTs are null iff
+ * error is non-null. Never touches handoff.js's resolveSessionId / the
+ * shared resolveSessionIdFromMarker above — a distinct rule for a distinct
+ * (stricter) caller.
+ */
+async function resolveUsageRecordMarkerDefault(db, projectId, handoffHost) {
+  const { rows } = await db.query(
+    `SELECT value FROM project_settings WHERE project_id = $1 AND key = $2`,
+    [projectId, 'session_in_progress']
+  );
+  const raw = rows.length > 0 ? rows[0].value : null;
+  const { markers } = parseSessionMarkersStrict(raw);
+  const candidates = filterMarkersByHost(markers, handoffHost);
+
+  if (candidates.length === 0) {
+    return {
+      sessionId: null,
+      markerTs: null,
+      error:
+        'usage_record: sessionId was omitted, no default could be resolved from this MCP server ' +
+        'process\'s own CLAUDE_CODE_SESSION_ID or CODEX_THREAD_ID env vars, and no project session ' +
+        'marker (session_in_progress) was found -- pass sessionId explicitly.',
+    };
+  }
+
+  if (candidates.length > 1) {
+    const hosts = candidates.map((m) => m.host || 'unknown');
+    return {
+      sessionId: null,
+      markerTs: null,
+      error:
+        `usage_record: ambiguous session markers (${candidates.length}) -- pass sessionId explicitly ` +
+        `(hosts: ${hosts.join(', ')}).`,
+    };
+  }
+
+  const only = candidates[0];
+  const derived = (typeof only.session_id === 'string' && only.session_id.length > 0) ? only.session_id : only.ts;
+  const trimmed = typeof derived === 'string' ? derived.trim() : '';
+  if (trimmed.length === 0) {
+    return {
+      sessionId: null,
+      markerTs: null,
+      error:
+        'usage_record: the project session marker (session_in_progress) resolved to a blank/whitespace ' +
+        'session id -- pass sessionId explicitly.',
+    };
+  }
+
+  return { sessionId: trimmed, markerTs: only.ts, error: null };
+}
+
 module.exports = {
   resolveSessionIdFromEnv,
   parseSessionMarkersDetailed,
   parseSessionMarkers,
   latestSessionMarker,
   resolveSessionIdFromMarker,
+  parseSessionMarkersStrict,
+  filterMarkersByHost,
+  resolveUsageRecordMarkerDefault,
 };

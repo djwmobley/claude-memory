@@ -81,11 +81,15 @@ argument that overrides the fallback chain entirely; a Codex caller should
 pass `CODEX_THREAD_ID` explicitly rather than relying on environment
 resolution alone. *(shipping in the companion PR, #278 — not yet merged.)*
 
-**Marker caveat.** The active-session marker (`project_settings.session_in_
-progress`) is a single slot per project — a nested session (a `codex exec`
-launched from inside an interactive session, or a second host touching the
-same project) overwrites it. This does not affect explicit closes: each one
-records its own session id append-only regardless of what the marker
+**Marker caveat.** The active-session marker
+(`project_settings.session_in_progress`) is stored as a JSON **array** of
+per-session marker objects — `{session_id, ts}`, with a `host` field
+(`"claude"`/`"codex"`) also stamped by the `SessionStart` loader hook as of
+this PR — not a single slot. A session's own loader-hook/`resume` write
+upserts (dedupes by `session_id`, refreshing `ts`) its own entry into that
+array; it does not overwrite a sibling session's entry. `handoff_status`
+displays every live entry. This does not affect explicit closes: each one
+records its own session id append-only regardless of what the marker array
 currently holds. Today, close's summary can claim the marker was cleared
 even when a later status check shows it still set (see item 10 in
 [Known real-world defects and quirks](#known-real-world-defects-and-quirks));
@@ -110,31 +114,45 @@ see below.
 - `usage_record`'s `sessionId` argument is optional. Omitted (the property
   genuinely absent from the call — an explicit `""` or whitespace-only
   string is NOT "omitted" and is a hard error instead), it resolves through
-  the engine's **full** precedence, in order: (1) an explicit `sessionId`
+  the engine's precedence, in order: (1) an explicit `sessionId`
   argument, checked first, always wins; (2) this MCP server process's own
   environment, using the exact same `CLAUDE_CODE_SESSION_ID` →
   `CODEX_THREAD_ID` precedence described in [Session
-  identity](#session-identity) above; (3) if neither env var resolves, the
-  project's live `session_in_progress` marker — set at `SessionStart` by the
-  loader hook, and resolved via `resolveSessionIdFromMarker` in
-  `scripts/lib/session-identity.js`, the SAME helper `handoff.js`'s own
-  `resolveSessionId` (used by `handoff_close`/`handoff_checkpoint`) and
-  `handoff_status` already share. Omitting `sessionId` with none of the
-  three available is a hard error, never a fabricated id.
+  identity](#session-identity) above; (3) if neither env var resolves, a
+  **strict, `usage_record`-only** marker default —
+  `resolveUsageRecordMarkerDefault` in `scripts/lib/session-identity.js`, a
+  rule distinct from (and stricter than) `resolveSessionIdFromMarker`, the
+  helper `handoff.js`'s own `resolveSessionId` (used by
+  `handoff_close`/`handoff_checkpoint`) and `handoff_status` share
+  unchanged. This step parses the `session_in_progress` marker array
+  strictly (malformed JSON is excluded, never legacy-parsed as a
+  bare-string marker), filters it to markers whose `host` matches this
+  server's own `HANDOFF_HOST` env var when at least one marker in the array
+  carries a `host` field, and requires **exactly one** surviving candidate:
+  zero is the same hard error described below, and more than one is a
+  distinct `"ambiguous session markers (N)"` hard error naming only the
+  count and each candidate's host (never a session id). Omitting
+  `sessionId` with none of the three available is a hard error, never a
+  fabricated id. The returned row always carries `session_id_source`
+  (`"explicit"|"env"|"marker"`) and, only when it is `"marker"`,
+  `marker_ts` — provenance for the id actually used.
 
-  **Under Codex, step (2) does not fire — the marker (step 3) is the path
-  that actually serves Codex.** A real Codex CLI end-to-end run
-  (2026-09-12) confirmed Codex does NOT put `CODEX_THREAD_ID` into this MCP
-  server process's own environment: `config.toml`'s `env` table for this
-  server carries only `HANDOFF_HOST` and `HANDOFF_PROMOTION_FILE`. Before
-  this fix, an omitted `sessionId` under Codex failed outright with "no
-  default could be resolved from ... CLAUDE_CODE_SESSION_ID or
-  CODEX_THREAD_ID env vars" in the SAME run where `handoff_status` reported
-  a `session_id` — because `handoff_status` reads the project's marker,
-  which the `SessionStart` loader hook (`--host codex`) writes with the
-  Codex thread id, and `usage_record` did not previously consult it. Pass
-  `sessionId` explicitly (e.g. the value from `handoff_status`, or the
-  hook's own `session_id`) to bypass the fallback chain entirely.
+  **Under Codex, step (2) fires only if the MCP server process has those
+  env vars; Codex does not set them, so step (3) is the path that serves
+  Codex.** A real Codex CLI end-to-end run (2026-09-12) confirmed Codex does
+  NOT put `CODEX_THREAD_ID` into this MCP server process's own environment:
+  `config.toml`'s `env` table for this server carries only `HANDOFF_HOST`
+  and `HANDOFF_PROMOTION_FILE`. Before the original fix, an omitted
+  `sessionId` under Codex failed outright with "no default could be
+  resolved from ... CLAUDE_CODE_SESSION_ID or CODEX_THREAD_ID env vars" in
+  the SAME run where `handoff_status` reported a `session_id` — because
+  `handoff_status` reads the project's marker array, which the
+  `SessionStart` loader hook (`--host codex`) writes with the Codex thread
+  id (and, as of this PR, `host: "codex"`), and `usage_record` did not
+  previously consult it. Pass `sessionId` explicitly (e.g. the value from
+  `handoff_status`, or the hook's own `session_id`) to bypass the fallback
+  chain entirely — doing so is also the only way to disambiguate when two
+  or more sessions have live markers for the same project.
   `usage_record` writes to `turn_usage` ONLY — it never writes
   `session_usage` or `feature_usage`.
 - `usage_query` does NOT resolve session identity from env — it has no
@@ -153,12 +171,11 @@ see below.
   `feature_usage` at init/heal (`handoff.js init`, or an equivalent schema
   heal reached via `ensureSchemaCurrent`) — never auto-created by
   usage_record/usage_query themselves. On an engine older than epoch 5 the
-  tools return the actionable error below instead. This is a statement
-  about the engine version once PR #298 lands on `main`, not a claim about
-  any particular checkout's manifest today — as of this writing this
-  checkout's `scripts/sql/schema-manifest.json` is `schema_epoch: 4` and
-  does not yet include these tables at all, so on an unpatched checkout the
-  error below is the ONLY outcome, on any project database. Calling either
+  tools return the actionable error below instead. As of this writing this
+  checkout's `scripts/sql/schema-manifest.json` is `schema_epoch: 5` and
+  includes these tables (PR #298); a project database whose stored
+  `schema_fingerprint` still carries an epoch older than 5 re-applies once
+  via `ensureSchemaCurrent`'s heal-on-touch path to pick them up. Calling either
   tool against a project database whose schema predates the table it needs
   returns an actionable error naming the missing relation, not a raw
   Postgres stack trace, e.g.:
@@ -240,8 +257,8 @@ and `decisions`. (Database names are arbitrary and set at `createdb` time —
 this project's own dogfood database, for example, still carries a legacy
 name from before a rename, which is cosmetic and has no effect on behavior.)
 
-Embeddings, when enabled, come from a local vLLM server running a
-Qwen3-Embedding-8B model (default port 8800) — see
+Embeddings, when enabled, come from a local vLLM server running an
+embedding model of the operator's choice (default port 8800) — see
 [Degraded modes](#degraded-modes) for what happens without one.
 
 ---

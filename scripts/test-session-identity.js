@@ -25,7 +25,11 @@ const assert = require('node:assert');
 const fs     = require('node:fs');
 const os     = require('node:os');
 const path   = require('node:path');
-const { resolveSessionIdFromEnv, resolveSessionIdFromMarker } = require('./lib/session-identity');
+const {
+  resolveSessionIdFromEnv,
+  resolveSessionIdFromMarker,
+  resolveUsageRecordMarkerDefault,
+} = require('./lib/session-identity');
 const pgHelpers = require('./lib/test-pg-helpers.js');
 
 let passed = 0;
@@ -193,6 +197,89 @@ async function runMarkerFallbackTests() {
         await resolveSessionIdFromMarker(db, projectId);
       check('SIM4: an explicit sessionId short-circuits before env or marker are ever consulted', resolved === 'explicit-sess-sim4');
     });
+
+    // ── SIU1-5: resolveUsageRecordMarkerDefault (Codex review C1/C2,
+    // fix/usage-record-marker-fallback follow-up) — the strict, usage_record-
+    // ONLY marker default. Distinct function from resolveSessionIdFromMarker
+    // above; these cases exercise exactly the total classification C1/C2
+    // describe. Same CodeQL js/clear-text-logging discipline as SIM1-4 —
+    // check() below takes only pre-computed booleans, never a marker/session
+    // id value itself.
+
+    // (SIU1) exactly one marker, no HANDOFF_HOST -> used verbatim, no error.
+    await pgHelpers.setSetting(
+      db, projectId, 'session_in_progress',
+      JSON.stringify([{ session_id: 'marker-sess-siu1', ts: new Date().toISOString(), host: 'claude' }])
+    );
+    {
+      const r = await resolveUsageRecordMarkerDefault(db, projectId, null);
+      check('SIU1: exactly one marker, HANDOFF_HOST unset -> used, no error', r.error === null && r.sessionId === 'marker-sess-siu1');
+    }
+
+    // (SIU2) two markers for the same project (neither host matches, or
+    // HANDOFF_HOST unset) -> ambiguous error, never a fabricated pick.
+    await pgHelpers.setSetting(
+      db, projectId, 'session_in_progress',
+      JSON.stringify([
+        { session_id: 'marker-sess-siu2a', ts: new Date().toISOString(), host: 'claude' },
+        { session_id: 'marker-sess-siu2b', ts: new Date().toISOString(), host: 'codex' },
+      ])
+    );
+    {
+      const r = await resolveUsageRecordMarkerDefault(db, projectId, null);
+      check(
+        'SIU2: two markers, same project, HANDOFF_HOST unset -> ambiguous error, no sessionId',
+        r.sessionId === null && typeof r.error === 'string' && r.error.includes('ambiguous session markers (2)')
+      );
+    }
+
+    // (SIU3) a host-tagged marker that does NOT match HANDOFF_HOST=codex is
+    // excluded from candidacy -> zero candidates -> the "no marker" error
+    // (never silently accepted as a stale/cross-host marker — the C1 bug).
+    await pgHelpers.setSetting(
+      db, projectId, 'session_in_progress',
+      JSON.stringify([{ session_id: 'marker-sess-siu3', ts: new Date().toISOString(), host: 'claude' }])
+    );
+    {
+      const r = await resolveUsageRecordMarkerDefault(db, projectId, 'codex');
+      check(
+        'SIU3: host-tagged marker (host=claude) mismatches HANDOFF_HOST=codex -> excluded, "no marker" error',
+        r.sessionId === null && typeof r.error === 'string' && r.error.includes('no project session marker')
+      );
+    }
+
+    // (SIU4) malformed (non-JSON) raw marker value -> excluded by the strict
+    // parser, never legacy-parsed as a bare-string marker (C2) -> zero
+    // candidates -> the same "no marker" error as an absent marker.
+    await pgHelpers.setSetting(db, projectId, 'session_in_progress', 'not-valid-json-{{{');
+    {
+      const r = await resolveUsageRecordMarkerDefault(db, projectId, null);
+      check(
+        'SIU4: malformed (non-JSON) marker value is excluded -> "no marker" error, never legacy-parsed',
+        r.sessionId === null && typeof r.error === 'string' && r.error.includes('no project session marker')
+      );
+    }
+
+    // (SIU5) exactly one candidate, but its session_id is whitespace-only ->
+    // the marker-derived id fails the same trim/non-empty validation an
+    // explicit sessionId would (C2) -> actionable error, never a blank id.
+    await pgHelpers.setSetting(
+      db, projectId, 'session_in_progress',
+      JSON.stringify([{ session_id: '   ', ts: new Date().toISOString(), host: 'claude' }])
+    );
+    {
+      const r = await resolveUsageRecordMarkerDefault(db, projectId, null);
+      check(
+        'SIU5: whitespace-only session_id marker (sole candidate) -> actionable error, never a blank sessionId',
+        r.sessionId === null && typeof r.error === 'string' && r.error.length > 0
+      );
+    }
+
+    // Clear the marker so it never leaks past this test file's own DB fixture.
+    await db.query(
+      `DELETE FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'`,
+      [projectId]
+    );
   } finally {
     if (db) {
       try { await db.end(); } catch (_) { /* best-effort */ }

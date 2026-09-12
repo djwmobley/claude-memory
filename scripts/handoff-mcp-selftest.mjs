@@ -445,14 +445,21 @@ async function runUsageTelemetryChecks() {
       // Boolean-only assertion below (CodeQL js/clear-text-logging) -- the
       // marker session id is never logged, only compared.
       {
-        const label = 'UT-G: usage_record with no sessionId and no env ids, marker present -> row written under the marker id';
+        // Codex review C1 (fix/usage-record-marker-fallback follow-up): this
+        // case now also asserts session_id_source === "marker" -- the
+        // provenance field the strict marker default (C1) added to every
+        // usage_record result, distinguishing "resolved from env" from
+        // "resolved from a project marker" without ever logging the id
+        // itself (CodeQL js/clear-text-logging -- the boolean-only
+        // assertion pattern below is unchanged).
+        const label = 'UT-G: usage_record with no sessionId and no env ids, marker present -> row written under the marker id, source=marker';
         const markerSessionId = 'marker-sess-ut-g';
         const projectId = pgHelpers.resolveProjectId(projectDir);
         const markerDb = await pgHelpers.pgConnect(dbName);
         try {
           await pgHelpers.setSetting(
             markerDb, projectId, 'session_in_progress',
-            JSON.stringify([{ session_id: markerSessionId, ts: new Date().toISOString() }])
+            JSON.stringify([{ session_id: markerSessionId, ts: new Date().toISOString(), host: 'codex' }])
           );
         } finally {
           await markerDb.end();
@@ -466,7 +473,11 @@ async function runUsageTelemetryChecks() {
                 arguments: { projectRoot: projectDir, turnIdx: 6, agentRole: 'ut-role', tokensIn: 10, tokensOut: 5 },
               });
               const row = result.isError ? null : JSON.parse(result.content[0].text);
-              check(label, !result.isError && row.sessionId === markerSessionId);
+              check(
+                label,
+                !result.isError && row.sessionId === markerSessionId &&
+                  row.session_id_source === 'marker' && typeof row.marker_ts === 'string'
+              );
             }
           );
         } finally {
@@ -482,8 +493,58 @@ async function runUsageTelemetryChecks() {
           }
         }
       }
+
+      // (h) Codex review C1: TWO live project markers -> the strict marker
+      // default refuses to guess between them (ambiguous), a hard error
+      // naming only the count -- never a session id (CodeQL js/clear-text-
+      // logging: the assertion below checks for the fixed literal substring
+      // "ambiguous session markers (2)" and the ABSENCE of either marker id
+      // in the error text, never logs an id itself).
+      {
+        const label = 'UT-H: usage_record with no sessionId, no env ids, TWO project markers -> ambiguous hard error, no id leaked';
+        const markerIdA = 'marker-sess-ut-h-a';
+        const markerIdB = 'marker-sess-ut-h-b';
+        const projectId = pgHelpers.resolveProjectId(projectDir);
+        const markerDb = await pgHelpers.pgConnect(dbName);
+        try {
+          await pgHelpers.setSetting(
+            markerDb, projectId, 'session_in_progress',
+            JSON.stringify([
+              { session_id: markerIdA, ts: new Date().toISOString(), host: 'claude' },
+              { session_id: markerIdB, ts: new Date().toISOString(), host: 'codex' },
+            ])
+          );
+        } finally {
+          await markerDb.end();
+        }
+        try {
+          await withMcpClient(
+            { HANDOFF_DB: dbName, HANDOFF_HOST: undefined, CLAUDE_CODE_SESSION_ID: undefined, CODEX_THREAD_ID: undefined },
+            async (client) => {
+              const result = await client.callTool({
+                name: 'usage_record',
+                arguments: { projectRoot: projectDir, turnIdx: 7, agentRole: 'ut-role', tokensIn: 10, tokensOut: 5 },
+              });
+              const text = result.content[0]?.text ?? '';
+              const rejectedProperly = result.isError === true && text.includes('ambiguous session markers (2)');
+              const leaked = text.includes(markerIdA) || text.includes(markerIdB);
+              check(label, rejectedProperly && !leaked);
+            }
+          );
+        } finally {
+          const cleanupDb = await pgHelpers.pgConnect(dbName);
+          try {
+            await cleanupDb.query(
+              `DELETE FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'`,
+              [projectId]
+            );
+          } finally {
+            await cleanupDb.end();
+          }
+        }
+      }
     } catch {
-      check('UT-BCDEFG: setup/execution', false);
+      check('UT-BCDEFGH: setup/execution', false);
     } finally {
       await pgHelpers.dropTestDb(dbName, projectDir);
     }
