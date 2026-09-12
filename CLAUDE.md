@@ -41,13 +41,17 @@ These rules are canon. They override convenience, time pressure, and apparent co
 
 ## Next session — read first
 
-- feature_usage (§18.3 / runbook amendment F) was ALREADY SHIPPED in PR #255 2126f6c 2026-09-06: `scripts/migrations/sql/migrate-12-feature-usage.sql`, `scripts/migrations/migrate-12-feature-usage.js`, `usage_query` granularity=feature. The prior "NOT SHIPPED" note in this block was wrong — it searched `scripts/sql` only.
-- 2026-09-11: DDL applied to `memory_manager_staging` via `migrate-schema-addenda.js` (MIGRATION_RESULT: PASS); migrate-12 backfill `--write` COMPLETE: 7/7 rows from `pipeline_pipeline.feature_token_usage`, project_id `pipeline` (staging's existing slug convention for pipeline-origin rows), reconciled ids 1-7, spot checks exact, usageQuery feature-grain returns the aggregate.
-- `cost_usd` is NULL for all 7 backfilled rows — the source table has no cost column.
-- Backups + SHA-256 manifest: `C:\Users\djwmo\Downloads\pg-backups\` (pipeline_pipeline and memory_manager_staging pre-migrate-12 dumps). Run reports: `C:\Users\djwmo\Downloads\feature-usage-reports\`.
-- Canon DB `memory_manager` does not exist yet — staging-first per runbook §15; feature_usage is not yet promoted to canon.
-- Init-time Q&A (§17.1.2, V7/V8/V9): design spec handed to judge as `djwmobley/judge#20` (`docs/specs/init-routing-qa.md` + `init-routing-qa.adversary.md`, adversary round 1 G1-G10 resolved in text). Verified 2026-09-11: PR #20 state OPEN, no merge commit. V7-V9 remain owner-review points inside the spec §7.
-- SessionEnd implicit close FIRED 2026-09-12T03:42Z (session 028d4707) but the evidence is CONFOUNDED: it fired at `/clear` because the explicit MCP close ran under the long-lived MCP-server session id while the marker carried the hook-side id (ids split after `/clear`). Not proof of the no-explicit-close path. Engine defect filed as cm#295; recurs for marker 09e48b2e at this window's exit.
-- vLLM real-reboot test: owner confirmed working 2026-09-11; thread closed.
-- Owner asked to coordinate the feature_usage work with Codex; no evidence found of Codex activity on migrate-12 (PR #255 authored by owner; Codex sessions 09-11 were in another project). Codex coordination questions pending owner answer.
-- NEXT: (1) owner answers on Codex coordination for feature_usage; (2) promote feature_usage to canon `memory_manager` when §15 acceptance battery runs; (3) judge implements init Q&A per spec (judge session, not here); (4) fix cm#295 (Opus plan → adversary → author; lean = SessionEnd honors a newer last_explicit_close regardless of id AND MCP close resolves identity from the live marker); vLLM thread is closed.
+- feature_usage: code shipped PR #255 (2026-09-06); 2026-09-11 DDL applied to `memory_manager_staging` + migrate-12 backfill 7/7 rows, project_id `pipeline`.
+- feature_usage `cost_usd` is NULL for all 7 rows (source table has no cost column); backups in `Downloads\pg-backups\`, run reports in `Downloads\feature-usage-reports\`.
+- Canon DB `memory_manager` not created — staging-first per runbook §15; feature_usage not yet promoted.
+- 2026-09-12 owner rule: "coordinate with Codex" means the feature must work with Codex as host AND Codex checks the work (`codex exec`, read-only sandbox; working binary under `AppData\Local\OpenAI\Codex\bin`; the `~/.codex/.sandbox-bin` copy lacks the code-mode host).
+- Codex-host gap found: usage tools failed on every engine DB because telemetry DDL was missing from `scripts/sql/schema-manifest.json`.
+- Fix PR #298 (91f58a2): DDL moved to `scripts/sql/usage-telemetry-schema.sql` + `feature-usage-schema.sql`, registered, schema_epoch 5, required_roster, manifest lint T11, fail-soft `model_registry` cost lookup.
+- Fix PR #299 (a878554): MCP annotations on all 35 tools (readOnlyHint false everywhere — heal-on-touch may write), actionable 42P01 errors, `scripts/lib/session-identity.js`, `docs/hosts/codex.md` approval section.
+- Fix PR #300 (44f7638): `usage_record` sessionId falls back to the project session marker (strict: host-filtered, exactly one); markers now record host and keep fields on rewrite.
+- Codex config: `~/.codex/config.toml` now sets `approval_mode="approve"` for `usage_query`/`usage_record` (backup `config.toml.bak-2026-09-12-usage-approval`); `codex exec` rejects MCP calls without such entries.
+- End-to-end verified 2026-09-12 via `codex exec` on main 44f7638: `handoff_status` shows host codex; `usage_query` by feature → empty; `usage_record` without sessionId → written with `session_id_source` marker; `usage_query` by role shows the row; empty sessionId rejected. Verdict: works; probe row deleted.
+- Init-time Q&A: judge PR #20 (`docs/specs/init-routing-qa.md`) OPEN, blocked by judge main red on the session-end worktree guard test (judge-owned fix); author worktree kept.
+- Engine defects filed: cm#295 (hook/MCP session-id split after `/clear` → spurious implicit close; marker left in place), cm#297 (close pointer gate suppresses session_tldr/open_thread citing cross-repo file:line; suppression_kind NULL).
+- NEXT: (1) fix cm#295 and cm#297 (plan → adversary → author → Codex check → approve); (2) judge fixes its red test, merges PR #20, implements init Q&A; (3) promote feature_usage to canon when §15 acceptance runs.
+- NEXT continued: (4) every feature: run through the Codex MCP path + `codex exec` check before done.
