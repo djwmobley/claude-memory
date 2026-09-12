@@ -137,7 +137,8 @@
  *   errors. 'turn' is every behavior documented below, unchanged.
  *   granularity='feature' (§18.3) reads feature_usage instead of turn_usage/
  *   session_usage -- a separate per-feature/per-PR provenance table
- *   (migrate-12-feature-usage.sql), project-scoped only: sessionId given
+ *   (scripts/sql/feature-usage-schema.sql, formerly migrate-12-feature-
+ *   usage.sql), project-scoped only: sessionId given
  *   together with granularity='feature' hard-errors BEFORE any query runs
  *   (feature_usage carries no session_id column to scope by at all -- this
  *   is a refused combination, not a silently-ignored parameter). groupBy
@@ -200,7 +201,8 @@ const VALID_OUTCOMES = Object.freeze(['success', 'failure', 'downgraded', 'unkno
 const VALID_GROUP_BY = Object.freeze(['model', 'role', 'provider', 'day']);
 // §18.3: usageQuery's granularity dimension. 'turn' (default) is every
 // pre-existing behavior above, unchanged. 'feature' reads feature_usage
-// (migrate-12-feature-usage.sql) instead of turn_usage/session_usage --
+// (scripts/sql/feature-usage-schema.sql, formerly migrate-12-feature-
+// usage.sql) instead of turn_usage/session_usage --
 // a wholly separate per-feature/per-PR provenance table with its own
 // column set, written only by migrate-12-feature-usage.js's data migration
 // (usageRecord/sessionUsageRollup never touch it).
@@ -210,7 +212,8 @@ const RESERVED_MODEL_SENTINEL = '(none)';
 
 /**
  * turn_usage.cost_usd and session_usage.total_cost_usd are both
- * NUMERIC(12,6) (migrate-11-usage-telemetry.sql) -- 12 total digits, 6 after
+ * NUMERIC(12,6) (scripts/sql/usage-telemetry-schema.sql, formerly migrate-
+ * 11-usage-telemetry.sql) -- 12 total digits, 6 after
  * the decimal point, so the largest representable magnitude is
  * 999999.999999. A cost value at or beyond this bound (caller-supplied OR
  * server-computed) is a COMPUTABLE ANOMALY (a mispriced or miscounted

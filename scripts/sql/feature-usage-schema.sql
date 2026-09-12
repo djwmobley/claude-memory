@@ -1,4 +1,11 @@
--- migrate-12-feature-usage.sql
+-- handoff:dialect postgres
+-- feature-usage-schema.sql (formerly scripts/migrations/sql/migrate-12-
+-- feature-usage.sql -- moved to scripts/sql/ so ensureSchemaCurrent's
+-- init/heal-on-touch applies it to EVERY live project engine DB, not only
+-- memory_manager_staging via migrate-schema-addenda.js. Registered in
+-- scripts/sql/schema-manifest.json (order 50, schema_epoch 5). The DATA
+-- MIGRATION script scripts/migrations/migrate-12-feature-usage.js keeps its
+-- own name/location unchanged -- only this DDL file moved.
 --
 -- Schema-setup-only (no data migration -- see migrate-12-feature-usage.js
 -- for the one-time backfill from pipeline_pipeline.feature_token_usage).

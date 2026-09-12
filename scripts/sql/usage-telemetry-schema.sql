@@ -1,4 +1,11 @@
--- migrate-11-usage-telemetry.sql
+-- handoff:dialect postgres
+-- usage-telemetry-schema.sql (formerly scripts/migrations/sql/migrate-11-
+-- usage-telemetry.sql -- moved to scripts/sql/ so ensureSchemaCurrent's
+-- init/heal-on-touch applies it to EVERY live project engine DB, not only
+-- memory_manager_staging via migrate-schema-addenda.js. Registered in
+-- scripts/sql/schema-manifest.json (order 40, schema_epoch 5). Same content,
+-- same file basename convention as this file group's sibling
+-- feature-usage-schema.sql (formerly migrate-12-feature-usage.sql).
 --
 -- Schema-setup-only (no data migration).
 --

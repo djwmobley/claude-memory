@@ -2921,10 +2921,17 @@ async function runS12() {
       assertEqual(result.errors.length, 0, 'S12.g1: zero classification errors');
       assertTrue(
         result.unitsByDialect.postgres.map((u) => u.basename).join(',') ===
-          'handoff-core-schema.sql,app-retrieval-events-schema.sql,decisions-base.sql',
-        `S12.g1: postgres unit order is [core, app-retrieval-events, decisions-base], got: ${result.unitsByDialect.postgres.map((u) => u.basename)}`
+          'handoff-core-schema.sql,app-retrieval-events-schema.sql,decisions-base.sql,usage-telemetry-schema.sql,feature-usage-schema.sql',
+        // PR-A (2026-09-12): usage-telemetry-schema.sql (order 40) and
+        // feature-usage-schema.sql (order 50) registered as postgres units
+        // -- see scripts/sql/schema-manifest.json.
+        `S12.g1: postgres unit order is [core, app-retrieval-events, decisions-base, usage-telemetry-schema, feature-usage-schema], got: ${result.unitsByDialect.postgres.map((u) => u.basename)}`
       );
-      assertEqual(result.unitsByDialect.sqlite.length, 1, 'S12.g1: exactly one sqlite unit');
+      // PR-A: both new units are classified postgres-only -- neither appears
+      // in unitsByDialect.sqlite, so this exact-count assertion doubles as
+      // the "new units skipped on SQLite" proof (a misclassification into
+      // sqlite would fail this count).
+      assertEqual(result.unitsByDialect.sqlite.length, 1, 'S12.g1: exactly one sqlite unit (turn_usage/session_usage/feature_usage are postgres-only and must NOT appear here)');
       assertEqual(result.unitsByDialect.sqlite[0].basename, 'handoff-sqlite-schema.sql', 'S12.g1: sqlite unit is handoff-sqlite-schema.sql');
       pass(label);
     } catch (err) { fail(label, err.message); }

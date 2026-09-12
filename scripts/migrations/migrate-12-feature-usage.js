@@ -6,8 +6,11 @@
  * §18.3 owner decision item F (2026-09-06). One-time data migration:
  * pipeline_pipeline.feature_token_usage (7 live rows, per-feature/per-PR
  * token+cost provenance) -> the consolidation target's feature_usage table
- * (scripts/migrations/sql/migrate-12-feature-usage.sql, applied by
- * migrate-schema-addenda.js). This script does NO schema work of its own —
+ * (scripts/sql/feature-usage-schema.sql, formerly scripts/migrations/sql/
+ * migrate-12-feature-usage.sql -- moved to scripts/sql/ by PR-A 2026-09-12
+ * so ensureSchemaCurrent creates it in every live project DB too; applied to
+ * memory_manager_staging by migrate-schema-addenda.js as before). This
+ * script does NO schema work of its own —
  * it refuses outright if the target table is absent (see PRECONDITION
  * below) rather than creating it.
  *

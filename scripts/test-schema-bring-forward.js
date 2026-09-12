@@ -65,6 +65,9 @@ const { PostgresAdapter } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'd
 const { classifySchemaFiles, normalizeContent } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'schema-classify.js'));
 // cm#224 follow-up: shared guarded pgvector-extension installer.
 const { ensureVectorExtension } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'test-pg-helpers.js'));
+// PR-A (2026-09-12): usage_query's feature-granularity read, exercised
+// against the fresh heal-only DB in testT6 below.
+const { usageQuery } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'usage-telemetry.js'));
 
 let passed = 0;
 let failed = 0;
@@ -463,6 +466,174 @@ function testT4() {
   }
 }
 
+// ── T6: PR-A telemetry-manifest registration — classification + fresh-DB
+//     provisioning + idempotency + empty feature-grain query ────────────────
+//
+// Adversary G4 guard: this must NOT pass merely because
+// memory_manager_staging already carries these tables from the pre-existing
+// migrate-schema-addenda.js path — every assertion below runs against a
+// FRESH throwaway DB this test provisions itself, with nothing seeded, so a
+// manifest registration bug (missing unit, wrong classification, wrong
+// order, phantom expected_objects entry) would fail here even if staging
+// looked fine.
+
+async function testT6() {
+  const label = 'T6: usage-telemetry-schema.sql + feature-usage-schema.sql — classified postgres, fresh-DB apply creates all 3 tables/8 named indexes/3 uniques/2 checks, idempotent re-run, empty feature-grain query';
+  if (!(await isPgAvailable())) { console.log(`SKIP  ${label} (Postgres unavailable)`); return; }
+
+  // (a)+(b): classification + manifest/DDL identifier parity — no DB needed.
+  const classification = classifySchemaFiles({ engineRoot: PROJECT_ROOT });
+  assertTrue(classification.ok, `T6(a/b): classifySchemaFiles reports ok (manifest/DDL desync would fail here) — errors: ${JSON.stringify(classification.errors)}`);
+  const postgresBasenames = classification.unitsByDialect.postgres.map((u) => u.basename);
+  assertTrue(postgresBasenames.includes('usage-telemetry-schema.sql'), 'T6(a): usage-telemetry-schema.sql classified postgres and present');
+  assertTrue(postgresBasenames.includes('feature-usage-schema.sql'), 'T6(a): feature-usage-schema.sql classified postgres and present');
+  const usageUnit = classification.unitsByDialect.postgres.find((u) => u.basename === 'usage-telemetry-schema.sql');
+  const featureUnit = classification.unitsByDialect.postgres.find((u) => u.basename === 'feature-usage-schema.sql');
+  assertTrue(usageUnit.order < featureUnit.order, 'T6(b): usage-telemetry-schema.sql (order 40) sorts before feature-usage-schema.sql (order 50)');
+
+  const dbName = `cm_pra_t6_${Date.now()}`;
+  const PID = 'cm-pra-t6-project';
+  try {
+    await createThrowawayDb(dbName);
+    await ensureVectorExtension(dbName);
+
+    const db = await pgConnect(dbName);
+    const adapter = new PostgresAdapter(db);
+
+    // Bootstrap precondition only (identical to T3): a fresh throwaway DB
+    // with NOTHING but project_settings — every table this test asserts on
+    // must come from ensureSchemaCurrent's own additive apply, not from any
+    // fixture SQL this test applies by hand.
+    await db.query(
+      `CREATE TABLE project_settings (project_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (project_id, key))`
+    );
+
+    // (c): fresh apply.
+    const first = await handoffModule.ensureSchemaCurrent(adapter, PID, { silent: true });
+    assertTrue(first.applied, 'T6(c): first call applies against the fresh DB');
+
+    const { rows: tableRows } = await db.query(
+      `SELECT table_name FROM information_schema.tables WHERE table_name IN ('turn_usage','session_usage','feature_usage') ORDER BY table_name`
+    );
+    assertEqual(tableRows.length, 3, 'T6(c): all 3 tables (turn_usage, session_usage, feature_usage) exist after a bare fresh-DB apply');
+
+    const expectedNamedIndexes = [
+      'turn_usage_project_idx', 'turn_usage_session_idx', 'turn_usage_model_idx', 'session_usage_project_idx',
+      'feature_usage_project_idx', 'feature_usage_project_branch_idx', 'feature_usage_project_pr_idx', 'feature_usage_session_ids_gin_idx',
+    ];
+    const { rows: idxRows } = await db.query(
+      `SELECT indexname FROM pg_indexes WHERE indexname = ANY($1::text[])`,
+      [expectedNamedIndexes]
+    );
+    assertEqual(idxRows.length, 8, `T6(c): all 8 explicitly-named indexes across both units exist (got ${idxRows.length}: ${idxRows.map((r) => r.indexname).join(',')})`);
+
+    const { rows: uqRows } = await db.query(
+      `SELECT conrelid::regclass::text AS tbl FROM pg_constraint
+        WHERE contype = 'u' AND conrelid IN ('turn_usage'::regclass, 'session_usage'::regclass, 'feature_usage'::regclass)`
+    );
+    assertEqual(uqRows.length, 3, `T6(c): all 3 anonymous table-level UNIQUE constraints exist (adversary G6 — verified as constraints, not named indexes), got ${uqRows.length}`);
+
+    const { rows: ckRows } = await db.query(
+      `SELECT conname FROM pg_constraint WHERE contype = 'c' AND conrelid = 'turn_usage'::regclass`
+    );
+    assertEqual(ckRows.length, 2, `T6(c): turn_usage carries exactly 2 CHECK constraints (resolved_via, outcome), got ${ckRows.length}`);
+
+    // (d): idempotent re-run — zero DDL errors, reason 'current'.
+    const second = await handoffModule.ensureSchemaCurrent(adapter, PID, { silent: true });
+    assertFalse_(second.applied, 'T6(d): second call is a no-op');
+    assertEqual(second.reason, 'current', 'T6(d): second-call reason is "current" — no DDL re-attempted');
+
+    // usageQuery granularity='feature' against this fresh, heal-only-created
+    // DB: feature_usage exists but has zero rows (never backfilled here) —
+    // must return an EMPTY ARRAY, never throw (G1: this is empty by design,
+    // not a defect — feature_usage is populated only by migrate-12-
+    // feature-usage.js's data migration or a live feature run, never by
+    // schema apply itself).
+    const featureResult = await usageQuery(db, { projectId: PID, granularity: 'feature' });
+    assertTrue(Array.isArray(featureResult), 'T6: usageQuery(feature) returns an array');
+    assertEqual(featureResult.length, 0, 'T6: usageQuery(feature) against the fresh heal-only DB returns an EMPTY result, not an error');
+
+    await db.end();
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+  }
+}
+
+// ── T7: (e) hand-made turn_usage missing the resolved_via CHECK — healed
+//     exactly once via the fingerprint-'current' fast path, no loop on the
+//     second touch ──────────────────────────────────────────────────────────
+
+async function testT7() {
+  const label = 'T7: turn_usage missing the resolved_via CHECK — healed on the first fast-path touch, idempotent (no re-heal, no duplicate constraint) on the second';
+  if (!(await isPgAvailable())) { console.log(`SKIP  ${label} (Postgres unavailable)`); return; }
+
+  const dbName = `cm_pra_t7_${Date.now()}`;
+  const PID = 'cm-pra-t7-project';
+  try {
+    await createThrowawayDb(dbName);
+    await ensureVectorExtension(dbName);
+
+    const db = await pgConnect(dbName);
+    const adapter = new PostgresAdapter(db);
+    await db.query(
+      `CREATE TABLE project_settings (project_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (project_id, key))`
+    );
+
+    // Establish a clean, fully-applied, fingerprint-'current' baseline first
+    // (mirrors a live install that has already run init/heal once).
+    const baseline = await handoffModule.ensureSchemaCurrent(adapter, PID, { silent: true });
+    assertTrue(baseline.applied, 'T7 precondition: baseline apply succeeds');
+
+    // Simulate the "hand-made turn_usage" aged state (adversary G4: a
+    // pre-existing table that was never healed, not a fresh CREATE) by
+    // dropping ONLY the resolved_via CHECK constraint by hand -- turn_usage
+    // itself, its other CHECK (outcome), and its indexes/uniques are left
+    // untouched, so this exercises the CHECK-heal path in isolation.
+    await db.query(`ALTER TABLE turn_usage DROP CONSTRAINT turn_usage_resolved_via_check`);
+    const { rows: droppedCheck } = await db.query(
+      `SELECT conname FROM pg_constraint WHERE contype = 'c' AND conrelid = 'turn_usage'::regclass`
+    );
+    assertEqual(droppedCheck.length, 1, 'T7 precondition: only the outcome CHECK remains after the hand-drop');
+
+    // First touch after the hand-drop: fingerprint is STILL 'current' (SQL
+    // bytes never changed) — this must heal via the fast-path constraint-heal
+    // block (never re-run the whole additive apply), and must not error.
+    const healRun = await handoffModule.ensureSchemaCurrent(adapter, PID, { silent: true });
+    assertFalse_(healRun.applied, 'T7: heal touch does not report a fresh "applied" (fingerprint was already current -- the heal is folded into the fast path, not a new apply)');
+    assertEqual(healRun.reason, 'current', 'T7: heal touch resolves to "current" once the CHECK is healed');
+
+    const { rows: healedCheck } = await db.query(
+      `SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE contype = 'c' AND conrelid = 'turn_usage'::regclass ORDER BY conname`
+    );
+    assertEqual(healedCheck.length, 2, 'T7: exactly 2 CHECK constraints on turn_usage after healing (resolved_via re-added, outcome untouched) -- not 0, not 3');
+    assertTrue(
+      healedCheck.some((r) => r.def.includes("'directive'") && r.def.includes("'recommendation'")),
+      'T7: the healed resolved_via CHECK carries the correct def'
+    );
+
+    // Second touch: must be a pure no-op — no loop, no duplicate ADD
+    // CONSTRAINT, no error.
+    const secondTouch = await handoffModule.ensureSchemaCurrent(adapter, PID, { silent: true });
+    assertFalse_(secondTouch.applied, 'T7: second touch is a no-op');
+    assertEqual(secondTouch.reason, 'current', 'T7: second touch reason is "current"');
+
+    const { rows: finalCheck } = await db.query(
+      `SELECT conname FROM pg_constraint WHERE contype = 'c' AND conrelid = 'turn_usage'::regclass`
+    );
+    assertEqual(finalCheck.length, 2, 'T7: still exactly 2 CHECK constraints after the second touch — no duplicate re-heal, no loop');
+
+    await db.end();
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+  }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -472,6 +643,8 @@ async function main() {
   await testT2();
   await testT3();
   await testT5();
+  await testT6();
+  await testT7();
 
   console.log('');
   console.log(`Results: ${passed} passed, ${failed} failed`);
