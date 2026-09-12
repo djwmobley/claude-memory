@@ -66,8 +66,10 @@ const { classifySchemaFiles, normalizeContent } = require(path.join(PROJECT_ROOT
 // cm#224 follow-up: shared guarded pgvector-extension installer.
 const { ensureVectorExtension } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'test-pg-helpers.js'));
 // PR-A (2026-09-12): usage_query's feature-granularity read, exercised
-// against the fresh heal-only DB in testT6 below.
-const { usageQuery } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'usage-telemetry.js'));
+// against the fresh heal-only DB in testT6 below. Codex review follow-up
+// (2026-09-12): usageRecord, exercised against a model_registry-less fresh
+// engine DB in testT8 below (F1).
+const { usageQuery, usageRecord } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'usage-telemetry.js'));
 
 let passed = 0;
 let failed = 0;
@@ -634,6 +636,211 @@ async function testT7() {
   }
 }
 
+// ── T8: Codex review F1 — computeServerSideCost fails soft when
+//     model_registry does not exist on a fresh engine DB ────────────────────
+//
+// model_registry is created by scripts/migrations/sql/model-registry-base.sql
+// via migrate-schema-addenda.js, NOT by any scripts/sql/*.sql unit
+// ensureSchemaCurrent applies -- so a fresh engine DB provisioned by
+// ensureSchemaCurrent ALONE (exactly what this test does) genuinely has no
+// model_registry table at all. usageRecord with costUsd omitted must
+// therefore succeed with cost_usd NULL (fail-soft), never throw pg's raw
+// 42P01 (undefined_table).
+
+async function testT8() {
+  const label = 'T8: Codex review F1 — usageRecord(costUsd omitted) against a fresh engine DB with no model_registry succeeds, cost_usd NULL, one stderr line, no throw';
+  if (!(await isPgAvailable())) { console.log(`SKIP  ${label} (Postgres unavailable)`); return; }
+
+  const dbName = `cm_pra_t8_${Date.now()}`;
+  const PID = 'cm-pra-t8-project';
+  try {
+    await createThrowawayDb(dbName);
+    await ensureVectorExtension(dbName);
+
+    const db = await pgConnect(dbName);
+    const adapter = new PostgresAdapter(db);
+    await db.query(
+      `CREATE TABLE project_settings (project_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (project_id, key))`
+    );
+
+    // Provision via ensureSchemaCurrent ONLY — no migrate-schema-addenda.js,
+    // no model-registry-base.sql applied by hand. This is the exact "fresh
+    // engine DB" state F1 names.
+    const apply = await handoffModule.ensureSchemaCurrent(adapter, PID, { silent: true });
+    assertTrue(apply.applied, 'T8 precondition: fresh apply succeeds');
+
+    const { rows: mrRows } = await db.query(
+      `SELECT 1 FROM information_schema.tables WHERE table_name = 'model_registry'`
+    );
+    assertEqual(mrRows.length, 0, 'T8 precondition: model_registry genuinely does not exist on this DB');
+
+    // Capture stderr to confirm the ONE documented fail-soft line, without
+    // letting it print during a normal test run.
+    const originalWrite = process.stderr.write.bind(process.stderr);
+    const stderrLines = [];
+    process.stderr.write = (chunk, ...args) => { stderrLines.push(String(chunk)); return true; };
+    let result;
+    try {
+      result = await usageRecord(db, {
+        projectId: PID, sessionId: 'sess-t8', turnIdx: 0, agentRole: 'test',
+        modelId: 'claude-sonnet-5', tokensIn: 100, tokensOut: 50,
+        // costUsd deliberately omitted -> COMPUTE branch -> hits the
+        // model_registry lookup that does not exist.
+      });
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+
+    assertEqual(result.costUsd, null, 'T8: cost_usd is NULL (fail-soft), never a thrown error and never a guessed price');
+    assertEqual(result.tokensIn, 100, 'T8: tokensIn written correctly despite the cost fail-soft branch');
+    assertTrue(
+      stderrLines.some((l) => l.includes('model_registry') && l.includes('42P01')),
+      `T8: exactly one fail-soft stderr line naming model_registry + 42P01 was emitted — got: ${JSON.stringify(stderrLines)}`
+    );
+
+    // Explicit costUsd still wins (unaffected by the fail-soft branch, per
+    // F1's own wording) — same model_registry-less DB, a second turn.
+    const explicit = await usageRecord(db, {
+      projectId: PID, sessionId: 'sess-t8', turnIdx: 1, agentRole: 'test',
+      tokensIn: 10, tokensOut: 10, costUsd: 0.05,
+    });
+    assertEqual(explicit.costUsd, 0.05, 'T8: an explicit costUsd is used verbatim, never overridden by the fail-soft branch');
+
+    await db.end();
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+  }
+}
+
+// ── T9: Codex review F2 — a dropped base column on turn_usage/session_usage/
+//     feature_usage is no longer invisible to ensureSchemaCurrent's
+//     fingerprint-'current' fast path ──────────────────────────────────────
+
+async function testT9() {
+  const label = 'T9: Codex review F2 — a hand-dropped feature_usage.tokens_in column is DETECTED on the next touch, never a silent reason:"current"';
+  if (!(await isPgAvailable())) { console.log(`SKIP  ${label} (Postgres unavailable)`); return; }
+
+  const dbName = `cm_pra_t9_${Date.now()}`;
+  const PID = 'cm-pra-t9-project';
+  try {
+    await createThrowawayDb(dbName);
+    await ensureVectorExtension(dbName);
+
+    const db = await pgConnect(dbName);
+    const adapter = new PostgresAdapter(db);
+    await db.query(
+      `CREATE TABLE project_settings (project_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (project_id, key))`
+    );
+
+    const baseline = await handoffModule.ensureSchemaCurrent(adapter, PID, { silent: true });
+    assertTrue(baseline.applied, 'T9 precondition: baseline apply succeeds');
+
+    // Hand-drop a BASE column (part of the original CREATE TABLE, never an
+    // ALTER TABLE ADD COLUMN target — the exact shape F2's finding named).
+    await db.query(`ALTER TABLE feature_usage DROP COLUMN tokens_in`);
+    const { rows: droppedCol } = await db.query(
+      `SELECT 1 FROM information_schema.columns WHERE table_name = 'feature_usage' AND column_name = 'tokens_in'`
+    );
+    assertEqual(droppedCol.length, 0, 'T9 precondition: tokens_in genuinely absent after the hand-drop');
+
+    // Fingerprint is STILL 'current' (SQL bytes never changed) — this is
+    // exactly the fast-path branch F2's finding named as silently reporting
+    // "current" forever with an empty columns list. Parity check: this must
+    // resolve to something OTHER than a clean 'current' no-op, mirroring how
+    // handoff-core-schema.sql's own tracked columns are treated when absent
+    // (S1(b): apply-and-reverify, not a silent pass).
+    const touch = await handoffModule.ensureSchemaCurrent(adapter, PID, { silent: true });
+    assertTrue(
+      touch.reason !== 'current' || touch.applied === true,
+      `T9: a dropped base column must never resolve to a silent applied:false/reason:'current' no-op — got ${JSON.stringify({ applied: touch.applied, reason: touch.reason })}`
+    );
+    // This unit's DDL is a bare CREATE TABLE IF NOT EXISTS (no ALTER TABLE
+    // ADD COLUMN for tokens_in) — re-running it cannot itself resurrect a
+    // dropped base column, so the concrete outcome here is
+    // reason:'verification_failed' naming the missing column (S1(b)'s
+    // post-apply schemaObjectsExist check), never a false 'current'.
+    assertEqual(touch.reason, 'verification_failed', 'T9: reported as verification_failed (detected, not silently "current") — the column cannot self-heal from a bare CREATE TABLE IF NOT EXISTS, but the gap is no longer invisible');
+    assertTrue(
+      touch.detail.missing.some((m) => m.type === 'column' && m.table === 'feature_usage' && m.column === 'tokens_in'),
+      `T9: the reported missing set names feature_usage.tokens_in specifically — got ${JSON.stringify(touch.detail.missing)}`
+    );
+
+    await db.end();
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+  }
+}
+
+// ── T10: Codex review F3 — usage-telemetry-schema.sql / feature-usage-
+//     schema.sql are in required_roster; a fixture missing either file's own
+//     SQL fails classification, never a silent ok:true ─────────────────────
+
+function testT10() {
+  const label = 'T10: Codex review F3 — usage-telemetry-schema.sql and feature-usage-schema.sql are BOTH in required_roster; a fixture missing either file fails classification naming it';
+  try {
+    // (a) The real, live manifest actually lists both — the literal fix.
+    const liveManifestPath = path.join(PROJECT_ROOT, 'scripts', 'sql', 'schema-manifest.json');
+    const liveManifest = JSON.parse(fs.readFileSync(liveManifestPath, 'utf8'));
+    assertTrue(
+      liveManifest.required_roster.includes('usage-telemetry-schema.sql'),
+      'T10(a): usage-telemetry-schema.sql is in the live required_roster'
+    );
+    assertTrue(
+      liveManifest.required_roster.includes('feature-usage-schema.sql'),
+      'T10(a): feature-usage-schema.sql is in the live required_roster'
+    );
+
+    // (b) In-memory fixture: BOTH files declared in required_roster, but one
+    // (usage-telemetry-schema.sql) is missing from scripts/sql/ entirely —
+    // before F3 this returned ok:true (both units absent from required_roster
+    // meant classifySchemaFiles never even looked for them).
+    for (const missingFile of ['usage-telemetry-schema.sql', 'feature-usage-schema.sql']) {
+      const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-pra-t10-'));
+      const sqlDir = path.join(scratchRoot, 'scripts', 'sql');
+      fs.mkdirSync(sqlDir, { recursive: true });
+
+      const otherFile = missingFile === 'usage-telemetry-schema.sql' ? 'feature-usage-schema.sql' : 'usage-telemetry-schema.sql';
+      fs.writeFileSync(
+        path.join(sqlDir, otherFile),
+        '-- handoff:dialect postgres\nCREATE TABLE IF NOT EXISTS widgets (id serial primary key);\n',
+        'utf8'
+      );
+      fs.writeFileSync(
+        path.join(sqlDir, 'schema-manifest.json'),
+        JSON.stringify({
+          schema_epoch: 1,
+          required_roster: ['usage-telemetry-schema.sql', 'feature-usage-schema.sql'],
+          units: {
+            [otherFile]: { classification: 'postgres', order: 10, expected_objects: { tables: ['widgets'], columns: [], indexes: [] } },
+          },
+        }, null, 2),
+        'utf8'
+      );
+
+      const result = classifySchemaFiles({ engineRoot: scratchRoot });
+      assertFalse(result.ok, `T10(b): fixture missing ${missingFile} must fail classification (ok:false), not silently pass`);
+      assertTrue(
+        result.errors.some((e) => e.includes(missingFile) && e.includes('required schema file missing')),
+        `T10(b): an error names the specific missing file "${missingFile}" — got ${JSON.stringify(result.errors)}`
+      );
+
+      fs.rmSync(scratchRoot, { recursive: true, force: true });
+    }
+
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  }
+}
+
+function assertFalse(v, msg) { if (v !== false) throw new Error(msg || `expected false, got ${JSON.stringify(v)}`); }
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -645,6 +852,9 @@ async function main() {
   await testT5();
   await testT6();
   await testT7();
+  await testT8();
+  await testT9();
+  testT10();
 
   console.log('');
   console.log(`Results: ${passed} passed, ${failed} failed`);

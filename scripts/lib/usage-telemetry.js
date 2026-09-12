@@ -75,8 +75,15 @@
  *   reflect a token/model basis that is not the row's final COALESCEd
  *   state. Fails soft to NULL (never a guessed price, never 0) when: no
  *   effective model, the effective model is unregistered, either registered
- *   rate is NULL (the V9 gap), or either effective token count is
- *   unavailable. Cache tokens are NEVER priced -- provider cache-pricing
+ *   rate is NULL (the V9 gap), either effective token count is unavailable,
+ *   OR model_registry itself does not exist on this engine DB yet (Codex
+ *   review F1: model_registry is created by
+ *   scripts/migrations/sql/model-registry-base.sql via
+ *   migrate-schema-addenda.js, NOT by any scripts/sql/*.sql unit
+ *   ensureSchemaCurrent applies -- a freshly-provisioned engine DB can
+ *   genuinely lack it; caught by Postgres code 42P01/42703 on the lookup
+ *   query specifically, one stderr line emitted, never a thrown error).
+ *   Cache tokens are NEVER priced -- provider cache-pricing
  *   semantics vary and no rate columns exist for them; an operator wanting
  *   cache-aware cost passes an explicit costUsd.
  *
@@ -385,10 +392,37 @@ async function computeServerSideCost(pg, { projectId, sessionId, turnIdx, agentR
     return null;
   }
 
-  const { rows: regRows } = await pg.query(
-    `SELECT cost_in_per_mtok, cost_out_per_mtok FROM model_registry WHERE label = $1`,
-    [effectiveModelId]
-  );
+  // Codex review F1 (major): model_registry is created by
+  // scripts/migrations/sql/model-registry-base.sql, applied only via
+  // migrate-schema-addenda.js -- it is NOT one of the scripts/sql/*.sql units
+  // ensureSchemaCurrent's init/heal-on-touch applies to every engine DB. A
+  // freshly-provisioned engine DB (ensureSchemaCurrent's own applicable set
+  // only) can therefore genuinely lack model_registry entirely. That is an
+  // UNKNOWABLE
+  // cost input (fail-soft to NULL, same family as "unregistered model" and
+  // the V9 rate-NULL gap below), never a hard error that would make
+  // usageRecord itself throw just because cost happened to be omitted.
+  // Scoped to exactly this query (42P01 undefined_table, 42703
+  // undefined_column) -- any OTHER Postgres error still propagates
+  // unchanged, since those are not "model_registry doesn't exist yet",
+  // they are genuine anomalies this function has no basis to swallow.
+  let regRows;
+  try {
+    const result = await pg.query(
+      `SELECT cost_in_per_mtok, cost_out_per_mtok FROM model_registry WHERE label = $1`,
+      [effectiveModelId]
+    );
+    regRows = result.rows;
+  } catch (err) {
+    if (err && (err.code === '42P01' || err.code === '42703')) {
+      process.stderr.write(
+        `[usage-telemetry] model_registry lookup failed (${err.code}: ${err.message}) -- ` +
+        'cost_usd left NULL for this write (fail-soft; explicit costUsd is unaffected)\n'
+      );
+      return null;
+    }
+    throw err;
+  }
   if (regRows.length === 0) return null; // unregistered model
   const costIn = coerceNumeric(regRows[0].cost_in_per_mtok);
   const costOut = coerceNumeric(regRows[0].cost_out_per_mtok);
