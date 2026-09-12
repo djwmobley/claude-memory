@@ -9,6 +9,14 @@
  * the fix/mcp-usage-codex-identity PR task — test-loader-stop-gate.js's
  * SID1-11 continue to cover the handoff.js re-export unchanged.
  *
+ * CodeQL js/clear-text-logging (alert #21): the resolved session id (`r`
+ * below) is derived from process.env.CLAUDE_CODE_SESSION_ID /
+ * process.env.CODEX_THREAD_ID. Never interpolate that value itself into a
+ * fail() reason string — log only fixed diagnostic text plus non-sensitive
+ * derived facts (a boolean match/type check, or a length). fail()'s reason
+ * parameter is restricted to string/boolean at runtime to keep call sites
+ * honest about this.
+ *
  * Usage: node scripts/test-session-identity.js
  * Exit codes: 0 = all pass, 1 = any failure.
  */
@@ -18,8 +26,23 @@ const { resolveSessionIdFromEnv } = require('./lib/session-identity');
 let passed = 0;
 let failed = 0;
 
-function pass(label)         { console.log(`PASS  ${label}`); passed++; }
-function fail(label, reason) { console.log(`FAIL  ${label}: ${reason}`); failed++; }
+function pass(label) { console.log(`PASS  ${label}`); passed++; }
+
+/** reason must be a fixed diagnostic string or boolean — never an env-derived value. */
+function fail(label, reason) {
+  if (typeof reason !== 'string' && typeof reason !== 'boolean') {
+    throw new TypeError(`fail() reason must be a literal string or boolean, got ${typeof reason}`);
+  }
+  console.log(`FAIL  ${label}: ${reason}`);
+  failed++;
+}
+
+/** Non-sensitive shape summary of a resolved session id — never the value itself. */
+function describe(r) {
+  if (r === null) return 'null';
+  if (typeof r !== 'string') return `unexpected type=${typeof r}`;
+  return `string length=${r.length}`;
+}
 
 /** process.env.X = undefined coerces to the literal string "undefined" — always delete instead. */
 function restoreEnvVar(key, savedValue) {
@@ -40,55 +63,55 @@ function withEnv(vars, fn) {
 withEnv({ CLAUDE_CODE_SESSION_ID: undefined, CODEX_THREAD_ID: undefined }, () => {
   const label = 'SI1: neither CLAUDE_CODE_SESSION_ID nor CODEX_THREAD_ID set -> null';
   const r = resolveSessionIdFromEnv(null);
-  if (r !== null) fail(label, `expected null, got ${JSON.stringify(r)}`); else pass(label);
+  if (r !== null) fail(label, `expected null, got ${describe(r)}`); else pass(label);
 });
 
 withEnv({ CLAUDE_CODE_SESSION_ID: 'claude-sess-1', CODEX_THREAD_ID: undefined }, () => {
   const label = 'SI2: only CLAUDE_CODE_SESSION_ID set -> that value';
   const r = resolveSessionIdFromEnv(null);
-  if (r !== 'claude-sess-1') fail(label, `expected claude-sess-1, got ${JSON.stringify(r)}`); else pass(label);
+  if (r !== 'claude-sess-1') fail(label, `mismatch, ${describe(r)}`); else pass(label);
 });
 
 withEnv({ CLAUDE_CODE_SESSION_ID: undefined, CODEX_THREAD_ID: '01a0884c-306e-7182-851c-74d81482720b' }, () => {
   const label = 'SI3: only CODEX_THREAD_ID set -> that value';
   const r = resolveSessionIdFromEnv(null);
-  if (r !== '01a0884c-306e-7182-851c-74d81482720b') fail(label, `expected the codex thread id, got ${JSON.stringify(r)}`); else pass(label);
+  if (r !== '01a0884c-306e-7182-851c-74d81482720b') fail(label, `mismatch, ${describe(r)}`); else pass(label);
 });
 
 withEnv({ CLAUDE_CODE_SESSION_ID: 'same-id', CODEX_THREAD_ID: 'same-id' }, () => {
   const label = 'SI4: both set and EQUAL -> that value, no ambiguity';
   const r = resolveSessionIdFromEnv('codex');
-  if (r !== 'same-id') fail(label, `expected same-id, got ${JSON.stringify(r)}`); else pass(label);
+  if (r !== 'same-id') fail(label, `mismatch, ${describe(r)}`); else pass(label);
 });
 
 withEnv({ CLAUDE_CODE_SESSION_ID: 'claude-sess', CODEX_THREAD_ID: 'codex-thread' }, () => {
   const label = "SI5: both set, DIFFERENT, host='codex' -> CODEX_THREAD_ID";
   const r = resolveSessionIdFromEnv('codex');
-  if (r !== 'codex-thread') fail(label, `expected codex-thread, got ${JSON.stringify(r)}`); else pass(label);
+  if (r !== 'codex-thread') fail(label, `expected the codex thread id, ${describe(r)}`); else pass(label);
 });
 
 withEnv({ CLAUDE_CODE_SESSION_ID: 'claude-sess', CODEX_THREAD_ID: 'codex-thread' }, () => {
   const label = "SI6: both set, DIFFERENT, host='claude' -> CLAUDE_CODE_SESSION_ID";
   const r = resolveSessionIdFromEnv('claude');
-  if (r !== 'claude-sess') fail(label, `expected claude-sess, got ${JSON.stringify(r)}`); else pass(label);
+  if (r !== 'claude-sess') fail(label, `mismatch, ${describe(r)}`); else pass(label);
 });
 
 withEnv({ CLAUDE_CODE_SESSION_ID: 'claude-sess', CODEX_THREAD_ID: 'codex-thread' }, () => {
   const label = 'SI7: both set, DIFFERENT, host absent/null -> CLAUDE_CODE_SESSION_ID (default)';
   const r = resolveSessionIdFromEnv(null);
-  if (r !== 'claude-sess') fail(label, `expected claude-sess (default), got ${JSON.stringify(r)}`); else pass(label);
+  if (r !== 'claude-sess') fail(label, `expected the default (claude), ${describe(r)}`); else pass(label);
 });
 
 withEnv({ CLAUDE_CODE_SESSION_ID: '   ', CODEX_THREAD_ID: 'codex-thread-2' }, () => {
   const label = 'SI8: a whitespace-only CLAUDE_CODE_SESSION_ID is trimmed to absent, falls through to CODEX_THREAD_ID';
   const r = resolveSessionIdFromEnv(null);
-  if (r !== 'codex-thread-2') fail(label, `expected codex-thread-2 (whitespace-only treated as absent), got ${JSON.stringify(r)}`); else pass(label);
+  if (r !== 'codex-thread-2') fail(label, `expected fallthrough to CODEX_THREAD_ID, ${describe(r)}`); else pass(label);
 });
 
 withEnv({ CLAUDE_CODE_SESSION_ID: '  claude-sess-padded  ', CODEX_THREAD_ID: undefined }, () => {
   const label = 'SI9: a padded CLAUDE_CODE_SESSION_ID value is trimmed before being returned';
   const r = resolveSessionIdFromEnv(null);
-  if (r !== 'claude-sess-padded') fail(label, `expected trimmed value, got ${JSON.stringify(r)}`); else pass(label);
+  if (r !== 'claude-sess-padded') fail(label, `expected the trimmed value, ${describe(r)}`); else pass(label);
 });
 
 console.log('');
