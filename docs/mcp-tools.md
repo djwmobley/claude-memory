@@ -533,6 +533,10 @@ its rates are unregistered.
   error, raised before any query runs** — `feature_usage` carries no
   `session_id` column to scope by at all.
 
+`turn_usage`, `session_usage`, and `feature_usage` are created by
+`handoff.js init`/heal-on-touch in EVERY project engine DB (schema_epoch 5,
+PR-A 2026-09-12) — not only `memory_manager_staging`.
+
 Both grains return the same row shape: `{ key, tokens_in, tokens_out,
 cost_usd, turns }` — for `granularity: "feature"`, `turns` counts
 `feature_usage` rows, not agent turns.

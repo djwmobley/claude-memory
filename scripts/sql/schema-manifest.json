@@ -1,11 +1,13 @@
 {
   "_doc": "cm#185 schema bring-forward manifest. Cross-checked against each file's own in-file header directive (first non-blank lines: '-- handoff:dialect postgres' | '-- handoff:dialect sqlite' | '-- handoff:excluded <reason>') by scripts/lib/schema-classify.js. This file provides CLASSIFICATION + EXPECTED-OBJECTS metadata only -- it is never the source of enumeration. Enumeration always reads the filesystem (scripts/sql/*.sql, non-recursive) and cross-checks git-tracked status; any enumerated file absent from this manifest, or any manifest entry whose classification disagrees with the file's own header directive, is a loud classification error (persistent project_settings 'schema_apply_degraded' row + stderr), never a silent skip. schema_epoch is a monotonically-bumped integer bumped whenever the applicable-unit set or any unit's DDL changes in a way that must force a re-apply on already-current databases; it is embedded as the '<epoch>:<hash>' prefix of the stored project_settings.schema_fingerprint value (see _computeSchemaFingerprint in scripts/handoff.js).",
-  "schema_epoch": 4,
+  "schema_epoch": 5,
   "required_roster": [
     "handoff-core-schema.sql",
     "handoff-sqlite-schema.sql",
     "app-retrieval-events-schema.sql",
-    "decisions-base.sql"
+    "decisions-base.sql",
+    "usage-telemetry-schema.sql",
+    "feature-usage-schema.sql"
   ],
   "units": {
     "handoff-core-schema.sql": {
@@ -86,7 +88,8 @@
       ],
       "expected_uniques": [
         { "_doc": "entities: UNIQUE (project_id, name).", "table": "entities", "columns": ["project_id", "name"] },
-        { "_doc": "embedding_providers: name TEXT NOT NULL UNIQUE.", "table": "embedding_providers", "columns": ["name"] }
+        { "_doc": "embedding_providers: name TEXT NOT NULL UNIQUE.", "table": "embedding_providers", "columns": ["name"] },
+        { "_doc": "PR-A manifest-lint follow-up (T11, 2026-09-12): retrieval_contract: UNIQUE (project_id, name) -- anonymous table-level UNIQUE, previously untracked here (found by the new required-roster uniques-or-PK lint).", "table": "retrieval_contract", "columns": ["project_id", "name"] }
       ],
       "expected_not_nulls": [
         { "table": "assertions", "column": "confidence" },
@@ -194,12 +197,24 @@
     "app-retrieval-events-schema.sql": {
       "classification": "postgres",
       "order": 20,
+      "_doc_columns": "PR-A manifest-lint follow-up (test-schema-bring-forward.js T11, 2026-09-12): every non-id column of retrieval_events and retrieval_event_assertions, captured by name directly from this unit's own CREATE TABLE text (same rationale as usage-telemetry-schema.sql's own _doc_columns -- a bare CREATE TABLE IF NOT EXISTS with no later ALTER-added columns, so a dropped base column would otherwise never be probed by schemaObjectsExist() at all). This closes the same class of gap T11 lints for categorically: this unit previously declared expected_objects.columns: [] despite having non-empty expected_objects.tables.",
       "expected_objects": {
         "tables": [
           "retrieval_events",
           "retrieval_event_assertions"
         ],
-        "columns": [],
+        "columns": [
+          { "table": "retrieval_events", "column": "project_id" },
+          { "table": "retrieval_events", "column": "query_text" },
+          { "table": "retrieval_events", "column": "retrieved_at" },
+          { "table": "retrieval_events", "column": "outcome" },
+          { "table": "retrieval_events", "column": "outcome_at" },
+          { "table": "retrieval_events", "column": "outcome_signal" },
+          { "table": "retrieval_events", "column": "session_id" },
+          { "table": "retrieval_events", "column": "notes" },
+          { "table": "retrieval_event_assertions", "column": "event_id" },
+          { "table": "retrieval_event_assertions", "column": "assertion_id" }
+        ],
         "indexes": [
           "retrieval_events_project_idx",
           "retrieval_events_outcome_idx",
@@ -287,6 +302,124 @@
         { "name": "decisions_project_idx", "create_sql": "CREATE INDEX decisions_project_idx ON public.decisions USING btree (project_id)" },
         { "name": "decisions_project_topic_unique", "create_sql": "CREATE UNIQUE INDEX decisions_project_topic_unique ON public.decisions USING btree (project_id, topic)" },
         { "name": "decisions_topic_idx", "create_sql": "CREATE INDEX decisions_topic_idx ON public.decisions USING btree (project_id, topic)" }
+      ]
+    },
+    "usage-telemetry-schema.sql": {
+      "classification": "postgres",
+      "order": 40,
+      "_doc": "PR-A (cm#feature_usage-DDL-manifest, 2026-09-12): formerly scripts/migrations/sql/migrate-11-usage-telemetry.sql, applied only to memory_manager_staging via migrate-schema-addenda.js. Moved to scripts/sql/ so ensureSchemaCurrent's init/heal-on-touch creates turn_usage + session_usage in EVERY live project engine DB. schema_epoch bumped 4->5 (new units added to the applicable-unit set) so every already-current live project DB re-applies once to pick these up.",
+      "_doc_columns": "Codex review F2 (major): every non-id column of turn_usage and session_usage, captured by name from information_schema.columns on a throwaway fresh-DB apply (test_cm_pra_telemetry_capture) -- NOT hand-typed. Unlike handoff-core-schema.sql's columns list (which tracks only columns added by a LATER ALTER TABLE ADD COLUMN IF NOT EXISTS, since this unit's DDL is a bare CREATE TABLE IF NOT EXISTS with no such ALTER statements at all), a dropped BASE column here (e.g. feature_usage.tokens_in) would otherwise never be probed at all and the fingerprint-'current' fast path would report reason:'current' forever -- the exact gap F2 closed. Re-running this unit's idempotent SQL cannot itself re-add a dropped base column (CREATE TABLE IF NOT EXISTS no-ops against an existing table), so the fast path's own S1(b) apply-and-reverify sequence surfaces this as reason:'verification_failed' (missing named) rather than a false 'current' -- parity with how every OTHER ungated expected_objects.columns gap (missing table/index) is already reported, not a claim that the column heals itself.",
+      "expected_objects": {
+        "tables": ["turn_usage", "session_usage"],
+        "columns": [
+          { "table": "turn_usage", "column": "project_id" },
+          { "table": "turn_usage", "column": "session_id" },
+          { "table": "turn_usage", "column": "turn_idx" },
+          { "table": "turn_usage", "column": "agent_role" },
+          { "table": "turn_usage", "column": "model_id" },
+          { "table": "turn_usage", "column": "provider" },
+          { "table": "turn_usage", "column": "tokens_in" },
+          { "table": "turn_usage", "column": "tokens_out" },
+          { "table": "turn_usage", "column": "cache_read_tokens" },
+          { "table": "turn_usage", "column": "cache_write_tokens" },
+          { "table": "turn_usage", "column": "cost_usd" },
+          { "table": "turn_usage", "column": "resolved_via" },
+          { "table": "turn_usage", "column": "recommended_model" },
+          { "table": "turn_usage", "column": "cost_delta_usd" },
+          { "table": "turn_usage", "column": "outcome" },
+          { "table": "turn_usage", "column": "source_model" },
+          { "table": "turn_usage", "column": "agent_id" },
+          { "table": "turn_usage", "column": "ts" },
+          { "table": "session_usage", "column": "project_id" },
+          { "table": "session_usage", "column": "session_id" },
+          { "table": "session_usage", "column": "model_breakdown" },
+          { "table": "session_usage", "column": "total_tokens_in" },
+          { "table": "session_usage", "column": "total_tokens_out" },
+          { "table": "session_usage", "column": "total_cost_usd" },
+          { "table": "session_usage", "column": "turn_count" },
+          { "table": "session_usage", "column": "computed_at" }
+        ],
+        "indexes": [
+          "turn_usage_project_idx",
+          "turn_usage_session_idx",
+          "turn_usage_model_idx",
+          "session_usage_project_idx"
+        ]
+      },
+      "expected_uniques": [
+        { "_doc": "turn_usage: UNIQUE (project_id, session_id, turn_idx, agent_role) -- anonymous table-level UNIQUE, NOT a named index (adversary G6).", "table": "turn_usage", "columns": ["project_id", "session_id", "turn_idx", "agent_role"] },
+        { "_doc": "session_usage: UNIQUE (project_id, session_id) -- anonymous table-level UNIQUE, NOT a named index (adversary G6).", "table": "session_usage", "columns": ["project_id", "session_id"] }
+      ],
+      "expected_not_nulls": [
+        { "table": "turn_usage", "column": "project_id" },
+        { "table": "turn_usage", "column": "session_id" },
+        { "table": "turn_usage", "column": "turn_idx" },
+        { "table": "turn_usage", "column": "agent_role" },
+        { "table": "session_usage", "column": "project_id" },
+        { "table": "session_usage", "column": "session_id" }
+      ],
+      "expected_checks": [
+        { "_doc": "turn_usage.resolved_via CHECK (resolved_via IN ('directive','recommendation')). `def` captured verbatim via pg_get_constraintdef on a throwaway Postgres DB (test_cm_pra_telemetry_capture) after applying this unit's own SQL -- never hand-typed (adversary risk).", "table": "turn_usage", "expression_tokens": ["resolved_via"], "def": "CHECK ((resolved_via = ANY (ARRAY['directive'::text, 'recommendation'::text])))" },
+        { "_doc": "turn_usage.outcome CHECK (outcome IN ('success','failure','downgraded','unknown')). `def` captured verbatim via pg_get_constraintdef on the same throwaway DB.", "table": "turn_usage", "expression_tokens": ["outcome"], "def": "CHECK ((outcome = ANY (ARRAY['success'::text, 'failure'::text, 'downgraded'::text, 'unknown'::text])))" }
+      ],
+      "expected_index_defs": [
+        { "name": "session_usage_project_idx", "create_sql": "CREATE INDEX session_usage_project_idx ON public.session_usage USING btree (project_id)" },
+        { "name": "turn_usage_model_idx", "create_sql": "CREATE INDEX turn_usage_model_idx ON public.turn_usage USING btree (project_id, model_id)" },
+        { "name": "turn_usage_project_idx", "create_sql": "CREATE INDEX turn_usage_project_idx ON public.turn_usage USING btree (project_id)" },
+        { "name": "turn_usage_session_idx", "create_sql": "CREATE INDEX turn_usage_session_idx ON public.turn_usage USING btree (project_id, session_id)" }
+      ]
+    },
+    "feature-usage-schema.sql": {
+      "classification": "postgres",
+      "order": 50,
+      "_doc": "PR-A (cm#feature_usage-DDL-manifest, 2026-09-12): formerly scripts/migrations/sql/migrate-12-feature-usage.sql, applied only to memory_manager_staging via migrate-schema-addenda.js. Moved to scripts/sql/ so ensureSchemaCurrent's init/heal-on-touch creates feature_usage in EVERY live project engine DB. Freestanding CREATE TABLE, no FK onto usage-telemetry-schema.sql's tables -- ordered after it (50 > 40) purely by arrival order, matching migrate-schema-addenda.js's own historical SQL_FILES sequencing. Data migration (backfill from pipeline_pipeline.feature_token_usage) stays migrate-12-feature-usage.js's job, unaffected by this DDL move -- G1 (adversary): feature_usage is empty per-project by design until that backfill (or a live feature run) writes to it; an empty result from usage_query granularity=feature against a freshly-healed DB is correct, not a defect.",
+      "_doc_columns": "Codex review F2 (major): every non-id column of feature_usage, captured by name from information_schema.columns on the same throwaway fresh-DB apply as usage-telemetry-schema.sql's own columns list -- see that unit's _doc_columns for the full rationale (bare CREATE TABLE IF NOT EXISTS, no ALTER-added columns, so a dropped base column such as tokens_in was previously invisible to the fingerprint-'current' fast path and reported reason:'current' forever -- the exact finding this closes).",
+      "expected_objects": {
+        "tables": ["feature_usage"],
+        "columns": [
+          { "table": "feature_usage", "column": "project_id" },
+          { "table": "feature_usage", "column": "branch" },
+          { "table": "feature_usage", "column": "pr_number" },
+          { "table": "feature_usage", "column": "github_issue" },
+          { "table": "feature_usage", "column": "started_at" },
+          { "table": "feature_usage", "column": "completed_at" },
+          { "table": "feature_usage", "column": "model_id" },
+          { "table": "feature_usage", "column": "model_breakdown" },
+          { "table": "feature_usage", "column": "assistant_msgs" },
+          { "table": "feature_usage", "column": "tokens_in" },
+          { "table": "feature_usage", "column": "tokens_out" },
+          { "table": "feature_usage", "column": "cache_creation_5m_tokens" },
+          { "table": "feature_usage", "column": "cache_creation_1h_tokens" },
+          { "table": "feature_usage", "column": "cache_read_tokens" },
+          { "table": "feature_usage", "column": "cache_hit_pct" },
+          { "table": "feature_usage", "column": "cost_usd" },
+          { "table": "feature_usage", "column": "tool_calls" },
+          { "table": "feature_usage", "column": "session_ids" },
+          { "table": "feature_usage", "column": "notes" },
+          { "table": "feature_usage", "column": "source_feature_token_usage_id" },
+          { "table": "feature_usage", "column": "source_db" },
+          { "table": "feature_usage", "column": "created_at" }
+        ],
+        "indexes": [
+          "feature_usage_project_idx",
+          "feature_usage_project_branch_idx",
+          "feature_usage_project_pr_idx",
+          "feature_usage_session_ids_gin_idx"
+        ]
+      },
+      "expected_uniques": [
+        { "_doc": "feature_usage: UNIQUE (project_id, source_db, source_feature_token_usage_id) -- anonymous table-level UNIQUE, NOT a named index (adversary G6).", "table": "feature_usage", "columns": ["project_id", "source_db", "source_feature_token_usage_id"] }
+      ],
+      "expected_not_nulls": [
+        { "table": "feature_usage", "column": "project_id" },
+        { "table": "feature_usage", "column": "branch" },
+        { "table": "feature_usage", "column": "started_at" }
+      ],
+      "expected_index_defs": [
+        { "name": "feature_usage_project_branch_idx", "create_sql": "CREATE INDEX feature_usage_project_branch_idx ON public.feature_usage USING btree (project_id, branch)" },
+        { "name": "feature_usage_project_idx", "create_sql": "CREATE INDEX feature_usage_project_idx ON public.feature_usage USING btree (project_id)" },
+        { "name": "feature_usage_project_pr_idx", "create_sql": "CREATE INDEX feature_usage_project_pr_idx ON public.feature_usage USING btree (project_id, pr_number)" },
+        { "name": "feature_usage_session_ids_gin_idx", "create_sql": "CREATE INDEX feature_usage_session_ids_gin_idx ON public.feature_usage USING gin (session_ids)" }
       ]
     },
     "phase3b-schema.sql": {

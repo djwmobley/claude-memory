@@ -329,7 +329,7 @@ async function testProofOfFiring() {
       fail('T5c', 'proof-of-firing: pre-existing stub table with missing columns → verifyAddenda FAILs on missing columns, not missing table', `missingTables=${JSON.stringify(v.missingTables)} sessionUsageMissingCols=${JSON.stringify(sessionUsageMissingCols)}`);
     }
     await client.query('DROP TABLE IF EXISTS session_usage CASCADE');
-    await addenda.applySqlFile(client, findFile('migrate-11-usage-telemetry.sql')); // heal (recreates turn_usage idempotently too)
+    await addenda.applySqlFile(client, findFile('usage-telemetry-schema.sql')); // heal (recreates turn_usage idempotently too)
 
     // (d) column present but its CHECK constraint absent → verifyAddenda
     // FAILs on the missing CHECK (column itself is NOT in missingColumns).
@@ -682,8 +682,9 @@ ALTER TABLE synth_array_table ADD COLUMN IF NOT EXISTS more_tags TEXT [];
   // Exact expected sets for the shipped files (computed once, pinned here).
   const shipped = addenda.deriveSchemaAddenda(addenda.SQL_FILES);
   const shippedTables = [...migrateOne.deriveExpectedObjects(addenda.SQL_FILES).tables].sort();
-  // §18.3: migrate-12-feature-usage.sql added a 7th file (feature_usage) --
-  // adds 1 table, 23 columns, 0 CHECKs, 4 indexes (project/branch/pr/GIN
+  // §18.3: feature-usage-schema.sql (formerly migrate-12-feature-usage.sql,
+  // moved to scripts/sql/ by PR-A) is the 7th file (feature_usage) -- adds 1
+  // table, 23 columns, 0 CHECKs, 4 indexes (project/branch/pr/GIN
   // session_ids), 1 table-level UNIQUE, 0 seeds.
   const expectedShippedTables = ['embedding_providers', 'feature_usage', 'model_registry', 'routing_profiles', 'routing_session_overrides', 'session_usage', 'turn_usage'];
   const tablesOk = JSON.stringify(shippedTables) === JSON.stringify(expectedShippedTables);

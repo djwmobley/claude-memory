@@ -2216,7 +2216,13 @@ const { classifySchemaFiles, normalizeContent } = require('./lib/schema-classify
 // EXISTS / DROP+CREATE-idempotent) -- the epoch bump exists purely to force
 // the migration gate to run at least once on every live DB, matching the
 // PR #225 (cm#224) precedent for a non-DDL-shape reason to bump.
-const SCHEMA_EPOCH = 4;
+// Bumped to 5 (PR-A, 2026-09-12): usage-telemetry-schema.sql (turn_usage,
+// session_usage) and feature-usage-schema.sql (feature_usage) -- formerly
+// applied ONLY to memory_manager_staging via migrate-schema-addenda.js --
+// are added to the postgres applicable-unit set in scripts/sql/, so every
+// already-current live project DB must re-apply once to pick up these
+// three tables via init/heal-on-touch.
+const SCHEMA_EPOCH = 5;
 
 // Module-level cache: maps schemaFilePath → { mtimeMs, size, hash } so repeated
 // calls in one process don't re-read or re-hash the SQL files. Keyed on

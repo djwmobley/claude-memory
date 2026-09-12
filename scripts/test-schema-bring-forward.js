@@ -48,9 +48,57 @@
  *     absent, and cmdInit never writes schema_fingerprint at all (so R-6's
  *     "never upsert on integrity failure" invariant holds identically on
  *     both the init path and the ensureSchemaCurrent sentinel path).
+ * T11 Manifest lint (PR-A fix-what-you-flag categorical guard, 2026-09-12):
+ *     (a) every unit with classification "postgres" that declares a
+ *     non-empty expected_objects.tables must also declare a non-empty
+ *     expected_objects.columns (a totally-empty columns list on a unit with
+ *     real tables is exactly the F2-class gap Codex review flagged for the
+ *     telemetry units -- a dropped base column is invisible to the
+ *     fingerprint-'current' fast path forever), and every column named in
+ *     that list must textually appear in the unit's own SQL file (manifest/
+ *     DDL identifier parity, mirrors schema-classify.js's own check but in
+ *     the missing-coverage direction that check does not cover); (b) every
+ *     table in a required_roster postgres unit whose own DDL declares an
+ *     ANONYMOUS table-level UNIQUE constraint (not a named CREATE UNIQUE
+ *     INDEX, not a PRIMARY KEY) must have a matching expected_uniques entry
+ *     -- a table whose only uniqueness guarantee is its PRIMARY KEY needs no
+ *     further manifest tracking (this manifest format has no
+ *     expected_primary_keys field), and a table with neither a PK nor an
+ *     anonymous UNIQUE in its own DDL (e.g. retrieval_event_assertions, an
+ *     observability-only join table by design) is out of this check's scope
+ *     entirely, never a false failure. Pure, no DB required. Fixture proof:
+ *     a fixture unit with "columns": [] must fail (a); the live manifest,
+ *     after this same commit populates app-retrieval-events-schema.sql's
+ *     previously-empty columns list and handoff-core-schema.sql's
+ *     previously-untracked retrieval_contract UNIQUE (project_id, name),
+ *     must pass both (a) and (b).
+ *     Codex round-2 follow-up (2026-09-12, R2/R3), same testT11():
+ *     (c) the (b) unique-parity check now compares the DDL UNIQUE
+ *     constraint's COMPLETE column set against the matching expected_uniques
+ *     entry's own `columns` (order-insensitive set equality), not merely
+ *     "some entry named this table exists" -- a fixture that narrows
+ *     turn_usage's expected_uniques to ["project_id"] must fail naming the
+ *     column-set mismatch, not pass because a same-table entry happens to be
+ *     present; (d) the scanner strips SQL line comments (--...), block
+ *     comments (/* ... *\/), and single-quoted string literals before
+ *     scanning for CREATE TABLE blocks or UNIQUE clauses, and refuses (an
+ *     explicit lint error naming the file+table, never a silent guess) a
+ *     table declared via a double-quoted identifier or a schema-qualified
+ *     name that its plain-identifier regex cannot locate -- fixtures prove a
+ *     `DEFAULT ')'` column default before a real `UNIQUE (id)` does not
+ *     truncate the paren-depth scan early, a string literal containing the
+ *     literal text "UNIQUE (id)" does not invent a phantom constraint, and a
+ *     `CREATE TABLE "Table" (...)` yields the explicit unsupported-syntax
+ *     error rather than a silent "no anonymous UNIQUE" false-negative.
+ * T12 Codex round-2 R1 (2026-09-12): computeServerSideCost (usage-
+ *     telemetry.js) must be transaction-safe -- a caller-owned
+ *     BEGIN / usageRecord(costUsd omitted) / COMMIT against a
+ *     model_registry-less DB must COMMIT cleanly with cost_usd NULL, never
+ *     leave the caller's transaction server-side aborted (25P02) the way
+ *     catching a raw 42P01 inside it used to. Requires Postgres.
  *
  * Requires Postgres (PGHOST/PGUSER/PGPASSWORD, defaults localhost/postgres/postgres).
- * T4 is pure and runs with no DB. Exit 0 = all run tests passed.
+ * T4 and T11 are pure and run with no DB. Exit 0 = all run tests passed.
  */
 
 const fs   = require('fs');
@@ -65,6 +113,11 @@ const { PostgresAdapter } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'd
 const { classifySchemaFiles, normalizeContent } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'schema-classify.js'));
 // cm#224 follow-up: shared guarded pgvector-extension installer.
 const { ensureVectorExtension } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'test-pg-helpers.js'));
+// PR-A (2026-09-12): usage_query's feature-granularity read, exercised
+// against the fresh heal-only DB in testT6 below. Codex review follow-up
+// (2026-09-12): usageRecord, exercised against a model_registry-less fresh
+// engine DB in testT8 below (F1).
+const { usageQuery, usageRecord } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'usage-telemetry.js'));
 
 let passed = 0;
 let failed = 0;
@@ -463,6 +516,925 @@ function testT4() {
   }
 }
 
+// ── T6: PR-A telemetry-manifest registration — classification + fresh-DB
+//     provisioning + idempotency + empty feature-grain query ────────────────
+//
+// Adversary G4 guard: this must NOT pass merely because
+// memory_manager_staging already carries these tables from the pre-existing
+// migrate-schema-addenda.js path — every assertion below runs against a
+// FRESH throwaway DB this test provisions itself, with nothing seeded, so a
+// manifest registration bug (missing unit, wrong classification, wrong
+// order, phantom expected_objects entry) would fail here even if staging
+// looked fine.
+
+async function testT6() {
+  const label = 'T6: usage-telemetry-schema.sql + feature-usage-schema.sql — classified postgres, fresh-DB apply creates all 3 tables/8 named indexes/3 uniques/2 checks, idempotent re-run, empty feature-grain query';
+  if (!(await isPgAvailable())) { console.log(`SKIP  ${label} (Postgres unavailable)`); return; }
+
+  // (a)+(b): classification + manifest/DDL identifier parity — no DB needed.
+  const classification = classifySchemaFiles({ engineRoot: PROJECT_ROOT });
+  assertTrue(classification.ok, `T6(a/b): classifySchemaFiles reports ok (manifest/DDL desync would fail here) — errors: ${JSON.stringify(classification.errors)}`);
+  const postgresBasenames = classification.unitsByDialect.postgres.map((u) => u.basename);
+  assertTrue(postgresBasenames.includes('usage-telemetry-schema.sql'), 'T6(a): usage-telemetry-schema.sql classified postgres and present');
+  assertTrue(postgresBasenames.includes('feature-usage-schema.sql'), 'T6(a): feature-usage-schema.sql classified postgres and present');
+  const usageUnit = classification.unitsByDialect.postgres.find((u) => u.basename === 'usage-telemetry-schema.sql');
+  const featureUnit = classification.unitsByDialect.postgres.find((u) => u.basename === 'feature-usage-schema.sql');
+  assertTrue(usageUnit.order < featureUnit.order, 'T6(b): usage-telemetry-schema.sql (order 40) sorts before feature-usage-schema.sql (order 50)');
+
+  const dbName = `cm_pra_t6_${Date.now()}`;
+  const PID = 'cm-pra-t6-project';
+  try {
+    await createThrowawayDb(dbName);
+    await ensureVectorExtension(dbName);
+
+    const db = await pgConnect(dbName);
+    const adapter = new PostgresAdapter(db);
+
+    // Bootstrap precondition only (identical to T3): a fresh throwaway DB
+    // with NOTHING but project_settings — every table this test asserts on
+    // must come from ensureSchemaCurrent's own additive apply, not from any
+    // fixture SQL this test applies by hand.
+    await db.query(
+      `CREATE TABLE project_settings (project_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (project_id, key))`
+    );
+
+    // (c): fresh apply.
+    const first = await handoffModule.ensureSchemaCurrent(adapter, PID, { silent: true });
+    assertTrue(first.applied, 'T6(c): first call applies against the fresh DB');
+
+    const { rows: tableRows } = await db.query(
+      `SELECT table_name FROM information_schema.tables WHERE table_name IN ('turn_usage','session_usage','feature_usage') ORDER BY table_name`
+    );
+    assertEqual(tableRows.length, 3, 'T6(c): all 3 tables (turn_usage, session_usage, feature_usage) exist after a bare fresh-DB apply');
+
+    const expectedNamedIndexes = [
+      'turn_usage_project_idx', 'turn_usage_session_idx', 'turn_usage_model_idx', 'session_usage_project_idx',
+      'feature_usage_project_idx', 'feature_usage_project_branch_idx', 'feature_usage_project_pr_idx', 'feature_usage_session_ids_gin_idx',
+    ];
+    const { rows: idxRows } = await db.query(
+      `SELECT indexname FROM pg_indexes WHERE indexname = ANY($1::text[])`,
+      [expectedNamedIndexes]
+    );
+    assertEqual(idxRows.length, 8, `T6(c): all 8 explicitly-named indexes across both units exist (got ${idxRows.length}: ${idxRows.map((r) => r.indexname).join(',')})`);
+
+    const { rows: uqRows } = await db.query(
+      `SELECT conrelid::regclass::text AS tbl FROM pg_constraint
+        WHERE contype = 'u' AND conrelid IN ('turn_usage'::regclass, 'session_usage'::regclass, 'feature_usage'::regclass)`
+    );
+    assertEqual(uqRows.length, 3, `T6(c): all 3 anonymous table-level UNIQUE constraints exist (adversary G6 — verified as constraints, not named indexes), got ${uqRows.length}`);
+
+    const { rows: ckRows } = await db.query(
+      `SELECT conname FROM pg_constraint WHERE contype = 'c' AND conrelid = 'turn_usage'::regclass`
+    );
+    assertEqual(ckRows.length, 2, `T6(c): turn_usage carries exactly 2 CHECK constraints (resolved_via, outcome), got ${ckRows.length}`);
+
+    // (d): idempotent re-run — zero DDL errors, reason 'current'.
+    const second = await handoffModule.ensureSchemaCurrent(adapter, PID, { silent: true });
+    assertFalse_(second.applied, 'T6(d): second call is a no-op');
+    assertEqual(second.reason, 'current', 'T6(d): second-call reason is "current" — no DDL re-attempted');
+
+    // usageQuery granularity='feature' against this fresh, heal-only-created
+    // DB: feature_usage exists but has zero rows (never backfilled here) —
+    // must return an EMPTY ARRAY, never throw (G1: this is empty by design,
+    // not a defect — feature_usage is populated only by migrate-12-
+    // feature-usage.js's data migration or a live feature run, never by
+    // schema apply itself).
+    const featureResult = await usageQuery(db, { projectId: PID, granularity: 'feature' });
+    assertTrue(Array.isArray(featureResult), 'T6: usageQuery(feature) returns an array');
+    assertEqual(featureResult.length, 0, 'T6: usageQuery(feature) against the fresh heal-only DB returns an EMPTY result, not an error');
+
+    await db.end();
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+  }
+}
+
+// ── T7: (e) hand-made turn_usage missing the resolved_via CHECK — healed
+//     exactly once via the fingerprint-'current' fast path, no loop on the
+//     second touch ──────────────────────────────────────────────────────────
+
+async function testT7() {
+  const label = 'T7: turn_usage missing the resolved_via CHECK — healed on the first fast-path touch, idempotent (no re-heal, no duplicate constraint) on the second';
+  if (!(await isPgAvailable())) { console.log(`SKIP  ${label} (Postgres unavailable)`); return; }
+
+  const dbName = `cm_pra_t7_${Date.now()}`;
+  const PID = 'cm-pra-t7-project';
+  try {
+    await createThrowawayDb(dbName);
+    await ensureVectorExtension(dbName);
+
+    const db = await pgConnect(dbName);
+    const adapter = new PostgresAdapter(db);
+    await db.query(
+      `CREATE TABLE project_settings (project_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (project_id, key))`
+    );
+
+    // Establish a clean, fully-applied, fingerprint-'current' baseline first
+    // (mirrors a live install that has already run init/heal once).
+    const baseline = await handoffModule.ensureSchemaCurrent(adapter, PID, { silent: true });
+    assertTrue(baseline.applied, 'T7 precondition: baseline apply succeeds');
+
+    // Simulate the "hand-made turn_usage" aged state (adversary G4: a
+    // pre-existing table that was never healed, not a fresh CREATE) by
+    // dropping ONLY the resolved_via CHECK constraint by hand -- turn_usage
+    // itself, its other CHECK (outcome), and its indexes/uniques are left
+    // untouched, so this exercises the CHECK-heal path in isolation.
+    await db.query(`ALTER TABLE turn_usage DROP CONSTRAINT turn_usage_resolved_via_check`);
+    const { rows: droppedCheck } = await db.query(
+      `SELECT conname FROM pg_constraint WHERE contype = 'c' AND conrelid = 'turn_usage'::regclass`
+    );
+    assertEqual(droppedCheck.length, 1, 'T7 precondition: only the outcome CHECK remains after the hand-drop');
+
+    // First touch after the hand-drop: fingerprint is STILL 'current' (SQL
+    // bytes never changed) — this must heal via the fast-path constraint-heal
+    // block (never re-run the whole additive apply), and must not error.
+    const healRun = await handoffModule.ensureSchemaCurrent(adapter, PID, { silent: true });
+    assertFalse_(healRun.applied, 'T7: heal touch does not report a fresh "applied" (fingerprint was already current -- the heal is folded into the fast path, not a new apply)');
+    assertEqual(healRun.reason, 'current', 'T7: heal touch resolves to "current" once the CHECK is healed');
+
+    const { rows: healedCheck } = await db.query(
+      `SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE contype = 'c' AND conrelid = 'turn_usage'::regclass ORDER BY conname`
+    );
+    assertEqual(healedCheck.length, 2, 'T7: exactly 2 CHECK constraints on turn_usage after healing (resolved_via re-added, outcome untouched) -- not 0, not 3');
+    assertTrue(
+      healedCheck.some((r) => r.def.includes("'directive'") && r.def.includes("'recommendation'")),
+      'T7: the healed resolved_via CHECK carries the correct def'
+    );
+
+    // Second touch: must be a pure no-op — no loop, no duplicate ADD
+    // CONSTRAINT, no error.
+    const secondTouch = await handoffModule.ensureSchemaCurrent(adapter, PID, { silent: true });
+    assertFalse_(secondTouch.applied, 'T7: second touch is a no-op');
+    assertEqual(secondTouch.reason, 'current', 'T7: second touch reason is "current"');
+
+    const { rows: finalCheck } = await db.query(
+      `SELECT conname FROM pg_constraint WHERE contype = 'c' AND conrelid = 'turn_usage'::regclass`
+    );
+    assertEqual(finalCheck.length, 2, 'T7: still exactly 2 CHECK constraints after the second touch — no duplicate re-heal, no loop');
+
+    await db.end();
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+  }
+}
+
+// ── T8: Codex review F1 — computeServerSideCost fails soft when
+//     model_registry does not exist on a fresh engine DB ────────────────────
+//
+// model_registry is created by scripts/migrations/sql/model-registry-base.sql
+// via migrate-schema-addenda.js, NOT by any scripts/sql/*.sql unit
+// ensureSchemaCurrent applies -- so a fresh engine DB provisioned by
+// ensureSchemaCurrent ALONE (exactly what this test does) genuinely has no
+// model_registry table at all. usageRecord with costUsd omitted must
+// therefore succeed with cost_usd NULL (fail-soft), never throw pg's raw
+// 42P01 (undefined_table).
+
+async function testT8() {
+  const label = 'T8: Codex review F1 — usageRecord(costUsd omitted) against a fresh engine DB with no model_registry succeeds, cost_usd NULL, one stderr line, no throw';
+  if (!(await isPgAvailable())) { console.log(`SKIP  ${label} (Postgres unavailable)`); return; }
+
+  const dbName = `cm_pra_t8_${Date.now()}`;
+  const PID = 'cm-pra-t8-project';
+  try {
+    await createThrowawayDb(dbName);
+    await ensureVectorExtension(dbName);
+
+    const db = await pgConnect(dbName);
+    const adapter = new PostgresAdapter(db);
+    await db.query(
+      `CREATE TABLE project_settings (project_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (project_id, key))`
+    );
+
+    // Provision via ensureSchemaCurrent ONLY — no migrate-schema-addenda.js,
+    // no model-registry-base.sql applied by hand. This is the exact "fresh
+    // engine DB" state F1 names.
+    const apply = await handoffModule.ensureSchemaCurrent(adapter, PID, { silent: true });
+    assertTrue(apply.applied, 'T8 precondition: fresh apply succeeds');
+
+    const { rows: mrRows } = await db.query(
+      `SELECT 1 FROM information_schema.tables WHERE table_name = 'model_registry'`
+    );
+    assertEqual(mrRows.length, 0, 'T8 precondition: model_registry genuinely does not exist on this DB');
+
+    // Capture stderr to confirm the ONE documented fail-soft line, without
+    // letting it print during a normal test run.
+    const originalWrite = process.stderr.write.bind(process.stderr);
+    const stderrLines = [];
+    process.stderr.write = (chunk, ...args) => { stderrLines.push(String(chunk)); return true; };
+    let result;
+    try {
+      result = await usageRecord(db, {
+        projectId: PID, sessionId: 'sess-t8', turnIdx: 0, agentRole: 'test',
+        modelId: 'claude-sonnet-5', tokensIn: 100, tokensOut: 50,
+        // costUsd deliberately omitted -> COMPUTE branch -> hits the
+        // model_registry lookup that does not exist.
+      });
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+
+    assertEqual(result.costUsd, null, 'T8: cost_usd is NULL (fail-soft), never a thrown error and never a guessed price');
+    assertEqual(result.tokensIn, 100, 'T8: tokensIn written correctly despite the cost fail-soft branch');
+    // R1 (Codex round 2, 2026-09-12): the common "table genuinely absent"
+    // case is now caught by the tx-safe `to_regclass` pre-check, BEFORE the
+    // query that used to raise 42P01 is ever issued -- so the emitted line
+    // no longer names 42P01 (that code now surfaces only from the narrow
+    // backstop race branch, not this path).
+    assertTrue(
+      stderrLines.some((l) => l.includes('model_registry') && l.includes('does not exist')),
+      `T8: exactly one fail-soft stderr line naming model_registry (via the to_regclass pre-check) was emitted — got: ${JSON.stringify(stderrLines)}`
+    );
+
+    // Explicit costUsd still wins (unaffected by the fail-soft branch, per
+    // F1's own wording) — same model_registry-less DB, a second turn.
+    const explicit = await usageRecord(db, {
+      projectId: PID, sessionId: 'sess-t8', turnIdx: 1, agentRole: 'test',
+      tokensIn: 10, tokensOut: 10, costUsd: 0.05,
+    });
+    assertEqual(explicit.costUsd, 0.05, 'T8: an explicit costUsd is used verbatim, never overridden by the fail-soft branch');
+
+    await db.end();
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+  }
+}
+
+// ── T9: Codex review F2 — a dropped base column on turn_usage/session_usage/
+//     feature_usage is no longer invisible to ensureSchemaCurrent's
+//     fingerprint-'current' fast path ──────────────────────────────────────
+
+async function testT9() {
+  const label = 'T9: Codex review F2 — a hand-dropped feature_usage.tokens_in column is DETECTED on the next touch, never a silent reason:"current"';
+  if (!(await isPgAvailable())) { console.log(`SKIP  ${label} (Postgres unavailable)`); return; }
+
+  const dbName = `cm_pra_t9_${Date.now()}`;
+  const PID = 'cm-pra-t9-project';
+  try {
+    await createThrowawayDb(dbName);
+    await ensureVectorExtension(dbName);
+
+    const db = await pgConnect(dbName);
+    const adapter = new PostgresAdapter(db);
+    await db.query(
+      `CREATE TABLE project_settings (project_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (project_id, key))`
+    );
+
+    const baseline = await handoffModule.ensureSchemaCurrent(adapter, PID, { silent: true });
+    assertTrue(baseline.applied, 'T9 precondition: baseline apply succeeds');
+
+    // Hand-drop a BASE column (part of the original CREATE TABLE, never an
+    // ALTER TABLE ADD COLUMN target — the exact shape F2's finding named).
+    await db.query(`ALTER TABLE feature_usage DROP COLUMN tokens_in`);
+    const { rows: droppedCol } = await db.query(
+      `SELECT 1 FROM information_schema.columns WHERE table_name = 'feature_usage' AND column_name = 'tokens_in'`
+    );
+    assertEqual(droppedCol.length, 0, 'T9 precondition: tokens_in genuinely absent after the hand-drop');
+
+    // Fingerprint is STILL 'current' (SQL bytes never changed) — this is
+    // exactly the fast-path branch F2's finding named as silently reporting
+    // "current" forever with an empty columns list. Parity check: this must
+    // resolve to something OTHER than a clean 'current' no-op, mirroring how
+    // handoff-core-schema.sql's own tracked columns are treated when absent
+    // (S1(b): apply-and-reverify, not a silent pass).
+    const touch = await handoffModule.ensureSchemaCurrent(adapter, PID, { silent: true });
+    assertTrue(
+      touch.reason !== 'current' || touch.applied === true,
+      `T9: a dropped base column must never resolve to a silent applied:false/reason:'current' no-op — got ${JSON.stringify({ applied: touch.applied, reason: touch.reason })}`
+    );
+    // This unit's DDL is a bare CREATE TABLE IF NOT EXISTS (no ALTER TABLE
+    // ADD COLUMN for tokens_in) — re-running it cannot itself resurrect a
+    // dropped base column, so the concrete outcome here is
+    // reason:'verification_failed' naming the missing column (S1(b)'s
+    // post-apply schemaObjectsExist check), never a false 'current'.
+    assertEqual(touch.reason, 'verification_failed', 'T9: reported as verification_failed (detected, not silently "current") — the column cannot self-heal from a bare CREATE TABLE IF NOT EXISTS, but the gap is no longer invisible');
+    assertTrue(
+      touch.detail.missing.some((m) => m.type === 'column' && m.table === 'feature_usage' && m.column === 'tokens_in'),
+      `T9: the reported missing set names feature_usage.tokens_in specifically — got ${JSON.stringify(touch.detail.missing)}`
+    );
+
+    await db.end();
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+  }
+}
+
+// ── T12: Codex round-2 R1 — computeServerSideCost's model_registry
+//     existence check must be transaction-safe: a caller-owned BEGIN...
+//     usageRecord(costUsd omitted)...COMMIT survives against a
+//     model_registry-less DB. Before the fix, the 42P01 raised by the raw
+//     `SELECT ... FROM model_registry` was caught in JS, but Postgres had
+//     already server-side ABORTED the transaction (25P02,
+//     in_failed_sql_transaction) -- the caller's own COMMIT (or any
+//     statement after the catch, including this function's own upsert)
+//     then failed too. The fix replaces the catch-and-hope with a
+//     `to_regclass` pre-check that never errors, so the query that used to
+//     raise 42P01 is never issued in the common case at all. ─────────────
+
+async function testT12() {
+  const label = 'T12: Codex R1 — usageRecord(costUsd omitted) inside a caller-owned BEGIN...COMMIT on a model_registry-less DB: row written, COMMIT succeeds, cost_usd NULL';
+  if (!(await isPgAvailable())) { console.log(`SKIP  ${label} (Postgres unavailable)`); return; }
+
+  const dbName = `cm_pra_t12_${Date.now()}`;
+  const PID = 'cm-pra-t12-project';
+  try {
+    await createThrowawayDb(dbName);
+    await ensureVectorExtension(dbName);
+
+    const db = await pgConnect(dbName);
+    const adapter = new PostgresAdapter(db);
+    await db.query(
+      `CREATE TABLE project_settings (project_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (project_id, key))`
+    );
+
+    const apply = await handoffModule.ensureSchemaCurrent(adapter, PID, { silent: true });
+    assertTrue(apply.applied, 'T12 precondition: fresh apply succeeds');
+
+    const { rows: mrRows } = await db.query(
+      `SELECT 1 FROM information_schema.tables WHERE table_name = 'model_registry'`
+    );
+    assertEqual(mrRows.length, 0, 'T12 precondition: model_registry genuinely does not exist on this DB');
+
+    // The exact shape R1 named: the CALLER opens and owns the transaction --
+    // usageRecord neither opens nor closes it, and runs entirely inside it.
+    await db.query('BEGIN');
+    let result;
+    try {
+      result = await usageRecord(db, {
+        projectId: PID, sessionId: 'sess-t12', turnIdx: 0, agentRole: 'test',
+        modelId: 'claude-sonnet-5', tokensIn: 100, tokensOut: 50,
+        // costUsd deliberately omitted -> COMPUTE branch -> hits the
+        // (now tx-safe) model_registry existence check.
+      });
+    } catch (err) {
+      await db.query('ROLLBACK').catch(() => {});
+      throw new Error(`T12: usageRecord itself threw inside the caller's transaction (it must not) -- ${err.message}`);
+    }
+    // Before the fix this COMMIT would raise 25P02
+    // (current transaction is aborted, commands ignored until end of
+    // transaction block) because the caught-in-JS 42P01 had already
+    // poisoned the transaction server-side.
+    await db.query('COMMIT');
+
+    assertEqual(result.costUsd, null, 'T12: cost_usd is NULL (fail-soft) in the returned row');
+
+    const { rows: written } = await db.query(
+      `SELECT cost_usd FROM turn_usage WHERE project_id = $1 AND session_id = $2 AND turn_idx = 0 AND agent_role = 'test'`,
+      [PID, 'sess-t12']
+    );
+    assertEqual(written.length, 1, 'T12: the row survived the COMMIT (neither rolled back nor lost to an aborted tx)');
+    assertEqual(written[0].cost_usd, null, 'T12: cost_usd is NULL in the committed row itself, not just the in-memory return value');
+
+    await db.end();
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+  }
+}
+
+// ── T10: Codex review F3 — usage-telemetry-schema.sql / feature-usage-
+//     schema.sql are in required_roster; a fixture missing either file's own
+//     SQL fails classification, never a silent ok:true ─────────────────────
+
+function testT10() {
+  const label = 'T10: Codex review F3 — usage-telemetry-schema.sql and feature-usage-schema.sql are BOTH in required_roster; a fixture missing either file fails classification naming it';
+  try {
+    // (a) The real, live manifest actually lists both — the literal fix.
+    const liveManifestPath = path.join(PROJECT_ROOT, 'scripts', 'sql', 'schema-manifest.json');
+    const liveManifest = JSON.parse(fs.readFileSync(liveManifestPath, 'utf8'));
+    assertTrue(
+      liveManifest.required_roster.includes('usage-telemetry-schema.sql'),
+      'T10(a): usage-telemetry-schema.sql is in the live required_roster'
+    );
+    assertTrue(
+      liveManifest.required_roster.includes('feature-usage-schema.sql'),
+      'T10(a): feature-usage-schema.sql is in the live required_roster'
+    );
+
+    // (b) In-memory fixture: BOTH files declared in required_roster, but one
+    // (usage-telemetry-schema.sql) is missing from scripts/sql/ entirely —
+    // before F3 this returned ok:true (both units absent from required_roster
+    // meant classifySchemaFiles never even looked for them).
+    for (const missingFile of ['usage-telemetry-schema.sql', 'feature-usage-schema.sql']) {
+      const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-pra-t10-'));
+      const sqlDir = path.join(scratchRoot, 'scripts', 'sql');
+      fs.mkdirSync(sqlDir, { recursive: true });
+
+      const otherFile = missingFile === 'usage-telemetry-schema.sql' ? 'feature-usage-schema.sql' : 'usage-telemetry-schema.sql';
+      fs.writeFileSync(
+        path.join(sqlDir, otherFile),
+        '-- handoff:dialect postgres\nCREATE TABLE IF NOT EXISTS widgets (id serial primary key);\n',
+        'utf8'
+      );
+      fs.writeFileSync(
+        path.join(sqlDir, 'schema-manifest.json'),
+        JSON.stringify({
+          schema_epoch: 1,
+          required_roster: ['usage-telemetry-schema.sql', 'feature-usage-schema.sql'],
+          units: {
+            [otherFile]: { classification: 'postgres', order: 10, expected_objects: { tables: ['widgets'], columns: [], indexes: [] } },
+          },
+        }, null, 2),
+        'utf8'
+      );
+
+      const result = classifySchemaFiles({ engineRoot: scratchRoot });
+      assertFalse(result.ok, `T10(b): fixture missing ${missingFile} must fail classification (ok:false), not silently pass`);
+      assertTrue(
+        result.errors.some((e) => e.includes(missingFile) && e.includes('required schema file missing')),
+        `T10(b): an error names the specific missing file "${missingFile}" — got ${JSON.stringify(result.errors)}`
+      );
+
+      fs.rmSync(scratchRoot, { recursive: true, force: true });
+    }
+
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  }
+}
+
+function assertFalse(v, msg) { if (v !== false) throw new Error(msg || `expected false, got ${JSON.stringify(v)}`); }
+
+// ── T11: manifest lint — every postgres unit's tables carry non-empty,
+//     DDL-backed columns; every required-roster table's anonymous DDL
+//     UNIQUE is tracked in expected_uniques ─────────────────────────────────
+
+function _escapeRegExpT11(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// Codex round-2 (R3, 2026-09-12): strips SQL line comments (--...to end of
+// line), block comments (/* ... */, non-nesting per standard SQL), and
+// single-quoted string literals (doubled '' as the standard escaped-quote
+// form) BEFORE any of this file's textual scanning runs — every later regex
+// in this module operates on the returned text, never the raw file. Without
+// this, a `)` or a `UNIQUE (` sequence typed inside a comment or a string
+// literal is textually indistinguishable from real DDL syntax to a regex/
+// paren-counting scanner: a `DEFAULT ')'` column default can terminate the
+// CREATE TABLE paren-depth scan early (silently truncating the block and
+// hiding a REAL UNIQUE constraint that comes after it — an under-detection,
+// not merely a false positive), and a string literal or comment containing
+// the literal text "UNIQUE (id)" can invent a constraint that was never
+// declared.
+//
+// Deliberately a SINGLE-PASS, state-tracking character scan, NOT two
+// sequential regex passes (comments-then-strings or strings-then-comments)
+// — a sequential-pass approach was tried and failed adversarially against
+// this file's own live DDL: handoff-core-schema.sql line ~323 has
+// `RAISE NOTICE 'assertions.embedding halfvec(4000) skipped -- pgvector not
+// installed; ...'` — a real string literal whose CONTENT contains a literal
+// `--`. A comments-first pass has no notion of "currently inside a string"
+// and strips from that inner `--` to end of line, eating the string's own
+// closing quote and leaving the total quote count in the file odd; the next
+// real quote anywhere later in the file then wrongly closes a giant
+// "string" spanning everything in between, silently blanking genuine DDL
+// (this exact scenario mis-fired on handoff-core-schema.sql's real
+// `ALTER TABLE retrieval_contract ADD COLUMN ... version ...` several lines
+// later during this fix's own development — caught here rather than
+// shipped). A single left-to-right scan that only recognizes `--`/`/*` as a
+// comment start when NOT already inside a string, and only recognizes `'`
+// as a string delimiter when NOT already inside a comment, has no such
+// ordering hazard — each character is classified exactly once, in exactly
+// one state. Replacement is same-length whitespace (newlines preserved) so
+// this never shifts any other match's position.
+function _stripSqlNoiseT11(sqlText) {
+  const n = sqlText.length;
+  let out = '';
+  let i = 0;
+  while (i < n) {
+    const c = sqlText[i];
+    const c2 = i + 1 < n ? sqlText[i + 1] : '';
+
+    if (c === '-' && c2 === '-') {
+      while (i < n && sqlText[i] !== '\n') { out += ' '; i++; }
+      continue;
+    }
+
+    if (c === '/' && c2 === '*') {
+      out += '  ';
+      i += 2;
+      while (i < n && !(sqlText[i] === '*' && i + 1 < n && sqlText[i + 1] === '/')) {
+        out += sqlText[i] === '\n' ? '\n' : ' ';
+        i++;
+      }
+      if (i < n) { out += '  '; i += 2; } // blank the closing */ itself
+      continue;
+    }
+
+    if (c === "'") {
+      out += ' ';
+      i++;
+      while (i < n) {
+        if (sqlText[i] === "'" && i + 1 < n && sqlText[i + 1] === "'") {
+          out += (sqlText[i] === '\n' ? '\n' : ' ') + (sqlText[i + 1] === '\n' ? '\n' : ' ');
+          i += 2;
+          continue;
+        }
+        if (sqlText[i] === "'") { out += ' '; i++; break; }
+        out += sqlText[i] === '\n' ? '\n' : ' ';
+        i++;
+      }
+      continue;
+    }
+
+    out += c;
+    i++;
+  }
+  return out;
+}
+
+// Cheap textual sanity check — NOT a DDL parser (mirrors schema-classify.js's
+// own internal _identifierAppearsInSQL, reimplemented here rather than
+// exported from that module since this file has no other reason to import
+// its private surface). Callers pass comment/string-stripped text (see
+// _stripSqlNoiseT11).
+function _identifierInSqlT11(sql, identifier) {
+  if (typeof identifier !== 'string' || identifier.length === 0) return false;
+  return new RegExp('\\b' + _escapeRegExpT11(identifier) + '\\b', 'i').test(sql);
+}
+
+// Extracts the column-list text between a CREATE TABLE [IF NOT EXISTS]
+// <table> ( ... ) statement's own outer parens, via paren-depth counting (so
+// nested CHECK(...)/DEFAULT now() parens don't terminate the scan early).
+// Returns null if no CREATE TABLE for `table` is found in `sqlText`. Callers
+// pass comment/string-stripped text — see _stripSqlNoiseT11 — so a
+// `DEFAULT ')'` column default (a `)` char inside what WAS a string literal)
+// can never desync the depth counter. This regex intentionally matches only
+// a bare, unquoted, unqualified identifier immediately before `(` — a
+// double-quoted or schema-qualified table name will not match here at all;
+// callers that need to distinguish "table genuinely absent from this file"
+// from "table present but declared in a form this scanner refuses to guess
+// about" use _createTableDeclUnparseableT11 for that second case.
+function _createTableBlockT11(sqlText, table) {
+  const re = new RegExp('CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?' + _escapeRegExpT11(table) + '\\s*\\(', 'i');
+  const m = re.exec(sqlText);
+  if (!m) return null;
+  let depth = 1;
+  let i = m.index + m[0].length;
+  const start = i;
+  while (i < sqlText.length && depth > 0) {
+    if (sqlText[i] === '(') depth++;
+    else if (sqlText[i] === ')') depth--;
+    i++;
+  }
+  return sqlText.slice(start, i - 1);
+}
+
+// True iff `sqlText` (comment/string-stripped) declares `table` via a
+// double-quoted identifier (`CREATE TABLE "table" (`) or a schema-qualified
+// name, quoted or not (`CREATE TABLE schema.table (`, `CREATE TABLE
+// "schema"."table" (`, `CREATE TABLE schema."table" (`, `CREATE TABLE
+// "schema".table (`) — every form _createTableBlockT11's plain-identifier
+// regex cannot match. This is a total-classification companion to that
+// function: when the plain regex finds nothing, this function distinguishes
+// "table genuinely not declared in this file" (silently nothing to check,
+// unchanged prior behavior) from "table IS declared here, in a form this
+// scanner refuses to guess about" (a hard lint error — R3: friction over a
+// silent false-negative that would let an untracked constraint through).
+function _createTableDeclUnparseableT11(sqlText, table) {
+  const t = _escapeRegExpT11(table);
+  const ident = '(?:"[A-Za-z_][A-Za-z0-9_]*"|[A-Za-z_][A-Za-z0-9_]*)';
+  const patterns = [
+    new RegExp('CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?"' + t + '"\\s*\\(', 'i'),
+    new RegExp('CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?' + ident + '\\.' + t + '\\s*\\(', 'i'),
+    new RegExp('CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?' + ident + '\\."' + t + '"\\s*\\(', 'i'),
+  ];
+  return patterns.some((re) => re.test(sqlText));
+}
+
+// Returns one array of column names per ANONYMOUS table-level UNIQUE
+// constraint (`UNIQUE (col, col, ...)` inside the column list) found in an
+// already-extracted CREATE TABLE block — deliberately excludes a standalone
+// `CREATE UNIQUE INDEX ...` (outside the block, tracked instead via
+// expected_index_defs/indexes) and a column-level `... UNIQUE` modifier
+// folded into a PRIMARY KEY (a bare PK needs no expected_uniques entry —
+// this manifest format has no expected_primary_keys field at all). `block`
+// is expected to already be comment/string-stripped (it is always derived
+// from _createTableBlockT11's output in this file).
+function _ddlAnonUniqueColumnSetsT11(block) {
+  if (block == null) return [];
+  const re = /(?:^|[,\n])\s*UNIQUE\s*\(([^()]*)\)/gi;
+  const sets = [];
+  let m;
+  while ((m = re.exec(block)) !== null) {
+    sets.push(m[1].split(',').map((c) => c.trim()).filter(Boolean));
+  }
+  return sets;
+}
+
+// Order-insensitive set equality between a manifest expected_uniques entry's
+// `columns` array and a DDL-extracted column-name array (Codex round-2 R2:
+// the prior check compared table name only, so an expected_uniques entry
+// for the right table but the WRONG columns — e.g. narrowed by a careless
+// hand-edit — passed silently).
+function _sameColumnSetT11(manifestColumns, ddlColumns) {
+  if (!Array.isArray(manifestColumns) || !Array.isArray(ddlColumns)) return false;
+  if (manifestColumns.length !== ddlColumns.length) return false;
+  const ddlSet = new Set(ddlColumns);
+  if (ddlSet.size !== ddlColumns.length) return false; // DDL had a duplicate column name — never a match
+  return manifestColumns.every((c) => ddlSet.has(c)) && new Set(manifestColumns).size === manifestColumns.length;
+}
+
+function _lintManifestT11(manifest, sqlDir) {
+  const errors = [];
+  const units = manifest.units || {};
+  const roster = new Set(manifest.required_roster || []);
+
+  for (const [basename, unit] of Object.entries(units)) {
+    if (unit.classification !== 'postgres') continue;
+    const eo = unit.expected_objects || {};
+    const tables = Array.isArray(eo.tables) ? eo.tables : [];
+    if (tables.length === 0) continue; // nothing to check (excluded/roster-less units land here too)
+
+    const columns = Array.isArray(eo.columns) ? eo.columns : [];
+    if (columns.length === 0) {
+      errors.push(
+        `${basename}: expected_objects.tables is non-empty (${tables.join(', ')}) but expected_objects.columns ` +
+        `is EMPTY — every classification:postgres unit with tables must declare its columns (T11 categorical guard)`
+      );
+      continue; // no columns to identifier-parity-check
+    }
+
+    let rawSqlText = null;
+    try { rawSqlText = fs.readFileSync(path.join(sqlDir, basename), 'utf8'); } catch (_) { /* reported below */ }
+    if (rawSqlText == null) {
+      errors.push(`${basename}: expected_objects.columns declared but the unit's own SQL file could not be read for identifier-parity checking`);
+      continue;
+    }
+    // R3: every scan below runs against comment/string-stripped text, never
+    // the raw file.
+    const sqlText = _stripSqlNoiseT11(rawSqlText);
+
+    for (const c of columns) {
+      if (!c || typeof c.column !== 'string' || !_identifierInSqlT11(sqlText, c.column)) {
+        errors.push(
+          `${basename}: expected_objects.columns entry "${c && c.table}.${c && c.column}" has no textual match ` +
+          `in ${basename}'s own SQL file — manifest/DDL desync`
+        );
+      }
+    }
+
+    // (b) required-roster uniques-or-PK coverage — scoped to roster units
+    // only (the required-roster is the set schema-classify.js's own F3 fix
+    // treats as mandatory; a non-roster postgres unit's uniqueness tracking
+    // is not this guard's concern).
+    if (roster.has(basename)) {
+      const uniques = Array.isArray(unit.expected_uniques) ? unit.expected_uniques : [];
+      for (const table of tables) {
+        const block = _createTableBlockT11(sqlText, table);
+        if (block == null) {
+          // R3: distinguish "not declared here at all" (nothing to check,
+          // prior behavior) from "declared here in a form this scanner
+          // refuses to guess about" (hard error — never a silent pass).
+          if (_createTableDeclUnparseableT11(sqlText, table)) {
+            errors.push(
+              `${basename}: table "${table}" is declared via a quoted identifier or a schema-qualified name in ` +
+              `its own DDL that this scanner cannot parse — refusing to guess whether it carries an anonymous ` +
+              `UNIQUE constraint (T11 total-classification guard: unsupported syntax is a lint error, never a ` +
+              `silent pass)`
+            );
+          }
+          continue;
+        }
+        const ddlSets = _ddlAnonUniqueColumnSetsT11(block);
+        if (ddlSets.length === 0) continue; // no anonymous UNIQUE for this table — nothing to track (a bare PK, or neither, is out of scope)
+        for (const ddlCols of ddlSets) {
+          const matched = uniques.some((u) => u && u.table === table && _sameColumnSetT11(u.columns, ddlCols));
+          if (matched) continue;
+          const sameTable = uniques.filter((u) => u && u.table === table);
+          if (sameTable.length === 0) {
+            errors.push(
+              `${basename}: required-roster table "${table}" declares an anonymous UNIQUE constraint (${ddlCols.join(', ')}) ` +
+              `in its own DDL with no matching expected_uniques entry — untracked constraint would go un-healed if dropped`
+            );
+          } else {
+            errors.push(
+              `${basename}: required-roster table "${table}" DDL UNIQUE (${ddlCols.join(', ')}) does not match the ` +
+              `column set of any expected_uniques entry for that table (manifest has: ` +
+              `${sameTable.map((u) => JSON.stringify(u.columns)).join('; ')}) — manifest/DDL column-set desync ` +
+              `(T11 unique-parity guard, Codex round-2 R2)`
+            );
+          }
+        }
+      }
+    }
+  }
+
+  return errors;
+}
+
+function testT11() {
+  const label = 'T11: manifest lint — every postgres unit with tables declares non-empty, DDL-identifier-parity-checked columns; every required-roster anonymous-UNIQUE table is tracked in expected_uniques';
+  try {
+    const sqlDir = path.join(PROJECT_ROOT, 'scripts', 'sql');
+
+    // (1) Fixture: a unit with non-empty tables but columns: [] must FAIL —
+    // the exact shape app-retrieval-events-schema.sql had before this commit.
+    const fixtureManifest = {
+      required_roster: [],
+      units: {
+        'usage-telemetry-schema.sql': {
+          classification: 'postgres',
+          expected_objects: { tables: ['turn_usage', 'session_usage'], columns: [], indexes: [] },
+        },
+      },
+    };
+    const fixtureErrors = _lintManifestT11(fixtureManifest, sqlDir);
+    assertTrue(
+      fixtureErrors.some((e) => e.includes('usage-telemetry-schema.sql') && e.includes('EMPTY')),
+      `T11(1): fixture unit with columns: [] must be flagged — got ${JSON.stringify(fixtureErrors)}`
+    );
+
+    // (2) Fixture: a bogus column name (no textual match in the real SQL
+    // file) must FAIL identifier parity.
+    const fixtureDesync = {
+      required_roster: [],
+      units: {
+        'usage-telemetry-schema.sql': {
+          classification: 'postgres',
+          expected_objects: {
+            tables: ['turn_usage'],
+            columns: [{ table: 'turn_usage', column: 'this_column_does_not_exist_xyz' }],
+            indexes: [],
+          },
+        },
+      },
+    };
+    const desyncErrors = _lintManifestT11(fixtureDesync, sqlDir);
+    assertTrue(
+      desyncErrors.some((e) => e.includes('this_column_does_not_exist_xyz') && e.includes('manifest/DDL desync')),
+      `T11(2): fixture with a phantom column name must be flagged as manifest/DDL desync — got ${JSON.stringify(desyncErrors)}`
+    );
+
+    // (3) Fixture: a required-roster table with an anonymous DDL UNIQUE and
+    // no expected_uniques entry must FAIL (b).
+    const fixtureUnique = {
+      required_roster: ['usage-telemetry-schema.sql'],
+      units: {
+        'usage-telemetry-schema.sql': {
+          classification: 'postgres',
+          expected_objects: {
+            tables: ['turn_usage', 'session_usage'],
+            columns: [{ table: 'turn_usage', column: 'project_id' }, { table: 'session_usage', column: 'project_id' }],
+            indexes: [],
+          },
+          expected_uniques: [],
+        },
+      },
+    };
+    const uniqueErrors = _lintManifestT11(fixtureUnique, sqlDir);
+    assertTrue(
+      uniqueErrors.some((e) => e.includes('turn_usage') && e.includes('anonymous UNIQUE')),
+      `T11(3): fixture with an untracked anonymous DDL UNIQUE on a required-roster table must be flagged — got ${JSON.stringify(uniqueErrors)}`
+    );
+
+    // (4) The live manifest, after this same commit's fixes, passes BOTH
+    // checks cleanly — zero errors, not merely "fewer" errors.
+    const liveManifestPath = path.join(sqlDir, 'schema-manifest.json');
+    const liveManifest = JSON.parse(fs.readFileSync(liveManifestPath, 'utf8'));
+    const liveErrors = _lintManifestT11(liveManifest, sqlDir);
+    assertEqual(liveErrors.length, 0, `T11(4): live schema-manifest.json must pass the lint cleanly — got ${JSON.stringify(liveErrors)}`);
+
+    // (5) Codex round-2 R2: an expected_uniques entry naming the RIGHT table
+    // but the WRONG columns (turn_usage narrowed to just ["project_id"],
+    // dropping session_id/turn_idx/agent_role) must FAIL, naming the
+    // column-set mismatch — the prior table-name-only check would have
+    // silently passed this because SOME entry for "turn_usage" exists.
+    // session_usage's own entry is left correct in the same fixture to
+    // prove the check is per-table, not an all-or-nothing unit failure.
+    const fixtureUniqueColumnMismatch = {
+      required_roster: ['usage-telemetry-schema.sql'],
+      units: {
+        'usage-telemetry-schema.sql': {
+          classification: 'postgres',
+          expected_objects: {
+            tables: ['turn_usage', 'session_usage'],
+            columns: [{ table: 'turn_usage', column: 'project_id' }, { table: 'session_usage', column: 'project_id' }],
+            indexes: [],
+          },
+          expected_uniques: [
+            { table: 'turn_usage', columns: ['project_id'] },
+            { table: 'session_usage', columns: ['project_id', 'session_id'] },
+          ],
+        },
+      },
+    };
+    const columnMismatchErrors = _lintManifestT11(fixtureUniqueColumnMismatch, sqlDir);
+    assertTrue(
+      columnMismatchErrors.some((e) => e.includes('turn_usage') && e.includes('column-set desync') && e.includes('project_id')),
+      `T11(5): turn_usage expected_uniques narrowed to ["project_id"] must be flagged as a column-set mismatch, not pass on table-name match alone — got ${JSON.stringify(columnMismatchErrors)}`
+    );
+    assertFalse(
+      columnMismatchErrors.some((e) => e.includes('session_usage')),
+      `T11(5): session_usage's own expected_uniques entry is correct and must NOT be flagged — got ${JSON.stringify(columnMismatchErrors)}`
+    );
+
+    // (6)-(8) Codex round-2 R3: comment/string-literal stripping and refusal
+    // on unparseable table declarations. The real scripts/sql/*.sql files
+    // have none of these shapes, so these three run against hand-written
+    // fixture SQL in a scratch directory.
+    const r3Root = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-pra-t11-r3-'));
+    try {
+      // (6) A `DEFAULT ')'` string-literal column default BEFORE a real
+      // `UNIQUE (id)` must not truncate the paren-depth scan early — proven
+      // by a POSITIVE "untracked constraint" flag (expected_uniques is
+      // deliberately left empty), i.e. the constraint was still detected.
+      fs.writeFileSync(
+        path.join(r3Root, 'r3a.sql'),
+        "CREATE TABLE t_r3a (\n  id INT PRIMARY KEY,\n  note TEXT DEFAULT ')',\n  UNIQUE (id)\n);\n",
+        'utf8'
+      );
+      const r3aErrors = _lintManifestT11(
+        {
+          required_roster: ['r3a.sql'],
+          units: {
+            'r3a.sql': {
+              classification: 'postgres',
+              expected_objects: { tables: ['t_r3a'], columns: [{ table: 't_r3a', column: 'id' }], indexes: [] },
+              expected_uniques: [],
+            },
+          },
+        },
+        r3Root
+      );
+      assertTrue(
+        r3aErrors.some((e) => e.includes('t_r3a') && e.includes('anonymous UNIQUE') && e.includes('(id)')),
+        `T11(6): a DEFAULT ')' string literal before a real UNIQUE (id) must not truncate the scan — the constraint must still be DETECTED — got ${JSON.stringify(r3aErrors)}`
+      );
+
+      // (7) A string literal whose CONTENT is the literal text
+      // "UNIQUE (id)" — placed right after an embedded literal newline
+      // (Postgres string literals may span lines), the exact layout the
+      // pre-fix column-scan regex would have matched as a REAL constraint —
+      // must not invent a phantom constraint. Zero errors expected (nothing
+      // really declared, nothing to track).
+      fs.writeFileSync(
+        path.join(r3Root, 'r3b.sql'),
+        "CREATE TABLE t_r3b (\n  id INT PRIMARY KEY,\n  descr TEXT DEFAULT 'line one,\nUNIQUE (id)\nline two'\n);\n",
+        'utf8'
+      );
+      const r3bErrors = _lintManifestT11(
+        {
+          required_roster: ['r3b.sql'],
+          units: {
+            'r3b.sql': {
+              classification: 'postgres',
+              expected_objects: { tables: ['t_r3b'], columns: [{ table: 't_r3b', column: 'id' }], indexes: [] },
+              expected_uniques: [],
+            },
+          },
+        },
+        r3Root
+      );
+      assertEqual(r3bErrors.length, 0, `T11(7): a string literal containing the text "UNIQUE (id)" must not invent a phantom constraint — got ${JSON.stringify(r3bErrors)}`);
+
+      // (8) A double-quoted table identifier must yield an explicit
+      // unsupported-syntax lint error naming the file+table, never a silent
+      // "no anonymous UNIQUE" false-negative.
+      fs.writeFileSync(
+        path.join(r3Root, 'r3c.sql'),
+        'CREATE TABLE "Table" (\n  id INT PRIMARY KEY,\n  UNIQUE (id)\n);\n',
+        'utf8'
+      );
+      const r3cErrors = _lintManifestT11(
+        {
+          required_roster: ['r3c.sql'],
+          units: {
+            'r3c.sql': {
+              classification: 'postgres',
+              expected_objects: { tables: ['Table'], columns: [{ table: 'Table', column: 'id' }], indexes: [] },
+              expected_uniques: [],
+            },
+          },
+        },
+        r3Root
+      );
+      assertTrue(
+        r3cErrors.some((e) => e.includes('r3c.sql') && e.includes('Table') && e.includes('quoted identifier') && e.includes('cannot parse')),
+        `T11(8): a quoted "Table" identifier must yield an explicit unsupported-syntax error naming the file, never a silent guess — got ${JSON.stringify(r3cErrors)}`
+      );
+    } finally {
+      fs.rmSync(r3Root, { recursive: true, force: true });
+    }
+
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -472,6 +1444,13 @@ async function main() {
   await testT2();
   await testT3();
   await testT5();
+  await testT6();
+  await testT7();
+  await testT8();
+  await testT9();
+  await testT12();
+  testT10();
+  testT11();
 
   console.log('');
   console.log(`Results: ${passed} passed, ${failed} failed`);

@@ -8,11 +8,19 @@
  * but belong to no single migration phase: attribution columns on the
  * engine-core tables, a carryover_status column, a model registry base
  * table, an embedding-providers base table (with one seed row), the
- * routing-harness and usage-telemetry table groups, and (§18.3) the
- * feature_usage table (per-feature/per-PR token-and-cost provenance, keyed
- * by (project_id, source_db, source_feature_token_usage_id) — populated by
- * migrate-12-feature-usage.js, not by this script). See scripts/migrations/
- * sql/*.sql for the DDL itself and each file's own header comment for its
+ * routing-harness table group, and (§18.3) the feature_usage table
+ * (per-feature/per-PR token-and-cost provenance, keyed by (project_id,
+ * source_db, source_feature_token_usage_id) — populated by migrate-12-
+ * feature-usage.js, not by this script). PR-A (2026-09-12): the usage-
+ * telemetry (turn_usage/session_usage) and feature_usage DDL itself now
+ * lives in scripts/sql/ (usage-telemetry-schema.sql, feature-usage-
+ * schema.sql), registered in scripts/sql/schema-manifest.json, and is
+ * applied to EVERY live project DB by ensureSchemaCurrent — this script
+ * still applies the SAME two files (by path, resolved from that manifest;
+ * see resolveTelemetrySqlFiles) to memory_manager_staging specifically, so
+ * staging never diverges from the live-DB apply path. See scripts/
+ * migrations/sql/*.sql for the other five files' DDL, and scripts/sql/*.sql
+ * for the telemetry pair, plus each file's own header comment for its
  * origin section.
  *
  * WHAT THIS SCRIPT DOES:
@@ -85,12 +93,16 @@
  *
  * ORDER: attribution-columns -> migrate-06-carryover-status ->
  * model-registry-base -> embedding-providers-base ->
- * migrate-10-routing-harness -> migrate-11-usage-telemetry ->
- * migrate-12-feature-usage. This is the runner's own explicit SQL_FILES
- * array, never filename lexicographic order — model_registry's base CREATE
- * TABLE must precede migrate-10's ALTERs onto it, entities/assertions/edges
- * (migrate-01's tables) are a hard prerequisite for the very first file, and
- * migrate-12-feature-usage's feature_usage table is a freestanding CREATE
+ * migrate-10-routing-harness -> usage-telemetry-schema (order 40 in
+ * schema-manifest.json) -> feature-usage-schema (order 50). This is the
+ * runner's own explicit SQL_FILES array — the first five entries are always
+ * hardcoded paths, never filename lexicographic order; the last two are
+ * resolved from schema-manifest.json's own order field (single ordering
+ * authority, adversary G7 — see resolveTelemetrySqlFiles) rather than a
+ * second hardcoded copy. model_registry's base CREATE TABLE must precede
+ * migrate-10's ALTERs onto it, entities/assertions/edges (migrate-01's
+ * tables) are a hard prerequisite for the very first file, and feature-
+ * usage-schema's feature_usage table is a freestanding CREATE
  * TABLE with no FK onto any of the other six files' tables, so it is placed
  * last purely by arrival order, not by any dependency requirement.
  *
@@ -124,17 +136,50 @@ const migrateOne = require('./migrate-01-canonical-db');
 
 const MIGRATIONS_DIR = __dirname;
 const SQL_DIR = path.join(MIGRATIONS_DIR, 'sql');
+// PR-A (2026-09-12): usage-telemetry-schema.sql / feature-usage-schema.sql
+// moved to the top-level scripts/sql/ directory (schema-manifest.json order
+// 40/50) so ensureSchemaCurrent's init/heal-on-touch applies them to EVERY
+// live project DB, not just this script's memory_manager_staging target.
+const ENGINE_SQL_DIR = path.join(MIGRATIONS_DIR, '..', 'sql');
+
+// Single ordering authority (adversary G7): these two basenames' PATH and
+// RELATIVE ORDER are never hand-duplicated here — they are looked up from
+// scripts/sql/schema-manifest.json (the same manifest ensureSchemaCurrent
+// itself reads), sorted by that manifest's own `order` field, exactly once,
+// below. A future reorder in the manifest is picked up automatically; this
+// script never carries a second, independently-maintained copy of "where
+// these two files live and in what order" that could drift out of sync with
+// the manifest.
+const TELEMETRY_MANIFEST_BASENAMES = ['usage-telemetry-schema.sql', 'feature-usage-schema.sql'];
+
+function resolveTelemetrySqlFiles() {
+  const manifestPath = path.join(ENGINE_SQL_DIR, 'schema-manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const resolved = TELEMETRY_MANIFEST_BASENAMES.map((basename) => {
+    const entry = manifest.units && manifest.units[basename];
+    if (!entry || typeof entry.order !== 'number') {
+      throw new Error(
+        `migrate-schema-addenda.js: schema-manifest.json has no unit entry (with a numeric "order") for ` +
+        `"${basename}" — single ordering authority (G7) requires this manifest entry to exist`
+      );
+    }
+    return { basename, order: entry.order, fullPath: path.join(ENGINE_SQL_DIR, basename) };
+  });
+  resolved.sort((a, b) => a.order - b.order);
+  return resolved.map((r) => r.fullPath);
+}
 
 // Explicit apply order (see ORDER note in the header comment above) — NEVER
-// filename lexicographic order.
+// filename lexicographic order. The first five entries are this script's own
+// staging-only SQL pieces (scripts/migrations/sql/); the last two are
+// resolved from schema-manifest.json's order (see resolveTelemetrySqlFiles).
 const SQL_FILES = [
   path.join(SQL_DIR, 'attribution-columns.sql'),
   path.join(SQL_DIR, 'migrate-06-carryover-status.sql'),
   path.join(SQL_DIR, 'model-registry-base.sql'),
   path.join(SQL_DIR, 'embedding-providers-base.sql'),
   path.join(SQL_DIR, 'migrate-10-routing-harness.sql'),
-  path.join(SQL_DIR, 'migrate-11-usage-telemetry.sql'),
-  path.join(SQL_DIR, 'migrate-12-feature-usage.sql'),
+  ...resolveTelemetrySqlFiles(),
 ];
 
 // Engine-core tables this addendum's ALTER TABLE statements target. Must
@@ -318,7 +363,7 @@ function normalizeType(typeToken) {
 
 /**
  * Parse a column's declared-type token PLUS whether it carries a trailing
- * `[]` array suffix (e.g. `TEXT[]`) — migrate-12-feature-usage.sql's
+ * `[]` array suffix (e.g. `TEXT[]`) — feature-usage-schema.sql's
  * session_ids TEXT[] is the first array-typed column any addendum-family
  * SQL file has declared. An array-suffixed column's live
  * information_schema.columns.data_type is the literal string 'ARRAY'

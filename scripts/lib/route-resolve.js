@@ -45,7 +45,8 @@
  * REGISTRY JOIN KEY: model_registry is joined exclusively on `label` (NOT
  * NULL UNIQUE). turn_usage.model_id and routing_session_overrides.model_id
  * hold strings that conventionally match model_registry.label (per
- * migrate-11-usage-telemetry.sql's own header comment). migrate-10's
+ * scripts/sql/usage-telemetry-schema.sql's own header comment, formerly
+ * migrate-11-usage-telemetry.sql). migrate-10's
  * model_registry.model_id column (the provider's own identifier string, no
  * uniqueness) is UNUSED by this resolver.
  *
