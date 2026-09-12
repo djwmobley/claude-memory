@@ -103,17 +103,38 @@ still enters the project DB heal-on-touch path (`withProjectDb` ->
 `ensureSchemaCurrent`/`ensureProjectIdentity`), which may write schema
 repairs even though the tool's own query is read-only — see this project's
 `readOnlyHint:false` annotation on `usage_query` in `scripts/handoff-mcp.mjs`
-(Codex review F1). Only `usage_record` follows the env-based session
-resolution described in [Session identity](#session-identity) above —
-`usage_query` does not resolve session identity from env at all; see below.
+(Codex review F1). Only `usage_record` defaults its session identity at
+all — `usage_query` does not resolve session identity from env or marker;
+see below.
 
 - `usage_record`'s `sessionId` argument is optional. Omitted (the property
   genuinely absent from the call — an explicit `""` or whitespace-only
-  string is NOT "omitted" and is a hard error instead), it defaults from
-  this MCP server process's own environment using the exact same
-  `CLAUDE_CODE_SESSION_ID` → `CODEX_THREAD_ID` precedence described in
-  [Session identity](#session-identity) above — under Codex that resolves to
-  `CODEX_THREAD_ID`. Pass `sessionId` explicitly to override the default.
+  string is NOT "omitted" and is a hard error instead), it resolves through
+  the engine's **full** precedence, in order: (1) an explicit `sessionId`
+  argument, checked first, always wins; (2) this MCP server process's own
+  environment, using the exact same `CLAUDE_CODE_SESSION_ID` →
+  `CODEX_THREAD_ID` precedence described in [Session
+  identity](#session-identity) above; (3) if neither env var resolves, the
+  project's live `session_in_progress` marker — set at `SessionStart` by the
+  loader hook, and resolved via `resolveSessionIdFromMarker` in
+  `scripts/lib/session-identity.js`, the SAME helper `handoff.js`'s own
+  `resolveSessionId` (used by `handoff_close`/`handoff_checkpoint`) and
+  `handoff_status` already share. Omitting `sessionId` with none of the
+  three available is a hard error, never a fabricated id.
+
+  **Under Codex, step (2) does not fire — the marker (step 3) is the path
+  that actually serves Codex.** A real Codex CLI end-to-end run
+  (2026-09-12) confirmed Codex does NOT put `CODEX_THREAD_ID` into this MCP
+  server process's own environment: `config.toml`'s `env` table for this
+  server carries only `HANDOFF_HOST` and `HANDOFF_PROMOTION_FILE`. Before
+  this fix, an omitted `sessionId` under Codex failed outright with "no
+  default could be resolved from ... CLAUDE_CODE_SESSION_ID or
+  CODEX_THREAD_ID env vars" in the SAME run where `handoff_status` reported
+  a `session_id` — because `handoff_status` reads the project's marker,
+  which the `SessionStart` loader hook (`--host codex`) writes with the
+  Codex thread id, and `usage_record` did not previously consult it. Pass
+  `sessionId` explicitly (e.g. the value from `handoff_status`, or the
+  hook's own `session_id`) to bypass the fallback chain entirely.
   `usage_record` writes to `turn_usage` ONLY — it never writes
   `session_usage` or `feature_usage`.
 - `usage_query` does NOT resolve session identity from env — it has no

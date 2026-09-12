@@ -198,24 +198,42 @@ async function runUsageTelemetryChecks() {
 
   const stamp = Date.now();
 
-  // migrate-11-usage-telemetry.sql (schema-setup-only, idempotent
-  // `CREATE TABLE IF NOT EXISTS`, no FK dependencies) is NOT part of the
-  // base schema-manifest.json this repo ships today -- a freshly-`init`ed
-  // throwaway project genuinely lacks turn_usage/session_usage out of the
-  // box, which is exactly check (a)'s real-world reproduction (no DROP TABLE
-  // needed at all). Checks (b)/(c)/(d) need a DB that DOES have turn_usage,
-  // so they apply this migration SQL directly to their own throwaway DB --
-  // running an existing migration file's SQL against a scratch fixture, same
-  // as test-pg-helpers.js's own applySchema() does for the base schema, never
-  // editing scripts/migrations/* (that tree is out of scope for this PR).
+  // usage-telemetry-schema.sql (schema-setup-only, idempotent `CREATE TABLE
+  // IF NOT EXISTS`, no FK dependencies) -- PR #298 (feat(schema): telemetry
+  // + feature_usage DDL in schema manifest, epoch 5) moved this file from
+  // scripts/migrations/sql/migrate-11-usage-telemetry.sql to scripts/sql/
+  // and registered it in scripts/sql/schema-manifest.json so
+  // ensureSchemaCurrent's init/heal-on-touch path now applies it to every
+  // live project DB directly -- it is no longer a standalone migration file
+  // outside the base schema (path fixed here, fix/usage-record-marker-
+  // fallback: the stale scripts/migrations/sql path this block referenced
+  // pre-#298 no longer exists, which made every usage-telemetry check in
+  // this file ENOENT before even connecting to a DB). Checks (b)/(c)/(d)/(g)
+  // apply this SQL directly to their own throwaway DB the same way
+  // test-pg-helpers.js's own applySchema() does for the base schema, so
+  // they still exercise a DB with turn_usage even if a future schema-
+  // manifest change makes it redundant with `setupProject`'s own init.
   const USAGE_MIGRATION_SQL = fs.readFileSync(
-    path.join(__dirname, 'migrations', 'sql', 'migrate-11-usage-telemetry.sql'),
+    path.join(__dirname, 'sql', 'usage-telemetry-schema.sql'),
     'utf8'
   );
 
-  // (a) usage_query against a freshly-init'ed DB, which genuinely lacks
-  // turn_usage (see above) -> actionable error text, never a raw pg stack
-  // trace ("at Client..." frames).
+  // (a) usage_query against a DB genuinely lacking turn_usage -> actionable
+  // error text, never a raw pg stack trace ("at Client..." frames).
+  //
+  // fix/usage-record-marker-fallback (2026-09-12): PR #298 registered
+  // usage-telemetry-schema.sql in the base scripts/sql/schema-manifest.json
+  // (epoch 5) so ensureSchemaCurrent's init/heal-on-touch path now creates
+  // turn_usage in EVERY freshly-init'ed project DB -- the "a freshly-
+  // init'ed DB genuinely lacks turn_usage, no DROP TABLE needed" premise
+  // this check's original comment stated is no longer true post-#298 (it
+  // predates #298; the check was silently never executing at all in the
+  // interim, masked by a since-fixed ENOENT on the stale
+  // scripts/migrations/sql/migrate-11-usage-telemetry.sql path this same
+  // block used to read from -- see USAGE_MIGRATION_SQL's comment above).
+  // DROP TABLE below reproduces the genuinely-missing-relation scenario
+  // this check exists to cover, explicitly rather than relying on init's
+  // own (now different) starting state.
   {
     const dbName = `test_usage_mcp_missing_${stamp}`;
     const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-mcp-missing-'));
@@ -223,6 +241,12 @@ async function runUsageTelemetryChecks() {
     try {
       await pgHelpers.createTestDb(dbName, projectDir);
       await pgHelpers.setupProject(dbName, projectDir);
+      const dropDb = await pgHelpers.pgConnect(dbName);
+      try {
+        await dropDb.query('DROP TABLE IF EXISTS turn_usage CASCADE');
+      } finally {
+        await dropDb.end();
+      }
 
       await withMcpClient({ HANDOFF_DB: dbName, CLAUDE_CODE_SESSION_ID: undefined, CODEX_THREAD_ID: undefined }, async (client) => {
         // sessionId given -> the turn_usage-scoped path (usageQuerySessionScoped),
@@ -352,8 +376,58 @@ async function runUsageTelemetryChecks() {
           }
         );
       }
+
+      // (g) fix/usage-record-marker-fallback: sessionId omitted, NEITHER env
+      // id set, but a live project session_in_progress marker IS present ->
+      // writes under the marker's session_id. This is the real Codex e2e
+      // gap this PR fixes -- Codex's MCP server env carries no
+      // CODEX_THREAD_ID at all (config.toml's `env` table for this server
+      // only ever sets HANDOFF_HOST/HANDOFF_PROMOTION_FILE), so the marker
+      // fallback (resolveSessionIdFromMarker, scripts/lib/session-identity.js)
+      // is the path that actually serves Codex here -- same marker
+      // handoff.js's own resolveSessionId and handoff_status already share.
+      // Boolean-only assertion below (CodeQL js/clear-text-logging) -- the
+      // marker session id is never logged, only compared.
+      {
+        const label = 'UT-G: usage_record with no sessionId and no env ids, marker present -> row written under the marker id';
+        const markerSessionId = 'marker-sess-ut-g';
+        const projectId = pgHelpers.resolveProjectId(projectDir);
+        const markerDb = await pgHelpers.pgConnect(dbName);
+        try {
+          await pgHelpers.setSetting(
+            markerDb, projectId, 'session_in_progress',
+            JSON.stringify([{ session_id: markerSessionId, ts: new Date().toISOString() }])
+          );
+        } finally {
+          await markerDb.end();
+        }
+        try {
+          await withMcpClient(
+            { HANDOFF_DB: dbName, HANDOFF_HOST: undefined, CLAUDE_CODE_SESSION_ID: undefined, CODEX_THREAD_ID: undefined },
+            async (client) => {
+              const result = await client.callTool({
+                name: 'usage_record',
+                arguments: { projectRoot: projectDir, turnIdx: 6, agentRole: 'ut-role', tokensIn: 10, tokensOut: 5 },
+              });
+              const row = result.isError ? null : JSON.parse(result.content[0].text);
+              check(label, !result.isError && row.sessionId === markerSessionId);
+            }
+          );
+        } finally {
+          // Clear the marker so it never leaks into a later check sharing this DB.
+          const cleanupDb = await pgHelpers.pgConnect(dbName);
+          try {
+            await cleanupDb.query(
+              `DELETE FROM project_settings WHERE project_id = $1 AND key = 'session_in_progress'`,
+              [projectId]
+            );
+          } finally {
+            await cleanupDb.end();
+          }
+        }
+      }
     } catch {
-      check('UT-BCD: setup/execution', false);
+      check('UT-BCDEFG: setup/execution', false);
     } finally {
       await pgHelpers.dropTestDb(dbName, projectDir);
     }

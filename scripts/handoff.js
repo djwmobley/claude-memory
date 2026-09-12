@@ -113,7 +113,13 @@ const { REALITY_CHECKS, runVerifyDispatch }        = require('./lib/reality-chec
 // this one write path.
 const { validateDecisionRows, persistDecisionRow } = require('./lib/decisions-writer');
 const { renderKeyPathsBullets, healKeyPathsSection, resolvePromotionHost, resolvePromotionTarget, looksLikeFindReplaceCopy, resolveProjectDisplayName } = require('./lib/claude-md-key-paths');
-const { resolveSessionIdFromEnv } = require('./lib/session-identity');
+const {
+  resolveSessionIdFromEnv,
+  parseSessionMarkersDetailed,
+  parseSessionMarkers,
+  latestSessionMarker,
+  resolveSessionIdFromMarker,
+} = require('./lib/session-identity');
 
 process.on('exit', () => {
   const ms = Number(process.hrtime.bigint() - __startNs) / 1e6;
@@ -1428,81 +1434,13 @@ async function setSetting(db, projectId, key, value) {
 // here — legacy = "not JSON", full stop — is what keeps those callers correct
 // after this fix; see latestSessionMarker's handling of an unparseable ts.
 
-// fix(close): parseSessionMarkersDetailed's `markers` return value MUST be
-// byte-identical to main's original parseSessionMarkers over EVERY input —
-// every non-close caller (status, loader-stop, resume) reads markers through
-// this same function and none of them may see their list shrink or their
-// session_id values change shape as a side effect of a close-only feature.
-// Main's original total classification, preserved here verbatim:
-//   - an array element is DROPPED (never produced as a marker) iff it is not
-//     an object (falsy, or typeof !== 'object' — this also drops a bare
-//     array element, since arrays lack a string .ts) OR its .ts is not a
-//     string.
-//   - a surviving element's session_id is used as-is when it is a non-empty
-//     string; ANY other value (null, undefined, a number, an object, an
-//     empty string, ...) is COERCED to null — main did this unconditionally
-//     and silently. parseSessionMarkersDetailed keeps that coercion (so
-//     clearSessionMarkerForClose's `markers` list — and every other caller's
-//     — is identical to main) but now COUNTS the two failure shapes
-//     separately (`dropped` for elements that never became a marker at all;
-//     `coerced` for elements that became a marker but had a malformed
-//     session_id forced to null) rather than losing the distinction. Only
-//     clearSessionMarkerForClose consumes these counts, to report them
-//     truthfully on the close Done line — no other caller's behavior changes.
-function parseSessionMarkersDetailed(raw) {
-  if (raw === null || raw === undefined || raw === '') return { markers: [], dropped: 0, coerced: 0 };
-  try {
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) {
-      const markers = [];
-      let dropped = 0;
-      let coerced = 0;
-      for (const e of parsed) {
-        // Byte-identical to main's filter predicate: `e && typeof e === 'object' && typeof e.ts === 'string'`.
-        const isObjectLike = Boolean(e) && typeof e === 'object';
-        const tsOk = isObjectLike && typeof e.ts === 'string';
-        if (!tsOk) {
-          dropped++;
-          continue;
-        }
-        const sidIsUsableString = typeof e.session_id === 'string' && e.session_id.length > 0;
-        const sidIsNullish = e.session_id === null || e.session_id === undefined;
-        if (!sidIsUsableString && !sidIsNullish) {
-          // A non-string, non-null/undefined session_id (number, object,
-          // boolean, empty-string-excepted-above...) — main silently forced
-          // this to null; still does, but now counted.
-          coerced++;
-        }
-        markers.push({
-          session_id: sidIsUsableString ? e.session_id : null,
-          ts: e.ts,
-        });
-      }
-      return { markers, dropped, coerced };
-    }
-    // valid JSON, not an array -> [] (never produced by this code; fail
-    // open — no per-element structure to count as dropped/coerced).
-    return { markers: [], dropped: 0, coerced: 0 };
-  } catch (_) {
-    // Not JSON — legacy marker (pre-S3 format). Accepted as-is regardless of
-    // whether it happens to be a parseable date (see note above).
-    if (typeof raw === 'string' && raw.length > 0) {
-      return { markers: [{ session_id: null, ts: raw }], dropped: 0, coerced: 0 };
-    }
-    return { markers: [], dropped: 0, coerced: 0 };
-  }
-}
-
-/**
- * fix(close): thin wrapper — returns EXACTLY the `markers` array
- * parseSessionMarkersDetailed computes, for every pre-existing caller
- * (status, loader-stop, resume, ...) that only ever wanted the clean list
- * and must see identical behavior to main (see parseSessionMarkersDetailed's
- * header comment).
- */
-function parseSessionMarkers(raw) {
-  return parseSessionMarkersDetailed(raw).markers;
-}
+// parseSessionMarkersDetailed / parseSessionMarkers now live in
+// ./lib/session-identity.js (required at the top of this file), lifted
+// verbatim (fix/usage-record-marker-fallback) so resolveSessionIdFromMarker
+// there — and every pre-existing caller here (status, loader-stop, resume,
+// close) — read markers through the SAME implementation. No behavior
+// change: same total classification, same dropped/coerced counting; see
+// that module's header comment for the full doc this used to carry.
 
 /** Read all in-flight session markers for a project. See parseSessionMarkers. */
 async function getSessionMarkers(db, projectId) {
@@ -1617,36 +1555,9 @@ function findMatchingMarkerIndex(list, currentSessionId) {
   return -1;
 }
 
-/**
- * The single most-recently-written marker across all sessions for this
- * project — a compatibility shim for callers that predate S3 and only ever
- * expected ONE global session_in_progress value (C2 bias-attribution
- * session-id resolution in writeExtraction/resolveSessionId, retrieval_events
- * logging in cmdLoaderLoad). Under S3's true multi-session model these
- * callers cannot disambiguate between concurrent sibling sessions; picking
- * the most recent write reproduces the pre-S3 last-writer-wins behavior
- * exactly for the single-session case (still the overwhelming majority).
- *
- * ts is not guaranteed to be a parseable date — a legacy opaque marker
- * carries whatever string was originally written (see parseSessionMarkers).
- * Total classification of the pairwise comparison: both parseable -> later
- * date wins; one parseable -> the parseable one wins (a real timestamp is
- * always preferred over an opaque legacy string); neither parseable -> the
- * later array entry wins (addSessionMarker always appends, so "later in the
- * array" already means "more recently written").
- */
-function latestSessionMarker(list) {
-  if (!list || list.length === 0) return null;
-  return list.reduce((latest, m) => {
-    if (!latest) return m;
-    const mMs = Date.parse(m.ts);
-    const lMs = Date.parse(latest.ts);
-    if (Number.isNaN(mMs) && Number.isNaN(lMs)) return m;
-    if (Number.isNaN(lMs)) return m;
-    if (Number.isNaN(mMs)) return latest;
-    return mMs > lMs ? m : latest;
-  }, null);
-}
+// latestSessionMarker now lives in ./lib/session-identity.js (required at
+// the top of this file), lifted verbatim alongside parseSessionMarkers* —
+// see that module's header comment. No behavior change.
 
 /**
  * Human-readable summary of the per-session session_in_progress markers for
@@ -8253,11 +8164,13 @@ async function resolveSessionId(db, projectId, payload) {
   }
   const envSessionId = resolveSessionIdFromEnv(null);
   if (envSessionId) return envSessionId;
-  // S3: session_in_progress is now a JSON array of per-session markers — resolve
-  // to the single most-recently-written one (see latestSessionMarker's header comment).
-  const markers = await getSessionMarkers(db, projectId);
-  const latest  = latestSessionMarker(markers);
-  return latest ? (latest.session_id || latest.ts) : null;
+  // S3: session_in_progress is now a JSON array of per-session markers —
+  // resolveSessionIdFromMarker (./lib/session-identity.js) resolves to the
+  // single most-recently-written one (see latestSessionMarker's header
+  // comment there) — same query/selection this function has always used,
+  // now shared verbatim with scripts/handoff-mcp.mjs's usage_record default
+  // (fix/usage-record-marker-fallback). No behavior change here.
+  return resolveSessionIdFromMarker(db, projectId);
 }
 
 /**
