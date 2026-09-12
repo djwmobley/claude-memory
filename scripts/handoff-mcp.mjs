@@ -256,7 +256,14 @@ function libErrorTypeName(err) {
  * `.schemaApplyDegraded` record (a gated-column failure during a
  * 'degraded' schema state), it is appended so the MCP caller sees the full
  * degradation record alongside the error, not just the bare message. */
-function libToolError(err) {
+// Exported (fix/usage-record-marker-fallback selftest hardening) so
+// handoff-mcp-selftest.mjs can unit-test the 42P01 mapping and the
+// CostOutOfRangeError name-rendering directly against synthetic error
+// objects, in-process — see that file's "actionableUsageSchemaError /
+// libToolError unit checks" section. This does NOT start a stdio server
+// (see buildServer's own isDirectRun guard at the bottom of this file);
+// importing these two functions is side-effect-free.
+export function libToolError(err) {
   const namedCodes = new Set([
     'MemoryUpsertError', 'MemorySearchError', 'EntityGraphCrudError',
     'MemoryViewError', 'ExchangeLogError', 'RoutingProfileError',
@@ -297,7 +304,7 @@ const USAGE_TELEMETRY_RELATIONS = new Set(['turn_usage', 'session_usage', 'featu
  * 3rd fn argument) -- reused here rather than re-derived, so the message
  * reports the exact classification the engine used, not a guess.
  */
-function actionableUsageSchemaError(err, { database, schemaReason }) {
+export function actionableUsageSchemaError(err, { database, schemaReason }) {
   if (!err || err.code !== '42P01') return err;
   const match = /relation "([^"]+)" does not exist/.exec(err.message || '');
   const relation = match ? match[1] : null;

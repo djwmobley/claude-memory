@@ -37,7 +37,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 // annotations/schema, never the handler code itself. Importing the module
 // this way does NOT start a stdio server (see handoff-mcp.mjs's isDirectRun
 // guard at the bottom of that file).
-import { buildServer } from './handoff-mcp.mjs';
+import { buildServer, actionableUsageSchemaError, libToolError } from './handoff-mcp.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -218,46 +218,102 @@ async function runUsageTelemetryChecks() {
     'utf8'
   );
 
-  // (a) usage_query against a DB genuinely lacking turn_usage -> actionable
-  // error text, never a raw pg stack trace ("at Client..." frames).
-  //
-  // fix/usage-record-marker-fallback (2026-09-12): PR #298 registered
+  // (a) fix/usage-record-marker-fallback (2026-09-12): PR #298 registered
   // usage-telemetry-schema.sql in the base scripts/sql/schema-manifest.json
-  // (epoch 5) so ensureSchemaCurrent's init/heal-on-touch path now creates
-  // turn_usage in EVERY freshly-init'ed project DB -- the "a freshly-
-  // init'ed DB genuinely lacks turn_usage, no DROP TABLE needed" premise
-  // this check's original comment stated is no longer true post-#298 (it
-  // predates #298; the check was silently never executing at all in the
-  // interim, masked by a since-fixed ENOENT on the stale
-  // scripts/migrations/sql/migrate-11-usage-telemetry.sql path this same
-  // block used to read from -- see USAGE_MIGRATION_SQL's comment above).
-  // DROP TABLE below reproduces the genuinely-missing-relation scenario
-  // this check exists to cover, explicitly rather than relying on init's
-  // own (now different) starting state.
+  // (epoch 5), so ensureSchemaCurrent's init/heal-on-touch path (run by
+  // withProjectDb on EVERY §8/§18 tool call, before the tool's own query
+  // ever executes) now recreates turn_usage/session_usage/feature_usage on
+  // any live engine DB behind epoch 5, INCLUDING one this test just DROPped
+  // the table from -- the "a DB genuinely lacking turn_usage" premise UT-A
+  // used to test is no longer reachable through a live MCP call on a
+  // current engine (heal-on-touch wins the race every time; verified: this
+  // exact DROP-then-call sequence went from FAIL to a false PASS once #298
+  // shipped, because usage_query started succeeding with an empty result
+  // instead of erroring). The 42P01 mapping (actionableUsageSchemaError,
+  // exported by handoff-mcp.mjs) is now a backstop for engines behind epoch
+  // 5 or mid-race, not a live path this selftest can drive end-to-end --
+  // so UT-A1..UT-A6 below test that mapping DIRECTLY with synthetic error
+  // objects (no DB, no MCP round-trip), and UT-A7 replaces the old live
+  // scenario with the actual current behavior: a fresh engine DB answers
+  // usage_query cleanly, never erroring, never healing mid-call.
+  //
+  // UT-A1..UT-A3: each usage-telemetry relation maps to actionable text
+  // that names the relation and points at the remedy ("init") -- never a
+  // raw pg stack frame.
   {
-    const dbName = `test_usage_mcp_missing_${stamp}`;
-    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-mcp-missing-'));
-    const label = 'UT-A: usage_query against a DB lacking turn_usage returns the actionable string, no raw pg stack';
+    const cases = [
+      ['turn_usage', 'UT-A1'],
+      ['session_usage', 'UT-A2'],
+      ['feature_usage', 'UT-A3'],
+    ];
+    for (const [relation, id] of cases) {
+      const label = `${id}: synthetic 42P01 on "${relation}" maps to actionable text (names the relation, points at init, no raw stack frame)`;
+      const err = { code: '42P01', message: `relation "${relation}" does not exist` };
+      const mapped = actionableUsageSchemaError(err, { database: 'ut-a-synthetic-db', schemaReason: 'current' });
+      const namesRelation = typeof mapped.message === 'string' && mapped.message.includes(relation);
+      const pointsAtRemedy = typeof mapped.message === 'string' && (mapped.message.includes('epoch') || mapped.message.includes('init'));
+      const noRawStackFrame = typeof mapped.message === 'string' && !mapped.message.includes('at Client');
+      check(label, mapped !== err && namesRelation && pointsAtRemedy && noRawStackFrame);
+    }
+  }
+
+  // UT-A4: a 42P01 on a relation this helper does NOT own (project_settings)
+  // is passed through completely unchanged -- adversary G5, never fabricate
+  // a schema-behind remedy for an unrecognized relation.
+  {
+    const label = 'UT-A4: synthetic 42P01 on "project_settings" (not a usage-telemetry relation) passes through unchanged';
+    const err = { code: '42P01', message: 'relation "project_settings" does not exist' };
+    const mapped = actionableUsageSchemaError(err, { database: 'ut-a-synthetic-db', schemaReason: 'current' });
+    check(label, mapped === err);
+  }
+
+  // UT-A5: a non-42P01 pg error code is left completely unchanged.
+  {
+    const label = 'UT-A5: synthetic 23505 (unique_violation) passes through unchanged';
+    const err = { code: '23505' };
+    const mapped = actionableUsageSchemaError(err, { database: 'ut-a-synthetic-db', schemaReason: 'current' });
+    check(label, mapped === err);
+  }
+
+  // UT-A6: libToolError renders a named-but-codeless lib error (usage-
+  // telemetry.js's CostOutOfRangeError -- no `.code`, name set on the
+  // instance rather than via a real subclass) by its actual name, never
+  // falls through to a generic "[undefined]"-shaped stack dump.
+  {
+    const label = 'UT-A6: libToolError renders a CostOutOfRangeError by name, not "[undefined]"';
+    const err = new Error('cost 999.99 exceeds configured ceiling');
+    err.name = 'CostOutOfRangeError';
+    const result = libToolError(err);
+    const text = result.content[0].text;
+    check(label, result.isError === true && text.includes('CostOutOfRangeError') && !text.includes('[undefined]'));
+  }
+
+  // UT-A7 (replaces the old live UT-A scenario): the REAL post-#298
+  // behavior -- a fresh engine DB provisioned by ensureSchemaCurrent (via
+  // setupProject's `handoff.js init`, epoch 5) already has feature_usage,
+  // so usage_query at granularity="feature" against it never errors and
+  // never needs a heal-on-touch mid-call; it answers with an empty result
+  // because no feature_usage rows exist yet on this brand-new DB.
+  {
+    const dbName = `test_usage_mcp_fresh_${stamp}`;
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-mcp-fresh-'));
+    const label = 'UT-A7: usage_query granularity="feature" against a fresh engine DB returns an empty result, no error';
     try {
       await pgHelpers.createTestDb(dbName, projectDir);
       await pgHelpers.setupProject(dbName, projectDir);
-      const dropDb = await pgHelpers.pgConnect(dbName);
-      try {
-        await dropDb.query('DROP TABLE IF EXISTS turn_usage CASCADE');
-      } finally {
-        await dropDb.end();
-      }
 
       await withMcpClient({ HANDOFF_DB: dbName, CLAUDE_CODE_SESSION_ID: undefined, CODEX_THREAD_ID: undefined }, async (client) => {
-        // sessionId given -> the turn_usage-scoped path (usageQuerySessionScoped),
-        // so the missing relation is turn_usage specifically, not session_usage's
-        // rollup path (sessionId omitted would hit session_usage instead -- also
-        // covered by this same helper, just a different relation name).
-        const result = await client.callTool({ name: 'usage_query', arguments: { projectRoot: projectDir, sessionId: 'ut-a-session' } });
-        const text = result.content[0].text;
-        const hasActionableText = text.includes('turn_usage is missing in') && text.includes('ensureSchemaCurrent reason=');
-        const hasRawStackFrame = text.includes('at Client');
-        check(label, result.isError === true && hasActionableText && !hasRawStackFrame);
+        const result = await client.callTool({
+          name: 'usage_query',
+          arguments: { projectRoot: projectDir, granularity: 'feature' },
+        });
+        let rows;
+        try {
+          rows = result.isError ? null : JSON.parse(result.content[0].text).rows;
+        } catch {
+          rows = null;
+        }
+        check(label, result.isError !== true && Array.isArray(rows) && rows.length === 0);
       });
     } catch {
       check(label, false);
