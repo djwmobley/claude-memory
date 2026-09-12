@@ -344,8 +344,12 @@ jobs:
       - name: Run feature-usage migration tests (§18.3 owner decision item F, 2026-09-06)
         # Tests scripts/migrations/migrate-12-feature-usage.js -- the one-time
         # data migration from pipeline_pipeline.feature_token_usage into the
-        # feature_usage table (migrate-schema-addenda.js's 7th SQL file,
-        # scripts/migrations/sql/migrate-12-feature-usage.sql).
+        # feature_usage table. PR-A (2026-09-12): the feature_usage DDL itself
+        # moved out of migrate-schema-addenda.js's SQL_FILES list into
+        # scripts/sql/feature-usage-schema.sql (schema-manifest.json
+        # required_roster), so ensureSchemaCurrent's init/heal-on-touch
+        # creates it in every project engine DB; this migration script now
+        # only carries the data backfill.
         # Covers: pure unit tests for resolveProjectId (longest-prefix-wins,
         # ties broken by array order, map-level default applying ONLY on
         # zero-prefix-match, unmapped-branch-<raw> with a possible-trim-

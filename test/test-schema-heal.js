@@ -71,6 +71,7 @@ const HANDOFF_SCRIPT = path.join(PROJECT_ROOT, 'scripts', 'handoff.js');
 const handoffModule = require(path.join(PROJECT_ROOT, 'scripts', 'handoff.js'));
 const { PostgresAdapter, SQLiteAdapter } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'db-seam.js'));
 const { classifySchemaFiles, _clearClassifyCache } = require(path.join(PROJECT_ROOT, 'scripts', 'lib', 'schema-classify.js'));
+const { copySchemaUnits } = require(path.join(__dirname, 'lib', 'scratch-engine-root.js'));
 // cm#185 review: 'pg' is a dependency of scripts/ (scripts/node_modules),
 // not of the repo root or test/ — requiring it from a lib file that already
 // lives under scripts/ (test-pg-helpers.js) resolves correctly regardless
@@ -583,19 +584,23 @@ async function testT9() {
     await preClient.query('CREATE EXTENSION IF NOT EXISTS vector');
     await preClient.end();
 
-    // Scratch engine root: real schema-manifest.json + real SQL units,
-    // EXCEPT handoff-core-schema.sql's gated ALTER is rewritten to a bogus
-    // type — the DO $$ ... EXCEPTION WHEN OTHERS $$ block still degrades
-    // gracefully, but now ALWAYS fails regardless of pgvector's presence
-    // (a stand-in for "extension present, gated DDL still doesn't take" —
-    // e.g. an old pgvector build with no halfvec type — without needing to
-    // control the test Postgres's actual pgvector version).
+    // Scratch engine root: real schema-manifest.json + every OTHER
+    // required_roster SQL unit, copied verbatim by the shared
+    // copySchemaUnits() helper (test/lib/scratch-engine-root.js) so this
+    // list can never again go stale as required_roster grows (cm#298 CI
+    // break: a hand-typed basename list here omitted usage-telemetry-
+    // schema.sql / feature-usage-schema.sql after they were added).
+    // handoff-core-schema.sql is the ONE deliberate exclusion — this test's
+    // whole point is to apply a MUTATED copy of it (see below) with its
+    // gated ALTER rewritten to a bogus type, so the DO $$ ...
+    // EXCEPTION WHEN OTHERS $$ block still degrades gracefully but now
+    // ALWAYS fails regardless of pgvector's presence (a stand-in for
+    // "extension present, gated DDL still doesn't take" — e.g. an old
+    // pgvector build with no halfvec type — without needing to control the
+    // test Postgres's actual pgvector version).
     const realSqlDir = path.join(PROJECT_ROOT, 'scripts', 'sql');
     const scratchSqlDir = path.join(scratchEngineRoot, 'scripts', 'sql');
-    fs.mkdirSync(scratchSqlDir, { recursive: true });
-    for (const basename of ['schema-manifest.json', 'handoff-sqlite-schema.sql', 'app-retrieval-events-schema.sql', 'decisions-base.sql']) {
-      fs.copyFileSync(path.join(realSqlDir, basename), path.join(scratchSqlDir, basename));
-    }
+    copySchemaUnits(PROJECT_ROOT, scratchEngineRoot, { exclude: ['handoff-core-schema.sql'] });
     const coreSrc = fs.readFileSync(path.join(realSqlDir, 'handoff-core-schema.sql'), 'utf8');
     assertTrue(coreSrc.includes('embedding halfvec(4000)'), 'T9 precondition: the real file still has the expected gated ALTER text to rewrite');
     const brokenCore = coreSrc.replace(
