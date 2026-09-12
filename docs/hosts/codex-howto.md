@@ -94,6 +94,36 @@ there.
 
 ---
 
+## Usage telemetry under Codex
+
+Two more MCP tools follow the same env-based session resolution as above:
+`usage_record` (per-turn tokens/cost) and `usage_query` (roll-ups by model,
+role, provider, day, branch, or PR).
+
+- `usage_record`'s `sessionId` argument is optional. Omitted, it defaults
+  from this MCP server process's own environment using the exact same
+  `CLAUDE_CODE_SESSION_ID` → `CODEX_THREAD_ID` precedence described in
+  [Session identity](#session-identity) above — under Codex that resolves to
+  `CODEX_THREAD_ID`. Pass `sessionId` explicitly to override the default.
+- `usage_query`'s `sessionId` has **no** such default — "omitted" already
+  means something specific there (a project-wide rollup for
+  `granularity="turn"`, or a required-absent case for `granularity="feature"`)
+  and auto-filling it from the calling session's own id would silently
+  defeat both. It is always exactly what the caller passed.
+- Both tools read/write `turn_usage`, `session_usage`, and `feature_usage`.
+  Those tables are created by `handoff.js init` (or an equivalent schema
+  heal) in a separate change — never auto-created by usage_record/
+  usage_query themselves. Calling either tool against a project database
+  whose schema predates those tables returns an actionable error naming the
+  missing relation, not a raw Postgres stack trace, e.g.:
+
+  > `turn_usage is missing in <database>: the engine schema for this project
+  > is behind (ensureSchemaCurrent reason=<reason>); run "node
+  > scripts/handoff.js init" against this project root, or upgrade the
+  > engine so the schema manifest includes usage telemetry`
+
+---
+
 ## Reading the graph
 
 Beyond resume/checkpoint/close, the MCP surface exposes direct reads and

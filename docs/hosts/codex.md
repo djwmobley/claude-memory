@@ -152,6 +152,42 @@ interactive session with fresh eyes.
 
 ---
 
+## Non-interactive approval for MCP tools
+
+`codex exec` (non-interactive/scripted invocation) with an approval policy
+of `never` does **not** reject an MCP tool call just because that tool has
+no per-tool approval entry in `config.toml`. Observed 2026-09-12: a scripted
+run rejected `usage_query` ("MCP tool call requires approval, but approval
+policy is never") while `handoff_status` — which has an explicit
+`approval_mode = "approve"` entry — ran without prompting. The distinguishing
+factor is not read-vs-write; it's whether the specific tool name has a
+`[mcp_servers.handoff.tools.<name>]` sub-table in `config.toml` at all. A
+tool with no such entry falls back to Codex's own per-tool default, which a
+`never` policy does not always resolve the same way `handoff_status`'s
+explicit entry does.
+
+The stanza shape, one sub-table per tool:
+
+```toml
+[mcp_servers.handoff.tools.usage_query]
+approval_mode = "approve"
+
+[mcp_servers.handoff.tools.usage_record]
+approval_mode = "approve"
+```
+
+**Add these by editing `config.toml` directly, never via `codex mcp add`.**
+`codex mcp add` rewrites the entire `[mcp_servers.handoff]` block from its
+own flags and has no flag for a `tools.*` sub-table — running it after
+hand-adding these entries silently deletes them (same underlying behavior as
+the `config.toml` clobber noted in
+[Known real-world defects and quirks](codex-howto.md#known-real-world-defects-and-quirks),
+item 4, in the how-to page). If you must re-run `codex mcp add` for another
+reason (a changed engine path, say), re-add the `tools.*` sub-tables
+afterward.
+
+---
+
 ## Timeouts
 
 Codex **clamps SessionEnd hook execution to 3 seconds**, regardless of any
