@@ -41,10 +41,9 @@ These rules are canon. They override convenience, time pressure, and apparent co
 
 ## Next session — read first
 
-- pwa-etl onboarding DONE 2026-09-05: per-project engine live, 583 decisions migrated; follow-ups done except seed 19-vs-20 lead, attributed to L3 has_unpackaged_state injection (static read).
-- 2026-09-06 sweep merged 10 PRs (squash shas): #234 4ab0478 §17 gap-audit note; #235 8c0ac27 route_resolve hints+tests; #236 726b1e9 cm#231 MCP write-path unified; #237 51915cd Dependabot bumps; #238 9260b51 cm#232 live counts+naming (cm#233 NOT shipped).
-- #239 9f48a74 cm#230 decisions[] persisted via shared writer; #240 b54877c cm#222 migrate-08 parser (dry-run, total-classification); #241 9a8dd61 §17 B1 model/routing overrides, roster 35, cm#167 closed; #242 b5bed21 implicit close gates on SessionEnd; #243 a12e8f9 decisions count on Done line.
-- Verified CLOSED on GitHub: issues 222, 230, 231, 232, 167. cm#224 still OPEN despite PR #225 claiming the fix — recheck before assuming done. cm#233 OPEN by design (not shipped).
-- NEXT: (1) verify SessionEnd hook — after real exit, session_in_progress marker cleared, implicit close recorded only if no explicit close ran; (2) private-runbook §17.5(i)-(iv) owner decisions pending; (3) cm#233 design call: cosmetic fix vs migrate subject+matcher together.
-- (4) cm#224 state check — PR #225 claimed the fix but issue is still open; (5) pwa-etl HANDOFF-HISTORY.md migrate-08 write mode unblocked (H-13 passed) — owner go required before writing to pipeline_pwa_etl.
-- install.js now migrates matcher-wrapped user-scope hooks (`--hooks-scope`, dry-run diff, backup+atomic write); live SessionEnd wiring applied by orchestrator after merge — verify it landed.
+- Codex onboarding COMPLETE 2026-09-11: hooks phase 2 written (`--host codex` on loader-hook/loader-stop) + owner re-trusted via CLI /hooks; 8 adapter skills installed to ~/.agents/skills; MCP env verified via new `status` host/promotion_file fields (PR #292 f3bab5b).
+- Verified 2026-09-11: CodeQL alerts 2,3 FIXED 09-10; ci-watch-foreground-guard fires live (63 tests); vLLM autostart task + systemd service OK, real reboot untested; SessionEnd implicit-close path verified by reading (handoff.js ~10137-10199), no fire evidence yet (last loader-stop outcome no_marker).
+- Stale leads retired: cm#224 CLOSED (PR #225); cm#233 CLOSED (PR #252 intentKey); runbook §17.5 items 1-4 all DECIDED 2026-09-06 (1 and 4 amended in §17.7.E/F); pwa-etl migrate-08 written 09-06.
+- NOT SHIPPED from §17.5 decisions: feature_usage table (§17.7.F; DDL unread) and init-time Q&A (item 2, V7/V8/V9 owner-review points). routing-identity.js SHIPPED.
+- Root tree clean 2026-09-11 (12 untracked artifacts deleted; snapshot in Downloads).
+- NEXT: (1) feature_usage table DDL + migration — owner go required; (2) init-time Q&A design per V7-V9; (3) real-reboot vLLM test when convenient.
