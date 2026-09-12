@@ -87,6 +87,32 @@
  *   semantics vary and no rate columns exist for them; an operator wanting
  *   cache-aware cost passes an explicit costUsd.
  *
+ *   TX-SAFE EXISTENCE CHECK (Codex review R1, 2026-09-12): usageRecord is
+ *   frequently called inside a transaction the CALLER opened and owns (e.g.
+ *   a checkpoint/close routine that writes several tables atomically). A
+ *   Postgres error inside that transaction -- even one this function catches
+ *   in JS -- aborts the transaction server-side (state 25P02,
+ *   in_failed_sql_transaction); every statement after it, including this
+ *   function's own upsert, then fails, and the caller's COMMIT does too.
+ *   Catching 42P01/42703 in JS does NOT undo that abort with no savepoint in
+ *   play, and this function deliberately does not open one (savepoint
+ *   games inside a library that does not own the transaction are exactly
+ *   the kind of implicit, caller-invisible transaction management this
+ *   module's header rules out). So the model_registry lookup is guarded
+ *   BEFORE it can ever throw: `SELECT to_regclass('public.model_registry')`
+ *   is a catalog lookup that returns NULL for a missing relation and NEVER
+ *   errors, transaction-safe by construction. When it comes back NULL, the
+ *   lookup is skipped entirely (cost_usd fails soft to NULL, one stderr
+ *   line, same message shape as before) and the actual `SELECT ... FROM
+ *   model_registry` is never issued -- so a caller-owned transaction is
+ *   never put in the aborted state by this path at all. The 42P01/42703
+ *   catch around the lookup query itself REMAINS, but only as a backstop for
+ *   the narrow race where to_regclass sees the table (existence check
+ *   passes) and it is then dropped by a concurrent DDL before the lookup
+ *   query runs -- a real anomaly this function still fails soft on rather
+ *   than propagating, but one it no longer relies on as the primary
+ *   detection path.
+ *
  *   RANGE GUARD (distinct from the fail-soft-NULL branches above): cost_usd
  *   is NUMERIC(12,6) (max magnitude 999999.999999 -- MAX_NUMERIC_12_6). A
  *   cost value that IS computable but exceeds that bound -- whether
@@ -406,6 +432,20 @@ async function computeServerSideCost(pg, { projectId, sessionId, turnIdx, agentR
   // undefined_column) -- any OTHER Postgres error still propagates
   // unchanged, since those are not "model_registry doesn't exist yet",
   // they are genuine anomalies this function has no basis to swallow.
+  // R1 (Codex round 2): to_regclass never throws -- not on a missing schema,
+  // not on a missing table -- so this pre-check is safe to run even inside a
+  // transaction the caller opened and owns. Skipping the lookup entirely on
+  // NULL means the SELECT that WOULD raise 42P01 is never issued, so a
+  // caller-owned transaction can never be left aborted (25P02) by this path.
+  const { rows: regClassRows } = await pg.query(`SELECT to_regclass('public.model_registry') AS r`);
+  if (!regClassRows[0] || regClassRows[0].r === null) {
+    process.stderr.write(
+      '[usage-telemetry] model_registry does not exist on this engine DB -- ' +
+      'cost_usd left NULL for this write (fail-soft; explicit costUsd is unaffected)\n'
+    );
+    return null;
+  }
+
   let regRows;
   try {
     const result = await pg.query(
@@ -414,6 +454,10 @@ async function computeServerSideCost(pg, { projectId, sessionId, turnIdx, agentR
     );
     regRows = result.rows;
   } catch (err) {
+    // Backstop only (see module header, R1): the to_regclass pre-check above
+    // already handles the common "does not exist" case without ever issuing
+    // this query. This catch covers only the narrow race where the table is
+    // dropped by a concurrent DDL between the pre-check and this query.
     if (err && (err.code === '42P01' || err.code === '42703')) {
       process.stderr.write(
         `[usage-telemetry] model_registry lookup failed (${err.code}: ${err.message}) -- ` +

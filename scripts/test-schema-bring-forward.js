@@ -72,6 +72,30 @@
  *     previously-empty columns list and handoff-core-schema.sql's
  *     previously-untracked retrieval_contract UNIQUE (project_id, name),
  *     must pass both (a) and (b).
+ *     Codex round-2 follow-up (2026-09-12, R2/R3), same testT11():
+ *     (c) the (b) unique-parity check now compares the DDL UNIQUE
+ *     constraint's COMPLETE column set against the matching expected_uniques
+ *     entry's own `columns` (order-insensitive set equality), not merely
+ *     "some entry named this table exists" -- a fixture that narrows
+ *     turn_usage's expected_uniques to ["project_id"] must fail naming the
+ *     column-set mismatch, not pass because a same-table entry happens to be
+ *     present; (d) the scanner strips SQL line comments (--...), block
+ *     comments (/* ... *\/), and single-quoted string literals before
+ *     scanning for CREATE TABLE blocks or UNIQUE clauses, and refuses (an
+ *     explicit lint error naming the file+table, never a silent guess) a
+ *     table declared via a double-quoted identifier or a schema-qualified
+ *     name that its plain-identifier regex cannot locate -- fixtures prove a
+ *     `DEFAULT ')'` column default before a real `UNIQUE (id)` does not
+ *     truncate the paren-depth scan early, a string literal containing the
+ *     literal text "UNIQUE (id)" does not invent a phantom constraint, and a
+ *     `CREATE TABLE "Table" (...)` yields the explicit unsupported-syntax
+ *     error rather than a silent "no anonymous UNIQUE" false-negative.
+ * T12 Codex round-2 R1 (2026-09-12): computeServerSideCost (usage-
+ *     telemetry.js) must be transaction-safe -- a caller-owned
+ *     BEGIN / usageRecord(costUsd omitted) / COMMIT against a
+ *     model_registry-less DB must COMMIT cleanly with cost_usd NULL, never
+ *     leave the caller's transaction server-side aborted (25P02) the way
+ *     catching a raw 42P01 inside it used to. Requires Postgres.
  *
  * Requires Postgres (PGHOST/PGUSER/PGPASSWORD, defaults localhost/postgres/postgres).
  * T4 and T11 are pure and run with no DB. Exit 0 = all run tests passed.
@@ -717,9 +741,14 @@ async function testT8() {
 
     assertEqual(result.costUsd, null, 'T8: cost_usd is NULL (fail-soft), never a thrown error and never a guessed price');
     assertEqual(result.tokensIn, 100, 'T8: tokensIn written correctly despite the cost fail-soft branch');
+    // R1 (Codex round 2, 2026-09-12): the common "table genuinely absent"
+    // case is now caught by the tx-safe `to_regclass` pre-check, BEFORE the
+    // query that used to raise 42P01 is ever issued -- so the emitted line
+    // no longer names 42P01 (that code now surfaces only from the narrow
+    // backstop race branch, not this path).
     assertTrue(
-      stderrLines.some((l) => l.includes('model_registry') && l.includes('42P01')),
-      `T8: exactly one fail-soft stderr line naming model_registry + 42P01 was emitted — got: ${JSON.stringify(stderrLines)}`
+      stderrLines.some((l) => l.includes('model_registry') && l.includes('does not exist')),
+      `T8: exactly one fail-soft stderr line naming model_registry (via the to_regclass pre-check) was emitted — got: ${JSON.stringify(stderrLines)}`
     );
 
     // Explicit costUsd still wins (unaffected by the fail-soft branch, per
@@ -801,6 +830,81 @@ async function testT9() {
   }
 }
 
+// ── T12: Codex round-2 R1 — computeServerSideCost's model_registry
+//     existence check must be transaction-safe: a caller-owned BEGIN...
+//     usageRecord(costUsd omitted)...COMMIT survives against a
+//     model_registry-less DB. Before the fix, the 42P01 raised by the raw
+//     `SELECT ... FROM model_registry` was caught in JS, but Postgres had
+//     already server-side ABORTED the transaction (25P02,
+//     in_failed_sql_transaction) -- the caller's own COMMIT (or any
+//     statement after the catch, including this function's own upsert)
+//     then failed too. The fix replaces the catch-and-hope with a
+//     `to_regclass` pre-check that never errors, so the query that used to
+//     raise 42P01 is never issued in the common case at all. ─────────────
+
+async function testT12() {
+  const label = 'T12: Codex R1 — usageRecord(costUsd omitted) inside a caller-owned BEGIN...COMMIT on a model_registry-less DB: row written, COMMIT succeeds, cost_usd NULL';
+  if (!(await isPgAvailable())) { console.log(`SKIP  ${label} (Postgres unavailable)`); return; }
+
+  const dbName = `cm_pra_t12_${Date.now()}`;
+  const PID = 'cm-pra-t12-project';
+  try {
+    await createThrowawayDb(dbName);
+    await ensureVectorExtension(dbName);
+
+    const db = await pgConnect(dbName);
+    const adapter = new PostgresAdapter(db);
+    await db.query(
+      `CREATE TABLE project_settings (project_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (project_id, key))`
+    );
+
+    const apply = await handoffModule.ensureSchemaCurrent(adapter, PID, { silent: true });
+    assertTrue(apply.applied, 'T12 precondition: fresh apply succeeds');
+
+    const { rows: mrRows } = await db.query(
+      `SELECT 1 FROM information_schema.tables WHERE table_name = 'model_registry'`
+    );
+    assertEqual(mrRows.length, 0, 'T12 precondition: model_registry genuinely does not exist on this DB');
+
+    // The exact shape R1 named: the CALLER opens and owns the transaction --
+    // usageRecord neither opens nor closes it, and runs entirely inside it.
+    await db.query('BEGIN');
+    let result;
+    try {
+      result = await usageRecord(db, {
+        projectId: PID, sessionId: 'sess-t12', turnIdx: 0, agentRole: 'test',
+        modelId: 'claude-sonnet-5', tokensIn: 100, tokensOut: 50,
+        // costUsd deliberately omitted -> COMPUTE branch -> hits the
+        // (now tx-safe) model_registry existence check.
+      });
+    } catch (err) {
+      await db.query('ROLLBACK').catch(() => {});
+      throw new Error(`T12: usageRecord itself threw inside the caller's transaction (it must not) -- ${err.message}`);
+    }
+    // Before the fix this COMMIT would raise 25P02
+    // (current transaction is aborted, commands ignored until end of
+    // transaction block) because the caught-in-JS 42P01 had already
+    // poisoned the transaction server-side.
+    await db.query('COMMIT');
+
+    assertEqual(result.costUsd, null, 'T12: cost_usd is NULL (fail-soft) in the returned row');
+
+    const { rows: written } = await db.query(
+      `SELECT cost_usd FROM turn_usage WHERE project_id = $1 AND session_id = $2 AND turn_idx = 0 AND agent_role = 'test'`,
+      [PID, 'sess-t12']
+    );
+    assertEqual(written.length, 1, 'T12: the row survived the COMMIT (neither rolled back nor lost to an aborted tx)');
+    assertEqual(written[0].cost_usd, null, 'T12: cost_usd is NULL in the committed row itself, not just the in-memory return value');
+
+    await db.end();
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    await dropThrowawayDb(dbName);
+  }
+}
+
 // ── T10: Codex review F3 — usage-telemetry-schema.sql / feature-usage-
 //     schema.sql are in required_roster; a fixture missing either file's own
 //     SQL fails classification, never a silent ok:true ─────────────────────
@@ -871,10 +975,91 @@ function assertFalse(v, msg) { if (v !== false) throw new Error(msg || `expected
 
 function _escapeRegExpT11(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
+// Codex round-2 (R3, 2026-09-12): strips SQL line comments (--...to end of
+// line), block comments (/* ... */, non-nesting per standard SQL), and
+// single-quoted string literals (doubled '' as the standard escaped-quote
+// form) BEFORE any of this file's textual scanning runs — every later regex
+// in this module operates on the returned text, never the raw file. Without
+// this, a `)` or a `UNIQUE (` sequence typed inside a comment or a string
+// literal is textually indistinguishable from real DDL syntax to a regex/
+// paren-counting scanner: a `DEFAULT ')'` column default can terminate the
+// CREATE TABLE paren-depth scan early (silently truncating the block and
+// hiding a REAL UNIQUE constraint that comes after it — an under-detection,
+// not merely a false positive), and a string literal or comment containing
+// the literal text "UNIQUE (id)" can invent a constraint that was never
+// declared.
+//
+// Deliberately a SINGLE-PASS, state-tracking character scan, NOT two
+// sequential regex passes (comments-then-strings or strings-then-comments)
+// — a sequential-pass approach was tried and failed adversarially against
+// this file's own live DDL: handoff-core-schema.sql line ~323 has
+// `RAISE NOTICE 'assertions.embedding halfvec(4000) skipped -- pgvector not
+// installed; ...'` — a real string literal whose CONTENT contains a literal
+// `--`. A comments-first pass has no notion of "currently inside a string"
+// and strips from that inner `--` to end of line, eating the string's own
+// closing quote and leaving the total quote count in the file odd; the next
+// real quote anywhere later in the file then wrongly closes a giant
+// "string" spanning everything in between, silently blanking genuine DDL
+// (this exact scenario mis-fired on handoff-core-schema.sql's real
+// `ALTER TABLE retrieval_contract ADD COLUMN ... version ...` several lines
+// later during this fix's own development — caught here rather than
+// shipped). A single left-to-right scan that only recognizes `--`/`/*` as a
+// comment start when NOT already inside a string, and only recognizes `'`
+// as a string delimiter when NOT already inside a comment, has no such
+// ordering hazard — each character is classified exactly once, in exactly
+// one state. Replacement is same-length whitespace (newlines preserved) so
+// this never shifts any other match's position.
+function _stripSqlNoiseT11(sqlText) {
+  const n = sqlText.length;
+  let out = '';
+  let i = 0;
+  while (i < n) {
+    const c = sqlText[i];
+    const c2 = i + 1 < n ? sqlText[i + 1] : '';
+
+    if (c === '-' && c2 === '-') {
+      while (i < n && sqlText[i] !== '\n') { out += ' '; i++; }
+      continue;
+    }
+
+    if (c === '/' && c2 === '*') {
+      out += '  ';
+      i += 2;
+      while (i < n && !(sqlText[i] === '*' && i + 1 < n && sqlText[i + 1] === '/')) {
+        out += sqlText[i] === '\n' ? '\n' : ' ';
+        i++;
+      }
+      if (i < n) { out += '  '; i += 2; } // blank the closing */ itself
+      continue;
+    }
+
+    if (c === "'") {
+      out += ' ';
+      i++;
+      while (i < n) {
+        if (sqlText[i] === "'" && i + 1 < n && sqlText[i + 1] === "'") {
+          out += (sqlText[i] === '\n' ? '\n' : ' ') + (sqlText[i + 1] === '\n' ? '\n' : ' ');
+          i += 2;
+          continue;
+        }
+        if (sqlText[i] === "'") { out += ' '; i++; break; }
+        out += sqlText[i] === '\n' ? '\n' : ' ';
+        i++;
+      }
+      continue;
+    }
+
+    out += c;
+    i++;
+  }
+  return out;
+}
+
 // Cheap textual sanity check — NOT a DDL parser (mirrors schema-classify.js's
 // own internal _identifierAppearsInSQL, reimplemented here rather than
 // exported from that module since this file has no other reason to import
-// its private surface).
+// its private surface). Callers pass comment/string-stripped text (see
+// _stripSqlNoiseT11).
 function _identifierInSqlT11(sql, identifier) {
   if (typeof identifier !== 'string' || identifier.length === 0) return false;
   return new RegExp('\\b' + _escapeRegExpT11(identifier) + '\\b', 'i').test(sql);
@@ -883,7 +1068,15 @@ function _identifierInSqlT11(sql, identifier) {
 // Extracts the column-list text between a CREATE TABLE [IF NOT EXISTS]
 // <table> ( ... ) statement's own outer parens, via paren-depth counting (so
 // nested CHECK(...)/DEFAULT now() parens don't terminate the scan early).
-// Returns null if no CREATE TABLE for `table` is found in `sqlText`.
+// Returns null if no CREATE TABLE for `table` is found in `sqlText`. Callers
+// pass comment/string-stripped text — see _stripSqlNoiseT11 — so a
+// `DEFAULT ')'` column default (a `)` char inside what WAS a string literal)
+// can never desync the depth counter. This regex intentionally matches only
+// a bare, unquoted, unqualified identifier immediately before `(` — a
+// double-quoted or schema-qualified table name will not match here at all;
+// callers that need to distinguish "table genuinely absent from this file"
+// from "table present but declared in a form this scanner refuses to guess
+// about" use _createTableDeclUnparseableT11 for that second case.
 function _createTableBlockT11(sqlText, table) {
   const re = new RegExp('CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?' + _escapeRegExpT11(table) + '\\s*\\(', 'i');
   const m = re.exec(sqlText);
@@ -899,16 +1092,59 @@ function _createTableBlockT11(sqlText, table) {
   return sqlText.slice(start, i - 1);
 }
 
-// True iff `table`'s own CREATE TABLE block declares an ANONYMOUS table-level
-// UNIQUE constraint (`UNIQUE (...)` inside the column list) — deliberately
-// excludes a standalone `CREATE UNIQUE INDEX ...` (outside the block, tracked
-// instead via expected_index_defs/indexes) and a column-level `... UNIQUE`
-// modifier folded into a PRIMARY KEY (a bare PK needs no expected_uniques
-// entry — this manifest format has no expected_primary_keys field at all).
-function _ddlHasAnonUniqueT11(sqlText, table) {
-  const block = _createTableBlockT11(sqlText, table);
-  if (block == null) return false;
-  return /(?:^|[,\n])\s*UNIQUE\s*\(/i.test(block);
+// True iff `sqlText` (comment/string-stripped) declares `table` via a
+// double-quoted identifier (`CREATE TABLE "table" (`) or a schema-qualified
+// name, quoted or not (`CREATE TABLE schema.table (`, `CREATE TABLE
+// "schema"."table" (`, `CREATE TABLE schema."table" (`, `CREATE TABLE
+// "schema".table (`) — every form _createTableBlockT11's plain-identifier
+// regex cannot match. This is a total-classification companion to that
+// function: when the plain regex finds nothing, this function distinguishes
+// "table genuinely not declared in this file" (silently nothing to check,
+// unchanged prior behavior) from "table IS declared here, in a form this
+// scanner refuses to guess about" (a hard lint error — R3: friction over a
+// silent false-negative that would let an untracked constraint through).
+function _createTableDeclUnparseableT11(sqlText, table) {
+  const t = _escapeRegExpT11(table);
+  const ident = '(?:"[A-Za-z_][A-Za-z0-9_]*"|[A-Za-z_][A-Za-z0-9_]*)';
+  const patterns = [
+    new RegExp('CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?"' + t + '"\\s*\\(', 'i'),
+    new RegExp('CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?' + ident + '\\.' + t + '\\s*\\(', 'i'),
+    new RegExp('CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?' + ident + '\\."' + t + '"\\s*\\(', 'i'),
+  ];
+  return patterns.some((re) => re.test(sqlText));
+}
+
+// Returns one array of column names per ANONYMOUS table-level UNIQUE
+// constraint (`UNIQUE (col, col, ...)` inside the column list) found in an
+// already-extracted CREATE TABLE block — deliberately excludes a standalone
+// `CREATE UNIQUE INDEX ...` (outside the block, tracked instead via
+// expected_index_defs/indexes) and a column-level `... UNIQUE` modifier
+// folded into a PRIMARY KEY (a bare PK needs no expected_uniques entry —
+// this manifest format has no expected_primary_keys field at all). `block`
+// is expected to already be comment/string-stripped (it is always derived
+// from _createTableBlockT11's output in this file).
+function _ddlAnonUniqueColumnSetsT11(block) {
+  if (block == null) return [];
+  const re = /(?:^|[,\n])\s*UNIQUE\s*\(([^()]*)\)/gi;
+  const sets = [];
+  let m;
+  while ((m = re.exec(block)) !== null) {
+    sets.push(m[1].split(',').map((c) => c.trim()).filter(Boolean));
+  }
+  return sets;
+}
+
+// Order-insensitive set equality between a manifest expected_uniques entry's
+// `columns` array and a DDL-extracted column-name array (Codex round-2 R2:
+// the prior check compared table name only, so an expected_uniques entry
+// for the right table but the WRONG columns — e.g. narrowed by a careless
+// hand-edit — passed silently).
+function _sameColumnSetT11(manifestColumns, ddlColumns) {
+  if (!Array.isArray(manifestColumns) || !Array.isArray(ddlColumns)) return false;
+  if (manifestColumns.length !== ddlColumns.length) return false;
+  const ddlSet = new Set(ddlColumns);
+  if (ddlSet.size !== ddlColumns.length) return false; // DDL had a duplicate column name — never a match
+  return manifestColumns.every((c) => ddlSet.has(c)) && new Set(manifestColumns).size === manifestColumns.length;
 }
 
 function _lintManifestT11(manifest, sqlDir) {
@@ -931,12 +1167,15 @@ function _lintManifestT11(manifest, sqlDir) {
       continue; // no columns to identifier-parity-check
     }
 
-    let sqlText = null;
-    try { sqlText = fs.readFileSync(path.join(sqlDir, basename), 'utf8'); } catch (_) { /* reported below */ }
-    if (sqlText == null) {
+    let rawSqlText = null;
+    try { rawSqlText = fs.readFileSync(path.join(sqlDir, basename), 'utf8'); } catch (_) { /* reported below */ }
+    if (rawSqlText == null) {
       errors.push(`${basename}: expected_objects.columns declared but the unit's own SQL file could not be read for identifier-parity checking`);
       continue;
     }
+    // R3: every scan below runs against comment/string-stripped text, never
+    // the raw file.
+    const sqlText = _stripSqlNoiseT11(rawSqlText);
 
     for (const c of columns) {
       if (!c || typeof c.column !== 'string' || !_identifierInSqlT11(sqlText, c.column)) {
@@ -954,13 +1193,40 @@ function _lintManifestT11(manifest, sqlDir) {
     if (roster.has(basename)) {
       const uniques = Array.isArray(unit.expected_uniques) ? unit.expected_uniques : [];
       for (const table of tables) {
-        if (!_ddlHasAnonUniqueT11(sqlText, table)) continue; // no anonymous UNIQUE for this table — nothing to track (a bare PK, or neither, is out of scope)
-        const tracked = uniques.some((u) => u && u.table === table);
-        if (!tracked) {
-          errors.push(
-            `${basename}: required-roster table "${table}" declares an anonymous UNIQUE constraint in its own DDL ` +
-            `with no matching expected_uniques entry — untracked constraint would go un-healed if dropped`
-          );
+        const block = _createTableBlockT11(sqlText, table);
+        if (block == null) {
+          // R3: distinguish "not declared here at all" (nothing to check,
+          // prior behavior) from "declared here in a form this scanner
+          // refuses to guess about" (hard error — never a silent pass).
+          if (_createTableDeclUnparseableT11(sqlText, table)) {
+            errors.push(
+              `${basename}: table "${table}" is declared via a quoted identifier or a schema-qualified name in ` +
+              `its own DDL that this scanner cannot parse — refusing to guess whether it carries an anonymous ` +
+              `UNIQUE constraint (T11 total-classification guard: unsupported syntax is a lint error, never a ` +
+              `silent pass)`
+            );
+          }
+          continue;
+        }
+        const ddlSets = _ddlAnonUniqueColumnSetsT11(block);
+        if (ddlSets.length === 0) continue; // no anonymous UNIQUE for this table — nothing to track (a bare PK, or neither, is out of scope)
+        for (const ddlCols of ddlSets) {
+          const matched = uniques.some((u) => u && u.table === table && _sameColumnSetT11(u.columns, ddlCols));
+          if (matched) continue;
+          const sameTable = uniques.filter((u) => u && u.table === table);
+          if (sameTable.length === 0) {
+            errors.push(
+              `${basename}: required-roster table "${table}" declares an anonymous UNIQUE constraint (${ddlCols.join(', ')}) ` +
+              `in its own DDL with no matching expected_uniques entry — untracked constraint would go un-healed if dropped`
+            );
+          } else {
+            errors.push(
+              `${basename}: required-roster table "${table}" DDL UNIQUE (${ddlCols.join(', ')}) does not match the ` +
+              `column set of any expected_uniques entry for that table (manifest has: ` +
+              `${sameTable.map((u) => JSON.stringify(u.columns)).join('; ')}) — manifest/DDL column-set desync ` +
+              `(T11 unique-parity guard, Codex round-2 R2)`
+            );
+          }
         }
       }
     }
@@ -1041,6 +1307,128 @@ function testT11() {
     const liveErrors = _lintManifestT11(liveManifest, sqlDir);
     assertEqual(liveErrors.length, 0, `T11(4): live schema-manifest.json must pass the lint cleanly — got ${JSON.stringify(liveErrors)}`);
 
+    // (5) Codex round-2 R2: an expected_uniques entry naming the RIGHT table
+    // but the WRONG columns (turn_usage narrowed to just ["project_id"],
+    // dropping session_id/turn_idx/agent_role) must FAIL, naming the
+    // column-set mismatch — the prior table-name-only check would have
+    // silently passed this because SOME entry for "turn_usage" exists.
+    // session_usage's own entry is left correct in the same fixture to
+    // prove the check is per-table, not an all-or-nothing unit failure.
+    const fixtureUniqueColumnMismatch = {
+      required_roster: ['usage-telemetry-schema.sql'],
+      units: {
+        'usage-telemetry-schema.sql': {
+          classification: 'postgres',
+          expected_objects: {
+            tables: ['turn_usage', 'session_usage'],
+            columns: [{ table: 'turn_usage', column: 'project_id' }, { table: 'session_usage', column: 'project_id' }],
+            indexes: [],
+          },
+          expected_uniques: [
+            { table: 'turn_usage', columns: ['project_id'] },
+            { table: 'session_usage', columns: ['project_id', 'session_id'] },
+          ],
+        },
+      },
+    };
+    const columnMismatchErrors = _lintManifestT11(fixtureUniqueColumnMismatch, sqlDir);
+    assertTrue(
+      columnMismatchErrors.some((e) => e.includes('turn_usage') && e.includes('column-set desync') && e.includes('project_id')),
+      `T11(5): turn_usage expected_uniques narrowed to ["project_id"] must be flagged as a column-set mismatch, not pass on table-name match alone — got ${JSON.stringify(columnMismatchErrors)}`
+    );
+    assertFalse(
+      columnMismatchErrors.some((e) => e.includes('session_usage')),
+      `T11(5): session_usage's own expected_uniques entry is correct and must NOT be flagged — got ${JSON.stringify(columnMismatchErrors)}`
+    );
+
+    // (6)-(8) Codex round-2 R3: comment/string-literal stripping and refusal
+    // on unparseable table declarations. The real scripts/sql/*.sql files
+    // have none of these shapes, so these three run against hand-written
+    // fixture SQL in a scratch directory.
+    const r3Root = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-pra-t11-r3-'));
+    try {
+      // (6) A `DEFAULT ')'` string-literal column default BEFORE a real
+      // `UNIQUE (id)` must not truncate the paren-depth scan early — proven
+      // by a POSITIVE "untracked constraint" flag (expected_uniques is
+      // deliberately left empty), i.e. the constraint was still detected.
+      fs.writeFileSync(
+        path.join(r3Root, 'r3a.sql'),
+        "CREATE TABLE t_r3a (\n  id INT PRIMARY KEY,\n  note TEXT DEFAULT ')',\n  UNIQUE (id)\n);\n",
+        'utf8'
+      );
+      const r3aErrors = _lintManifestT11(
+        {
+          required_roster: ['r3a.sql'],
+          units: {
+            'r3a.sql': {
+              classification: 'postgres',
+              expected_objects: { tables: ['t_r3a'], columns: [{ table: 't_r3a', column: 'id' }], indexes: [] },
+              expected_uniques: [],
+            },
+          },
+        },
+        r3Root
+      );
+      assertTrue(
+        r3aErrors.some((e) => e.includes('t_r3a') && e.includes('anonymous UNIQUE') && e.includes('(id)')),
+        `T11(6): a DEFAULT ')' string literal before a real UNIQUE (id) must not truncate the scan — the constraint must still be DETECTED — got ${JSON.stringify(r3aErrors)}`
+      );
+
+      // (7) A string literal whose CONTENT is the literal text
+      // "UNIQUE (id)" — placed right after an embedded literal newline
+      // (Postgres string literals may span lines), the exact layout the
+      // pre-fix column-scan regex would have matched as a REAL constraint —
+      // must not invent a phantom constraint. Zero errors expected (nothing
+      // really declared, nothing to track).
+      fs.writeFileSync(
+        path.join(r3Root, 'r3b.sql'),
+        "CREATE TABLE t_r3b (\n  id INT PRIMARY KEY,\n  descr TEXT DEFAULT 'line one,\nUNIQUE (id)\nline two'\n);\n",
+        'utf8'
+      );
+      const r3bErrors = _lintManifestT11(
+        {
+          required_roster: ['r3b.sql'],
+          units: {
+            'r3b.sql': {
+              classification: 'postgres',
+              expected_objects: { tables: ['t_r3b'], columns: [{ table: 't_r3b', column: 'id' }], indexes: [] },
+              expected_uniques: [],
+            },
+          },
+        },
+        r3Root
+      );
+      assertEqual(r3bErrors.length, 0, `T11(7): a string literal containing the text "UNIQUE (id)" must not invent a phantom constraint — got ${JSON.stringify(r3bErrors)}`);
+
+      // (8) A double-quoted table identifier must yield an explicit
+      // unsupported-syntax lint error naming the file+table, never a silent
+      // "no anonymous UNIQUE" false-negative.
+      fs.writeFileSync(
+        path.join(r3Root, 'r3c.sql'),
+        'CREATE TABLE "Table" (\n  id INT PRIMARY KEY,\n  UNIQUE (id)\n);\n',
+        'utf8'
+      );
+      const r3cErrors = _lintManifestT11(
+        {
+          required_roster: ['r3c.sql'],
+          units: {
+            'r3c.sql': {
+              classification: 'postgres',
+              expected_objects: { tables: ['Table'], columns: [{ table: 'Table', column: 'id' }], indexes: [] },
+              expected_uniques: [],
+            },
+          },
+        },
+        r3Root
+      );
+      assertTrue(
+        r3cErrors.some((e) => e.includes('r3c.sql') && e.includes('Table') && e.includes('quoted identifier') && e.includes('cannot parse')),
+        `T11(8): a quoted "Table" identifier must yield an explicit unsupported-syntax error naming the file, never a silent guess — got ${JSON.stringify(r3cErrors)}`
+      );
+    } finally {
+      fs.rmSync(r3Root, { recursive: true, force: true });
+    }
+
     pass(label);
   } catch (err) {
     fail(label, err.message);
@@ -1060,6 +1448,7 @@ async function main() {
   await testT7();
   await testT8();
   await testT9();
+  await testT12();
   testT10();
   testT11();
 
