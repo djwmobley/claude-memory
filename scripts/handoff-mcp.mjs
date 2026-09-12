@@ -19,7 +19,7 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 
 import { z } from 'zod';
@@ -34,8 +34,14 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // path (project-identity.js's ensureProjectIdentity, M-19) — no tool below
 // implements its own DB connection or project_id lookup. ──────────────────
 const require = createRequire(import.meta.url);
-const { connectForRoot } = require('./lib/mcp-db-connect.js');
+const { connectForRoot, resolveTargetDbForRoot } = require('./lib/mcp-db-connect.js');
 const { ensureProjectIdentity } = require('./lib/project-identity.js');
+// PR B (fix/mcp-usage-codex-identity): the SAME env-var precedence
+// handoff.js uses for every other session-id resolution (explicit ->
+// CLAUDE_CODE_SESSION_ID -> CODEX_THREAD_ID, host='codex' preferring
+// CODEX_THREAD_ID on a differing pair) — never a second hand-rolled
+// implementation for the MCP path (adversary G2).
+const { resolveSessionIdFromEnv } = require('./lib/session-identity.js');
 // cm#224 (decisions canon fix): the SAME ensureSchemaCurrent handoff.js itself
 // calls from cmdLoaderLoad/cmdClose/cmdInit — never a second implementation.
 // Requiring handoff.js here does NOT run its CLI router: handoff.js's own
@@ -202,7 +208,12 @@ async function withProjectDb(projectRoot, fn) {
       );
     }
     try {
-      return await fn(db, identity.projectId);
+      // schemaResult.reason is passed as a 3rd arg -- every pre-existing
+      // callback ignores extra args, so this is additive only. usage_record/
+      // usage_query (PR B, fix/mcp-usage-codex-identity) use it to report
+      // WHICH ensureSchemaCurrent classification was in effect when a
+      // usage-telemetry relation turns out to be missing.
+      return await fn(db, identity.projectId, schemaResult.reason);
     } catch (toolErr) {
       // cm#224 follow-up: only attach when this specific call was degraded
       // AND the tool's own failure is actually a gated-column failure (our
@@ -222,29 +233,82 @@ async function withProjectDb(projectRoot, fn) {
   }
 }
 
+/** Resolves the "real" name of a named lib error even when the class never
+ * set `this.name` in its constructor (usage-telemetry.js's
+ * CostOutOfRangeError is exactly this case — adversary G3: it has no
+ * `.code` either, so it must be matched by name, and `err.name` alone is
+ * "Error" for it, inherited from Error.prototype). Prefers `err.name` when
+ * it is a real (non-generic) name; falls back to the constructor's name. */
+function libErrorTypeName(err) {
+  if (!err) return null;
+  if (err.name && err.name !== 'Error') return err.name;
+  return (err.constructor && err.constructor.name) || err.name || null;
+}
+
 /** Maps every §8 lib error class's `.code` to a stable MCP-tool error
  * response. Named library errors (MemoryUpsertError, MemorySearchError,
  * EntityGraphCrudError, MemoryViewError, ExchangeLogError,
- * RoutingProfileError, EmbeddingColumnAbsentError — cm#224 follow-up) are
- * reported with their code + message; anything else falls through to
- * errorResult's generic stack-trace formatting. Either way, if
- * withProjectDb attached a `.schemaApplyDegraded` record (a gated-column
- * failure during a 'degraded' schema state), it is appended so the MCP
- * caller sees the full degradation record alongside the error, not just
- * the bare message. */
+ * RoutingProfileError, EmbeddingColumnAbsentError — cm#224 follow-up,
+ * CostOutOfRangeError — usage-telemetry.js, matched by name per
+ * libErrorTypeName since it carries no `.code`) are reported with their
+ * code + message; anything else falls through to errorResult's generic
+ * stack-trace formatting. Either way, if withProjectDb attached a
+ * `.schemaApplyDegraded` record (a gated-column failure during a
+ * 'degraded' schema state), it is appended so the MCP caller sees the full
+ * degradation record alongside the error, not just the bare message. */
 function libToolError(err) {
   const namedCodes = new Set([
     'MemoryUpsertError', 'MemorySearchError', 'EntityGraphCrudError',
     'MemoryViewError', 'ExchangeLogError', 'RoutingProfileError',
     'EmbeddingColumnAbsentError', 'RoutingWriteSurfaceError',
+    'CostOutOfRangeError',
   ]);
-  const result = (err && namedCodes.has(err.name))
-    ? toolError(`${err.name} [${err.code}]: ${err.message}`)
+  const typeName = libErrorTypeName(err);
+  const result = (err && namedCodes.has(typeName))
+    ? toolError(`${typeName}${err.code ? ` [${err.code}]` : ''}: ${err.message}`)
     : errorResult(err);
   if (err && err.schemaApplyDegraded) {
     result.content[0].text += `\n\n-- project_settings.schema_apply_degraded --\n${JSON.stringify(err.schemaApplyDegraded, null, 2)}`;
   }
   return result;
+}
+
+// ── §18 usage-telemetry schema-drift error hygiene ───────────────────────────
+//
+// The set of relations usage_record/usage_query own (usage-telemetry.js's
+// own TABLE OWNERSHIP invariant: turn_usage written by usageRecord,
+// session_usage by sessionUsageRollup, feature_usage read-only via
+// migrate-12). A pg 42P01 (undefined_table) on any OTHER relation is left
+// completely unchanged -- adversary G5: never claim a schema-behind remedy
+// for a relation this helper does not recognize; every other 42P01 keeps
+// falling through libToolError's existing errorResult() stack-trace path.
+const USAGE_TELEMETRY_RELATIONS = new Set(['turn_usage', 'session_usage', 'feature_usage']);
+
+/**
+ * Detects a Postgres 42P01 on one of the usage-telemetry relations and
+ * returns an actionable Error naming the remedy, instead of the raw pg
+ * DatabaseError (whose stack reads "at Client._handleErrorMessage ...").
+ * Returns the ORIGINAL err unchanged for every other case (wrong code,
+ * unparseable message, or an unrecognized relation) -- this function never
+ * fabricates a relation name.
+ *
+ * `schemaReason` is the SAME `ensureSchemaCurrent` classification
+ * withProjectDb already computed for this call (threaded through as its
+ * 3rd fn argument) -- reused here rather than re-derived, so the message
+ * reports the exact classification the engine used, not a guess.
+ */
+function actionableUsageSchemaError(err, { database, schemaReason }) {
+  if (!err || err.code !== '42P01') return err;
+  const match = /relation "([^"]+)" does not exist/.exec(err.message || '');
+  const relation = match ? match[1] : null;
+  if (!relation || !USAGE_TELEMETRY_RELATIONS.has(relation)) return err;
+  const actionable = new Error(
+    `${relation} is missing in ${database}: the engine schema for this project is behind ` +
+    `(ensureSchemaCurrent reason=${schemaReason}); run "node scripts/handoff.js init" against this ` +
+    `project root, or upgrade the engine so the schema manifest includes usage telemetry`
+  );
+  actionable.cause = err;
+  return actionable;
 }
 
 // ── MCP result helpers ───────────────────────────────────────────────────────
@@ -808,15 +872,70 @@ async function toolRoutingSessionOverrideClear({ projectRoot, sessionId, role })
   }
 }
 
+// resolveHandoffHost(): the MCP server process's OWN env, NEVER a spawned
+// child's. Every OTHER tool in this file that shells out to handoff.js
+// (runNode / spawn call sites elsewhere in this file) strips
+// CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID from the CHILD's env deliberately
+// (see this file's header + test-loader-stop-gate.js's env-stripping
+// comment) -- that stripping applies ONLY to those spawned children. This
+// server's own process env (process.env.HANDOFF_HOST, and the two session-
+// id vars resolveSessionIdFromEnv reads) is untouched by that convention,
+// since usage_record/usage_query never spawn a child at all -- they call
+// usage-telemetry.js's lib functions in-process, over the same `db` handle
+// withProjectDb already opened.
+function resolveHandoffHost() {
+  return process.env.HANDOFF_HOST || null;
+}
+
 async function toolUsageRecord(args) {
   const { projectRoot, sessionId, turnIdx, agentRole, tokensIn, tokensOut, cacheReadTokens, cacheWriteTokens, costUsd, modelId, provider, outcome, sourceModel, agentId } = args;
   try {
-    return await withProjectDb(projectRoot, async (db, projectId) => {
-      const result = await usageTelemetryLib.usageRecord(db, {
-        projectId, sessionId, turnIdx, agentRole, tokensIn, tokensOut, cacheReadTokens, cacheWriteTokens,
-        costUsd, modelId, provider, outcome, sourceModel, agentId,
-      });
-      return textResult(result);
+    return await withProjectDb(projectRoot, async (db, projectId, schemaReason) => {
+      // Explicit sessionId always wins (adversary G2/risk 5). Omitted ->
+      // resolveSessionIdFromEnv (lib/session-identity.js), the SAME
+      // CLAUDE_CODE_SESSION_ID -> CODEX_THREAD_ID precedence handoff.js
+      // uses everywhere else, keyed off this server's OWN HANDOFF_HOST env
+      // (see resolveHandoffHost() above) -- never a second precedence.
+      //
+      // Codex review F2 (2026-09-12), total classification (every possible
+      // sessionId value maps to exactly one branch, no allow-list):
+      //   - sessionId === undefined (the property is genuinely ABSENT from
+      //     the call, distinct from a caller-supplied blank) -> default from
+      //     host env, hard error if no env default resolves either.
+      //   - sessionId is a string that is empty or whitespace-only (an
+      //     EXPLICIT blank value, not an omission) -> reject with the SAME
+      //     validation error usage-telemetry.js's own requireNonEmptyString
+      //     raises for a blank sessionId (mirrored verbatim here because
+      //     requireNonEmptyString's zero-length-only check would silently
+      //     accept a whitespace-only string and write a garbage session id
+      //     row -- this MCP-layer guard is what catches that case). The
+      //     prior `sessionId || resolveSessionIdFromEnv(...)` form treated
+      //     "" as falsy and silently substituted the env default here --
+      //     fixed.
+      //   - sessionId is any other non-blank string -> used verbatim.
+      let resolvedSessionId;
+      if (sessionId === undefined) {
+        resolvedSessionId = resolveSessionIdFromEnv(resolveHandoffHost());
+        if (!resolvedSessionId) {
+          throw new Error(
+            'usage_record: sessionId was omitted and no default could be resolved from this MCP server ' +
+            'process\'s own CLAUDE_CODE_SESSION_ID or CODEX_THREAD_ID env vars -- pass sessionId explicitly.'
+          );
+        }
+      } else if (typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+        throw new Error(`usage-telemetry: "sessionId" must be a non-empty string (got ${JSON.stringify(sessionId)})`);
+      } else {
+        resolvedSessionId = sessionId;
+      }
+      try {
+        const result = await usageTelemetryLib.usageRecord(db, {
+          projectId, sessionId: resolvedSessionId, turnIdx, agentRole, tokensIn, tokensOut, cacheReadTokens, cacheWriteTokens,
+          costUsd, modelId, provider, outcome, sourceModel, agentId,
+        });
+        return textResult(result);
+      } catch (err) {
+        throw actionableUsageSchemaError(err, { database: resolveTargetDbForRoot(projectRoot).name, schemaReason });
+      }
     });
   } catch (err) {
     return libToolError(err);
@@ -825,9 +944,24 @@ async function toolUsageRecord(args) {
 
 async function toolUsageQuery({ projectRoot, sessionId, groupBy, granularity }) {
   try {
-    return await withProjectDb(projectRoot, async (db, projectId) => {
-      const rows = await usageTelemetryLib.usageQuery(db, { projectId, sessionId, groupBy, granularity });
-      return textResult({ rows });
+    return await withProjectDb(projectRoot, async (db, projectId, schemaReason) => {
+      // NOTE (deliberately NOT defaulted, unlike usage_record): sessionId
+      // omitted here already carries an existing, documented meaning --
+      // granularity="turn" reads the project-wide session_usage ROLLUP, and
+      // granularity="feature" REQUIRES sessionId to be absent (a present
+      // sessionId is a hard error -- feature_usage has no session_id column
+      // at all). Auto-filling a resolved value from host env whenever the
+      // caller omits sessionId would silently defeat BOTH of those existing
+      // contracts for every real caller (virtually every MCP call runs
+      // inside SOME host session, so "omitted" would never reach usage-
+      // telemetry.js as null again). sessionId here therefore stays exactly
+      // what the caller passed -- no host-env default.
+      try {
+        const rows = await usageTelemetryLib.usageQuery(db, { projectId, sessionId, groupBy, granularity });
+        return textResult({ rows });
+      } catch (err) {
+        throw actionableUsageSchemaError(err, { database: resolveTargetDbForRoot(projectRoot).name, schemaReason });
+      }
     });
   } catch (err) {
     return libToolError(err);
@@ -898,13 +1032,29 @@ const EXTRACTION_PAYLOAD_FIELD_CONTRACT =
 
 // ── Server wiring ────────────────────────────────────────────────────────────
 
-function buildServer() {
+// Exported (Codex review F1 amend) so scripts/handoff-mcp-selftest.mjs can
+// build a server IN-PROCESS and inspect each registered tool's actual
+// handler function source text — the readOnlyHint mechanical trace check
+// needs the real function object, which the stdio wire protocol never
+// exposes (tools/list only serializes name/description/annotations/schema).
+// Importing this module for that purpose must NOT also start a stdio
+// server — see the isDirectRun guard at the bottom of this file.
+export function buildServer() {
   const server = new McpServer({ name: 'handoff-mcp', version: '0.1.0' }, { capabilities: { tools: {} } });
 
   server.registerTool(
     'handoff_status',
     {
-      title: 'Read-only handoff project memory status',
+      // Codex review F1 (2026-09-12): cmdStatus (handoff.js) itself runs
+      // ensureSchemaCurrent, an additive-DDL/migration-capable heal path
+      // that CAN write to this project's schema on a behind-schema DB (the
+      // SAME reasoning usage_query's own comment below already applies to
+      // itself) — heal-on-touch may write, so this is NOT true read-only.
+      // Total classification (no per-tool exceptions): readOnlyHint:true
+      // ONLY for a handler that never enters withProjectDb/ensureSchemaCurrent/
+      // ensureProjectIdentity or an equivalent child-process heal path.
+      annotations: { readOnlyHint: false, idempotentHint: true },
+      title: 'Handoff project memory status (heal-on-touch may write)',
       description:
         'Runs `handoff.js status --json` for the given project and returns the parsed result: project_id, ' +
         'host (\'claude\' | \'codex\', or null if unresolvable — resolved via the SAME shared resolver ' +
@@ -920,7 +1070,9 @@ function buildServer() {
         '{ts, embedded, remaining, outcome} where outcome is one of healed/partial/disabled/provider_unready/' +
         'error:<short>, or null if it has never run for this project), and last_loader_stop ' +
         '(the most recent SessionEnd/loader-stop outcome: {ts, session_id, outcome} or null if it has never fired). ' +
-        'Read-only — makes no writes.',
+        'Reports project state only (no domain-data writes), but heal-on-touch may write: the underlying ' +
+        '`handoff.js status` run calls ensureSchemaCurrent, which can apply additive schema DDL to a ' +
+        'behind-schema project DB — see this tool\'s readOnlyHint:false annotation.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root (the directory containing the project marker / .git).'),
       },
@@ -937,6 +1089,13 @@ function buildServer() {
   server.registerTool(
     'handoff_resume',
     {
+      // DEVIATION from a naive "resume is read-only" label: this tool's OWN
+      // description two lines below already says "READ-MOSTLY, not pure
+      // read-only" — cmdResume unconditionally writes a session_in_progress
+      // marker row AND bumps last_reinforced/reality_check on every served
+      // assertion. That is a genuine, always-on write, not schema-heal
+      // plumbing — so readOnlyHint is false here, unlike the pure-read tools.
+      annotations: { readOnlyHint: false, idempotentHint: false },
       title: 'Force-load prior-session handoff context (read-mostly)',
       description:
         'Runs `handoff.js resume` for the given project and returns the SAME context block the SessionStart ' +
@@ -967,6 +1126,7 @@ function buildServer() {
   server.registerTool(
     'handoff_checkpoint',
     {
+      annotations: { readOnlyHint: false, idempotentHint: false },
       title: 'Mid-session handoff checkpoint (full extraction payload)',
       description:
         'Writes a mid-session extraction payload to the handoff store WITHOUT ending the session. Payload is ' +
@@ -994,6 +1154,7 @@ function buildServer() {
   server.registerTool(
     'handoff_close',
     {
+      annotations: { readOnlyHint: false, idempotentHint: false },
       title: 'End-of-session handoff close (full extraction payload — SINGLE-PASS, must be complete)',
       description:
         'Ends the session: clears the session_in_progress marker, runs close-time reality reconciliation, and ' +
@@ -1033,6 +1194,9 @@ function buildServer() {
   server.registerTool(
     'handoff_init',
     {
+      // idempotentHint:true grounded in this tool's own description below
+      // ("Safe to re-run — idempotent").
+      annotations: { readOnlyHint: false, idempotentHint: true },
       title: 'First-run handoff provisioning for a project',
       description:
         'Runs `handoff.js init [name] -y` for the given project root: applies schema migrations, ensures ' +
@@ -1057,6 +1221,9 @@ function buildServer() {
   server.registerTool(
     'persist_decisions',
     {
+      // idempotentHint:true — keyed ON CONFLICT (project_id, topic) DO
+      // UPDATE (M-1); repeating the same rows converges to the same state.
+      annotations: { readOnlyHint: false, idempotentHint: true },
       title: 'Persist and embed roadmap decisions to the project-scoped decisions table (§8 M-1/M-2/M-3 repoint)',
       description:
         'DECLARED BREAK (M-3): this tool now writes the SAME project-scoped, structured `decisions` table ' +
@@ -1103,6 +1270,15 @@ function buildServer() {
   server.registerTool(
     'memory_search',
     {
+      // Grounded in memory-search.js: no UPDATE/INSERT/DELETE anywhere in
+      // the module — pure SELECT. Codex review F1 (2026-09-12): this handler
+      // still runs through withProjectDb, which unconditionally runs
+      // ensureSchemaCurrent/ensureProjectIdentity — migration-capable heal
+      // paths that CAN write (intent-key migration, additive schema DDL) on
+      // a behind-schema/pre-marker project DB. Total classification:
+      // readOnlyHint:true is reserved for a handler that never enters
+      // withProjectDb or an equivalent heal path — heal-on-touch may write.
+      annotations: { readOnlyHint: false, idempotentHint: true },
       title: 'Hybrid vector+FTS search across the generalized memory store, project-scoped',
       description:
         'Runs the §10.3 hybrid scoring formula (ts_rank * 0.3 + cosine * 0.7, per-table — a table with no ' +
@@ -1138,6 +1314,10 @@ function buildServer() {
   server.registerTool(
     'memory_upsert',
     {
+      // idempotentHint:false -- INSERT-ONLY for every table except
+      // decisions (a PK/unique collision is a loud error, not a converging
+      // no-op), so repeating the same call is NOT safe in general.
+      annotations: { readOnlyHint: false, idempotentHint: false },
       title: 'Typed, project-scoped write to one §5.3 seam table (including decisions\' M-1 ON CONFLICT carve-out)',
       description:
         memoryUpsertLib.MEMORY_UPSERT_TOOL_DESCRIPTION +
@@ -1157,6 +1337,13 @@ function buildServer() {
   server.registerTool(
     'memory_get',
     {
+      // Grounded in memory-upsert.js's memoryGet(): builds a SELECT only.
+      // Codex review F1 (2026-09-12): still goes through withProjectDb ->
+      // ensureSchemaCurrent/ensureProjectIdentity, migration-capable heal
+      // paths that CAN write — heal-on-touch may write, so readOnlyHint is
+      // false (total classification: true is reserved for a handler that
+      // never enters withProjectDb or an equivalent heal path).
+      annotations: { readOnlyHint: false, idempotentHint: true },
       title: 'Direct lookup by table + natural key',
       description:
         'Looks up rows in one §5.3 seam table by an explicit {column: value} key (e.g. `decisions` by ' +
@@ -1176,11 +1363,20 @@ function buildServer() {
   server.registerTool(
     'memory_lint',
     {
-      title: 'Read-only, periodic store-wide health sweep (§7.8)',
+      // Grounded in memory-lint.js: no UPDATE/INSERT/DELETE in the module.
+      // Codex review F1 (2026-09-12): still goes through withProjectDb ->
+      // ensureSchemaCurrent/ensureProjectIdentity, migration-capable heal
+      // paths that CAN write — heal-on-touch may write, so readOnlyHint is
+      // false (total classification: true is reserved for a handler that
+      // never enters withProjectDb or an equivalent heal path).
+      annotations: { readOnlyHint: false, idempotentHint: true },
+      title: 'Periodic store-wide health sweep (§7.8; heal-on-touch may write)',
       description:
         'Runs one or more of the four §7.8 checks (orphan_entities, contradicting_assertions, ' +
-        'stale_unreconciled, unlinked_mentions) against the project. Read-only — never mutates. `checks` ' +
-        'omitted runs all four; an unrecognized check name is a hard error.',
+        'stale_unreconciled, unlinked_mentions) against the project. Never mutates domain data itself, but ' +
+        'heal-on-touch may write: withProjectDb runs ensureSchemaCurrent/ensureProjectIdentity, which can apply ' +
+        'additive schema DDL to a behind-schema project DB — see this tool\'s readOnlyHint:false annotation. ' +
+        '`checks` omitted runs all four; an unrecognized check name is a hard error.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         checks: z.array(z.enum(memoryLintLib.ALL_CHECKS)).optional().describe('Subset of checks to run; omitted = all four.'),
@@ -1194,6 +1390,13 @@ function buildServer() {
   server.registerTool(
     'memory_view_set',
     {
+      // Codex review F3 (2026-09-12): NOT idempotent -- this tool's own
+      // description two lines below says it plainly: "an update to an
+      // existing view increments its version, never mutates queries in
+      // place without a version bump". Repeating the SAME call therefore
+      // does NOT converge to the same row state (the version column keeps
+      // incrementing), so idempotentHint must be false, not true.
+      annotations: { readOnlyHint: false, idempotentHint: false },
       title: 'Create or update a saved retrieval view (retrieval_contract kind=\'view\')',
       description:
         'Saves a named, reusable set of structured §4 query-type queries (entity/assertion/recency/vector) for ' +
@@ -1213,7 +1416,17 @@ function buildServer() {
   server.registerTool(
     'memory_view_run',
     {
-      title: 'Execute a saved retrieval view',
+      // Grounded in memory-view.js's memoryViewRun(): dispatches to
+      // runEntityQuery/runAssertionQuery/runRecencyQuery/vector query
+      // helpers, all SELECT-only (the module's only INSERT/UPDATE is in
+      // memoryViewSet, a separate function this tool never calls). Codex
+      // review F1 (2026-09-12): still goes through withProjectDb ->
+      // ensureSchemaCurrent/ensureProjectIdentity, migration-capable heal
+      // paths that CAN write — heal-on-touch may write, so readOnlyHint is
+      // false (total classification: true is reserved for a handler that
+      // never enters withProjectDb or an equivalent heal path).
+      annotations: { readOnlyHint: false, idempotentHint: true },
+      title: 'Execute a saved retrieval view (heal-on-touch may write)',
       description:
         'Executes a saved view\'s queries and returns structured JSON results, one entry per saved query. M-16: ' +
         'interprets ONLY the structured §4 query-type JSON (entity/assertion/recency/vector) — NEVER raw SQL. ' +
@@ -1232,6 +1445,7 @@ function buildServer() {
   server.registerTool(
     'entity_create',
     {
+      annotations: { readOnlyHint: false, idempotentHint: false },
       title: 'Create an entity, with near-match surfacing and suppressed-row revival',
       description:
         'M-12/M-13: ALWAYS runs an exact normalizeForCompare-equal check first, PLUS a trigram fuzzy pass ' +
@@ -1256,7 +1470,14 @@ function buildServer() {
   server.registerTool(
     'entity_read',
     {
-      title: 'Read entities by id or name',
+      // Grounded in entity-graph-crud.js's entityRead(): SELECT only. Codex
+      // review F1 (2026-09-12): still goes through withProjectDb ->
+      // ensureSchemaCurrent/ensureProjectIdentity, migration-capable heal
+      // paths that CAN write — heal-on-touch may write, so readOnlyHint is
+      // false (total classification: true is reserved for a handler that
+      // never enters withProjectDb or an equivalent heal path).
+      annotations: { readOnlyHint: false, idempotentHint: true },
+      title: 'Read entities by id or name (heal-on-touch may write)',
       description: 'Looks up entity rows by id and/or name, project-scoped. Either id or name is required. ' +
         'Paginated: limit defaults to 200, offset to 0. entities carry no vector column today (includeEmbeddings is a no-op, accepted for symmetry).',
       inputSchema: {
@@ -1274,6 +1495,7 @@ function buildServer() {
   server.registerTool(
     'entity_update',
     {
+      annotations: { readOnlyHint: false, idempotentHint: false },
       title: 'Update an entity in place',
       description: 'Plain in-place UPDATE of entity_type/description (entities have no bi-temporal design — see scripts/lib/entity-graph-crud.js\'s header comment). Forensically visible via the entities_audit trigger.',
       inputSchema: {
@@ -1290,6 +1512,9 @@ function buildServer() {
   server.registerTool(
     'entity_suppress',
     {
+      // idempotentHint:true -- setting suppressed=true on an already-
+      // suppressed row converges to the same state (non-destructive, M-4).
+      annotations: { readOnlyHint: false, idempotentHint: true },
       title: 'Suppress (retract) an entity',
       description: 'Sets suppressed=true. Non-destructive — a later entity_create with the same normalized name revives it (M-4).',
       inputSchema: {
@@ -1304,6 +1529,7 @@ function buildServer() {
   server.registerTool(
     'assertion_create',
     {
+      annotations: { readOnlyHint: false, idempotentHint: false },
       title: 'Create one assertion, outside the checkpoint/close batch flow',
       description:
         'Runs the §7.3 ingest-time contradiction check (same (project_id, subject, predicate) with a ' +
@@ -1343,7 +1569,14 @@ function buildServer() {
   server.registerTool(
     'assertion_read',
     {
-      title: 'Read live assertions by id, subject, and/or predicate',
+      // Grounded in entity-graph-crud.js's assertionRead(): SELECT only.
+      // Codex review F1 (2026-09-12): still goes through withProjectDb ->
+      // ensureSchemaCurrent/ensureProjectIdentity, migration-capable heal
+      // paths that CAN write — heal-on-touch may write, so readOnlyHint is
+      // false (total classification: true is reserved for a handler that
+      // never enters withProjectDb or an equivalent heal path).
+      annotations: { readOnlyHint: false, idempotentHint: true },
+      title: 'Read live assertions by id, subject, and/or predicate (heal-on-touch may write)',
       description: 'Returns live (suppressed=false, invalid_at IS NULL) assertion rows matching the given ' +
         'filters, project-scoped. Paginated: limit defaults to 200, offset to 0. By default the embedding ' +
         'vector column is stripped from each row and replaced with embedding_present (bool) and ' +
@@ -1368,6 +1601,7 @@ function buildServer() {
   server.registerTool(
     'assertion_update',
     {
+      annotations: { readOnlyHint: false, idempotentHint: false },
       title: 'Supersede an assertion (suppress-old + insert-new, one transaction, optimistic guard)',
       description:
         'M-5/M-6: supersede = suppress the old row (suppressed=true, invalid_at=now(), suppression_kind=' +
@@ -1403,6 +1637,22 @@ function buildServer() {
   server.registerTool(
     'assertion_suppress',
     {
+      // Codex review P2 (2026-09-12, round 2): idempotentHint:false, NOT
+      // true. assertionSuppress (entity-graph-crud.js) sets
+      // `invalid_at = now()` on every call whose WHERE matches the row --
+      // it does not exclude already-suppressed rows, so a second call on an
+      // already-retired row moves invalid_at forward again. The row's
+      // suppressed flag converges, but invalid_at does not: repeat calls
+      // are NOT side-effect-free repeats of the same write. Audited
+      // against the other *_suppress/*_update tools for the same
+      // now()-per-call pattern: entity_suppress and edge_suppress set only
+      // `suppressed = true` (no now()) -- idempotentHint:true stands for
+      // both. entity_update/edge_update are plain COALESCE overwrites (no
+      // now(), no bi-temporal column) -- unaffected, left as-is.
+      // assertion_update already carries idempotentHint:false (it also
+      // sets invalid_at=now() on the superseded row AND inserts a second
+      // new row every call) -- already consistent, left as-is.
+      annotations: { readOnlyHint: false, idempotentHint: false },
       title: 'Suppress an assertion (retract, no supersession)',
       description: 'Sets suppressed=true, invalid_at=now(), suppression_kind=\'retired\' (cm#231 — matches the ' +
         'seed/close path\'s own operator-retirement vocabulary) without inserting a replacement — use ' +
@@ -1419,6 +1669,7 @@ function buildServer() {
   server.registerTool(
     'edge_create',
     {
+      annotations: { readOnlyHint: false, idempotentHint: false },
       title: 'Create an edge between two entities',
       description: 'Plain INSERT (edges have no dedup/near-match surfacing — that is an entity-only concept, §5.1). ' +
         'edges carry no vector column today (includeEmbeddings is a no-op, accepted for symmetry).',
@@ -1439,7 +1690,14 @@ function buildServer() {
   server.registerTool(
     'edge_read',
     {
-      title: 'Read live edges by id, from_entity, and/or to_entity',
+      // Grounded in entity-graph-crud.js's edgeRead(): SELECT only. Codex
+      // review F1 (2026-09-12): still goes through withProjectDb ->
+      // ensureSchemaCurrent/ensureProjectIdentity, migration-capable heal
+      // paths that CAN write — heal-on-touch may write, so readOnlyHint is
+      // false (total classification: true is reserved for a handler that
+      // never enters withProjectDb or an equivalent heal path).
+      annotations: { readOnlyHint: false, idempotentHint: true },
+      title: 'Read live edges by id, from_entity, and/or to_entity (heal-on-touch may write)',
       description: 'Paginated: limit defaults to 200, offset to 0.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
@@ -1457,6 +1715,7 @@ function buildServer() {
   server.registerTool(
     'edge_update',
     {
+      annotations: { readOnlyHint: false, idempotentHint: false },
       title: 'Update an edge in place',
       description: 'Plain in-place UPDATE of edge_type/weight (no bi-temporal design — same posture as entity_update). Forensically visible via the edges_audit trigger.',
       inputSchema: {
@@ -1473,7 +1732,20 @@ function buildServer() {
   server.registerTool(
     'edge_suppress',
     {
+      // idempotentHint:true -- retracting an already-suppressed edge converges.
+      annotations: { readOnlyHint: false, idempotentHint: true },
       title: 'Suppress (retract) an edge',
+      // Pre-existing gap fixed incidentally while verifying the full
+      // selftest run end to end (HANDOFF_SELFTEST_PROJECT_ROOT set): every
+      // OTHER tool registration in this file has a `description`, but this
+      // one had none, and the selftest's tools/list printer unconditionally
+      // calls `.description.slice(...)` -- crashing the run the moment the
+      // project-dependent section executes. One line, same file this PR
+      // already touches for every other §8 tool's annotations.
+      description: 'Sets suppressed=true (retract) on the target edge row (UPDATE, forensically visible via the ' +
+        'edges_audit trigger). Unlike entity_create\'s M-4 suppressed-row revival, edge_create is a plain INSERT ' +
+        'with no dedup/revival logic — a suppressed edge is NOT automatically un-suppressed by re-creating it, ' +
+        'and no MCP tool in this file un-suppresses an edge today.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         id: z.number().int().describe('Target edge id.'),
@@ -1488,6 +1760,9 @@ function buildServer() {
   server.registerTool(
     'exchange_append',
     {
+      // idempotentHint:false -- append-only ledger; repeating the call adds
+      // another row rather than converging to the same state.
+      annotations: { readOnlyHint: false, idempotentHint: false },
       title: 'Append one row to the append-only agent_exchange A2A log',
       description: exchangeLogLib.EXCHANGE_APPEND_TOOL_DESCRIPTION,
       inputSchema: {
@@ -1514,7 +1789,14 @@ function buildServer() {
   server.registerTool(
     'exchange_read',
     {
-      title: 'Poll the append-only agent_exchange A2A log via a compound watermark',
+      // Grounded in exchange-log.js's exchangeRead(): SELECT only. Codex
+      // review F1 (2026-09-12): still goes through withProjectDb ->
+      // ensureSchemaCurrent/ensureProjectIdentity, migration-capable heal
+      // paths that CAN write — heal-on-touch may write, so readOnlyHint is
+      // false (total classification: true is reserved for a handler that
+      // never enters withProjectDb or an equivalent heal path).
+      annotations: { readOnlyHint: false, idempotentHint: true },
+      title: 'Poll the append-only agent_exchange A2A log via a compound watermark (heal-on-touch may write)',
       description:
         'WHERE project_id=$1 AND (to_agent=$2 OR to_agent IS NULL) AND (created_at, id) > (afterCreatedAt, ' +
         'afterId) — a WATERMARK, not a status flag (append-only design has no status column). M-8: ' +
@@ -1537,6 +1819,9 @@ function buildServer() {
   server.registerTool(
     'route_resolve',
     {
+      // idempotentHint:true -- this tool's own description says "Idempotent:
+      // a second call for the SAME key returns the recorded row unchanged".
+      annotations: { readOnlyHint: false, idempotentHint: true },
       title: 'Resolve a model-routing decision (idempotent per turn)',
       description:
         'Resolves per §17\'s precedence ladder: explicit directive > session override > routing_profiles pin > ' +
@@ -1559,6 +1844,10 @@ function buildServer() {
   server.registerTool(
     'routing_profile_set',
     {
+      // idempotentHint:false -- always deactivate-then-insert-a-NEW-versioned-
+      // row (own description: "Never mutates an existing row's tier/model in
+      // place"), so repeating the call keeps incrementing the version.
+      annotations: { readOnlyHint: false, idempotentHint: false },
       title: 'Set a versioned routing profile pin for (project_id, role)',
       description:
         'M-18: ONE transaction — a transaction-scoped advisory lock keyed on (project_id, role) serializes ' +
@@ -1583,7 +1872,14 @@ function buildServer() {
   server.registerTool(
     'routing_profile_get',
     {
-      title: 'Get active routing profile(s) for a project',
+      // Grounded in routing-profile.js's routingProfileGet(): SELECT only.
+      // Codex review F1 (2026-09-12): still goes through withProjectDb ->
+      // ensureSchemaCurrent/ensureProjectIdentity, migration-capable heal
+      // paths that CAN write — heal-on-touch may write, so readOnlyHint is
+      // false (total classification: true is reserved for a handler that
+      // never enters withProjectDb or an equivalent heal path).
+      annotations: { readOnlyHint: false, idempotentHint: true },
+      title: 'Get active routing profile(s) for a project (heal-on-touch may write)',
       description: '`role` omitted returns every active profile for the project.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
@@ -1603,6 +1899,8 @@ function buildServer() {
   server.registerTool(
     'model_registry_set',
     {
+      // idempotentHint:true -- upsert on normalized label; identical inputs converge.
+      annotations: { readOnlyHint: false, idempotentHint: true },
       title: 'Register or update a model in model_registry (upsert on label)',
       description:
         'Upserts on normalized label (trim+NFC+internal-whitespace-collapse). Every field besides label is ' +
@@ -1639,6 +1937,8 @@ function buildServer() {
   server.registerTool(
     'routing_session_override_set',
     {
+      // idempotentHint:true -- upsert on (project_id, session_id, role); identical inputs converge.
+      annotations: { readOnlyHint: false, idempotentHint: true },
       title: 'Set a session-scoped routing directive (project_id, session_id, role)',
       description:
         'Upserts on (project_id, session_id, role) — the ONLY write path for this table; route_resolve never ' +
@@ -1664,11 +1964,19 @@ function buildServer() {
   server.registerTool(
     'routing_session_override_get',
     {
-      title: 'List active session-scoped routing directive(s) without side effects',
+      // Grounded in routing-write-surface.js's routingSessionOverrideGet(): SELECT only.
+      // Codex review F1 (2026-09-12): still goes through withProjectDb ->
+      // ensureSchemaCurrent/ensureProjectIdentity, migration-capable heal
+      // paths that CAN write — heal-on-touch may write, so readOnlyHint is
+      // false (total classification: true is reserved for a handler that
+      // never enters withProjectDb or an equivalent heal path).
+      annotations: { readOnlyHint: false, idempotentHint: true },
+      title: 'List active session-scoped routing directive(s) (heal-on-touch may write)',
       description:
-        '`role` omitted returns every override active for (project_id, session_id). Read-only — never a ' +
-        'substitute for calling route_resolve, but the only way to introspect what is active without ' +
-        'route_resolve\'s side effect of finalizing a turn\'s resolution.',
+        '`role` omitted returns every override active for (project_id, session_id). Never mutates the ' +
+        'session-override table itself and is not a substitute for calling route_resolve, but heal-on-touch may ' +
+        'write: withProjectDb runs ensureSchemaCurrent/ensureProjectIdentity, which can apply additive schema DDL ' +
+        'to a behind-schema project DB.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
         sessionId: z.string(),
@@ -1681,6 +1989,10 @@ function buildServer() {
   server.registerTool(
     'routing_session_override_clear',
     {
+      // idempotentHint:true -- this tool's own description says "a no-op
+      // on an already-clear key is success, never an error" (F-7 total
+      // classification: {cleared:true}|{cleared:false}, both success).
+      annotations: { readOnlyHint: false, idempotentHint: true },
       title: 'Clear a session-scoped routing directive (project_id, session_id, role)',
       description:
         'Deletes the (project_id, session_id, role) row if present. Returns {cleared:true} when a row was ' +
@@ -1701,15 +2013,32 @@ function buildServer() {
   server.registerTool(
     'usage_record',
     {
+      // idempotentHint:false -- upsert via COALESCE-preserve, but costUsd
+      // omitted server-computes from CURRENT model_registry rates each call,
+      // so repeating with the same args is not guaranteed to converge if
+      // rates changed between calls (see usage-telemetry.js's COST
+      // COMPUTATION doc comment) -- conservative false rather than an
+      // unverified true.
+      annotations: { readOnlyHint: false, idempotentHint: false },
       title: 'Record token/cost usage for one turn',
       description:
         'Matched on (project_id, session_id, turn_idx, agent_role) — UPDATEs the row route_resolve already ' +
         'created (the common resolve-first-measure-after case), or upserts a fresh row if usage is recorded ' +
         'without route_resolve having run first. costUsd omitted computes server-side from model_registry rates ' +
-        '(fails soft to NULL, never a guessed price, when the model or its rates are unregistered).',
+        '(fails soft to NULL, never a guessed price, when the model or its rates are unregistered). ' +
+        'sessionId is optional: OMITTED (the property genuinely absent from the call) defaults to this MCP ' +
+        'server process\'s own CLAUDE_CODE_SESSION_ID env var, then CODEX_THREAD_ID (same precedence handoff.js ' +
+        'uses everywhere else — see scripts/lib/session-identity.js), with CODEX_THREAD_ID preferred when both ' +
+        'are set and differ AND this server\'s own HANDOFF_HOST env var is "codex". An explicit sessionId ' +
+        'always wins over any env default. A tool call that has neither an explicit sessionId nor a resolvable ' +
+        'env default is a hard error, never a fabricated id. An explicit "" or whitespace-only sessionId is NOT ' +
+        'treated as omitted — it is a hard error (the same non-empty-string validation usage-telemetry.js\'s ' +
+        'own write path raises), never silently replaced by the env default.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
-        sessionId: z.string(),
+        sessionId: z.string().optional().describe(
+          'Defaults to this server\'s own CLAUDE_CODE_SESSION_ID env var, then CODEX_THREAD_ID, when omitted — see the tool description.'
+        ),
         turnIdx: z.number().int().min(0),
         agentRole: z.string(),
         tokensIn: z.number().int().min(0).optional(),
@@ -1730,6 +2059,23 @@ function buildServer() {
   server.registerTool(
     'usage_query',
     {
+      // Codex checker finding 7 (2026-09-12), generalized by Codex review F1
+      // (2026-09-12): this tool's own withProjectDb call runs
+      // ensureSchemaCurrent/ensureProjectIdentity, both of which are
+      // additive-DDL/migration-capable heal paths that CAN write to this
+      // project's schema/identity rows on a behind-schema DB (see
+      // withProjectDb's own header comment and project-identity.js's
+      // ensureProjectIdentity doc: "migration-capable (not a pure read)") --
+      // so this tool is NOT declared read-only. Every other §8 read tool in
+      // this file shares the SAME withProjectDb call and is likewise
+      // readOnlyHint:false now (F1 fixed the prior inconsistent convention
+      // that treated this shared heal-on-touch plumbing as non-disqualifying
+      // for SELECT-only handlers) -- see docs/hosts/codex.md's
+      // "Non-interactive approval for MCP tools" section for the live Codex
+      // approval-policy observation that first surfaced this gap.
+      // idempotentHint:true: the query itself never mutates reported data,
+      // and the heal path is additive/idempotent DDL.
+      annotations: { readOnlyHint: false, idempotentHint: true },
       title: 'Roll up token/cost usage by model, role, provider, day, branch, or PR',
       description:
         'granularity="turn" (default): sessionId given aggregates turn_usage directly, any of ' +
@@ -1737,10 +2083,15 @@ function buildServer() {
         'ROLLUPS only (staleness-by-design — a session whose rollup has not been recomputed is invisible), ' +
         'groupBy must be "model". granularity="feature" (§18.3): reads feature_usage (per-feature/per-PR ' +
         `provenance), project-scoped only, groupBy one of ${JSON.stringify(usageTelemetryLib.VALID_FEATURE_GROUP_BY)} ` +
-        '— sessionId given together with granularity="feature" is a hard error before any query runs.',
+        '— sessionId given together with granularity="feature" is a hard error before any query runs. ' +
+        'UNLIKE usage_record, sessionId has NO host-env default here (no CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID ' +
+        'fallback): "omitted" already means something specific in both granularity modes above (the project-' +
+        'wide rollup, or the required-absent case for "feature") — auto-filling it from the calling session\'s ' +
+        'own id would silently defeat both. Pass sessionId explicitly to scope to one session; omit it ' +
+        'deliberately for a rollup/feature query.',
       inputSchema: {
         projectRoot: z.string().describe('Absolute path to the project root.'),
-        sessionId: z.string().optional().describe('Not supported with granularity="feature".'),
+        sessionId: z.string().optional().describe('No env default (unlike usage_record) — see the tool description. Not supported with granularity="feature".'),
         granularity: z.enum(usageTelemetryLib.VALID_GRANULARITY).optional().describe('Default "turn".'),
         groupBy: z.enum([...new Set([...usageTelemetryLib.VALID_GROUP_BY, ...usageTelemetryLib.VALID_FEATURE_GROUP_BY])])
           .optional()
@@ -1759,7 +2110,14 @@ async function main() {
   await server.connect(transport);
 }
 
-main().catch((err) => {
-  console.error('handoff-mcp: fatal error:', err);
-  process.exit(1);
-});
+// Only auto-start the stdio server when this file is the process entry
+// point (the ESM equivalent of `require.main === module`) — never when a
+// test imports { buildServer } from this module (see the export comment
+// above buildServer()).
+const isDirectRun = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isDirectRun) {
+  main().catch((err) => {
+    console.error('handoff-mcp: fatal error:', err);
+    process.exit(1);
+  });
+}

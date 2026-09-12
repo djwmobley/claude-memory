@@ -94,6 +94,61 @@ there.
 
 ---
 
+## Usage telemetry under Codex
+
+Two more MCP tools exist: `usage_record` (per-turn tokens/cost, writes only)
+and `usage_query` (roll-ups by model, role, provider, day, branch, or PR).
+`usage_query` reads telemetry tables; like every tool on this MCP server it
+still enters the project DB heal-on-touch path (`withProjectDb` ->
+`ensureSchemaCurrent`/`ensureProjectIdentity`), which may write schema
+repairs even though the tool's own query is read-only — see this project's
+`readOnlyHint:false` annotation on `usage_query` in `scripts/handoff-mcp.mjs`
+(Codex review F1). Only `usage_record` follows the env-based session
+resolution described in [Session identity](#session-identity) above —
+`usage_query` does not resolve session identity from env at all; see below.
+
+- `usage_record`'s `sessionId` argument is optional. Omitted (the property
+  genuinely absent from the call — an explicit `""` or whitespace-only
+  string is NOT "omitted" and is a hard error instead), it defaults from
+  this MCP server process's own environment using the exact same
+  `CLAUDE_CODE_SESSION_ID` → `CODEX_THREAD_ID` precedence described in
+  [Session identity](#session-identity) above — under Codex that resolves to
+  `CODEX_THREAD_ID`. Pass `sessionId` explicitly to override the default.
+  `usage_record` writes to `turn_usage` ONLY — it never writes
+  `session_usage` or `feature_usage`.
+- `usage_query` does NOT resolve session identity from env — it has no
+  `CLAUDE_CODE_SESSION_ID`/`CODEX_THREAD_ID` fallback of any kind. It is
+  project-scoped unless `sessionId` is passed explicitly: "omitted" already
+  means something specific here (a project-wide rollup for
+  `granularity="turn"`, or a required-absent case for `granularity="feature"`)
+  and auto-filling it from the calling session's own id would silently
+  defeat both. `sessionId` is always exactly what the caller passed, never a
+  resolved default. `usage_query` reads across `turn_usage` (session-scoped,
+  `granularity="turn"` with `sessionId` given), `session_usage` (project-wide
+  rollup, `granularity="turn"` with `sessionId` omitted), and `feature_usage`
+  (`granularity="feature"`) depending on the arguments given — it writes to
+  none of them.
+- Engine schema epoch 5 or later creates `turn_usage`/`session_usage`/
+  `feature_usage` at init/heal (`handoff.js init`, or an equivalent schema
+  heal reached via `ensureSchemaCurrent`) — never auto-created by
+  usage_record/usage_query themselves. On an engine older than epoch 5 the
+  tools return the actionable error below instead. This is a statement
+  about the engine version once PR #298 lands on `main`, not a claim about
+  any particular checkout's manifest today — as of this writing this
+  checkout's `scripts/sql/schema-manifest.json` is `schema_epoch: 4` and
+  does not yet include these tables at all, so on an unpatched checkout the
+  error below is the ONLY outcome, on any project database. Calling either
+  tool against a project database whose schema predates the table it needs
+  returns an actionable error naming the missing relation, not a raw
+  Postgres stack trace, e.g.:
+
+  > `turn_usage is missing in <database>: the engine schema for this project
+  > is behind (ensureSchemaCurrent reason=<reason>); run "node
+  > scripts/handoff.js init" against this project root, or upgrade the
+  > engine so the schema manifest includes usage telemetry`
+
+---
+
 ## Reading the graph
 
 Beyond resume/checkpoint/close, the MCP surface exposes direct reads and

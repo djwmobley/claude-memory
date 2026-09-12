@@ -152,6 +152,65 @@ interactive session with fresh eyes.
 
 ---
 
+## Non-interactive approval for MCP tools
+
+Observed 2026-09-12, under an approval policy of `never`: a scripted
+`codex exec` run rejected `usage_query` ("MCP tool call requires approval,
+but approval policy is never") — `usage_query` had no
+`[mcp_servers.handoff.tools.usage_query]` sub-table in `config.toml` at that
+point — while `handoff_status`, which DOES have an explicit
+`approval_mode = "approve"` entry, ran without prompting. That is the full
+extent of what was observed: two tools, two outcomes, one config
+difference (entry present vs. absent).
+
+**Do not read more into this than the observation supports.** In
+particular, this project's own `readOnlyHint` tool annotation (see
+`scripts/handoff-mcp.mjs`) is NOT known to be what Codex's approval engine
+keys on — no test here has isolated `readOnlyHint` as a variable, and at
+the time of this observation `usage_query` and `handoff_status` also
+differed in whether they had a `config.toml` entry at all, which is a
+confound this project has not controlled for. Codex's own documentation
+describes both a server-level default approval behavior and a per-tool
+`approval_mode` value of `"writes"` (distinct from `"approve"`) as parts of
+its approval model; whether either of those, rather than the tools.\*
+entry's mere presence, explains the reject/allow split above has not been
+verified against Codex's source or a controlled test in this project.
+
+**What was actually observed, exactly, and nothing more:** `usage_query`
+with no `tools.*` entry was rejected under an approval policy of `never`;
+`handoff_status` with an `approval_mode = "approve"` entry ran without
+prompting. That is the whole experiment — two tools, two configs, two
+outcomes. The `usage_query` stanza below is the direct counterfactual for
+the exact case that was rejected (same tool, same config difference, other
+direction) — it was not, itself, separately run and confirmed to succeed.
+The `usage_record` stanza below is weaker still: `usage_record` was not
+part of this experiment in either configuration. It is included here
+expected by symmetry with `usage_query` and `handoff_status` — both write
+paths, both plausibly needing the same `approval_mode = "approve"` entry —
+not because it was separately observed to work.
+
+The stanza shape, one sub-table per tool:
+
+```toml
+[mcp_servers.handoff.tools.usage_query]
+approval_mode = "approve"
+
+[mcp_servers.handoff.tools.usage_record]
+approval_mode = "approve"
+```
+
+**Add these by editing `config.toml` directly, never via `codex mcp add`.**
+`codex mcp add` rewrites the entire `[mcp_servers.handoff]` block from its
+own flags and has no flag for a `tools.*` sub-table — running it after
+hand-adding these entries silently deletes them (same underlying behavior as
+the `config.toml` clobber noted in
+[Known real-world defects and quirks](codex-howto.md#known-real-world-defects-and-quirks),
+item 4, in the how-to page). If you must re-run `codex mcp add` for another
+reason (a changed engine path, say), re-add the `tools.*` sub-tables
+afterward.
+
+---
+
 ## Timeouts
 
 Codex **clamps SessionEnd hook execution to 3 seconds**, regardless of any
