@@ -29,6 +29,7 @@ const {
   resolveSessionIdFromEnv,
   resolveSessionIdFromMarker,
   resolveUsageRecordMarkerDefault,
+  parseSessionMarkersDetailed,
 } = require('./lib/session-identity');
 const pgHelpers = require('./lib/test-pg-helpers.js');
 
@@ -272,6 +273,88 @@ async function runMarkerFallbackTests() {
       check(
         'SIU5: whitespace-only session_id marker (sole candidate) -> actionable error, never a blank sessionId',
         r.sessionId === null && typeof r.error === 'string' && r.error.length > 0
+      );
+    }
+
+    // ── SIP1-2: field-preservation round-trip (Codex P1, fix/usage-record-
+    // marker-fallback follow-up) — parseSessionMarkersDetailed must retain a
+    // surviving marker's `host` field across a read-modify-write cycle, the
+    // exact shape every marker writer in handoff.js (loader-hook add, close/
+    // loader-stop removal) performs: read the full list, filter/push an
+    // entry for the CURRENT session only, write the whole list back. Before
+    // this fix, the read step silently narrowed every element to
+    // {session_id, ts} — a sibling's `host` was erased the instant any OTHER
+    // session's SessionStart hook rewrote the key. Reproduced concretely
+    // here: Codex session A's marker, then a simulated Codex session B
+    // "add" (read -> filter -> push -> write, same shape as the loader-hook
+    // inline write) — A's host must survive that cycle. Same
+    // js/clear-text-logging discipline as SIM1-4/SIU1-5 above: check() takes
+    // only pre-computed booleans, never a marker/session id value itself.
+    async function readRawMarkers() {
+      const { rows } = await db.query(
+        `SELECT value FROM project_settings WHERE project_id = $1 AND key = $2`,
+        [projectId, 'session_in_progress']
+      );
+      return rows.length > 0 ? rows[0].value : null;
+    }
+
+    // (SIP1) [{A, host:'codex'}] + simulated loader-hook "add {B, host:'codex'}"
+    // -> both A and B keep their host field -> resolveUsageRecordMarkerDefault
+    // (no HANDOFF_HOST filter) reports the ambiguous-markers error (2
+    // candidates), never silently picking one.
+    await pgHelpers.setSetting(
+      db, projectId, 'session_in_progress',
+      JSON.stringify([{ session_id: 'marker-sess-sip1-a', ts: new Date().toISOString(), host: 'codex' }])
+    );
+    {
+      const before = parseSessionMarkersDetailed(await readRawMarkers()).markers;
+      // Same read-modify-write shape as the loader-hook inline write (handoff.js):
+      // filter out any existing entry for the incoming session, then push it.
+      const filtered = before.filter((m) => m.session_id !== 'marker-sess-sip1-b');
+      filtered.push({ session_id: 'marker-sess-sip1-b', ts: new Date().toISOString(), host: 'codex' });
+      await pgHelpers.setSetting(db, projectId, 'session_in_progress', JSON.stringify(filtered));
+
+      const after = parseSessionMarkersDetailed(await readRawMarkers()).markers;
+      const a = after.find((m) => m.session_id === 'marker-sess-sip1-a');
+      const b = after.find((m) => m.session_id === 'marker-sess-sip1-b');
+      check(
+        'SIP1a: a loader-hook-shaped add of B preserves A\'s host field across the read-modify-write',
+        Boolean(a) && a.host === 'codex' && Boolean(b) && b.host === 'codex'
+      );
+
+      const r = await resolveUsageRecordMarkerDefault(db, projectId, null);
+      check(
+        'SIP1b: with both hosts preserved, two same-host markers -> ambiguous error, never a silent pick',
+        r.sessionId === null && typeof r.error === 'string' && r.error.includes('ambiguous session markers (2)')
+      );
+    }
+
+    // (SIP2) [{A, host:'codex'}] + simulated add {B, host:'claude'} -> A's
+    // host is still preserved, and resolveUsageRecordMarkerDefault with
+    // HANDOFF_HOST='codex' filters out B and resolves cleanly to A (the
+    // codex-host fallback still works after the round-trip).
+    await pgHelpers.setSetting(
+      db, projectId, 'session_in_progress',
+      JSON.stringify([{ session_id: 'marker-sess-sip2-a', ts: new Date().toISOString(), host: 'codex' }])
+    );
+    {
+      const before = parseSessionMarkersDetailed(await readRawMarkers()).markers;
+      const filtered = before.filter((m) => m.session_id !== 'marker-sess-sip2-b');
+      filtered.push({ session_id: 'marker-sess-sip2-b', ts: new Date().toISOString(), host: 'claude' });
+      await pgHelpers.setSetting(db, projectId, 'session_in_progress', JSON.stringify(filtered));
+
+      const after = parseSessionMarkersDetailed(await readRawMarkers()).markers;
+      const a = after.find((m) => m.session_id === 'marker-sess-sip2-a');
+      const b = after.find((m) => m.session_id === 'marker-sess-sip2-b');
+      check(
+        'SIP2a: an add of a DIFFERENT-host B still preserves A\'s original host',
+        Boolean(a) && a.host === 'codex' && Boolean(b) && b.host === 'claude'
+      );
+
+      const r = await resolveUsageRecordMarkerDefault(db, projectId, 'codex');
+      check(
+        'SIP2b: HANDOFF_HOST=codex filters out the claude-host B and still resolves to A',
+        r.error === null && r.sessionId === 'marker-sess-sip2-a'
       );
     }
 

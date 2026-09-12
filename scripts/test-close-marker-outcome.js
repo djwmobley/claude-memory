@@ -53,6 +53,8 @@ const {
   resolveClearSessionId,
   isAmbiguousSessionEnvPair,
   findMatchingMarkerIndex,
+  getSessionMarkers,
+  setSessionMarkers,
 } = require('./handoff.js');
 
 let passed = 0;
@@ -264,6 +266,75 @@ async function run() {
     assert.strictEqual(markers.length, 3);
     assert.strictEqual(dropped, 2);
     assert.strictEqual(coerced, 2);
+  });
+
+  // ── Field preservation (Codex P1, fix/usage-record-marker-fallback follow-
+  // up) — parseSessionMarkersDetailed must retain every field a surviving
+  // marker carries (host today; any future field), not just {session_id, ts}.
+
+  await test('detailed: host field is preserved through the parser (field-preservation fix)', async () => {
+    const { markers } = parseSessionMarkersDetailed(JSON.stringify([
+      { session_id: 'a', ts: '2026-01-01T00:00:00.000Z', host: 'codex' },
+    ]));
+    assert.strictEqual(markers.length, 1);
+    assert.strictEqual(markers[0].session_id, 'a');
+    assert.strictEqual(markers[0].host, 'codex');
+  });
+
+  await test('detailed: a marker with NO host field round-trips to exactly {session_id, ts} — no host key is introduced', async () => {
+    const { markers } = parseSessionMarkersDetailed(JSON.stringify([
+      { session_id: 'a', ts: '2026-01-01T00:00:00.000Z' },
+    ]));
+    assert.deepStrictEqual(markers[0], { session_id: 'a', ts: '2026-01-01T00:00:00.000Z' });
+  });
+
+  // ── P1 round-trip: loader-hook add followed by loader-stop removal of B
+  // leaves A's host intact ────────────────────────────────────────────────
+  //
+  // Exercises the REAL exported read-modify-write primitives every marker
+  // writer uses (getSessionMarkers/setSessionMarkers/findMatchingMarkerIndex)
+  // against FakeDb, in the exact shapes handoff.js's own loader-hook inline
+  // write (SessionStart) and cmdLoaderStop (SessionEnd) perform — no test-
+  // side reimplementation of either write path's filter/push logic.
+  await test('P1 round-trip: loader-hook add of B, then loader-stop removal of B, leaves A\'s host intact', async () => {
+    const db = new FakeDb();
+    db.seedMarker(JSON.stringify([
+      { session_id: 'sess-A', ts: '2026-01-01T00:00:00.000Z', host: 'codex' },
+    ]));
+
+    // Loader-hook inline write shape (handoff.js cmdLoaderHook): read the
+    // full list, filter out any existing entry for the incoming session,
+    // push the fresh host-stamped marker, write the whole list back.
+    {
+      const markers = await getSessionMarkers(db, PROJECT_ID);
+      const filtered = markers.filter((m) => m.session_id !== 'sess-B');
+      filtered.push({ session_id: 'sess-B', ts: '2026-01-01T00:00:01.000Z', host: 'codex' });
+      await setSessionMarkers(db, PROJECT_ID, filtered);
+    }
+
+    // A's host must have survived B's addition.
+    {
+      const markers = await getSessionMarkers(db, PROJECT_ID);
+      const a = markers.find((m) => m.session_id === 'sess-A');
+      assert.ok(a, 'sess-A marker must still be present after B was added');
+      assert.strictEqual(a.host, 'codex', 'sess-A must keep its host field after B\'s loader-hook add');
+    }
+
+    // Loader-stop removal shape (handoff.js cmdLoaderStop): find B's own
+    // marker by exact session_id match, delete only that one entry.
+    {
+      const markers = await getSessionMarkers(db, PROJECT_ID);
+      const matchIdx = findMatchingMarkerIndex(markers, 'sess-B');
+      assert.notStrictEqual(matchIdx, -1, 'sess-B must be found for removal');
+      const remaining = markers.filter((_, i) => i !== matchIdx);
+      await setSessionMarkers(db, PROJECT_ID, remaining);
+    }
+
+    // A must remain, with its host field STILL intact, after B's removal.
+    const finalMarkers = await getSessionMarkers(db, PROJECT_ID);
+    assert.strictEqual(finalMarkers.length, 1, 'only sess-A should remain after sess-B is removed');
+    assert.strictEqual(finalMarkers[0].session_id, 'sess-A');
+    assert.strictEqual(finalMarkers[0].host, 'codex', 'sess-A\'s host must still be intact after the full add+remove round-trip');
   });
 
   // ── formatOwnerIds — dedupe + cap ──────────────────────────────────────────

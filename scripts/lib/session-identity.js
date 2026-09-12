@@ -91,8 +91,11 @@ function resolveSessionIdFromEnv(host) {
 // per-session aware (S3)" section header for the full storage-format doc,
 // not restated here):
 //   - absent / null / ''                    -> []
-//   - valid JSON, an array                  -> each element normalized to {session_id, ts};
-//                                               a malformed element (no string .ts) is dropped
+//   - valid JSON, an array                  -> each element normalized to
+//                                               {...element, session_id, ts}
+//                                               (see field-preservation note
+//                                               below); a malformed element
+//                                               (no string .ts) is dropped
 //   - valid JSON, not an array               -> [] (never produced by this code; fail open)
 //   - not valid JSON, non-empty string       -> [{session_id: null, ts: raw}]  (legacy format)
 //   - not valid JSON, empty/non-string       -> [] (garbage — fail open, never crash)
@@ -112,6 +115,28 @@ function resolveSessionIdFromEnv(host) {
 //     `dropped` (never became a marker at all) vs `coerced` (became a
 //     marker but had a malformed session_id forced to null); only
 //     clearSessionMarkerForClose (handoff.js) consumes these counts.
+//
+// Field preservation (Codex P1, fix/usage-record-marker-fallback follow-up):
+// a surviving element keeps EVERY field the raw JSON carried (host today;
+// any field a future writer adds, without another change here) — only
+// session_id and ts are normalized/overridden by this function. This is load-
+// bearing: every marker read-modify-write site in handoff.js (loader-hook
+// add, close/loader-stop removal, resume's addSessionMarker) reads the full
+// list through this parser, mutates only the entries it owns, and writes the
+// WHOLE list back verbatim — so a field this parser dropped from a sibling's
+// marker would be silently erased from storage the next time ANY session
+// rewrote the key. Before this fix, only {session_id, ts} survived, which
+// erased the `host` field the loader-hook stamps (Codex review C1's marker-
+// fallback host-filtering) off of every OTHER live marker whenever a new
+// session's SessionStart hook fired — reproduced: Codex session A starts
+// (marker: {A, host:'codex'}), Codex session B starts (reads [A] through the
+// old parser -> loses A's host -> writes [{A, ts},{B, host:'codex'}]) ->
+// resolveUsageRecordMarkerDefault sees hosts [null, 'codex'] and silently
+// picks B instead of reporting the ambiguous-marker error C1 exists to give.
+// For callers that never had a `host` field to begin with, this is a true
+// no-op: spreading an object whose only keys are session_id/ts and then
+// overriding those same two keys produces an object equal in every key/value
+// to what the old {session_id, ts}-only construction produced.
 function parseSessionMarkersDetailed(raw) {
   if (raw === null || raw === undefined || raw === '') return { markers: [], dropped: 0, coerced: 0 };
   try {
@@ -136,7 +161,13 @@ function parseSessionMarkersDetailed(raw) {
           // this to null; still does, but now counted.
           coerced++;
         }
+        // Field preservation (see header comment above): spread the WHOLE
+        // parsed element first (retains `host` and any other field the raw
+        // JSON carried) and only then override session_id/ts with their
+        // validated forms — never construct a narrowed {session_id, ts}-only
+        // object here.
         markers.push({
+          ...e,
           session_id: sidIsUsableString ? e.session_id : null,
           ts: e.ts,
         });
