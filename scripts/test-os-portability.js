@@ -307,6 +307,16 @@ function testP3() {
   //     permutations.js pattern — builds a cross-platform `codex` stub (a plain
   //     POSIX shell/node file with a shebang vs. a win32 .cmd wrapper) for the
   //     codex-host-adapter test suite.
+  //   - handoff.js (cm#297, _classifyPointerScope): the close-time bulk pointer-
+  //     suppression pass compares a pointer's resolved path against projectRoot
+  //     case-insensitively ONLY on win32 (NTFS/ReFS are case-insensitive by
+  //     default, so a case-differing relative pointer must not misclassify
+  //     OUTSIDE_REPO there) and byte-exact on POSIX (case-sensitive filesystems).
+  //     This is the same "what counts as the same path on THIS OS" shape as
+  //     handoff-paths.js/install.js above, not diverging engine behavior.
+  //   - test-pointer-gate.js (cm#297): T27 asserts the win32-only branch above;
+  //     it is itself gated by `process.platform !== 'win32'` to log a skip
+  //     (still a pass) rather than assert a win32-specific outcome elsewhere.
   //
   // We allowlist by file + approximate pattern.
   const ALLOWED = [
@@ -346,6 +356,17 @@ function testP3() {
       // tests exercise both branches deterministically; every real call
       // site omits it and this line's `process.platform === 'win32'` fires.
       textRe: /process\.platform\s*===\s*['"]win32['"]/,
+    },
+    {
+      file: HANDOFF_JS,
+      // _classifyPointerScope() (cm#297): win32-only case-insensitive
+      // path-relativize comparison — see justification above.
+      textRe: /const rel = process\.platform === ['"]win32['"]/,
+    },
+    {
+      file: path.join(TEST_DIR, 'handoff', 'test-pointer-gate.js'),
+      // T27 (cm#297): win32-only assertion, no-op skip elsewhere.
+      textRe: /process\.platform\s*!==?\s*['"]win32['"]/,
     },
   ];
 

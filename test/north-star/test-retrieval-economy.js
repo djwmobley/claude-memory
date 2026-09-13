@@ -248,7 +248,12 @@ function rankOf(stdout, needle) {
               'Backfill the remaining legacy rows that predate the last_reinforced default.',
               'Confirm the tier-aware prefix survives the node:sqlite rewrite path.',
             ],
-            quick_references: 'handoff.js:2373 decay ORDER BY; sql/handoff-core-schema.sql:75 last_reinforced.',
+            // cm#297: kept deliberately free of any `path.ext:N` code-pointer
+            // shape — a quick_reference citing a genuine stale/out-of-scope
+            // pointer is now correctly annotated (not silently dropped),
+            // which would grow this fixture's handoff.md past the thin-
+            // pointer budget this test is actually checking.
+            quick_references: 'Decay-rank ORDER BY lives in the resume loader; last_reinforced lives in the core schema.',
             contract:         ASSERTION_CONTRACT,
           });
 
