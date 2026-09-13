@@ -98,6 +98,21 @@ minimum. This is a total classification, not an allow-list of accepted
 formats: anything that isn't the one recognized shape is UNKNOWN by
 construction, not by an enumerated reject-list.
 
+**Per-family version rule (B3):** the strict three-part rule above is the
+default and applies to `node`/`git`/`gh`/`codex`/`claude`, but it is wrong
+for PostgreSQL-family binaries — PostgreSQL 10+ reports a two-part version
+(`postgres (PostgreSQL) 16.2`, `pg_dump (PostgreSQL) 18.0`), while versions
+before 10 reported three-part (`9.6.24`). A Postgres-family row (`pg_dump`
+today; any future `postgres`/`psql`/`pg_isready`/`SHOW server_version` row)
+instead parses each whitespace token against `^\d+\.\d+(\.\d+)?$` — no `v`
+prefix, two- or three-part only, still no prerelease/build suffix — so it
+correctly reads the numeral out of the tool's own `(PostgreSQL) X.Y`
+banner. A dev/beta build (`17devel`, `18beta2`) has no `.` in that token
+and is still `UNKNOWN` by construction, never coerced. This is a second
+total classification selected per prerequisite, not a loosening of the
+rule above for everyone: `node`/`git`/`gh`/`codex`/`claude` keep the
+strict three-part rule unchanged.
+
 ### Empty/garbage output and launcher stubs (A2)
 
 A process that spawns successfully but returns exit code `9009` (Windows
@@ -202,11 +217,14 @@ is a misleading status line, so the checker defaults to the more honest
 
 ### pg_dump (E1)
 
-`pg_dump --version`, minimum matching the target Postgres major (16). This
-is a full §3 row, required — not optional, and not folded into the
-`postgres` row above, because §6's upgrade path needs it independently of
-which Postgres source (Docker or external) was chosen. `--upgrade` (§6)
-refuses outright if this row is `ABSENT` or `UNKNOWN`.
+`pg_dump --version`, minimum matching the target Postgres major (16),
+parsed with the Postgres-family per-family rule above (B3) — real
+`pg_dump --version` output is `pg_dump (PostgreSQL) 18.0`, a two-part
+version on PostgreSQL 10+. This is a full §3 row, required — not optional,
+and not folded into the `postgres` row above, because §6's upgrade path
+needs it independently of which Postgres source (Docker or external) was
+chosen. `--upgrade` (§6) refuses outright if this row is `ABSENT` or
+`UNKNOWN`.
 
 ## 4. Compose file
 

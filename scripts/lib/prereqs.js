@@ -12,6 +12,24 @@
  *   A1/G1 — classifyVersion parses a STRICT ^v?\d+\.\d+\.\d+$ token; any
  *           other shape (range, prerelease, bare major) is UNKNOWN, never
  *           silently accepted as satisfying a minimum.
+ *   B3    — the STRICT rule above is wrong for PostgreSQL-family binaries:
+ *           PostgreSQL >= 10 reports a two-part version (`postgres
+ *           (PostgreSQL) 16.2`, `pg_dump (PostgreSQL) 18.0`); versions
+ *           before 10 reported three-part. classifyVersion takes an
+ *           optional `{ family: 'postgres' }` rule that swaps in
+ *           PG_VERSION_TOKEN_RE (two-OR-three-part, no "v" prefix, no
+ *           prerelease/build suffix) instead of the strict rule -- applied
+ *           via the same first-whitespace-token-that-matches-in-full scan,
+ *           so it lands on the numeral in the tool's own `(PostgreSQL)
+ *           X.Y` banner without needing to special-case that marker's
+ *           position. Every other prerequisite (node/git/gh/codex/claude)
+ *           keeps the strict three-part rule unchanged. A dev/beta build
+ *           (`17devel`) has no `.` in its token and still never matches --
+ *           UNKNOWN, never coerced. Only the `pgDump` row is wired to this
+ *           family today (the only Postgres-family binary this file
+ *           actually version-probes); the mechanism is written per-family
+ *           so any future Postgres-family row (`psql`, `postgres`,
+ *           `pg_isready`, `SHOW server_version`) can opt in the same way.
  *   A2    — exit 9009 / empty stdout on exit 0 / any nonzero exit from a
  *           process that DID spawn is UNKNOWN, not ABSENT. ABSENT is
  *           reserved for a confirmed spawn-level not-found (ENOENT),
@@ -46,8 +64,14 @@ const DEFAULT_TIMEOUT_MS = 5000;
 const DOCKER_INFO_TIMEOUT_MS = 15000; // A5
 
 // Strict major.minor.patch only — no ranges, no prerelease/build suffixes,
-// no bare major/minor. A1/G1.
+// no bare major/minor. A1/G1. Used for node/git/gh/codex/claude.
 const VERSION_TOKEN_RE = /^v?(\d+)\.(\d+)\.(\d+)$/;
+
+// Postgres-family version token — two-OR-three-part digits, no "v" prefix,
+// no prerelease/build suffix. B3: PostgreSQL >= 10 reports two-part
+// (16.2); pre-10 reported three-part (9.6.24). A dev/beta build
+// (17devel, 18beta2) has no "." in its token and never matches.
+const PG_VERSION_TOKEN_RE = /^(\d+)\.(\d+)(?:\.(\d+))?$/;
 
 // B1: prereqs whose real-world install command is elevated on every
 // supported platform (Docker Desktop, a system Postgres, the pgvector
@@ -61,13 +85,14 @@ const REQUIRED_PREREQS_DEFAULT = ['node', 'git', 'pgDump', 'hostCli', 'postgres'
 
 // ─── pure version parsing ────────────────────────────────────────────────
 
-function parseVersionToken(stdout) {
+function parseVersionToken(stdout, re) {
+  re = re || VERSION_TOKEN_RE;
   if (typeof stdout !== 'string') return null;
   const tokens = stdout.trim().split(/\s+/);
   for (const raw of tokens) {
     const token = raw.replace(/[,;]+$/, '');
-    const m = VERSION_TOKEN_RE.exec(token);
-    if (m) return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]) };
+    const m = re.exec(token);
+    if (m) return { major: Number(m[1]), minor: Number(m[2]), patch: m[3] !== undefined ? Number(m[3]) : 0 };
   }
   return null;
 }
@@ -90,13 +115,18 @@ function parseMin(min) {
 }
 
 /**
- * classifyVersion(stdout, exitCode, min) — pure, total classification of a
- * version probe's raw output. Returns { outcome, reason, version, min }.
+ * classifyVersion(stdout, exitCode, min, opts) — pure, total classification
+ * of a version probe's raw output. Returns { outcome, reason, version, min }.
  * outcome is one of PRESENT_OK / PRESENT_TOO_OLD / UNKNOWN. Never ABSENT —
  * that outcome requires a confirmed spawn-level failure this function
  * never sees (see classifyProbe).
+ * opts.family: 'postgres' swaps the strict three-part token rule for
+ * PG_VERSION_TOKEN_RE (B3) — every other prerequisite keeps the strict
+ * rule (the default when opts/opts.family is omitted).
  */
-function classifyVersion(stdout, exitCode, min) {
+function classifyVersion(stdout, exitCode, min, opts) {
+  opts = opts || {};
+  const versionRe = opts.family === 'postgres' ? PG_VERSION_TOKEN_RE : VERSION_TOKEN_RE;
   const minVer = parseMin(min);
   const minStr = fmtVersion(minVer);
 
@@ -119,11 +149,12 @@ function classifyVersion(stdout, exitCode, min) {
     // app-execution alias) that returns immediately with nothing printed.
     return { outcome: 'UNKNOWN', reason: 'empty_stdout', version: null, min: minStr };
   }
-  const found = parseVersionToken(stdout);
+  const found = parseVersionToken(stdout, versionRe);
   if (!found) {
-    // A1/G1: anything that is not a strict v?\d+.\d+.\d+ token -- a range,
-    // a prerelease suffix, a bare major -- is UNKNOWN, never silently
-    // treated as satisfying the minimum.
+    // A1/G1 (strict rule) / B3 (postgres-family rule): anything that is
+    // not the applicable token shape -- a range, a prerelease suffix, a
+    // bare major, a dev/beta build with no "." -- is UNKNOWN, never
+    // silently treated as satisfying the minimum.
     return { outcome: 'UNKNOWN', reason: 'unparseable_version', version: null, min: minStr };
   }
   const outcome = compareVersion(found, minVer) >= 0 ? 'PRESENT_OK' : 'PRESENT_TOO_OLD';
@@ -137,8 +168,9 @@ function classifyVersion(stdout, exitCode, min) {
  * process may still be running -- never silently ABSENT). A real spawn
  * error (ENOENT-shaped: result.error set, no numeric status) is the ONLY
  * path to ABSENT.
- * rule: { min } for a version rule, or { functional: fn(result) } to
- * delegate entirely (used for docker info / host-CLI functional checks).
+ * rule: { min, family } for a version rule (family: 'postgres' selects the
+ * B3 two-or-three-part rule, see classifyVersion), or { functional: fn(result) }
+ * to delegate entirely (used for docker info / host-CLI functional checks).
  */
 function classifyProbe(result, rule) {
   rule = rule || {};
@@ -152,7 +184,7 @@ function classifyProbe(result, rule) {
   if (typeof rule.functional === 'function') {
     return rule.functional(result);
   }
-  return classifyVersion(result.stdout, result.status, rule.min);
+  return classifyVersion(result.stdout, result.status, rule.min, { family: rule.family });
 }
 
 // ─── host CLI functional checks (A3/A4) ──────────────────────────────────
@@ -423,7 +455,7 @@ async function probeAll(opts) {
   // pg_dump (E1)
   {
     const r = await exec('pg_dump', ['--version'], DEFAULT_TIMEOUT_MS);
-    rows.push({ prereq: 'pgDump', required: true, ...classifyProbe(r, { min: opts.pgDumpMin || '16.0.0' }) });
+    rows.push({ prereq: 'pgDump', required: true, ...classifyProbe(r, { min: opts.pgDumpMin || '16.0.0', family: 'postgres' }) });
   }
   // host CLI (A3/A4)
   {
@@ -489,6 +521,7 @@ async function probeAll(opts) {
 
 module.exports = {
   VERSION_TOKEN_RE,
+  PG_VERSION_TOKEN_RE,
   ELEVATED_PREREQS,
   REQUIRED_PREREQS_DEFAULT,
   parseVersionToken,

@@ -262,6 +262,90 @@ test('G2 -- gh nonzero-non-ENOENT is UNKNOWN (non-fatal, optional) not ABSENT', 
   assert(c.reason === 'nonzero_exit' || c.reason === 'empty_stdout', 'must not be a confident absence');
 });
 
+test('B3 -- Postgres-family two-part banner is UNKNOWN under the DEFAULT (strict) rule, proving the family opt-in is what fixes it', () => {
+  const c = classifyVersion('postgres (PostgreSQL) 16.2\n', 0, '16.0.0');
+  assertEqual(c.outcome, 'UNKNOWN', 'without family: postgres, a real two-part Postgres banner must not silently pass the strict three-part rule');
+  assertEqual(c.reason, 'unparseable_version');
+});
+
+test('B3 -- real-world postgres banner (16.2) classifies PRESENT_OK under family: postgres', () => {
+  const c = classifyVersion('postgres (PostgreSQL) 16.2\n', 0, '16.0.0', { family: 'postgres' });
+  assertEqual(c.outcome, 'PRESENT_OK');
+  assertEqual(c.version, '16.2.0');
+});
+
+test('B3 -- real-world pg_dump banner (18.0) classifies PRESENT_OK under family: postgres', () => {
+  const c = classifyVersion('pg_dump (PostgreSQL) 18.0\n', 0, '16.0.0', { family: 'postgres' });
+  assertEqual(c.outcome, 'PRESENT_OK');
+  assertEqual(c.version, '18.0.0');
+});
+
+test('B3 -- real-world psql banner with a trailing distro suffix classifies PRESENT_OK, first matching token wins', () => {
+  const c = classifyVersion('psql (PostgreSQL) 16.2 (Ubuntu 16.2-1.pgdg22.04+1)\n', 0, '16.0.0', { family: 'postgres' });
+  assertEqual(c.outcome, 'PRESENT_OK');
+  assertEqual(c.version, '16.2.0', 'must extract 16.2 from the banner, never a fragment of the distro suffix');
+});
+
+test('B3 -- real-world pg_dump banner (15.7) below minimum classifies PRESENT_TOO_OLD, not UNKNOWN', () => {
+  const c = classifyVersion('pg_dump (PostgreSQL) 15.7\n', 0, '16.0.0', { family: 'postgres' });
+  assertEqual(c.outcome, 'PRESENT_TOO_OLD');
+  assertEqual(c.version, '15.7.0');
+  assertEqual(c.min, '16.0.0');
+});
+
+test('B3 -- a nightly/dev build (17devel) never coerces to a passing version -- UNKNOWN', () => {
+  const c = classifyVersion('psql (PostgreSQL) 17devel (Debian 17~devel-1.pgdg120+1)\n', 0, '16.0.0', { family: 'postgres' });
+  assertEqual(c.outcome, 'UNKNOWN', 'a dev/beta build with no "." in its token must never silently pass');
+  assertEqual(c.reason, 'unparseable_version');
+});
+
+test('B3 -- pre-10 three-part Postgres version (9.6.24) still parses under family: postgres', () => {
+  const c = classifyVersion('pg_dump (PostgreSQL) 9.6.24\n', 0, '9.0.0', { family: 'postgres' });
+  assertEqual(c.outcome, 'PRESENT_OK');
+  assertEqual(c.version, '9.6.24');
+});
+
+asyncTest('B3 -- probeAll wires the pgDump row through family: postgres so a real pg_dump banner classifies correctly end to end', async () => {
+  const exec = async (cmd, args) => {
+    if (cmd === 'node') return r({ stdout: 'v22.9.0\n' });
+    if (cmd === 'git') return r({ stdout: 'git version 2.43.0\n' });
+    if (cmd === 'gh') return r({ error: { code: 'ENOENT' } });
+    if (cmd === 'pg_dump') return r({ stdout: 'pg_dump (PostgreSQL) 18.0\n' });
+    if (cmd === 'claude') return r({ stdout: '2.1.270 (Claude Code)\n' });
+    if (cmd === 'docker' && args && args[0] === 'compose') return r({ stdout: 'Docker Compose version v2.29.0\n' });
+    if (cmd === 'docker') return r({ stdout: 'Server Version: 27.0.0\n' });
+    if (cmd === 'psql') return r({ status: 0 });
+    return r({ error: { code: 'ENOENT' } });
+  };
+  const result = await probeAll({ exec, httpProbe: async () => true, embedderUrl: 'http://x', dockerImageShipsVector: true });
+  const pgDumpRow = result.rows.find((row) => row.prereq === 'pgDump');
+  assertEqual(pgDumpRow.outcome, 'PRESENT_OK', 'a real-world two-part pg_dump banner must classify PRESENT_OK, not UNKNOWN, through probeAll');
+  assertEqual(pgDumpRow.version, '18.0.0');
+  assertEqual(result.ok, true, 'the whole check must pass when every required row (including the real-shaped pg_dump banner) is satisfied');
+});
+
+asyncTest('B3 -- docker/postgres pair classifies correctly against real "Docker Compose version vX.Y.Z" + docker info output (exit-code gated, not version-parsed)', async () => {
+  // probeAll's docker path never calls classifyVersion for `docker compose
+  // version` or `docker info` (see probeAll) -- it is exit-code gated
+  // only, via dockerOk()/dockerBad() -- so real-shaped, well-formed output
+  // with exit 0 must resolve the postgres row via the docker path, not
+  // misclassify it as UNKNOWN/ABSENT.
+  const exec = async (cmd, args) => {
+    if (cmd === 'node') return r({ stdout: 'v22.9.0\n' });
+    if (cmd === 'git') return r({ stdout: 'git version 2.43.0\n' });
+    if (cmd === 'gh') return r({ error: { code: 'ENOENT' } });
+    if (cmd === 'pg_dump') return r({ stdout: 'pg_dump (PostgreSQL) 18.0\n' });
+    if (cmd === 'claude') return r({ stdout: '2.1.270 (Claude Code)\n' });
+    if (cmd === 'docker' && args && args[0] === 'compose') return r({ stdout: 'Docker Compose version v2.27.0\n' });
+    if (cmd === 'docker') return r({ stdout: 'Server Version: 27.0.0\nContext: default\n' }); // `docker info`
+    if (cmd === 'psql') return r({ error: { code: 'ENOENT' } }); // no external Postgres -- docker path must carry the row
+    return r({ error: { code: 'ENOENT' } });
+  };
+  const result = await probeAll({ exec, httpProbe: async () => true, embedderUrl: 'http://x', dockerImageShipsVector: true });
+  const pgRow = result.rows.find((row) => row.prereq === 'postgres');
+  assertEqual(pgRow.outcome, 'PRESENT_OK', 'real docker compose + docker info output must resolve the postgres row via the docker path');
+});
+
 asyncTest('G2 -- gh row is marked required: false so it never gates --check-only', async () => {
   const exec = async (cmd) => {
     if (cmd === 'gh') return r({ status: 1, stdout: '' }); // present-but-erroring, never ENOENT
