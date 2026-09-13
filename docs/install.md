@@ -76,7 +76,25 @@ nothing breaks, you just lose semantic/vector matching. See
 
 ---
 
-## 3. Configure the project and run `handoff init`
+## 3. Install script dependencies
+
+The zip you downloaded (or this repo checkout) does **not** ship
+`scripts/node_modules` unless you built or requested the `--offline`
+variant (see [package-and-installer.md](specs/package-and-installer.md)
+section 1) — the default zip expects `npm` to fetch dependencies itself:
+
+```sh
+cd scripts && npm install && cd ..
+```
+
+This installs `pg`, `@modelcontextprotocol/sdk`, and `zod` from
+`scripts/package.json`/`scripts/package-lock.json`. Skip this step only if
+you built an `--offline` zip (its `scripts/node_modules` is already
+staged) — running it again there is harmless.
+
+---
+
+## 4. Configure the project and run `handoff init`
 
 Point this project at the database compose just started, then create its
 schema:
@@ -95,7 +113,7 @@ a short interactive Q&A. Full step-by-step detail:
 
 ---
 
-## 4. Host wiring
+## 5. Host wiring
 
 Run the installer for whichever host(s) you use. `install.cmd` (Windows)
 and `install.sh` (macOS/Linux) are thin wrappers that just locate Node and
@@ -146,7 +164,7 @@ approval policy the `usage_query`/`usage_record` MCP tools need a hand-added
 
 ---
 
-## 5. Smoke test
+## 6. Smoke test
 
 Verify the MCP server actually answers, through the **host's own** MCP
 path (not a bare script call):
@@ -168,12 +186,12 @@ as `codex`.
 
 **You should see** a status summary, not a connection error. If you get a
 connection error, re-check step 2 (`docker compose ps` shows `postgres`
-healthy) and step 3 (`.claude/pipeline.yml` points at the right
+healthy) and step 4 (`.claude/pipeline.yml` points at the right
 host/port/db).
 
 ---
 
-## 6. Upgrade
+## 7. Upgrade
 
 ```sh
 git pull   # or: extract a newer memory-manager-<version>.zip over this checkout
@@ -192,7 +210,7 @@ node scripts/handoff.js init  # re-applies schema; heal-on-touch, idempotent
 
 ---
 
-## 7. Uninstall
+## 8. Uninstall
 
 There is no `--uninstall` flag yet (the package-and-installer design's
 section 7 describes the planned flow, including `--purge-data`'s two typed

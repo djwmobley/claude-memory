@@ -10,6 +10,28 @@
  * repo's actual deploy/ directory, not flattened to the zip root as that
  * DRAFT text shows).
  *
+ * PRIVACY DESIGN (round 2): candidate files under each included directory
+ * are enumerated via `git ls-files --cached` -- i.e. the git INDEX, not
+ * the filesystem. This is the total classification: tracked (safe branch,
+ * proven by the fact someone deliberately committed it) vs. everything
+ * else (untracked, gitignored, or merely locally-present -- always
+ * excluded, unconditionally, by construction, never by name-matching).
+ * A gitignored file the working tree happens to contain (an ad hoc report,
+ * a local backup, a scratch DB dump) can therefore never reach the zip no
+ * matter what isExcludedPath() does or doesn't know about it -- there is
+ * no filesystem walk of an included directory's real contents anymore.
+ * isExcludedPath() remains a second, defense-in-depth filter over the
+ * tracked set (catching hazards that were nonetheless committed, e.g. a
+ * stray .bak- file). A second safety net, assertNoIgnoredFiles(), runs
+ * `git check-ignore --stdin` over the final tracked candidate list and
+ * refuses the build if anything on it is gitignored -- the only way that
+ * can happen is a `git add -f` of a file .gitignore says must never ship,
+ * and that must be a loud build failure, never a silent inclusion.
+ * scripts/node_modules (--offline only) is the one deliberate exception:
+ * it is legitimately untracked/gitignored real npm output, so it is
+ * staged straight off the filesystem via walkEntry() instead, and is
+ * never passed through assertNoIgnoredFiles().
+ *
  * CommonJS, Node >=18, zero new dependencies. Archiving shells out to a
  * platform archiver detected at runtime: `tar -a -c -f` on win32 (bsdtar
  * ships with Windows 10+ as C:\Windows\System32\tar.exe and auto-detects
@@ -28,10 +50,11 @@
  *               silently produces an offline zip missing its dependencies.
  *   --out-dir   Directory the zip is written to. Defaults to <repo>/dist.
  *
- * Testability: getIncludePaths(), isExcludedPath(), validateIncludePaths(),
+ * Testability: getIncludePaths(), isExcludedPath(), listTrackedFiles(),
+ * assertNoIgnoredFiles(), walkEntry(), validateIncludePaths(),
  * resolveVersion(), stageBuild(), and computeShaSums() are pure/side-
  * effect-scoped functions exported below for unit testing (see
- * test/test-build-zip.js) against synthetic fixture trees -- requiring
+ * test/test-build-zip.js) against synthetic fixture git repos -- requiring
  * this module never touches argv/cwd/process.exit; main() only runs when
  * this file is executed directly.
  */
@@ -68,6 +91,7 @@ const BASE_INCLUDE_PATHS = [
   'scripts/handoff-mcp.mjs',
   'scripts/handoff-mcp-selftest.mjs',
   'scripts/init-config.js',
+  'scripts/pipeline-chunker.js',
   'scripts/lib',
   'scripts/sql',
   'scripts/migrations',
@@ -82,15 +106,18 @@ function getIncludePaths({ offline = false } = {}) {
   return offline ? [...BASE_INCLUDE_PATHS, ...OFFLINE_EXTRA_PATHS] : [...BASE_INCLUDE_PATHS];
 }
 
-// ─── Exclusion rules (total classification within an included directory) ───
-// Anything NOT matched here is included by default -- that default branch
-// is intentional (this is a curated allow-list of top-level paths already;
-// within an included directory we exclude the specific, named hazards
-// rather than re-deriving an inner allow-list). Checked against the
-// path's basename and its full repo-relative path (forward-slash
-// normalized) at every directory-walk step, so nested occurrences (e.g.
-// docs/notes/, any node_modules/ that isn't the offline top-level one) are
-// caught too.
+// ─── Exclusion rules (defense-in-depth over the git-tracked candidate set) ──
+// The PRIMARY total classification is "is this file tracked by git" (see
+// listTrackedFiles() below): tracked is the only safe branch, everything
+// else -- untracked, gitignored, locally-present-only -- never reaches
+// this function at all because it never reaches the candidate list in the
+// first place. Anything NOT matched here is included by default -- that
+// default branch is intentional at THIS layer (within the already-tracked
+// set we exclude the specific, named hazards that could nonetheless have
+// been committed, rather than re-deriving an inner allow-list). Checked
+// against the path's basename and its full repo-relative path (forward-
+// slash normalized), so nested occurrences (e.g. docs/notes/, any
+// node_modules/ that isn't the offline top-level one) are caught too.
 function isExcludedPath(relPath, { offline = false } = {}) {
   const norm = relPath.split(path.sep).join('/');
   const base = norm.split('/').pop();
@@ -152,6 +179,77 @@ function walkEntry(repoRoot, entry, { offline = false } = {}) {
   return out;
 }
 
+// ─── git plumbing ────────────────────────────────────────────────────────────
+function execGit(repoRoot, args, { input } = {}) {
+  const res = spawnSync('git', args, {
+    cwd: repoRoot,
+    shell: false,
+    input,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  if (res.error) {
+    throw new Error(`build-zip: failed to run "git ${args.join(' ')}": ${res.error.message}`);
+  }
+  return res;
+}
+
+// ─── Tracked-file enumeration (the PRIMARY privacy gate -- see file header) ─
+// Enumerates every file git considers tracked (present in the index) under
+// `paths`, using `git ls-files -z --cached`. Untracked, gitignored, and
+// locally-present-only files structurally never appear in this output --
+// there is no filesystem walk of these directories' real contents, so a
+// private file that happens to sit next to a shipped one (a local DB dump,
+// a scratch report, a triage JSON) can never leak in regardless of what
+// isExcludedPath() does or doesn't name. isExcludedPath() is then applied
+// as a second, defense-in-depth filter over this already-tracked set.
+function listTrackedFiles(repoRoot, paths, { offline = false } = {}) {
+  if (!paths || paths.length === 0) return [];
+  const res = execGit(repoRoot, ['ls-files', '-z', '--cached', '--', ...paths]);
+  if (res.status !== 0) {
+    const stderr = res.stderr ? res.stderr.toString('utf8').trim() : '';
+    throw new Error(`build-zip: "git ls-files" exited with status ${res.status}${stderr ? `: ${stderr}` : ''}`);
+  }
+  const rels = res.stdout.toString('utf8').split('\0').filter(Boolean);
+  return rels
+    .filter((rel) => !isExcludedPath(rel, { offline }))
+    .map((rel) => ({ abs: path.join(repoRoot, ...rel.split('/')), rel }));
+}
+
+// ─── check-ignore safety net (the SECOND privacy gate -- see file header) ──
+// Runs `git check-ignore --no-index --stdin` over the final tracked
+// candidate list. `--no-index` is load-bearing: plain `git check-ignore`
+// silently reports a path as NOT ignored whenever that path is already in
+// the index (git's ignore rules only ever gate adding new files, never
+// files already tracked) -- which is exactly the force-add case this net
+// exists to catch, so the plain form would never fire. `--no-index`
+// forces pure gitignore-pattern evaluation regardless of tracked state. A
+// path can only show up here as "ignored" if it was force-added to the
+// index (`git add -f`) despite .gitignore saying it must never ship --
+// that is always a build-time failure, loud and named, never a silent
+// inclusion. Never call this on filesystem-sourced (non-tracked) entries
+// like the --offline scripts/node_modules staging, which is legitimately
+// gitignored by design.
+function assertNoIgnoredFiles(repoRoot, rels) {
+  if (!rels || rels.length === 0) return;
+  const res = execGit(repoRoot, ['check-ignore', '--no-index', '--stdin'], { input: rels.join('\n') + '\n' });
+  if (res.status === 0) {
+    const ignored = res.stdout
+      .toString('utf8')
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    throw new Error(
+      `build-zip: refusing to run -- ${ignored.length} candidate file(s) are gitignored ` +
+        `(force-added to the index with "git add -f"?) and must never ship in the public ` +
+        `zip:\n  ${ignored.join('\n  ')}`
+    );
+  }
+  if (res.status !== 1) {
+    const stderr = res.stderr ? res.stderr.toString('utf8').trim() : '';
+    throw new Error(`build-zip: "git check-ignore" exited with unexpected status ${res.status}${stderr ? `: ${stderr}` : ''}`);
+  }
+}
+
 // ─── Include-list validation ────────────────────────────────────────────────
 // "refuses to run if the include list contains a path that does not
 // exist" -- every entry is checked up front, and ALL missing entries are
@@ -200,11 +298,26 @@ function computeShaSums(stagedFiles) {
 // SHA256SUMS themselves. Pure side effect (filesystem only) -- no
 // archiving here, so tests can assert on staged content without needing a
 // working platform archiver.
-function stageBuild({ repoRoot, includePaths, offline, version, stageDir }) {
-  const files = [];
-  for (const entry of includePaths) {
-    for (const f of walkEntry(repoRoot, entry, { offline })) {
-      files.push(f);
+//
+// Source of files: BASE_INCLUDE_PATHS is enumerated via listTrackedFiles()
+// (git-index-only -- see file header) and passed through
+// assertNoIgnoredFiles(); OFFLINE_EXTRA_PATHS (scripts/node_modules,
+// --offline only) is the one deliberate filesystem-sourced exception,
+// staged via walkEntry() since it is legitimately untracked/gitignored
+// real npm output, never through the git-tracked gates above.
+function stageBuild({ repoRoot, offline = false, version, stageDir }) {
+  const trackedFiles = listTrackedFiles(repoRoot, BASE_INCLUDE_PATHS, { offline });
+  assertNoIgnoredFiles(
+    repoRoot,
+    trackedFiles.map((f) => f.rel)
+  );
+
+  const files = [...trackedFiles];
+  if (offline) {
+    for (const entry of OFFLINE_EXTRA_PATHS) {
+      for (const f of walkEntry(repoRoot, entry, { offline })) {
+        files.push(f);
+      }
     }
   }
 
@@ -295,7 +408,7 @@ function buildZip({ repoRoot = REPO_ROOT, versionFlag, offline = false, outDir }
 
   const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mm-build-zip-'));
   try {
-    const { stagedFiles } = stageBuild({ repoRoot, includePaths, offline, version, stageDir });
+    const { stagedFiles } = stageBuild({ repoRoot, offline, version, stageDir });
     archive(zipPath, stageDir);
     return { zipPath, version, stagedFiles, stageDir };
   } finally {
@@ -341,9 +454,13 @@ function main() {
 
 module.exports = {
   REPO_ROOT,
+  BASE_INCLUDE_PATHS,
+  OFFLINE_EXTRA_PATHS,
   getIncludePaths,
   isExcludedPath,
   walkEntry,
+  listTrackedFiles,
+  assertNoIgnoredFiles,
   validateIncludePaths,
   resolveVersion,
   computeShaSums,
