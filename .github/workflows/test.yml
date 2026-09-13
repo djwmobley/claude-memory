@@ -1399,6 +1399,19 @@ jobs:
         # Postgres required — every case runs against a scratch project root
         # with no DB config at all.
         run: node test/test-cli-args-fail-closed.js
+      - name: Run installer prerequisite-checker tests (package-and-installer.md §3)
+        # scripts/lib/prereqs.js total classification (PRESENT_OK /
+        # PRESENT_TOO_OLD / ABSENT / UNKNOWN / AMBIGUOUS_PG) plus the
+        # `install.js --check-only` wiring. One fixture per adversary
+        # finding (A1-G2: strict version regex, exit-9009/empty-stdout ->
+        # UNKNOWN never ABSENT, codex code-mode-host functional check,
+        # claude desktop-launcher check, docker info timeout, elevated
+        # installs never auto-run, AMBIGUOUS_PG, password/​.env/idempotency/
+        # pg_dump/epoch-ack/purge-data/hand-edited-hook contracts, gh
+        # optional-never-gates), a >=40-case generated totality table, and
+        # a real `--check-only` subprocess smoke test. No Postgres or
+        # network required — every probe is injected.
+        run: node test/test-prereqs.js
       - name: Run schema suppression_kind ordering tests
         # Regression guard for the suppression_kind CHECK constraint ordering bug (#124):
         #   T1  Field-report repro: apply schema fresh; INSERT one row per suppression_kind
