@@ -79,26 +79,106 @@ const path = require('path');
  */
 function readDiskSchemaEpoch(engineRoot) {
   const manifestPath = path.join(engineRoot, 'scripts', 'sql', 'schema-manifest.json');
-  let raw;
+  // Codex review r2 finding 4 (2026-09-13): the ENTIRE body below is wrapped
+  // in one outer try/catch (which also catches RangeError) as a backstop —
+  // a manifest whose schema_epoch is a pathologically deep nested structure
+  // (e.g. an array nested 20,000 levels) could previously blow the stack
+  // inside JSON.stringify(epoch) below (used only to render the error
+  // string), well AFTER JSON.parse itself had already succeeded. The fix
+  // removes that JSON.stringify call entirely (no recursion over the parsed
+  // value anywhere in this function — a plain `typeof` check is enough to
+  // reject anything that isn't already a number) and this outer catch is
+  // the last line of defense against any other unanticipated throw
+  // (including one from JSON.parse's own native depth limit, on an engine
+  // build where that throws RangeError instead of returning).
   try {
-    raw = fs.readFileSync(manifestPath, 'utf8');
+    let raw;
+    try {
+      raw = fs.readFileSync(manifestPath, 'utf8');
+    } catch (err) {
+      return { ok: false, error: `cannot read ${manifestPath}: ${err.message}` };
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      return { ok: false, error: `cannot parse ${manifestPath}: ${err.message}` };
+    }
+    if (typeof parsed !== 'object' || parsed === null) {
+      return { ok: false, error: `${manifestPath}: parsed manifest is not an object (got ${typeof parsed})` };
+    }
+    const epoch = parsed.schema_epoch;
+    if (typeof epoch !== 'number' || !Number.isSafeInteger(epoch) || epoch < 1) {
+      // Deliberately no JSON.stringify(epoch) here — epoch is untrusted and
+      // may be an arbitrarily deep/large structure; `typeof` never recurses.
+      return {
+        ok: false,
+        error: `${manifestPath}: schema_epoch must be a positive safe integer, got a value of type ${typeof epoch}`,
+      };
+    }
+    return { ok: true, epoch };
   } catch (err) {
-    return { ok: false, error: `cannot read ${manifestPath}: ${err.message}` };
+    return { ok: false, error: `${manifestPath}: unexpected error reading schema epoch: ${err && err.message}` };
   }
-  let parsed;
+}
+
+// Codex review r2 finding 1 (2026-09-13): checkSpawnEngineEpochOrThrow's
+// pre-spawn comparison only ever read the override checkout's
+// schema-manifest.json — a half-updated override whose manifest was bumped
+// to match but whose scripts/handoff.js still declares an OLDER SCHEMA_EPOCH
+// literal would pass that check and still execute. readEngineEpochLiteral
+// reads (at most) the first MAX_HANDOFF_JS_READ_BYTES of the override's own
+// scripts/handoff.js and extracts its `const SCHEMA_EPOCH = <int>;`
+// declaration directly, as TEXT — never by require()'ing/evaluating the
+// file (this module has no business executing an arbitrary override
+// checkout's code just to learn one integer it declares).
+const MAX_HANDOFF_JS_READ_BYTES = 512 * 1024;
+const SCHEMA_EPOCH_LITERAL_RE = /^\s*const SCHEMA_EPOCH\s*=\s*(\d+)\s*;/m;
+
+/**
+ * Reads at most the first MAX_HANDOFF_JS_READ_BYTES bytes of
+ * <engineRoot>/scripts/handoff.js and extracts its SCHEMA_EPOCH literal.
+ * Never throws — every failure mode (missing file, unreadable, no matching
+ * literal in the read window, a non-numeric/non-positive/unsafe match)
+ * returns {ok:false, error}.
+ *
+ * @param {string} engineRoot
+ * @returns {{ok: true, epoch: number} | {ok: false, error: string}}
+ */
+function readEngineEpochLiteral(engineRoot) {
+  const handoffPath = path.join(engineRoot, 'scripts', 'handoff.js');
   try {
-    parsed = JSON.parse(raw);
+    let text;
+    let fd;
+    try {
+      fd = fs.openSync(handoffPath, 'r');
+    } catch (err) {
+      return { ok: false, error: `cannot read ${handoffPath}: ${err.message}` };
+    }
+    try {
+      const buf = Buffer.alloc(MAX_HANDOFF_JS_READ_BYTES);
+      const bytesRead = fs.readSync(fd, buf, 0, MAX_HANDOFF_JS_READ_BYTES, 0);
+      text = buf.toString('utf8', 0, bytesRead);
+    } catch (err) {
+      return { ok: false, error: `cannot read ${handoffPath}: ${err.message}` };
+    } finally {
+      try { fs.closeSync(fd); } catch (_err) { /* best-effort */ }
+    }
+    const match = SCHEMA_EPOCH_LITERAL_RE.exec(text);
+    if (!match) {
+      return {
+        ok: false,
+        error: `cannot find a "const SCHEMA_EPOCH = <int>;" literal in the first ${MAX_HANDOFF_JS_READ_BYTES} bytes of ${handoffPath}`,
+      };
+    }
+    const epoch = Number(match[1]);
+    if (!Number.isSafeInteger(epoch) || epoch < 1) {
+      return { ok: false, error: `${handoffPath}: SCHEMA_EPOCH literal must be a positive safe integer, got "${match[1]}"` };
+    }
+    return { ok: true, epoch };
   } catch (err) {
-    return { ok: false, error: `cannot parse ${manifestPath}: ${err.message}` };
+    return { ok: false, error: `${handoffPath}: unexpected error reading SCHEMA_EPOCH literal: ${err && err.message}` };
   }
-  const epoch = parsed ? parsed.schema_epoch : undefined;
-  if (!Number.isSafeInteger(epoch) || epoch < 1) {
-    return {
-      ok: false,
-      error: `${manifestPath}: schema_epoch must be a positive safe integer, got ${JSON.stringify(epoch)}`,
-    };
-  }
-  return { ok: true, epoch };
 }
 
 // Never let a heal_failed report-only message accidentally read as an
@@ -106,65 +186,134 @@ function readDiskSchemaEpoch(engineRoot) {
 // eslint-disable-next-line no-useless-escape
 const NAMES_INIT_OR_RESUME = /\b(init|resume)\b/i;
 
-// Codex review P2b (2026-09-13): JSON.stringify escapes a real newline/tab/
-// carriage-return inside a string value as the TWO literal characters
-// backslash+letter (e.g. the four characters \, n for a real "\n"). Against
-// the RAW string "Fix: run\ninit" that is a genuine word boundary (a real
-// newline), but against the SERIALIZED string "Fix: run\\ninit" the "n" of
-// the escape and the "n" of "init" are adjacent WORD characters with no
-// boundary between them, so \binit\b silently fails to match. Normalize
-// those three escape sequences to a real space before testing so a remedy
-// word split across an escaped whitespace character cannot slip through.
-function normalizeEscapedWhitespace(str) {
-  return str.replace(/\\[ntr]/g, ' ');
+// Codex review r2 finding 3 (2026-09-13): normalizes BOTH (a) a real control/
+// whitespace character embedded directly in a RAW string value — form feed,
+// vertical tab, NEL, NBSP, line/paragraph separator, any \s — to a plain
+// space, so e.g. the raw string "run\finit" (an actual form-feed byte) reads
+// as "run init" with a genuine word boundary, and (b) a JSON-serialized
+// ESCAPED whitespace sequence — JSON.stringify renders a real newline as the
+// TWO literal characters backslash+n, so "run\ninit" survives serialization
+// as the literal text run\ninit, where the escape's "n" and "init"'s "i" are
+// adjacent word characters with no boundary between them. Both
+// normalizations are applied unconditionally and are each no-ops against
+// text the other doesn't apply to, so one function is safe to use against
+// either a raw string or an already-serialized one.
+const ESCAPED_WHITESPACE_RE = /\\[ntr]/g;
+// eslint-disable-next-line no-control-regex
+const RAW_WHITESPACE_AND_CONTROL_RE = /[\s\u0000-\u001f\u007f\u0085\u00a0\u2028\u2029]+/g;
+
+function normalizeForRemedyScan(str) {
+  return str.replace(ESCAPED_WHITESPACE_RE, ' ').replace(RAW_WHITESPACE_AND_CONTROL_RE, ' ');
 }
 
 function namesInitOrResume(str) {
-  return NAMES_INIT_OR_RESUME.test(normalizeEscapedWhitespace(str));
+  return NAMES_INIT_OR_RESUME.test(normalizeForRemedyScan(str));
 }
 
+// The exact, exhaustive set of `reason` strings scripts/handoff.js's
+// ensureSchemaCurrentCore can return (enumerated 2026-09-13 by grepping every
+// `return { applied: ..., reason: '<x>' }` in that function — see the PR
+// body for the exact grep). Codex review r2 finding 3: healReason is
+// caller-supplied and must be whitelisted before interpolation exactly like
+// detail is redacted — an arbitrary/hostile string (or a value that isn't a
+// string at all, including undefined) is never echoed verbatim.
+const KNOWN_HEAL_REASONS = new Set([
+  'ahead', 'applied', 'apply_failed', 'classification_error', 'current',
+  'degraded', 'integrity_index_failed', 'lock_acquire_failed',
+  'manifest_error', 'unknown', 'verification_failed', 'verification_probe_failed',
+]);
+
+function safeHealReason(reason) {
+  return KNOWN_HEAL_REASONS.has(reason) ? reason : 'unknown_reason';
+}
+
+const MAX_DETAIL_WALK_DEPTH = 8;
+
 /**
- * If `detail` (or any of its own top-level key names) mentions "init" or
- * "resume" anywhere — e.g. a lower-level error message that itself
- * suggested `handoff.js init`, OR a key literally named after one of those
- * verbs — replace the ENTIRE detail with a bare redaction stub (no key
- * list, no fragment of the original content) before it is interpolated
- * into a report-only message. Codex review P2b (2026-09-13): the prior
- * version's `{redacted: true, keys}` shape copied the original UNSANITIZED
- * key names into the replacement, which could itself contain the remedy
- * text (a key literally named "run handoff.js init"). There is no safe
- * subset of a matching detail to preserve, so a match redacts everything.
- * Serialization failure (BigInt, a circular reference, or anything else
- * JSON.stringify cannot handle) is treated as its OWN redaction reason —
- * P2c requires this function to never throw and never pass an
- * unserializable value through.
+ * Recursively walks `value` over its OWN enumerable properties only —
+ * Codex review r2 finding 3: deliberately NEVER via JSON.stringify/toJSON.
+ * A stateful toJSON() (safe text on one call, remedy text on the next) must
+ * never be trusted for detection; only the real own-property structure is
+ * inspected here, so this cannot be fooled by a toJSON() that lies about the
+ * object's own shape. Arrays are included (their own enumerable index
+ * properties). Depth-capped at MAX_DETAIL_WALK_DEPTH — a value nested deeper
+ * than that simply stops being inspected (never treated as a match, never
+ * recursed into further) — and cycle-safe via a Set of already-visited
+ * objects (a repeat visit returns false immediately rather than looping).
+ * A throwing getter for one property is skipped (not a match, not a crash);
+ * the walk continues over the object's other properties.
  */
-function redactDetailIfNamesRemedy(detail) {
-  if (detail === undefined || detail === null) return detail;
-  let asString;
+function detailNamesRemedy(value, depth, seen) {
+  if (typeof value === 'string') return namesInitOrResume(value);
+  if (value === null || typeof value !== 'object') return false;
+  if (depth > MAX_DETAIL_WALK_DEPTH) return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  let keys;
   try {
-    asString = JSON.stringify(detail);
+    keys = Object.keys(value);
   } catch (_err) {
-    return { redacted: true, reason: 'unserializable' };
+    return false;
   }
-  if (typeof asString !== 'string') return { redacted: true, reason: 'unserializable' };
+  for (const key of keys) {
+    if (typeof key === 'string' && namesInitOrResume(key)) return true;
+    let child;
+    try {
+      child = value[key];
+    } catch (_err) {
+      continue;
+    }
+    if (detailNamesRemedy(child, depth + 1, seen)) return true;
+  }
+  return false;
+}
 
-  if (namesInitOrResume(asString)) return { redacted: true };
-
-  // Defense in depth: also scan each own top-level key independently (the
-  // whole-string scan above already covers this in the common case, since
-  // JSON.stringify emits key names as quoted substrings of asString, but a
-  // key scan makes the "any key" requirement explicit and keeps working
-  // even if the whole-string scan's normalization ever diverges).
-  let keys = [];
+function safeStringifyOnce(value) {
   try {
-    if (typeof detail === 'object' && !Array.isArray(detail)) keys = Object.keys(detail);
+    const text = JSON.stringify(value);
+    return typeof text === 'string' ? { ok: true, text } : { ok: false };
   } catch (_err) {
-    keys = [];
+    return { ok: false };
   }
-  if (keys.some((k) => namesInitOrResume(k))) return { redacted: true };
+}
 
-  return detail;
+const REDACTED_DETAIL_TEXT = '{"redacted":true}';
+
+/**
+ * Produces the exact `, detail: <json>` suffix for a report-only
+ * heal_failed message (or '' when detail is absent). Codex review r2
+ * finding 3: the prior implementation called JSON.stringify(detail) TWICE —
+ * once (via redactDetailIfNamesRemedy) to test for a match, once more (in
+ * healFailedMessage) to render the output — so a stateful toJSON() could
+ * return safe text on the first call and the remedy on the second, emitting
+ * it unchanged. This version calls JSON.stringify on the ORIGINAL detail AT
+ * MOST ONCE, ever:
+ *   1. First, the raw-structure walk above (which never touches toJSON) —
+ *      if it finds a match, detail is redacted WITHOUT ever serializing the
+ *      original at all.
+ *   2. Only if step 1 finds nothing: serialize `detail` exactly once. If
+ *      that single call throws (BigInt, a circular reference, anything else
+ *      JSON.stringify cannot handle), the result is the unserializable stub.
+ *      Otherwise, the ONE string that call produced is tested for a remedy
+ *      word (covering a toJSON() whose OUTPUT — not its raw own-properties —
+ *      names one) and, if it matches, that string is discarded (never
+ *      re-stringified, never partially emitted) in favor of the bare stub.
+ */
+function sanitizeDetailForMessage(detail) {
+  if (detail === undefined || detail === null) return '';
+
+  if (detailNamesRemedy(detail, 0, new Set())) {
+    return `, detail: ${REDACTED_DETAIL_TEXT}`;
+  }
+
+  const serialized = safeStringifyOnce(detail);
+  if (!serialized.ok) {
+    return ', detail: {"redacted":true,"reason":"unserializable"}';
+  }
+  if (namesInitOrResume(serialized.text)) {
+    return `, detail: ${REDACTED_DETAIL_TEXT}`;
+  }
+  return `, detail: ${serialized.text}`;
 }
 
 /**
@@ -175,28 +324,19 @@ function redactDetailIfNamesRemedy(detail) {
  * post-ensureSchemaCurrent call site, when the manifest is unreadable and
  * therefore contributes no epoch signal) can still render the SAME wording
  * from the SAME reason/detail, rather than a second hand-written string.
+ * No string from `detail` or `reason` reaches the returned message except
+ * through sanitizeDetailForMessage (detail) and safeHealReason (reason).
  *
  * @param {string|undefined} reason
  * @param {object|undefined} detail
  * @returns {string}
  */
 function healFailedMessage(reason, detail) {
-  const safeDetail = redactDetailIfNamesRemedy(detail);
-  let detailSuffix = '';
-  if (safeDetail !== undefined && safeDetail !== null) {
-    // P2c: redactDetailIfNamesRemedy already guarantees safeDetail is either
-    // the original (proven-serializable, non-remedy-naming) detail or a
-    // trivially-serializable {redacted:true[, reason]} stub — but stringify
-    // it defensively anyway so this function itself can never throw.
-    try {
-      detailSuffix = `, detail: ${JSON.stringify(safeDetail)}`;
-    } catch (_err) {
-      detailSuffix = ', detail: {"redacted":true,"reason":"unserializable"}';
-    }
-  }
+  const safeReason = safeHealReason(reason);
+  const detailSuffix = sanitizeDetailForMessage(detail);
   return (
     `handoff MCP: schema is not current for this project DB and the automatic bring-forward did not ` +
-    `succeed (reason: ${reason}${detailSuffix}). Report-only: no command is offered; this state needs a maintainer.`
+    `succeed (reason: ${safeReason}${detailSuffix}). Report-only: no command is offered; this state needs a maintainer.`
   );
 }
 
@@ -323,4 +463,9 @@ module.exports = {
   // part of the two required exports, but the SAME function classifyEpochDrift
   // uses internally, never a second implementation.
   healFailedMessage,
+  // Codex review r2 finding 1: the SAME literal-extraction helper
+  // handoff-mcp.mjs's checkSpawnEngineEpochOrThrow uses to validate a
+  // HANDOFF_MCP_ENGINE_PATH override's own scripts/handoff.js, exposed for
+  // direct unit coverage — no second implementation.
+  readEngineEpochLiteral,
 };

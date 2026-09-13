@@ -11426,13 +11426,11 @@ async function main() {
   // host process — only main()'s own CLI dispatch (require.main === module)
   // reaches this.
   //
-  // One exemption plus one downgrade, both mirroring the SAME
-  // read-only-vs-write split scripts/lib/cli-args.js's own WRITE_SUBCOMMANDS
-  // already draws (that module's header: "Read-only subcommands (status,
-  // resume, loader-load, loader-hook, loader-stop, resurrect) ... --help/-h
-  // consistency for those is a non-mandatory nice-to-have"):
-  //   - a bare --help/-h invocation: a diagnostic no-op with no side effect
-  //     should still work against a broken checkout. Fully exempt.
+  // ONE downgrade only (Codex review r2 finding 2, 2026-09-13: the PRIOR
+  // "--help/-h" exemption is REMOVED — this check now runs on EVERY
+  // invocation that reaches this line, whether or not the caller also
+  // passed --help/-h). Mirrors the SAME read-only-vs-write split
+  // scripts/lib/cli-args.js's own WRITE_SUBCOMMANDS already draws:
   //   - loader-hook/loader-stop: the SessionStart/SessionEnd hook entry
   //     points install.js wires into EVERY Claude Code / Codex session
   //     automatically (hooks/hooks.json, install.js's EVENT_FOR_VERB) —
@@ -11454,8 +11452,22 @@ async function main() {
   //     intentionally has no scripts/sql/schema-manifest.json at all (it
   //     tests asset-path resolution, not schema state) — that fixture now
   //     warns on stderr instead of being skipped, and must still pass.
+  //
+  // Why the --help exemption was wrong: it let e.g. `status --help` or
+  // `resume -h` skip this check entirely and fall through to
+  // enforceTotalClassification (below), whose own total classification
+  // returns immediately for an uncovered command+flag combination rather
+  // than blocking it — so the subcommand's REAL handler (cmdStatus,
+  // cmdResume, ...) still ran against a checkout this guard exists to
+  // reject. There is no side-effect-free "--help" fast path anywhere below
+  // this line for an already-dispatched subcommand, so there is nothing
+  // for the exemption to safely protect. (A bare `handoff.js --help` with
+  // NO valid subcommand at all never reaches this line in the first place —
+  // the router's own `!subcommands[sub]` usage check above already printed
+  // usage and called `process.exit(2)`; that is pre-existing router
+  // behavior this guard does not touch either way.)
   const CLI_SELF_CONSISTENCY_WARN_ONLY_SUBCOMMANDS = new Set(['loader-hook', 'loader-stop']);
-  if (!rest.includes('--help') && !rest.includes('-h')) {
+  {
     const { readDiskSchemaEpoch } = require('./lib/schema-epoch-guard.js');
     const diskResult = readDiskSchemaEpoch(_ENGINE_ROOT);
     if (!diskResult.ok || diskResult.epoch !== SCHEMA_EPOCH) {

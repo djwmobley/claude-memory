@@ -35,10 +35,12 @@
  *       is reflected on the very next call.
  *   T11 engine_checkout_inconsistent (loaded 6, disk 5).
  *   T12 a healDetail object naming "init"/"resume" — in its value, in a KEY
- *       name, split across an escaped newline, or nested inside a child
- *       object — is redacted to the bare `{redacted:true}` stub (no key
- *       list, no fragment of the original content survives a match) before
- *       it reaches the heal_failed message.
+ *       name (including a key that IS exactly "init"), split across an
+ *       escaped newline or a REAL form-feed/vertical-tab/NBSP character, in
+ *       a toJSON() return value (not just the object's own raw properties),
+ *       or nested inside a child object — is redacted to the bare
+ *       `{redacted:true}` stub (no key list, no fragment of the original
+ *       content survives a match) before it reaches the heal_failed message.
  *   T13 live stdio MCP regression: a real handoff-mcp.mjs process, running
  *       from a throwaway copy of the engine whose on-disk schema-manifest.json
  *       is bumped AFTER the server starts (so the server's in-memory
@@ -55,6 +57,17 @@
  *       scripts/node_modules to exist (see "Install dependencies" in
  *       .github/workflows/test.yml, working-directory: scripts); SKIPs with
  *       a clear reason if that directory is absent.
+ *   T13b same stale-engine scratch setup as T13, but calls a DIRECT-PG (§8
+ *       withProjectDb) tool, assertion_read, instead of a spawn-based one —
+ *       T13 alone never proved withProjectDb's own call-site-1 guard runs,
+ *       since handoff_status never calls withProjectDb/connectForRoot.
+ *   T13c a HANDOFF_MCP_ENGINE_PATH override whose schema-manifest.json
+ *       matches the server's own loaded epoch (what the pre-fix check only
+ *       ever compared) but whose OWN scripts/handoff.js declares a
+ *       DIFFERENT SCHEMA_EPOCH literal (a half-updated override) is
+ *       rejected before handoff_status's spawn call site runs — proven by
+ *       the override's sentinel handoff.js, which writes a marker file the
+ *       instant it is actually executed, never having written it.
  *   T14 main() CLI dispatch, loader-hook: an inconsistent scratch engine now
  *       WARNS on stderr ("handoff: WARNING engine checkout is internally
  *       inconsistent ...") and still exits 0, with stdout byte-identical to
@@ -68,11 +81,19 @@
  *       text, no "WARNING") — proves the downgrade is scoped to
  *       loader-hook/loader-stop only. T14-T16 share T13's SKIP-if-absent
  *       scripts/node_modules gate.
+ *   T17 main() CLI dispatch, status --help / resume -h: the REMOVED
+ *       --help/-h exemption on the same self-consistency check — a
+ *       subcommand invoked WITH --help/-h now hard-fails on an inconsistent
+ *       engine exactly like the bare subcommand does.
+ *   T18 readDiskSchemaEpoch: a manifest whose schema_epoch is a valid-JSON
+ *       array nested 20,000 levels deep -> ok:false, never throws (the
+ *       fixed implementation never calls JSON.stringify on an untrusted
+ *       parsed value).
  *
  * No live Postgres required — every test here is pure or filesystem-only
- * (T13 spawns a real process but never opens a database connection, since
- * the guard rejects before withProjectDb/runNode's DB-touching paths run).
- * Exit 0 = all run tests passed.
+ * (T13/T13b/T13c spawn a real process but never open a database connection,
+ * since the guard rejects before withProjectDb/runNode's DB-touching paths
+ * run). Exit 0 = all run tests passed.
  */
 
 const fs = require('fs');
@@ -409,6 +430,38 @@ function testT11_EngineCheckoutInconsistent() {
   } catch (err) { fail(label, err.message); }
 }
 
+// ── T18: readDiskSchemaEpoch — pathologically nested manifest value ───────
+
+function testT18_NestedArrayManifestNeverThrows() {
+  const label = 'T18: readDiskSchemaEpoch — schema_epoch as a 20,000-deep nested array -> ok:false, never throws';
+  try {
+    withScratchManifestDir((dir, manifestPath) => {
+      // Codex review r2 finding 4 (2026-09-13): a valid-JSON manifest whose
+      // schema_epoch is an array nested 20,000 levels deep parses
+      // successfully, then previously threw "Maximum call stack size
+      // exceeded" (RangeError) inside the OLD implementation's
+      // JSON.stringify(epoch) call — used only to render the error string
+      // for an already-known-malformed value. Written as raw text (never
+      // via JSON.stringify/nested JS array construction) so building the
+      // FIXTURE itself cannot also blow this test's own stack.
+      const depth = 20000;
+      const manifestText = `{"schema_epoch": ${'['.repeat(depth)}${']'.repeat(depth)}}`;
+      fs.writeFileSync(manifestPath, manifestText, 'utf8');
+      let result;
+      let thrown = null;
+      try {
+        result = readDiskSchemaEpoch(dir);
+      } catch (err) {
+        thrown = err;
+      }
+      assertTrue(thrown === null, `readDiskSchemaEpoch must never throw; threw: ${thrown && thrown.message}`);
+      assertEqual(result.ok, false, 'a nested-array schema_epoch must be ok:false');
+      assertTrue(typeof result.error === 'string' && result.error.length > 0, 'ok:false must carry a string error');
+    });
+    pass(label);
+  } catch (err) { fail(label, err.message); }
+}
+
 // ── T12: detail redaction ────────────────────────────────────────────────
 
 function testT12_DetailRedaction() {
@@ -461,6 +514,52 @@ function testT12_DetailRedaction() {
     const cleanDetail = { message: 'ddl failed', code: 'X2' };
     const cleanMsg = healFailedMessage('apply_failed', cleanDetail);
     assertMatch(cleanMsg, /"message":"ddl failed"/);
+
+    // Codex review r2 finding 3 (2026-09-13): a remedy word split across a
+    // REAL (not escaped) form-feed character. JSON.stringify would render
+    // this as the two literal characters backslash+f in the OLD
+    // implementation's serialize-then-regex approach, but the new
+    // raw-structure walk sees the actual 0x0C byte directly and must
+    // normalize it to a real word boundary before the \binit\b test.
+    const formFeedDetail = { message: 'run\finit' };
+    const formFeedMsg = healFailedMessage('apply_failed', formFeedDetail);
+    assertMatch(formFeedMsg, /"redacted":true/);
+    assertNoMatch(formFeedMsg, /run/);
+
+    // Same, with a real vertical-tab character (0x0B).
+    const vtabDetail = { message: 'run\vinit' };
+    const vtabMsg = healFailedMessage('apply_failed', vtabDetail);
+    assertMatch(vtabMsg, /"redacted":true/);
+    assertNoMatch(vtabMsg, /run/);
+
+    // Same, with a real non-breaking space (U+00A0) — not covered by \s in
+    // some regex engines/flags, which is exactly why this normalizer lists
+    // it explicitly rather than relying on \s alone.
+    const nbspDetail = { message: 'run init' };
+    const nbspMsg = healFailedMessage('apply_failed', nbspDetail);
+    assertMatch(nbspMsg, /"redacted":true/);
+    assertNoMatch(nbspMsg, /run/);
+
+    // A key literally named "init" (the whole key, not a phrase containing
+    // it) must also be redacted — exercises the exact-word key scan, not
+    // just a key that happens to contain "init" inside a longer phrase.
+    const bareKeyDetail = { init: 'this value on its own says nothing' };
+    const bareKeyMsg = healFailedMessage('apply_failed', bareKeyDetail);
+    assertMatch(bareKeyMsg, /"redacted":true/);
+    assertNoMatch(bareKeyMsg, /"init"/);
+    assertNoMatch(bareKeyMsg, /this value on its own/);
+
+    // Codex review r2 finding 3's THIRD escape (the one the raw-structure
+    // walk alone cannot see, by design — it deliberately ignores toJSON):
+    // an object whose real own properties name nothing, but whose toJSON()
+    // OUTPUT contains "resume". The walk finds no match; the single
+    // safe-stringify-once call (which DOES invoke toJSON, exactly once)
+    // must catch this from that one result before it is ever emitted.
+    const toJsonDetail = { toJSON() { return 'contains the word resume in here'; } };
+    const toJsonMsg = healFailedMessage('apply_failed', toJsonDetail);
+    assertMatch(toJsonMsg, /"redacted":true/);
+    assertNoMatch(toJsonMsg, /contains the word resume/);
+
     pass(label);
   } catch (err) { fail(label, err.message); }
 }
@@ -610,6 +709,160 @@ async function testT13_LiveStdioStaleEngine() {
   }
 }
 
+// Codex review r2 finding 5 (2026-09-13): T13 above only ever exercised
+// handoff_status, a SPAWN-based (runNode) tool — it never calls
+// withProjectDb/connectForRoot at all, so it could not prove the DIRECT-PG
+// call-site-1 guard (withProjectDb's own checkEngineEpochOrThrow, called
+// BEFORE connectForRoot) actually runs for the §8 direct-PG tool surface
+// (assertion_read, memory_search, ...). This is the same stale-engine
+// scratch setup as T13, but calls assertion_read instead — same
+// unreachable-DB distinguishing proof (no pg-connection-error vocabulary
+// anywhere in the response) applies identically.
+async function testT13b_LiveStdioDirectPgToolStaleEngine() {
+  const label = 'T13b: live stdio MCP — direct-PG tool (assertion_read) also rejects stale engine before connecting';
+  const nodeModulesDir = path.join(PROJECT_ROOT, 'scripts', 'node_modules');
+  if (!fs.existsSync(nodeModulesDir)) {
+    skip(label, 'scripts/node_modules absent — run `pnpm install --frozen-lockfile` in scripts/ first (see .github/workflows/test.yml\'s "Install dependencies" step)');
+    return;
+  }
+  let scratch = null;
+  let unreachableProjectRoot = null;
+  let client = null;
+  try {
+    scratch = buildScratchEngineCopy();
+    unreachableProjectRoot = buildUnreachableDbProjectRoot();
+
+    const childEnv = { ...process.env };
+    delete childEnv.CLAUDE_PLUGIN_ROOT;
+    delete childEnv.HANDOFF_MCP_ENGINE_PATH;
+
+    client = await connectMcp(path.join(scratch.scratchScripts, 'handoff-mcp.mjs'), childEnv);
+
+    const manifest = JSON.parse(fs.readFileSync(scratch.manifestPath, 'utf8'));
+    const loadedEpoch = manifest.schema_epoch;
+    manifest.schema_epoch = loadedEpoch + 1;
+    fs.writeFileSync(scratch.manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
+
+    const res = await client.callTool({
+      name: 'assertion_read',
+      arguments: { projectRoot: unreachableProjectRoot },
+    });
+    if (!res.isError) {
+      fail(label, `expected an isError tool result, got success: ${JSON.stringify(res).slice(0, 300)}`);
+      return;
+    }
+    const text = res.content && res.content[0] && res.content[0].text;
+    assertMatch(text, /stale engine build/i);
+    assertMatch(text, new RegExp(`loaded schema epoch ${loadedEpoch}`));
+    assertMatch(text, new RegExp(`on disk ${loadedEpoch + 1}`));
+    assertNoMatch(text, /ECONNREFUSED|ETIMEDOUT|ENOTFOUND|connect ECONNREFUSED|Connection terminated|client password/i);
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    if (client) { try { await client.close(); } catch (_err) { /* best-effort */ } }
+    if (scratch) { try { fs.rmSync(scratch.scratchRoot, { recursive: true, force: true }); } catch (_err) { /* best-effort */ } }
+    if (unreachableProjectRoot) { try { fs.rmSync(unreachableProjectRoot, { recursive: true, force: true }); } catch (_err) { /* best-effort */ } }
+  }
+}
+
+/**
+ * Builds a throwaway "override" engine checkout for the
+ * HANDOFF_MCP_ENGINE_PATH sentinel test below: its schema-manifest.json
+ * declares `matchingEpoch` (matching the scratch SERVER's own loaded
+ * epoch — exactly what the OLD, pre-fix checkSpawnEngineEpochOrThrow only
+ * ever checked, and would therefore have ACCEPTED), but its scripts/
+ * handoff.js sentinel script declares a DIFFERENT SCHEMA_EPOCH literal —
+ * reproducing the Codex review r2 finding 1 counterexample (a half-updated
+ * override: manifest bumped to match, handoff.js not) that the NEW
+ * literal-extraction check must catch. The sentinel script itself writes
+ * markerPath the instant it is actually executed, then exits immediately —
+ * proving (by the marker's absence) that the rejected call never reached
+ * the spawn call site at all.
+ */
+function buildSentinelOverrideEngine(matchingEpoch) {
+  const sentinelRoot = path.join(os.tmpdir(), `epoch-guard-sentinel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  const sentinelScripts = path.join(sentinelRoot, 'scripts');
+  fs.mkdirSync(path.join(sentinelScripts, 'sql'), { recursive: true });
+  fs.writeFileSync(
+    path.join(sentinelScripts, 'sql', 'schema-manifest.json'),
+    JSON.stringify({ schema_epoch: matchingEpoch }, null, 2),
+    'utf8'
+  );
+  const markerPath = path.join(sentinelRoot, 'executed.marker');
+  const mismatchedLiteral = matchingEpoch + 1;
+  const sentinelHandoffJs = [
+    "'use strict';",
+    `const SCHEMA_EPOCH = ${mismatchedLiteral};`,
+    "const fs = require('fs');",
+    `fs.writeFileSync(${JSON.stringify(markerPath)}, 'executed\\n');`,
+    'process.exit(0);',
+    '',
+  ].join('\n');
+  const sentinelHandoffPath = path.join(sentinelScripts, 'handoff.js');
+  fs.writeFileSync(sentinelHandoffPath, sentinelHandoffJs, 'utf8');
+  return { sentinelRoot, sentinelHandoffPath, markerPath, mismatchedLiteral };
+}
+
+// Codex review r2 finding 1 (2026-09-13): proves checkSpawnEngineEpochOrThrow
+// rejects a HANDOFF_MCP_ENGINE_PATH override whose manifest matches the
+// server but whose own scripts/handoff.js literal does not — BEFORE the
+// spawn call site ever runs. Uses a CONSISTENT scratch server (no manifest
+// bump on the server's own checkout) so checkEngineEpochOrThrow (the
+// _ENGINE_ROOT check) passes cleanly and only checkSpawnEngineEpochOrThrow
+// (the override check) is under test.
+async function testT13c_SpawnToolSentinelOverrideRejected() {
+  const label = 'T13c: live stdio MCP — HANDOFF_MCP_ENGINE_PATH override with a mismatched handoff.js literal is rejected before spawn';
+  const nodeModulesDir = path.join(PROJECT_ROOT, 'scripts', 'node_modules');
+  if (!fs.existsSync(nodeModulesDir)) {
+    skip(label, 'scripts/node_modules absent — run `pnpm install --frozen-lockfile` in scripts/ first (see .github/workflows/test.yml\'s "Install dependencies" step)');
+    return;
+  }
+  let scratch = null;
+  let sentinel = null;
+  let client = null;
+  try {
+    scratch = buildScratchEngineCopy();
+    const scratchManifest = JSON.parse(fs.readFileSync(scratch.manifestPath, 'utf8'));
+    sentinel = buildSentinelOverrideEngine(scratchManifest.schema_epoch);
+
+    const childEnv = { ...process.env };
+    delete childEnv.CLAUDE_PLUGIN_ROOT;
+    // The override under test — set BEFORE the server starts, exactly like
+    // a real deployment would set it in the MCP server's own launch config.
+    childEnv.HANDOFF_MCP_ENGINE_PATH = sentinel.sentinelHandoffPath;
+
+    client = await connectMcp(path.join(scratch.scratchScripts, 'handoff-mcp.mjs'), childEnv);
+
+    const res = await client.callTool({
+      name: 'handoff_status',
+      arguments: { projectRoot: PROJECT_ROOT },
+    });
+    if (!res.isError) {
+      fail(label, `expected an isError tool result, got success: ${JSON.stringify(res).slice(0, 300)}`);
+      return;
+    }
+    const text = res.content && res.content[0] && res.content[0].text;
+    assertMatch(text, /HANDOFF_MCP_ENGINE_PATH/);
+    assertMatch(text, new RegExp(`SCHEMA_EPOCH ${sentinel.mismatchedLiteral}`));
+    assertMatch(text, new RegExp(`schema-manifest\\.json epoch ${scratchManifest.schema_epoch}`));
+
+    // The distinguishing proof: the sentinel's own marker file must be
+    // ABSENT — if checkSpawnEngineEpochOrThrow's rejection had somehow run
+    // AFTER the spawn call site (or not at all), the sentinel script would
+    // have actually executed and written this file.
+    assertTrue(!fs.existsSync(sentinel.markerPath), 'sentinel override script must never have been spawned');
+
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    if (client) { try { await client.close(); } catch (_err) { /* best-effort */ } }
+    if (scratch) { try { fs.rmSync(scratch.scratchRoot, { recursive: true, force: true }); } catch (_err) { /* best-effort */ } }
+    if (sentinel) { try { fs.rmSync(sentinel.sentinelRoot, { recursive: true, force: true }); } catch (_err) { /* best-effort */ } }
+  }
+}
+
 // ── T14-T16: main() CLI dispatch — warn-vs-fail split ─────────────────────
 //
 // fix/mcp-stale-engine-gate follow-up: loader-hook/loader-stop no longer
@@ -752,6 +1005,49 @@ function testT16_StatusStillHardFails() {
   }
 }
 
+// Codex review r2 finding 2 (2026-09-13): the PRIOR --help/-h exemption on
+// this same self-consistency check let e.g. `status --help` skip the check
+// entirely and fall through into cmdStatus's real handler against a broken
+// checkout. That exemption is now REMOVED — this proves a subcommand
+// invoked WITH --help hard-fails exactly like the bare subcommand does.
+function testT17_SubcommandHelpFlagStillChecked() {
+  const label = 'T17: status --help — inconsistent engine still hard-fails (no --help exemption)';
+  const nodeModulesDir = path.join(PROJECT_ROOT, 'scripts', 'node_modules');
+  if (!fs.existsSync(nodeModulesDir)) {
+    skip(label, 'scripts/node_modules absent — run `pnpm install --frozen-lockfile` in scripts/ first (see .github/workflows/test.yml\'s "Install dependencies" step)');
+    return;
+  }
+  let scratch = null;
+  let emptyProjectDir = null;
+  try {
+    scratch = buildScratchEngineCopy();
+    emptyProjectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'epoch-guard-t17-project-'));
+
+    const manifest = JSON.parse(fs.readFileSync(scratch.manifestPath, 'utf8'));
+    const loadedEpoch = manifest.schema_epoch;
+    manifest.schema_epoch = loadedEpoch + 1;
+    fs.writeFileSync(scratch.manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
+
+    const result = runScratchCli(scratch.scratchScripts, ['status', '--help'], emptyProjectDir);
+    assertTrue(result.status !== 0, `status --help must hard-fail on an inconsistent engine; got exit ${result.status}`);
+    const stderr = result.stderr?.toString() ?? '';
+    assertMatch(stderr, /handoff: engine checkout is internally inconsistent/);
+    assertNoMatch(stderr, /WARNING/);
+
+    // A bare -h on a different subcommand, same shape.
+    const resultDashH = runScratchCli(scratch.scratchScripts, ['resume', '-h'], emptyProjectDir);
+    assertTrue(resultDashH.status !== 0, `resume -h must hard-fail on an inconsistent engine; got exit ${resultDashH.status}`);
+    assertMatch(resultDashH.stderr?.toString() ?? '', /handoff: engine checkout is internally inconsistent/);
+
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    if (scratch) { try { fs.rmSync(scratch.scratchRoot, { recursive: true, force: true }); } catch (_err) { /* best-effort */ } }
+    if (emptyProjectDir) { try { fs.rmSync(emptyProjectDir, { recursive: true, force: true }); } catch (_err) { /* best-effort */ } }
+  }
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -770,9 +1066,13 @@ async function main() {
   testT11_EngineCheckoutInconsistent();
   testT12_DetailRedaction();
   await testT13_LiveStdioStaleEngine();
+  await testT13b_LiveStdioDirectPgToolStaleEngine();
+  await testT13c_SpawnToolSentinelOverrideRejected();
   testT14_LoaderHookWarnsNotFails();
   testT15_LoaderStopWarnsNotFails();
   testT16_StatusStillHardFails();
+  testT17_SubcommandHelpFlagStillChecked();
+  testT18_NestedArrayManifestNeverThrows();
 
   console.log('');
   console.log(`Results: ${passed} passed, ${failed} failed, ${skipped} skipped`);

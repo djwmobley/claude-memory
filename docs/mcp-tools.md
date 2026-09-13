@@ -120,35 +120,56 @@ healReason, dbEpoch)` combination maps to exactly one of these branches.
 dispatch runs the same "does this checkout agree with itself" check
 (`readDiskSchemaEpoch` vs. the loaded `SCHEMA_EPOCH`, the same question the
 `engine_checkout_inconsistent` branch above answers for the MCP server) for
-every one-shot CLI invocation. Every subcommand hard-fails (exit 1) on a
-mismatch except the SessionStart/SessionEnd hook entry points,
-`loader-hook`/`loader-stop`, and a bare `--help`/`-h`: those two hooks still
-run the check but only WARN on stderr (never stdout — the host injects
+every one-shot CLI invocation, on EVERY subcommand, whether or not the
+caller also passed `--help`/`-h` — there is no `--help` exemption. Every
+subcommand hard-fails (exit 1) on a mismatch except the SessionStart/
+SessionEnd hook entry points, `loader-hook`/`loader-stop`, which still run
+the check but only WARN on stderr (never stdout — the host injects
 `loader-hook`'s stdout into session context) and continue, since an
 automatic hook must never hard-fail a session's start or end over an
-engine-checkout problem nobody has explicitly asked it to look at.
+engine-checkout problem nobody has explicitly asked it to look at. (An
+EARLIER version of this check exempted a bare `--help`/`-h` entirely —
+removed 2026-09-13, Codex review r2 finding 2: the exemption let e.g.
+`status --help`/`resume -h` skip straight past this guard into their real
+handler against a checkout this guard exists to reject, since
+`enforceTotalClassification` itself returns immediately for an uncovered
+flag rather than blocking it. Separately, and unrelated to this guard: a
+bare `handoff.js --help`/`-h` with NO valid subcommand at all still exits
+**2** via the router's own `!subcommands[sub]` usage check, which runs
+BEFORE this guard is ever reached.)
 
-**`HANDOFF_MCP_ENGINE_PATH` divergence rule (Codex review P1a,
-2026-09-13).** The table above and `checkEngineEpochOrThrow` both validate
-only the checkout THIS server process required at startup (`_ENGINE_ROOT`).
-Every spawn-based tool (`handoff_status`/`handoff_resume`/
-`handoff_checkpoint`/`handoff_close`/`handoff_init`) launches `ENGINE_PATH`
-instead, which is `HANDOFF_MCP_ENGINE_PATH` when that env var is set — a
-completely independent checkout this server never required. A SEPARATE
-pre-spawn check, `checkSpawnEngineEpochOrThrow`, covers that case: when
+**`HANDOFF_MCP_ENGINE_PATH` divergence rule (Codex review P1a, 2026-09-13;
+hardened by Codex review r2 finding 1, 2026-09-13).** The table above and
+`checkEngineEpochOrThrow` both validate only the checkout THIS server
+process required at startup (`_ENGINE_ROOT`). Every spawn-based tool
+(`handoff_status`/`handoff_resume`/`handoff_checkpoint`/`handoff_close`/
+`handoff_init`) launches `ENGINE_PATH` instead, which is
+`HANDOFF_MCP_ENGINE_PATH` when that env var is set — a completely
+independent checkout this server never required. A SEPARATE pre-spawn
+check, `checkSpawnEngineEpochOrThrow`, covers that case: when
 `HANDOFF_MCP_ENGINE_PATH`'s directory resolves to the SAME root as
 `_ENGINE_ROOT` it is a no-op (already covered above); when it resolves to a
-DIFFERENT root, that checkout's own on-disk `schema_epoch` is read fresh
-and compared against this server's own loaded `SCHEMA_EPOCH` — if the
-manifest is unreadable/malformed OR the epoch differs in EITHER direction,
-the call is rejected with an explicit "point the override at the same
-engine build as the server, or unset it and restart the MCP server" error,
-before any temp file is written or child process is spawned. Unlike the
-four-branch table above (which arbitrates a loaded/disk/database
-three-way using the database's stored epoch as independent evidence), this
-check has no third source of truth to arbitrate two DIFFERENT engine
-checkouts against each other, so it does not sub-classify the mismatch —
-any divergence is rejected outright and the caller must reconcile the two
+DIFFERENT root, the call proceeds only when ALL THREE of the following
+agree: (1) the override's `schema-manifest.json` is readable and its
+`schema_epoch` equals this server's own loaded `SCHEMA_EPOCH`; (2) the
+override's OWN `scripts/handoff.js` `SCHEMA_EPOCH` literal is extractable
+(`readEngineEpochLiteral` — read as TEXT, at most the first 512 KB, never
+required/evaluated); and (3) that literal equals the override's own
+manifest epoch from (1). An earlier version of this check compared only the
+override's manifest against the server's epoch, which let a HALF-UPDATED
+override — a manifest bumped to match, but a `scripts/handoff.js` still
+declaring an older `SCHEMA_EPOCH` literal — pass and still execute; a
+checkout that disagrees with ITSELF is exactly as dangerous as one that
+disagrees with the server, since spawning it runs whichever number its
+actual code believes. Any failure to read either number, or either pair
+disagreeing, rejects with a message naming which specific number(s) could
+not be read or disagreed, before any temp file is written or child process
+is spawned. Unlike the four-branch table above (which arbitrates a
+loaded/disk/database three-way using the database's stored epoch as
+independent evidence), this check has no third source of truth to
+arbitrate two DIFFERENT engine checkouts against each other, so it does not
+sub-classify the mismatch beyond naming the disagreeing numbers — any
+divergence is rejected outright and the caller must reconcile the two
 checkouts (or unset the override) itself.
 
 **pgvector-gated columns — loud, not silent.** `assertions.embedding` and

@@ -61,7 +61,7 @@ const { ensureSchemaCurrent, SCHEMA_EPOCH, _ENGINE_ROOT } = require('./handoff.j
 // "the checkout is broken" from "the engine build itself needs upgrading"
 // from every other heal failure (report-only) — see that module's header
 // for the full incident writeup and the four-branch rule set.
-const { readDiskSchemaEpoch, classifyEpochDrift, healFailedMessage } = require('./lib/schema-epoch-guard.js');
+const { readDiskSchemaEpoch, classifyEpochDrift, healFailedMessage, readEngineEpochLiteral } = require('./lib/schema-epoch-guard.js');
 const memoryUpsertLib = require('./lib/memory-upsert.js');
 const memorySearchLib = require('./lib/memory-search.js');
 const entityCrudLib = require('./lib/entity-graph-crud.js');
@@ -227,33 +227,80 @@ function deriveSpawnEngineRoot(enginePath) {
 //     override set, or the override happens to point right back at the
 //     same checkout) -> checkEngineEpochOrThrow already covers this
 //     checkout fully; return immediately without a second manifest read.
-//   - different root, on-disk manifest unreadable/malformed, OR readable
-//     but its schema_epoch differs from this server's own loaded
-//     SCHEMA_EPOCH -> reject. An epoch MISMATCH in either direction is
-//     rejected here (not classified into stale/ahead/behind sub-branches
-//     the way _ENGINE_ROOT's own drift is) because this server has no
-//     basis to decide which of the two independent checkouts is "right" —
-//     unlike _ENGINE_ROOT vs. the database (where the database's own
-//     stored epoch is authoritative evidence), there is no third source of
-//     truth to arbitrate two DIFFERENT engine checkouts against each
-//     other. The caller must reconcile them.
-//   - different root, readable manifest, epoch equal -> proceed (a
-//     deliberately pinned override that happens to be schema-identical to
-//     the server's own build is not a hazard).
+//   - different root -> proceed ONLY when ALL THREE of the following agree:
+//       (a) the override's schema-manifest.json is readable, AND its
+//           schema_epoch === this server's own loaded SCHEMA_EPOCH;
+//       (b) the override's OWN scripts/handoff.js SCHEMA_EPOCH literal is
+//           extractable (readEngineEpochLiteral), AND
+//       (c) that literal === the override manifest's schema_epoch (from
+//           (a)) — i.e. the override checkout agrees with ITSELF, not just
+//           with this server's number.
+//     Every other combination — either read failing, or either pair
+//     disagreeing — rejects, naming which specific number(s) could not be
+//     read or disagreed. Codex review r2 finding 1 (2026-09-13): checking
+//     only the override's manifest (as an earlier version of this function
+//     did) let a HALF-UPDATED override — manifest bumped to match this
+//     server's epoch, but its own scripts/handoff.js still declaring an
+//     OLDER SCHEMA_EPOCH literal — pass this check and still execute; a
+//     checkout that disagrees with itself is exactly as dangerous as one
+//     that disagrees with the server, since spawning it runs whichever of
+//     the two numbers its actual CODE (the literal, not the manifest)
+//     believes. An epoch mismatch in either direction is rejected outright
+//     (not classified into stale/ahead/behind sub-branches the way
+//     _ENGINE_ROOT's own drift is) because this server has no basis to
+//     decide which of two independent checkouts is "right" — unlike
+//     _ENGINE_ROOT vs. the database (where the database's own stored epoch
+//     is authoritative evidence), there is no third source of truth to
+//     arbitrate two DIFFERENT engine checkouts against each other. The
+//     caller must reconcile them.
 function checkSpawnEngineEpochOrThrow() {
   const spawnEngineRoot = deriveSpawnEngineRoot(ENGINE_PATH);
   if (path.resolve(spawnEngineRoot) === path.resolve(_ENGINE_ROOT)) {
     return;
   }
-  const diskResult = readDiskSchemaEpoch(spawnEngineRoot);
-  const diskDescription = diskResult.ok ? diskResult.epoch : 'unreadable';
-  if (!diskResult.ok || diskResult.epoch !== SCHEMA_EPOCH) {
-    throw new Error(
-      `handoff MCP: HANDOFF_MCP_ENGINE_PATH points at an engine checkout (${spawnEngineRoot}) whose schema epoch ` +
-      `(${diskDescription}) differs from this server's loaded epoch (${SCHEMA_EPOCH}). Point the override at the ` +
-      `same engine build as the server, or unset it and restart the MCP server.`
+  const manifestResult = readDiskSchemaEpoch(spawnEngineRoot);
+  const literalResult = readEngineEpochLiteral(spawnEngineRoot);
+
+  const manifestOk = manifestResult.ok && manifestResult.epoch === SCHEMA_EPOCH;
+  const literalOk = literalResult.ok && manifestResult.ok && literalResult.epoch === manifestResult.epoch;
+  if (manifestOk && literalOk) {
+    return;
+  }
+
+  const problems = [];
+  if (!manifestResult.ok) {
+    problems.push(`schema-manifest.json ${manifestResult.error}`);
+  } else if (manifestResult.epoch !== SCHEMA_EPOCH) {
+    problems.push(
+      `schema-manifest.json declares schema_epoch ${manifestResult.epoch}, which differs from this ` +
+      `server's loaded epoch ${SCHEMA_EPOCH}`
     );
   }
+  if (!literalResult.ok) {
+    problems.push(`scripts/handoff.js: ${literalResult.error}`);
+  } else if (manifestResult.ok && literalResult.epoch !== manifestResult.epoch) {
+    problems.push(
+      `scripts/handoff.js declares SCHEMA_EPOCH ${literalResult.epoch}, which differs from its own ` +
+      `schema-manifest.json epoch ${manifestResult.epoch}`
+    );
+  } else if (!manifestResult.ok && literalResult.epoch !== SCHEMA_EPOCH) {
+    problems.push(
+      `scripts/handoff.js declares SCHEMA_EPOCH ${literalResult.epoch}, which differs from this ` +
+      `server's loaded epoch ${SCHEMA_EPOCH}`
+    );
+  }
+  // Total classification means this is unreachable (manifestOk && literalOk
+  // already returned above), but never let a mismatch surface with an empty
+  // reason list if some future edit changes the rules above.
+  if (problems.length === 0) {
+    problems.push('the override checkout failed its consistency check for an unspecified reason');
+  }
+
+  throw new Error(
+    `handoff MCP: HANDOFF_MCP_ENGINE_PATH points at an engine checkout (${spawnEngineRoot}) that fails the ` +
+    `pre-spawn consistency check: ${problems.join('; ')}. Point the override at the same, internally-consistent ` +
+    `engine build as the server, or unset it and restart the MCP server.`
+  );
 }
 
 // ── §8 direct-pg tool plumbing ───────────────────────────────────────────
