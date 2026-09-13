@@ -1444,6 +1444,23 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run MCP stale-engine epoch-guard tests (fix/mcp-stale-engine-gate)
+        # Incident 2026-09-13: withProjectDb's old blanket "run init/resume"
+        # remedy for every ensureSchemaCurrent heal failure would have told a
+        # stale-engine caller to force the database BACKWARD for reason:
+        # 'ahead'. scripts/lib/schema-epoch-guard.js's classifyEpochDrift now
+        # separates that bare reason string into 4 branches (stale_engine /
+        # engine_checkout_inconsistent / engine_behind_db / heal_failed) --
+        # 13 tests: the 4 named branches + their exact messages, a T8
+        # totality matrix (loaded x disk x reason x db, cross-checked
+        # against an independently written reference classifier, 441
+        # combinations, never throws), readDiskSchemaEpoch's no-memoization
+        # contract, and a T13 live stdio MCP regression against a real
+        # handoff-mcp.mjs process running from a throwaway engine copy whose
+        # on-disk schema-manifest.json is bumped AFTER the server starts.
+        # Pure/filesystem-only -- no live Postgres required (the guard
+        # rejects before any database connection is opened).
+        run: node test/test-mcp-epoch-guard.js
       - name: Run host-agnostic naming tests
         # Regression guard for #135 (host-agnostic naming generalization):
         #   M1-M7  Dual-marker same-directory classification (new .memory-engine

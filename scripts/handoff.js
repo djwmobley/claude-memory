@@ -3768,7 +3768,18 @@ async function ensureSchemaCurrentCore(db, projectId, { silent } = {}) {
   if (cmp === 'ahead') {
     // Stored epoch is newer than this engine build knows about — refuse to
     // apply (would be a downgrade), warn persistently, continue non-fatally.
-    const detail = { stored, current: currentFingerprint, note: 'stored schema_fingerprint epoch is newer than this engine build — refusing to apply; upgrade the engine' };
+    // fix/mcp-stale-engine-gate: stored_epoch/current_epoch are added as
+    // parsed INTEGER fields (not just the raw "<epoch>:<hash>" strings above)
+    // so scripts/lib/schema-epoch-guard.js's classifyEpochDrift can read
+    // dbEpoch (the DATABASE's stored epoch) directly off this detail object
+    // without re-parsing the fingerprint string itself.
+    const storedParsed = _parseSchemaFingerprint(stored);
+    const currentParsed = _parseSchemaFingerprint(currentFingerprint);
+    const detail = {
+      stored, current: currentFingerprint,
+      stored_epoch: storedParsed.epoch, current_epoch: currentParsed.epoch,
+      note: 'stored schema_fingerprint epoch is newer than this engine build — refusing to apply; upgrade the engine',
+    };
     await recordSchemaDegradation(db, projectId, 'fingerprint_ahead', detail, { silent });
     return { applied: false, reason: 'ahead', detail };
   }
@@ -11400,6 +11411,79 @@ async function main() {
     process.exit(2);
   }
 
+  // P1b (Codex review 2026-09-13, fix/mcp-stale-engine-gate follow-up):
+  // engine self-consistency at the CLI entry point, NOT at module require
+  // time — a process spawned from a half-updated checkout (a partial git
+  // checkout, an interrupted rebase, or a stray local edit to SCHEMA_EPOCH
+  // with no matching schema-manifest.json bump) previously had no way to
+  // detect that on its own before running a real command. This is the same
+  // "does THIS checkout agree with itself" question
+  // scripts/lib/schema-epoch-guard.js's classifyEpochDrift asks for the long-
+  // lived MCP server process (its engine_checkout_inconsistent branch) —
+  // reused here (readDiskSchemaEpoch, no second implementation) for a
+  // one-shot CLI process instead. Deliberately NOT run at require() time so
+  // `require('./handoff.js')` from a test or another module never exits the
+  // host process — only main()'s own CLI dispatch (require.main === module)
+  // reaches this.
+  //
+  // ONE downgrade only (Codex review r2 finding 2, 2026-09-13: the PRIOR
+  // "--help/-h" exemption is REMOVED — this check now runs on EVERY
+  // invocation that reaches this line, whether or not the caller also
+  // passed --help/-h). Mirrors the SAME read-only-vs-write split
+  // scripts/lib/cli-args.js's own WRITE_SUBCOMMANDS already draws:
+  //   - loader-hook/loader-stop: the SessionStart/SessionEnd hook entry
+  //     points install.js wires into EVERY Claude Code / Codex session
+  //     automatically (hooks/hooks.json, install.js's EVENT_FOR_VERB) —
+  //     never an explicit user/agent action. These are deliberately
+  //     designed as fast, best-effort no-ops that must not hard-fail a
+  //     session's start/end over an engine-checkout problem a human hasn't
+  //     even asked this process to look at (Codex's own loader-stop
+  //     TIMEOUT_OVERRIDE is 3 SECONDS — there is no budget here to surface
+  //     anything beyond the inert/no-marker fast path). Still WARN (single
+  //     stderr line, never stdout — loader-hook's stdout is injected into
+  //     the session context by the host and must stay clean) so a broken
+  //     checkout is visible without hard-failing the hook. A genuinely
+  //     broken checkout still fails loud on every OTHER subcommand (status,
+  //     resume, and every write command) — this downgrade narrows WHERE the
+  //     check hard-fails, never whether a broken checkout eventually
+  //     surfaces.
+  //     Regression proof: scripts/test-plugin-packaging.js's P2 spawns
+  //     `loader-hook` against a synthetic CLAUDE_PLUGIN_ROOT fixture that
+  //     intentionally has no scripts/sql/schema-manifest.json at all (it
+  //     tests asset-path resolution, not schema state) — that fixture now
+  //     warns on stderr instead of being skipped, and must still pass.
+  //
+  // Why the --help exemption was wrong: it let e.g. `status --help` or
+  // `resume -h` skip this check entirely and fall through to
+  // enforceTotalClassification (below), whose own total classification
+  // returns immediately for an uncovered command+flag combination rather
+  // than blocking it — so the subcommand's REAL handler (cmdStatus,
+  // cmdResume, ...) still ran against a checkout this guard exists to
+  // reject. There is no side-effect-free "--help" fast path anywhere below
+  // this line for an already-dispatched subcommand, so there is nothing
+  // for the exemption to safely protect. (A bare `handoff.js --help` with
+  // NO valid subcommand at all never reaches this line in the first place —
+  // the router's own `!subcommands[sub]` usage check above already printed
+  // usage and called `process.exit(2)`; that is pre-existing router
+  // behavior this guard does not touch either way.)
+  const CLI_SELF_CONSISTENCY_WARN_ONLY_SUBCOMMANDS = new Set(['loader-hook', 'loader-stop']);
+  {
+    const { readDiskSchemaEpoch } = require('./lib/schema-epoch-guard.js');
+    const diskResult = readDiskSchemaEpoch(_ENGINE_ROOT);
+    if (!diskResult.ok || diskResult.epoch !== SCHEMA_EPOCH) {
+      const disk = diskResult.ok ? diskResult.epoch : `unreadable (${diskResult.error})`;
+      const message =
+        `engine checkout is internally inconsistent (scripts/handoff.js declares schema epoch ` +
+        `${SCHEMA_EPOCH}, scripts/sql/schema-manifest.json declares ${disk}); restore a clean engine checkout.`;
+      if (CLI_SELF_CONSISTENCY_WARN_ONLY_SUBCOMMANDS.has(sub)) {
+        process.stderr.write(`handoff: WARNING ${message}\n`);
+      } else {
+        console.error(`handoff: ${message}`);
+        process.exit(1);
+      }
+    }
+  }
+
   // Total-classification argv check for write subcommands (scripts/lib/cli-args.js).
   // MUST run before subcommands[sub]() is invoked — this is what guarantees
   // "reject before any DB connection or file write" for every write command,
@@ -11474,6 +11558,11 @@ if (require.main === module) {
     checkPgvectorGatedObjects,
     reportPgvectorGatedDegradation,
     SCHEMA_EPOCH,
+    // fix/mcp-stale-engine-gate: exposed so scripts/handoff-mcp.mjs can
+    // resolve the SAME engine-root scripts/lib/schema-epoch-guard.js reads
+    // scripts/sql/schema-manifest.json against — no second, independently-
+    // computed "where is this checkout rooted" path.
+    _ENGINE_ROOT,
     // cm#185-schema-heal FK extension — exposed for test/test-schema-heal.js
     // (no test-side reimplementation of the FK identity/classification rules).
     _collectExpectedFks,

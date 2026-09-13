@@ -56,7 +56,13 @@ const { resolveSessionIdFromEnv, resolveUsageRecordMarkerDefault } = require('./
 // (CJS, via createRequire) from this ESM server process, so only its
 // module.exports object is evaluated — verified empirically (see the PR
 // body for the probe transcript).
-const { ensureSchemaCurrent } = require('./handoff.js');
+const { ensureSchemaCurrent, SCHEMA_EPOCH, _ENGINE_ROOT } = require('./handoff.js');
+// fix/mcp-stale-engine-gate: total classification distinguishing "this
+// server process is a stale engine build" (restart, no DB action) from
+// "the checkout is broken" from "the engine build itself needs upgrading"
+// from every other heal failure (report-only) — see that module's header
+// for the full incident writeup and the four-branch rule set.
+const { readDiskSchemaEpoch, classifyEpochDrift, healFailedMessage, readEngineEpochLiteral } = require('./lib/schema-epoch-guard.js');
 const memoryUpsertLib = require('./lib/memory-upsert.js');
 const memorySearchLib = require('./lib/memory-search.js');
 const entityCrudLib = require('./lib/entity-graph-crud.js');
@@ -155,6 +161,149 @@ function stripAnsi(str) {
   return str.replace(/\x1b\[[0-9;]*m/g, '');
 }
 
+// ── fix/mcp-stale-engine-gate: engine-identity pre-check ─────────────────
+//
+// checkEngineEpochOrThrow(): the ONE call site every path below (the four
+// spawn-based tools AND withProjectDb's own call site 1) uses to catch a
+// stale-engine or broken-checkout condition BEFORE doing anything else —
+// connecting to a database, resolving project identity, or spawning a
+// child process. Only ever throws for 'stale_engine' and
+// 'engine_checkout_inconsistent' (both restart-the-server conditions with
+// no database involved at all — see schema-epoch-guard.js's header) and,
+// defensively, 'heal_failed' (loadedEpoch itself malformed — should be
+// unreachable outside a broken engine build). 'proceed' (the common case)
+// and 'annotate_only' (manifest unreadable — no epoch signal available
+// here; the engine's OWN ensureSchemaCurrent/classifySchemaFiles call will
+// independently hit the same unreadable file and report a heal failure
+// through the normal path) both fall through silently.
+//
+// This validates the SERVER PROCESS's OWN engine identity — the handoff.js
+// this process required at startup, and that same handoff.js's own
+// _ENGINE_ROOT. It does NOT validate ENGINE_PATH (see below): a spawn-based
+// tool that launches a HANDOFF_MCP_ENGINE_PATH-overridden checkout needs
+// checkSpawnEngineEpochOrThrow, the separate check right below this one,
+// covering that case (Codex review P1a, 2026-09-13).
+function checkEngineEpochOrThrow() {
+  const diskResult = readDiskSchemaEpoch(_ENGINE_ROOT);
+  const classification = classifyEpochDrift({
+    loadedEpoch: SCHEMA_EPOCH,
+    diskEpoch: diskResult.ok ? diskResult.epoch : null,
+  });
+  if (classification.branch === 'stale_engine' ||
+      classification.branch === 'engine_checkout_inconsistent' ||
+      classification.branch === 'heal_failed') {
+    throw new Error(classification.message);
+  }
+  // 'proceed' or 'annotate_only' — continue.
+}
+
+// ── Codex review P1a (2026-09-13): the spawned engine can escape the check
+// above ──────────────────────────────────────────────────────────────────
+//
+// checkEngineEpochOrThrow validates _ENGINE_ROOT (the checkout THIS server
+// required at startup via `require('./handoff.js')`), but every spawn-based
+// tool below launches ENGINE_PATH instead — which is
+// `HANDOFF_MCP_ENGINE_PATH` when that env var is set, a checkout this
+// server never required and knows nothing about. A stale-or-inconsistent
+// override checkout could previously launch completely unchecked.
+//
+// deriveSpawnEngineRoot mirrors handoff.js's own _ENGINE_ROOT derivation
+// (scripts/handoff.js ~174: `path.resolve(__dirname, '..')` when
+// CLAUDE_PLUGIN_ROOT is unset) computed from a FILE PATH instead of
+// `__dirname`, since the override checkout is never require()'d here:
+// ENGINE_PATH is `<root>/scripts/handoff.js`, so its own directory
+// (`path.dirname`) is the `scripts/` directory `__dirname` would be inside
+// that checkout, and one more level up from there is that checkout's root
+// — two hops up from the file itself, exactly as many as `_ENGINE_ROOT`'s
+// own derivation takes from `__dirname` inside handoff.js.
+function deriveSpawnEngineRoot(enginePath) {
+  return path.resolve(path.dirname(enginePath), '..');
+}
+
+// checkSpawnEngineEpochOrThrow(): called immediately alongside
+// checkEngineEpochOrThrow() at every one of the four spawn call sites
+// below. Total classification over ENGINE_PATH's relationship to this
+// server's own required checkout:
+//   - same root as _ENGINE_ROOT (the overwhelming common case — no
+//     override set, or the override happens to point right back at the
+//     same checkout) -> checkEngineEpochOrThrow already covers this
+//     checkout fully; return immediately without a second manifest read.
+//   - different root -> proceed ONLY when ALL THREE of the following agree:
+//       (a) the override's schema-manifest.json is readable, AND its
+//           schema_epoch === this server's own loaded SCHEMA_EPOCH;
+//       (b) the override's OWN scripts/handoff.js SCHEMA_EPOCH literal is
+//           extractable (readEngineEpochLiteral), AND
+//       (c) that literal === the override manifest's schema_epoch (from
+//           (a)) — i.e. the override checkout agrees with ITSELF, not just
+//           with this server's number.
+//     Every other combination — either read failing, or either pair
+//     disagreeing — rejects, naming which specific number(s) could not be
+//     read or disagreed. Codex review r2 finding 1 (2026-09-13): checking
+//     only the override's manifest (as an earlier version of this function
+//     did) let a HALF-UPDATED override — manifest bumped to match this
+//     server's epoch, but its own scripts/handoff.js still declaring an
+//     OLDER SCHEMA_EPOCH literal — pass this check and still execute; a
+//     checkout that disagrees with itself is exactly as dangerous as one
+//     that disagrees with the server, since spawning it runs whichever of
+//     the two numbers its actual CODE (the literal, not the manifest)
+//     believes. An epoch mismatch in either direction is rejected outright
+//     (not classified into stale/ahead/behind sub-branches the way
+//     _ENGINE_ROOT's own drift is) because this server has no basis to
+//     decide which of two independent checkouts is "right" — unlike
+//     _ENGINE_ROOT vs. the database (where the database's own stored epoch
+//     is authoritative evidence), there is no third source of truth to
+//     arbitrate two DIFFERENT engine checkouts against each other. The
+//     caller must reconcile them.
+function checkSpawnEngineEpochOrThrow() {
+  const spawnEngineRoot = deriveSpawnEngineRoot(ENGINE_PATH);
+  if (path.resolve(spawnEngineRoot) === path.resolve(_ENGINE_ROOT)) {
+    return;
+  }
+  const manifestResult = readDiskSchemaEpoch(spawnEngineRoot);
+  const literalResult = readEngineEpochLiteral(spawnEngineRoot);
+
+  const manifestOk = manifestResult.ok && manifestResult.epoch === SCHEMA_EPOCH;
+  const literalOk = literalResult.ok && manifestResult.ok && literalResult.epoch === manifestResult.epoch;
+  if (manifestOk && literalOk) {
+    return;
+  }
+
+  const problems = [];
+  if (!manifestResult.ok) {
+    problems.push(`schema-manifest.json ${manifestResult.error}`);
+  } else if (manifestResult.epoch !== SCHEMA_EPOCH) {
+    problems.push(
+      `schema-manifest.json declares schema_epoch ${manifestResult.epoch}, which differs from this ` +
+      `server's loaded epoch ${SCHEMA_EPOCH}`
+    );
+  }
+  if (!literalResult.ok) {
+    problems.push(`scripts/handoff.js: ${literalResult.error}`);
+  } else if (manifestResult.ok && literalResult.epoch !== manifestResult.epoch) {
+    problems.push(
+      `scripts/handoff.js declares SCHEMA_EPOCH ${literalResult.epoch}, which differs from its own ` +
+      `schema-manifest.json epoch ${manifestResult.epoch}`
+    );
+  } else if (!manifestResult.ok && literalResult.epoch !== SCHEMA_EPOCH) {
+    problems.push(
+      `scripts/handoff.js declares SCHEMA_EPOCH ${literalResult.epoch}, which differs from this ` +
+      `server's loaded epoch ${SCHEMA_EPOCH}`
+    );
+  }
+  // Total classification means this is unreachable (manifestOk && literalOk
+  // already returned above), but never let a mismatch surface with an empty
+  // reason list if some future edit changes the rules above.
+  if (problems.length === 0) {
+    problems.push('the override checkout failed its consistency check for an unspecified reason');
+  }
+
+  throw new Error(
+    `handoff MCP: HANDOFF_MCP_ENGINE_PATH points at an engine checkout (${spawnEngineRoot}) that fails the ` +
+    `pre-spawn consistency check: ${problems.join('; ')}. Point the override at the same, internally-consistent ` +
+    `engine build as the server, or unset it and restart the MCP server.`
+  );
+}
+
 // ── §8 direct-pg tool plumbing ───────────────────────────────────────────
 //
 // withProjectDb: the ONE call site every new §8 tool below uses to (a)
@@ -181,6 +330,8 @@ async function withProjectDb(projectRoot, fn) {
   if (!isFullyQualifiedPath(projectRoot)) {
     throw new Error(`projectRoot must be a fully qualified absolute path, got ${JSON.stringify(projectRoot)}`);
   }
+  // fix/mcp-stale-engine-gate call site 1 — BEFORE any connection is opened.
+  checkEngineEpochOrThrow();
   const db = await connectForRoot(projectRoot);
   try {
     const identity = await ensureProjectIdentity(db, { cwd: projectRoot, silent: true });
@@ -216,13 +367,26 @@ async function withProjectDb(projectRoot, fn) {
     //     confusing SQL-layer failure inside the tool's own write.
     const schemaResult = await ensureSchemaCurrent(db, identity.projectId, { silent: true });
     if (!schemaResult.applied && schemaResult.reason !== 'current' && schemaResult.reason !== 'degraded') {
-      throw new Error(
-        `withProjectDb: schema is not current for this project DB and the automatic bring-forward did ` +
-        `not succeed (reason: ${schemaResult.reason}` +
-        `${schemaResult.detail ? `, detail: ${JSON.stringify(schemaResult.detail)}` : ''}). ` +
-        `Remedy: run \`node scripts/handoff.js init\` (or \`resume\`) directly against this project root ` +
-        `in an interactive terminal to resolve the degraded state, then retry this MCP tool call.`
-      );
+      // fix/mcp-stale-engine-gate call site 2 — the old blanket "run init/
+      // resume" remedy is gone: it named a downgrade as the fix for
+      // reason:'ahead'. Re-derive the disk epoch fresh (the manifest may
+      // have changed since call site 1 above) and classify total across
+      // the four branches — never a bare reason string again.
+      const diskResult = readDiskSchemaEpoch(_ENGINE_ROOT);
+      const classification = classifyEpochDrift({
+        loadedEpoch: SCHEMA_EPOCH,
+        diskEpoch: diskResult.ok ? diskResult.epoch : null,
+        dbEpoch: schemaResult.detail && schemaResult.detail.stored_epoch,
+        healReason: schemaResult.reason,
+        healDetail: schemaResult.detail,
+      });
+      // classification.message is non-null for every branch EXCEPT
+      // 'proceed'/'annotate_only' — 'proceed' cannot occur here (we are
+      // inside the failure branch already) but 'annotate_only' can (the
+      // manifest is unreadable, contributing no epoch signal): fall back to
+      // the SAME report-only wording, built directly from schemaResult's
+      // own reason/detail, rather than surfacing a null message.
+      throw new Error(classification.message || healFailedMessage(schemaResult.reason, schemaResult.detail));
     }
     try {
       // schemaResult.reason is passed as a 3rd arg -- every pre-existing
@@ -320,6 +484,22 @@ const USAGE_TELEMETRY_RELATIONS = new Set(['turn_usage', 'session_usage', 'featu
  * withProjectDb already computed for this call (threaded through as its
  * 3rd fn argument) -- reused here rather than re-derived, so the message
  * reports the exact classification the engine used, not a guess.
+ *
+ * RESIDUAL (documented, not changed — Codex review finding 3, 2026-09-13):
+ * this message still recommends `handoff.js init` unconditionally for a
+ * missing usage-telemetry relation. That is safe DESPITE
+ * fix/mcp-stale-engine-gate's rule that no branch may ever recommend
+ * init/resume for an engine that is behind the database, because this
+ * function is only ever reached with a schemaReason of 'current',
+ * 'applied', or 'degraded' — every OTHER `ensureSchemaCurrent` reason,
+ * including 'ahead' (the actual "engine is behind the DB" case this rule
+ * protects), now makes `withProjectDb`'s own call-site-2
+ * `classifyEpochDrift` check throw BEFORE `fn(db, projectId, schemaReason)`
+ * ever runs — so this helper, which only wraps errors thrown INSIDE that
+ * `fn` call, never sees an 'ahead' schemaReason to begin with. If a future
+ * change ever lets `fn` run with an unclassified/heal_failed schemaReason,
+ * this message would need the same total-classification treatment
+ * schema-epoch-guard.js already applies elsewhere on this path.
  */
 export function actionableUsageSchemaError(err, { database, schemaReason }) {
   if (!err || err.code !== '42P01') return err;
@@ -398,6 +578,17 @@ function parseInitReport(stdout) {
 // ── Tool implementations ────────────────────────────────────────────────────
 
 async function toolHandoffStatus({ projectRoot }) {
+  // fix/mcp-stale-engine-gate: same call-site-1 check as withProjectDb,
+  // before spawning — the child runs its own heal, so no call-site-2
+  // equivalent is needed here. checkSpawnEngineEpochOrThrow (Codex review
+  // P1a) additionally validates ENGINE_PATH itself, which can diverge from
+  // _ENGINE_ROOT under HANDOFF_MCP_ENGINE_PATH.
+  try {
+    checkEngineEpochOrThrow();
+    checkSpawnEngineEpochOrThrow();
+  } catch (err) {
+    return toolError(err.message);
+  }
   const { code, stdout, stderr } = await runNode({
     scriptPath: ENGINE_PATH,
     args: ['status', '--json'],
@@ -423,6 +614,13 @@ async function toolHandoffStatus({ projectRoot }) {
  * to the engine for this one caller, this tool returns that stdout verbatim —
  * the model reads it as context the same way a human reads the CLI output. */
 async function toolHandoffResume({ projectRoot }) {
+  // fix/mcp-stale-engine-gate: see toolHandoffStatus's identical checks.
+  try {
+    checkEngineEpochOrThrow();
+    checkSpawnEngineEpochOrThrow();
+  } catch (err) {
+    return toolError(err.message);
+  }
   const { code, stdout, stderr } = await runNode({
     scriptPath: ENGINE_PATH,
     args: ['resume'],
@@ -452,6 +650,15 @@ function applySessionId(payload, sessionId) {
 async function runPayloadSubcommand(subcommand, { projectRoot, payload, sessionId }) {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
     return toolError(`payload must be a plain JSON object (not array or primitive) for handoff ${subcommand}.`);
+  }
+  // fix/mcp-stale-engine-gate: see toolHandoffStatus's identical checks.
+  // Checked before writeTempJson/runNode so a stale-engine reject never
+  // leaves a temp payload file behind.
+  try {
+    checkEngineEpochOrThrow();
+    checkSpawnEngineEpochOrThrow();
+  } catch (err) {
+    return toolError(err.message);
   }
 
   const effectivePayload = applySessionId(payload, sessionId);
@@ -494,6 +701,13 @@ const SESSION_ID_PARAM_DESCRIPTION =
   'ITS OWN session_in_progress marker rather than a sibling session\'s.';
 
 async function toolHandoffInit({ projectRoot, name }) {
+  // fix/mcp-stale-engine-gate: see toolHandoffStatus's identical checks.
+  try {
+    checkEngineEpochOrThrow();
+    checkSpawnEngineEpochOrThrow();
+  } catch (err) {
+    return toolError(err.message);
+  }
   const args = name ? ['init', name, '-y'] : ['init', '-y'];
   const { code, stdout, stderr } = await runNode({
     scriptPath: ENGINE_PATH,
