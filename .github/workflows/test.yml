@@ -1589,6 +1589,23 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run loader-stop SessionEnd tests
+        # DB-backed regression guard for the "implicit close fires at turn
+        # end, not session end" fix: loader-stop moved from Claude Code's
+        # Stop hook (fires every turn) to SessionEnd (fires once). Covers
+        # own-session close-and-clear, no-marker no-op, SessionStart's
+        # stale-foreign-marker late-close sweep + DIVERGENCE line,
+        # fresh-foreign-marker preservation, source=clear/compact skip,
+        # writeHandoffMd atomicity (no .tmp- residue), and
+        # implicit_close=disabled as a full no-op at both hooks. Run with
+        # CLAUDE_CODE_SESSION_ID unset so marker-based resolution isn't
+        # masked by the env fallback. Reuses claude_memory_eval_test
+        # (created by Create handoff test database step above).
+        run: node test/handoff/test-loader-stop-sessionend.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run promote --regenerate tests
         # Coverage for `promote --regenerate [--dry-run]`: target-state total
         # classification (absent/file/directory), "## Durable facts"
