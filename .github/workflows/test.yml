@@ -1461,6 +1461,22 @@ jobs:
         # Pure/filesystem-only -- no live Postgres required (the guard
         # rejects before any database connection is opened).
         run: node test/test-mcp-epoch-guard.js
+      - name: Run engine-revision tests (feat/status-engine-revision)
+        # Owner ruling 2026-09-13: handoff_status reports the engine
+        # revision/schema-epoch three ways -- LOADED (module-import
+        # snapshot, frozen), DISK (fresh read every call), DB (the project
+        # DB's own stored epoch) -- and a schema-epoch-guard.js drift
+        # verdict. T1-T4 (readDiskRevision total classification: git
+        # checkout / VERSION-file / empty dir / manifest-only dir) and T5
+        # (LOADED never changes; a fresh call reflects a post-import
+        # VERSION rewrite) are pure/filesystem-only. T6 spins up its own
+        # throwaway Postgres DB/project (never claude_memory_eval_test) and
+        # asserts `handoff.js status --json`'s `engine` object shape.
+        run: node test/test-engine-revision.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run host-agnostic naming tests
         # Regression guard for #135 (host-agnostic naming generalization):
         #   M1-M7  Dual-marker same-directory classification (new .memory-engine
