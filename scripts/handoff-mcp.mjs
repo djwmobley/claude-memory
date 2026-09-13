@@ -2422,10 +2422,77 @@ export function buildServer() {
   return server;
 }
 
+// Fix (process-lifecycle): the SDK's own StdioServerTransport (see
+// node_modules/@modelcontextprotocol/sdk .../server/stdio.js) only calls its
+// own close() when stdin emits a read ERROR mid-message -- a graceful host
+// disconnect (stdin just ends, no error) is never wired to close() or to
+// process.exit() anywhere in this file or the SDK. That leaves this process
+// running indefinitely after a host that closes stdin cleanly (rather than
+// signaling the child) exits. installLifecycleGuards wires three
+// independent, mutually-exclusive exit paths, each funneled through
+// exitOnce() so only the FIRST one to fire actually runs the exit sequence:
+//   1. stdin 'end'/'close' -- the host disconnected its write end (the
+//      common case for a host that tears its child down cleanly).
+//   2. SIGTERM/SIGINT/SIGHUP -- the host (or the OS) signaled this process
+//      directly.
+//   3. A parent-liveness watchdog, polled every 15s: if process.ppid no
+//      longer resolves to a live process, the host that spawned us is gone
+//      and nothing will ever close our stdin (e.g. a Windows host killed
+//      without tearing down its job object). The interval timer is
+//      unref()'ed so it can never by itself keep the event loop -- and this
+//      process -- alive.
+// Exactly one line is logged to stderr per exit path, and only the fixed
+// literal `reason` string is logged -- never anything read from process.env
+// or a tool argument (CodeQL js/clear-text-logging).
+function installLifecycleGuards(transport) {
+  let exiting = false;
+
+  async function exitOnce(reason) {
+    if (exiting) return;
+    exiting = true;
+    console.error(`handoff-mcp: exiting (${reason})`);
+    try {
+      if (transport && typeof transport.close === 'function') {
+        await transport.close();
+      }
+    } catch {
+      // Best-effort teardown -- we are exiting regardless of the outcome.
+    }
+    process.exit(0);
+  }
+
+  process.stdin.on('end', () => { exitOnce('stdin end'); });
+  process.stdin.on('close', () => { exitOnce('stdin close'); });
+
+  for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+    process.on(sig, () => { exitOnce(`signal ${sig}`); });
+  }
+
+  const watchdog = setInterval(() => {
+    const ppid = process.ppid;
+    if (!ppid) return;
+    try {
+      // Total classification of the probe outcome: it throws (parent gone,
+      // or exists-but-unsignalable) or it does not (parent alive). win32 (and
+      // POSIX) both raise EPERM when the pid exists but this process lacks
+      // permission to signal it -- that is evidence the parent IS alive, not
+      // evidence it is gone, so EPERM alone must never trigger exit. Any
+      // other thrown error (ESRCH -- no such process) means the parent is
+      // gone.
+      process.kill(ppid, 0);
+    } catch (err) {
+      if (err && err.code === 'EPERM') return;
+      exitOnce('parent process no longer exists');
+    }
+  }, 15000);
+  watchdog.unref();
+}
+
 async function main() {
   const server = buildServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  installLifecycleGuards(transport);
 }
 
 // Only auto-start the stdio server when this file is the process entry

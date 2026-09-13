@@ -26,7 +26,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -61,6 +61,70 @@ const SERVER_PATH = path.join(__dirname, 'handoff-mcp.mjs');
 // needed a real project's checkout in the first place.
 const PROJECT_ROOT = process.env.HANDOFF_SELFTEST_PROJECT_ROOT;
 
+// Fix (process-lifecycle): a thrown assertion anywhere in main()'s body used
+// to skip the trailing `await client.close()` entirely, orphaning the
+// spawned `node handoff-mcp.mjs` child. closeClientAndWaitForExit() is the
+// SAME close-then-verify helper withMcpClient() below uses (never a second
+// hand-rolled close path): it captures transport.pid BEFORE calling
+// client.close() (the SDK clears its internal _process reference during
+// close(), so transport.pid reads back null afterward), then polls
+// process.kill(pid, 0) for up to 5s after close() returns; a process still
+// answering that probe past the deadline is force-killed with SIGKILL and
+// reported to stderr. Total classification of the post-close state: the pid
+// either stops answering the probe (exited -- normal), or it is killed and
+// reported (watchdog fired) -- there is no third, silent outcome.
+async function closeClientAndWaitForExit(client, transport, label) {
+  const pid = typeof transport.pid === 'number' ? transport.pid : null;
+  try {
+    await client.close();
+  } finally {
+    if (pid !== null) {
+      const deadline = Date.now() + 5000;
+      let alive = true;
+      while (Date.now() < deadline) {
+        try {
+          process.kill(pid, 0);
+        } catch {
+          alive = false;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      if (alive) {
+        try {
+          process.kill(pid, 0);
+        } catch {
+          alive = false;
+        }
+      }
+      if (alive) {
+        console.error(`WATCHDOG (${label}): server child pid ${pid} still alive 5s after close() -- force killing`);
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          // already gone between the probe and the kill -- fine.
+        }
+      }
+    }
+  }
+}
+
+// Shared by main() and withMcpClient() below (never two hand-rolled
+// try/finally-around-close blocks): runs `fn(client)`, and — whether it
+// returns or throws — ALWAYS routes through closeClientAndWaitForExit
+// exactly once before this function itself resolves or rejects. This is the
+// exact shape a thrown assertion inside main()'s old body used to skip
+// entirely (see the closeClientAndWaitForExit comment above). Exported so
+// test/test-mcp-process-lifecycle.js can drive it directly with a stub
+// client + a throwing `fn`, without spawning a real server child.
+async function runWithClient(client, transport, label, fn) {
+  try {
+    return await fn(client);
+  } finally {
+    await closeClientAndWaitForExit(client, transport, label);
+  }
+}
+
 async function main() {
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -73,6 +137,11 @@ async function main() {
   await client.connect(transport);
   console.log('connected OK');
 
+  await runWithClient(client, transport, 'main()', runMainBody);
+  console.log('\n== selftest complete ==');
+}
+
+async function runMainBody(client) {
   console.log('\n== tools/list ==');
   const toolsList = await client.listTools();
   for (const t of toolsList.tools) {
@@ -136,9 +205,6 @@ async function main() {
   });
   console.log('isError (expect true):', badResult.isError ?? false);
   console.log(badResult.content[0].text);
-
-  await client.close();
-  console.log('\n== selftest complete ==');
 }
 
 // ── fix/mcp-usage-codex-identity: usage_record/usage_query MCP checks ───────
@@ -174,11 +240,7 @@ async function withMcpClient(env, fn) {
   });
   const client = new Client({ name: 'usage-telemetry-selftest', version: '0.1.0' }, { capabilities: {} });
   await client.connect(transport);
-  try {
-    return await fn(client);
-  } finally {
-    await client.close();
-  }
+  return runWithClient(client, transport, 'withMcpClient()', fn);
 }
 
 async function runUsageTelemetryChecks() {
@@ -855,7 +917,18 @@ async function runAll() {
   }
 }
 
-runAll().catch((err) => {
-  console.error('selftest FAILED:', err);
-  process.exit(1);
-});
+// Only auto-run the full selftest suite when this file is the process entry
+// point (same isDirectRun pattern handoff-mcp.mjs itself uses) — never when
+// test/test-mcp-process-lifecycle.js imports { runWithClient,
+// closeClientAndWaitForExit } from this module to unit-test the close-on-
+// throw fix directly, without spawning a real server child or hitting
+// Postgres.
+const isDirectRun = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isDirectRun) {
+  runAll().catch((err) => {
+    console.error('selftest FAILED:', err);
+    process.exit(1);
+  });
+}
+
+export { runWithClient, closeClientAndWaitForExit };
