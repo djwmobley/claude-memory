@@ -1,0 +1,2212 @@
+{
+  "generated_at": "2026-09-13T21:05:38.787Z",
+  "source_sha": "f85c79cb37e448cd7525566ff5de27324a59caab",
+  "entries": [
+    {
+      "path": ".github/workflows/sanitize.yml",
+      "class": "LIFT",
+      "source_sha256": "906ebf0e08c8e350f611a2aa3e08867de6e2d184726999b68c0cb731cdaaa76f",
+      "transform": null,
+      "_note": "bootstrap file injected by scripts/lift-to-public.js from templates/public-repo/.github/workflows/sanitize.yml (PR #306), not a path present in claude-memory's own tree at source_sha; source_sha256 here is the template's own content hash, checked at its TARGET path per the ongoing-CI reuse of this same manifest once it becomes memory-manager's own PUBLIC-MANIFEST.json"
+    },
+    {
+      "path": "hooks/pre-push",
+      "class": "LIFT",
+      "source_sha256": "1b63695d2789734f2368d2a9988f18b12a3a4d8a7ccf954f0c1d05e18c199145",
+      "transform": null,
+      "_note": "bootstrap file injected by scripts/lift-to-public.js from templates/public-repo/hooks/pre-push (PR #306); same reasoning as the sanitize.yml entry above"
+    },
+    {
+      "path": ".claude-memory",
+      "class": "LEAVE",
+      "reason": "private per-instance marker file (live marker UUID 90394596-...); a fresh memory-manager checkout mints its own via handoff_init, this one is never portable"
+    },
+    {
+      "path": ".claude-plugin/marketplace.json",
+      "class": "LIFT",
+      "source_sha256": "fd74fd97fb6aa7e024caad2b6938ee041aa747f7f7aa4f3dedc0b06339bed08c",
+      "transform": null
+    },
+    {
+      "path": ".claude-plugin/plugin.json",
+      "class": "LIFT",
+      "source_sha256": "a98bc5dd3e0d47276b6bf1fa4c75e998ab58226176c2d11773d9314bffa4a15c",
+      "transform": null
+    },
+    {
+      "path": ".claude/pipeline.yml",
+      "class": "LEAVE",
+      "reason": "private per-instance config override (database: claude_memory_eval_test, host/port) — analogous to .env, cm-runbook §11.6 scope"
+    },
+    {
+      "path": ".gitattributes",
+      "class": "LIFT",
+      "source_sha256": "f3192792a93c475cdc526c92fd8c24ba702ad6ac68b8b241b797c21c4d997fb8",
+      "transform": null
+    },
+    {
+      "path": ".github/workflows/test.yml",
+      "class": "LIFT",
+      "source_sha256": "3722be9f2f92a662c8cde260ad7e5f57351c17599a2ed4a83464245335ab1944",
+      "transform": null
+    },
+    {
+      "path": ".gitignore",
+      "class": "LIFT",
+      "source_sha256": "7f12d4bed207e9e4520beec9c1368a26a87bf24f5925a96bd59a56945febf6f9",
+      "transform": null
+    },
+    {
+      "path": "AGENTS.md",
+      "class": "LIFT",
+      "source_sha256": "c2d708927e3b5a146b8e3af09bd0170c096bd290b59cd85177ccbf5a4ecd29f9",
+      "transform": null
+    },
+    {
+      "path": "CHANGELOG.md",
+      "class": "LEAVE",
+      "reason": "not applicable — narrates dev/claude-memory's OWN private development history (internal cm#/PR-numbered entries); §11.6 is an archival + greenfield-repo move, not an in-place rewrite, so memory-manager starts its own changelog from the initial import commit forward rather than inheriting the old repo's private journal"
+    },
+    {
+      "path": "CLAUDE.md",
+      "class": "LEAVE",
+      "reason": "owner decision pending — mixes portable operating canon with a private \"Next session — read first\" journal section (project_id `pipeline`, internal PR/cm# references); needs an editorial split before lift, not a straight port"
+    },
+    {
+      "path": "CODE_OF_CONDUCT.md",
+      "class": "LIFT",
+      "source_sha256": "369bf7301883368fc19203bd0f1233fed2b83f0378ad19c4d0708bf61925339b",
+      "transform": null
+    },
+    {
+      "path": "CONTRIBUTING.md",
+      "class": "LIFT",
+      "source_sha256": "9c4e9b0f72dbe7e1107d5b73177b9129e5667bb671c8abebad8d93697aa59186",
+      "transform": null
+    },
+    {
+      "path": "LICENSE",
+      "class": "LIFT",
+      "source_sha256": "51d1f5fd1223f9eeff9dbd8dba2b8a228562cd4be105a356624d5fd53b86b845",
+      "transform": null
+    },
+    {
+      "path": "MANIFEST.md",
+      "class": "LEAVE",
+      "reason": "not applicable — dev/claude-memory's own private SHIPPED-feature ledger (project convention: MANIFEST tracks SHIPPED only); same archival-not-rewrite reasoning as CHANGELOG.md, memory-manager starts its own"
+    },
+    {
+      "path": "PREREQS.md",
+      "class": "LIFT",
+      "source_sha256": "9d3d6e1ea8981233c2b67ae86025386c797c0e9d33e498cb9c3b316267908c1d",
+      "transform": null
+    },
+    {
+      "path": "QUICKSTART.md",
+      "class": "LIFT",
+      "source_sha256": "d17893e17f41f4a9e6fe4cae79aee83477e74ffa597d168cfed6288d0aabbe8c",
+      "transform": null
+    },
+    {
+      "path": "README.md",
+      "class": "LIFT",
+      "source_sha256": "940507239bd15efe9bace442da9dd63435f3ff2e9c9d195dbda5fdd5c93d2182",
+      "transform": null
+    },
+    {
+      "path": "SECURITY.md",
+      "class": "LIFT",
+      "source_sha256": "f07655e2322ce1a83b1890f64dba99e02426e26c8d994cadee6478900bcd22ba",
+      "transform": null
+    },
+    {
+      "path": "commands/handoff/README.md",
+      "class": "LIFT",
+      "source_sha256": "fc0176a5808079d5e15d36cbcb3295808541fdc4af86dbaf5d532fb3cbd08560",
+      "transform": null
+    },
+    {
+      "path": "commands/handoff/checkpoint.md",
+      "class": "LIFT",
+      "source_sha256": "3a603cde0006687741624c5e2344dfbccefd58f99ebed56c15dc3cee8934ab57",
+      "transform": null
+    },
+    {
+      "path": "commands/handoff/close.md",
+      "class": "LIFT",
+      "source_sha256": "2b2b2f770b867d137e15ac4d57affff5f05d3c76d59cc67658095f88dca90895",
+      "transform": null
+    },
+    {
+      "path": "commands/handoff/drop.md",
+      "class": "LIFT",
+      "source_sha256": "80478e9b5d6e8b89e0a16e81adc2b049033bf179a35023a47a4c41f377f46e66",
+      "transform": null
+    },
+    {
+      "path": "commands/handoff/init.md",
+      "class": "LIFT",
+      "source_sha256": "546e54807e92a2a2ee06211393401674e1e3779b50b47df2ccdf7653bf4e59ba",
+      "transform": null
+    },
+    {
+      "path": "commands/handoff/promote.md",
+      "class": "LIFT",
+      "source_sha256": "53c459dc8683d6b0d4cf9ac736e50436e5ebfc03d53ee4d0ad17994ebdbef7e8",
+      "transform": null
+    },
+    {
+      "path": "commands/handoff/purge.md",
+      "class": "LIFT",
+      "source_sha256": "005e40d929168472f0cc3268804da2cd032b83a22b3a898f8c15b29d85b80ece",
+      "transform": null
+    },
+    {
+      "path": "commands/handoff/resume.md",
+      "class": "LIFT",
+      "source_sha256": "de24509a5cf880b4a3b4f23b4aadf8fba3a2f04cca290d344855535b818c4049",
+      "transform": null
+    },
+    {
+      "path": "commands/handoff/resurrect.md",
+      "class": "LIFT",
+      "source_sha256": "02db746009d58a16a9d41f0e125e74a6e3b2863cc7b3fb5ef1a55dc2472c729e",
+      "transform": null
+    },
+    {
+      "path": "commands/handoff/status.md",
+      "class": "LIFT",
+      "source_sha256": "b43acddb89d3a332b89f33cf6f9bb4c13272bb7458006cda351137d3aa878fa2",
+      "transform": null
+    },
+    {
+      "path": "docs/agent-interop.md",
+      "class": "LIFT",
+      "source_sha256": "ddcb83dd34b21e9297ccf91e69eab9fb722108ce1116081aa9098e2e11d1715a",
+      "transform": null
+    },
+    {
+      "path": "docs/case-study.md",
+      "class": "LIFT",
+      "source_sha256": "a0cece27e40744760c2a954b99fd18e8b41094bdf60111054a8dcae910af0ac1",
+      "transform": null
+    },
+    {
+      "path": "docs/deep/findings/debate-2026-05-16-memory-bootstrap-collision.md",
+      "class": "LIFT",
+      "source_sha256": "367a95e9aa5c925d832600c780fb4da4335c235337052791c5e790511f059e1b",
+      "transform": null
+    },
+    {
+      "path": "docs/deep/retrieval-contract-evolution.md",
+      "class": "LIFT",
+      "source_sha256": "1e8b8f7b63ac98bfa0b2feadb215c26ef0708ee9a1b0f9e8779a567a776d673c",
+      "transform": null
+    },
+    {
+      "path": "docs/deep/specs/2026-05-14-bundle-a-substrate.md",
+      "class": "LIFT",
+      "source_sha256": "ae212da814c96d827a93f8ce981a323be4227f6e20eb00ebf9bfe2495c7fa1b0",
+      "transform": null
+    },
+    {
+      "path": "docs/deep/specs/2026-05-16-assertion-extraction-architecture.md",
+      "class": "LIFT",
+      "source_sha256": "7364132b11091080dbb9957ce5472a8e5ddfce396560f6b140a577a4ee56b0f7",
+      "transform": null
+    },
+    {
+      "path": "docs/deep/specs/2026-05-16-memory-bootstrap-collision.md",
+      "class": "LIFT",
+      "source_sha256": "176dbe6c1011c3d090dc0a53781055c0c170c75cdb25d7aac16f7353f5534240",
+      "transform": null
+    },
+    {
+      "path": "docs/deep/specs/2026-05-17-predicate-normalization.md",
+      "class": "LIFT",
+      "source_sha256": "57ac9ca161002708becb4cc7fb73c7e975c04a4d02c2b872252e06b306e94795",
+      "transform": null
+    },
+    {
+      "path": "docs/deep/studies/2026-05-memory-systems-comparison.md",
+      "class": "LIFT",
+      "source_sha256": "4271ff8bd97f2c453447d64274590f907d847407d5a92fa3db361f66e185d758",
+      "transform": null
+    },
+    {
+      "path": "docs/deep/studies/decay-vs-dont-forget-and-resurrection.md",
+      "class": "LIFT",
+      "source_sha256": "d8fa2bed86cadeb9086ed8fe606bd1c8645c2b88bea93f1564a37c21eea29930",
+      "transform": null
+    },
+    {
+      "path": "docs/glossary.md",
+      "class": "LIFT",
+      "source_sha256": "225703ddaaa7826c0d36cc16c7767eef406fbd1fca13a1ebac3f2fe426b63bdf",
+      "transform": null
+    },
+    {
+      "path": "docs/hosts/codex-howto.md",
+      "class": "LIFT",
+      "source_sha256": "3656a7d28ddbe1de3df630cafcda8e1d07a12eaae101582174aeb7a060fcc6f0",
+      "transform": null
+    },
+    {
+      "path": "docs/hosts/codex-quickstart.md",
+      "class": "LIFT",
+      "source_sha256": "4cb68c5597730cc78b8205aa7ff84695459a134abaf0f2304a53c9f743bd7c38",
+      "transform": null
+    },
+    {
+      "path": "docs/hosts/codex.md",
+      "class": "LIFT",
+      "source_sha256": "9ee8f4c77ad22976f726fa49761358384fc4f2d22f9da2932a06937cfbfa119b",
+      "transform": null
+    },
+    {
+      "path": "docs/how-memory-works.md",
+      "class": "LIFT",
+      "source_sha256": "f9949b592f1eb8d2a7ec5b20dae859f39825cb3fb3633b56d858c453520c744d",
+      "transform": null
+    },
+    {
+      "path": "docs/mcp-tools.md",
+      "class": "LIFT",
+      "source_sha256": "c0e38dd3e4274c7bd11512ceb6be965f1bfb558a3a59275f34fc4775e6783c21",
+      "transform": null
+    },
+    {
+      "path": "docs/notes/2026-09-02-s17-routing-harness-status.md",
+      "class": "LIFT",
+      "source_sha256": "7f2fd2e8642e836377813f336b10cda857e58a8c075aba23fa737f5374190c16",
+      "transform": null
+    },
+    {
+      "path": "docs/notes/2026-09-06-s17-routing-gap-audit.md",
+      "class": "LIFT",
+      "source_sha256": "25189fa38b0e5cc20ec4115317dba8f0a6e383144f7d47573b9137026ceacb18",
+      "transform": null
+    },
+    {
+      "path": "docs/troubleshooting.md",
+      "class": "LIFT",
+      "source_sha256": "28577c497f22f4a2c5b3661669823c1cde825bcf7fdae59e109336ac75113fa0",
+      "transform": null
+    },
+    {
+      "path": "hooks/README.md",
+      "class": "LIFT",
+      "source_sha256": "10ccb400f40a3ddd0f875c2a9d10a2a53466fb2844d4469080e76012d1dbe42d",
+      "transform": null
+    },
+    {
+      "path": "hooks/hooks.json",
+      "class": "LIFT",
+      "source_sha256": "f9933e5f7add4d436d27480161fa7b651373892d129b00e3b6bfe963c30c9176",
+      "transform": null
+    },
+    {
+      "path": "scripts/.npmrc",
+      "class": "LIFT",
+      "source_sha256": "a28c9d86a8981049d203ad164cff1e753ed61dc0460ee8765316cbb3d0007d00",
+      "transform": null
+    },
+    {
+      "path": "scripts/audit-predicates.js",
+      "class": "LIFT",
+      "source_sha256": "621b26967035adbaf638d2769b1cb06573ef24294b01167e650c3d94befe81dd",
+      "transform": null
+    },
+    {
+      "path": "scripts/bench-handoff.js",
+      "class": "LIFT",
+      "source_sha256": "1a24fedd88946dd7a0834f92e8a458c81a37d83f40c029978fad8638fd5d6576",
+      "transform": null
+    },
+    {
+      "path": "scripts/bundleb-w2-extract.js",
+      "class": "LIFT",
+      "source_sha256": "6355605b18e7a3a7d2131d13c22b3027beaf28462bfd0c7004d4f6edbc7c2186",
+      "transform": null
+    },
+    {
+      "path": "scripts/bundleb-w3-communities.js",
+      "class": "LIFT",
+      "source_sha256": "06d87f4b2e588e694f3f7a191c4b9c49b27a6e13f43848862571f54ced549703",
+      "transform": null
+    },
+    {
+      "path": "scripts/bundleb-w4-contract.js",
+      "class": "LIFT",
+      "source_sha256": "f046929f40a8bb0cfc639b8ad9be92053298b985c97f176f325dff38bf75d0c0",
+      "transform": null
+    },
+    {
+      "path": "scripts/dev/backfill-assertion-embeddings.js",
+      "class": "LIFT",
+      "source_sha256": "f1ac2496cbc12805b9bca3db2ab70f0bafba82d4144141dd4b652b26d410d347",
+      "transform": null
+    },
+    {
+      "path": "scripts/dev/generate-embed-fixtures.js",
+      "class": "LIFT",
+      "source_sha256": "ec37b8208bd0451a10a885932a46da2d582348a02eaab3829b0ecd7a0322b98a",
+      "transform": null
+    },
+    {
+      "path": "scripts/distill-corpus.js",
+      "class": "LIFT",
+      "source_sha256": "4513dcf9f11cc480bddb7358536f1aa50d3c8e1b9647f6b9af885edaed6ce765",
+      "transform": null
+    },
+    {
+      "path": "scripts/handoff-mcp-selftest.mjs",
+      "class": "LIFT",
+      "source_sha256": "3b1a4a4f829ef2593c959bada1f26aa3289f3e29b6ed1bea58b71f74988b8102",
+      "transform": null
+    },
+    {
+      "path": "scripts/handoff-mcp.mjs",
+      "class": "LIFT",
+      "source_sha256": "1ed9df14382dbfa848c41599267fbdfcd33637a73f11a0330eea29c0d45d453a",
+      "transform": null
+    },
+    {
+      "path": "scripts/handoff.js",
+      "class": "LIFT",
+      "source_sha256": "56770ea7ff253708c1a1a986448ca93308b8e192842b8ff550c4e43945a11aea",
+      "transform": null
+    },
+    {
+      "path": "scripts/init-config.js",
+      "class": "LIFT",
+      "source_sha256": "4ee2e9f65f957637e60149b083b5dda9fc8e6c49608fa7628995bdf64638254d",
+      "transform": null
+    },
+    {
+      "path": "scripts/install.js",
+      "class": "LIFT",
+      "source_sha256": "ced6ecdbcbe95380fa99bd27ef565c25534ee96ec51f6d9757afb99e1caba0b1",
+      "transform": null
+    },
+    {
+      "path": "scripts/leiden_communities.py",
+      "class": "LIFT",
+      "source_sha256": "9d276e19f11076ca3c9d7eb2bab47e8c72c00cbed587bf5ced60e16336a2d224",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/agent-provider.js",
+      "class": "LIFT",
+      "source_sha256": "9f70fc549eec10363221868ae0a0e6e0cad111081c688d500282183be550e835",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/backfill-embeddings.js",
+      "class": "LIFT",
+      "source_sha256": "f2b09c2a5253937218a4ea928c22d26cdcdb669652b8422092814f067423b057",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/carryover-render.js",
+      "class": "LIFT",
+      "source_sha256": "eba567093fe80b6c2c490b0040179497b1af43ab83b7714c231770521f8d35ba",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/caveman-lint.js",
+      "class": "LIFT",
+      "source_sha256": "92baecf5fbd397649f5e8baffba14c0a30c5df9cb7a6d0c05c0d2e970042b96b",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/claude-md-key-paths.js",
+      "class": "LIFT",
+      "source_sha256": "4878e7ff88ff86a527e619299acf7a7e85205990b937b0e9b4c0ea035e0e3665",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/cli-args.js",
+      "class": "LIFT",
+      "source_sha256": "3a7857090dda80cbea2f23762c3138f781b2ccef51713a5368a8392298c9a3bb",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/codex-install.js",
+      "class": "LIFT",
+      "source_sha256": "e42bb80c0441717f490d2e1d637ac83b4cf6cc3625b9192e62c0b21cbe3bccca",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/db-seam.js",
+      "class": "LEAVE",
+      "reason": "SQLite db-seam arm — V2 (owner 2026-07-20): Postgres-only public repo, seam retires with dev/claude-memory archive"
+    },
+    {
+      "path": "scripts/lib/decisions-writer.js",
+      "class": "LIFT",
+      "source_sha256": "d6d71cd50e81bc791935ab8cc0fa9f7d018e7f8f27f2ca6c30cbf5931484f509",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/embed-heal.js",
+      "class": "LIFT",
+      "source_sha256": "0084d9ffc105e2d65fad9e693e2c32fdc9d35e235de0f0d5967bcea9a611531f",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/embed.js",
+      "class": "LIFT",
+      "source_sha256": "14528d68b4c137f0e27aa382077dd4814e4695a0a45733d363419e7b9621be44",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/embedding-provider.js",
+      "class": "LIFT",
+      "source_sha256": "07dfd15f6c0e638c85482c12657e2fc6777c6d9fdfb84fe7ba0f61f1bf62af2b",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/encoded-cwd.js",
+      "class": "LIFT",
+      "source_sha256": "1d502e42f7e6da27d97ab3d27cc4561663dfc0cff0df2f77e4e772dba79c2c4e",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/entity-graph-crud.js",
+      "class": "LIFT",
+      "source_sha256": "bc5b09ace76abed7dcd743d7d8c822119994634d01ec4201b8bc3e2492789729",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/exchange-log.js",
+      "class": "LIFT",
+      "source_sha256": "d77a6488e77783728250734401ad4f151457bd2629fa8fcd1a26989f6d04a099",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/fs-path-normalize.js",
+      "class": "LIFT",
+      "source_sha256": "d3bee0a8f775afe129da9cd2b3346d32d87815af50b5517f01d42bab237fcf27",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/handoff-markdown-parse.js",
+      "class": "LIFT",
+      "source_sha256": "3be3adc243cce45ba1076df51496e981f52b1dc034dfc7192ad359508f03adc8",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/handoff-paths.js",
+      "class": "LIFT",
+      "source_sha256": "6d3b873c6bfe1041dfe75a12eebb666b1e9255972f71b1396345863c50fee2e3",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/host-target.js",
+      "class": "LIFT",
+      "source_sha256": "c5a5ee6a8e3b20c7af8f61b5de24e1a223622aa17b64820805ee8ebbdb239137",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/intent-key.js",
+      "class": "LIFT",
+      "source_sha256": "5e4f7c7338eaa84f0ee4174bc1a28f5704f3f5e263744dedaa52134341ac80b8",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/mcp-db-connect.js",
+      "class": "LIFT",
+      "source_sha256": "a11fbde8ffaeadd048bc988ec4caa72c5b45490c820bb2ac046c17a66556f3c4",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/memory-lint.js",
+      "class": "LIFT",
+      "source_sha256": "0ab12e7641fbce4b15e881f2352d01cd4fd67140dd5e5a3bbfc97f6677da5899",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/memory-search.js",
+      "class": "LIFT",
+      "source_sha256": "580f684b97d51cdc38586759ae2d579e316bdb54c40557e4e320af45718286cc",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/memory-upsert.js",
+      "class": "LIFT",
+      "source_sha256": "fb91eb610ee26741b45009af2025a86e361ab796d420d4a98dba750c00242cda",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/memory-view.js",
+      "class": "LIFT",
+      "source_sha256": "b11273ce143fc96bfa4fc2cc31f905afdb33bbe9557fde4554677c90bb72d971",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/normalize-text.js",
+      "class": "LIFT",
+      "source_sha256": "573210fcae89676124e2807cc46c18ca4bc9f0980ace9996a5b61eec5573dbbb",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/payload-schema.js",
+      "class": "LIFT",
+      "source_sha256": "3886d540f02479284b8bb6bf0e071a8b7034e8227f8a85304b2ee3a448f6d689",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/predicate-audit.js",
+      "class": "LIFT",
+      "source_sha256": "36ffd57bb59cacd18ae092882cc637e949c3bc29ef6c6cf08b7a957a92d6474b",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/predicate-registry.js",
+      "class": "LIFT",
+      "source_sha256": "b1cd60c69aa8402b2e824bd6ab69212e775bc97ccefa7bbd669ee73ebc039086",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/predicate-registry.json",
+      "class": "LIFT",
+      "source_sha256": "c69c3d3f5d0425e665a9797310b641286d6d0122f0d8e426bd12043421cc4622",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/project-identity.js",
+      "class": "LIFT",
+      "source_sha256": "27709d1db33f1036fe7500cf985fe971ebc3e957626bd675074bb08ff6d487fa",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/project-marker.js",
+      "class": "LIFT",
+      "source_sha256": "cac23d5481262e8e69fff4fbe77d8f12651f74ef344be8ddd948076f6c97892a",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/reality-checks.js",
+      "class": "LIFT",
+      "source_sha256": "e179ad7d1bed099af8e5c52d08374bce5e291c6afcbbdd0ce1ff8e46a1cf13c5",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/render-handoff-card.js",
+      "class": "LIFT",
+      "source_sha256": "3770a5a309498729470a2ff1462659549581eaf8f4e61c7a42538d69d0d5516c",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/route-resolve.js",
+      "class": "LIFT",
+      "source_sha256": "e84229e7e229f47684bb50b358d78d933ab4e7466901f1c0177988814c473014",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/routing-identity.js",
+      "class": "LIFT",
+      "source_sha256": "f4853051c440036c925033d74372446688d98b394284d31968aa7d3fc2686238",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/routing-profile.js",
+      "class": "LIFT",
+      "source_sha256": "06f2da6f4ef4908a8e97b06e3e971f54a1dc07073fca42669d34a0eab0c63852",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/routing-write-surface.js",
+      "class": "LIFT",
+      "source_sha256": "a1d7de6ff2ff126233cc19422f2e520e7b704e4f95bcb8f6b59a2352cd768546",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/schema-classify.js",
+      "class": "LIFT",
+      "source_sha256": "41794648a2eacc971b71afe9348f6f423483a6cb3e6ee27a4b684f9e2dcb0072",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/schema-epoch-guard.js",
+      "class": "LIFT",
+      "source_sha256": "d43e6ce5d6cf3366e00b6f860bf69b1f938148a98bbf740e6e4304ae422b9150",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/session-identity.js",
+      "class": "LIFT",
+      "source_sha256": "5816dcb3f24710d125bab00c49111f1154fe58ed6a58bee789cd09e5ae27de93",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/shared.js",
+      "class": "LIFT",
+      "source_sha256": "03911edd0be67ec76edbb663093880062867059b0b1d72e65c082eed35160642",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/source-file-normalize.js",
+      "class": "LIFT",
+      "source_sha256": "3d2b4abf80b5de659ca4c9d07277e37538d45c9874a8872c64a04be767e6ffbd",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/subject-alias-map.json",
+      "class": "LIFT",
+      "source_sha256": "c3225b4604bde6596560539ac889b4cd6cac334153cdc062d93312c4336dfe54",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/subject-canon.js",
+      "class": "LIFT",
+      "source_sha256": "8beb8157c54f91f980556193ce19b500da4ea4c1dd3b7023e9069af14ec9eb47",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/test-env-isolation.js",
+      "class": "LIFT",
+      "source_sha256": "4efa022da0060c2d7ad6ad5bffb1dde0e44d2cee1d2b36a730f4aa3b0cdc16b6",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/test-fake-embed-server.js",
+      "class": "LIFT",
+      "source_sha256": "6673d4f70e8f02ee6d49349960150640c3f371cb4ab9ab0673f9464c5f983ec3",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/test-pg-helpers.js",
+      "class": "LIFT",
+      "source_sha256": "86248d008bef3122e41132ef41b488dddeee28078c463126ec086d941a83aabb",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/usage-telemetry.js",
+      "class": "LIFT",
+      "source_sha256": "78f48e6b42a205b9e32f98d10dc2ea9e9fa9a10debe4a75517b895f80a62dfbf",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/vector-strip.js",
+      "class": "LIFT",
+      "source_sha256": "cfe34b931fd167d7a6473d10a0f4bea6d80ae56d72d1309745927dbe7346a584",
+      "transform": null
+    },
+    {
+      "path": "scripts/lib/write-time-embed.js",
+      "class": "LIFT",
+      "source_sha256": "24923fe422e6e05a3960f7701b62d169f570ae7d32798590593228d5f28a2fd3",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/audit-roster-t3-declarations.js",
+      "class": "LIFT",
+      "source_sha256": "5c7cd9cc80a129167b62bd06954539c898d3d02e489807a5ae762e6c2ddbe379",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/caveman-columns.json",
+      "class": "LIFT",
+      "source_sha256": "6e5349250fd0e72fd239bbaec3b78d356ac69b724ffdef87d3f880fa304bf6d8",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/claude-context-topic-rules.example.json",
+      "class": "LIFT",
+      "source_sha256": "ee76d274bcf1c30f5532f597abcdfd1ab9dde7efc76982897295a04c233c4ef7",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/cure-migration-manifest-retirement.js",
+      "class": "LIFT",
+      "source_sha256": "7f836cbee2e96dd10331c04a2be3b7835afbb2de3d5819c75bc3e4171cb6bf0c",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/db-triage.example.json",
+      "class": "LIFT",
+      "source_sha256": "9e68c75888f6ceb0588a224160a37c0c999f0c534c064b3f4a94551d533b23c8",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/feature-usage-project-map.example.json",
+      "class": "LIFT",
+      "source_sha256": "a3e4959d7c017423af089f7df3390628344fbe9821aae89c2b974fc32e317bf1",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/file-memory-project-enrollment.example.json",
+      "class": "LIFT",
+      "source_sha256": "3ae4395ebfcc66ee832601d8f218d2d907c3572fd6eeeaacf2f3c6e768d0c1f2",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/handoff-section-headings.json",
+      "class": "LIFT",
+      "source_sha256": "82c3367e44f59421176d7037ceab405a426b65f2322ca89aca55d3a4ebd5447d",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/harness-authorship.json",
+      "class": "LIFT",
+      "source_sha256": "2517a5c81c2289c0261215776d524e587555cbe4a88658d12a02aa80236452c4",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/inventory-manifest.json",
+      "class": "LIFT",
+      "source_sha256": "3340534dafa5c4f6c473fbb07f6364d4ca368158a8f91fc585d81cb70ff02eaf",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/known-own-graph-project-ids.example.json",
+      "class": "LIFT",
+      "source_sha256": "ab8507cb018a7b2b93c478df423158358b9e9a4d04d226ffcec9e8301a0e94ec",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/lib/constraint-preflight.js",
+      "class": "LIFT",
+      "source_sha256": "d2668a971c3f598ca9dc347ec197cfeaf52fb9cdeeee4f476fc44a7277950a4e",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/lib/smoke-harness.js",
+      "class": "LIFT",
+      "source_sha256": "de4512cec4d7deda76ec6a486c4655a1d87521c1e0b086d3c086905d88f1d964",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/lib/verify15-shared.js",
+      "class": "LIFT",
+      "source_sha256": "8710cd13718793b32b294b23e4f09e14214caa8be196980a15d07ad46bded80b",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/memory-entry-dir-overrides.example.json",
+      "class": "LIFT",
+      "source_sha256": "81562e8c25103f61a0240e200dfacb01f130821ebb37fe98273fa45709869d7c",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/memory-entry-project-map.example.json",
+      "class": "LIFT",
+      "source_sha256": "6ad28d53b8a1b43ae1e804b9f84f35c011fed1645d53b47d7b90d0c9f4b5bf33",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/migrate-01-canonical-db.js",
+      "class": "LIFT",
+      "source_sha256": "e1c6de72c55e783090ad41035cd43ebed502f41311309006fd95827ada95e457",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/migrate-02-decisions.js",
+      "class": "LIFT",
+      "source_sha256": "6d0ae1ffa44cd8e4eb27007e24b331eb2be385ee0116f4349d28c984c34bbdd7",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/migrate-03-corpus-project-id.js",
+      "class": "LIFT",
+      "source_sha256": "fdc04b5b72d81a9589bf4381e2b7b6788358c242af148b3c56d06d7890d81ab3",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/migrate-04-absorb-pipeline-tables.js",
+      "class": "LIFT",
+      "source_sha256": "5d9075651591ef84c49910ede812ff232a47d4f3b41a83bf3447f2fa2ade99fc",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/migrate-05-sync-file-memory.js",
+      "class": "LIFT",
+      "source_sha256": "721413a1087753a7d1c4f22df69d7ef39df7adb40f8a84814ec3f017f6fc3adb",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/migrate-07-reembed-corpus.js",
+      "class": "LIFT",
+      "source_sha256": "f85431a1b3bf60b58a55e9f738eac867a73ef3c32ba59e51db75a6d4d7cbc846",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/migrate-08-handoff-markdown.js",
+      "class": "LIFT",
+      "source_sha256": "b40aa63697fe5479c01ebbdc2e0242609b8e1e2f5850b0f186ca77dfb8db23f1",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/migrate-09-file-memory-markdown.js",
+      "class": "LIFT",
+      "source_sha256": "f3e9acf479de85c24cb3bcda8e58bbdbbc9735db312684c91f6e9676ccd25503",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/migrate-12-feature-usage.js",
+      "class": "LIFT",
+      "source_sha256": "7bb03169c455429fa9ccd441457235f315cff0d6be1f0277239c27beafb57c45",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/migrate-13-agent-exchange.js",
+      "class": "LIFT",
+      "source_sha256": "e66fe8f2f053bcf8a244c3221b8492b28e2dc4734c87966c332469656b3a0d75",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/migrate-14-seam-tables.js",
+      "class": "LIFT",
+      "source_sha256": "9facc2e6c86fb87a7241b08806c43ad0fe8e4ecd5370a118787a68d5e4287939",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/migrate-15-mcp-addenda.js",
+      "class": "LIFT",
+      "source_sha256": "84648ba6c92acd21e348ea6f6e1f4a78f67e927075d4fc84ac358164d97236f9",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/migrate-16-caveman-addenda.js",
+      "class": "LIFT",
+      "source_sha256": "27cac48b4f98432d30b47d22337f89f6d50d6dc1d8f64695d4f3e21b604b5dfe",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/migrate-17-intent-key.js",
+      "class": "LIFT",
+      "source_sha256": "fa1e6b5140be6e077c7992a1e9b8acdc77a4452df216259fbc16f2913ac73291",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/migrate-schema-addenda.js",
+      "class": "LIFT",
+      "source_sha256": "f2fb97acaa0ace4f9706e55618292127aff23afe78dab6605b6409c6652bb8b2",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/migrate-verify-own-graph.js",
+      "class": "LIFT",
+      "source_sha256": "e8e8928cec65df5f6856d11a4f1c39d54b831407a3a17af9bbeca97e2b777bd3",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/pipeline-db-project-map.example.json",
+      "class": "LIFT",
+      "source_sha256": "ac8d49f3ca9f064c85e3bf6db4b337d4ada7071542e13b3fbf5105e8585259d1",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/recall-equivalence-queries.example.json",
+      "class": "LIFT",
+      "source_sha256": "2547c832a4d6f4bbbfd37829ae82bfb0a1a5e0759ff3f2a7bc62b7439132c3b7",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/source-table-roster.example.json",
+      "class": "LIFT",
+      "source_sha256": "9f7b6baad7fefa676892931a1519fb07445253e675b84569f634f2c6d69da90b",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/sql/attribution-columns.sql",
+      "class": "LIFT",
+      "source_sha256": "e243c0479a7be62c023e545c969fda6d451c12c110d57d89d6ba7af8dfd9059b",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/sql/embedding-providers-base.sql",
+      "class": "LIFT",
+      "source_sha256": "3c800b9dac6c89bded4f9f609401c8399fd520259142e1d9278ddca6240b99fd",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/sql/migrate-04-seam-ddl-addenda.sql",
+      "class": "LIFT",
+      "source_sha256": "0a4315b6aec766de46387e6d4299a8e4e0677690dc635d0219f33b86806470f1",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/sql/migrate-05-ddl-addenda.sql",
+      "class": "LIFT",
+      "source_sha256": "ddd7db124d7f78281dfd62b80b712bb5e2fb4c9818da66325f60f636708099b1",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/sql/migrate-06-carryover-status.sql",
+      "class": "LIFT",
+      "source_sha256": "d774929726f5c2cac7c676d1c06933ff0b3a6aeba13ba70b86dea0dd35ef8a41",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/sql/migrate-07-ddl-addenda.sql",
+      "class": "LIFT",
+      "source_sha256": "aa8b680a85577d3ed3d4f196ebc31b03f1445b7462c8fc64b03a4ba417cd45e7",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/sql/migrate-09-file-memory-schema.sql",
+      "class": "LIFT",
+      "source_sha256": "0cecd2474ce7e1a452072396d830cd6889c0a02b2d18f708465725e11a42fa40",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/sql/migrate-10-routing-harness.sql",
+      "class": "LIFT",
+      "source_sha256": "4acfc0a94ca529d3aab7c9a52d50fb9b71e6088855a87ef50f46d4a46041e0a0",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/sql/migrate-13-agent-exchange.sql",
+      "class": "LIFT",
+      "source_sha256": "278e6ccd8a7f20bd66942638dada27a3bb8cd43103473cb6ac685a33a29e0a28",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/sql/migrate-14-seam-tables-embeddings.sql",
+      "class": "LIFT",
+      "source_sha256": "33f05ad504948f08a9146eb24a601ba40209a1c0ec695a28972b9101b399bdf6",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/sql/migrate-14-seam-tables.sql",
+      "class": "LIFT",
+      "source_sha256": "350ef168926d5d676b16b479f6d7d3139283ca0ddbce5c67b69b26b6f4d8231c",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/sql/migrate-15-mcp-addenda.sql",
+      "class": "LIFT",
+      "source_sha256": "7176ade36c6c37108bb8f046139d56039fbe97144fe30e482e7ed39ddac9499f",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/sql/migrate-16-caveman-addenda.sql",
+      "class": "LIFT",
+      "source_sha256": "591e74ff1e2974bf2f60ca4e44a8620e883ab7d5a48e8de085ee064877bf6f23",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/sql/model-registry-base.sql",
+      "class": "LIFT",
+      "source_sha256": "78106acc6b85ba8858524b7c9dae0055624e50ac75ba2b5960794c9b8cf4c30f",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/topic-prefix-to-project.example.json",
+      "class": "LIFT",
+      "source_sha256": "cc89522a7ec58e1237a407640a081d9e5d949847aad0388a359b51cef2419329",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/verify-13-exchange-smoke.js",
+      "class": "LIFT",
+      "source_sha256": "9d9b9d1624502770df0b9741e954d0bde7a695bb9f034e58fce6a7dcb58610f0",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/verify-15-acceptance.js",
+      "class": "LIFT",
+      "source_sha256": "6b772f689681c19aca1c52fe1727adf061a22f9a0c8f77cf688fbd7143fe465c",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/verify-15-freeze-precondition.js",
+      "class": "LIFT",
+      "source_sha256": "47df898acfb8554a6c821c5076bfc9f44c11177a6d3dba986bc6b606ca136b9d",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/verify-15-t0-roster-completeness.js",
+      "class": "LIFT",
+      "source_sha256": "ad090cb0f0e573e616c52d298ac650ba0c792681ea53af9e92460d1d98960999",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/verify-15-t0-roster.js",
+      "class": "LIFT",
+      "source_sha256": "6a74abc52f8ecb7ddd9b8df1b84d9cb24db5ee9f3b64e788a42514c7c095cba5",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/verify-15-t1-snapshot.js",
+      "class": "LIFT",
+      "source_sha256": "655dc385e984971d4751e4cc68fe433c0560e24c95c046503399e2990ea87799",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/verify-15-t2-5-dualwrite.js",
+      "class": "LIFT",
+      "source_sha256": "31d202266f985bd7120c0a6aedf4674d7a12d63cfbc906cc7a0eebbe82b76285",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/verify-15-t2-rowcount.js",
+      "class": "LIFT",
+      "source_sha256": "c830f18a413aa414b1ce17105960b06c35511e35ada99c05c57e59aea0ed81d1",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/verify-15-t3-content-hash.js",
+      "class": "LIFT",
+      "source_sha256": "2abefc58344397c8374592c8c806a02a794d88423e4c3ddb41980939200b36cc",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/verify-15-t3b-reverse-containment.js",
+      "class": "LIFT",
+      "source_sha256": "2656c24bd6479f3d7a807e1d30fafe134d096b2dfdf81eaa481d772af9aeb97f",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/verify-15-t4-recall-equivalence.js",
+      "class": "LIFT",
+      "source_sha256": "e6682e416bc2449bfafd72e4f3dd2bef6adc919b288ccd6e6d9666a124705486",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/verify-15-t5-embedding-coverage.js",
+      "class": "LIFT",
+      "source_sha256": "39f14fce19c3c3b43cf52127f54054cd1409f5e1dcf0a0996ee1c875a422c314",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/verify-15-t6-referential-integrity.js",
+      "class": "LIFT",
+      "source_sha256": "520c923d3fdc003f7fe0c7671e729a09122c50ff0bc57dc90baa0b6f20bddc33",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/verify-15-t7-caveman-economy.js",
+      "class": "LIFT",
+      "source_sha256": "a189d26dff094f5bf673c045f0c270d8e163d733879d0a6d687179ba6c8b000d",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/verify-15-t8-idempotency.js",
+      "class": "LIFT",
+      "source_sha256": "12a4e88a834d32b72ec0ab1c7170d4fa2899bf9b925e3dc63acb88ef066b3356",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/verify-15-t9-negative.js",
+      "class": "LIFT",
+      "source_sha256": "056a703754bbcdd0feb71cbd6619175d1b03dd2ae5324a6128f5685cb10ddb2b",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/verify-17-routing-smoke.js",
+      "class": "LIFT",
+      "source_sha256": "81731769aa857e9a2f05c6a43fec74d8044454658aed08fd6e41b5ac88abac0c",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/verify-18-usage-smoke.js",
+      "class": "LIFT",
+      "source_sha256": "c8777bf20e260b30bf6f943b57503ee32f0a6a69f3cd3fbf4a473b268e139629",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/verify-19-seams-smoke.js",
+      "class": "LIFT",
+      "source_sha256": "cc49fb2fa82c9a9f8eb49820460ec287b9bcdc5377d3c505247bb101bbb2b56f",
+      "transform": null
+    },
+    {
+      "path": "scripts/migrations/verify-20-mcp-surface.js",
+      "class": "LIFT",
+      "source_sha256": "32224e8c7e0b5283ad25ed726cddde8267506c994d5aea7dd4e63dc13c7980df",
+      "transform": null
+    },
+    {
+      "path": "scripts/normalize-predicates.js",
+      "class": "LIFT",
+      "source_sha256": "06b92e2e1f979b7d7630521449a774090e728d0a8cc8aec4e72cb635d884a9ce",
+      "transform": null
+    },
+    {
+      "path": "scripts/operator-pin.js",
+      "class": "LIFT",
+      "source_sha256": "9b00a494e4f3163a790db5992a3945eb2f110bf0bb581c6253296e3e4ac4bf0d",
+      "transform": null
+    },
+    {
+      "path": "scripts/package-lock.json",
+      "class": "LIFT",
+      "source_sha256": "ad14508f91f6f5c86e95775a79b02c3f1582664eb689872634c18fd005f0a658",
+      "target_sha256": "dffa83b9dad35d86cafd4075a99990f3c45b85cadeba01fe51c64407ccb0a07b",
+      "transform": {
+        "from": "pipeline-scripts",
+        "to": "memory-manager"
+      }
+    },
+    {
+      "path": "scripts/package.json",
+      "class": "LIFT",
+      "source_sha256": "50f45370cee2d09ec15aff52e1eef63de0b643620150d294b6a341f9c4aab31f",
+      "target_sha256": "44afb037a3fa57fe278c7e7433931233832217a8bbada2878b42bf6778ff3c13",
+      "transform": {
+        "from": "pipeline-scripts",
+        "to": "memory-manager"
+      }
+    },
+    {
+      "path": "scripts/phase0-decisions-backfill.js",
+      "class": "LEAVE",
+      "reason": "Bundle-A eval-migration artifact, cm-runbook §11.6 LEAVE list"
+    },
+    {
+      "path": "scripts/phase2-schema-apply.js",
+      "class": "LEAVE",
+      "reason": "Bundle-A eval-migration artifact, cm-runbook §11.6 LEAVE list"
+    },
+    {
+      "path": "scripts/phase3b-schema-apply.js",
+      "class": "LEAVE",
+      "reason": "Bundle-A eval-migration artifact, cm-runbook §11.6 LEAVE list"
+    },
+    {
+      "path": "scripts/pipeline-chunker.js",
+      "class": "LEAVE",
+      "reason": "hard-forked pipeline-*.js script, cm-runbook §11.6 LEAVE list"
+    },
+    {
+      "path": "scripts/pipeline-db.js",
+      "class": "LEAVE",
+      "reason": "hard-forked pipeline-*.js script, cm-runbook §11.6 LEAVE list"
+    },
+    {
+      "path": "scripts/pipeline-embed.js",
+      "class": "LEAVE",
+      "reason": "hard-forked pipeline-*.js script, cm-runbook §11.6 LEAVE list"
+    },
+    {
+      "path": "scripts/pipeline-memory-loader.js",
+      "class": "LEAVE",
+      "reason": "hard-forked pipeline-*.js script, cm-runbook §11.6 LEAVE list"
+    },
+    {
+      "path": "scripts/pnpm-lock.yaml",
+      "class": "LIFT",
+      "source_sha256": "271c0626f567d93f781d98156524f6033ad585522d91e9216b055f27c219a579",
+      "transform": null
+    },
+    {
+      "path": "scripts/pr3a-corpus-acceptance-test.js",
+      "class": "LEAVE",
+      "reason": "PR-3a live-migration churn incident artifact (historical, project memory project_pr3a_live_migration_churn_incident), Bundle-A-adjacent eval scaffolding not part of the portable product"
+    },
+    {
+      "path": "scripts/qwen3_reranker.jinja",
+      "class": "LIFT",
+      "source_sha256": "200e241ab565d529b4b6f94909f3ef7a9be25ee5ca07041ad20ac6b2fbf30417",
+      "transform": null
+    },
+    {
+      "path": "scripts/setup.sql",
+      "class": "LIFT",
+      "source_sha256": "2a1e85826d47bf210a0c037e15fc87b05324ca1be5db049d09ee121de36146ba",
+      "transform": null
+    },
+    {
+      "path": "scripts/smoketest-handoff.js",
+      "class": "LIFT",
+      "source_sha256": "317dae305d05de8b7f0e71debb732131b911f56b6608b6f77b9e5beddbdc3d41",
+      "transform": null
+    },
+    {
+      "path": "scripts/smoketest-resurrect-real-vllm.js",
+      "class": "LIFT",
+      "source_sha256": "25cd3a0479ab248f6e316e8f84a61c94bf0d1f1ced7aabf5aec27b0209679dbb",
+      "transform": null
+    },
+    {
+      "path": "scripts/sql/app-retrieval-events-schema.sql",
+      "class": "LIFT",
+      "source_sha256": "4c27c940df619b984b46009d43f67502ae590c35478cb7b22154c0e1a9fa5cee",
+      "transform": null
+    },
+    {
+      "path": "scripts/sql/decisions-base.sql",
+      "class": "LIFT",
+      "source_sha256": "1e6f3c4b92c9488b955fbb954ebc93d8fda8ab5909f0835ededf6341e4147ea9",
+      "transform": null
+    },
+    {
+      "path": "scripts/sql/feature-usage-schema.sql",
+      "class": "LIFT",
+      "source_sha256": "71202cf6d839399cba98f64ab7530ffe2ff375da5873b5dbf1762ecacbbc32bf",
+      "transform": null
+    },
+    {
+      "path": "scripts/sql/handoff-core-schema.sql",
+      "class": "LIFT",
+      "source_sha256": "4d784f392933d2ddfa29af94ccf7604bd0da19134bf4e920a21df76ab61f5527",
+      "transform": null
+    },
+    {
+      "path": "scripts/sql/handoff-sqlite-schema.sql",
+      "class": "LEAVE",
+      "reason": "SQLite db-seam arm — V2 (owner 2026-07-20), not lifted"
+    },
+    {
+      "path": "scripts/sql/phase3b-schema.sql",
+      "class": "LEAVE",
+      "reason": "Bundle-A eval-migration artifact (paired with phase3b-schema-apply.js), cm-runbook §11.6 LEAVE list"
+    },
+    {
+      "path": "scripts/sql/schema-manifest.json",
+      "class": "LIFT",
+      "source_sha256": "9110a7e97f7c4013343cb99dabf1a642681713b1557c8c4f19fde74638bd8b6d",
+      "transform": null
+    },
+    {
+      "path": "scripts/sql/usage-telemetry-schema.sql",
+      "class": "LIFT",
+      "source_sha256": "720ea04cf29421622ce13a3244f5adc804e067370d16f4c3b96f11dbdfe89298",
+      "transform": null
+    },
+    {
+      "path": "scripts/sql/v_memory_hits.sql",
+      "class": "LIFT",
+      "source_sha256": "cd7fbe63cd1e83d7f40a5f4bc9dc040f6f545d5584ca799a0b266869fcf5c668",
+      "transform": null
+    },
+    {
+      "path": "scripts/sync-hooks.js",
+      "class": "LIFT",
+      "source_sha256": "f5d949bd3b19ddc73c4e9907b7ae1e5b7a55ad2e4b197ddeadaceb5cdcdd0541",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-async-queue.js",
+      "class": "LIFT",
+      "source_sha256": "d7338a947df323f9210e7c5c187d7fe13d1ee23e6d1f8cbda8652ce08fbaa6e3",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-both-backends.js",
+      "class": "LEAVE",
+      "reason": "SQLite db-seam parity test — V2 (owner 2026-07-20), not lifted"
+    },
+    {
+      "path": "scripts/test-chunker.js",
+      "class": "LIFT",
+      "source_sha256": "73ab97c0ee70b74e1169343a02850a1a2fb9d176bd83e62865fb5507290d72ef",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-close-marker-outcome.js",
+      "class": "LIFT",
+      "source_sha256": "81ac135ad47637a80f83448dca177ca3627e893f47be3a57698ef06a291c250f",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-config-loading.js",
+      "class": "LIFT",
+      "source_sha256": "6e0cfed8cd1320e0a03b108d5c8b43489bee739a50d7e576f62fb8372e43bad9",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-doc-lint.js",
+      "class": "LIFT",
+      "source_sha256": "b373a4f841b8ba91298aee7725570341cb9a11cabf5a6f83657749a543b6498a",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-embed-heal.js",
+      "class": "LIFT",
+      "source_sha256": "f65e8c3de0d0c63582c7cdc7cab37d94810e51939ee2092165f3ad97b8a59abb",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-graph-traversal.js",
+      "class": "LIFT",
+      "source_sha256": "24b4eabec4063140e18426ca2bc90df2dbf5e804e8c76736ce26c7a255c419fb",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-host-agnostic-naming.js",
+      "class": "LIFT",
+      "source_sha256": "1343d61238ac96c5983c493bb4c9d87bda3073d920574801a2fecc7b5ab78747",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-init-atomic.js",
+      "class": "LIFT",
+      "source_sha256": "8402a2606841fc23d9692a0d634e70993d19e4a174c2444e9702d34ac8976462",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-init-confirm.js",
+      "class": "LIFT",
+      "source_sha256": "bcab0e5d92a9f3abbc65ca2c6fd045499b4fba6e39dbefe6cb325c07782b4c94",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-install-engine-path.js",
+      "class": "LIFT",
+      "source_sha256": "5e9304086718db684aa8f07f07300f22ef3a3ac1f4d1e31d518e8207f81480cc",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-install-host.js",
+      "class": "LIFT",
+      "source_sha256": "c30a76b2da25c1c6c2828cd3920b76415d2165e6c62b8973ec53eb9a079bddfc",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-install-sessionend-migration.js",
+      "class": "LIFT",
+      "source_sha256": "8f76a0514d0868caedaa3cffa67dd101a4b0f14b749a1b8c8c67b1e61ec64e91",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-l0-consolidation-gate.js",
+      "class": "LIFT",
+      "source_sha256": "d43598fa945285987adfafb6477f4d142227c01d7c77721772cf796d3cecb029",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-l2-consolidation-gate.js",
+      "class": "LIFT",
+      "source_sha256": "c65dc493294815c4eb0417820e592cffdecf381ca1296200df56f7f2b3671bed",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-l3-reality-checks.js",
+      "class": "LIFT",
+      "source_sha256": "ef7f3c656c7720f014dd7ce0083aed6a37559648e071519887a2fe498ea59d6c",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-l4-degraded-close.js",
+      "class": "LIFT",
+      "source_sha256": "8abcf84d77334735a971ed5b17ba2f4cfd66fb1603c001a53fad0d6ba970576a",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-l5-directive-retirement.js",
+      "class": "LIFT",
+      "source_sha256": "c1509948bceacf0d3ffc04ba9e07c72613eff809c53777727c893a74eb1b1b11",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-loader-stop-gate.js",
+      "class": "LIFT",
+      "source_sha256": "d072886e75633849b3f1498fdde8fb87467c49f76caa28c7471ca9ca3440d2b2",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-memory-search-gate.js",
+      "class": "LIFT",
+      "source_sha256": "72a1cee10fbd3c74d0d06b3a74bc327c6efb1a407ca35474a3d85649671e694c",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-operator-pin.js",
+      "class": "LIFT",
+      "source_sha256": "97b1d22579a4835b5cd27c96bd71d0c24ad68316e9e53e524212f18e767d0667",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-os-portability.js",
+      "class": "LIFT",
+      "source_sha256": "22b3a2f86c523e6c9a76af4078b745963c028ad7b11ee2981a972c4a78c1dbe3",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-payload-schema.js",
+      "class": "LIFT",
+      "source_sha256": "3382bdbc18b506ace86b8bb197e481af78d3ba2661654e096de2b0c833c9b963",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-plugin-packaging.js",
+      "class": "LIFT",
+      "source_sha256": "bc885eaa97c19a8528bbbc724e7955ed2e802543940dfb8a632b9b52168f6c13",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-project-identity-legacy-root.js",
+      "class": "LIFT",
+      "source_sha256": "dba0c7e61467732de43e46ee9b2a916088bbee9528bb138bf9659178adbacf0f",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-resurrect.js",
+      "class": "LIFT",
+      "source_sha256": "dbdb95ce5b73467b9b4bf210e302fa526c5a388befbcf598a27e96f074b37de9",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-schema-bring-forward.js",
+      "class": "LIFT",
+      "source_sha256": "ae7dadc06b6359a6e7bea9575c1ea03653541a85d27a55d31b9358979fa48558",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-schema-suppression-kind.js",
+      "class": "LIFT",
+      "source_sha256": "e358cf98f1a07ec90b670f7a32d0526a8a3dff405364513ab70cfe6b38b44ad2",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-session-identity.js",
+      "class": "LIFT",
+      "source_sha256": "a963fc1e93473c07c781854cdde9443b76bf0710f4dff8af4cbe9d0c0cd79c02",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-source-file-normalize.js",
+      "class": "LIFT",
+      "source_sha256": "229fd05d90453add1b12d30832a9243eb979289ec35a108d2f3b5ee2c1c9d91e",
+      "transform": null
+    },
+    {
+      "path": "scripts/test-sqlite-seam.js",
+      "class": "LEAVE",
+      "reason": "SQLite db-seam parity test — V2 (owner 2026-07-20), not lifted"
+    },
+    {
+      "path": "start-vllm-reranker.sh",
+      "class": "LIFT",
+      "source_sha256": "0deeb4e281c7add5543a544f2a8b34d94c62ebcb2692fe75138892c83b061f56",
+      "transform": null
+    },
+    {
+      "path": "templates/codex-skills/handoff-checkpoint/SKILL.md",
+      "class": "LIFT",
+      "source_sha256": "158102d6ba1e65fd40f062907f1bb4703996ac9ac2416b1a1b89e2d94f5456e9",
+      "transform": null
+    },
+    {
+      "path": "templates/codex-skills/handoff-close/SKILL.md",
+      "class": "LIFT",
+      "source_sha256": "345d98a3ffed78e74c0af68db237f50e7c8d133cdc08e00fe1ea909e6af125fe",
+      "transform": null
+    },
+    {
+      "path": "templates/codex-skills/handoff-init/SKILL.md",
+      "class": "LIFT",
+      "source_sha256": "ea74b4dd6cb0dc4050ea163912240b8cf635e635cf516495569c0aea47ce6871",
+      "transform": null
+    },
+    {
+      "path": "templates/codex-skills/handoff-promote/SKILL.md",
+      "class": "LIFT",
+      "source_sha256": "a056ecdf2c0b4878c2b0d4cb4ec7590df583e980d94464a839b1a62eed22f912",
+      "transform": null
+    },
+    {
+      "path": "templates/codex-skills/handoff-query/SKILL.md",
+      "class": "LIFT",
+      "source_sha256": "924c8675643aa7075b9337a1ffd31f76f705aebef733d5c4917f0e498328dc9c",
+      "transform": null
+    },
+    {
+      "path": "templates/codex-skills/handoff-resume/SKILL.md",
+      "class": "LIFT",
+      "source_sha256": "10e6c08f630ae938e9a13cf439e1b0f3d48636f405d26134aaa46098dcdecf3d",
+      "transform": null
+    },
+    {
+      "path": "templates/codex-skills/handoff-status/SKILL.md",
+      "class": "LIFT",
+      "source_sha256": "3bf4fb9aac1fb135c0a46ad7697bdd26ab8f6bcc6ed34fd065da9664e9d1a245",
+      "transform": null
+    },
+    {
+      "path": "templates/codex-skills/handoff/SKILL.md",
+      "class": "LIFT",
+      "source_sha256": "f40eed279ef1483f07441b496e739579f6f72a909880160c7dd601397c004a2a",
+      "transform": null
+    },
+    {
+      "path": "templates/handoff.md.tpl",
+      "class": "LIFT",
+      "source_sha256": "d8ebe9d2ac5e44d68173299a35ff54334c26297de1c7170074ea51a819675bb9",
+      "transform": null
+    },
+    {
+      "path": "templates/project-agents-md.tpl",
+      "class": "LIFT",
+      "source_sha256": "4117354483226c2b2a4ec5a8151ee50c698cb71114ef74357385a445c1b69408",
+      "transform": null
+    },
+    {
+      "path": "templates/project-claude-md.tpl",
+      "class": "LIFT",
+      "source_sha256": "de594b2917eb739b078ce2c9b1ba5397d7f30b9d27ca1e4136043ae70199e795",
+      "transform": null
+    },
+    {
+      "path": "test/eval/baseline.json",
+      "class": "LIFT",
+      "source_sha256": "26722a1d3958f3c39369e1947608f817d241d80965279c74ceff70d9a370192e",
+      "transform": null
+    },
+    {
+      "path": "test/eval/eval-retrieval.js",
+      "class": "LIFT",
+      "source_sha256": "a294eb42515b9a5ef2dbc50609d5024db95e3dd2069acb4f4141aac217ea3542",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/api-rate-limit-strategies.md",
+      "class": "LIFT",
+      "source_sha256": "155962b2b928b24446e721ac17837c448dfa7c3688d2301a9ebafa4c33ae099f",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/bash-postgres-backup-script.md",
+      "class": "LIFT",
+      "source_sha256": "ebf4f21924bc676d9b79663cb9ec8a6b84504bcf112bf0a8baf4cffc8f600b18",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/bge-e5-model-families.md",
+      "class": "LIFT",
+      "source_sha256": "d765b674df8fe7609c4d4ea8fc540236d0bd7a096132d54a488728344f385eed",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/building-rag-tutorial.md",
+      "class": "LIFT",
+      "source_sha256": "d34e6ef8d5178818c91385493f978197c6cdf43bf46c489e0d96d9d210666292",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/colbert-late-interaction.md",
+      "class": "LIFT",
+      "source_sha256": "c572153062039fe559620dfde20cc34f1f8f0ebd7d5d2c16dc17ae379baaad16",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/connection-pool-tuning.md",
+      "class": "LIFT",
+      "source_sha256": "3423ebb502058dc464eb61b2a114c475771a7b4fe62ba8dbf42b11cf565cc60f",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/contextual-retrieval-blurbs.md",
+      "class": "LIFT",
+      "source_sha256": "6f7caf193322118b2b52c7605bfc831dc1ed113f49475c4685f69420b2d468bb",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/cosine-similarity-formula.md",
+      "class": "LIFT",
+      "source_sha256": "6c9cf9b5494463dfd4caed0d1fb7c319e315f70e85d13bc879f92fdd066c9bb4",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/cross-encoder-rerankers.md",
+      "class": "LIFT",
+      "source_sha256": "4e4967a6b1cfe9b2aa3f7c7b2346387b5f10ef706a6eb92626d073bd73a0a02b",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/database-design-handbook.md",
+      "class": "LIFT",
+      "source_sha256": "852c8787a169265381fc89e8cab9e026e1e3750fe21c0794a1c6262c4b0de65a",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/distributed-embedding-inference.md",
+      "class": "LIFT",
+      "source_sha256": "26f90fd15896634cba6b7a663df617c03890c8450bae5957d35cfb60005ef78a",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/embedding-api-rate-limits.md",
+      "class": "LIFT",
+      "source_sha256": "04dc4b8ed9673d128bff923bc00cfbb335229d01d3ee3b5726bb8e3710b4ab4d",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/embedding-drift-monitoring.md",
+      "class": "LIFT",
+      "source_sha256": "32d5f9e6257529c7d19e9ad95d054e971fcdb50e26aff2ac370d0bcbdf54ece3",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/embedding-model-selection.md",
+      "class": "LIFT",
+      "source_sha256": "334b2abdb3b45f790fd0da69ee112a2cf0d078b7834a8db7efaece7ec13b9112",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/embedding-quantization.md",
+      "class": "LIFT",
+      "source_sha256": "23566c9f459085b7ce832347307733bf60bf79b0a14de203ac1e200c862fb751",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/error-handling-retry-jitter.md",
+      "class": "LIFT",
+      "source_sha256": "139cd5070dc573d514dc638a57b3ba26c19520a22bcdc49116f09ee11ecd1290",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/frontmatter-yaml-spec.md",
+      "class": "LIFT",
+      "source_sha256": "f9da77648965974a71b6fe7b6dd34ea365ab893bfeb02f538d603e4dd2f3457b",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/fts-vs-vector-search.md",
+      "class": "LIFT",
+      "source_sha256": "286f9d1ffa0c6ca9f23e2b2998a42e575f37200940ff97242dd3b9ffdd3f546e",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/hnsw-parameters.md",
+      "class": "LIFT",
+      "source_sha256": "6f34ba099f7a839602a7faf9fa5b6ab42990cfb2e3c230515ba26a8e34beb3b8",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/hyde-query-expansion.md",
+      "class": "LIFT",
+      "source_sha256": "50e102626d7cbec5f448f5b5bd142b412d1df9980779fdb9c219d5590ab720c7",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/incremental-sync-content-hash.md",
+      "class": "LIFT",
+      "source_sha256": "032e04b42f80205b0f9ad1e345a110894686675d74adeffd4dd0a1fa3b78a783",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/knowledge-graph-entity-resolution.md",
+      "class": "LIFT",
+      "source_sha256": "e293a8b42ee5774d23a904337db77dc81d3c0902f953b623225551980be5c381",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/late-chunking-technique.md",
+      "class": "LIFT",
+      "source_sha256": "fa262177fa72ef7d94b2e127a05f037ee2c2f5227f06ed5459780c1ca70173f5",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/matryoshka-embeddings.md",
+      "class": "LIFT",
+      "source_sha256": "c66f9c900acc7b89336457798250a5fb8d1d98155cbc540e4650d8fe528bb797",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/migration-zero-downtime.md",
+      "class": "LIFT",
+      "source_sha256": "bcd6be4d6b060c59c6387917c6e88b9d8e3dbb8a7d4a88c20af96018c853e1e0",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/multi-vector-retrieval.md",
+      "class": "LIFT",
+      "source_sha256": "8ec5082cdb1d8f7e9f6f98ab661981bff6b61101de820c4da805cad372088314",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/nodejs-pg-client-patterns.md",
+      "class": "LIFT",
+      "source_sha256": "ff654bd3aebeb21e96b991eb5286be749f0d01869b8195d11359db443f153dae",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/pgvector-setup-sql.md",
+      "class": "LIFT",
+      "source_sha256": "606f5dd0eddd2e72c7b60eb7a1590aa88e74e85e14dd18c7a58c7105ba51e64d",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/prompt-caching-mechanics.md",
+      "class": "LIFT",
+      "source_sha256": "68a22dd141081504d64d592c2068d96a1cb998f109ee89f20a336016fc8473d7",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/python-embedding-batch.md",
+      "class": "LIFT",
+      "source_sha256": "640808066a77b39578f28274c3e69f8e4427aa3d4ed34d4c660463f6cef0d4e3",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/rag-architecture.md",
+      "class": "LIFT",
+      "source_sha256": "9b53880ca72b723375ff760b456c2480a14192034a742fe9ee4ec989c6409c4d",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/rag-eval-annotation.md",
+      "class": "LIFT",
+      "source_sha256": "59695bf70136d9719fd8590859cde2a2799e696c1d37ec79d3950472e0d0c72a",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/rag-fusion-strategies.md",
+      "class": "LIFT",
+      "source_sha256": "e8bc8d7ec3e7dfceb4b94ec71cb1dff40752a75ed068be2b641394cab705dae4",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/reciprocal-rank-fusion.md",
+      "class": "LIFT",
+      "source_sha256": "476bac68a583c53a1a5a0f764c4acf18c38418a578c1114f7a4a22a5d91d0ff5",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/semantic-cache-invalidation.md",
+      "class": "LIFT",
+      "source_sha256": "590ee020b032ab904b52f3940a640dea9a617743bd0e24181a6b72d3f4f0fee8",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/semantic-chunking-strategies.md",
+      "class": "LIFT",
+      "source_sha256": "215d61f56400aef336679b62a136a64b3efe70c08153989d5a727ae5a22ff466",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/splade-sparse-encoders.md",
+      "class": "LIFT",
+      "source_sha256": "87778ad4dad1ed60fcbd5e0ef78213400455d1edec8627068ee4a58b10a0072d",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/sql-fts-tsvector-recipes.md",
+      "class": "LIFT",
+      "source_sha256": "0cf6275593b73ccaccfafba25012c99c18f61e478e37f177dfc80d7eed0bca71",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/tokenizer-vocabulary-differences.md",
+      "class": "LIFT",
+      "source_sha256": "d44e13867f8b9f0a14688a97d97cefb83cf4957ef41bee8519ce202f120b8d1e",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/tsvector-explained.md",
+      "class": "LIFT",
+      "source_sha256": "782ca8034edb64c3ac92424795cc493087b77444f17269277e16fa4bb2fb7195",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/tsvector-weight-classes.md",
+      "class": "LIFT",
+      "source_sha256": "2cb5f4ee2e84f5f9bb59c046e8b1a5ede1509ccab8a2a8fc413a3676fd836446",
+      "transform": null
+    },
+    {
+      "path": "test/eval/fixtures/vector-indexes-postgres.md",
+      "class": "LIFT",
+      "source_sha256": "cdc79d7af00ae9ba41b4fda35fec90378581ed82eeaea4232c1841c095b4c1a8",
+      "transform": null
+    },
+    {
+      "path": "test/eval/queries.json",
+      "class": "LIFT",
+      "source_sha256": "3a4f52eb9222ef7579db12f8e5408ae6aa75c6fb48749bbfe5ec086ff16cdd2d",
+      "transform": null
+    },
+    {
+      "path": "test/handoff/fixtures/embed-fixtures.json",
+      "class": "LIFT",
+      "source_sha256": "735338517a2a7f8e07cf20996ff8bfa8205ff917093e03333974b4be0fca995e",
+      "transform": null
+    },
+    {
+      "path": "test/handoff/test-cmd-params.js",
+      "class": "LIFT",
+      "source_sha256": "97446513a34ea1f6789aaf0a91c0ddb73375955daa157489c12c6031dca3ff7e",
+      "transform": null
+    },
+    {
+      "path": "test/handoff/test-degraded-close-retention.js",
+      "class": "LIFT",
+      "source_sha256": "b31c542be1c314118829fd3eb9fefd61dc3baf9e5bc3a85cfa9e0968b69505f0",
+      "transform": null
+    },
+    {
+      "path": "test/handoff/test-handoff.js",
+      "class": "LIFT",
+      "source_sha256": "90b081833fb9eee1b01ceec582f8dacb5e460ebf4f76977a100067b54d5b65b5",
+      "transform": null
+    },
+    {
+      "path": "test/handoff/test-loader-stop-sessionend.js",
+      "class": "LIFT",
+      "source_sha256": "1524235c410591ee21e32e7c8ddab25b846acfeefa67fbbaf69428a2f2f19f5c",
+      "transform": null
+    },
+    {
+      "path": "test/handoff/test-mcp-resume.js",
+      "class": "LIFT",
+      "source_sha256": "ecbac29dd0904e6423083a2468eccbbb4f024954ec9a43c66e02e0304f574a2b",
+      "transform": null
+    },
+    {
+      "path": "test/handoff/test-open-thread-verify.js",
+      "class": "LIFT",
+      "source_sha256": "d753be677926a87eecc4479ddce6f18ca63278f1426d1674ef3bd0755070b88c",
+      "transform": null
+    },
+    {
+      "path": "test/handoff/test-pointer-gate.js",
+      "class": "LIFT",
+      "source_sha256": "1b514dc1b53ec9899fc9290357b506c1b69732edce008f157b8cf6f84f24b00b",
+      "transform": null
+    },
+    {
+      "path": "test/handoff/test-predicate-vocabulary.js",
+      "class": "LIFT",
+      "source_sha256": "a512626583bd0aede56b738613e4a8e7ed26d8b5898a672d8f7eb152d896b534",
+      "transform": null
+    },
+    {
+      "path": "test/handoff/test-promote-regenerate.js",
+      "class": "LIFT",
+      "source_sha256": "39f01b2a70ef45ca422d34e9c262a6da46b212897d53a138875d7c249c85e4b4",
+      "transform": null
+    },
+    {
+      "path": "test/handoff/test-reality-reconcile.js",
+      "class": "LIFT",
+      "source_sha256": "4dea872075762494ab2713ae2ddcd09cf713ef23ab38d6a790d79197ce2faa56",
+      "transform": null
+    },
+    {
+      "path": "test/handoff/test-resume-vector-query.js",
+      "class": "LIFT",
+      "source_sha256": "8d90062c2ecba5aaf57395bb0d37be0502a07f790e34fcd937a58b3573423c42",
+      "transform": null
+    },
+    {
+      "path": "test/handoff/test-resurrect-semantic.js",
+      "class": "LIFT",
+      "source_sha256": "7b26fabb82b4bc9d9302e0c0edf2707ad8fa1118db76448f9a449005c93f3edd",
+      "transform": null
+    },
+    {
+      "path": "test/handoff/test-serve-time-staleness.js",
+      "class": "LIFT",
+      "source_sha256": "565ce28fec91866f39a04dc2db1585f047f402ab98ef65f1035464786bb5b08c",
+      "transform": null
+    },
+    {
+      "path": "test/handoff/test-session-marker-concurrency.js",
+      "class": "LIFT",
+      "source_sha256": "317b8e76ed9ebae2487b9e272ea2997afef1bf4e5f65fff79bf2531708dfc3f1",
+      "transform": null
+    },
+    {
+      "path": "test/handoff/test-staleness-permutations.js",
+      "class": "LIFT",
+      "source_sha256": "71d9c4ca05bc122c8bdbe1bfc8b217a9faa4589b9de17ddf78f34fd5bf96664f",
+      "transform": null
+    },
+    {
+      "path": "test/handoff/test-write-path-params.js",
+      "class": "LIFT",
+      "source_sha256": "0c71ed75c4bc3390233bc1315c602cf328e84e5ec8021fac1b6dd95021efd4e9",
+      "transform": null
+    },
+    {
+      "path": "test/lib/scratch-engine-root.js",
+      "class": "LIFT",
+      "source_sha256": "e851323163cd35666ac9d88cf432493d6e7762100dfe97f52e064248e2e91b6b",
+      "transform": null
+    },
+    {
+      "path": "test/lib/test-decisions-writer.js",
+      "class": "LIFT",
+      "source_sha256": "1429f0d004af1d96d2886662a351d6c8bffc5f83716c42c1087d7287c35ed043",
+      "transform": null
+    },
+    {
+      "path": "test/lib/test-provenance-invariant.js",
+      "class": "LIFT",
+      "source_sha256": "51c41454a29d9e900b0746d3d53737d52e9e5ca313c580efd162b9f56d39e013",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-caveman-gate-store-wide.js",
+      "class": "LIFT",
+      "source_sha256": "4c4f761214e0f4ba1a83579119614f7a9969eadf6bb4d4c1d92029b3310e17f6",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-handoff-markdown-parse.js",
+      "class": "LIFT",
+      "source_sha256": "834ad0b57ee72a76751c08031e68a8451924f705a2952980c484e64112ef15f8",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-migrate-01.js",
+      "class": "LIFT",
+      "source_sha256": "5e4ca463a3cc2bf2aa30bddb72e65ae82b39fae22988d4be2d709451b77078eb",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-migrate-02-decisions.js",
+      "class": "LIFT",
+      "source_sha256": "cb3bb6a496e9af6b3a729526cf286e9bddfd81af704059715b1c03d2fa1c4fbe",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-migrate-03-corpus-project-id.js",
+      "class": "LIFT",
+      "source_sha256": "afa124dfefa8f7160b3671c4336c7c6905f4a4f5c4e7782017618bf81e27e753",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-migrate-04-absorb-pipeline-tables.js",
+      "class": "LIFT",
+      "source_sha256": "4570317985a081645f2b68c4661182c15ae9271d232c336d219da8e72bb8fe3e",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-migrate-05-sync-file-memory.js",
+      "class": "LIFT",
+      "source_sha256": "64c543f1370eba43a50682658cdec3b1ed5a49db651223ad7e4c8f60ef5dfc6c",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-migrate-07-reembed-corpus.js",
+      "class": "LIFT",
+      "source_sha256": "37e0b3d6cb7d01f6c3c8e72aab78b2bc908c1ff76eac7e604d947625be0cbb68",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-migrate-08-handoff-markdown.js",
+      "class": "LIFT",
+      "source_sha256": "5def06d35590e86412308dad25a7c16a0547dd309e5490bf42929b4b36a1b28e",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-migrate-09-file-memory-markdown.js",
+      "class": "LIFT",
+      "source_sha256": "0507b72bcd478fb11a0726867a50707206108acb262080b70a8a4c2e4cfa4b6b",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-migrate-12-feature-usage.js",
+      "class": "LIFT",
+      "source_sha256": "f065e93c259baf8b5a3d912b959c0810a67e389e518c113df4d655b942c4c08e",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-migrate-14-seam-tables.js",
+      "class": "LIFT",
+      "source_sha256": "204713a8f4bb19027c71cba6556b23c1d39ff85c57df24de9e5eb8c2472b2760",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-migrate-17-intent-key.js",
+      "class": "LIFT",
+      "source_sha256": "2f087ff3292c6ceee5f49bd2379261c78a104fa9156dab667c3737aa8c5e93dc",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-migrate-schema-addenda.js",
+      "class": "LIFT",
+      "source_sha256": "7d530f80cf9a44a986882b6df5f3c541d3333b1171a63610dcb9e65cf6365c10",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-migrate-verify-own-graph.js",
+      "class": "LIFT",
+      "source_sha256": "d35dbd2556e1641760ac3d713e2859a11def1ac9c1d8aa8906f986e33af7a7b0",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-route-resolve-contract.js",
+      "class": "LIFT",
+      "source_sha256": "c3089f582ae7264399944db32e1f3ef4029fa6954022e2836ec282dc47f1e453",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-routing-profile-concurrency.js",
+      "class": "LIFT",
+      "source_sha256": "8bc53323264614f1ce3665b31c23c6bb55446deb6a7cdc282a9734611ffaa63d",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-verify-13.js",
+      "class": "LIFT",
+      "source_sha256": "0d6930350f2dd3a0605e3008d8cf6a995f6400e710efe89bfcc06b066b018053",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-verify-15.js",
+      "class": "LIFT",
+      "source_sha256": "e66c9b04550ee4fe59724256274c6267e5a83d329c275453f906ac4fc125220b",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-verify-17.js",
+      "class": "LIFT",
+      "source_sha256": "156bd803c48e13cf905abb6bb800f282e0707303f7b680241fd9c804d2d5926c",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-verify-18.js",
+      "class": "LIFT",
+      "source_sha256": "2088f12d1ae1ab962c8ac62242ad450e7d6f0c3f9fc8e1660f4109f8c748fe36",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-verify-19.js",
+      "class": "LIFT",
+      "source_sha256": "4423f9f172151a22defa99cc350896a3417708314b954f6658c41e34be788b6b",
+      "transform": null
+    },
+    {
+      "path": "test/migrations/test-verify-20.js",
+      "class": "LIFT",
+      "source_sha256": "a0925a669400aa7e7c09a26af902ab49ba8d34ffc99c43b6ac672b8af82f1a24",
+      "transform": null
+    },
+    {
+      "path": "test/north-star/fixtures/caveman-payload.json",
+      "class": "LIFT",
+      "source_sha256": "83dec86fb30e8ed68bea0cc3bccee0400d3f9510873116c98c322d777ed8047f",
+      "transform": null
+    },
+    {
+      "path": "test/north-star/fixtures/multi-session.json",
+      "class": "LIFT",
+      "source_sha256": "651ce354d8fc22eb890083d23daa5664fb52c622afa6a4513d116c12a6964fd7",
+      "transform": null
+    },
+    {
+      "path": "test/north-star/fixtures/single-session.json",
+      "class": "LIFT",
+      "source_sha256": "20d6fd90d2f6319d66d956b262f127c38826542755acd01b01b7f581285072c1",
+      "transform": null
+    },
+    {
+      "path": "test/north-star/fixtures/verbose-payload.json",
+      "class": "LIFT",
+      "source_sha256": "8a3c77129fc0b02b810a7ddf258551542d250a90b65a33115131985cf9d9e651",
+      "transform": null
+    },
+    {
+      "path": "test/north-star/lib/ns-harness.js",
+      "class": "LIFT",
+      "source_sha256": "7ddb12474714df384f40656e0b127bdb79c9fb7bea1288dae96cd9b03485e17f",
+      "transform": null
+    },
+    {
+      "path": "test/north-star/test-caveman-economy-store-wide.js",
+      "class": "LIFT",
+      "source_sha256": "a1a8f8e6cc4f98dfe4a85cdcd1a6ba9877a0899cf86f6319de6fc7f7239abd9e",
+      "transform": null
+    },
+    {
+      "path": "test/north-star/test-caveman-economy.js",
+      "class": "LIFT",
+      "source_sha256": "6dac5aa18327d445714897855d75271091bb5f7992ed2d0fe95892015fe6b900",
+      "transform": null
+    },
+    {
+      "path": "test/north-star/test-fidelity-dataloss.js",
+      "class": "LIFT",
+      "source_sha256": "7175fda1ef06e78a8a2a681ef1b05c9aa6b784e3da76196c90648522335b0eb6",
+      "transform": null
+    },
+    {
+      "path": "test/north-star/test-lifecycle-roundtrip.js",
+      "class": "LIFT",
+      "source_sha256": "d67f23c8a8cdeb5f89edd0febb5eb3ccae109de84f25a2ffbc693900de30e4c6",
+      "transform": null
+    },
+    {
+      "path": "test/north-star/test-provenance.js",
+      "class": "LIFT",
+      "source_sha256": "d2aa477dd611c8f3d3b2ee40f71ca9400cafc9186d2bf84da5e6a8464eb4a7ce",
+      "transform": null
+    },
+    {
+      "path": "test/north-star/test-retrieval-economy.js",
+      "class": "LIFT",
+      "source_sha256": "8553d25eac227ca77bb4ddd3eaea0c81113cf1898b8036e57e0c8243008f451d",
+      "transform": null
+    },
+    {
+      "path": "test/test-claude-md-key-paths.js",
+      "class": "LIFT",
+      "source_sha256": "5154844cc0ae6070a1352e3c7cd09922719f1475c4c3cd830dc2e0f582e517c6",
+      "transform": null
+    },
+    {
+      "path": "test/test-cli-args-fail-closed.js",
+      "class": "LIFT",
+      "source_sha256": "c6958209583152ef5de12f3f0e5c49726991b5b95eb32aa5c174816329d6b481",
+      "transform": null
+    },
+    {
+      "path": "test/test-decisions-canon.js",
+      "class": "LIFT",
+      "source_sha256": "0c872aa418461625333c0a2fc293cfeecfba62132296afa652a2c11c83989b5e",
+      "transform": null
+    },
+    {
+      "path": "test/test-embed-endpoint-classify.js",
+      "class": "LIFT",
+      "source_sha256": "60c3ce8f5806fd7b1196d373be2e72bcf5f8acb07fe9d05275bc86b5f4507662",
+      "transform": null
+    },
+    {
+      "path": "test/test-embed-url-project-root.js",
+      "class": "LIFT",
+      "source_sha256": "ee80c4a7f040b7cc4d85b137b126b9be302ecbb931c27c95188b0a815f754807",
+      "transform": null
+    },
+    {
+      "path": "test/test-index-cap-md5.js",
+      "class": "LIFT",
+      "source_sha256": "4f623cfd4b97b897b5c31d8101743c075eda3a15413f9bc45a6a8f356c81a19f",
+      "transform": null
+    },
+    {
+      "path": "test/test-init-embeddability.js",
+      "class": "LIFT",
+      "source_sha256": "da3536de7f2b802e0952be859796a47d2dcc96d6f904f1af5b043b58cb389840",
+      "transform": null
+    },
+    {
+      "path": "test/test-intent-key.js",
+      "class": "LIFT",
+      "source_sha256": "8965c38681ff7a87c6da4339c214d87af0b8a1c714e961c4d88b197574618c7c",
+      "transform": null
+    },
+    {
+      "path": "test/test-mcp-epoch-guard.js",
+      "class": "LIFT",
+      "source_sha256": "f19fb9f5be038219cbfa01f5dd8f4925d250d0f08f1f1c3104bdf9323bfb318d",
+      "transform": null
+    },
+    {
+      "path": "test/test-routing-identity.js",
+      "class": "LIFT",
+      "source_sha256": "b4662e481ed46f0d76e4c917b1fd3576fdc8bd22d23886e3cb36aad50a7fe259",
+      "transform": null
+    },
+    {
+      "path": "test/test-schema-heal.js",
+      "class": "LIFT",
+      "source_sha256": "ee2542f23692f5b81f8db0b7fd189e0b121c5bf58f54465798052ee0e3f9bfe7",
+      "transform": null
+    },
+    {
+      "path": "test/test-vector-strip.js",
+      "class": "LIFT",
+      "source_sha256": "0f1ef44d31f7a49b586a4679c687a6e99b1d5971b9582900c220216e16c216be",
+      "transform": null
+    }
+  ]
+}

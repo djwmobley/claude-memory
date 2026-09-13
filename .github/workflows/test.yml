@@ -1384,6 +1384,20 @@ jobs:
         # Postgres required — every case runs against a scratch project root
         # with no DB config at all.
         run: node test/test-cli-args-fail-closed.js
+      - name: Run public-lift manifest and lift-to-public.js tests
+        # PUBLIC-MANIFEST.json total-classification (every origin/main tree
+        # path is LIFT or LEAVE, no overlaps) + scripts/lift-to-public.js
+        # (hash-drift verification, transform re-hashing, --dry-run writes
+        # nothing, happy-path staging). STACKED ON PR #306
+        # (feat/public-sanitize-gate): two cases (seeded private-term
+        # fixture, happy-path fixture) require scripts/sanitize-gate.js,
+        # which does not exist until that PR merges and this branch is
+        # rebased onto it — those two cases fail loudly with a clear
+        # "stacked on #306" message until then, by design; the other five
+        # (manifest totality, sha256 verification, hash-drift fixture,
+        # --dry-run, no-write-to-manifest invariant) run unconditionally.
+        # No live Postgres required.
+        run: node test/test-lift-to-public.js
       - name: Run schema suppression_kind ordering tests
         # Regression guard for the suppression_kind CHECK constraint ordering bug (#124):
         #   T1  Field-report repro: apply schema fresh; INSERT one row per suppression_kind
