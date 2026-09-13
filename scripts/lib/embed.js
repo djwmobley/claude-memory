@@ -28,7 +28,7 @@
 const fs   = require('fs');
 const path = require('path');
 const http = require('http');
-const { loadConfig } = require('./shared');
+const { loadConfig, isFullyQualifiedPath } = require('./shared');
 
 const EMBED_DIMS = parseInt(process.env.EMBED_DIMS || '4000', 10);
 
@@ -290,8 +290,23 @@ async function embedQuery(text, opts = {}) {
   }
 
   // Mock mode: EMBED_MOCK_FIXTURES_PATH set → look up fixture.
+  //
+  // Codex review of PR #302 (r2, "pre-existing mock-mode cwd dependency"): a
+  // RELATIVE EMBED_MOCK_FIXTURES_PATH reached fs.readFileSync unchanged,
+  // silently resolving against process.cwd() — exactly the class of
+  // ambient-cwd bug this whole fix closes for the URL/model resolution
+  // path, just re-opened here via a different env var. Mock mode is
+  // opt-in (only reachable when this env var is explicitly set), so this
+  // is not a caller-facing behavior change for anyone not already using
+  // it — but a relative value is now a hard, clearly-named error instead
+  // of a silent cwd-dependent read.
   const fixturePath = process.env.EMBED_MOCK_FIXTURES_PATH;
   if (fixturePath) {
+    if (!isFullyQualifiedPath(fixturePath)) {
+      throw new Error(
+        `[embed] EMBED_MOCK_FIXTURES_PATH must be a fully qualified absolute path, got ${JSON.stringify(fixturePath)}`
+      );
+    }
     const fixtures = _loadFixtures(fixturePath);
     if (!Object.prototype.hasOwnProperty.call(fixtures, text)) {
       throw new Error(

@@ -596,7 +596,26 @@ knowledge:
         assertEqual(result.embedSource, 'pipeline_yml');
         assertEqual(result.searchMode, 'hybrid');
         assertEqual(result.note, undefined, 'no note key in hybrid mode');
-        const { sql: expectedSql } = buildTableQuery('decisions');
+        // Codex review of PR #302 (r2, S3 "NOT FIXED completely"): comparing
+        // against buildTableQuery()'s OWN live output proves nothing — a
+        // regression inside buildTableQuery itself would change BOTH sides
+        // of the comparison together and this test would still pass. This
+        // literal is the 'decisions' hybrid SQL shape buildTableQuery()
+        // produces from TABLE_DESCRIPTORS.decisions (idExpr 'id', labelExpr
+        // 'topic', snippetExpr substring(coalesce(decision,''),1,300),
+        // hasFts:true, whereExtra:null) — pinned so a future change to
+        // buildTableQuery's hybrid-mode SQL text shows up here as a real
+        // test failure instead of silently passing against itself.
+        const expectedSql = `
+    SELECT 'decisions'::text AS source_table,
+           (id)::text AS id,
+           (topic)::text AS label,
+           substring(coalesce(decision,''), 1, 300) AS snippet,
+           (COALESCE(ts_rank(fts_vec, plainto_tsquery('english', $2)), 0) * 0.3 + (1 - (embedding <=> $1::halfvec)) * 0.7) AS score
+      FROM "decisions"
+     WHERE project_id = $3 AND embedding IS NOT NULL
+     ORDER BY score DESC
+     LIMIT $4`;
         assertEqual(capturedSql.replace(/\s+/g, ' ').trim(), expectedSql.replace(/\s+/g, ' ').trim(), 'hybrid SQL must be byte-identical (modulo whitespace) to the pre-fix shape');
       } finally {
         server.close();

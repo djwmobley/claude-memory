@@ -37,6 +37,19 @@
  *   T14 getYmlValueInSection (direct): surrounding single- OR double-quoted
  *       values are unquoted, and a trailing ` # comment` outside quotes is
  *       stripped
+ *   T15 loadConfig() (CLI path, via PROJECT_ROOT) and
+ *       mcp-db-connect.js's loadConfigForRoot() (MCP path, explicit root)
+ *       resolve IDENTICAL host/database from the SAME pipeline.yml
+ *       containing a blank line inside the knowledge section (Codex review
+ *       of PR #302, r2, "new defect introduced by the fix": loadConfig()
+ *       started using the hardened section reader while loadConfigForRoot()
+ *       kept its own old contiguity-based parser, so the two paths could
+ *       silently disagree on which DB a call targets). Ruling: the
+ *       contiguity fix is a bug fix, applied uniformly to both readers —
+ *       T11/T12 above, asserting loadConfig()'s corrected behavior, are
+ *       correct and stay unchanged; this test proves loadConfigForRoot()
+ *       now matches them via the SAME shared reader rather than being
+ *       carved out as a "preserve old CLI behavior" exception.
  *
  * IMPORTANT — CRLF footgun analysis (shared.js getInSection / getTopLevel):
  *   The regex `([^"\n]+)` followed by `.trim()` would capture a trailing \r from
@@ -57,6 +70,10 @@ const path = require('path');
 
 // Load shared.js exports.
 const { loadConfig, findProjectRoot, getYmlValueInSection } = require(path.join(__dirname, 'lib', 'shared'));
+// T15: the MCP-side reader (mcp-db-connect.js) — loaded here to prove it
+// stays in parity with loadConfig() above after both were unified onto
+// getYmlValueInSection.
+const { loadConfigForRoot } = require(path.join(__dirname, 'lib', 'mcp-db-connect'));
 
 // ── Tracking ───────────────────────────────────────────────────────────────────
 
@@ -475,6 +492,29 @@ async function main() {
       // A '#' INSIDE quotes is data, never a comment marker — must survive.
       const hashInQuotes = getYmlValueInSection(['knowledge:', '  host: "host#with-hash"', ''].join('\n'), 'knowledge', 'host');
       if (hashInQuotes !== 'host#with-hash') throw new Error(`expected 'host#with-hash' (a '#' inside quotes is data, not a comment), got '${hashInQuotes}'`);
+    });
+
+    // T15 — CLI (loadConfig via PROJECT_ROOT) and MCP (loadConfigForRoot,
+    // explicit root) must resolve IDENTICAL host/database from the SAME
+    // pipeline.yml with a blank line inside the knowledge section (Codex
+    // review of PR #302, r2 "new defect introduced by the fix").
+    await runTest('T15: loadConfig() and loadConfigForRoot() agree on host/database with a blank line inside the section', () => {
+      const cfgPath = path.join(claudeDir, 'pipeline.yml');
+      fs.writeFileSync(cfgPath, [
+        'knowledge:',
+        '  host: parity-host',
+        '',
+        '  database: parity_db',
+        '',
+      ].join('\n'), { encoding: 'utf8' });
+      process.env.PROJECT_ROOT = tmpBase;
+      const cliCfg = loadConfig();
+      const mcpCfg = loadConfigForRoot(tmpBase);
+      if (cliCfg.host !== 'parity-host') throw new Error(`expected CLI host 'parity-host', got '${cliCfg.host}'`);
+      if (cliCfg.host !== mcpCfg.host) throw new Error(`CLI/MCP host mismatch: loadConfig()='${cliCfg.host}' vs loadConfigForRoot()='${mcpCfg.host}'`);
+      if (cliCfg.database !== mcpCfg.database) throw new Error(`CLI/MCP database mismatch: loadConfig()='${cliCfg.database}' vs loadConfigForRoot()='${mcpCfg.database}'`);
+      if (mcpCfg.database !== 'parity_db') throw new Error(`expected MCP database 'parity_db' (blank line must not end the section), got '${mcpCfg.database}'`);
+      fs.unlinkSync(cfgPath);
     });
 
   } finally {

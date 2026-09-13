@@ -54,6 +54,27 @@ function findProjectRoot() {
   return process.cwd();
 }
 
+// isFullyQualifiedPath — Codex review of PR #302 (r2, finding 6b):
+// `path.isAbsolute('/repo')` and `path.isAbsolute('\\repo')` are BOTH true
+// on win32 — a "rooted but driveless" path that Windows resolves against
+// the CURRENT PROCESS'S drive, not a fixed, unambiguous location — so
+// `path.isAbsolute()` alone is not a safe "this identifies exactly one
+// location, independent of process state" guard for any caller that treats
+// an absolute path as pinning a specific directory (a projectRoot guard, a
+// mock-fixtures path). This helper requires an actual drive letter
+// (`C:\...` / `C:/...`) or a UNC prefix (`\\server\share\...`) on win32,
+// and a leading `/` on POSIX — the total classification: every string is
+// either fully qualified (one branch) or not (the other); there is no
+// third "maybe" case. `platform` is injectable (default: process.platform)
+// so this is unit-testable deterministically on any host OS.
+function isFullyQualifiedPath(p, platform = process.platform) {
+  if (typeof p !== 'string' || p.length === 0) return false;
+  if (platform === 'win32') {
+    return /^[A-Za-z]:[\\/]/.test(p) || /^\\\\[^\\]+\\[^\\]+/.test(p);
+  }
+  return p.startsWith('/');
+}
+
 // ─── CONFIG ─────────────────────────────────────────────────────────────────
 
 /**
@@ -93,22 +114,36 @@ function _escapeRegExp(s) {
 // Strip a YAML scalar value down to its actual content:
 //   - surrounding matching single OR double quotes are removed (a value
 //     that opens with a quote but never closes it is returned verbatim —
-//     malformed input is never silently corrupted further);
-//   - for an UNQUOTED value, a trailing ` #comment` (a `#` preceded by
-//     whitespace) is stripped, since only a quoted value may contain a
-//     literal `#` as data.
-// Pure function of the raw (already key-stripped) text on the line.
+//     malformed input is never silently corrupted further); everything
+//     after the closing quote (including a trailing comment) is discarded,
+//     since only a QUOTED value may contain a literal `#` as data;
+//   - for an UNQUOTED value, a trailing comment is stripped FIRST — before
+//     any trimming — because the caller's keyRe already consumes the
+//     whitespace between `key:` and the value via `\s*`, so a comment-only
+//     value like `key: # disabled` arrives here as the bare string
+//     "# disabled" with NO leading whitespace of its own left to match
+//     against. Codex review of PR #302 (r2, finding 2): the previous
+//     order — trim() THEN look for a `\s#` — could never see that lost
+//     leading whitespace, so "# disabled" survived trim() unchanged and was
+//     returned as if it were literal data. The fix: treat a `#` at the
+//     very START of the raw value (position 0) as ALSO marking a comment
+//     (equivalent to "preceded by whitespace" once you account for the
+//     whitespace \s* already ate), in addition to a `#` preceded by
+//     whitespace mid-value. Trim happens AFTER comment-stripping, not
+//     before. A value that is empty after all of this is absent (the
+//     caller maps '' to null).
+// Pure function of the raw (already key-stripped, NOT pre-trimmed) text on
+// the line.
 function _stripYmlScalar(raw) {
-  const trimmed = raw.trim();
-  if (trimmed.length === 0) return trimmed;
-  const first = trimmed[0];
+  const first = raw[0];
   if (first === '"' || first === "'") {
-    const closeIdx = trimmed.indexOf(first, 1);
-    if (closeIdx !== -1) return trimmed.slice(1, closeIdx);
-    return trimmed; // no closing quote found — malformed; best-effort passthrough
+    const closeIdx = raw.indexOf(first, 1);
+    if (closeIdx !== -1) return raw.slice(1, closeIdx);
+    return raw.trim(); // no closing quote found — malformed; best-effort passthrough
   }
-  const commentMatch = trimmed.match(/\s#/);
-  return commentMatch ? trimmed.slice(0, commentMatch.index).trim() : trimmed;
+  const commentMatch = raw.match(/(?:^|\s)#/);
+  const withoutComment = commentMatch ? raw.slice(0, commentMatch.index) : raw;
+  return withoutComment.trim();
 }
 
 // Extract a YAML section (from "key:" to the next NON-COMMENT line at
@@ -895,4 +930,11 @@ module.exports = {
   // pipeline.yml that loadConfig()'s own cwd-scoped path already applies —
   // never a second, divergent validation rule for the MCP path.
   validateEmbeddingModel, VLLM_MODEL,
+  // Exported (2026-09-13, embed-url-from-project-root fix, Codex r2 finding
+  // 6b) so handoff-mcp.mjs's withProjectDb guard and embedding-provider.js's
+  // resolveConfiguredEmbedEndpointDetailed guard both reject a Windows
+  // rooted-but-driveless path (`/repo`, `\repo`) that path.isAbsolute()
+  // alone would wrongly accept — by reference to the SAME helper, never two
+  // divergent path-qualification checks.
+  isFullyQualifiedPath,
 };

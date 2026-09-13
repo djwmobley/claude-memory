@@ -52,7 +52,7 @@ const { resolveBaseDir } = require('./handoff-paths');
 // reused BY REFERENCE (validation-parity amendment, 2026-09-13) so a model
 // resolved from an explicit project root's pipeline.yml on the MCP path is
 // held to the identical rule, never a second, divergent one.
-const { readPipelineYmlSectionKey, validateEmbeddingModel } = require('./shared');
+const { readPipelineYmlSectionKey, validateEmbeddingModel, isFullyQualifiedPath } = require('./shared');
 
 class EmbeddingProvider {
   /**
@@ -519,9 +519,15 @@ function resolveConfiguredEmbedEndpointDetailed(opts = {}) {
   const env = opts.env || process.env;
 
   if (projectRoot !== undefined && projectRoot !== null) {
-    if (typeof projectRoot !== 'string' || !path.isAbsolute(projectRoot)) {
+    // Codex review of PR #302 (r2, finding 6b): path.isAbsolute() alone
+    // accepts a Windows rooted-but-driveless path ('/repo', '\repo') that
+    // resolves against the server process's CURRENT DRIVE, not a fixed
+    // location — isFullyQualifiedPath requires an actual drive letter or
+    // UNC prefix on win32 (a leading '/' on POSIX), by reference to the
+    // SAME helper handoff-mcp.mjs's withProjectDb guard uses.
+    if (typeof projectRoot !== 'string' || !isFullyQualifiedPath(projectRoot)) {
       throw new Error(
-        `resolveConfiguredEmbedEndpointDetailed: opts.projectRoot must be an absolute path string when provided, got ${JSON.stringify(projectRoot)}`
+        `resolveConfiguredEmbedEndpointDetailed: opts.projectRoot must be a fully qualified absolute path string when provided, got ${JSON.stringify(projectRoot)}`
       );
     }
   }

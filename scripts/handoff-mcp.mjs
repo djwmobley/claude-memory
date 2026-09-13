@@ -35,6 +35,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // implements its own DB connection or project_id lookup. ──────────────────
 const require = createRequire(import.meta.url);
 const { connectForRoot, resolveTargetDbForRoot } = require('./lib/mcp-db-connect.js');
+const { isFullyQualifiedPath } = require('./lib/shared.js');
 const { ensureProjectIdentity } = require('./lib/project-identity.js');
 // PR B (fix/mcp-usage-codex-identity): the SAME env-var precedence
 // handoff.js uses for every other session-id resolution (explicit ->
@@ -172,8 +173,13 @@ async function withProjectDb(projectRoot, fn) {
   }
   // Codex review of PR #302, finding 6a: reject a non-absolute projectRoot
   // before any cwd-dependent work downstream (connectForRoot/project-marker.js).
-  if (!path.isAbsolute(projectRoot)) {
-    throw new Error(`projectRoot must be an absolute path, got ${JSON.stringify(projectRoot)}`);
+  // Finding 6b (r2): path.isAbsolute() alone accepts a Windows
+  // rooted-but-driveless path ('/repo', '\repo') that resolves against the
+  // server process's CURRENT DRIVE, not a fixed location — isFullyQualifiedPath
+  // requires an actual drive letter or UNC prefix on win32 (a leading '/' on
+  // POSIX), closing that gap.
+  if (!isFullyQualifiedPath(projectRoot)) {
+    throw new Error(`projectRoot must be a fully qualified absolute path, got ${JSON.stringify(projectRoot)}`);
   }
   const db = await connectForRoot(projectRoot);
   try {
