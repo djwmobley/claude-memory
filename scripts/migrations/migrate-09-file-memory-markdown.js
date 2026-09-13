@@ -188,13 +188,43 @@
  *     file-memory-project-enrollment.json.
  *   - It never reads HANDOFF_DB, and it never creates the target database.
  *
+ * DRY-RUN MODE (--dry-run): a read-only preview of the MIGRATE-mode plan,
+ * added because this script's first real run previously doubled as its own
+ * preview (every other writing migrate-NN script in this repo has a
+ * --dry-run; see migrate-05-sync-file-memory.js). The target DB is opened
+ * through a read-only guard (makeReadOnlyClient below) that throws on any
+ * write statement (INSERT/UPDATE/DELETE/CREATE/ALTER/DROP/TRUNCATE/BEGIN/
+ * COMMIT/ROLLBACK/GRANT/REVOKE) — the SQL schema file is never applied,
+ * migration_manifest DDL is never applied, and no entities/edges/manifest
+ * rows are written. Enrolled dirs are walked exactly as MIGRATE mode walks
+ * them (same enumeration, same classification, same per-file parsing), and
+ * the plan is computed by READING the target's current entities/edges rows
+ * and re-deriving the exact insert/update/unchanged verdict MIGRATE mode's
+ * own upsertEntity/upsertEdge precedence rules would produce — this is a
+ * real comparison against live state, never skipped or stubbed (see
+ * buildDryRunPlan/classifyEntityPlan/computeEntityPlanCounts/
+ * computeEdgePlanCounts below). The report prints, per project_id: file
+ * count; entity insert/update/unchanged counts; entity_type source
+ * breakdown (frontmatter.type / frontmatter.metadata.type /
+ * filename-prefix-fallback / NULL); edges that would be created vs. are
+ * already present (this script's own tag); every `[[link]]` that would NOT
+ * resolve (capped at 50 printed lines, total count always shown); and any
+ * file skipped (e.g. unreadable) with its reason. Ends with
+ * `MIGRATION_RESULT: DRY_RUN` and exit 0, or a non-zero exit with whatever
+ * precheck failure (bad db name, refused target, missing prerequisite
+ * table/column, bad enrollment config) would also refuse MIGRATE mode —
+ * those checks run identically in both modes, before the mode branch.
+ * Mutually exclusive with --rollback (rejected as a usage error).
+ *
  * Usage:
  *   node scripts/migrations/migrate-09-file-memory-markdown.js [--db <target>]
  *     [--projects-root <path>] [--enrollment-config <path>] [--rollback]
+ *     [--dry-run]
  *
  * Exit codes: 0 = PASS (migrate: every processed file/link accounted for;
- * rollback: completed), 1 = refused / precondition failure / apply
- * failure / verification mismatch, 2 = bad CLI usage.
+ * rollback: completed; dry-run: plan computed, zero writes), 1 = refused /
+ * precondition failure / apply failure / verification mismatch, 2 = bad
+ * CLI usage.
  */
 
 const fs = require('fs');
@@ -273,6 +303,7 @@ function parseArgs(argv) {
     projectsRoot: DEFAULT_PROJECTS_ROOT,
     enrollmentConfigPath: ENROLLMENT_CONFIG_PATH,
     rollback: false,
+    dryRun: false,
     help: false,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -284,6 +315,7 @@ function parseArgs(argv) {
     else if (a === '--enrollment-config') parsed.enrollmentConfigPath = argv[++i];
     else if (a.startsWith('--enrollment-config=')) parsed.enrollmentConfigPath = a.slice('--enrollment-config='.length);
     else if (a === '--rollback') parsed.rollback = true;
+    else if (a === '--dry-run') parsed.dryRun = true;
     else if (a === '--help' || a === '-h') parsed.help = true;
     else throw new UsageError(`Unknown argument: ${a}`);
   }
@@ -294,6 +326,7 @@ function printUsage() {
   console.log([
     'Usage: node scripts/migrations/migrate-09-file-memory-markdown.js [--db <target>]',
     '         [--projects-root <path>] [--enrollment-config <path>] [--rollback]',
+    '         [--dry-run]',
     '',
     '  --db <name>               Target database (else MIGRATE_TARGET_DB env, else',
     '                            memory_manager_staging). Never reads HANDOFF_DB.',
@@ -303,6 +336,11 @@ function printUsage() {
     '                            (default: alongside this script).',
     '  --rollback                Delete this script\'s tagged edges/entities instead',
     '                            of migrating (reference-count-gated, see header).',
+    '  --dry-run                 Read-only plan preview: walks enrolled dirs, computes',
+    '                            insert/update/unchanged counts against the target\'s',
+    '                            live rows, prints unresolved [[links]] and skipped',
+    '                            files. No DDL, no upserts, no manifest rows. Mutually',
+    '                            exclusive with --rollback.',
   ].join('\n'));
 }
 
@@ -653,6 +691,190 @@ function parseProjectMemoryDir(memoryDirPath) {
   return { entities, edges: [...edgesByKey.values()], events, fileCount: fileNames.length };
 }
 
+// ─── DRY-RUN PLAN (read-only — no writes reach the target) ─────────────────
+
+// Write-statement gate: the ONE choke point every dry-run DB call passes
+// through. Total classification, not an allow-list: any statement matching
+// this leading-keyword pattern is refused; everything else (SELECT, and
+// nothing else is ever issued in dry-run mode) passes through untouched.
+const WRITE_STATEMENT_RE = /^\s*(INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|TRUNCATE|BEGIN|COMMIT|ROLLBACK|GRANT|REVOKE)\b/i;
+
+function assertReadOnlyStatement(sql) {
+  if (WRITE_STATEMENT_RE.test(sql)) {
+    throw new Error(`INTERNAL: --dry-run attempted a write statement (all writes must be gated) — refused: ${String(sql).trim().slice(0, 160)}`);
+  }
+}
+
+/**
+ * Wraps a pg Client so every `.query()` call is checked by
+ * assertReadOnlyStatement() before reaching the real client — the read-only
+ * guarantee for --dry-run (I: "opens the DB read-only"). Used for EVERY
+ * client.query() call made while parsed.dryRun is true, including the
+ * prerequisite-table/column checks (SELECT-only, so unaffected) — there is
+ * no code path in dry-run mode that talks to the DB through the unwrapped
+ * client. Deliberately a thin object, not a Proxy, so a test can pass a
+ * bare mock ({ query: (sql) => {...} }) and assert on exactly what reached
+ * it.
+ */
+function makeReadOnlyClient(client) {
+  return {
+    query: (textOrConfig, values) => {
+      const sql = typeof textOrConfig === 'string' ? textOrConfig : (textOrConfig && textOrConfig.text) || '';
+      assertReadOnlyStatement(sql);
+      return client.query(textOrConfig, values);
+    },
+  };
+}
+
+/**
+ * Read-only counterpart to parseProjectMemoryDir: same per-file parsing
+ * (frontmatter, entity-type resolution, wiki-link scan) but with per-file
+ * read errors caught and reported as a named skip instead of throwing and
+ * aborting the whole plan. Kept as its own function (rather than adding a
+ * try/catch to parseProjectMemoryDir, which MIGRATE mode and migrate-05
+ * both call by reference and whose exact throw-on-unreadable-file behavior
+ * is unchanged here) — see PR body blind-spots for the duplication this
+ * implies.
+ */
+function buildDryRunPlan(memoryDirPath) {
+  const fileNames = listTopicFiles(memoryDirPath);
+  const skippedFiles = [];
+  const readableFiles = [];
+  const textByFile = new Map();
+  for (const fileName of fileNames) {
+    try {
+      textByFile.set(fileName, fs.readFileSync(path.join(memoryDirPath, fileName), 'utf8'));
+      readableFiles.push(fileName);
+    } catch (err) {
+      skippedFiles.push({ fileName, reason: err.message });
+    }
+  }
+  const stemSet = new Set(readableFiles.map((f) => path.basename(f, path.extname(f))));
+
+  let memoryIndex = new Map();
+  const memoryIndexPath = path.join(memoryDirPath, MEMORY_INDEX_FILENAME);
+  if (fs.existsSync(memoryIndexPath)) {
+    try {
+      memoryIndex = parseMemoryIndex(fs.readFileSync(memoryIndexPath, 'utf8'));
+    } catch (err) {
+      skippedFiles.push({ fileName: MEMORY_INDEX_FILENAME, reason: err.message });
+    }
+  }
+
+  const entities = [];
+  const edgesByKey = new Map();
+  const events = [];
+
+  for (const fileName of readableFiles) {
+    const stem = path.basename(fileName, path.extname(fileName));
+    const { frontmatter, body } = parseFrontmatterAndBody(textByFile.get(fileName));
+
+    const resolved = resolveEntityType(frontmatter, stem);
+    const { entityType, method } = resolved;
+    if (method === 'filename-prefix-fallback') {
+      events.push({ kind: 'filename-prefix-fallback', stem, entityType });
+    } else if (method === 'invalid-enum-value') {
+      events.push({ kind: 'unmatched-type', stem, reason: 'invalid-enum-value', invalidValue: resolved.invalidValue, invalidSource: resolved.invalidSource });
+    } else if (method === 'unmatched-type') {
+      events.push({ kind: 'unmatched-type', stem, reason: 'no-frontmatter-type-no-prefix-match' });
+    }
+
+    let description = null;
+    if (memoryIndex.has(stem)) {
+      description = memoryIndex.get(stem);
+    } else {
+      events.push({ kind: 'no-memory-index-entry', stem });
+    }
+
+    entities.push({ name: stem, entityType, method, description });
+
+    const links = extractWikiLinks(body);
+    for (const link of links) {
+      if (link.malformed) {
+        events.push({ kind: 'unresolved-link', fromStem: stem, raw: link.raw, reason: 'malformed-empty-target' });
+        continue;
+      }
+      if (link.target === stem) {
+        events.push({ kind: 'unresolved-link', fromStem: stem, raw: link.raw, reason: 'self-link' });
+        continue;
+      }
+      if (!stemSet.has(link.target)) {
+        events.push({ kind: 'unresolved-link', fromStem: stem, raw: link.raw, reason: 'not-found', target: link.target });
+        continue;
+      }
+      const key = `${stem}::${EDGE_TYPE}::${link.target}`;
+      edgesByKey.set(key, { fromEntity: stem, edgeType: EDGE_TYPE, toEntity: link.target });
+    }
+  }
+
+  return { entities, edges: [...edgesByKey.values()], events, fileCount: readableFiles.length, skippedFiles };
+}
+
+/**
+ * Re-derives, WITHOUT writing, the exact verdict upsertEntity()'s CASE
+ * expressions would produce for one entity against its current DB row (or
+ * absence of one): 'insert' (no existing row), 'update' (a write would
+ * change entity_type/description/source_model under this script's own
+ * precedence — see upsertEntity's header comment), or 'unchanged'.
+ */
+function classifyEntityPlan(existingRow, entity) {
+  if (!existingRow) return 'insert';
+  const ownedByUs = existingRow.source_model === null || existingRow.source_model === SOURCE_MODEL_TAG;
+  if (ownedByUs) {
+    const changed = existingRow.entity_type !== entity.entityType
+      || existingRow.description !== entity.description
+      || existingRow.source_model !== SOURCE_MODEL_TAG;
+    return changed ? 'update' : 'unchanged';
+  }
+  // I-12 additive-only precedence: a foreign-owned row can only ever gain a
+  // currently-NULL entity_type from this script; description/source_model
+  // are never candidates for change under this branch.
+  const changed = existingRow.entity_type === null && entity.entityType !== null;
+  return changed ? 'update' : 'unchanged';
+}
+
+/** Batched read-only lookup + classification for one project's entity list. */
+async function computeEntityPlanCounts(dbClient, projectId, entities) {
+  const names = entities.map((e) => e.name);
+  let existingByName = new Map();
+  if (names.length) {
+    const { rows } = await dbClient.query(
+      `SELECT name, entity_type, description, source_model FROM entities WHERE project_id=$1 AND name = ANY($2::text[])`,
+      [projectId, names]
+    );
+    existingByName = new Map(rows.map((r) => [r.name, r]));
+  }
+  const counts = { insert: 0, update: 0, unchanged: 0 };
+  for (const e of entities) {
+    counts[classifyEntityPlan(existingByName.get(e.name) || null, e)]++;
+  }
+  return { counts };
+}
+
+/**
+ * Batched read-only lookup for one project's resolved-edge list. An edge
+ * "would be created" unless a row with this exact tuple ALREADY carries
+ * this script's own source_model tag (the same existence guard
+ * edgeAlreadyWrittenByThisScript() checks at write time — edges have no
+ * "update" verdict, only insert-or-already-present).
+ */
+async function computeEdgePlanCounts(dbClient, projectId, edges) {
+  let existingSet = new Set();
+  if (edges.length) {
+    const { rows } = await dbClient.query(
+      `SELECT from_entity, to_entity FROM edges WHERE project_id=$1 AND edge_type=$2 AND source_model=$3`,
+      [projectId, EDGE_TYPE, SOURCE_MODEL_TAG]
+    );
+    existingSet = new Set(rows.map((r) => `${r.from_entity}::${r.to_entity}`));
+  }
+  const counts = { wouldCreate: 0, unchanged: 0 };
+  for (const edge of edges) {
+    if (existingSet.has(`${edge.fromEntity}::${edge.toEntity}`)) counts.unchanged++;
+    else counts.wouldCreate++;
+  }
+  return { counts };
+}
+
 // ─── DB WRITES ──────────────────────────────────────────────────────────────
 
 /**
@@ -911,6 +1133,11 @@ async function main() {
     printUsage();
     process.exit(0);
   }
+  if (parsed.dryRun && parsed.rollback) {
+    console.error('Error: --dry-run and --rollback are mutually exclusive.');
+    printUsage();
+    process.exit(2);
+  }
 
   const { name: target, source: targetSource } = migrateOne.resolveTargetDb({ db: parsed.db });
   if (!migrateOne.DB_NAME_RE.test(target)) {
@@ -926,7 +1153,7 @@ async function main() {
 
   const enrollmentConfig = loadEnrollmentConfig(parsed.enrollmentConfigPath);
 
-  console.log(`migrate-09-file-memory-markdown: target="${target}" (resolved from ${targetSource}) projects-root="${parsed.projectsRoot}" mode=${parsed.rollback ? 'ROLLBACK' : 'MIGRATE'}`);
+  console.log(`migrate-09-file-memory-markdown: target="${target}" (resolved from ${targetSource}) projects-root="${parsed.projectsRoot}" mode=${parsed.rollback ? 'ROLLBACK' : parsed.dryRun ? 'DRY-RUN' : 'MIGRATE'}`);
 
   const memoryBearingDirs = enumerateMemoryBearingDirs(parsed.projectsRoot);
   const enrolledProjects = []; // { projectId, dirName, memoryDirPath }
@@ -955,8 +1182,13 @@ async function main() {
     process.exit(1);
   }
 
+  // I: dry-run opens the target read-only — every client.query() call made
+  // while parsed.dryRun is true (including these prerequisite checks) goes
+  // through the write-gated wrapper, never the raw client.
+  const dbClient = parsed.dryRun ? makeReadOnlyClient(client) : client;
+
   try {
-    const { rows: tblRows } = await client.query(
+    const { rows: tblRows } = await dbClient.query(
       `SELECT table_name FROM information_schema.tables
        WHERE table_schema = current_schema() AND table_name = ANY($1::text[]) AND table_type = 'BASE TABLE'`,
       [PREREQUISITE_TABLES]
@@ -970,7 +1202,7 @@ async function main() {
       return;
     }
 
-    const { rows: colRows } = await client.query(
+    const { rows: colRows } = await dbClient.query(
       `SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = current_schema()`
     );
     const colSet = new Set(colRows.map((r) => `${r.table_name}.${r.column_name}`));
@@ -979,6 +1211,63 @@ async function main() {
       console.error(`Refused: target "${target}" is missing column(s): ${missingCols.map((c) => `${c.table}.${c.column}`).join(', ')}.`);
       console.error('Run migrate-schema-addenda.js against this target first (attribution-columns.sql), then re-run this script. Nothing was applied.');
       process.exitCode = 1;
+      return;
+    }
+
+    if (parsed.dryRun) {
+      console.log(`  [DRY-RUN] read-only mode: no schema DDL will be applied; no entities/edges/manifest rows will be written.`);
+      let totalFiles = 0;
+      const entityCounts = { insert: 0, update: 0, unchanged: 0 };
+      const edgeCounts = { wouldCreate: 0, unchanged: 0 };
+      const typeBreakdown = { 'frontmatter.type': 0, 'frontmatter.metadata.type': 0, 'filename-prefix-fallback': 0, NULL: 0 };
+      const unresolvedLinks = [];
+      const skippedFiles = [];
+
+      for (const proj of enrolledProjects) {
+        const plan = buildDryRunPlan(proj.memoryDirPath);
+        const entityResult = await computeEntityPlanCounts(dbClient, proj.projectId, plan.entities);
+        const edgeResult = await computeEdgePlanCounts(dbClient, proj.projectId, plan.edges);
+
+        entityCounts.insert += entityResult.counts.insert;
+        entityCounts.update += entityResult.counts.update;
+        entityCounts.unchanged += entityResult.counts.unchanged;
+        edgeCounts.wouldCreate += edgeResult.counts.wouldCreate;
+        edgeCounts.unchanged += edgeResult.counts.unchanged;
+        totalFiles += plan.fileCount;
+
+        for (const e of plan.entities) {
+          if (e.method === 'frontmatter.type') typeBreakdown['frontmatter.type']++;
+          else if (e.method === 'frontmatter.metadata.type') typeBreakdown['frontmatter.metadata.type']++;
+          else if (e.method === 'filename-prefix-fallback') typeBreakdown['filename-prefix-fallback']++;
+          else typeBreakdown.NULL++; // unmatched-type / invalid-enum-value -> NULL entity_type
+        }
+        for (const ev of plan.events) {
+          if (ev.kind === 'unresolved-link' && ev.reason !== 'self-link') {
+            unresolvedLinks.push(`project_id="${proj.projectId}" from="${ev.fromStem}" raw="[[${ev.raw}]]" reason="${ev.reason}"${ev.target ? ` target="${ev.target}"` : ''}`);
+          }
+        }
+        for (const sf of plan.skippedFiles) {
+          skippedFiles.push(`project_id="${proj.projectId}" file="${sf.fileName}" reason="${sf.reason}"`);
+        }
+
+        printEvents(proj.projectId, plan.events.filter((e) => e.kind !== 'unresolved-link'));
+        console.log(`  [DRY-RUN] project_id="${proj.projectId}": ${plan.fileCount} file(s) -> entities{insert=${entityResult.counts.insert} update=${entityResult.counts.update} unchanged=${entityResult.counts.unchanged}} edges{would_create=${edgeResult.counts.wouldCreate} unchanged=${edgeResult.counts.unchanged}}`);
+      }
+
+      console.log(`Plan: files=${totalFiles} entities{insert=${entityCounts.insert} update=${entityCounts.update} unchanged=${entityCounts.unchanged}} edges{would_create=${edgeCounts.wouldCreate} unchanged=${edgeCounts.unchanged}}`);
+      console.log(`Plan: entity_type source breakdown: frontmatter.type=${typeBreakdown['frontmatter.type']} frontmatter.metadata.type=${typeBreakdown['frontmatter.metadata.type']} filename-prefix-fallback=${typeBreakdown['filename-prefix-fallback']} NULL=${typeBreakdown.NULL}`);
+
+      const cappedLinks = unresolvedLinks.slice(0, 50);
+      console.log(`Plan: ${unresolvedLinks.length} [[link]] target(s) would NOT resolve${unresolvedLinks.length > 50 ? ' (showing first 50)' : ''}:`);
+      for (const line of cappedLinks) console.log(`  [UNRESOLVED-LINK] ${line}`);
+
+      if (skippedFiles.length) {
+        console.log(`Plan: ${skippedFiles.length} file(s) skipped:`);
+        for (const line of skippedFiles) console.log(`  [SKIPPED] ${line}`);
+      }
+
+      console.log(`MIGRATION_RESULT: DRY_RUN (projects=${enrolledProjects.length}, files=${totalFiles}, entities_insert=${entityCounts.insert}, entities_update=${entityCounts.update}, entities_unchanged=${entityCounts.unchanged}, edges_would_create=${edgeCounts.wouldCreate}, edges_unchanged=${edgeCounts.unchanged}, unresolved_links=${unresolvedLinks.length}, skipped_files=${skippedFiles.length})`);
+      exitCode = 0;
       return;
     }
 
@@ -1059,6 +1348,13 @@ module.exports = {
   rollbackProject,
   verifyProject,
   computeContentFingerprint,
+  WRITE_STATEMENT_RE,
+  assertReadOnlyStatement,
+  makeReadOnlyClient,
+  buildDryRunPlan,
+  classifyEntityPlan,
+  computeEntityPlanCounts,
+  computeEdgePlanCounts,
   SQL_FILE,
   SQL_FILES,
   SOURCE_TABLE_ENTITIES,

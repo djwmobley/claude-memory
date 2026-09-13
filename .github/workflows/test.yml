@@ -526,9 +526,13 @@ jobs:
         # NULL for the unmatched-type case); an idempotent re-run (proves
         # edges_project_from_type_to_unique + the upsert, not a duplicate
         # insert); the description-never-overwritten-by-another-writer
-        # upsert precedence; and --rollback's reference-count-gated entity
+        # upsert precedence; --rollback's reference-count-gated entity
         # cleanup (an entity a surviving, differently-tagged edge still
-        # references is preserved; one with none is deleted).
+        # references is preserved; one with none is deleted); and --dry-run
+        # (a write-gate spy proving zero write statements reach the DB
+        # adapter, a 3-file fixture's insert/unresolved-link plan counts,
+        # a real-run-then-dry-run all-unchanged check, and --dry-run +
+        # --rollback rejected as a mutually-exclusive usage error).
         # Creates/drops its own scratch database (target "_staging"-suffixed
         # to satisfy migrate-01's classifyTarget) and its own temp
         # --projects-root fixture tree; never touches

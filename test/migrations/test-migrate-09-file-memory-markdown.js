@@ -52,6 +52,13 @@
  *     none is deleted.
  *   - Prerequisite refusal: missing entities/edges table refuses loud,
  *     nothing applied.
+ *   - --dry-run: write-gate spy (zero write statements reach the adapter);
+ *     a 3-file fixture (frontmatter.type / metadata.type / unresolved
+ *     link) reports insert/unresolved-link counts with zero rows written;
+ *     a real run followed by --dry-run reports all-unchanged with zero
+ *     further writes; --dry-run + --rollback is a rejected usage error;
+ *     --rollback after --dry-run is unaffected (still removes exactly the
+ *     real run's rows).
  *
  * Usage: node test/migrations/test-migrate-09-file-memory-markdown.js
  * Exit 0 = all pass; nonzero = any failure.
@@ -773,9 +780,133 @@ async function main() {
     }
   });
 
+  // ── --dry-run ────────────────────────────────────────────────────────────
+
+  await run('T13', 'write gate: makeReadOnlyClient passes SELECT through and throws on a write statement (spy on the adapter, zero write calls reach it)', async () => {
+    const calls = [];
+    const mockClient = { query: async (sql, values) => { calls.push({ sql, values }); return { rows: [] }; } };
+    const guarded = migrate09.makeReadOnlyClient(mockClient);
+
+    await guarded.query('SELECT 1 FROM entities WHERE project_id=$1', ['p1']);
+    assert(calls.length === 1, `expected the SELECT to pass through, got ${calls.length} call(s)`);
+
+    const writeStatements = [
+      `INSERT INTO entities (project_id, name) VALUES ('p1','x')`,
+      `UPDATE entities SET description='x' WHERE id=1`,
+      `DELETE FROM edges WHERE project_id='p1'`,
+      `BEGIN`,
+      `COMMIT`,
+      `CREATE INDEX foo ON entities(name)`,
+    ];
+    for (const stmt of writeStatements) {
+      let threw = false;
+      try { await guarded.query(stmt); } catch (err) { threw = true; }
+      assert(threw, `expected makeReadOnlyClient to throw on: ${stmt}`);
+    }
+    assert(calls.length === 1, `expected zero write calls to reach the underlying adapter, but ${calls.length - 1} extra call(s) got through: ${JSON.stringify(calls.slice(1))}`);
+  });
+
+  // 3-file fixture dedicated to the dry-run scenarios: one frontmatter.type,
+  // one frontmatter.metadata.type, one with a [[link]] to a missing stem.
+  const dryRunRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'mm09-dryrun-'));
+  const dryRunDirName = 'C--Users-example-dev-proj-dryrun';
+  const dryRunMemoryDir = path.join(dryRunRoot, dryRunDirName, 'memory');
+  fs.mkdirSync(dryRunMemoryDir, { recursive: true });
+  fs.writeFileSync(path.join(dryRunMemoryDir, 'dryrun_user_topic.md'), '---\ntype: user\n---\n\nA user topic.', 'utf8');
+  fs.writeFileSync(path.join(dryRunMemoryDir, 'dryrun_project_topic.md'), '---\nmetadata:\n  type: project\n---\n\nA project topic.', 'utf8');
+  fs.writeFileSync(path.join(dryRunMemoryDir, 'dryrun_missing_link_topic.md'), '---\ntype: reference\n---\n\nLinks to [[does_not_exist_stem]].', 'utf8');
+  const dryRunCfgPath = path.join(dryRunRoot, 'enrollment-config.json');
+  fs.writeFileSync(dryRunCfgPath, JSON.stringify({
+    enrolled_dirs: [{ dir_name: dryRunDirName, project_id: 'proj-dryrun-test' }],
+    test_artifact_patterns: [],
+  }, null, 2), 'utf8');
+
+  await run('T14', 'DB: --dry-run on a 3-file fixture (frontmatter.type, metadata.type, unresolved link) — expected counts, zero writes, exit 0', async () => {
+    const r = runMigrate09(['--db', dbName, '--projects-root', dryRunRoot, '--enrollment-config', dryRunCfgPath, '--dry-run']);
+    assert(r.status === 0, `expected exit 0, got ${r.status}; stdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert(/MIGRATION_RESULT: DRY_RUN/.test(r.stdout), `expected MIGRATION_RESULT: DRY_RUN, got: ${r.stdout}`);
+    assert(/entities_insert=3/.test(r.stdout), `expected entities_insert=3, got: ${r.stdout}`);
+    assert(/entities_update=0/.test(r.stdout), `expected entities_update=0, got: ${r.stdout}`);
+    assert(/entities_unchanged=0/.test(r.stdout), `expected entities_unchanged=0, got: ${r.stdout}`);
+    assert(/edges_would_create=0/.test(r.stdout), `expected edges_would_create=0 (the only link target does not exist), got: ${r.stdout}`);
+    assert(/unresolved_links=1/.test(r.stdout), `expected unresolved_links=1, got: ${r.stdout}`);
+    // dryrun_user_topic.md AND dryrun_missing_link_topic.md both carry a
+    // top-level frontmatter.type (user / reference respectively) -> 2.
+    assert(/frontmatter\.type=2/.test(r.stdout), `expected frontmatter.type=2 in the type breakdown, got: ${r.stdout}`);
+    assert(/frontmatter\.metadata\.type=1/.test(r.stdout), `expected frontmatter.metadata.type=1 in the type breakdown, got: ${r.stdout}`);
+    assert(/UNRESOLVED-LINK.*does_not_exist_stem/.test(r.stdout), `expected the unresolved link stem named in the plan output, got: ${r.stdout}`);
+
+    const client = await pgConnect(dbName);
+    try {
+      const { rows: entRows } = await client.query(`SELECT 1 FROM entities WHERE project_id='proj-dryrun-test'`);
+      assert(entRows.length === 0, `--dry-run must write zero entities rows, got ${entRows.length}`);
+      const { rows: edgeRows } = await client.query(`SELECT 1 FROM edges WHERE project_id='proj-dryrun-test'`);
+      assert(edgeRows.length === 0, `--dry-run must write zero edges rows, got ${edgeRows.length}`);
+      const { rows: manRows } = await client.query(`SELECT 1 FROM migration_manifest WHERE project_id_or_null='proj-dryrun-test'`);
+      assert(manRows.length === 0, `--dry-run must write zero migration_manifest rows, got ${manRows.length}`);
+    } finally {
+      await client.end();
+    }
+  });
+
+  await run('T15', 'DB: real run then --dry-run — all entities report unchanged, zero further writes', async () => {
+    const realRun = runMigrate09(['--db', dbName, '--projects-root', dryRunRoot, '--enrollment-config', dryRunCfgPath]);
+    assert(realRun.status === 0, `real run expected exit 0, got ${realRun.status}; stderr=${realRun.stderr}`);
+    assert(/MIGRATION_RESULT: PASS/.test(realRun.stdout), `expected MIGRATION_RESULT: PASS, got: ${realRun.stdout}`);
+
+    const client = await pgConnect(dbName);
+    let countAfterReal;
+    try {
+      const { rows } = await client.query(`SELECT COUNT(*) AS n FROM entities WHERE project_id='proj-dryrun-test'`);
+      countAfterReal = Number(rows[0].n);
+      assert(countAfterReal === 3, `expected 3 entities after the real run, got ${countAfterReal}`);
+    } finally {
+      await client.end();
+    }
+
+    const dryRun = runMigrate09(['--db', dbName, '--projects-root', dryRunRoot, '--enrollment-config', dryRunCfgPath, '--dry-run']);
+    assert(dryRun.status === 0, `dry-run expected exit 0, got ${dryRun.status}; stderr=${dryRun.stderr}`);
+    assert(/MIGRATION_RESULT: DRY_RUN/.test(dryRun.stdout), `expected MIGRATION_RESULT: DRY_RUN, got: ${dryRun.stdout}`);
+    assert(/entities_insert=0/.test(dryRun.stdout), `expected entities_insert=0 after real run, got: ${dryRun.stdout}`);
+    assert(/entities_update=0/.test(dryRun.stdout), `expected entities_update=0 after real run, got: ${dryRun.stdout}`);
+    assert(/entities_unchanged=3/.test(dryRun.stdout), `expected entities_unchanged=3 after real run, got: ${dryRun.stdout}`);
+
+    const client2 = await pgConnect(dbName);
+    try {
+      const { rows } = await client2.query(`SELECT COUNT(*) AS n FROM entities WHERE project_id='proj-dryrun-test'`);
+      assert(Number(rows[0].n) === countAfterReal, `--dry-run after a real run must not change the row count, got ${rows[0].n} vs ${countAfterReal}`);
+    } finally {
+      await client2.end();
+    }
+  });
+
+  await run('T16', '--dry-run and --rollback are mutually exclusive (usage error, exit 2); a plain --rollback after --dry-run is unaffected and still removes the real run\'s rows', async () => {
+    const both = runMigrate09(['--db', dbName, '--projects-root', dryRunRoot, '--enrollment-config', dryRunCfgPath, '--dry-run', '--rollback']);
+    assert(both.status === 2, `expected exit 2 for --dry-run + --rollback, got ${both.status}; stdout=${both.stdout}\nstderr=${both.stderr}`);
+
+    // One more no-op --dry-run pass (proving it changed nothing) immediately
+    // before the real rollback, which must still remove exactly what the
+    // T15 real run wrote.
+    const dryRunAgain = runMigrate09(['--db', dbName, '--projects-root', dryRunRoot, '--enrollment-config', dryRunCfgPath, '--dry-run']);
+    assert(dryRunAgain.status === 0, `expected exit 0, got ${dryRunAgain.status}; stderr=${dryRunAgain.stderr}`);
+
+    const rollback = runMigrate09(['--db', dbName, '--projects-root', dryRunRoot, '--enrollment-config', dryRunCfgPath, '--rollback']);
+    assert(rollback.status === 0, `expected exit 0, got ${rollback.status}; stdout=${rollback.stdout}\nstderr=${rollback.stderr}`);
+    assert(/ROLLBACK_RESULT: PASS/.test(rollback.stdout), `expected ROLLBACK_RESULT: PASS, got: ${rollback.stdout}`);
+
+    const client = await pgConnect(dbName);
+    try {
+      const { rows } = await client.query(`SELECT 1 FROM entities WHERE project_id='proj-dryrun-test'`);
+      assert(rows.length === 0, `expected rollback to remove all of proj-dryrun-test's entities (none referenced by a surviving edge), got ${rows.length}`);
+    } finally {
+      await client.end();
+    }
+  });
+
   // ── Cleanup ──────────────────────────────────────────────────────────────
   await dropDb(dbName);
   if (fixtureRoot) fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  fs.rmSync(dryRunRoot, { recursive: true, force: true });
 
   console.log(`\n${passed} passed, ${failed} failed.`);
   process.exitCode = failed > 0 ? 1 : 0;
