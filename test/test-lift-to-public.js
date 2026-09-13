@@ -61,6 +61,34 @@ function sha256(buf) {
   return crypto.createHash('sha256').update(buf).digest('hex');
 }
 
+// CI's actions/checkout@v4 runs with default (shallow, depth-1) history, so
+// PUBLIC-MANIFEST.json's own source_sha (an older ancestor commit) is often
+// not present locally even though it's the real, correct commit the
+// manifest was generated against. `git fetch origin <sha>` deepens the
+// checkout on demand (GitHub allows fetching a specific reachable SHA);
+// idempotent, retried at most once per call site.
+function ensureCommitAvailable(sha) {
+  try {
+    execFileSync('git', ['cat-file', '-e', `${sha}^{commit}`], { cwd: PROJECT_ROOT, stdio: 'ignore' });
+    return;
+  } catch (_e) {
+    // not present locally yet — fall through to fetch.
+  }
+  execFileSync('git', ['fetch', '--quiet', '--depth=1', 'origin', sha], { cwd: PROJECT_ROOT, stdio: 'ignore' });
+}
+
+function lsTreeWithFetchFallback(sha) {
+  ensureCommitAvailable(sha);
+  try {
+    return execFileSync('git', ['ls-tree', '-r', '--name-only', sha], {
+      cwd: PROJECT_ROOT,
+      encoding: 'utf8',
+    }).split(/\r?\n/).filter(Boolean);
+  } catch (e) {
+    throw new Error(`${sha} still not resolvable in this checkout after a fetch attempt: ${e.message}`);
+  }
+}
+
 function requireGate() {
   if (!fs.existsSync(GATE_SCRIPT)) {
     throw new Error(
@@ -155,15 +183,7 @@ test('PUBLIC-MANIFEST.json classifies every path in its own source_sha tree exac
   const manifest = lift.readManifest(MANIFEST_PATH);
   assert(typeof manifest.source_sha === 'string' && manifest.source_sha.length > 0, 'manifest.source_sha missing');
 
-  let treePaths;
-  try {
-    treePaths = execFileSync('git', ['ls-tree', '-r', '--name-only', manifest.source_sha], {
-      cwd: PROJECT_ROOT,
-      encoding: 'utf8',
-    }).split(/\r?\n/).filter(Boolean);
-  } catch (e) {
-    throw new Error(`manifest.source_sha ${manifest.source_sha} not resolvable in this checkout (fetch it first): ${e.message}`);
-  }
+  const treePaths = lsTreeWithFetchFallback(manifest.source_sha);
 
   const seen = new Map();
   for (const e of manifest.entries) {
@@ -195,6 +215,7 @@ test('PUBLIC-MANIFEST.json classifies every path in its own source_sha tree exac
 // ===========================================================================
 test('every LIFT entry source_sha256 (and target_sha256) matches the live blob', () => {
   const manifest = lift.readManifest(MANIFEST_PATH);
+  ensureCommitAvailable(manifest.source_sha);
   const liftEntries = lift.verifyAndCollectLift(manifest, PROJECT_ROOT, manifest.source_sha);
   assert(liftEntries.length > 0, 'expected at least one LIFT entry');
   const liftCount = manifest.entries.filter((e) => e.class === 'LIFT').length;
