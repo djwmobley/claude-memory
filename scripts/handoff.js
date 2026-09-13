@@ -3768,7 +3768,18 @@ async function ensureSchemaCurrentCore(db, projectId, { silent } = {}) {
   if (cmp === 'ahead') {
     // Stored epoch is newer than this engine build knows about — refuse to
     // apply (would be a downgrade), warn persistently, continue non-fatally.
-    const detail = { stored, current: currentFingerprint, note: 'stored schema_fingerprint epoch is newer than this engine build — refusing to apply; upgrade the engine' };
+    // fix/mcp-stale-engine-gate: stored_epoch/current_epoch are added as
+    // parsed INTEGER fields (not just the raw "<epoch>:<hash>" strings above)
+    // so scripts/lib/schema-epoch-guard.js's classifyEpochDrift can read
+    // dbEpoch (the DATABASE's stored epoch) directly off this detail object
+    // without re-parsing the fingerprint string itself.
+    const storedParsed = _parseSchemaFingerprint(stored);
+    const currentParsed = _parseSchemaFingerprint(currentFingerprint);
+    const detail = {
+      stored, current: currentFingerprint,
+      stored_epoch: storedParsed.epoch, current_epoch: currentParsed.epoch,
+      note: 'stored schema_fingerprint epoch is newer than this engine build — refusing to apply; upgrade the engine',
+    };
     await recordSchemaDegradation(db, projectId, 'fingerprint_ahead', detail, { silent });
     return { applied: false, reason: 'ahead', detail };
   }
@@ -11474,6 +11485,11 @@ if (require.main === module) {
     checkPgvectorGatedObjects,
     reportPgvectorGatedDegradation,
     SCHEMA_EPOCH,
+    // fix/mcp-stale-engine-gate: exposed so scripts/handoff-mcp.mjs can
+    // resolve the SAME engine-root scripts/lib/schema-epoch-guard.js reads
+    // scripts/sql/schema-manifest.json against — no second, independently-
+    // computed "where is this checkout rooted" path.
+    _ENGINE_ROOT,
     // cm#185-schema-heal FK extension — exposed for test/test-schema-heal.js
     // (no test-side reimplementation of the FK identity/classification rules).
     _collectExpectedFks,

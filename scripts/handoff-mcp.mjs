@@ -55,7 +55,13 @@ const { resolveSessionIdFromEnv, resolveUsageRecordMarkerDefault } = require('./
 // (CJS, via createRequire) from this ESM server process, so only its
 // module.exports object is evaluated — verified empirically (see the PR
 // body for the probe transcript).
-const { ensureSchemaCurrent } = require('./handoff.js');
+const { ensureSchemaCurrent, SCHEMA_EPOCH, _ENGINE_ROOT } = require('./handoff.js');
+// fix/mcp-stale-engine-gate: total classification distinguishing "this
+// server process is a stale engine build" (restart, no DB action) from
+// "the checkout is broken" from "the engine build itself needs upgrading"
+// from every other heal failure (report-only) — see that module's header
+// for the full incident writeup and the four-branch rule set.
+const { readDiskSchemaEpoch, classifyEpochDrift, healFailedMessage } = require('./lib/schema-epoch-guard.js');
 const memoryUpsertLib = require('./lib/memory-upsert.js');
 const memorySearchLib = require('./lib/memory-search.js');
 const entityCrudLib = require('./lib/entity-graph-crud.js');
@@ -154,6 +160,44 @@ function stripAnsi(str) {
   return str.replace(/\x1b\[[0-9;]*m/g, '');
 }
 
+// ── fix/mcp-stale-engine-gate: engine-identity pre-check ─────────────────
+//
+// checkEngineEpochOrThrow(): the ONE call site every path below (the four
+// spawn-based tools AND withProjectDb's own call site 1) uses to catch a
+// stale-engine or broken-checkout condition BEFORE doing anything else —
+// connecting to a database, resolving project identity, or spawning a
+// child process. Only ever throws for 'stale_engine' and
+// 'engine_checkout_inconsistent' (both restart-the-server conditions with
+// no database involved at all — see schema-epoch-guard.js's header) and,
+// defensively, 'heal_failed' (loadedEpoch itself malformed — should be
+// unreachable outside a broken engine build). 'proceed' (the common case)
+// and 'annotate_only' (manifest unreadable — no epoch signal available
+// here; the engine's OWN ensureSchemaCurrent/classifySchemaFiles call will
+// independently hit the same unreadable file and report a heal failure
+// through the normal path) both fall through silently.
+//
+// KNOWN RESIDUAL GAP: this validates the SERVER PROCESS's OWN engine
+// identity only — the handoff.js this process required at startup, and
+// that same handoff.js's own _ENGINE_ROOT. A deployment where
+// HANDOFF_MCP_ENGINE_PATH (see ENGINE_PATH above) points a runNode-spawned
+// child at a DIFFERENT checkout than the one THIS server required is
+// invisible to this guard: the child process resolves its own SCHEMA_EPOCH
+// and _ENGINE_ROOT independently when it starts, and this server never
+// inspects that checkout before spawning it.
+function checkEngineEpochOrThrow() {
+  const diskResult = readDiskSchemaEpoch(_ENGINE_ROOT);
+  const classification = classifyEpochDrift({
+    loadedEpoch: SCHEMA_EPOCH,
+    diskEpoch: diskResult.ok ? diskResult.epoch : null,
+  });
+  if (classification.branch === 'stale_engine' ||
+      classification.branch === 'engine_checkout_inconsistent' ||
+      classification.branch === 'heal_failed') {
+    throw new Error(classification.message);
+  }
+  // 'proceed' or 'annotate_only' — continue.
+}
+
 // ── §8 direct-pg tool plumbing ───────────────────────────────────────────
 //
 // withProjectDb: the ONE call site every new §8 tool below uses to (a)
@@ -170,6 +214,8 @@ async function withProjectDb(projectRoot, fn) {
   if (typeof projectRoot !== 'string' || !projectRoot.trim()) {
     throw new Error('projectRoot is required and must be a non-empty string');
   }
+  // fix/mcp-stale-engine-gate call site 1 — BEFORE any connection is opened.
+  checkEngineEpochOrThrow();
   const db = await connectForRoot(projectRoot);
   try {
     const identity = await ensureProjectIdentity(db, { cwd: projectRoot, silent: true });
@@ -205,13 +251,26 @@ async function withProjectDb(projectRoot, fn) {
     //     confusing SQL-layer failure inside the tool's own write.
     const schemaResult = await ensureSchemaCurrent(db, identity.projectId, { silent: true });
     if (!schemaResult.applied && schemaResult.reason !== 'current' && schemaResult.reason !== 'degraded') {
-      throw new Error(
-        `withProjectDb: schema is not current for this project DB and the automatic bring-forward did ` +
-        `not succeed (reason: ${schemaResult.reason}` +
-        `${schemaResult.detail ? `, detail: ${JSON.stringify(schemaResult.detail)}` : ''}). ` +
-        `Remedy: run \`node scripts/handoff.js init\` (or \`resume\`) directly against this project root ` +
-        `in an interactive terminal to resolve the degraded state, then retry this MCP tool call.`
-      );
+      // fix/mcp-stale-engine-gate call site 2 — the old blanket "run init/
+      // resume" remedy is gone: it named a downgrade as the fix for
+      // reason:'ahead'. Re-derive the disk epoch fresh (the manifest may
+      // have changed since call site 1 above) and classify total across
+      // the four branches — never a bare reason string again.
+      const diskResult = readDiskSchemaEpoch(_ENGINE_ROOT);
+      const classification = classifyEpochDrift({
+        loadedEpoch: SCHEMA_EPOCH,
+        diskEpoch: diskResult.ok ? diskResult.epoch : null,
+        dbEpoch: schemaResult.detail && schemaResult.detail.stored_epoch,
+        healReason: schemaResult.reason,
+        healDetail: schemaResult.detail,
+      });
+      // classification.message is non-null for every branch EXCEPT
+      // 'proceed'/'annotate_only' — 'proceed' cannot occur here (we are
+      // inside the failure branch already) but 'annotate_only' can (the
+      // manifest is unreadable, contributing no epoch signal): fall back to
+      // the SAME report-only wording, built directly from schemaResult's
+      // own reason/detail, rather than surfacing a null message.
+      throw new Error(classification.message || healFailedMessage(schemaResult.reason, schemaResult.detail));
     }
     try {
       // schemaResult.reason is passed as a 3rd arg -- every pre-existing
@@ -387,6 +446,14 @@ function parseInitReport(stdout) {
 // ── Tool implementations ────────────────────────────────────────────────────
 
 async function toolHandoffStatus({ projectRoot }) {
+  // fix/mcp-stale-engine-gate: same call-site-1 check as withProjectDb,
+  // before spawning — the child runs its own heal, so no call-site-2
+  // equivalent is needed here.
+  try {
+    checkEngineEpochOrThrow();
+  } catch (err) {
+    return toolError(err.message);
+  }
   const { code, stdout, stderr } = await runNode({
     scriptPath: ENGINE_PATH,
     args: ['status', '--json'],
@@ -412,6 +479,12 @@ async function toolHandoffStatus({ projectRoot }) {
  * to the engine for this one caller, this tool returns that stdout verbatim —
  * the model reads it as context the same way a human reads the CLI output. */
 async function toolHandoffResume({ projectRoot }) {
+  // fix/mcp-stale-engine-gate: see toolHandoffStatus's identical check.
+  try {
+    checkEngineEpochOrThrow();
+  } catch (err) {
+    return toolError(err.message);
+  }
   const { code, stdout, stderr } = await runNode({
     scriptPath: ENGINE_PATH,
     args: ['resume'],
@@ -441,6 +514,14 @@ function applySessionId(payload, sessionId) {
 async function runPayloadSubcommand(subcommand, { projectRoot, payload, sessionId }) {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
     return toolError(`payload must be a plain JSON object (not array or primitive) for handoff ${subcommand}.`);
+  }
+  // fix/mcp-stale-engine-gate: see toolHandoffStatus's identical check.
+  // Checked before writeTempJson/runNode so a stale-engine reject never
+  // leaves a temp payload file behind.
+  try {
+    checkEngineEpochOrThrow();
+  } catch (err) {
+    return toolError(err.message);
   }
 
   const effectivePayload = applySessionId(payload, sessionId);
@@ -483,6 +564,12 @@ const SESSION_ID_PARAM_DESCRIPTION =
   'ITS OWN session_in_progress marker rather than a sibling session\'s.';
 
 async function toolHandoffInit({ projectRoot, name }) {
+  // fix/mcp-stale-engine-gate: see toolHandoffStatus's identical check.
+  try {
+    checkEngineEpochOrThrow();
+  } catch (err) {
+    return toolError(err.message);
+  }
   const args = name ? ['init', name, '-y'] : ['init', '-y'];
   const { code, stdout, stderr } = await runNode({
     scriptPath: ENGINE_PATH,

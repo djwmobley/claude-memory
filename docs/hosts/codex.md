@@ -303,6 +303,17 @@ automatically. `--force-promotion` backs up the existing file
 from the current template — use it for that stale-copy case, or any time you
 want a clean re-render regardless of cause.
 
+**Stale MCP server:** if an MCP tool call errors with "this server is
+running a stale engine build (loaded schema epoch N, on disk M)", that
+means the `handoff-mcp.mjs` process itself was started before the engine
+checkout on disk was updated (its `SCHEMA_EPOCH` is a frozen in-memory
+literal, read once at startup) — restart the MCP server so it reloads
+`scripts/handoff.js`, then retry; this is never fixed by `init` or `resume`
+against the project, and no database change is needed. See
+[docs/mcp-tools.md](../mcp-tools.md)'s `withProjectDb` remedy table for the
+other three branches (`engine_checkout_inconsistent`, `engine_behind_db`,
+`heal_failed`) this same guard can report.
+
 ---
 
 ## Environment variables and flags

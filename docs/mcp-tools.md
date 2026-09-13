@@ -68,19 +68,52 @@ true` means proceed silently (the overwhelming common case); `reason ===
 rest of the schema is fine and most tools never touch a gated column;
 anything else is a real degradation (a classification error, a lock that
 could not be acquired, a failed post-apply verification, …) and
-`withProjectDb` throws a hard tool error naming `handoff.js init`/`resume`
-as the remedy, run directly against the project root in an interactive
-terminal. This is a deliberate divergence from `cmdLoaderLoad`/`cmdClose`'s
-own non-fatal, stderr-only handling of the same call: those run in a
-human's terminal (stderr is visible, the CLI process itself is disposable);
-an MCP tool call has no stderr channel an agent caller can read and no
-interactive prompt to answer, so failing loud with an explicit remedy is
-strictly better than deferring to a more confusing SQL-layer error inside
-the tool's own write. Pre-existing constraint, unchanged by this fix: a
-`projectRoot` whose DB has NEVER been `init`-ed at all (zero core tables)
-was already out of scope for the whole §8 surface before this change —
-`ensureProjectIdentity()` itself queries
-core tables and requires them to exist.
+`withProjectDb` throws a hard tool error. This is a deliberate divergence
+from `cmdLoaderLoad`/`cmdClose`'s own non-fatal, stderr-only handling of the
+same call: those run in a human's terminal (stderr is visible, the CLI
+process itself is disposable); an MCP tool call has no stderr channel an
+agent caller can read and no interactive prompt to answer, so failing loud
+is strictly better than deferring to a more confusing SQL-layer error
+inside the tool's own write. Pre-existing constraint, unchanged by this
+fix: a `projectRoot` whose DB has NEVER been `init`-ed at all (zero core
+tables) was already out of scope for the whole §8 surface before this
+change — `ensureProjectIdentity()` itself queries core tables and requires
+them to exist.
+
+**The remedy is never a blanket "run init/resume" — fix/mcp-stale-engine-gate
+(incident 2026-09-13).** A handoff-mcp.mjs server process holds
+`SCHEMA_EPOCH` as a frozen in-memory literal from the `scripts/handoff.js`
+it required at startup, while `scripts/sql/schema-manifest.json`'s
+`schema_epoch` and the database's own stored fingerprint can each move
+independently after that (a newer engine build lands on disk; the database
+gets bumped by some other, newer process). Naming `handoff.js init`/
+`resume` as the remedy for EVERY heal failure — the old behavior — was
+actively dangerous for one of these cases: it would have told the caller to
+force the database backward. `scripts/lib/schema-epoch-guard.js`'s
+`classifyEpochDrift()` now separates that bare `reason` string into four
+branches, checked at two call sites (before `connectForRoot` in
+`withProjectDb`, and again after `ensureSchemaCurrent()` returns a non-
+proceeding reason — plus the same before-spawn check on the four
+child-process tools, `handoff_status`/`handoff_resume`/
+`handoff_checkpoint`/`handoff_close`/`handoff_init`):
+
+| Branch | Condition | Remedy |
+|---|---|---|
+| `stale_engine` | this process's loaded `SCHEMA_EPOCH` < the on-disk manifest's `schema_epoch` | **Restart** the MCP server so it reloads `scripts/handoff.js`. No database action. |
+| `engine_checkout_inconsistent` | loaded `SCHEMA_EPOCH` > the on-disk manifest's `schema_epoch` (the SAME checkout disagrees with itself) | Restore a clean engine checkout, then restart the server. There is no database-side fix. |
+| `engine_behind_db` | checkout is internally consistent, but `ensureSchemaCurrentCore`'s own `reason:'ahead'` says the DATABASE's stored epoch is newer still | **Upgrade** the engine checkout to the build that wrote that epoch, then restart the server. Refuses to apply what would be a downgrade. |
+| `heal_failed` | every other non-proceeding `ensureSchemaCurrent` reason (`manifest_error`, `classification_error`, `lock_acquire_failed`, `apply_failed`, `integrity_index_failed`, `verification_failed`, `verification_probe_failed`, `unknown`, or anything unlisted) | Report-only — no command is offered. This state needs a maintainer. |
+
+No branch's message ever names `init` or `resume` as a fix (a `heal_failed`
+message's interpolated `detail` is scanned and redacted to `{redacted:true,
+keys:[...]}` if it happens to mention either word). See
+`scripts/lib/schema-epoch-guard.js`'s header comment for the full incident
+writeup and `test/test-mcp-epoch-guard.js` for the totality-matrix proof
+that every `(loadedEpoch, diskEpoch, healReason, dbEpoch)` combination maps
+to exactly one of these branches. Known residual gap: this guard validates
+the SERVER PROCESS's OWN engine identity only — a deployment where
+`HANDOFF_MCP_ENGINE_PATH` points a spawned child at a DIFFERENT checkout
+than the one this server itself required is invisible to it.
 
 **pgvector-gated columns — loud, not silent.** `assertions.embedding` and
 `decisions.embedding` (and their HNSW indexes) are wrapped in `DO $$ ...
