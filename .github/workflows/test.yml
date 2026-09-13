@@ -1547,6 +1547,22 @@ jobs:
         #   T9  multiple assertions citing same stale pointer → gate processes all in output
         #   T10 stale-pointer finding lands in same unified Reconciliation block as
         #       contradiction findings (single ## Reconciliation notice, not two)
+        #   T11 legacy pointer, zero prose-vs-content overlap → P-4, no derived anchor
+        #   T12 legacy pointer, token overlap passes → no P-4, derived anchor present
+        #   T13 bulk supersession (cm#297 TOTAL classification): in-range-stale
+        #       suppressed w/ suppression_kind='stale_pointer'+invalid_at, in-range-valid
+        #       anchored, already-suppressed unchanged
+        #   T14 bare-filename pointer resolved via scripts/ fallback → no P-1, anchor derived
+        #   T15-T21 cm#297 _classifyPointerScope TOTAL scope classification: Windows
+        #       backslash/UNC/forward-slash-drive-letter pre-filter (never falls back to
+        #       bare-filename match even with a same-named in-repo file), relative-path
+        #       normalize-inside vs. outside, line-range parsing, `#L10` → NOT_A_POINTER
+        #   T22-T25 cm#297 row-decision fixtures: mixed stale+resolvable not suppressed,
+        #       intent row (session_tldr/open_thread/quick_reference) survives with
+        #       annotation, out-of-scope pointer leaves row untouched with annotation,
+        #       zero rows end up suppressed=true with suppression_kind IS NULL
+        #   T26 cm#297 --dry-run parity: same findings, "(dry-run)"-prefixed, zero writes
+        #   T27 cm#297 win32-only case-insensitive relative-path comparison
         # Self-contained: creates + drops throwaway DB (claude_memory_ptr_gate_<ts>).
         run: node test/handoff/test-pointer-gate.js
         env:

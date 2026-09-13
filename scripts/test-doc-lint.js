@@ -21,7 +21,7 @@
  *        and the --suppression-kind enumeration bullet in the glossary
  *        must both equal the canonical set from the SQL schema CHECK
  *        constraint (currently: superseded, downvoted_terminal,
- *        downvoted_probation, retired, reality_reconciled).
+ *        downvoted_probation, retired, reality_reconciled, stale_pointer).
  *
  *   D4 -- MANIFEST index integrity: every row inside the MANIFEST.md
  *        documentation-index table is exhaustively classified as exactly

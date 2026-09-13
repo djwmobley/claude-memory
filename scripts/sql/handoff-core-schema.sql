@@ -147,6 +147,11 @@ ALTER TABLE assertions ADD COLUMN IF NOT EXISTS agent_id     TEXT;
 --              'downvoted_probation' C2 auto-downvote soft-exclusion; revivable by positive feedback
 --              'retired'             operator-retired via cmdRetire (L5); non-destructive; row
 --                                    is excluded from retrieval but retained and recoverable
+--              'stale_pointer'       cm#297 close-time bulk pass (_suppressStaleLegacyPointers):
+--                                    every extracted pointer classified IN_REPO_STALE and the
+--                                    predicate is not an intent predicate (session_tldr/
+--                                    open_thread/quick_reference); always paired with invalid_at
+--                                    in the SAME UPDATE.
 --              NULL when the row is live (not suppressed).
 -- pinned     — if true, the assertion is NEVER auto-suppressed/auto-downvoted by the C2 path.
 --              Explicit cardinality-driven supersession (user re-stating a 1:1 predicate) MAY
@@ -219,6 +224,8 @@ ALTER TABLE assertions ADD COLUMN IF NOT EXISTS corroboration_count INTEGER NOT 
 --   downvoted_probation   C2 auto-downvote soft-exclusion; revivable by positive feedback
 --   retired               operator-retired via cmdRetire (L5); non-destructive
 --   reality_reconciled    close-time mismatch reconciliation; audit trail distinct from supersession
+--   stale_pointer         cm#297 close-time bulk pass; every extracted pointer classified
+--                          IN_REPO_STALE and the predicate is not an intent predicate
 --
 -- Constraint name: assertions_suppression_kind_check  (Postgres auto-name for a
 -- column-level CHECK on the assertions table).
@@ -228,7 +235,7 @@ DECLARE
   current_def TEXT;
 BEGIN
   -- Fast no-op path (R-7 lock-budget guard): if the constraint already exists
-  -- under its canonical name with the exact canonical 5-value definition, skip
+  -- under its canonical name with the exact canonical 6-value definition, skip
   -- the drop+recreate entirely -- the steady-state case (already-current DB)
   -- takes zero row locks and does not touch pg_constraint at all.
   --
@@ -258,7 +265,8 @@ BEGIN
      AND current_def LIKE '%downvoted_terminal%'
      AND current_def LIKE '%downvoted_probation%'
      AND current_def LIKE '%retired%'
-     AND current_def LIKE '%reality_reconciled%' THEN
+     AND current_def LIKE '%reality_reconciled%'
+     AND current_def LIKE '%stale_pointer%' THEN
     RETURN;
   END IF;
 
@@ -280,7 +288,7 @@ BEGIN
   BEGIN
     ALTER TABLE assertions
       ADD CONSTRAINT assertions_suppression_kind_check
-        CHECK (suppression_kind IN ('superseded','downvoted_terminal','downvoted_probation','retired','reality_reconciled'));
+        CHECK (suppression_kind IN ('superseded','downvoted_terminal','downvoted_probation','retired','reality_reconciled','stale_pointer'));
   EXCEPTION
     WHEN duplicate_object THEN NULL;  -- constraint already present with identical definition
   END;

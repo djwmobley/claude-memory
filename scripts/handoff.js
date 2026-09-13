@@ -775,6 +775,278 @@ function _resolvePointerPath(projectRoot, ptrPath) {
   return null;
 }
 
+// ─── cm#297: TOTAL pointer-scope classification (bulk-suppression pass only) ─
+//
+// The close-time bulk-suppression pass (_suppressStaleLegacyPointers, below)
+// suppresses non-intent assertion rows whose ONLY pointer(s) are confidently
+// dead (file/line gone from inside this repo). Before cm#297 it silently
+// suppressed session_tldr/open_thread/quick_reference rows that merely cited
+// a file:line OUTSIDE this repo (e.g. a different repo's path), because the
+// old bare-filename fallback matched a same-named file in THIS repo by
+// accident, and because it only looked at ptrs[0] (the first pointer) and
+// used a bare "file not found / line out of range" test with no scope
+// distinction at all.
+//
+// This is a TOTAL classification (never an allow-list): every raw
+// pointer-shaped token maps to exactly one of six scopes. Only
+// IN_REPO_STALE is ever eligible for suppression (see
+// _suppressStaleLegacyPointers) — every other scope is "untouched + note",
+// never silently dropped.
+//
+// Deliberately NOT shared with validatePointers/_extractPointers/POINTER_RE
+// (the P-1..P-4 serve-time rewrite gate used at resume AND close for
+// TL;DR/open_threads/quick_references TEXT) — cm#297 non-goal: that gate's
+// rewrite behavior for in-repo pointers is unchanged. This classification
+// exists ONLY to decide whether an assertion ROW may be bulk-suppressed.
+
+/** Intent predicates — a row citing only IN_REPO_STALE pointers is NEVER
+ *  suppressed by the bulk pass when its predicate is one of these (annotated
+ *  instead). Compared normalized: trim + lowercase. */
+const INTENT_PREDICATES = new Set(['session_tldr', 'open_thread', 'quick_reference']);
+
+/**
+ * Pre-filter (spec item 1): does a raw pointer-shaped token look like an
+ * external/foreign path that must NEVER be resolved via the in-repo
+ * bare-filename fallback? Run BEFORE any path-shape regex matching.
+ *
+ * @param {string} raw
+ * @returns {boolean}
+ */
+function _isExternalPointerToken(raw) {
+  if (typeof raw !== 'string' || !raw) return false;
+  if (raw.indexOf('\\') !== -1) return true;                     // any backslash: Windows path or UNC
+  if (/^[A-Za-z]:/.test(raw)) return true;                        // drive-letter prefix (C:...)
+  if (/^\/\//.test(raw)) return true;                             // POSIX "//server/share" UNC form
+  if (/^file:\/\//i.test(raw)) return true;                       // file:// URL
+  if (/^[a-zA-Z][a-zA-Z0-9+.\-]*:\/\//.test(raw)) return true;    // scheme://host URL (incl. file://)
+  return false;
+}
+
+/**
+ * External-shaped SPANS (round 2 / cm#297 finding #1, #5 fix): matched over
+ * the WHOLE raw text, BEFORE any whitespace tokenization — a space inside a
+ * Windows path component ("C:\other\my file.js:9") must never truncate the
+ * candidate down to just the trailing whitespace-delimited word, which is
+ * what let an external path get misread as an in-repo bare filename.
+ * Extension: 1-10 alnum chars, matching the in-repo shape below.
+ */
+const EXTERNAL_SPAN_RE = new RegExp(
+  [
+    // Windows drive-letter path (backslash or forward slash after the colon).
+    String.raw`[A-Za-z]:[\\/][^:\r\n]*?\.[A-Za-z0-9]{1,10}:\d+(?:-\d+)?`,
+    // UNC backslash path: \\server\share\...
+    String.raw`\\\\[^\s\\]+\\[^:\r\n]*?\.[A-Za-z0-9]{1,10}:\d+(?:-\d+)?`,
+    // POSIX-style double-slash share: //server/share/...
+    String.raw`\/\/[^\s\/]+\/[^:\r\n]*?\.[A-Za-z0-9]{1,10}:\d+(?:-\d+)?`,
+    // file:// URL
+    String.raw`file:\/\/[^\s:\r\n]*?\.[A-Za-z0-9]{1,10}:\d+(?:-\d+)?`,
+    // http(s):// host-prefixed URL
+    String.raw`https?:\/\/[^\s:\r\n]*?\.[A-Za-z0-9]{1,10}:\d+(?:-\d+)?`,
+  ].join('|'),
+  'gi'
+);
+
+/**
+ * In-repo pointer candidates: GLOBAL matching over what's left after external
+ * spans are blanked out — never whitespace splitting — so
+ * "a.js:9;b.js:9", "(a.js:9)", and "a.js:9," each yield their own separate
+ * candidate instead of one malformed run.
+ */
+const IN_REPO_SPAN_RE = /(?:[A-Za-z0-9_./-]+\/)?[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,10}:\d+(?:-\d+)?/g;
+
+/**
+ * Fail-closed backstop (spec item 1c): any token that still contains a
+ * backslash and touches a `:N` line-number suffix after steps (a) and (b)
+ * have run — i.e. a malformed/unusual Windows-ish path that didn't match one
+ * of the structured external shapes above — is treated as external rather
+ * than risking an in-repo bare-filename match.
+ */
+const REMAINING_BACKSLASH_RE = /[^\s]*\\[^\s]*:[0-9]+(?:-[0-9]+)?/g;
+
+/**
+ * Extract every raw pointer-SHAPED candidate from a text blob (spec item 1).
+ * Three passes, in order:
+ *   (a) external-shaped spans over the WHOLE text (before any tokenization) —
+ *       each becomes an UNPARSEABLE_OR_EXTERNAL candidate (verified by
+ *       _classifyPointerScope's own _isExternalPointerToken pre-filter, since
+ *       the returned span retains its external-looking prefix) and is blanked
+ *       out of the working text so it can't also be picked up below;
+ *   (b) in-repo candidates via GLOBAL regex matching (not whitespace
+ *       splitting) over the remaining text;
+ *   (c) any leftover backslash-containing token touching `:N` — fail closed
+ *       as external.
+ *
+ * @param {string} text
+ * @returns {string[]} — de-duplicated, in first-seen (scan) order
+ */
+function _extractRawPointerCandidates(text) {
+  if (!text || typeof text !== 'string') return [];
+  const seen    = new Set();
+  const results = [];
+
+  // Mutable UTF-16-code-unit array so matched spans can be blanked (replaced
+  // with spaces of identical length) without shifting offsets for later passes.
+  const chars = text.split('');
+  const blank = (start, end) => { for (let i = start; i < end; i++) chars[i] = ' '; };
+  const record = (raw) => { if (!seen.has(raw)) { seen.add(raw); results.push(raw); } };
+
+  // Step (a): external-shaped spans over the WHOLE original text.
+  {
+    const re = new RegExp(EXTERNAL_SPAN_RE.source, EXTERNAL_SPAN_RE.flags);
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      record(m[0]);
+      blank(m.index, m.index + m[0].length);
+      if (m[0].length === 0) re.lastIndex++;
+    }
+  }
+
+  // Step (b): in-repo candidates, global matching over the blanked text.
+  const afterExternal = chars.join('');
+  {
+    const re = new RegExp(IN_REPO_SPAN_RE.source, IN_REPO_SPAN_RE.flags);
+    let m;
+    while ((m = re.exec(afterExternal)) !== null) {
+      record(m[0]);
+      blank(m.index, m.index + m[0].length);
+      if (m[0].length === 0) re.lastIndex++;
+    }
+  }
+
+  // Step (c): fail-closed backslash backstop over what's still left.
+  const afterInRepo = chars.join('');
+  {
+    const re = new RegExp(REMAINING_BACKSLASH_RE.source, REMAINING_BACKSLASH_RE.flags);
+    let m;
+    while ((m = re.exec(afterInRepo)) !== null) {
+      record(m[0]);
+      if (m[0].length === 0) re.lastIndex++;
+    }
+  }
+
+  return results;
+}
+
+/** Anchored single-token pointer shape (path.ext:N[-M]), applied only to an
+ *  already-isolated raw candidate that is NOT external (_isExternalPointerToken
+ *  already returned false). Extension: 1-10 alnum chars — deliberately NOT an
+ *  allow-list (cm#297 round 2 / finding #6): any plausible `name.ext:line`
+ *  shape is a candidate here, and existence on disk (see _isPlausiblePointerShape
+ *  and _pointerRangeVerdict below) decides IN_REPO_RESOLVABLE vs IN_REPO_STALE,
+ *  never the extension string itself. */
+const SINGLE_POINTER_RE = /^([\w./][\w./\-]*?\.([A-Za-z0-9]{1,10})):([1-9][0-9]*)(?:-([1-9][0-9]*))?$/;
+
+/**
+ * Classification-path plausibility check (cm#297 round 2 / finding #6):
+ * unlike _isValidPointerMatch (above — used ONLY by _extractPointers, the
+ * separate P-1..P-4 serve-time rewrite gate for TL;DR/open_threads/
+ * quick_references text; left unchanged, non-goal here), this does NOT
+ * consult POINTER_EXTENSIONS. Every extension is a candidate; a row is only
+ * ever ruled NOT_A_POINTER on SHAPE (no directory AND no letter/dash/
+ * underscore in the base name — i.e. it doesn't look like a filename at
+ * all), never because its extension isn't on some allow-list.
+ */
+function _isPlausiblePointerShape(pth) {
+  const hasSlash = pth.includes('/') || pth.includes('\\');
+  const hasDirOrKnownFile = hasSlash || /[a-zA-Z_-]/.test(pth.replace(/\.[^.]+$/, ''));
+  return hasDirOrKnownFile;
+}
+
+/**
+ * IN_REPO_RESOLVABLE vs IN_REPO_STALE — file exists and the cited line is
+ * in-range and non-blank, else stale. Shared by both classification branches
+ * below (path-with-directory and bare-filename-with-unique-match).
+ */
+function _pointerRangeVerdict(absPath, startLine) {
+  if (!fs.existsSync(absPath)) return { scope: 'IN_REPO_STALE' };
+  let fileLines;
+  try { fileLines = fs.readFileSync(absPath, 'utf8').split('\n'); } catch (_) { return { scope: 'IN_REPO_STALE' }; }
+  const idx = startLine - 1;
+  const inRange = idx >= 0 && idx < fileLines.length && fileLines[idx].trim().length > 0;
+  return { scope: inRange ? 'IN_REPO_RESOLVABLE' : 'IN_REPO_STALE' };
+}
+
+/**
+ * TOTAL scope classification for one raw pointer-shaped token (spec item 2).
+ * Every input maps to exactly one branch; the default is always
+ * "untouched + note" (never suppression) per the adversary-hardened spec —
+ * see _suppressStaleLegacyPointers for how each scope maps to a row decision.
+ *
+ * @param {string} projectRoot — absolute project root
+ * @param {string} raw         — raw candidate token (e.g. from _extractRawPointerCandidates)
+ * @returns {{
+ *   scope: 'UNPARSEABLE_OR_EXTERNAL'|'OUTSIDE_REPO'|'IN_REPO_AMBIGUOUS'|
+ *          'IN_REPO_RESOLVABLE'|'IN_REPO_STALE'|'NOT_A_POINTER',
+ *   pointer: string, path: string|null, ext: string|null,
+ *   startLine: number|null, endLine: number|null, resolvedAbsPath: string|null
+ * }}
+ */
+function _classifyPointerScope(projectRoot, raw) {
+  const base = { pointer: raw, path: null, ext: null, startLine: null, endLine: null, resolvedAbsPath: null };
+
+  // Step 1: pre-filter — external/unparseable tokens NEVER reach bare-filename
+  // fallback matching, regardless of what a same-named in-repo file exists.
+  if (_isExternalPointerToken(raw)) {
+    return Object.assign({}, base, { scope: 'UNPARSEABLE_OR_EXTERNAL' });
+  }
+
+  // Step 2: only now apply the path.ext:N[-M] shape match.
+  const m = SINGLE_POINTER_RE.exec(raw);
+  if (!m) return Object.assign({}, base, { scope: 'NOT_A_POINTER' });
+  const [, ptrPath, extRaw, startStr, endStr] = m;
+  const ext = extRaw.toLowerCase();
+  if (!_isPlausiblePointerShape(ptrPath)) {
+    return Object.assign({}, base, { scope: 'NOT_A_POINTER' });
+  }
+  const startLine = parseInt(startStr, 10);
+  const endLine   = endStr ? parseInt(endStr, 10) : null;
+  const withMeta  = Object.assign({}, base, { path: ptrPath, ext, startLine, endLine });
+
+  const hasSep = ptrPath.includes('/') || ptrPath.includes('\\');
+
+  // rel = path.relative(projectRoot, path.resolve(projectRoot, ptrPath)) — spec item 2.
+  // win32-only case-insensitive comparison: lowercase both sides before
+  // relativizing, so a pointer that differs from the real path only in case
+  // (NTFS/ReFS are case-insensitive by default) is not misclassified
+  // OUTSIDE_REPO. POSIX filesystems are case-sensitive by nature and are
+  // left byte-exact.
+  const resolved = path.resolve(projectRoot, ptrPath);
+  const rel = process.platform === 'win32'
+    ? path.relative(projectRoot.toLowerCase(), resolved.toLowerCase())
+    : path.relative(projectRoot, resolved);
+  const outside = rel.startsWith('..') || path.isAbsolute(rel);
+
+  if (hasSep) {
+    // Pointer has a directory component — no subdirectory fallback search;
+    // the file must exist at exactly the resolved path.
+    if (outside) return Object.assign({}, withMeta, { scope: 'OUTSIDE_REPO' });
+    return Object.assign({}, withMeta, _pointerRangeVerdict(resolved, startLine), { resolvedAbsPath: resolved });
+  }
+
+  // Bare filename (no directory component) — the ONLY case where the
+  // scripts/src/lib/test subdirectory fallback is allowed (spec item 2).
+  // (outside is always false here in practice — a bare name always resolves
+  // directly under projectRoot — kept for totality per the adversary rule:
+  // every branch maps somewhere, never falls through unclassified.)
+  if (outside) return Object.assign({}, withMeta, { scope: 'OUTSIDE_REPO' });
+  const candidates = [];
+  const direct = path.join(projectRoot, ptrPath);
+  if (fs.existsSync(direct)) candidates.push(direct);
+  for (const sub of ['scripts', 'src', 'lib', 'test']) {
+    const candidate = path.join(projectRoot, sub, ptrPath);
+    if (fs.existsSync(candidate)) candidates.push(candidate);
+  }
+  if (candidates.length >= 2) {
+    return Object.assign({}, withMeta, { scope: 'IN_REPO_AMBIGUOUS' });
+  }
+  if (candidates.length === 1) {
+    return Object.assign({}, withMeta, _pointerRangeVerdict(candidates[0], startLine), { resolvedAbsPath: candidates[0] });
+  }
+  // Zero candidates anywhere — a genuinely missing bare-named file is the
+  // classic "file deleted" stale case (matches pre-cm#297 P-1 semantics).
+  return Object.assign({}, withMeta, { scope: 'IN_REPO_STALE', resolvedAbsPath: null });
+}
+
 /**
  * Extract identifier-shaped tokens from a text string.
  * Matches camelCase, snake_case, kebab-case, and dotted identifiers of length >= 4.
@@ -1075,23 +1347,56 @@ async function _backfillMissingAnchors(db, projectId, projectRoot) {
 }
 
 /**
- * Bulk supersession pass for pre-gate stale-pointer legacy rows.
+ * Bulk supersession pass for pre-gate stale-pointer legacy rows (cm#297 —
+ * TOTAL scope classification, see _classifyPointerScope above).
  *
- * Called at close time (after _backfillMissingAnchors).  Iterates all
- * anchor-IS-NULL assertion rows with pointer-shaped objects and runs the
- * prose-vs-content overlap check.  Rows that fail overlap are suppressed
- * (suppressed = true).  Rows that pass get an anchor derived and persisted.
+ * Called at close time (after _backfillMissingAnchors), and in read-only
+ * `opts.dryRun` mode from the --dry-run preview (spec item 5: identical
+ * findings, "(dry-run)"-prefixed by the caller, zero writes here).
+ *
+ * Row decision (spec item 3):
+ *   - Extract ALL pointer-shaped tokens from `object` (never just ptrs[0] —
+ *     cm#297's root defect truncated to the first pointer only).
+ *   - A row with zero extracted tokens is left alone (the coarse SQL `~`
+ *     pre-filter can over-match; nothing to classify).
+ *   - A row is suppressed only if EVERY token classifies IN_REPO_STALE AND
+ *     the predicate (trim+lower) is NOT an intent predicate
+ *     (session_tldr / open_thread / quick_reference). Suppression sets
+ *     suppressed=true, suppression_kind='stale_pointer', invalid_at=now()
+ *     in ONE UPDATE statement (never a bare `suppressed=true` — cm#297's
+ *     other root defect: suppression_kind/invalid_at were left NULL).
+ *   - An intent row that would otherwise qualify is NEVER suppressed — it
+ *     is annotated instead (a findings entry, no DB write for that row).
+ *   - Any token classified UNPARSEABLE_OR_EXTERNAL / OUTSIDE_REPO /
+ *     IN_REPO_AMBIGUOUS leaves the row untouched with an annotation — a
+ *     row is never suppressed on the strength of an out-of-scope token,
+ *     and out-of-scope pointers never fall back to bare-filename matching.
+ *   - Otherwise (at least one IN_REPO_RESOLVABLE token, nothing
+ *     out-of-scope) an anchor is derived/persisted from the first
+ *     resolvable token, same as the pre-cm#297 "passes" path.
+ *   - Every suppression and every annotation produces a findings entry;
+ *     the caller renders these into DIVERGENCE lines via
+ *     formatIntentDivergenceLines — the SAME "existing intent-divergence
+ *     channel" cm#227 already wires into handoff.md's ## Degraded section
+ *     and the session_in_progress marker-retention gate.
  *
  * Resume mode NEVER runs this pass (§7 no-backfill invariant + gate close/resume split).
  *
- * S10 compliance: we NEVER UPDATE subject / predicate / object / source.
- * Only `suppressed` and `anchor` are written.
+ * S10 compliance unchanged: only suppressed / suppression_kind / invalid_at /
+ * anchor are ever written — subject / predicate / object / source are never
+ * touched.
  *
- * @param {object} db          — pg Client
- * @param {string} projectId
- * @param {string} projectRoot — absolute project root
+ * @param {object}  db          — pg Client
+ * @param {string}  projectId
+ * @param {string}  projectRoot — absolute project root
+ * @param {object}  [opts]
+ * @param {boolean} [opts.dryRun] — classify and report only; zero DB writes.
+ * @returns {Promise<{ findings: Array<{kind:string, predicate:string, message:string}> }>}
  */
-async function _suppressStaleLegacyPointers(db, projectId, projectRoot) {
+async function _suppressStaleLegacyPointers(db, projectId, projectRoot, opts) {
+  const dryRun   = !!(opts && opts.dryRun);
+  const tag      = dryRun ? '(dry-run) ' : '';
+  const findings = [];
   try {
     const { rows } = await db.query(
       `SELECT id, subject, predicate, object
@@ -1100,57 +1405,87 @@ async function _suppressStaleLegacyPointers(db, projectId, projectRoot) {
           AND object ~ $2`,
       [projectId, '\\.[a-z]+:[0-9]']
     );
-    if (!rows.length) return;
-    let suppressed = 0;
-    let anchored   = 0;
+    if (!rows.length) return { findings };
+
+    let suppressedCount = 0;
+    let notedCount      = 0;
+    let anchoredCount   = 0;
+
     for (const row of rows) {
-      const ptrs = _extractPointers(row.object);
-      if (!ptrs.length) continue;
-      const ptr = ptrs[0];
-      // Resolve the file — use the same fallback logic as validatePointers.
-      const absPath = _resolvePointerPath(projectRoot, ptr.path);
-      if (!absPath) {
-        // File not found — suppress as stale.
-        await db.query(`UPDATE assertions SET suppressed = true WHERE id = $1`, [row.id]);
-        suppressed++;
-        process.stderr.write(`[handoff] pointer-gate: suppressed legacy stale-pointer assertion id=${row.id} pointer=${ptr.pointer} — file not found\n`);
+      // Spec item 1: extract ALL pointer-shaped tokens, not ptrs[0].
+      const candidates = _extractRawPointerCandidates(row.object);
+      if (!candidates.length) continue;
+
+      const classified = candidates.map((raw) => _classifyPointerScope(projectRoot, raw));
+      const normalizedPredicate = String(row.predicate || '').trim().toLowerCase();
+      const isIntentRow = INTENT_PREDICATES.has(normalizedPredicate);
+      const ptrList = classified.map((c) => c.pointer).join(', ');
+
+      const allStale  = classified.every((c) => c.scope === 'IN_REPO_STALE');
+      const outOfScope = classified.filter((c) =>
+        c.scope === 'UNPARSEABLE_OR_EXTERNAL' || c.scope === 'OUTSIDE_REPO' || c.scope === 'IN_REPO_AMBIGUOUS'
+      );
+
+      if (allStale) {
+        if (isIntentRow) {
+          notedCount++;
+          const message = `assertion id=${row.id} (${row.predicate}) cites only stale in-repo pointer(s) — intent row NEVER suppressed: ${ptrList}`;
+          findings.push({ kind: 'stale_pointer_note', predicate: row.predicate, message });
+          process.stderr.write(`[handoff] pointer-gate: ${tag}intent row id=${row.id} predicate=${row.predicate} cites stale pointer(s) — annotated, not suppressed: ${ptrList}\n`);
+        } else {
+          suppressedCount++;
+          const message = `assertion id=${row.id} (${row.predicate}) suppressed — stale pointer(s): ${ptrList}`;
+          findings.push({ kind: 'stale_pointer_suppressed', predicate: row.predicate, message });
+          if (!dryRun) {
+            // Suppression, suppression_kind, and invalid_at are set together in
+            // ONE UPDATE — cm#297's root defect was a bare `suppressed = true`
+            // with suppression_kind/invalid_at left NULL.
+            await db.query(
+              `UPDATE assertions SET suppressed = true, suppression_kind = 'stale_pointer', invalid_at = now() WHERE id = $1`,
+              [row.id]
+            );
+          }
+          process.stderr.write(`[handoff] pointer-gate: ${tag}suppressed legacy stale-pointer assertion id=${row.id} predicate=${row.predicate} pointer(s)=${ptrList}\n`);
+        }
         continue;
       }
-      let fileLines;
-      try { fileLines = fs.readFileSync(absPath, 'utf8').split('\n'); } catch (_) { continue; }
-      // Compose prose from subject + predicate (object contains only the pointer in these rows).
-      const prose = `${row.subject} ${row.predicate} ${row.object}`;
-      const lineIdx = ptr.startLine - 1;
-      const plausible = lineIdx >= 0 && lineIdx < fileLines.length && fileLines[lineIdx].trim().length > 0;
-      if (!plausible) {
-        await db.query(`UPDATE assertions SET suppressed = true WHERE id = $1`, [row.id]);
-        suppressed++;
-        process.stderr.write(`[handoff] pointer-gate: suppressed legacy stale-pointer assertion id=${row.id} pointer=${ptr.pointer} — line out of range or blank\n`);
+
+      if (outOfScope.length > 0) {
+        notedCount++;
+        const offenderList = outOfScope.map((c) => `${c.pointer} [${c.scope}]`).join(', ');
+        const message = `assertion id=${row.id} (${row.predicate}) cites out-of-scope/unparseable pointer(s) — left untouched: ${offenderList}`;
+        findings.push({ kind: 'stale_pointer_note', predicate: row.predicate, message });
+        process.stderr.write(`[handoff] pointer-gate: ${tag}out-of-scope/unparseable pointer for assertion id=${row.id} predicate=${row.predicate} — untouched: ${offenderList}\n`);
         continue;
       }
-      const hasOverlap = _proseVsContentOverlap(prose, ptr.pointer, fileLines, ptr.startLine);
-      if (!hasOverlap) {
-        await db.query(`UPDATE assertions SET suppressed = true WHERE id = $1`, [row.id]);
-        suppressed++;
-        process.stderr.write(`[handoff] pointer-gate: suppressed legacy stale-pointer assertion id=${row.id} pointer=${ptr.pointer} — prose-vs-content mismatch\n`);
-      } else {
-        // Overlap passes — derive and persist an anchor.
-        const resolvedRelPath = path.relative(projectRoot, absPath).replace(/\\/g, '/');
-        const piResolved = resolvedRelPath !== ptr.path
-          ? Object.assign({}, ptr, { path: resolvedRelPath })
-          : ptr;
-        const anchor = _deriveAnchor(projectRoot, piResolved);
-        if (anchor) {
-          await db.query(`UPDATE assertions SET anchor = $1 WHERE id = $2`, [JSON.stringify(Object.assign({}, anchor, { pointer: ptr.pointer })), row.id]);
-          anchored++;
+
+      // Not all-stale and nothing out-of-scope: at least one IN_REPO_RESOLVABLE
+      // token (mixed with IN_REPO_STALE and/or NOT_A_POINTER tokens is fine —
+      // the row is never suppressed unless EVERY token is stale). Derive/persist
+      // an anchor from the first resolvable token, mirroring pre-cm#297 behavior.
+      if (!dryRun) {
+        const resolvable = classified.find((c) => c.scope === 'IN_REPO_RESOLVABLE');
+        if (resolvable) {
+          const anchor = _deriveAnchor(projectRoot, {
+            pointer: resolvable.pointer, path: resolvable.path, ext: resolvable.ext,
+            startLine: resolvable.startLine, endLine: resolvable.endLine,
+          });
+          if (anchor) {
+            await db.query(`UPDATE assertions SET anchor = $1 WHERE id = $2`,
+              [JSON.stringify(Object.assign({}, anchor, { pointer: resolvable.pointer })), row.id]);
+            anchoredCount++;
+          }
         }
       }
     }
-    if (suppressed > 0) process.stderr.write(`[handoff] pointer-gate: bulk-suppressed ${suppressed} stale legacy assertion(s)\n`);
-    if (anchored   > 0) process.stderr.write(`[handoff] pointer-gate: derived anchors for ${anchored} passing legacy assertion(s)\n`);
+
+    if (suppressedCount > 0) process.stderr.write(`[handoff] pointer-gate: ${tag}bulk-suppressed ${suppressedCount} stale legacy assertion(s)\n`);
+    if (notedCount      > 0) process.stderr.write(`[handoff] pointer-gate: ${tag}annotated ${notedCount} legacy assertion(s) (intent-exempt or out-of-scope pointer)\n`);
+    if (anchoredCount   > 0) process.stderr.write(`[handoff] pointer-gate: derived anchors for ${anchoredCount} passing legacy assertion(s)\n`);
   } catch (err) {
     process.stderr.write(`[handoff] pointer-gate: bulk supersession failed (non-fatal): ${err.message}\n`);
   }
+  return { findings };
 }
 
 /**
@@ -7895,6 +8230,15 @@ function formatIntentDivergenceLines(divergences) {
     if (d.kind === 'embed_degraded') {
       return `DIVERGENCE: ${d.predicate} EMBEDDING DEGRADED (row persisted, embedding=NULL) — ${firstLine}`;
     }
+    // cm#297: bulk legacy stale-pointer classification findings — routed
+    // through this SAME channel so a suppression/annotation is never
+    // silently invisible (the cm#297 root bug).
+    if (d.kind === 'stale_pointer_suppressed') {
+      return `DIVERGENCE: ${d.predicate} SUPPRESSED (stale pointer) — ${firstLine}`;
+    }
+    if (d.kind === 'stale_pointer_note') {
+      return `DIVERGENCE: ${d.predicate} POINTER OUT-OF-SCOPE — ${firstLine}`;
+    }
     return `DIVERGENCE: ${d.predicate} NOT PERSISTED — ${firstLine}`;
   });
 }
@@ -9169,6 +9513,18 @@ async function cmdClose(args) {
           console.log(`    [${f.rule}] ${f.message}`);
         }
       }
+
+      // cm#297 spec item 5 — dry-run parity: run the SAME TOTAL scope
+      // classification bulk pass in read-only mode (opts.dryRun=true —
+      // zero DB writes) and print the SAME DIVERGENCE/notes lines the real
+      // close would emit, each prefixed "(dry-run)".
+      const dryLegacyResult = await _suppressStaleLegacyPointers(db, projectId, root, { dryRun: true });
+      if (dryLegacyResult.findings.length > 0) {
+        console.log(`\n  legacy stale-pointer classification (informational — not written):`);
+        for (const line of formatIntentDivergenceLines(dryLegacyResult.findings)) {
+          console.log(`    (dry-run) ${line}`);
+        }
+      }
     } catch (_) {}
 
     // Skipped subsystems.
@@ -9770,19 +10126,6 @@ async function cmdClose(args) {
   // When no contradictions are detected, RECONCILIATION_SECTION is '' and the
   // rendered output is byte-identical to what it would be without the gate.
   {
-    // cm#227: intentDivergenceLines are appended to the SAME rendered ## Degraded
-    // section text but are deliberately NOT added to _degradedSubsystems itself —
-    // _degradedSubsystems drives the close_degraded_exit_mode='strict' exit-code
-    // gate below, and a session-intent persistence failure must remain non-fatal
-    // (visibility only, exit code unchanged) regardless of exit mode.
-    const degradedLines = [
-      ..._degradedSubsystems.map((d) => `- ${d.subsystem} ${d.reason}`),
-      ...intentDivergenceLines.map((l) => `- ${l}`),
-    ];
-    const degradedSection = degradedLines.length > 0
-      ? '\n\n## Degraded\n' + degradedLines.join('\n')
-      : '';
-
     // Contradiction gate — soft-inject only; never blocks close.
     let contradictions = [];
     try {
@@ -9796,6 +10139,16 @@ async function cmdClose(args) {
     // Rewrites stale line numbers in TL;DR/open_threads/quick_references, persists
     // anchor corrections back to assertion rows, and returns findings that feed into
     // the same ## Reconciliation notice section as the contradiction gate.
+    //
+    // cm#297: this now runs BEFORE degradedLines/degradedSection (below) is
+    // computed, so that any legacy-suppression/annotation findings from
+    // _suppressStaleLegacyPointers are pushed onto intentDivergenceLines
+    // FIRST — through the SAME "existing intent-divergence channel"
+    // (formatIntentDivergenceLines) cm#227 already wires into both the
+    // ## Degraded section below AND the session_in_progress marker-retention
+    // gate later in this function. Previously the bulk pass only wrote to
+    // stderr, so a suppression of a session_tldr/open_thread/quick_reference
+    // row reached neither channel — the cm#297 root bug.
     let pointerFindings = [];
     let rewrittenTldr         = payload.tldr || '(closed)';
     let rewrittenOpenThreads  = (payload.open_threads || []).map((t) => `- ${t}`).join('\n') || '- (none)';
@@ -9803,9 +10156,12 @@ async function cmdClose(args) {
     try {
       // Run anchor backfill for any legacy assertion rows before validating.
       await _backfillMissingAnchors(db, projectId, root);
-      // Sub-deliverable #2: suppress legacy stale-pointer rows via prose-vs-content check.
-      // Runs only at close time (never at resume — §7 no-backfill invariant).
-      await _suppressStaleLegacyPointers(db, projectId, root);
+      // cm#297: TOTAL scope classification bulk-suppression pass. Returns
+      // findings (never just logs to stderr); intent rows are never
+      // suppressed — only annotated. Runs only at close time (never at
+      // resume — §7 no-backfill invariant).
+      const legacyResult = await _suppressStaleLegacyPointers(db, projectId, root, { dryRun: false });
+      intentDivergenceLines.push(...formatIntentDivergenceLines(legacyResult.findings));
 
       const gateResult = await runPointerGate(
         {
@@ -9826,6 +10182,19 @@ async function cmdClose(args) {
       // Fully non-fatal: any error here must not break cmdClose.
       process.stderr.write(`[handoff] pointer-gate failed (non-fatal): ${ptrErr.message}\n`);
     }
+
+    // cm#227: intentDivergenceLines are appended to the SAME rendered ## Degraded
+    // section text but are deliberately NOT added to _degradedSubsystems itself —
+    // _degradedSubsystems drives the close_degraded_exit_mode='strict' exit-code
+    // gate below, and a session-intent persistence failure must remain non-fatal
+    // (visibility only, exit code unchanged) regardless of exit mode.
+    const degradedLines = [
+      ..._degradedSubsystems.map((d) => `- ${d.subsystem} ${d.reason}`),
+      ...intentDivergenceLines.map((l) => `- ${l}`),
+    ];
+    const degradedSection = degradedLines.length > 0
+      ? '\n\n## Degraded\n' + degradedLines.join('\n')
+      : '';
 
     // Combine contradiction and pointer-staleness findings into a single Reconciliation section.
     const allReconciliationFindings = [
@@ -11102,10 +11471,12 @@ async function cmdPrune(args) {
   const skIdx = args.indexOf('--suppression-kind');
   const suppressionKind = skIdx !== -1 ? args[skIdx + 1] : undefined;
   if (skIdx !== -1 && !suppressionKind) {
-    console.error('prune: --suppression-kind requires a value (superseded | downvoted_terminal | downvoted_probation | retired | reality_reconciled)');
+    console.error('prune: --suppression-kind requires a value (superseded | downvoted_terminal | downvoted_probation | retired | reality_reconciled | stale_pointer)');
     process.exit(2);
   }
-  const validKinds = ['superseded', 'downvoted_terminal', 'downvoted_probation', 'retired', 'reality_reconciled'];
+  // cm#297: 'stale_pointer' added — keep in sync with the canonical value set
+  // in scripts/sql/handoff-core-schema.sql's suppression_kind CHECK comment.
+  const validKinds = ['superseded', 'downvoted_terminal', 'downvoted_probation', 'retired', 'reality_reconciled', 'stale_pointer'];
   if (suppressionKind && !validKinds.includes(suppressionKind)) {
     console.error(`prune: invalid --suppression-kind "${suppressionKind}". Valid: ${validKinds.join(', ')}`);
     process.exit(2);
@@ -11702,6 +12073,12 @@ if (require.main === module) {
     _suppressStaleLegacyPointers,
     validatePointers,
     runPointerGate,
+    // cm#297 TOTAL pointer-scope classification internals (bulk-suppression
+    // pass only — exposed for test-pointer-gate.js).
+    INTENT_PREDICATES,
+    _isExternalPointerToken,
+    _extractRawPointerCandidates,
+    _classifyPointerScope,
     // cm#185 schema bring-forward exports — the real engine functions, no
     // test-side reimplementation (S-18: the former test-both-backends.js
     // mirrors are deleted; those tests now require() these).
