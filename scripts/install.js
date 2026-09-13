@@ -75,6 +75,9 @@ Flags:
                       Claude Code slash-command/settings.json path.
   --force-skills     (codex host only) overwrite a user-authored skill file
                       that lacks the managed-by marker, after backing it up.
+  --check-only       Run the §3 prerequisite checker (docs/specs/package-and-
+                      installer.md) and exit; writes nothing. Exit 0 only if
+                      every required row is PRESENT_OK (gh is optional).
   --help, -h         Print this message and exit.
 `.trim();
 
@@ -113,6 +116,15 @@ function resolveConfig() {
   const hostResult = resolveHost(args, process.env);
   if (!hostResult.ok) refuse(hostResult.reason);
   const host = hostResult.host;
+
+  // ── --check-only (package-and-installer.md §3): runs the prerequisite
+  // checker and exits -- never reaches the worktree guard or any write
+  // path below. Read-only by construction (probeAll never writes), so it
+  // is deliberately allowed to run from a worktree checkout, unlike every
+  // other flag in this file.
+  if (args.includes('--check-only')) {
+    return { checkOnly: true, host };
+  }
 
   const scopeFlagIdx = args.indexOf('--hooks-scope');
   let hooksScopeArg = 'auto';
@@ -208,6 +220,40 @@ function resolveConfig() {
     enginePathFile, enginePathContent,
     userSettingsPath, projectSettingsPath,
   };
+}
+
+// ─── --check-only: prerequisite table (package-and-installer.md §3) ─────────
+
+/**
+ * Print the §3 prerequisite table and a final single-line JSON summary,
+ * then exit 0 only when every REQUIRED row is PRESENT_OK (gh is the only
+ * optional row; AMBIGUOUS_PG and UNKNOWN both count as failing). Never
+ * writes anything — probeAll() is read-only I/O (spawns --version/probe
+ * commands, no installs, no file writes).
+ */
+async function runCheckOnly(host) {
+  const { probeAll, assistFor } = require('./lib/prereqs');
+  const result = await probeAll({ host });
+
+  console.log(`Prerequisite check (--host ${host}):`);
+  for (const row of result.rows) {
+    const label = row.required ? row.prereq : `${row.prereq} (optional)`;
+    const versionNote = row.version ? ` [${row.version}]` : '';
+    console.log(`  ${row.outcome.padEnd(14)} ${label}${versionNote}`);
+    if (row.outcome !== 'PRESENT_OK') {
+      const assist = assistFor(row.prereq, row, result.platform);
+      if (assist.text) console.log(`    -> ${assist.text}`);
+    }
+  }
+
+  const summary = {
+    ok: result.ok,
+    host: result.host,
+    platform: result.platform,
+    rows: result.rows.map((r) => ({ prereq: r.prereq, outcome: r.outcome, required: r.required, reason: r.reason || null })),
+  };
+  console.log(JSON.stringify(summary));
+  process.exit(result.ok ? 0 : 1);
 }
 
 // ─── HELPERS: SOURCE FILE LISTING ────────────────────────────────────────────
@@ -1257,8 +1303,15 @@ module.exports = {
 
 if (require.main === module) {
   const cfg = resolveConfig();
-  main(cfg).catch((err) => {
-    console.error('Error:', err.message);
-    process.exit(1);
-  });
+  if (cfg && cfg.checkOnly) {
+    runCheckOnly(cfg.host).catch((err) => {
+      console.error('Error:', err.message);
+      process.exit(1);
+    });
+  } else {
+    main(cfg).catch((err) => {
+      console.error('Error:', err.message);
+      process.exit(1);
+    });
+  }
 }
