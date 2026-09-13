@@ -854,6 +854,20 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run MCP process-lifecycle tests
+        # test/test-mcp-process-lifecycle.js — regression coverage for the
+        # fix/mcp-process-lifecycle PR: (T1) scripts/handoff-mcp.mjs exits
+        # within 3s of a clean stdin 'end' (a host closing its write end
+        # cleanly used to leave this process running forever -- the SDK's
+        # StdioServerTransport only ever closed itself on a stdin read
+        # ERROR, never on a clean end); (T2) exits within 3s of SIGTERM;
+        # (T3) scripts/handoff-mcp-selftest.mjs's runWithClient() helper
+        # still calls client.close() when the wrapped selftest body throws,
+        # so a failing selftest run never orphans its spawned server child.
+        # No live Postgres needed -- buildServer() registers tools
+        # synchronously and never connects to a DB until a tool is actually
+        # called.
+        run: node test/test-mcp-process-lifecycle.js
       - name: Run memory-search per-table availability gate tests (2026-09-09)
         # scripts/test-memory-search-gate.js — regression coverage for the
         # memory_search per-table gate rewrite: (A) a static drift test
