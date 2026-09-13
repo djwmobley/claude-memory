@@ -11426,13 +11426,13 @@ async function main() {
   // host process — only main()'s own CLI dispatch (require.main === module)
   // reaches this.
   //
-  // Two exemptions, both no-op/non-write shapes, mirroring the SAME
+  // One exemption plus one downgrade, both mirroring the SAME
   // read-only-vs-write split scripts/lib/cli-args.js's own WRITE_SUBCOMMANDS
   // already draws (that module's header: "Read-only subcommands (status,
   // resume, loader-load, loader-hook, loader-stop, resurrect) ... --help/-h
   // consistency for those is a non-mandatory nice-to-have"):
   //   - a bare --help/-h invocation: a diagnostic no-op with no side effect
-  //     should still work against a broken checkout.
+  //     should still work against a broken checkout. Fully exempt.
   //   - loader-hook/loader-stop: the SessionStart/SessionEnd hook entry
   //     points install.js wires into EVERY Claude Code / Codex session
   //     automatically (hooks/hooks.json, install.js's EVENT_FOR_VERB) —
@@ -11441,26 +11441,34 @@ async function main() {
   //     session's start/end over an engine-checkout problem a human hasn't
   //     even asked this process to look at (Codex's own loader-stop
   //     TIMEOUT_OVERRIDE is 3 SECONDS — there is no budget here to surface
-  //     anything beyond the inert/no-marker fast path). A genuinely broken
-  //     checkout still fails loud on every OTHER subcommand (status,
-  //     resume, and every write command) — this exemption narrows WHERE the
-  //     check fires, never whether a broken checkout eventually surfaces.
+  //     anything beyond the inert/no-marker fast path). Still WARN (single
+  //     stderr line, never stdout — loader-hook's stdout is injected into
+  //     the session context by the host and must stay clean) so a broken
+  //     checkout is visible without hard-failing the hook. A genuinely
+  //     broken checkout still fails loud on every OTHER subcommand (status,
+  //     resume, and every write command) — this downgrade narrows WHERE the
+  //     check hard-fails, never whether a broken checkout eventually
+  //     surfaces.
   //     Regression proof: scripts/test-plugin-packaging.js's P2 spawns
   //     `loader-hook` against a synthetic CLAUDE_PLUGIN_ROOT fixture that
   //     intentionally has no scripts/sql/schema-manifest.json at all (it
-  //     tests asset-path resolution, not schema state) — this exemption is
-  //     what keeps that established, in-scope test passing.
-  const CLI_SELF_CONSISTENCY_EXEMPT_SUBCOMMANDS = new Set(['loader-hook', 'loader-stop']);
-  if (!rest.includes('--help') && !rest.includes('-h') && !CLI_SELF_CONSISTENCY_EXEMPT_SUBCOMMANDS.has(sub)) {
+  //     tests asset-path resolution, not schema state) — that fixture now
+  //     warns on stderr instead of being skipped, and must still pass.
+  const CLI_SELF_CONSISTENCY_WARN_ONLY_SUBCOMMANDS = new Set(['loader-hook', 'loader-stop']);
+  if (!rest.includes('--help') && !rest.includes('-h')) {
     const { readDiskSchemaEpoch } = require('./lib/schema-epoch-guard.js');
     const diskResult = readDiskSchemaEpoch(_ENGINE_ROOT);
     if (!diskResult.ok || diskResult.epoch !== SCHEMA_EPOCH) {
       const disk = diskResult.ok ? diskResult.epoch : `unreadable (${diskResult.error})`;
-      console.error(
-        `handoff: engine checkout is internally inconsistent (scripts/handoff.js declares schema epoch ` +
-        `${SCHEMA_EPOCH}, scripts/sql/schema-manifest.json declares ${disk}); restore a clean engine checkout.`
-      );
-      process.exit(1);
+      const message =
+        `engine checkout is internally inconsistent (scripts/handoff.js declares schema epoch ` +
+        `${SCHEMA_EPOCH}, scripts/sql/schema-manifest.json declares ${disk}); restore a clean engine checkout.`;
+      if (CLI_SELF_CONSISTENCY_WARN_ONLY_SUBCOMMANDS.has(sub)) {
+        process.stderr.write(`handoff: WARNING ${message}\n`);
+      } else {
+        console.error(`handoff: ${message}`);
+        process.exit(1);
+      }
     }
   }
 

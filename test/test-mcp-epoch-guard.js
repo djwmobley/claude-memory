@@ -55,6 +55,19 @@
  *       scripts/node_modules to exist (see "Install dependencies" in
  *       .github/workflows/test.yml, working-directory: scripts); SKIPs with
  *       a clear reason if that directory is absent.
+ *   T14 main() CLI dispatch, loader-hook: an inconsistent scratch engine now
+ *       WARNS on stderr ("handoff: WARNING engine checkout is internally
+ *       inconsistent ...") and still exits 0, with stdout byte-identical to
+ *       a consistent scratch engine's run (loader-hook's stdout is injected
+ *       into session context by the host and must stay clean).
+ *   T15 main() CLI dispatch, loader-stop: same warn-not-fail shape as T14,
+ *       distinct subcommand.
+ *   T16 main() CLI dispatch, status (a non-exempt subcommand): the SAME
+ *       inconsistent scratch engine still hard-fails (non-zero exit, the
+ *       existing "handoff: engine checkout is internally inconsistent"
+ *       text, no "WARNING") — proves the downgrade is scoped to
+ *       loader-hook/loader-stop only. T14-T16 share T13's SKIP-if-absent
+ *       scripts/node_modules gate.
  *
  * No live Postgres required — every test here is pure or filesystem-only
  * (T13 spawns a real process but never opens a database connection, since
@@ -65,6 +78,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { spawnSync } = require('child_process');
 
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 const { readDiskSchemaEpoch, classifyEpochDrift, healFailedMessage } = require(
@@ -596,6 +610,148 @@ async function testT13_LiveStdioStaleEngine() {
   }
 }
 
+// ── T14-T16: main() CLI dispatch — warn-vs-fail split ─────────────────────
+//
+// fix/mcp-stale-engine-gate follow-up: loader-hook/loader-stop no longer
+// SKIP the self-consistency check entirely — they still run it, but an
+// inconsistent checkout is downgraded to a single stderr WARNING line
+// (never stdout — loader-hook's stdout is injected into session context by
+// the host) instead of process.exit(1). Every other subcommand keeps the
+// existing hard-fail. These three tests share buildScratchEngineCopy() /
+// the manifest-bump trick from T13, applied to the CLI (handoff.js) rather
+// than the MCP server (handoff-mcp.mjs).
+
+function runScratchCli(scratchScripts, args, projectDir) {
+  const childEnv = { ...process.env };
+  // Same rationale as T13: never let this test process's own ambient
+  // CLAUDE_PLUGIN_ROOT/HANDOFF_MCP_ENGINE_PATH point the child at a
+  // checkout other than the scratch copy this test just built and bumped.
+  delete childEnv.CLAUDE_PLUGIN_ROOT;
+  delete childEnv.HANDOFF_MCP_ENGINE_PATH;
+  childEnv.PROJECT_ROOT = projectDir;
+  return spawnSync(
+    process.execPath,
+    [path.join(scratchScripts, 'handoff.js'), ...args],
+    { env: childEnv, cwd: projectDir, timeout: 10000 }
+  );
+}
+
+function testT14_LoaderHookWarnsNotFails() {
+  const label = 'T14: loader-hook — inconsistent engine warns on stderr, exits 0, stdout unchanged';
+  const nodeModulesDir = path.join(PROJECT_ROOT, 'scripts', 'node_modules');
+  if (!fs.existsSync(nodeModulesDir)) {
+    skip(label, 'scripts/node_modules absent — run `pnpm install --frozen-lockfile` in scripts/ first (see .github/workflows/test.yml\'s "Install dependencies" step)');
+    return;
+  }
+  let scratch = null;
+  let emptyProjectDir = null;
+  try {
+    scratch = buildScratchEngineCopy();
+    emptyProjectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'epoch-guard-t14-project-'));
+
+    // Baseline: consistent engine (manifest epoch untouched) — no warning.
+    const consistentResult = runScratchCli(scratch.scratchScripts, ['loader-hook'], emptyProjectDir);
+    assertEqual(consistentResult.status, 0, `consistent loader-hook should exit 0; stderr: ${consistentResult.stderr?.toString()}`);
+    assertNoMatch(consistentResult.stderr?.toString() ?? '', /WARNING engine checkout is internally inconsistent/);
+
+    // Bump the on-disk manifest epoch so the copied handoff.js (its
+    // SCHEMA_EPOCH constant frozen at whatever the real repo declares)
+    // disagrees with its own checkout's schema-manifest.json.
+    const manifest = JSON.parse(fs.readFileSync(scratch.manifestPath, 'utf8'));
+    const loadedEpoch = manifest.schema_epoch;
+    manifest.schema_epoch = loadedEpoch + 1;
+    fs.writeFileSync(scratch.manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
+
+    const mismatchResult = runScratchCli(scratch.scratchScripts, ['loader-hook'], emptyProjectDir);
+    assertEqual(mismatchResult.status, 0, `mismatched loader-hook must still exit 0 (warn, not fail); stderr: ${mismatchResult.stderr?.toString()}`);
+    const mismatchStderr = mismatchResult.stderr?.toString() ?? '';
+    assertMatch(mismatchStderr, /handoff: WARNING engine checkout is internally inconsistent/);
+    assertMatch(mismatchStderr, new RegExp(`declares schema epoch ${loadedEpoch}`));
+    assertMatch(mismatchStderr, new RegExp(`declares ${loadedEpoch + 1}`));
+
+    // stdout is byte-identical to the consistent run — both are the inert
+    // no-marker fast path; the warning must never leak onto stdout.
+    const mismatchStdout = mismatchResult.stdout?.toString() ?? '';
+    const consistentStdout = consistentResult.stdout?.toString() ?? '';
+    assertEqual(mismatchStdout, consistentStdout, 'loader-hook stdout must be unchanged by the warning path');
+    assertEqual(mismatchStdout, '', 'loader-hook stdout must stay empty (no marker)');
+
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    if (scratch) { try { fs.rmSync(scratch.scratchRoot, { recursive: true, force: true }); } catch (_err) { /* best-effort */ } }
+    if (emptyProjectDir) { try { fs.rmSync(emptyProjectDir, { recursive: true, force: true }); } catch (_err) { /* best-effort */ } }
+  }
+}
+
+function testT15_LoaderStopWarnsNotFails() {
+  const label = 'T15: loader-stop — inconsistent engine warns on stderr, exits 0';
+  const nodeModulesDir = path.join(PROJECT_ROOT, 'scripts', 'node_modules');
+  if (!fs.existsSync(nodeModulesDir)) {
+    skip(label, 'scripts/node_modules absent — run `pnpm install --frozen-lockfile` in scripts/ first (see .github/workflows/test.yml\'s "Install dependencies" step)');
+    return;
+  }
+  let scratch = null;
+  let emptyProjectDir = null;
+  try {
+    scratch = buildScratchEngineCopy();
+    emptyProjectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'epoch-guard-t15-project-'));
+
+    const manifest = JSON.parse(fs.readFileSync(scratch.manifestPath, 'utf8'));
+    const loadedEpoch = manifest.schema_epoch;
+    manifest.schema_epoch = loadedEpoch + 1;
+    fs.writeFileSync(scratch.manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
+
+    const result = runScratchCli(scratch.scratchScripts, ['loader-stop'], emptyProjectDir);
+    assertEqual(result.status, 0, `mismatched loader-stop must exit 0 (warn, not fail); stderr: ${result.stderr?.toString()}`);
+    const stderr = result.stderr?.toString() ?? '';
+    assertMatch(stderr, /handoff: WARNING engine checkout is internally inconsistent/);
+    assertMatch(stderr, new RegExp(`declares schema epoch ${loadedEpoch}`));
+    assertMatch(stderr, new RegExp(`declares ${loadedEpoch + 1}`));
+
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    if (scratch) { try { fs.rmSync(scratch.scratchRoot, { recursive: true, force: true }); } catch (_err) { /* best-effort */ } }
+    if (emptyProjectDir) { try { fs.rmSync(emptyProjectDir, { recursive: true, force: true }); } catch (_err) { /* best-effort */ } }
+  }
+}
+
+function testT16_StatusStillHardFails() {
+  const label = 'T16: status (non-exempt) — same inconsistent engine still hard-fails';
+  const nodeModulesDir = path.join(PROJECT_ROOT, 'scripts', 'node_modules');
+  if (!fs.existsSync(nodeModulesDir)) {
+    skip(label, 'scripts/node_modules absent — run `pnpm install --frozen-lockfile` in scripts/ first (see .github/workflows/test.yml\'s "Install dependencies" step)');
+    return;
+  }
+  let scratch = null;
+  let emptyProjectDir = null;
+  try {
+    scratch = buildScratchEngineCopy();
+    emptyProjectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'epoch-guard-t16-project-'));
+
+    const manifest = JSON.parse(fs.readFileSync(scratch.manifestPath, 'utf8'));
+    const loadedEpoch = manifest.schema_epoch;
+    manifest.schema_epoch = loadedEpoch + 1;
+    fs.writeFileSync(scratch.manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
+
+    const result = runScratchCli(scratch.scratchScripts, ['status'], emptyProjectDir);
+    assertTrue(result.status !== 0, `status must hard-fail on an inconsistent engine; got exit ${result.status}`);
+    const stderr = result.stderr?.toString() ?? '';
+    assertMatch(stderr, /handoff: engine checkout is internally inconsistent/);
+    assertNoMatch(stderr, /WARNING/);
+
+    pass(label);
+  } catch (err) {
+    fail(label, err.message);
+  } finally {
+    if (scratch) { try { fs.rmSync(scratch.scratchRoot, { recursive: true, force: true }); } catch (_err) { /* best-effort */ } }
+    if (emptyProjectDir) { try { fs.rmSync(emptyProjectDir, { recursive: true, force: true }); } catch (_err) { /* best-effort */ } }
+  }
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -614,6 +770,9 @@ async function main() {
   testT11_EngineCheckoutInconsistent();
   testT12_DetailRedaction();
   await testT13_LiveStdioStaleEngine();
+  testT14_LoaderHookWarnsNotFails();
+  testT15_LoaderStopWarnsNotFails();
+  testT16_StatusStillHardFails();
 
   console.log('');
   console.log(`Results: ${passed} passed, ${failed} failed, ${skipped} skipped`);

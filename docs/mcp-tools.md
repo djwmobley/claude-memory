@@ -116,6 +116,18 @@ header comment for the full incident writeup and `test/test-mcp-epoch-guard.js`
 for the totality-matrix proof that every `(loadedEpoch, diskEpoch,
 healReason, dbEpoch)` combination maps to exactly one of these branches.
 
+**CLI-level self-consistency check.** `scripts/handoff.js`'s own `main()`
+dispatch runs the same "does this checkout agree with itself" check
+(`readDiskSchemaEpoch` vs. the loaded `SCHEMA_EPOCH`, the same question the
+`engine_checkout_inconsistent` branch above answers for the MCP server) for
+every one-shot CLI invocation. Every subcommand hard-fails (exit 1) on a
+mismatch except the SessionStart/SessionEnd hook entry points,
+`loader-hook`/`loader-stop`, and a bare `--help`/`-h`: those two hooks still
+run the check but only WARN on stderr (never stdout — the host injects
+`loader-hook`'s stdout into session context) and continue, since an
+automatic hook must never hard-fail a session's start or end over an
+engine-checkout problem nobody has explicitly asked it to look at.
+
 **`HANDOFF_MCP_ENGINE_PATH` divergence rule (Codex review P1a,
 2026-09-13).** The table above and `checkEngineEpochOrThrow` both validate
 only the checkout THIS server process required at startup (`_ENGINE_ROOT`).
