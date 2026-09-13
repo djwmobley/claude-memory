@@ -317,6 +317,14 @@ function testP3() {
   //   - test-pointer-gate.js (cm#297): T27 asserts the win32-only branch above;
   //     it is itself gated by `process.platform !== 'win32'` to log a skip
   //     (still a pass) rather than assert a win32-specific outcome elsewhere.
+  //   - build-zip.js (feat/package-compose-zip, docs/specs/package-and-installer.md
+  //     section 1): findArchiver() selects the platform archiver used to build
+  //     the distributable zip — `tar -a -c -f` (bsdtar, ships with Windows 10+)
+  //     on win32 vs. `zip -r` elsewhere. Genuinely different CLI tools with
+  //     different flag grammars, not just an alternate binary name for the same
+  //     invocation shape, so it cannot be folded into runWinBin's
+  //     same-args/multiple-candidate-name retry loop — same justification as
+  //     codex-install.js's discoverCodex() above.
   //
   // We allowlist by file + approximate pattern.
   const ALLOWED = [
@@ -367,6 +375,11 @@ function testP3() {
       file: path.join(TEST_DIR, 'handoff', 'test-pointer-gate.js'),
       // T27 (cm#297): win32-only assertion, no-op skip elsewhere.
       textRe: /process\.platform\s*!==?\s*['"]win32['"]/,
+    },
+    {
+      file: path.join(SCRIPTS_DIR, 'build-zip.js'),
+      // findArchiver() — see justification above.
+      textRe: /process\.platform\s*===\s*['"]win32['"]/,
     },
   ];
 

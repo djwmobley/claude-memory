@@ -8636,7 +8636,13 @@ async function resolveSessionId(db, projectId, payload) {
  * close already ran this session" (outcome explicit_close_present) from "no
  * marker because none was ever set" (outcome no_marker). One overwritten row,
  * not one row per session — no unbounded growth. Fail-soft: a failure to
- * stamp the breadcrumb never blocks or fails the close itself.
+ * stamp the breadcrumb never blocks or fails the close itself — cm#295
+ * round 2: enforced via db.querySafe's SAVEPOINT wrapping (see the inline
+ * comment at the write site), not a bare try/catch, so a breadcrumb failure
+ * can no longer discard the marker delete it was supposed to be reporting
+ * on. The result's `breadcrumb_written` field is true only when the stamp
+ * itself is confirmed written; a caller that needs the loader-stop signal
+ * to be present should check it rather than assume deleted>0 implies it.
  */
 /**
  * fix(close): dedupe (exact string equality) + cap a list of session ids for
@@ -8670,37 +8676,59 @@ function formatOwnerIds(ids) {
  * own the live marker can never claim it cleared one.
  *
  *   A. S non-null, >=1 exact session_id match       -> delete ALL exact matches.
+ *      outcome='cleared'.
  *   B. S non-null, no exact, list is the legacy
  *      single-entry null-id shape (length===1)      -> delete that one entry
  *      (the pre-S3 single-session format carries no identity at all — "any
  *      session closing" is provably correct here, since there is no sibling
  *      to misattribute against; a coerced-to-null entry is indistinguishable
- *      from a true legacy marker here, matching main).
+ *      from a true legacy marker here, matching main). outcome='cleared_legacy'.
  *   C. S non-null, no exact, list not the legacy
  *      single-entry shape, non-empty                -> delete nothing;
- *      report owners. PR4 §3: when a null-session_id entry is ALSO present
+ *      report owners AND the surviving marker count. cm#295 FIX B3:
+ *      outcome='no_matching_marker' — distinct from every other deleted:0
+ *      outcome, so a caller can tell "an explicit/resolved session id
+ *      matched nothing" apart from "nothing was ever there" (F) without
+ *      parsing prose. PR4 §3: when a null-session_id entry is ALSO present
  *      among >=2 total entries, this is real multi-session concurrency
  *      colliding with a legacy marker — the null entry is NEVER
  *      auto-claimed here (no wildcard); text additionally reports
  *      "unresolved legacy marker present".
  *   D. S null, list is the legacy single-entry
  *      null-id shape (length===1)                   -> delete that one entry.
+ *      outcome='cleared_legacy'.
  *   E. S null, list not the legacy single-entry
  *      shape, non-empty                              -> delete nothing;
- *      report owners (same "unresolved legacy marker present" addendum as C
- *      when a null entry is present among >=2 total entries).
+ *      report owners and the surviving marker count (same
+ *      "unresolved legacy marker present" addendum as C when a null entry
+ *      is present among >=2 total entries). outcome='no_matching_marker'
+ *      (session identity itself was unresolved, but the shape — real
+ *      session id vs none — is deliberately NOT split further here; a
+ *      caller distinguishing "unresolved identity" from "resolved but no
+ *      match" should inspect whether S was non-null, not `outcome` alone).
  *   F. list empty (after excluding dropped entries)  -> nothing to clear.
+ *      outcome='no_marker'.
  *   G. the marker store itself is unreadable (a real DB/read error, not a
  *      value-level parse outcome — those are all handled inside
  *      parseSessionMarkersDetailed's own fail-open total classification)
  *      -> delete nothing, report the error, never throw out of close.
+ *      outcome='unreadable'.
  *
  * Read-modify-write happens ENTIRELY inside withSessionMarkerLock (branch
- * decision and delete share one lock acquisition) — deciding the branch
- * from a read taken outside the lock would reopen the exact TOCTOU race the
- * lock exists to close.
+ * decision, delete, AND the last_explicit_close breadcrumb write all share
+ * one lock acquisition/transaction — cm#295 FIX B1 moved the breadcrumb
+ * write from after the lock released to inside it, closing the window where
+ * a concurrent reader could observe the delete without the breadcrumb, or
+ * vice versa). Deciding the branch from a read taken outside the lock would
+ * reopen the exact TOCTOU race the lock exists to close.
  *
- * Returns { branch, deleted, ownedBy, dropped, coerced, text } — never throws.
+ * Returns { branch, outcome, deleted, ownedBy, dropped, coerced, text,
+ * breadcrumb_written } — never throws. breadcrumb_written is true only when
+ * the last_explicit_close stamp itself is confirmed written (cm#295 round
+ * 2); it is false on every branch that never attempted the write (deleted:0)
+ * AND on a branch that attempted it but the write failed under its
+ * SAVEPOINT (deleted can still be >0 in that case — the delete and the
+ * breadcrumb are no longer coupled by a shared fate).
  */
 async function clearSessionMarkerForClose(db, projectId, payload) {
   const currentSessionId = resolveClearSessionId(payload);
@@ -8715,7 +8743,7 @@ async function clearSessionMarkerForClose(db, projectId, payload) {
         (coerced > 0 ? `; ${coerced} marker entr${coerced === 1 ? 'y' : 'ies'} had a non-string session id (treated as no id)` : '');
 
       if (markers.length === 0) {
-        return { branch: 'F', deleted: 0, ownedBy: [], dropped, coerced, text: `no session marker present${suffix}` };
+        return { branch: 'F', outcome: 'no_marker', deleted: 0, ownedBy: [], dropped, coerced, text: `no session marker present${suffix}`, breadcrumb_written: false };
       }
 
       const exactMatches   = currentSessionId ? markers.filter((m) => m.session_id === currentSessionId) : [];
@@ -8727,56 +8755,110 @@ async function clearSessionMarkerForClose(db, projectId, payload) {
       const hasUnclaimedLegacyEntry = !isSingleLegacy && markers.some((m) => m.session_id === null);
       const legacyNote = hasUnclaimedLegacyEntry ? '; unresolved legacy marker present' : '';
 
-      let branch, toDelete, ownedBy = [], text;
+      // cm#295 FIX B3: branch C (an explicit/resolved session id present but
+      // matching NO marker) gets its own outcome distinct from every other
+      // deleted:0 branch, and names the surviving marker count — a caller
+      // must never read deleted:0 alone and be unable to tell "nothing
+      // matched" (a real, actionable identity-split symptom) apart from
+      // "nothing was ever there" (branch F) or "an unresolved legacy marker
+      // sits alongside real markers" (still branch C/E territory, disjoint
+      // from D's true single-legacy claim). `outcome` is a total
+      // classification over every branch below — never left implicit.
+      let branch, outcome, toDelete, ownedBy = [], text;
       if (currentSessionId && exactMatches.length > 0) {
         branch = 'A';
+        outcome = 'cleared';
         toDelete = exactMatches;
         text = `session marker cleared (session ${currentSessionId})${suffix}`;
       } else if (currentSessionId && isSingleLegacy) {
         branch = 'B';
+        outcome = 'cleared_legacy';
         toDelete = markers;
         text = `legacy session marker cleared (marker had no session id)${suffix}`;
       } else if (currentSessionId) {
         branch = 'C';
+        outcome = 'no_matching_marker';
         toDelete = [];
         ownedBy = formatOwnerIds(markers.map((m) => m.session_id));
-        text = `session marker left in place (owned by ${ownedBy}${legacyNote})${suffix}`;
+        text = `session marker left in place (${markers.length} marker${markers.length === 1 ? '' : 's'} present, ` +
+          `none matched session ${currentSessionId}; owned by ${ownedBy}${legacyNote})${suffix}`;
       } else if (isSingleLegacy) {
         branch = 'D';
+        outcome = 'cleared_legacy';
         toDelete = markers;
         text = `session marker cleared (session id unresolved; marker had no session id)${suffix}`;
       } else {
         branch = 'E';
+        outcome = 'no_matching_marker';
         toDelete = [];
         ownedBy = formatOwnerIds(markers.map((m) => m.session_id));
-        text = `session marker left in place (session id unresolved; owned by ${ownedBy}${legacyNote})${suffix}`;
+        text = `session marker left in place (${markers.length} marker${markers.length === 1 ? '' : 's'} present, ` +
+          `session id unresolved; owned by ${ownedBy}${legacyNote})${suffix}`;
       }
 
+      let breadcrumbWritten = false;
       if (toDelete.length > 0) {
         const remaining = markers.filter((m) => !toDelete.includes(m));
         await setSessionMarkers(db, projectId, remaining);
+        // cm#295 FIX B1: the 'last_explicit_close' breadcrumb write now
+        // shares the SAME critical section (and DB transaction —
+        // withSessionMarkerLock wraps BEGIN/acquireNamedXactLock/COMMIT) as
+        // the marker delete it records, instead of running after the lock
+        // released. Before this fix a concurrent reader (e.g. a racing
+        // SessionEnd on another connection) could observe the marker already
+        // deleted but the breadcrumb not yet written (or vice versa under
+        // ROLLBACK) — a narrow but real window given the delete and the
+        // breadcrumb are supposed to be one atomic "this session explicitly
+        // closed" fact. Fail-soft is preserved: a breadcrumb write failure
+        // must never block the close.
+        //
+        // cm#295 round 2 (review finding, serious): a bare try/catch around
+        // a plain db.query() does NOT achieve that fail-soft guarantee on
+        // Postgres. Catching the thrown JS error only stops it propagating
+        // out of THIS function — it does nothing to the connection's server-
+        // side transaction state, which Postgres has already flipped to
+        // "aborted" the moment the breadcrumb INSERT failed. Every statement
+        // sent afterwards on that connection (including the marker delete's
+        // own COMMIT, issued by withSessionMarkerLock right after this
+        // function returns) is then silently discarded by Postgres as an
+        // implicit ROLLBACK — so a failed breadcrumb used to throw away the
+        // marker delete too, while this function still reported
+        // outcome:'cleared'/deleted:1 as if nothing had gone wrong.
+        //
+        // Fix: db.querySafe (PostgresAdapter: SAVEPOINT before the write,
+        // RELEASE on success, ROLLBACK TO SAVEPOINT + swallow on error —
+        // exactly the same port method querySafe's own doc comment and
+        // every other in-transaction speculative-write call site in this
+        // codebase already rely on; SQLiteAdapter's querySafe is a plain
+        // try/catch, since SQLite does not abort the whole transaction on a
+        // single statement error) confines a breadcrumb failure to its own
+        // savepoint, leaving the outer transaction — and the delete above —
+        // untouched and still committable. Same two-adapter port method,
+        // same S8 abstraction invariant: no dialect branch here.
+        const bcResult = await db.querySafe(
+          `INSERT INTO project_settings (project_id, key, value) VALUES ($1, $2, $3)
+           ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
+          [projectId, 'last_explicit_close', JSON.stringify({
+            session_id: currentSessionId || null,
+            ts: new Date().toISOString(),
+          })]
+        );
+        breadcrumbWritten = (bcResult && bcResult.rowCount) > 0;
       }
 
-      return { branch, deleted: toDelete.length, ownedBy, dropped, coerced, text };
+      return { branch, outcome, deleted: toDelete.length, ownedBy, dropped, coerced, text, breadcrumb_written: breadcrumbWritten };
     });
   } catch (err) {
     result = {
       branch: 'G',
+      outcome: 'unreadable',
       deleted: 0,
       ownedBy: [],
       dropped: 0,
       coerced: 0,
       text: `session marker unreadable (${err && err.message ? err.message : 'read failed'}); left as-is`,
+      breadcrumb_written: false,
     };
-  }
-
-  if (result.deleted > 0) {
-    try {
-      await setSetting(db, projectId, 'last_explicit_close', JSON.stringify({
-        session_id: currentSessionId || null,
-        ts: new Date().toISOString(),
-      }));
-    } catch (_) { /* fail-soft: breadcrumb loss never blocks close */ }
   }
 
   return result;
@@ -10204,6 +10286,7 @@ async function cmdClose(args) {
     );
     markerOutcome = {
       branch: 'DIVERGENCE',
+      outcome: 'divergence_hold',
       deleted: 0,
       ownedBy: [],
       dropped: 0,

@@ -854,6 +854,20 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run MCP process-lifecycle tests
+        # test/test-mcp-process-lifecycle.js — regression coverage for the
+        # fix/mcp-process-lifecycle PR: (T1) scripts/handoff-mcp.mjs exits
+        # within 3s of a clean stdin 'end' (a host closing its write end
+        # cleanly used to leave this process running forever -- the SDK's
+        # StdioServerTransport only ever closed itself on a stdin read
+        # ERROR, never on a clean end); (T2) exits within 3s of SIGTERM;
+        # (T3) scripts/handoff-mcp-selftest.mjs's runWithClient() helper
+        # still calls client.close() when the wrapped selftest body throws,
+        # so a failing selftest run never orphans its spawned server child.
+        # No live Postgres needed -- buildServer() registers tools
+        # synchronously and never connects to a DB until a tool is actually
+        # called.
+        run: node test/test-mcp-process-lifecycle.js
       - name: Run memory-search per-table availability gate tests (2026-09-09)
         # scripts/test-memory-search-gate.js — regression coverage for the
         # memory_search per-table gate rewrite: (A) a static drift test
@@ -1352,6 +1366,21 @@ jobs:
         #       both equal the canonical set in the SQL schema CHECK constraint
         # Pure static analysis — no Postgres or Ollama required.
         run: node scripts/test-doc-lint.js
+      - name: Run build-zip packaging tests (feat/package-compose-zip)
+        # Tests scripts/build-zip.js, the public dist/memory-manager-<version>.zip
+        # packager: T1 include-list totality against this repo checkout (every
+        # base + --offline path actually exists on main); T2 exclusion assertions
+        # via a synthetic fixture tree (.git/.claude/node_modules/.env/*.local.*/
+        # *.bak-*/docs/notes/private-runbook-named files all proven excluded,
+        # ordinary sibling files proven included); T3 VERSION + SHA256SUMS content
+        # and per-file hash correctness; T4 --offline (refuses loud when
+        # scripts/node_modules is absent, stages it when present); T5 an
+        # end-to-end archive() build via the platform archiver detected at
+        # runtime (tar/bsdtar on win32, zip elsewhere) — reported SKIPPED, never
+        # silently passed, if this runner has neither. Pure filesystem test — no
+        # Postgres or Ollama required; only ever touches temp directories under
+        # os.tmpdir(), never this checkout's own dist/.
+        run: node test/test-build-zip.js
       - name: Run §8 CRUD vector-strip tests (embedding stripping + read-limit clamp)
         # cm MCP-payload fix (PR #271): scripts/lib/vector-strip.js strips
         # pgvector-typed columns (manifest-driven, schema-manifest.json's
@@ -1595,6 +1624,45 @@ jobs:
         # from CI; re-added after the marker-pre-mint fix to test setup that resolves
         # the 12-failure cascade caused by ensureProjectIdentity auto-minting UUIDs.
         run: node test/handoff/test-handoff.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: Run cm#295 close/checkpoint session-identity tests
+        # Regression guard for the split-identity bug (MCP server's own
+        # spawn-time CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID going stale across
+        # a `/clear`, leaving the marker in place and causing a spurious
+        # implicit_close_recorded): handoff_close/handoff_checkpoint's
+        # omitted-sessionId default now resolves from the project's live
+        # session_in_progress marker (host-filtered, exactly-one-candidate),
+        # never from this long-lived server's own env vars. Covers: sole
+        # marker resolved + cleared + breadcrumb stamped + no spurious
+        # implicit close afterward; 2/0 host-filtered markers refused naming
+        # the count; an explicit sessionId matching no marker returns
+        # outcome=no_matching_marker with the marker untouched and no
+        # breadcrumb; concurrent markers A/B stay isolated (closing A never
+        # touches B); a legacy marker with an unparseable ts is swept as
+        # stale, never treated as fresh; checkpoint's default agrees with
+        # close's. Reuses claude_memory_eval_test (created by Create handoff
+        # test database step above).
+        run: node test/handoff/test-close-session-identity.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: Run loader-stop SessionEnd tests
+        # DB-backed regression guard for the "implicit close fires at turn
+        # end, not session end" fix: loader-stop moved from Claude Code's
+        # Stop hook (fires every turn) to SessionEnd (fires once). Covers
+        # own-session close-and-clear, no-marker no-op, SessionStart's
+        # stale-foreign-marker late-close sweep + DIVERGENCE line,
+        # fresh-foreign-marker preservation, source=clear/compact skip,
+        # writeHandoffMd atomicity (no .tmp- residue), and
+        # implicit_close=disabled as a full no-op at both hooks. Run with
+        # CLAUDE_CODE_SESSION_ID unset so marker-based resolution isn't
+        # masked by the env fallback. Reuses claude_memory_eval_test
+        # (created by Create handoff test database step above).
+        run: node test/handoff/test-loader-stop-sessionend.js
         env:
           PGHOST: localhost
           PGUSER: postgres
