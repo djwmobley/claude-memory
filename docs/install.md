@@ -236,9 +236,16 @@ survives switching hosts or reinstalling. To remove it too:
 docker compose -f deploy/docker-compose.yml down -v   # drops the mm_pgdata volume
 ```
 
-Only do this if compose provisioned your Postgres (check `MM_PG_PROVISIONED`
-in `deploy/.env`) — never run this against an external Postgres instance
+Only do this if compose itself provisioned your Postgres — i.e. you ran
+`docker compose up -d postgres` from this project and did not point
+`MM_PG_HOST`/`MM_PG_PORT` in `deploy/.env` at a Postgres instance you
+already had running elsewhere. Never run this against an external Postgres
 you pointed the project at instead.
+
+`MM_PG_PROVISIONED` in `deploy/.env.example` documents a planned
+`compose`-vs-external marker for this same check (see the
+package-and-installer design's `--purge-data` section), but nothing sets
+it yet — it isn't a usable signal today, so don't check it.
 
 ---
 
