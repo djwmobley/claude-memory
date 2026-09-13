@@ -68,19 +68,109 @@ true` means proceed silently (the overwhelming common case); `reason ===
 rest of the schema is fine and most tools never touch a gated column;
 anything else is a real degradation (a classification error, a lock that
 could not be acquired, a failed post-apply verification, …) and
-`withProjectDb` throws a hard tool error naming `handoff.js init`/`resume`
-as the remedy, run directly against the project root in an interactive
-terminal. This is a deliberate divergence from `cmdLoaderLoad`/`cmdClose`'s
-own non-fatal, stderr-only handling of the same call: those run in a
-human's terminal (stderr is visible, the CLI process itself is disposable);
-an MCP tool call has no stderr channel an agent caller can read and no
-interactive prompt to answer, so failing loud with an explicit remedy is
-strictly better than deferring to a more confusing SQL-layer error inside
-the tool's own write. Pre-existing constraint, unchanged by this fix: a
-`projectRoot` whose DB has NEVER been `init`-ed at all (zero core tables)
-was already out of scope for the whole §8 surface before this change —
-`ensureProjectIdentity()` itself queries
-core tables and requires them to exist.
+`withProjectDb` throws a hard tool error. This is a deliberate divergence
+from `cmdLoaderLoad`/`cmdClose`'s own non-fatal, stderr-only handling of the
+same call: those run in a human's terminal (stderr is visible, the CLI
+process itself is disposable); an MCP tool call has no stderr channel an
+agent caller can read and no interactive prompt to answer, so failing loud
+is strictly better than deferring to a more confusing SQL-layer error
+inside the tool's own write. Pre-existing constraint, unchanged by this
+fix: a `projectRoot` whose DB has NEVER been `init`-ed at all (zero core
+tables) was already out of scope for the whole §8 surface before this
+change — `ensureProjectIdentity()` itself queries core tables and requires
+them to exist.
+
+**The remedy is never a blanket "run init/resume" — fix/mcp-stale-engine-gate
+(incident 2026-09-13).** A handoff-mcp.mjs server process holds
+`SCHEMA_EPOCH` as a frozen in-memory literal from the `scripts/handoff.js`
+it required at startup, while `scripts/sql/schema-manifest.json`'s
+`schema_epoch` and the database's own stored fingerprint can each move
+independently after that (a newer engine build lands on disk; the database
+gets bumped by some other, newer process). Naming `handoff.js init`/
+`resume` as the remedy for EVERY heal failure — the old behavior — was
+actively dangerous for one of these cases: it would have told the caller to
+force the database backward. `scripts/lib/schema-epoch-guard.js`'s
+`classifyEpochDrift()` now separates that bare `reason` string into four
+branches, checked at two call sites (before `connectForRoot` in
+`withProjectDb`, and again after `ensureSchemaCurrent()` returns a non-
+proceeding reason — plus the same before-spawn check, `checkEngineEpochOrThrow`,
+on the five spawn-based tools, `handoff_status`/`handoff_resume`/
+`handoff_checkpoint`/`handoff_close`/`handoff_init`). Those same five tools
+also run a SECOND, separate before-spawn check, `checkSpawnEngineEpochOrThrow`
+— see the `HANDOFF_MCP_ENGINE_PATH` divergence rule below:
+
+| Branch | Condition | Remedy |
+|---|---|---|
+| `stale_engine` | this process's loaded `SCHEMA_EPOCH` < the on-disk manifest's `schema_epoch` | **Restart** the MCP server so it reloads `scripts/handoff.js`. No database action. |
+| `engine_checkout_inconsistent` | loaded `SCHEMA_EPOCH` > the on-disk manifest's `schema_epoch` (the SAME checkout disagrees with itself) | Restore a clean engine checkout, then restart the server. There is no database-side fix. |
+| `engine_behind_db` | checkout is internally consistent, but `ensureSchemaCurrentCore`'s own `reason:'ahead'` says the DATABASE's stored epoch is newer still | **Upgrade** the engine checkout to the build that wrote that epoch, then restart the server. Refuses to apply what would be a downgrade. |
+| `heal_failed` | every other non-proceeding `ensureSchemaCurrent` reason (`manifest_error`, `classification_error`, `lock_acquire_failed`, `apply_failed`, `integrity_index_failed`, `verification_failed`, `verification_probe_failed`, `unknown`, or anything unlisted) | Report-only — no command is offered. This state needs a maintainer. |
+
+No branch's message ever names `init` or `resume` as a fix (a `heal_failed`
+message's interpolated `detail` is scanned — the whole serialized value AND
+every one of its own top-level key names — and, on any match, replaced
+wholesale with the bare stub `{redacted:true}`; no fragment of the original
+content, including its key names, survives a match, since a key can itself
+be named after the remedy text). See `scripts/lib/schema-epoch-guard.js`'s
+header comment for the full incident writeup and `test/test-mcp-epoch-guard.js`
+for the totality-matrix proof that every `(loadedEpoch, diskEpoch,
+healReason, dbEpoch)` combination maps to exactly one of these branches.
+
+**CLI-level self-consistency check.** `scripts/handoff.js`'s own `main()`
+dispatch runs the same "does this checkout agree with itself" check
+(`readDiskSchemaEpoch` vs. the loaded `SCHEMA_EPOCH`, the same question the
+`engine_checkout_inconsistent` branch above answers for the MCP server) for
+every one-shot CLI invocation, on EVERY subcommand, whether or not the
+caller also passed `--help`/`-h` — there is no `--help` exemption. Every
+subcommand hard-fails (exit 1) on a mismatch except the SessionStart/
+SessionEnd hook entry points, `loader-hook`/`loader-stop`, which still run
+the check but only WARN on stderr (never stdout — the host injects
+`loader-hook`'s stdout into session context) and continue, since an
+automatic hook must never hard-fail a session's start or end over an
+engine-checkout problem nobody has explicitly asked it to look at. (An
+EARLIER version of this check exempted a bare `--help`/`-h` entirely —
+removed 2026-09-13, Codex review r2 finding 2: the exemption let e.g.
+`status --help`/`resume -h` skip straight past this guard into their real
+handler against a checkout this guard exists to reject, since
+`enforceTotalClassification` itself returns immediately for an uncovered
+flag rather than blocking it. Separately, and unrelated to this guard: a
+bare `handoff.js --help`/`-h` with NO valid subcommand at all still exits
+**2** via the router's own `!subcommands[sub]` usage check, which runs
+BEFORE this guard is ever reached.)
+
+**`HANDOFF_MCP_ENGINE_PATH` divergence rule (Codex review P1a, 2026-09-13;
+hardened by Codex review r2 finding 1, 2026-09-13).** The table above and
+`checkEngineEpochOrThrow` both validate only the checkout THIS server
+process required at startup (`_ENGINE_ROOT`). Every spawn-based tool
+(`handoff_status`/`handoff_resume`/`handoff_checkpoint`/`handoff_close`/
+`handoff_init`) launches `ENGINE_PATH` instead, which is
+`HANDOFF_MCP_ENGINE_PATH` when that env var is set — a completely
+independent checkout this server never required. A SEPARATE pre-spawn
+check, `checkSpawnEngineEpochOrThrow`, covers that case: when
+`HANDOFF_MCP_ENGINE_PATH`'s directory resolves to the SAME root as
+`_ENGINE_ROOT` it is a no-op (already covered above); when it resolves to a
+DIFFERENT root, the call proceeds only when ALL THREE of the following
+agree: (1) the override's `schema-manifest.json` is readable and its
+`schema_epoch` equals this server's own loaded `SCHEMA_EPOCH`; (2) the
+override's OWN `scripts/handoff.js` `SCHEMA_EPOCH` literal is extractable
+(`readEngineEpochLiteral` — read as TEXT, at most the first 512 KB, never
+required/evaluated); and (3) that literal equals the override's own
+manifest epoch from (1). An earlier version of this check compared only the
+override's manifest against the server's epoch, which let a HALF-UPDATED
+override — a manifest bumped to match, but a `scripts/handoff.js` still
+declaring an older `SCHEMA_EPOCH` literal — pass and still execute; a
+checkout that disagrees with ITSELF is exactly as dangerous as one that
+disagrees with the server, since spawning it runs whichever number its
+actual code believes. Any failure to read either number, or either pair
+disagreeing, rejects with a message naming which specific number(s) could
+not be read or disagreed, before any temp file is written or child process
+is spawned. Unlike the four-branch table above (which arbitrates a
+loaded/disk/database three-way using the database's stored epoch as
+independent evidence), this check has no third source of truth to
+arbitrate two DIFFERENT engine checkouts against each other, so it does not
+sub-classify the mismatch beyond naming the disagreeing numbers — any
+divergence is rejected outright and the caller must reconcile the two
+checkouts (or unset the override) itself.
 
 **pgvector-gated columns — loud, not silent.** `assertions.embedding` and
 `decisions.embedding` (and their HNSW indexes) are wrapped in `DO $$ ...
@@ -144,7 +234,15 @@ NULL-embedding backlog AND a successful live provider probe — a row
 existing in `embedding_providers` is no longer sufficient on its own),
 `backlog` (the live+actionable NULL count backing `HEALING(<n>)`), and
 `unembeddable_empty_text` (empty-embed-text NULL rows — never counted
-toward `backlog`, never blocking `READY`). This is the exact same JSON
+toward `backlog`, never blocking `READY`). feat/status-engine-revision
+(owner ruling 2026-09-13): the result also carries an `engine` object —
+`loaded` (`{schema_epoch, revision, source}`, captured once at THIS
+process's `scripts/lib/engine-revision.js` module-import time and frozen
+for its lifetime), `disk` (the same shape, recomputed fresh on every call
+from the engine checkout on disk), `db` (`{schema_epoch}`, the project DB's
+own stored `schema_fingerprint` epoch, or `null`), and `drift`/`remedy` —
+`schema-epoch-guard.js`'s `classifyEpochDrift` verdict/message, reused
+verbatim (never a second classifier). This is the exact same JSON
 `handoff.js status --json` returns; the MCP tool never re-derives it.
 **Not detected**: a target where the `vector` extension itself is present but an
 old version lacks the `halfvec` type (or `hnsw`/`halfvec_cosine_ops`) — the

@@ -7,6 +7,9 @@ node_modules/
 .vscode/
 .idea/
 
+# Built distributable zip (scripts/build-zip.js output) -- never committed.
+/dist/
+
 # Eval harness runtime output (per-run results; baseline.json is committed)
 test/eval/last-run.json
 
