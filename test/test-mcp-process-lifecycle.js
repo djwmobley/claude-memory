@@ -35,6 +35,15 @@
  *        propagates. This is the exact shape the old `await client.close()`
  *        as main()'s last statement used to skip entirely.
  *
+ *   T4 — round-2 fix: when fn() throws AND cleanup (close()) also throws,
+ *        the ORIGINAL fn() error must win (not get silently replaced by the
+ *        cleanup-time symptom), with the cleanup error attached via
+ *        `.cause` so it isn't lost either.
+ *
+ *   T5 — when fn() succeeds but cleanup (close()) throws, the cleanup error
+ *        must still propagate (there's no original error to prefer over
+ *        it).
+ *
  * Usage: node test/test-mcp-process-lifecycle.js
  * Exit 0 = all pass; nonzero = any failure.
  */
@@ -142,6 +151,46 @@ async function run() {
 
     assert(thrown !== null && thrown.message.includes('boom'), 'expected the thrown error to propagate unchanged');
     assert(closeCalls === 1, `expected client.close() to be called exactly once despite the throw, got ${closeCalls}`);
+  });
+
+  await test('T4: runWithClient() rethrows the ORIGINAL error (not the cleanup error) when both fn and close() throw', async () => {
+    const { runWithClient } = await import(require('url').pathToFileURL(SELFTEST_PATH).href);
+    const stubClient = {
+      close: async () => { throw new Error('cleanup failure - close() blew up too'); },
+    };
+    const stubTransport = { pid: null };
+
+    let thrown = null;
+    try {
+      await runWithClient(stubClient, stubTransport, 'test', async () => {
+        throw new Error('boom - simulated tools/call failure mid-selftest');
+      });
+    } catch (err) {
+      thrown = err;
+    }
+
+    assert(thrown !== null, 'expected an error to propagate');
+    assert(thrown.message.includes('boom'), `expected the ORIGINAL error to win, got: ${thrown.message}`);
+    assert(thrown.cause instanceof Error && thrown.cause.message.includes('cleanup failure'),
+      'expected the cleanup error to be attached via .cause, not dropped');
+  });
+
+  await test('T5: runWithClient() propagates the close() error when fn succeeds but cleanup fails', async () => {
+    const { runWithClient } = await import(require('url').pathToFileURL(SELFTEST_PATH).href);
+    const stubClient = {
+      close: async () => { throw new Error('cleanup failure - close() blew up on its own'); },
+    };
+    const stubTransport = { pid: null };
+
+    let thrown = null;
+    try {
+      await runWithClient(stubClient, stubTransport, 'test', async () => 'fn result, not used');
+    } catch (err) {
+      thrown = err;
+    }
+
+    assert(thrown !== null && thrown.message.includes('cleanup failure'),
+      `expected the cleanup error to propagate when fn itself succeeded, got: ${thrown && thrown.message}`);
   });
 
   console.log(`\n─── Results ──────────────────────────────────────`);

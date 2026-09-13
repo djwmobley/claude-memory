@@ -118,11 +118,30 @@ async function closeClientAndWaitForExit(client, transport, label) {
 // test/test-mcp-process-lifecycle.js can drive it directly with a stub
 // client + a throwing `fn`, without spawning a real server child.
 async function runWithClient(client, transport, label, fn) {
+  let result;
   try {
-    return await fn(client);
-  } finally {
-    await closeClientAndWaitForExit(client, transport, label);
+    result = await fn(client);
+  } catch (fnError) {
+    try {
+      await closeClientAndWaitForExit(client, transport, label);
+    } catch (closeError) {
+      // Both fn() and cleanup failed: the original error is the one callers
+      // and tests need to see (it's what actually went wrong), so it must
+      // win -- not get silently replaced by a cleanup-time symptom. Attach
+      // the cleanup error via `cause` so it's not lost either.
+      console.error(`WATCHDOG (${label}): cleanup also failed while handling the original error -- rethrowing the original`);
+      try {
+        fnError.cause = closeError;
+      } catch {
+        // fnError may reject a `cause` assignment (frozen/sealed) -- fine,
+        // the original error is still rethrown below without it.
+      }
+      throw fnError;
+    }
+    throw fnError;
   }
+  await closeClientAndWaitForExit(client, transport, label);
+  return result;
 }
 
 async function main() {
