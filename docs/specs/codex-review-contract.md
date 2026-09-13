@@ -132,6 +132,23 @@ the ones below it:
 Every bucket other than `VALID_APPROVE` is a non-passing result; the
 wrapper never defaults a non-passing bucket to approval.
 
+## Wrapper exit codes and final result line (round 2)
+
+The wrapper's process exit code distinguishes all three outcome classes a
+caller (CI step, shell script) might branch on: `VALID_APPROVE` exits `0`;
+`VALID_BLOCK` — a real, unresolved BLOCKER verdict — exits `2`; every other
+bucket (every halt, every precondition refusal, every gate error such as a
+failed `git diff` or a failed `gh pr comment` post) exits `3`. No bucket
+other than `VALID_APPROVE`/`VALID_BLOCK` ever exits `0`.
+
+Regardless of bucket, the wrapper's LAST line of stdout is always a
+single-line JSON object — `{"outcome": "<bucket>", "round": <int|null>,
+"sha": "<headSha>"|null, "reason": "<reason>"|null}` — in addition to the
+human-readable `Bucket: <bucket> (<reason>)` line and, for halting
+outcomes, the `HALT` line (Escalation, bullet 3). This JSON line is the
+authoritative machine-checkable result; the human-readable lines are for
+operators reading the log.
+
 ## Path fence equality (B5/B7)
 
 Both the fence's paths and any path being tested against it are
@@ -182,9 +199,9 @@ prompt is ever assembled automatically (R3). On halt the wrapper:
 2. Writes durable halt state (the posted comment itself, read back on
    every subsequent invocation via `parseLedger`) — a halt is not only an
    in-process flag.
-3. Exits non-zero and prints a `HALT` line to stdout, so a CI step that
-   only checks exit code and a shell script grepping stdout both detect
-   it.
+3. Exits with code `3` (see "Wrapper exit codes and final result line"
+   below) and prints a `HALT` line to stdout, so a CI step that only
+   checks exit code and a shell script grepping stdout both detect it.
 
 Any later invocation on that PR is classified `HALTED` and performs no
 further work — no Codex call, no new ledger comment — **unless** a PR
