@@ -234,7 +234,15 @@ NULL-embedding backlog AND a successful live provider probe — a row
 existing in `embedding_providers` is no longer sufficient on its own),
 `backlog` (the live+actionable NULL count backing `HEALING(<n>)`), and
 `unembeddable_empty_text` (empty-embed-text NULL rows — never counted
-toward `backlog`, never blocking `READY`). This is the exact same JSON
+toward `backlog`, never blocking `READY`). feat/status-engine-revision
+(owner ruling 2026-09-13): the result also carries an `engine` object —
+`loaded` (`{schema_epoch, revision, source}`, captured once at THIS
+process's `scripts/lib/engine-revision.js` module-import time and frozen
+for its lifetime), `disk` (the same shape, recomputed fresh on every call
+from the engine checkout on disk), `db` (`{schema_epoch}`, the project DB's
+own stored `schema_fingerprint` epoch, or `null`), and `drift`/`remedy` —
+`schema-epoch-guard.js`'s `classifyEpochDrift` verdict/message, reused
+verbatim (never a second classifier). This is the exact same JSON
 `handoff.js status --json` returns; the MCP tool never re-derives it.
 **Not detected**: a target where the `vector` extension itself is present but an
 old version lacks the `halfvec` type (or `hnsw`/`halfvec_cosine_ops`) — the
