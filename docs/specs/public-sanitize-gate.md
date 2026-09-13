@@ -75,10 +75,21 @@ classification below is what decides disposition, not discovery.
       "source_sha256": "…", "target_sha256": "…",
       "transform": { "from": "pipeline-scripts", "to": "memory-manager" } },
     { "path": "scripts/migrations/**", "class": "LEAVE",
-      "reason": "Bundle-A eval-migration artifacts, cm-runbook §11.6" }
+      "reason": "Bundle-A eval-migration artifacts, cm-runbook §11.6",
+      "expansion": ["scripts/migrations/0001_init.sql", "scripts/migrations/0002_seed.sql"] }
   ]
 }
 ```
+
+Every glob entry (a `path` containing `*`) additionally carries `expansion` —
+the resolved file list the glob matched at approval time. The gate
+recomputes the glob's expansion against the discovered tree and diffs it
+against this recorded list: a live match not in `expansion` is treated as
+not matched by that glob at all (falls through to another entry or to
+UNCLASSIFIED — "new file matched an old glob" is never a silent pass), and
+an `expansion` entry that no longer live-matches is a stale manifest record
+(`FAIL_GATE_ERROR`). A glob entry missing `expansion` is a shape violation
+(`FAIL_GATE_ERROR`).
 
 Every `LIFT` entry carries `source_sha256` (the sha256 of the file's bytes at
 `source_sha` in `claude-memory`, as approved). An entry whose `transform` is
@@ -102,6 +113,21 @@ independently recomputes sha256 for every discovered LIFT path (source-side
 pre-transform, target-side post-transform where applicable) and compares
 against the manifest's recorded value(s) — any mismatch is
 `FAIL_HASH_DRIFT`, gate-computed, never manifest-computed.
+
+For a `transform` entry, the **target** side is always verified: the gate
+reads the file's bytes as actually committed at the commit under test (git
+blob, never the working tree) and compares against `target_sha256` — this
+is what closes "unapproved transformed bytes can PASS", since the committed
+tree only ever contains the post-transform bytes. The **source** side (the
+pre-transform bytes, which do not exist in the target tree at all) is
+verified only when `--source-root <dir>` is supplied — the lift step (run
+from `claude-memory`, where the pre-transform bytes live) passes it,
+pointing at the approved `source_sha` checkout; comparisons are against a
+plain filesystem read at `<source-root>/<path>`, not a git blob, since the
+source tree is a different repository than the one under test. Ordinary
+public-repo CI/pre-push runs omit `--source-root` (there is no source tree
+to check against there) and skip the source-side comparison, relying on the
+lift step having verified it once at import time.
 
 ## Classification (total)
 
@@ -250,6 +276,28 @@ this list.
 - Does not classify content the private-terms file doesn't enumerate — term
   curation is a human responsibility this gate depends on, not replaces.
 
+## Round 1 Codex review (PR #306) — findings disposition
+
+All 14 findings from the round-1 review were verified against the code and
+fixed in round 2 (none were judged not-a-defect).
+
+| # | Finding (short) | Status |
+|---|---|---|
+| 1 | Transform entries skip hash verification (`!entry.transform` disabled it; `target_sha256` never checked) | Fixed — target always verified from the committed blob; source verified via `--source-root` when supplied |
+| 2 | Gate reads working-tree files instead of the commit's git blob | Fixed — `gitShowBlob` reads `<commit>:<path>` for every LIFT file |
+| 3 | Duplicate literal-path entries collapse in `literalMap`, silently picking one class | Fixed — duplicate normalized literal keys detected before the map is built -> `FAIL_GATE_ERROR` |
+| 4 | Glob expansion is unrecorded/unverified; a new file matching an old glob silently rides in | Fixed — `expansion` array required per glob entry, recomputed and diffed (new match not recorded -> UNCLASSIFIED; recorded match no longer live -> `FAIL_GATE_ERROR`) |
+| 5 | `globToRegExp` `**` does not respect path-segment boundaries (`dir/**/file.txt` matched `dir/notfile.txt`) | Fixed — segment-aware globstar construction; matrix test added |
+| 6 | PR bodies are never scanned (workflow never obtains/passes them) | Fixed — `--pr-body-file`, workflow writes `github.event.pull_request.body` to a temp file for `pull_request` events |
+| 7 | Commit range (messages, identity, earlier commits) is not evaluated — only the tip's tree/identity | Fixed for messages + identity — `--base <sha>` walks `git rev-list base..commit` and scans every commit's message + identity. Byte-content of intermediate trees is intentionally NOT diff-scanned (the gate evaluates the final tree snapshot per its Non-goals — "not a general secret-scanning replacement"); this remains a documented blind spot below |
+| 8 | `args.ref` never populated by `parseArgs`; fallback reads the checkout's branch (breaks under detached HEAD) | Fixed — `--ref` parsed and used ahead of the `gitRefName` fallback; templates pass it explicitly |
+| 9 | Omitting `--commit` skips identity requirement/checks entirely | Fixed — `effectiveCommit = args.commit \|\| 'HEAD'`; identity requirement and check now apply uniformly regardless of whether `--commit` was passed |
+| 10 | `pre-push` hook `exit 0`s when `SANITIZE_PRIVATE_TERMS_FILE` is unset, bypassing the check | Fixed — early-exit removed; the gate's own fail-closed `loadPrivateTerms` now produces `FAIL_GATE_ERROR` and blocks the push |
+| 11 | `pre-push` hardcodes `--commit HEAD`, ignoring git's actual ref-update input | Fixed — hook reads stdin ref-update lines and runs the gate once per outgoing, non-deleted ref/sha |
+| 12 | Whole-string `decodeURIComponent` throws on any malformed `%` elsewhere, suppressing a valid encoded `OWNER_PATH` | Fixed — percent-encoded candidate substrings are extracted and decoded independently |
+| 13 | Base64-decoded bytes are only re-scanned as UTF-8, missing a base64-wrapped UTF-16 (BOM) owner path | Fixed — `decodeMaybeUtf16` now also runs on the decoded base64 buffer |
+| 14 | `classifyOutcome(null)` / `classifyOutcome({findings:{}})` return PASS instead of failing on malformed/unknown state | Fixed — non-object/null `results`, or any bucket present but not an array, -> `FAIL_GATE_ERROR` |
+
 ## Blind spots
 
 What this gate cannot detect: semantic leaks in prose (a paraphrased
@@ -264,4 +312,15 @@ not the private repo's past commits); GitHub-side required-check enforcement
 itself is configured via the GitHub API/branch-protection settings, which
 this spec assumes are set correctly and does not itself verify at runtime
 (a misconfigured branch-protection rule that doesn't actually require the
-check is outside what `sanitize-gate.js` can detect from within a CI run).
+check is outside what `sanitize-gate.js` can detect from within a CI run);
+when `--base` is supplied, only each intermediate commit's **message** and
+**author/committer identity** are scanned across the range — the byte
+content of intermediate trees is not diff-scanned commit-by-commit (only the
+final tree at the commit under test is), so private bytes introduced and
+then reverted within the same incoming range, without appearing in any
+commit message, would not be caught by this gate (this is a scope line, not
+an oversight — see Non-goals: not a general secret-scanning replacement);
+`--source-root` source-side hash verification for `transform` entries only
+runs when the caller supplies it (the lift step does; ordinary public-repo
+CI/pre-push runs do not have a source tree to check and skip that side,
+relying on the lift step's one-time verification at import).

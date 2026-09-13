@@ -7,25 +7,49 @@
 #
 # Installed by the installer's --hooks step. Requires
 # SANITIZE_PRIVATE_TERMS_FILE to point at a local, gitignored terms file.
+#
+# No early-exit on a missing SANITIZE_PRIVATE_TERMS_FILE: the gate itself
+# fails closed (FAIL_GATE_ERROR) when the terms file is unset/unreadable/
+# empty, and this hook must not short-circuit that with its own exit 0 —
+# doing so would silently let a push through the one check that is
+# supposed to run locally before it ever reaches CI.
+#
+# Reads git's pre-push ref-update lines from stdin ("<local ref> <local
+# sha1> <remote ref> <remote sha1>", one per outgoing ref) and validates
+# every outgoing commit/ref being pushed — never just "HEAD", which checks
+# unrelated content whenever the push is of another branch, an explicit
+# SHA, or multiple refs at once.
 
-set -eu
+set -u
 
-if [ -z "${SANITIZE_PRIVATE_TERMS_FILE:-}" ]; then
-  echo "pre-push: SANITIZE_PRIVATE_TERMS_FILE is not set — skipping local" \
-       "sanitize check. CI will still run the authoritative gate on push." >&2
-  exit 0
-fi
+overall_status=0
 
-node scripts/sanitize-gate.js \
-  --manifest PUBLIC-MANIFEST.json \
-  --root . \
-  --commit HEAD \
-  --json
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -z "${local_sha:-}" ] && continue
+  # Deleting a ref pushes an all-zero local sha; nothing to scan.
+  case "$local_sha" in
+    0000000000000000000000000000000000000000) continue ;;
+  esac
 
-status=$?
-if [ "$status" -ne 0 ]; then
-  echo "pre-push: sanitize gate FAILED (exit $status). Push blocked locally." >&2
-  echo "This is a backstop only; do not attempt to bypass it — CI is" \
-       "authoritative and will independently block the merge." >&2
-fi
-exit "$status"
+  ref_name=$(printf '%s' "$local_ref" | sed 's#^refs/heads/##')
+
+  if node scripts/sanitize-gate.js \
+      --manifest PUBLIC-MANIFEST.json \
+      --root . \
+      --commit "$local_sha" \
+      --ref "$ref_name" \
+      --json; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  if [ "$rc" -ne 0 ]; then
+    echo "pre-push: sanitize gate FAILED for $local_ref ($local_sha, exit $rc). Push blocked locally." >&2
+    echo "This is a backstop only; do not attempt to bypass it — CI is" \
+         "authoritative and will independently block the merge." >&2
+    overall_status="$rc"
+  fi
+done
+
+exit "$overall_status"

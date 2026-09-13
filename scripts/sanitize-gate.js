@@ -13,7 +13,8 @@
  *
  * Usage:
  *   node scripts/sanitize-gate.js --manifest <path> --root <dir>
- *     [--commit <sha>] [--terms <path>] [--json]
+ *     [--commit <sha>] [--base <sha>] [--ref <name>] [--source-root <dir>]
+ *     [--pr-body-file <path>] [--terms <path>] [--json]
  *
  * Exit codes: 0 PASS, 2 FAIL_UNCLASSIFIED_PATH|FAIL_HASH_DRIFT|FAIL_CONTENT,
  * 3 FAIL_GATE_ERROR.
@@ -55,32 +56,61 @@ function normalizePath(p) {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal glob matcher — no new deps. Supports "**" (any path segment span)
-// and "*" (any run of non-slash chars). Sufficient for manifest globs like
-// "scripts/migrations/**".
+// Minimal glob matcher — no new deps. "**" matches zero or more WHOLE path
+// segments (never crossing into a partial-segment match), "*" matches any
+// run of non-slash chars within a single segment. Segment-aware: a literal
+// segment is only ever compared against a full path segment, never a
+// substring spanning a "/".
 // ---------------------------------------------------------------------------
 function globToRegExp(glob) {
   const norm = normalizePath(glob);
-  let out = '^';
-  for (let i = 0; i < norm.length; i++) {
-    const c = norm[i];
-    if (c === '*') {
-      if (norm[i + 1] === '*') {
-        out += '.*';
-        i++;
-        // consume an optional following slash so "dir/**" matches "dir" itself
-        if (norm[i + 1] === '/') i++;
+  const rawSegs = norm.length ? norm.split('/') : [''];
+
+  // Collapse consecutive "**" segments (e.g. "**/**") into one.
+  const segs = [];
+  for (const s of rawSegs) {
+    if (s === '**' && segs[segs.length - 1] === '**') continue;
+    segs.push(s);
+  }
+
+  function literalSegRe(seg) {
+    let r = '';
+    for (const c of seg) {
+      if (c === '*') r += '[^/]*';
+      else if ('.+?^${}()|[]\\'.includes(c)) r += '\\' + c;
+      else r += c;
+    }
+    return r;
+  }
+
+  let re = '^';
+  let prevWasGlobstar = false;
+  for (let i = 0; i < segs.length; i++) {
+    const seg = segs[i];
+    const isFirst = i === 0;
+    const isLast = i === segs.length - 1;
+    if (seg === '**') {
+      if (isFirst && isLast) {
+        re += '.*';
+      } else if (isFirst) {
+        re += '(?:[^/]+/)*';
+      } else if (isLast) {
+        re += '(?:/[^/]+)*';
       } else {
-        out += '[^/]*';
+        // Middle globstar: bake in the leading "/" (from the previous
+        // literal segment) so it is never omitted, and match zero-or-more
+        // whole trailing segments before the next literal.
+        re += '/(?:[^/]+/)*';
       }
-    } else if ('.+?^${}()|[]\\'.includes(c)) {
-      out += '\\' + c;
+      prevWasGlobstar = true;
     } else {
-      out += c;
+      if (!isFirst && !prevWasGlobstar) re += '/';
+      re += literalSegRe(seg);
+      prevWasGlobstar = false;
     }
   }
-  out += '$';
-  return new RegExp(out);
+  re += '$';
+  return new RegExp(re);
 }
 
 function isGlobEntry(entryPath) {
@@ -94,10 +124,23 @@ function isGlobEntry(entryPath) {
 // Returns:
 //   {
 //     classified: Map<path, { entry, matchedBy }>,
-//     unclassified: [path...],        // no manifest entry matched
+//     unclassified: [path...],        // no manifest entry matched (or the
+//                                      // only match was an unapproved glob
+//                                      // expansion — see below)
 //     overlap: [{ path, entries }...] // more than one manifest entry matched
 //     shapeErrors: [string...]        // malformed manifest entries
 //   }
+//
+// Glob expansion (spec: "No path-prefix allow-listing"): every glob entry
+// must carry a recorded `expansion: [paths...]` array (the approved
+// resolved file list at approval time). The live expansion is recomputed
+// against the discovered tree and diffed against the recorded one:
+//   - a live-matching path NOT in the recorded expansion is treated as if
+//     the glob did not match it at all (so it falls through to whatever
+//     else matches it, or to UNCLASSIFIED — "new file matched an old glob"
+//     never silently rides in on the glob's classification).
+//   - a recorded-expansion path that no longer live-matches the glob is a
+//     stale/wrong manifest record -> shapeErrors -> FAIL_GATE_ERROR.
 // ---------------------------------------------------------------------------
 function classifyPaths(treePaths, manifest) {
   const entries = (manifest && Array.isArray(manifest.entries)) ? manifest.entries : null;
@@ -131,12 +174,51 @@ function classifyPaths(treePaths, manifest) {
     if (e.class === 'LEAVE' && !e.reason) {
       shapeErrors.push(`LEAVE entry ${e.path}: missing reason`);
     }
+    if (isGlobEntry(e.path) && !Array.isArray(e.expansion)) {
+      shapeErrors.push(`glob entry ${e.path}: missing expansion array (recorded approved expansion required)`);
+    }
   }
 
   const literalEntries = entries.filter((e) => e && typeof e.path === 'string' && !isGlobEntry(e.path));
+
+  // Duplicate literal-path detection MUST happen before the literalMap is
+  // built — a Map silently keeps only the last entry for a repeated key,
+  // which would let (e.g.) a LIFT entry followed by a LEAVE entry for the
+  // same path collapse to LEAVE and PASS instead of failing. Any class
+  // combination for a duplicated normalized path is a manifest error.
+  const literalCounts = new Map();
+  for (const e of literalEntries) {
+    const key = normalizePath(e.path);
+    literalCounts.set(key, (literalCounts.get(key) || 0) + 1);
+  }
+  for (const [key, count] of literalCounts) {
+    if (count > 1) {
+      shapeErrors.push(`duplicate literal manifest entries for path ${key} (${count} entries)`);
+    }
+  }
+
   const globEntries = entries.filter((e) => e && typeof e.path === 'string' && isGlobEntry(e.path))
     .map((e) => ({ entry: e, re: globToRegExp(e.path) }));
   const literalMap = new Map(literalEntries.map((e) => [normalizePath(e.path), e]));
+
+  const normTreePaths = treePaths.map((p) => normalizePath(p));
+
+  // Recompute + diff each glob entry's expansion against the discovered tree.
+  for (const g of globEntries) {
+    if (!Array.isArray(g.entry.expansion)) continue; // already flagged above
+    const recordedSet = new Set(g.entry.expansion.map(normalizePath));
+    const liveSet = new Set(normTreePaths.filter((p) => g.re.test(p)));
+    g.liveSet = liveSet;
+    g.unapproved = new Set();
+    for (const p of liveSet) {
+      if (!recordedSet.has(p)) g.unapproved.add(p);
+    }
+    for (const p of recordedSet) {
+      if (!liveSet.has(p)) {
+        shapeErrors.push(`glob entry ${g.entry.path}: recorded expansion path ${p} no longer matches (stale expansion)`);
+      }
+    }
+  }
 
   const classified = new Map();
   const unclassified = [];
@@ -147,7 +229,9 @@ function classifyPaths(treePaths, manifest) {
     const matches = [];
     if (literalMap.has(p)) matches.push(literalMap.get(p));
     for (const g of globEntries) {
-      if (g.re.test(p)) matches.push(g.entry);
+      if (!g.re.test(p)) continue;
+      if (g.unapproved && g.unapproved.has(p)) continue; // unapproved expansion: not a real match
+      matches.push(g.entry);
     }
     if (matches.length === 0) {
       unclassified.push(p);
@@ -308,18 +392,36 @@ function scanText(str, ctx) {
   runPatternSet('SECRET_KEY', SECRET_KEY_PATTERNS, str, location, findings);
   runPatternSet('CONN_STRING', CONN_STRING_PATTERNS, str, location, findings);
 
-  // URL-encoded owner-path forms (A1): decode once and re-scan OWNER_PATH only.
-  try {
-    const decoded = decodeURIComponent(str);
-    if (decoded !== str) {
-      runPatternSet('OWNER_PATH', OWNER_PATH_PATTERNS, decoded, location, findings);
+  // URL-encoded owner-path forms (A1): decode each percent-encoded CANDIDATE
+  // substring independently. Whole-string decodeURIComponent() throws on
+  // ANY malformed percent sequence anywhere in the string (e.g. a bare "%"
+  // from "100% complete"), which would silently suppress a valid encoded
+  // owner path elsewhere in the same string. Isolate candidates first so one
+  // malformed run never poisons another.
+  {
+    const candidateRe = /[^\s"'<>]*%[0-9A-Fa-f]{2}[^\s"'<>]*/g;
+    const seen = new Set();
+    let cm;
+    while ((cm = candidateRe.exec(str))) {
+      const token = cm[0];
+      if (seen.has(token)) continue;
+      seen.add(token);
+      try {
+        const decoded = decodeURIComponent(token);
+        if (decoded !== token) {
+          runPatternSet('OWNER_PATH', OWNER_PATH_PATTERNS, decoded, location, findings);
+        }
+      } catch (_e) {
+        // this candidate isn't validly percent-encoded; skip only it
+      }
     }
-  } catch (_e) {
-    // not URL-encoded content; ignore
   }
 
   // BASE64_DECODE: find base64-looking runs >=64 chars, decode, re-scan
-  // (excluding this same base64 step, to avoid unbounded recursion).
+  // (excluding this same base64 step, to avoid unbounded recursion). Also
+  // re-run the UTF-16 decode heuristic against the decoded bytes so a
+  // base64-wrapped UTF-16LE/BE blob (e.g. with a BOM) is not limited to a
+  // direct-UTF-8 interpretation, matching scanBytes' additive behavior.
   if (!ctx || !ctx._skipBase64) {
     const b64re = /[A-Za-z0-9+/]{64,}={0,2}/g;
     let m;
@@ -328,7 +430,12 @@ function scanText(str, ctx) {
         const decodedBuf = Buffer.from(m[0], 'base64');
         const decodedStr = decodedBuf.toString('utf8');
         const inner = scanText(decodedStr, { location, termRegexes, _skipBase64: true });
-        if (inner.length > 0) {
+        let inner16 = [];
+        const utf16Decoded = decodeMaybeUtf16(decodedBuf);
+        if (utf16Decoded !== null) {
+          inner16 = scanText(utf16Decoded, { location, termRegexes, _skipBase64: true });
+        }
+        if (inner.length > 0 || inner16.length > 0) {
           findings.push({ label: 'BASE64_DECODE', location, snippet: m[0].slice(0, 40) });
         }
       } catch (_e) {
@@ -360,10 +467,24 @@ function scanBytes(buf, ctx) {
 // ---------------------------------------------------------------------------
 // classifyOutcome — total classification of the gate's final result from
 // accumulated result buckets. First matching branch wins; unknown internal
-// state defaults to FAIL_GATE_ERROR (never silently PASS).
+// state defaults to FAIL_GATE_ERROR (never silently PASS). `results` itself
+// (or any of its expected buckets) being malformed — null, not an object, or
+// a bucket present but not an array — is itself unknown state, not a clean
+// empty run, and must not resolve to PASS.
 // ---------------------------------------------------------------------------
 function classifyOutcome(results) {
-  const r = results || {};
+  if (results === null || typeof results !== 'object' || Array.isArray(results)) {
+    return { outcome: 'FAIL_GATE_ERROR', exitCode: 3 };
+  }
+  const bucketNames = ['gateErrors', 'unclassified', 'overlap', 'shapeErrors', 'hashDrift', 'findings'];
+  for (const name of bucketNames) {
+    const v = results[name];
+    if (v !== undefined && !Array.isArray(v)) {
+      return { outcome: 'FAIL_GATE_ERROR', exitCode: 3 };
+    }
+  }
+
+  const r = results;
   const gateErrors = r.gateErrors || [];
   const unclassified = r.unclassified || [];
   const overlap = r.overlap || [];
@@ -394,6 +515,15 @@ function gitLsTree(root, commit) {
   return out.split(/\r?\n/).filter((l) => l.length > 0);
 }
 
+// Read a path's bytes AS COMMITTED at `commit` (git blob), never the
+// working tree. Reading the working tree would let an uncommitted, unclean
+// replacement conceal private bytes in the commit actually being approved
+// (and CI checks out the PR head / merge tree, not necessarily what a local
+// working tree happens to contain).
+function gitShowBlob(root, commit, relPath) {
+  return execFileSync('git', ['show', `${commit}:${relPath}`], { cwd: root, maxBuffer: 1024 * 1024 * 256 });
+}
+
 function gitCommitIdentity(root, commit) {
   const out = execFileSync(
     'git',
@@ -402,6 +532,15 @@ function gitCommitIdentity(root, commit) {
   ).trim();
   const [an, ae, cn, ce] = out.split('\x00');
   return { authorName: an, authorEmail: ae, committerName: cn, committerEmail: ce };
+}
+
+function gitCommitMessage(root, commit) {
+  return execFileSync('git', ['log', '-1', '--format=%B', commit], { cwd: root, encoding: 'utf8' });
+}
+
+function gitRevList(root, base, commit) {
+  const out = execFileSync('git', ['rev-list', `${base}..${commit}`], { cwd: root, encoding: 'utf8' });
+  return out.split(/\r?\n/).filter((l) => l.length > 0);
 }
 
 function gitRefName(root) {
@@ -421,8 +560,12 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === '--manifest') args.manifest = argv[++i];
     else if (a === '--root') args.root = argv[++i];
+    else if (a === '--source-root') args.sourceRoot = argv[++i];
     else if (a === '--commit') args.commit = argv[++i];
+    else if (a === '--base') args.base = argv[++i];
+    else if (a === '--ref') args.ref = argv[++i];
     else if (a === '--terms') args.terms = argv[++i];
+    else if (a === '--pr-body-file') args.prBodyFile = argv[++i];
     else if (a === '--json') args.json = true;
   }
   return args;
@@ -445,10 +588,15 @@ function runGate(argv, env) {
     return { outcome: classifyOutcome(results), results };
   }
 
+  // The gate always evaluates SOME commit under test — an omitted --commit
+  // is HEAD, not "no commit". Identity enforcement below applies uniformly
+  // to whichever commit is actually under test, never skipped just because
+  // --commit wasn't spelled out on the CLI.
+  const effectiveCommit = args.commit || 'HEAD';
+
   const commitIdentityConfigured = env.SANITIZE_LIFT_COMMIT_IDENTITY;
-  const commit = args.commit;
-  if (commit && !commitIdentityConfigured) {
-    results.gateErrors.push('SANITIZE_LIFT_COMMIT_IDENTITY not set while --commit was given');
+  if (!commitIdentityConfigured) {
+    results.gateErrors.push('SANITIZE_LIFT_COMMIT_IDENTITY not set');
   }
 
   let termRegexes = [];
@@ -470,7 +618,7 @@ function runGate(argv, env) {
 
   let treePaths;
   try {
-    treePaths = commit ? gitLsTree(args.root, commit) : gitLsTree(args.root, 'HEAD');
+    treePaths = gitLsTree(args.root, effectiveCommit);
   } catch (e) {
     results.gateErrors.push(`git ls-tree failed: ${e.message}`);
     return { outcome: classifyOutcome(results), results };
@@ -481,20 +629,45 @@ function runGate(argv, env) {
   results.overlap.push(...cls.overlap);
   results.shapeErrors.push(...cls.shapeErrors);
 
-  // Hash-drift + content scan over classified LIFT files.
+  // Hash-drift + content scan over classified LIFT files. Bytes are read
+  // from the commit under test (git blob), never the working tree.
   for (const [p, { entry }] of cls.classified) {
     if (entry.class !== 'LIFT') continue;
-    const abs = path.join(args.root, p);
     let buf;
     try {
-      buf = fs.readFileSync(abs);
+      buf = gitShowBlob(args.root, effectiveCommit, p);
     } catch (e) {
-      results.gateErrors.push(`unreadable LIFT file ${p}: ${e.message}`);
+      results.gateErrors.push(`unreadable LIFT blob ${p} @ ${effectiveCommit}: ${e.message}`);
       continue;
     }
     const liveSha = crypto.createHash('sha256').update(buf).digest('hex');
-    if (entry.source_sha256 && liveSha !== entry.source_sha256 && !entry.transform) {
-      results.hashDrift.push({ path: p, expected: entry.source_sha256, actual: liveSha });
+    const hasTransform = entry.transform !== null && entry.transform !== undefined;
+    if (hasTransform) {
+      // Target-side: the bytes actually committed here (post-transform)
+      // must match the approved target_sha256.
+      if (entry.target_sha256 && liveSha !== entry.target_sha256) {
+        results.hashDrift.push({ path: p, side: 'target', expected: entry.target_sha256, actual: liveSha });
+      }
+      // Source-side: only verifiable when a pre-transform source tree is
+      // supplied (the lift step, run from claude-memory, passes
+      // --source-root at the approved source_sha; ordinary public-repo CI
+      // runs have no source tree to check against and skip this side).
+      if (args.sourceRoot && entry.source_sha256) {
+        let srcBuf = null;
+        try {
+          srcBuf = fs.readFileSync(path.join(args.sourceRoot, p));
+        } catch (e) {
+          results.gateErrors.push(`unreadable source blob ${p} in --source-root: ${e.message}`);
+        }
+        if (srcBuf) {
+          const srcSha = crypto.createHash('sha256').update(srcBuf).digest('hex');
+          if (srcSha !== entry.source_sha256) {
+            results.hashDrift.push({ path: p, side: 'source', expected: entry.source_sha256, actual: srcSha });
+          }
+        }
+      }
+    } else if (entry.source_sha256 && liveSha !== entry.source_sha256) {
+      results.hashDrift.push({ path: p, side: 'source', expected: entry.source_sha256, actual: liveSha });
     }
     const findings = scanBytes(buf, { location: p, termRegexes });
     results.findings.push(...findings);
@@ -505,25 +678,70 @@ function runGate(argv, env) {
     const findings = scanText(p, { location: `path:${p}`, termRegexes });
     results.findings.push(...findings);
   }
+  // The ref/branch name under test MUST come from the caller (CI/hook),
+  // which always knows the real incoming ref — falling back to the local
+  // checkout's current branch is wrong whenever that checkout is in
+  // detached HEAD (exactly the state a CI checkout of a PR/push commit is
+  // normally in), silently skipping REF_NAME scanning entirely.
   const ref = args.ref || gitRefName(args.root);
   if (ref) {
     results.findings.push(...scanText(ref, { location: 'ref', termRegexes }));
   }
 
-  // Commit identity (D1).
-  if (commit && commitIdentityConfigured) {
+  // PR body scanning (spec Inputs: "commit messages, PR bodies, ...").
+  if (args.prBodyFile) {
     try {
-      const id = gitCommitIdentity(args.root, commit);
-      const authorStr = `${id.authorName} <${id.authorEmail}>`;
-      const committerStr = `${id.committerName} <${id.committerEmail}>`;
-      if (authorStr !== commitIdentityConfigured) {
-        results.findings.push({ label: 'COMMIT_IDENTITY', location: 'commit:author', snippet: authorStr });
-      }
-      if (committerStr !== commitIdentityConfigured) {
-        results.findings.push({ label: 'COMMIT_IDENTITY', location: 'commit:committer', snippet: committerStr });
-      }
+      const body = fs.readFileSync(args.prBodyFile, 'utf8');
+      results.findings.push(...scanText(body, { location: 'pr-body', termRegexes }));
     } catch (e) {
-      results.gateErrors.push(`git log failed for commit identity: ${e.message}`);
+      results.gateErrors.push(`unreadable --pr-body-file ${args.prBodyFile}: ${e.message}`);
+    }
+  }
+
+  // Commit identity + message scanning. When --base is given, evaluate the
+  // FULL incoming commit range (base..commit) — not just the tip — so an
+  // intermediate commit's message/identity can't ride in unchecked behind a
+  // clean final commit. Without --base, only the commit under test itself
+  // is checked (identity + no message scan, matching the single-commit
+  // shape the rest of the gate already assumes).
+  if (commitIdentityConfigured) {
+    const checkOne = (c) => {
+      try {
+        const id = gitCommitIdentity(args.root, c);
+        const authorStr = `${id.authorName} <${id.authorEmail}>`;
+        const committerStr = `${id.committerName} <${id.committerEmail}>`;
+        const short = c.slice(0, 12);
+        if (authorStr !== commitIdentityConfigured) {
+          results.findings.push({ label: 'COMMIT_IDENTITY', location: `commit:${short}:author`, snippet: authorStr });
+        }
+        if (committerStr !== commitIdentityConfigured) {
+          results.findings.push({ label: 'COMMIT_IDENTITY', location: `commit:${short}:committer`, snippet: committerStr });
+        }
+      } catch (e) {
+        results.gateErrors.push(`git log failed for commit identity ${c}: ${e.message}`);
+      }
+    };
+
+    if (args.base) {
+      let commits;
+      try {
+        commits = gitRevList(args.root, args.base, effectiveCommit);
+        if (commits.length === 0) commits = [effectiveCommit];
+      } catch (e) {
+        results.gateErrors.push(`git rev-list failed for range ${args.base}..${effectiveCommit}: ${e.message}`);
+        commits = [];
+      }
+      for (const c of commits) {
+        checkOne(c);
+        try {
+          const msg = gitCommitMessage(args.root, c);
+          results.findings.push(...scanText(msg, { location: `commit-message:${c.slice(0, 12)}`, termRegexes }));
+        } catch (e) {
+          results.gateErrors.push(`git log failed for commit message ${c}: ${e.message}`);
+        }
+      }
+    } else {
+      checkOne(effectiveCommit);
     }
   }
 
@@ -545,7 +763,7 @@ function main() {
       process.stderr.write(`  overlap: ${results.overlap.map((o) => o.path).join(', ')}\n`);
     }
     if (results.hashDrift && results.hashDrift.length) {
-      process.stderr.write(`  hash drift: ${results.hashDrift.map((h) => h.path).join(', ')}\n`);
+      process.stderr.write(`  hash drift: ${results.hashDrift.map((h) => `${h.path} (${h.side})`).join(', ')}\n`);
     }
     if (results.findings && results.findings.length) {
       for (const f of results.findings) process.stderr.write(`  ${f.label} @ ${f.location}: ${f.snippet}\n`);
