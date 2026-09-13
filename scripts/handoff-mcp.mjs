@@ -35,6 +35,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // implements its own DB connection or project_id lookup. ──────────────────
 const require = createRequire(import.meta.url);
 const { connectForRoot, resolveTargetDbForRoot } = require('./lib/mcp-db-connect.js');
+const { isFullyQualifiedPath } = require('./lib/shared.js');
 const { ensureProjectIdentity } = require('./lib/project-identity.js');
 // PR B (fix/mcp-usage-codex-identity): the SAME env-var precedence
 // handoff.js uses for every other session-id resolution (explicit ->
@@ -318,6 +319,16 @@ function checkSpawnEngineEpochOrThrow() {
 async function withProjectDb(projectRoot, fn) {
   if (typeof projectRoot !== 'string' || !projectRoot.trim()) {
     throw new Error('projectRoot is required and must be a non-empty string');
+  }
+  // Codex review of PR #302, finding 6a: reject a non-absolute projectRoot
+  // before any cwd-dependent work downstream (connectForRoot/project-marker.js).
+  // Finding 6b (r2): path.isAbsolute() alone accepts a Windows
+  // rooted-but-driveless path ('/repo', '\repo') that resolves against the
+  // server process's CURRENT DRIVE, not a fixed location — isFullyQualifiedPath
+  // requires an actual drive letter or UNC prefix on win32 (a leading '/' on
+  // POSIX), closing that gap.
+  if (!isFullyQualifiedPath(projectRoot)) {
+    throw new Error(`projectRoot must be a fully qualified absolute path, got ${JSON.stringify(projectRoot)}`);
   }
   // fix/mcp-stale-engine-gate call site 1 — BEFORE any connection is opened.
   checkEngineEpochOrThrow();
@@ -747,12 +758,30 @@ async function toolPersistDecisions({ projectRoot, rows, verifyQuery }) {
       }
 
       let topHits = null;
+      let verifyMeta = null;
       if (typeof verifyQuery === 'string' && verifyQuery.trim()) {
-        const search = await memorySearchLib.memorySearch(db, { projectId, query: verifyQuery, tables: ['decisions'], limit: 3 });
+        // projectRoot threaded through (embed-url-from-project-root fix,
+        // 2026-09-13) so this verify-query embed resolves against THIS
+        // call's own project, never the MCP server process's cwd.
+        const search = await memorySearchLib.memorySearch(db, { projectId, query: verifyQuery, tables: ['decisions'], limit: 3, projectRoot });
         topHits = search.hits;
+        // Propagate the SAME degradation metadata memory_search's own MCP
+        // tool result carries (docs/hosts/codex.md's promised
+        // embedStatus/embedSource/embedReason/searchMode/note) — previously
+        // discarded here, so a verify-query run during an FTS-only degrade
+        // looked identical to a normal hybrid verify (Codex review of PR
+        // #302).
+        verifyMeta = {
+          embedStatus: search.embedStatus, embedSource: search.embedSource,
+          embedReason: search.embedReason, searchMode: search.searchMode,
+          note: search.note,
+        };
       }
 
-      return textResult({ projectId, written, embedWarnings: warnings, verify: verifyQuery ? { query: verifyQuery, topHits } : null });
+      return textResult({
+        projectId, written, embedWarnings: warnings,
+        verify: verifyQuery ? { query: verifyQuery, topHits, ...verifyMeta } : null,
+      });
     });
   } catch (err) {
     return libToolError(err);
@@ -764,7 +793,14 @@ async function toolPersistDecisions({ projectRoot, rows, verifyQuery }) {
 async function toolMemorySearch({ projectRoot, query, tables, limit }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const result = await memorySearchLib.memorySearch(db, { projectId, query, tables, limit });
+      // projectRoot threaded through (embed-url-from-project-root fix,
+      // 2026-09-13) so the default embedder resolves the embed endpoint
+      // against THIS tool call's own projectRoot, never the MCP server
+      // process's cwd (the incident this fix addresses: a Codex host
+      // launching the server from a different cwd than the calling
+      // project). Unresolvable -> memorySearch degrades to FTS-only
+      // (embedStatus/searchMode/note in the result) rather than throwing.
+      const result = await memorySearchLib.memorySearch(db, { projectId, query, tables, limit, projectRoot });
       return textResult(result);
     });
   } catch (err) {
@@ -827,7 +863,10 @@ async function toolMemoryViewSet({ projectRoot, name, queries }) {
 async function toolMemoryViewRun({ projectRoot, name }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const result = await memoryViewLib.memoryViewRun(db, { projectId, name });
+      // projectRoot threaded through to a 'vector'-type query's underlying
+      // memorySearch call (embed-url-from-project-root fix, 2026-09-13) —
+      // see toolMemorySearch's own comment above.
+      const result = await memoryViewLib.memoryViewRun(db, { projectId, name, projectRoot });
       return textResult(result);
     });
   } catch (err) {

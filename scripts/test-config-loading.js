@@ -22,6 +22,34 @@
  *   T10 loadConfig: embedding_model validation — any other value hard-errors at
  *       load time, naming the key, the value, and the single supported model
  *       (total classification, branch (b); e.g. a leftover "mxbai-embed-large")
+ *   T11 getYmlValueInSection (via loadConfig): a BLANK line inside the
+ *       knowledge section never ends it — a key after the blank line still
+ *       resolves (Codex review of PR #302, finding 2: the old reader ended
+ *       a section at the first blank line)
+ *   T12 getYmlValueInSection (via loadConfig): an UNINDENTED comment line
+ *       inside the knowledge section never ends it either — only a real,
+ *       non-comment column-0 line does
+ *   T13 getYmlValueInSection (direct): a key nested two levels deep under an
+ *       unrelated SIBLING mapping inside the same section is never matched —
+ *       only a key at the section's own first-child indentation level is
+ *       (finding 2's "placing unrelated.vllm_embed_url before the direct key
+ *       selects the unrelated URL" repro)
+ *   T14 getYmlValueInSection (direct): surrounding single- OR double-quoted
+ *       values are unquoted, and a trailing ` # comment` outside quotes is
+ *       stripped
+ *   T15 loadConfig() (CLI path, via PROJECT_ROOT) and
+ *       mcp-db-connect.js's loadConfigForRoot() (MCP path, explicit root)
+ *       resolve IDENTICAL host/database from the SAME pipeline.yml
+ *       containing a blank line inside the knowledge section (Codex review
+ *       of PR #302, r2, "new defect introduced by the fix": loadConfig()
+ *       started using the hardened section reader while loadConfigForRoot()
+ *       kept its own old contiguity-based parser, so the two paths could
+ *       silently disagree on which DB a call targets). Ruling: the
+ *       contiguity fix is a bug fix, applied uniformly to both readers —
+ *       T11/T12 above, asserting loadConfig()'s corrected behavior, are
+ *       correct and stay unchanged; this test proves loadConfigForRoot()
+ *       now matches them via the SAME shared reader rather than being
+ *       carved out as a "preserve old CLI behavior" exception.
  *
  * IMPORTANT — CRLF footgun analysis (shared.js getInSection / getTopLevel):
  *   The regex `([^"\n]+)` followed by `.trim()` would capture a trailing \r from
@@ -41,7 +69,11 @@ const os   = require('os');
 const path = require('path');
 
 // Load shared.js exports.
-const { loadConfig, findProjectRoot } = require(path.join(__dirname, 'lib', 'shared'));
+const { loadConfig, findProjectRoot, getYmlValueInSection } = require(path.join(__dirname, 'lib', 'shared'));
+// T15: the MCP-side reader (mcp-db-connect.js) — loaded here to prove it
+// stays in parity with loadConfig() above after both were unified onto
+// getYmlValueInSection.
+const { loadConfigForRoot } = require(path.join(__dirname, 'lib', 'mcp-db-connect'));
 
 // ── Tracking ───────────────────────────────────────────────────────────────────
 
@@ -385,6 +417,103 @@ async function main() {
       if (!message.includes('mxbai-embed-large')) throw new Error(`error message must name the offending value 'mxbai-embed-large'; got: ${message}`);
       if (!message.includes('Qwen/Qwen3-Embedding-8B')) throw new Error(`error message must name the single supported model; got: ${message}`);
 
+      fs.unlinkSync(cfgPath);
+    });
+
+    // T11 — a blank line inside the knowledge section never ends it (Codex
+    // review of PR #302, finding 2).
+    await runTest('T11: a blank line inside the knowledge section never ends it — a later key still resolves', () => {
+      const cfgPath = path.join(claudeDir, 'pipeline.yml');
+      fs.writeFileSync(cfgPath, [
+        'knowledge:',
+        '  tier: postgres',
+        '',
+        '  host: myhost-after-blank',
+        '',
+      ].join('\n'), { encoding: 'utf8' });
+      process.env.PROJECT_ROOT = tmpBase;
+      const cfg = loadConfig();
+      if (cfg.knowledge.tier !== 'postgres') throw new Error(`expected tier 'postgres', got '${cfg.knowledge.tier}'`);
+      if (cfg.host !== 'myhost-after-blank') throw new Error(`expected host 'myhost-after-blank' (blank line must not end the section), got '${cfg.host}'`);
+      fs.unlinkSync(cfgPath);
+    });
+
+    // T12 — an unindented (column-0) comment line inside the knowledge
+    // section never ends it either — only a real, non-comment column-0 line
+    // does (finding 2).
+    await runTest('T12: an unindented comment line inside the knowledge section never ends it', () => {
+      const cfgPath = path.join(claudeDir, 'pipeline.yml');
+      fs.writeFileSync(cfgPath, [
+        'knowledge:',
+        '  tier: postgres',
+        '# a column-0 comment inside the section',
+        '  host: myhost-after-comment',
+        '',
+      ].join('\n'), { encoding: 'utf8' });
+      process.env.PROJECT_ROOT = tmpBase;
+      const cfg = loadConfig();
+      if (cfg.knowledge.tier !== 'postgres') throw new Error(`expected tier 'postgres', got '${cfg.knowledge.tier}'`);
+      if (cfg.host !== 'myhost-after-comment') throw new Error(`expected host 'myhost-after-comment' (comment line must not end the section), got '${cfg.host}'`);
+      fs.unlinkSync(cfgPath);
+    });
+
+    // T13 — a key nested two levels deep under an unrelated sibling mapping
+    // is never matched; only the direct child key at the section's own
+    // first-child indentation level is (finding 2's repro: "placing
+    // unrelated.vllm_embed_url before the direct key selects the unrelated
+    // URL"). Tested directly against getYmlValueInSection since
+    // `vllm_embed_url` is not one of loadConfig()'s own mapped fields.
+    await runTest('T13: a key nested under an unrelated sibling mapping is NOT matched — only the direct child key is', () => {
+      const content = [
+        'knowledge:',
+        '  unrelated:',
+        '    vllm_embed_url: "http://nested-bogus:9999"',
+        '  vllm_embed_url: "http://correct:8800"',
+        '',
+      ].join('\n');
+      const value = getYmlValueInSection(content, 'knowledge', 'vllm_embed_url');
+      if (value !== 'http://correct:8800') {
+        throw new Error(`expected the direct child key's value 'http://correct:8800', got '${value}' (nested sibling key must never match)`);
+      }
+    });
+
+    // T14 — surrounding single- or double-quoted values are unquoted, and a
+    // trailing unquoted ` # comment` is stripped (finding 2).
+    await runTest('T14: single- and double-quoted values are unquoted; a trailing unquoted comment is stripped', () => {
+      const doubleQuoted = getYmlValueInSection(['knowledge:', '  host: "double-quoted-host"', ''].join('\n'), 'knowledge', 'host');
+      if (doubleQuoted !== 'double-quoted-host') throw new Error(`expected 'double-quoted-host', got '${doubleQuoted}'`);
+
+      const singleQuoted = getYmlValueInSection(['knowledge:', "  host: 'single-quoted-host'", ''].join('\n'), 'knowledge', 'host');
+      if (singleQuoted !== 'single-quoted-host') throw new Error(`expected 'single-quoted-host' (single quotes must be stripped), got '${singleQuoted}'`);
+
+      const trailingComment = getYmlValueInSection(['knowledge:', '  host: bare-host  # trailing comment', ''].join('\n'), 'knowledge', 'host');
+      if (trailingComment !== 'bare-host') throw new Error(`expected 'bare-host' (trailing comment must be stripped), got '${trailingComment}'`);
+
+      // A '#' INSIDE quotes is data, never a comment marker — must survive.
+      const hashInQuotes = getYmlValueInSection(['knowledge:', '  host: "host#with-hash"', ''].join('\n'), 'knowledge', 'host');
+      if (hashInQuotes !== 'host#with-hash') throw new Error(`expected 'host#with-hash' (a '#' inside quotes is data, not a comment), got '${hashInQuotes}'`);
+    });
+
+    // T15 — CLI (loadConfig via PROJECT_ROOT) and MCP (loadConfigForRoot,
+    // explicit root) must resolve IDENTICAL host/database from the SAME
+    // pipeline.yml with a blank line inside the knowledge section (Codex
+    // review of PR #302, r2 "new defect introduced by the fix").
+    await runTest('T15: loadConfig() and loadConfigForRoot() agree on host/database with a blank line inside the section', () => {
+      const cfgPath = path.join(claudeDir, 'pipeline.yml');
+      fs.writeFileSync(cfgPath, [
+        'knowledge:',
+        '  host: parity-host',
+        '',
+        '  database: parity_db',
+        '',
+      ].join('\n'), { encoding: 'utf8' });
+      process.env.PROJECT_ROOT = tmpBase;
+      const cliCfg = loadConfig();
+      const mcpCfg = loadConfigForRoot(tmpBase);
+      if (cliCfg.host !== 'parity-host') throw new Error(`expected CLI host 'parity-host', got '${cliCfg.host}'`);
+      if (cliCfg.host !== mcpCfg.host) throw new Error(`CLI/MCP host mismatch: loadConfig()='${cliCfg.host}' vs loadConfigForRoot()='${mcpCfg.host}'`);
+      if (cliCfg.database !== mcpCfg.database) throw new Error(`CLI/MCP database mismatch: loadConfig()='${cliCfg.database}' vs loadConfigForRoot()='${mcpCfg.database}'`);
+      if (mcpCfg.database !== 'parity_db') throw new Error(`expected MCP database 'parity_db' (blank line must not end the section), got '${mcpCfg.database}'`);
       fs.unlinkSync(cfgPath);
     });
 

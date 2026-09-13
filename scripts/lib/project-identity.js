@@ -68,11 +68,29 @@ const { resolveHandoffMdPath }    = require('./handoff-paths');
  * an explicit starting directory so tests can pass a tmpDir as `cwd` and
  * avoid the process.cwd() side-effect.
  *
+ * `opts.explicitRoot` (Codex review of PR #302, finding 6b, 2026-09-13):
+ * when true, the `PROJECT_ROOT` env var is NEVER consulted — `startDir` (the
+ * caller's own explicitly-supplied root, e.g. withProjectDb's MCP-tool-call
+ * `projectRoot`) wins outright. Previously this function preferred
+ * `process.env.PROJECT_ROOT` over `startDir` UNCONDITIONALLY, even when the
+ * caller (ensureProjectIdentity) had already resolved an explicit
+ * `opts.cwd` in preference to the env var one level up — so a markerless
+ * MCP call against project A, made from a server process whose OWN
+ * `PROJECT_ROOT` env happened to be set to a DIFFERENT project B, would
+ * silently target B for legacy-row lookup and marker placement. The env var
+ * is consulted ONLY when the caller itself had no explicit root to give
+ * (the CLI path, where `PROJECT_ROOT` env IS the documented, intentional
+ * resolution source — see ensureProjectIdentity's own `cwd` resolution
+ * above and shared.js's findProjectRoot).
+ *
  * @param {string} startDir
+ * @param {object} [opts]
+ * @param {boolean} [opts.explicitRoot] — true when `startDir` is itself an
+ *   explicitly-supplied root (never an env/cwd fallback) — see above.
  * @returns {string} directory containing `.git`, or startDir if not found
  */
-function _findLegacyRoot(startDir) {
-  if (process.env.PROJECT_ROOT) return process.env.PROJECT_ROOT;
+function _findLegacyRoot(startDir, opts = {}) {
+  if (!opts.explicitRoot && process.env.PROJECT_ROOT) return process.env.PROJECT_ROOT;
   let dir = startDir;
   while (dir !== path.dirname(dir)) {
     if (fs.existsSync(path.join(dir, '.git'))) return dir;
@@ -583,8 +601,12 @@ async function ensureProjectIdentity(db, opts = {}) {
 
   // ── Step 2: No marker found. Check for legacy rows. ──────────────────────
   // _findLegacyRoot() uses the .git walk starting from opts.cwd — still used
-  // here for legacy-row lookup ONLY, never for identity.
-  const legacyRoot   = _findLegacyRoot(cwd);
+  // here for legacy-row lookup ONLY, never for identity. `explicitRoot:
+  // !!opts.cwd` (finding 6b) ensures an explicit caller-supplied root (e.g.
+  // withProjectDb's MCP projectRoot) is never overridden by this process's
+  // own PROJECT_ROOT env var — only the CLI's own no-opts.cwd path still
+  // consults that env var, matching its documented, intentional precedence.
+  const legacyRoot   = _findLegacyRoot(cwd, { explicitRoot: !!opts.cwd });
   const legacyId     = encodeCwd(legacyRoot);
   const hasLegacyRows = await _hasAnyRows(db, legacyId);
 
@@ -824,4 +846,5 @@ module.exports = {
   verifyByteIdentical,      // exported for tests
   runOneShot,               // exported for tests (with custom fatalExit callback)
   writeMarkerAtomic,        // exported for tests
+  _findLegacyRoot,          // exported for tests (finding 6b, explicit-root-vs-env precedence)
 };

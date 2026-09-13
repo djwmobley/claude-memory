@@ -54,6 +54,27 @@ function findProjectRoot() {
   return process.cwd();
 }
 
+// isFullyQualifiedPath — Codex review of PR #302 (r2, finding 6b):
+// `path.isAbsolute('/repo')` and `path.isAbsolute('\\repo')` are BOTH true
+// on win32 — a "rooted but driveless" path that Windows resolves against
+// the CURRENT PROCESS'S drive, not a fixed, unambiguous location — so
+// `path.isAbsolute()` alone is not a safe "this identifies exactly one
+// location, independent of process state" guard for any caller that treats
+// an absolute path as pinning a specific directory (a projectRoot guard, a
+// mock-fixtures path). This helper requires an actual drive letter
+// (`C:\...` / `C:/...`) or a UNC prefix (`\\server\share\...`) on win32,
+// and a leading `/` on POSIX — the total classification: every string is
+// either fully qualified (one branch) or not (the other); there is no
+// third "maybe" case. `platform` is injectable (default: process.platform)
+// so this is unit-testable deterministically on any host OS.
+function isFullyQualifiedPath(p, platform = process.platform) {
+  if (typeof p !== 'string' || p.length === 0) return false;
+  if (platform === 'win32') {
+    return /^[A-Za-z]:[\\/]/.test(p) || /^\\\\[^\\]+\\[^\\]+/.test(p);
+  }
+  return p.startsWith('/');
+}
+
 // ─── CONFIG ─────────────────────────────────────────────────────────────────
 
 /**
@@ -85,6 +106,173 @@ function validateEmbeddingModel(value) {
   }
 }
 
+// Escape a string for literal use inside a `new RegExp(...)` pattern.
+function _escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Strip a YAML scalar value down to its actual content:
+//   - surrounding matching single OR double quotes are removed (a value
+//     that opens with a quote but never closes it is returned verbatim —
+//     malformed input is never silently corrupted further); everything
+//     after the closing quote (including a trailing comment) is discarded,
+//     since only a QUOTED value may contain a literal `#` as data;
+//   - for an UNQUOTED value, a trailing comment is stripped FIRST — before
+//     any trimming — because the caller's keyRe already consumes the
+//     whitespace between `key:` and the value via `\s*`, so a comment-only
+//     value like `key: # disabled` arrives here as the bare string
+//     "# disabled" with NO leading whitespace of its own left to match
+//     against. Codex review of PR #302 (r2, finding 2): the previous
+//     order — trim() THEN look for a `\s#` — could never see that lost
+//     leading whitespace, so "# disabled" survived trim() unchanged and was
+//     returned as if it were literal data. The fix: treat a `#` at the
+//     very START of the raw value (position 0) as ALSO marking a comment
+//     (equivalent to "preceded by whitespace" once you account for the
+//     whitespace \s* already ate), in addition to a `#` preceded by
+//     whitespace mid-value. Trim happens AFTER comment-stripping, not
+//     before. A value that is empty after all of this is absent (the
+//     caller maps '' to null).
+// Pure function of the raw (already key-stripped, NOT pre-trimmed) text on
+// the line.
+function _stripYmlScalar(raw) {
+  const first = raw[0];
+  if (first === '"' || first === "'") {
+    const closeIdx = raw.indexOf(first, 1);
+    if (closeIdx !== -1) return raw.slice(1, closeIdx);
+    return raw.trim(); // no closing quote found — malformed; best-effort passthrough
+  }
+  const commentMatch = raw.match(/(?:^|\s)#/);
+  const withoutComment = commentMatch ? raw.slice(0, commentMatch.index) : raw;
+  return withoutComment.trim();
+}
+
+// Extract a YAML section (from "key:" to the next NON-COMMENT line at
+// indentation 0, or EOF) out of a raw pipeline.yml file's already-read text
+// content. Pure function of `content` — no I/O — so it can be reused both by
+// loadConfig() (which reads the CWD-resolved project's pipeline.yml) and by
+// any caller that already has a specific, explicitly-known project root's
+// file content in hand and must NOT fall back to cwd/PROJECT_ROOT (see
+// readPipelineYmlSectionKey below — the embed-url-from-project-root fix's
+// single section-scoped reader, reused by reference from
+// scripts/lib/embedding-provider.js and scripts/lib/embed.js rather than
+// forked as a second regex).
+//
+// Line-based (never position/contiguity-assuming beyond "this section's own
+// lines"), per project canon on parsers reading human-edited files:
+//   - a BLANK line inside the section never ends it (previously did: the old
+//     regex's `[ \t]+.*` per-line alternation required at least one leading
+//     whitespace char, so an empty line broke the match early);
+//   - a COMMENT line (`#...`) at ANY indentation, including column 0, never
+//     ends the section — only a real (non-comment) line back at column 0
+//     does;
+//   - every other indented line (any depth) is part of the section body,
+//     same as before.
+function getYmlSection(content, section) {
+  const lines = content.split(/\r\n|\r|\n/);
+  const sectionRe = new RegExp(`^${_escapeRegExp(section)}:`);
+  let started = false;
+  const collected = [];
+  for (const line of lines) {
+    if (!started) {
+      if (sectionRe.test(line)) started = true;
+      continue;
+    }
+    if (line.trim() === '') { collected.push(line); continue; } // blank line: never ends the section
+    const leadingWs = line.match(/^[ \t]*/)[0];
+    if (leadingWs.length === 0) {
+      if (line.startsWith('#')) { collected.push(line); continue; } // column-0 comment: never ends the section
+      break; // real, non-comment column-0 content: ends the section
+    }
+    collected.push(line);
+  }
+  return collected.join('\n');
+}
+
+// Get a value within a specific section — scoped to BOTH that section's own
+// lines (see getYmlSection above) AND the section's own first-child
+// indentation level: a key match requires EXACTLY that indentation, never
+// "any indentation" — so a key nested two levels deep under an unrelated
+// sibling mapping inside the same section is never mistaken for a direct
+// child key. Blank lines and comment lines (at any indentation) inside the
+// section are skipped when scanning for both the base indentation and the
+// key itself — they can never establish the base indent and can never match
+// as a key line. Never an any-indented-line match against the whole file, so
+// a same-named key under a DIFFERENT top-level section is never picked up
+// either. Quoted values are unquoted and a trailing unquoted `# comment` is
+// stripped — see _stripYmlScalar above.
+function getYmlValueInSection(content, section, key) {
+  const sectionContent = getYmlSection(content, section);
+  if (!sectionContent) return null;
+  const lines = sectionContent.split('\n');
+
+  const isCommentLine = (line) => {
+    const leadingWs = line.match(/^[ \t]*/)[0];
+    return line.slice(leadingWs.length).startsWith('#');
+  };
+
+  // The section's base (first-child) indentation is whatever the FIRST
+  // actual (non-blank, non-comment) line's leading whitespace is — every
+  // direct child key must match that exact indentation; anything deeper
+  // (a nested key under a sibling mapping) never matches.
+  let baseIndent = null;
+  for (const line of lines) {
+    if (line.trim() === '' || isCommentLine(line)) continue;
+    baseIndent = line.match(/^[ \t]*/)[0];
+    break;
+  }
+  if (baseIndent === null) return null;
+
+  const keyRe = new RegExp(`^${_escapeRegExp(baseIndent)}${_escapeRegExp(key)}:\\s*(.*)$`);
+  for (const line of lines) {
+    if (line.trim() === '' || isCommentLine(line)) continue;
+    const m = line.match(keyRe);
+    if (!m) continue;
+    const value = _stripYmlScalar(m[1]);
+    return value.length ? value : null;
+  }
+  return null;
+}
+
+/**
+ * readPipelineYmlSectionKey — read a single key, scoped to a named
+ * top-level section, from `<root>/.claude/pipeline.yml`, given an EXPLICIT
+ * `root` — never cwd, never PROJECT_ROOT env, never findProjectRoot().
+ * Total classification over the file's reachability: no `root`, no file, or
+ * an absent key all resolve to `null` — never a throw (mirrors
+ * embed.js's own pre-existing `_readPipelineYmlKey`'s "never throw"
+ * contract, for the same reason: a caller resolving an OPTIONAL config
+ * value must be able to treat "not configured" as ordinary data, not an
+ * exceptional path).
+ *
+ * This is the ONE section-scoped pipeline.yml reader outside loadConfig()
+ * itself — scripts/lib/embedding-provider.js's resolveConfiguredEmbedEndpointDetailed
+ * (tier 1, `knowledge.vllm_embed_url`) and scripts/lib/embed.js's embedQuery
+ * (the `opts.projectRoot`-driven `knowledge.embedding_model` fallback) both
+ * call this BY REFERENCE rather than forking a second regex — see
+ * embed.js's `_readPipelineYmlKey`'s own header for why that pre-existing,
+ * DIFFERENT (any-indented-line, unscoped) regex is deliberately NOT reused
+ * for either of those two call sites.
+ *
+ * @param {string} root — absolute project root (caller's responsibility to
+ *   validate; this function itself just treats a falsy/unreadable root as
+ *   "no file")
+ * @param {string} section — top-level YAML section name (e.g. 'knowledge')
+ * @param {string} key — key name within that section
+ * @returns {string|null}
+ */
+function readPipelineYmlSectionKey(root, section, key) {
+  if (!root) return null;
+  const configPath = path.join(root, '.claude', 'pipeline.yml');
+  if (!fs.existsSync(configPath)) return null;
+  let content;
+  try {
+    content = fs.readFileSync(configPath, 'utf8');
+  } catch (_) {
+    return null;
+  }
+  return getYmlValueInSection(content, section, key);
+}
+
 function loadConfig() {
   const root = findProjectRoot();
   const configPath = path.join(root, '.claude', 'pipeline.yml');
@@ -107,18 +295,10 @@ function loadConfig() {
     return match ? match[1].trim() : null;
   };
 
-  // Extract a YAML section (from "key:" to next top-level key or EOF)
-  const getSection = (section) => {
-    const match = content.match(new RegExp(`^${section}:.*\\r?\\n((?:[ \\t]+.*\\r?\\n?)*)`, 'm'));
-    return match ? match[1] : '';
-  };
-
-  // Get a value within a specific section
-  const getInSection = (section, key) => {
-    const sectionContent = getSection(section);
-    const match = sectionContent.match(new RegExp(`^\\s*${key}:\\s*"?([^"\\n]+)"?`, 'm'));
-    return match ? match[1].trim() : null;
-  };
+  // Get a value within a specific section (of THIS file's own already-read
+  // content) — thin wrapper over the shared getYmlValueInSection above, kept
+  // as a local closure so every existing call site below is unchanged.
+  const getInSection = (section, key) => getYmlValueInSection(content, section, key);
 
   const resolvedProjectName = getInSection('project', 'name') || defaults.project;
   const tier = getInSection('knowledge', 'tier') || 'files';
@@ -737,4 +917,24 @@ module.exports = {
   findProjectRoot, loadConfig, connect, c, ollamaBlurbDefaults, projectToDbName,
   vllmEmbed, tryEmbed, hasProvenanceColumn, runWinBin, quoteForCmd, vllmRerank,
   ollamaGenerateBlurb, vllmTokenize, vllmTokenEmbed, lateChunkEmbed,
+  // Exported (2026-09-13, embed-url-from-project-root fix) so
+  // scripts/lib/embedding-provider.js and scripts/lib/embed.js can read a
+  // pipeline.yml key scoped to a named section for an EXPLICIT project root
+  // — never cwd/PROJECT_ROOT — by reference to the SAME regex loadConfig()
+  // itself uses, rather than forking a second one.
+  getYmlSection, getYmlValueInSection, readPipelineYmlSectionKey,
+  // Exported (2026-09-13, embed-url-from-project-root fix, validation-parity
+  // amendment) so scripts/lib/embedding-provider.js's central embed-endpoint/
+  // model resolver can apply the SAME "vLLM is the only supported embedding
+  // backend" validation to a model resolved from an EXPLICIT project root's
+  // pipeline.yml that loadConfig()'s own cwd-scoped path already applies —
+  // never a second, divergent validation rule for the MCP path.
+  validateEmbeddingModel, VLLM_MODEL,
+  // Exported (2026-09-13, embed-url-from-project-root fix, Codex r2 finding
+  // 6b) so handoff-mcp.mjs's withProjectDb guard and embedding-provider.js's
+  // resolveConfiguredEmbedEndpointDetailed guard both reject a Windows
+  // rooted-but-driveless path (`/repo`, `\repo`) that path.isAbsolute()
+  // alone would wrongly accept — by reference to the SAME helper, never two
+  // divergent path-qualification checks.
+  isFullyQualifiedPath,
 };

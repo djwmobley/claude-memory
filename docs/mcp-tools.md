@@ -383,6 +383,35 @@ meaningless similarity score.
 The table enum is closed — an unrecognized table name is a tool error, not
 a silent skip.
 
+**Embed-endpoint resolution and FTS-only degrade** (embed-url-from-project-
+root fix, 2026-09-13): the query embedding is resolved strictly against
+this call's own `projectRoot` — an explicit override, then that project's
+own `.claude/pipeline.yml` `knowledge.vllm_embed_url`, then the
+`VLLM_EMBED_URL` env var, then the user-scope
+`~/.claude/handoff-embed.json` default — never the MCP server process's
+cwd. See [docs/hosts/codex.md § Configuring the embedding
+endpoint](hosts/codex.md#configuring-the-embedding-endpoint) for the full
+tier order and why this matters under Codex specifically. When nothing
+resolves, `memory_search` never throws — it degrades to FTS-only ranking
+against just the 4 tables above that carry a `fts_vec` column, and the
+result carries these additive keys so a caller can tell the difference:
+
+| Key | Values | Meaning |
+|---|---|---|
+| `embedStatus` | `"ok"` \| `"unconfigured"` | Whether an embed endpoint resolved for this call. |
+| `embedSource` | `"explicit"` \| `"pipeline_yml"` \| `"env"` \| `"user_scope"` \| `null` | Which resolution tier won, or `null` when unconfigured. |
+| `embedReason` | `string` \| `null` | Why resolution failed (e.g. `"unconfigured"`), or `null` when `embedStatus` is `"ok"`. |
+| `searchMode` | `"hybrid"` \| `"fts_only"` | Which scoring path actually ran. |
+| `note` | `string` (only present when `searchMode` is `"fts_only"`) | Human-readable summary naming which of the requested tables were skipped because they have no `fts_vec` column to fall back to. |
+
+`hits`, `tablesSearched`, `skippedTables`, and `allSkipped` keep their
+pre-existing shape and names in both modes. In `fts_only` mode, a
+requested table with no `fts_vec` column lands in `skippedTables` with
+`reason: "no_fts_column"` — the admitted-table set is always a subset of
+what hybrid mode would have admitted from the same request. An injected
+test embedder (internal callers only — not a tool parameter) bypasses this
+resolution entirely and always runs hybrid.
+
 ## `memory_upsert` / `memory_get` — typed writes and lookups
 
 `memory_upsert` writes one row to any of the 9 seam tables that carry a
