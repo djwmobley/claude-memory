@@ -12,6 +12,7 @@ Quick health check. Shows the project name and marker uuid, when the last sessio
 - Live-row counts for `entities`, `assertions`, `edges`, scoped to this project. **Live** means `suppressed = false` (entities/edges) or `suppressed = false AND invalid_at IS NULL` (assertions — the bi-temporal predicate). The `assertions` figure also breaks out `suppressed` and `invalidated` counts alongside it so nothing is silently folded in (cm#232 — before this fix, `assertions` was a raw `COUNT(*)` that included suppressed rows).
 - Current retrieval contract names stored in `retrieval_contract`.
 - Whether a `session_in_progress` marker is present in `project_settings`.
+- `engine` — the running engine's revision/schema-epoch reported three ways (owner ruling 2026-09-13): `loaded` (captured once when this process's `scripts/lib/engine-revision.js` module was imported — frozen for the life of the process, so a long-lived MCP server's `loaded` stays fixed even if the checkout on disk later changes), `disk` (the SAME `{schema_epoch, revision, source}` shape, recomputed fresh on every `status` call from the engine checkout on disk), and `db` (`{schema_epoch}`, the project DB's own stored `schema_fingerprint` epoch, or `null` if unreadable/unset). `revision` is a short git SHA (`source: "git"`) when the engine checkout is a git repo, a `VERSION` file's contents (`source: "version-file"`) otherwise, or `"unknown"`/`"unknown"` if neither is available. `drift` is one of `schema-epoch-guard.js`'s total-classification branch names (`proceed`, `stale_engine`, `engine_checkout_inconsistent`, `engine_behind_db`, `annotate_only`, `heal_failed`) and `remedy` is that branch's actionable message, or `null` on `proceed`/`annotate_only`.
 
 ## Arguments
 
@@ -25,7 +26,7 @@ Flags may be combined freely: `--json --breakdown --stale-pointers` emits a sing
 
 ## Preferred path — MCP
 
-If the `mcp__handoff__handoff_status` tool is available in this session, call it directly — it returns the same structured fields as `status --json` (project_id, project_name, host, promotion_file, live entity/assertion/edge counts plus assertions_suppressed/assertions_invalidated/assertions_total, handoff.md path, last_close/days_since, contracts, session_active, session_id, packaging) without a shell round-trip. Read-only — makes no writes.
+If the `mcp__handoff__handoff_status` tool is available in this session, call it directly — it returns the same structured fields as `status --json` (project_id, project_name, host, promotion_file, live entity/assertion/edge counts plus assertions_suppressed/assertions_invalidated/assertions_total, handoff.md path, last_close/days_since, contracts, session_active, session_id, packaging, engine) without a shell round-trip. Read-only — makes no writes.
 
 ```
 ToolSearch({ query: "select:mcp__handoff__handoff_status" })
@@ -112,6 +113,8 @@ Running: handoff:status
   edges:            12
   contracts:        default
   session_active:   no
+  engine (loaded):  schema_epoch=5 revision=f85c79c (git)
+  engine (disk):    schema_epoch=5 revision=f85c79c (git); db schema_epoch=5; drift=proceed
 
 Done: handoff:status — project=my-project marker=C--Users-username-dev-my-project — 23 entities, 41 assertions (suppressed: 5, invalidated: 1), 12 edges
 ```
@@ -136,7 +139,14 @@ Done: handoff:status — project=my-project marker=C--Users-username-dev-my-proj
   "contracts": ["default"],
   "session_active": false,
   "session_id": null,
-  "packaging": "clean"
+  "packaging": "clean",
+  "engine": {
+    "loaded": { "schema_epoch": 5, "revision": "f85c79c", "source": "git" },
+    "disk": { "schema_epoch": 5, "revision": "f85c79c", "source": "git" },
+    "db": { "schema_epoch": 5 },
+    "drift": "proceed",
+    "remedy": null
+  }
 }
 ```
 

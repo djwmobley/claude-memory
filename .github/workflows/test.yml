@@ -854,6 +854,20 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run MCP process-lifecycle tests
+        # test/test-mcp-process-lifecycle.js — regression coverage for the
+        # fix/mcp-process-lifecycle PR: (T1) scripts/handoff-mcp.mjs exits
+        # within 3s of a clean stdin 'end' (a host closing its write end
+        # cleanly used to leave this process running forever -- the SDK's
+        # StdioServerTransport only ever closed itself on a stdin read
+        # ERROR, never on a clean end); (T2) exits within 3s of SIGTERM;
+        # (T3) scripts/handoff-mcp-selftest.mjs's runWithClient() helper
+        # still calls client.close() when the wrapped selftest body throws,
+        # so a failing selftest run never orphans its spawned server child.
+        # No live Postgres needed -- buildServer() registers tools
+        # synchronously and never connects to a DB until a tool is actually
+        # called.
+        run: node test/test-mcp-process-lifecycle.js
       - name: Run memory-search per-table availability gate tests (2026-09-09)
         # scripts/test-memory-search-gate.js — regression coverage for the
         # memory_search per-table gate rewrite: (A) a static drift test
@@ -1352,6 +1366,21 @@ jobs:
         #       both equal the canonical set in the SQL schema CHECK constraint
         # Pure static analysis — no Postgres or Ollama required.
         run: node scripts/test-doc-lint.js
+      - name: Run build-zip packaging tests (feat/package-compose-zip)
+        # Tests scripts/build-zip.js, the public dist/memory-manager-<version>.zip
+        # packager: T1 include-list totality against this repo checkout (every
+        # base + --offline path actually exists on main); T2 exclusion assertions
+        # via a synthetic fixture tree (.git/.claude/node_modules/.env/*.local.*/
+        # *.bak-*/docs/notes/private-runbook-named files all proven excluded,
+        # ordinary sibling files proven included); T3 VERSION + SHA256SUMS content
+        # and per-file hash correctness; T4 --offline (refuses loud when
+        # scripts/node_modules is absent, stages it when present); T5 an
+        # end-to-end archive() build via the platform archiver detected at
+        # runtime (tar/bsdtar on win32, zip elsewhere) — reported SKIPPED, never
+        # silently passed, if this runner has neither. Pure filesystem test — no
+        # Postgres or Ollama required; only ever touches temp directories under
+        # os.tmpdir(), never this checkout's own dist/.
+        run: node test/test-build-zip.js
       - name: Run §8 CRUD vector-strip tests (embedding stripping + read-limit clamp)
         # cm MCP-payload fix (PR #271): scripts/lib/vector-strip.js strips
         # pgvector-typed columns (manifest-driven, schema-manifest.json's
@@ -1461,6 +1490,22 @@ jobs:
         # Pure/filesystem-only -- no live Postgres required (the guard
         # rejects before any database connection is opened).
         run: node test/test-mcp-epoch-guard.js
+      - name: Run engine-revision tests (feat/status-engine-revision)
+        # Owner ruling 2026-09-13: handoff_status reports the engine
+        # revision/schema-epoch three ways -- LOADED (module-import
+        # snapshot, frozen), DISK (fresh read every call), DB (the project
+        # DB's own stored epoch) -- and a schema-epoch-guard.js drift
+        # verdict. T1-T4 (readDiskRevision total classification: git
+        # checkout / VERSION-file / empty dir / manifest-only dir) and T5
+        # (LOADED never changes; a fresh call reflects a post-import
+        # VERSION rewrite) are pure/filesystem-only. T6 spins up its own
+        # throwaway Postgres DB/project (never claude_memory_eval_test) and
+        # asserts `handoff.js status --json`'s `engine` object shape.
+        run: node test/test-engine-revision.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run host-agnostic naming tests
         # Regression guard for #135 (host-agnostic naming generalization):
         #   M1-M7  Dual-marker same-directory classification (new .memory-engine

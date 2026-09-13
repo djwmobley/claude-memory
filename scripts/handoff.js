@@ -120,6 +120,13 @@ const {
   latestSessionMarker,
   resolveSessionIdFromMarker,
 } = require('./lib/session-identity');
+// feat/status-engine-revision: LOADED is captured once at THIS process's
+// module-import time; readDiskRevision is called again fresh on every
+// cmdStatus touch (see cmdStatus below) for the "DISK" half of the owner
+// ruling. No second implementation of "what revision/epoch does the on-disk
+// checkout declare" — schema-epoch-guard.js's readDiskSchemaEpoch backs both.
+const { readDiskRevision, LOADED: ENGINE_LOADED } = require('./lib/engine-revision.js');
+const { classifyEpochDrift } = require('./lib/schema-epoch-guard.js');
 
 process.on('exit', () => {
   const ms = Number(process.hrtime.bigint() - __startNs) / 1e6;
@@ -4866,6 +4873,59 @@ async function cmdStatus(args = []) {
     process.stderr.write('[handoff] schema heal check failed (non-fatal): ' + schemaHealErr.message + '\n');
   }
 
+  // feat/status-engine-revision, owner ruling 2026-09-13: report the engine
+  // revision + schema epoch three ways — LOADED (module-import snapshot,
+  // frozen), DISK (fresh read of THIS engine checkout, right now), and DB
+  // (the project DB's own stored epoch) — plus a drift verdict, so a caller
+  // (human or Codex) can tell "this MCP server is stale" apart from "this
+  // engine build is older than the database" apart from "the database's
+  // schema state itself could not be classified", without guessing from a
+  // bare boolean.
+  //
+  // dbSchemaEpoch is read directly off project_settings.schema_fingerprint
+  // (via the SAME _parseSchemaFingerprint parser ensureSchemaCurrentCore's
+  // own 'ahead' branch uses — never a second parser) rather than reused only
+  // from schemaHealResult.detail.stored_epoch, because that detail field is
+  // populated ONLY on the 'ahead' branch — every other reason ('current',
+  // 'applied', 'degraded', 'unknown', ...) would otherwise leave db.schema_epoch
+  // permanently null even when the DB's own stored fingerprint is perfectly
+  // readable. null here (row absent, or a fingerprint string
+  // _parseSchemaFingerprint cannot parse) is itself meaningful input to
+  // classifyEpochDrift below — never coerced to a fake number.
+  let dbSchemaEpoch = null;
+  try {
+    const rawSchemaFingerprint = await getSetting(db, projectId, 'schema_fingerprint', null);
+    if (rawSchemaFingerprint) {
+      dbSchemaEpoch = _parseSchemaFingerprint(rawSchemaFingerprint).epoch;
+    }
+  } catch (_) {
+    dbSchemaEpoch = null;
+  }
+
+  // Fresh, request-time read of the checkout on disk — engineDisk is
+  // recomputed on EVERY cmdStatus call (per the owner ruling); ENGINE_LOADED
+  // (module-top require) is the frozen, captured-once-at-import snapshot.
+  const engineDisk = readDiskRevision(_ENGINE_ROOT);
+
+  // classifyEpochDrift's loadedEpoch is the real in-process SCHEMA_EPOCH
+  // literal (the same value every other call site of this classifier in
+  // this codebase passes — checkEngineEpochOrThrow, main()'s CLI-entry
+  // self-consistency gate) — deliberately NOT ENGINE_LOADED.schema_epoch,
+  // which is itself a manifest-file read captured at import time and would
+  // silently mask a real "code literal disagrees with its own manifest"
+  // drift (both numbers would just be whatever the manifest said at
+  // import, never the literal). ENGINE_LOADED is still the correct value
+  // to REPORT as `engine.loaded` below (that field's whole contract is "the
+  // import-time snapshot"); it is just not the right input for this
+  // classification. classifyEpochDrift itself is reused verbatim — no fork.
+  const engineDriftClassification = classifyEpochDrift({
+    loadedEpoch: SCHEMA_EPOCH,
+    diskEpoch: engineDisk.schema_epoch,
+    dbEpoch: dbSchemaEpoch,
+    healReason: schemaHealResult ? schemaHealResult.reason : undefined,
+    healDetail: schemaHealResult ? schemaHealResult.detail : undefined,
+  });
+
   // Counts — cm#232: getLiveCounts is the single shared query behind every
   // entity/assertion/edge count status reports (prose, --json, and the Done
   // line all derive from this one call — see getLiveCounts above).
@@ -5088,6 +5148,18 @@ async function cmdStatus(args = []) {
       session_active: sipDisplay.active,
       session_id:     sipDisplay.id,
       packaging:      packagingState,
+      // feat/status-engine-revision, owner ruling 2026-09-13: LOADED (frozen
+      // at this process's module-import time) and DISK (fresh, this call)
+      // are BOTH always reported — never just one — plus the DB's own
+      // stored epoch and a total-classification drift verdict/remedy reused
+      // verbatim from schema-epoch-guard.js's classifyEpochDrift.
+      engine: {
+        loaded: ENGINE_LOADED,
+        disk:   engineDisk,
+        db:     { schema_epoch: dbSchemaEpoch },
+        drift:  engineDriftClassification.branch,
+        remedy: engineDriftClassification.message,
+      },
       schema_heal:    schemaHealedLine,
       schema_apply_degraded: schemaDegraded,
       embedding_readiness: embeddingReadiness,
@@ -5125,6 +5197,10 @@ async function cmdStatus(args = []) {
   console.log(`  contracts:        ${contracts}`);
   console.log(`  session_active:   ${sipDisplay.prose}`);
   console.log(`  last SessionEnd (loader-stop): ${lastLoaderStop ? `${lastLoaderStop.ts} ${lastLoaderStop.outcome}${lastLoaderStop.session_id ? ` [session ${lastLoaderStop.session_id}]` : ''}` : 'never'}`);
+  // feat/status-engine-revision: LOADED (frozen at module-import) and DISK
+  // (fresh, this call) are always both printed — never just one.
+  console.log(`  engine (loaded):  schema_epoch=${ENGINE_LOADED.schema_epoch != null ? ENGINE_LOADED.schema_epoch : '?'} revision=${ENGINE_LOADED.revision} (${ENGINE_LOADED.source})`);
+  console.log(`  engine (disk):    schema_epoch=${engineDisk.schema_epoch != null ? engineDisk.schema_epoch : '?'} revision=${engineDisk.revision} (${engineDisk.source}); db schema_epoch=${dbSchemaEpoch != null ? dbSchemaEpoch : '?'}; drift=${engineDriftClassification.branch}`);
   if (packagingLine) console.log(packagingLine);
   if (schemaHealedLine) {
     console.log(`  schema_heal:      ${schemaHealedLine}`);
