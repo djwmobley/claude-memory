@@ -46,6 +46,7 @@ const {
   runPointerGate,
   // cm#297 TOTAL pointer-scope classification internals.
   _classifyPointerScope,
+  _extractRawPointerCandidates,
 } = require('../../scripts/handoff.js');
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
@@ -976,6 +977,62 @@ async function runTests() {
     const r = _classifyPointerScope(dir, upperPointer);
     assert.strictEqual(r.scope, 'IN_REPO_RESOLVABLE',
       `case-differing relative pointer must resolve IN_REPO on win32, got ${r.scope} for ${upperPointer} against root ${dir}`);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // ── T28-T33: cm#297 round 2 — whole-text external detection + no extension
+  // allow-list (_extractRawPointerCandidates / _classifyPointerScope) ───────────
+
+  await test('T28: external drive-letter pointer with a space in the path component is extracted whole, not truncated at the space', () => {
+    const candidates = _extractRawPointerCandidates('C:\\other\\my file.js:9');
+    assert.deepStrictEqual(candidates, ['C:\\other\\my file.js:9'],
+      `expected the full external span, got ${JSON.stringify(candidates)}`);
+  });
+
+  await test('T29: a space-containing external pointer alongside an in-repo pointer yields one external + one in-repo candidate', () => {
+    const candidates = _extractRawPointerCandidates('C:\\other\\my file.js:9 and scripts/handoff.js:10');
+    assert.deepStrictEqual(candidates, ['C:\\other\\my file.js:9', 'scripts/handoff.js:10'],
+      `expected external + in-repo candidates, got ${JSON.stringify(candidates)}`);
+  });
+
+  await test('T30: UNC path with a space in a directory component is extracted whole', () => {
+    const candidates = _extractRawPointerCandidates('\\\\srv\\share\\my dir\\x.js:1');
+    assert.deepStrictEqual(candidates, ['\\\\srv\\share\\my dir\\x.js:1'],
+      `expected the full UNC span, got ${JSON.stringify(candidates)}`);
+  });
+
+  await test('T31: semicolon-adjacent pointers (a.js:9;b.js:9) yield two separate candidates, not one malformed token', () => {
+    const candidates = _extractRawPointerCandidates('a.js:9;b.js:9');
+    assert.deepStrictEqual(candidates, ['a.js:9', 'b.js:9'],
+      `expected two separate candidates, got ${JSON.stringify(candidates)}`);
+  });
+
+  await test('T32: parenthesis-wrapped pointer ((handoff.js:10)) is extracted without the parens', () => {
+    const candidates = _extractRawPointerCandidates('(handoff.js:10)');
+    assert.deepStrictEqual(candidates, ['handoff.js:10'],
+      `expected the pointer without parens, got ${JSON.stringify(candidates)}`);
+  });
+
+  await test('T33: extension allow-list is gone from the classification path — main.go:12 classifies by existence, not extension', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ptr-gate-t33-'));
+    fs.writeFileSync(path.join(dir, 'main.go'), Array.from({ length: 15 }, (_, i) => i === 11 ? 'func main() {}' : `// ${i}`).join('\n'), 'utf8');
+
+    const resolvable = _classifyPointerScope(dir, 'main.go:12');
+    assert.strictEqual(resolvable.scope, 'IN_REPO_RESOLVABLE',
+      `expected IN_REPO_RESOLVABLE for an existing .go file, got ${resolvable.scope}`);
+
+    const stale = _classifyPointerScope(dir, 'main.go:9999');
+    assert.strictEqual(stale.scope, 'IN_REPO_STALE',
+      `expected IN_REPO_STALE for an out-of-range .go pointer, got ${stale.scope}`);
+
+    const missing = _classifyPointerScope(dir, 'scripts/gone.go:9');
+    assert.strictEqual(missing.scope, 'IN_REPO_STALE',
+      `expected IN_REPO_STALE for a missing .go file (never NOT_A_POINTER for an unlisted extension), got ${missing.scope}`);
+
+    const unknownExt = _classifyPointerScope(dir, 'x.unknownext:3');
+    assert.notStrictEqual(unknownExt.scope, 'NOT_A_POINTER',
+      `an unrecognized-but-plausible extension must never classify NOT_A_POINTER on the strength of the extension alone, got ${unknownExt.scope}`);
+
     fs.rmSync(dir, { recursive: true, force: true });
   });
 

@@ -823,37 +823,134 @@ function _isExternalPointerToken(raw) {
 }
 
 /**
- * Extract every raw pointer-SHAPED token from a text blob: a maximal
- * whitespace-delimited run ending in `.ext:N` or `.ext:N-M`. This is
- * deliberately broader than POINTER_RE — it captures a token's full
- * external-looking prefix (backslashes, drive letters, UNC, URL scheme) so
- * _isExternalPointerToken (above) can classify it BEFORE any bare-filename
- * fallback is attempted (spec item 1: an unparseable/external token must
- * never fall back to bare-filename matching).
+ * External-shaped SPANS (round 2 / cm#297 finding #1, #5 fix): matched over
+ * the WHOLE raw text, BEFORE any whitespace tokenization — a space inside a
+ * Windows path component ("C:\other\my file.js:9") must never truncate the
+ * candidate down to just the trailing whitespace-delimited word, which is
+ * what let an external path get misread as an in-repo bare filename.
+ * Extension: 1-10 alnum chars, matching the in-repo shape below.
+ */
+const EXTERNAL_SPAN_RE = new RegExp(
+  [
+    // Windows drive-letter path (backslash or forward slash after the colon).
+    String.raw`[A-Za-z]:[\\/][^:\r\n]*?\.[A-Za-z0-9]{1,10}:\d+(?:-\d+)?`,
+    // UNC backslash path: \\server\share\...
+    String.raw`\\\\[^\s\\]+\\[^:\r\n]*?\.[A-Za-z0-9]{1,10}:\d+(?:-\d+)?`,
+    // POSIX-style double-slash share: //server/share/...
+    String.raw`\/\/[^\s\/]+\/[^:\r\n]*?\.[A-Za-z0-9]{1,10}:\d+(?:-\d+)?`,
+    // file:// URL
+    String.raw`file:\/\/[^\s:\r\n]*?\.[A-Za-z0-9]{1,10}:\d+(?:-\d+)?`,
+    // http(s):// host-prefixed URL
+    String.raw`https?:\/\/[^\s:\r\n]*?\.[A-Za-z0-9]{1,10}:\d+(?:-\d+)?`,
+  ].join('|'),
+  'gi'
+);
+
+/**
+ * In-repo pointer candidates: GLOBAL matching over what's left after external
+ * spans are blanked out — never whitespace splitting — so
+ * "a.js:9;b.js:9", "(a.js:9)", and "a.js:9," each yield their own separate
+ * candidate instead of one malformed run.
+ */
+const IN_REPO_SPAN_RE = /(?:[A-Za-z0-9_./-]+\/)?[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,10}:\d+(?:-\d+)?/g;
+
+/**
+ * Fail-closed backstop (spec item 1c): any token that still contains a
+ * backslash and touches a `:N` line-number suffix after steps (a) and (b)
+ * have run — i.e. a malformed/unusual Windows-ish path that didn't match one
+ * of the structured external shapes above — is treated as external rather
+ * than risking an in-repo bare-filename match.
+ */
+const REMAINING_BACKSLASH_RE = /[^\s]*\\[^\s]*:[0-9]+(?:-[0-9]+)?/g;
+
+/**
+ * Extract every raw pointer-SHAPED candidate from a text blob (spec item 1).
+ * Three passes, in order:
+ *   (a) external-shaped spans over the WHOLE text (before any tokenization) —
+ *       each becomes an UNPARSEABLE_OR_EXTERNAL candidate (verified by
+ *       _classifyPointerScope's own _isExternalPointerToken pre-filter, since
+ *       the returned span retains its external-looking prefix) and is blanked
+ *       out of the working text so it can't also be picked up below;
+ *   (b) in-repo candidates via GLOBAL regex matching (not whitespace
+ *       splitting) over the remaining text;
+ *   (c) any leftover backslash-containing token touching `:N` — fail closed
+ *       as external.
  *
  * @param {string} text
- * @returns {string[]} — de-duplicated, in first-seen order
+ * @returns {string[]} — de-duplicated, in first-seen (scan) order
  */
-const RAW_POINTER_CANDIDATE_RE = /\S+\.[A-Za-z]+:[1-9][0-9]*(?:-[1-9][0-9]*)?/g;
 function _extractRawPointerCandidates(text) {
   if (!text || typeof text !== 'string') return [];
   const seen    = new Set();
   const results = [];
-  const re      = new RegExp(RAW_POINTER_CANDIDATE_RE.source, 'g');
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    if (seen.has(m[0])) continue;
-    seen.add(m[0]);
-    results.push(m[0]);
+
+  // Mutable UTF-16-code-unit array so matched spans can be blanked (replaced
+  // with spaces of identical length) without shifting offsets for later passes.
+  const chars = text.split('');
+  const blank = (start, end) => { for (let i = start; i < end; i++) chars[i] = ' '; };
+  const record = (raw) => { if (!seen.has(raw)) { seen.add(raw); results.push(raw); } };
+
+  // Step (a): external-shaped spans over the WHOLE original text.
+  {
+    const re = new RegExp(EXTERNAL_SPAN_RE.source, EXTERNAL_SPAN_RE.flags);
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      record(m[0]);
+      blank(m.index, m.index + m[0].length);
+      if (m[0].length === 0) re.lastIndex++;
+    }
   }
+
+  // Step (b): in-repo candidates, global matching over the blanked text.
+  const afterExternal = chars.join('');
+  {
+    const re = new RegExp(IN_REPO_SPAN_RE.source, IN_REPO_SPAN_RE.flags);
+    let m;
+    while ((m = re.exec(afterExternal)) !== null) {
+      record(m[0]);
+      blank(m.index, m.index + m[0].length);
+      if (m[0].length === 0) re.lastIndex++;
+    }
+  }
+
+  // Step (c): fail-closed backslash backstop over what's still left.
+  const afterInRepo = chars.join('');
+  {
+    const re = new RegExp(REMAINING_BACKSLASH_RE.source, REMAINING_BACKSLASH_RE.flags);
+    let m;
+    while ((m = re.exec(afterInRepo)) !== null) {
+      record(m[0]);
+      if (m[0].length === 0) re.lastIndex++;
+    }
+  }
+
   return results;
 }
 
 /** Anchored single-token pointer shape (path.ext:N[-M]), applied only to an
  *  already-isolated raw candidate that is NOT external (_isExternalPointerToken
- *  already returned false). Extension is intentionally lowercase-only, same as
- *  POINTER_RE, so an uppercase-extension token classifies NOT_A_POINTER. */
-const SINGLE_POINTER_RE = /^([\w./][\w./\-]*?\.([a-z]+)):([1-9][0-9]*)(?:-([1-9][0-9]*))?$/;
+ *  already returned false). Extension: 1-10 alnum chars — deliberately NOT an
+ *  allow-list (cm#297 round 2 / finding #6): any plausible `name.ext:line`
+ *  shape is a candidate here, and existence on disk (see _isPlausiblePointerShape
+ *  and _pointerRangeVerdict below) decides IN_REPO_RESOLVABLE vs IN_REPO_STALE,
+ *  never the extension string itself. */
+const SINGLE_POINTER_RE = /^([\w./][\w./\-]*?\.([A-Za-z0-9]{1,10})):([1-9][0-9]*)(?:-([1-9][0-9]*))?$/;
+
+/**
+ * Classification-path plausibility check (cm#297 round 2 / finding #6):
+ * unlike _isValidPointerMatch (above — used ONLY by _extractPointers, the
+ * separate P-1..P-4 serve-time rewrite gate for TL;DR/open_threads/
+ * quick_references text; left unchanged, non-goal here), this does NOT
+ * consult POINTER_EXTENSIONS. Every extension is a candidate; a row is only
+ * ever ruled NOT_A_POINTER on SHAPE (no directory AND no letter/dash/
+ * underscore in the base name — i.e. it doesn't look like a filename at
+ * all), never because its extension isn't on some allow-list.
+ */
+function _isPlausiblePointerShape(pth) {
+  const hasSlash = pth.includes('/') || pth.includes('\\');
+  const hasDirOrKnownFile = hasSlash || /[a-zA-Z_-]/.test(pth.replace(/\.[^.]+$/, ''));
+  return hasDirOrKnownFile;
+}
 
 /**
  * IN_REPO_RESOLVABLE vs IN_REPO_STALE — file exists and the cited line is
@@ -898,7 +995,7 @@ function _classifyPointerScope(projectRoot, raw) {
   if (!m) return Object.assign({}, base, { scope: 'NOT_A_POINTER' });
   const [, ptrPath, extRaw, startStr, endStr] = m;
   const ext = extRaw.toLowerCase();
-  if (!_isValidPointerMatch(ext, ptrPath)) {
+  if (!_isPlausiblePointerShape(ptrPath)) {
     return Object.assign({}, base, { scope: 'NOT_A_POINTER' });
   }
   const startLine = parseInt(startStr, 10);
