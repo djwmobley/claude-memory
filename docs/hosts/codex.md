@@ -33,6 +33,47 @@ requirement:
   [codex-howto.md § Degraded modes](codex-howto.md#degraded-modes)).
 - **The `codex` CLI itself**, on `PATH`, already authenticated.
 
+### Configuring the embedding endpoint
+
+Every MCP tool call that embeds a query (`memory_search`, `memory_view_run`'s
+`vector`-kind queries, `persist_decisions`'s `verifyQuery`) resolves the vLLM
+endpoint URL and model **from that call's own `projectRoot` argument** — it
+never reads the MCP server process's own working directory or its
+`PROJECT_ROOT` environment variable. This matters specifically under Codex:
+Codex is free to launch the MCP server from a cwd that differs from the
+project you are actually calling tools against (e.g. a `.codex-temp`
+scratch directory), and before this fix that mismatch made every embed call
+throw. Resolution order, first match wins:
+
+1. An explicit per-call override (used only by internal callers; not
+   exposed as a tool parameter).
+2. `<projectRoot>/.claude/pipeline.yml`, `knowledge.vllm_embed_url` — the
+   calling project's own config. Read scoped to the `knowledge:` section
+   only; a same-named key under a different section is never picked up.
+3. The `VLLM_EMBED_URL` environment variable (in the MCP server's own
+   process env), trimmed — a whitespace-only value is treated as unset.
+4. The user-scope default, `~/.claude/handoff-embed.json`'s
+   `vllm_embed_url` key (or `$HANDOFF_BASE_DIR/handoff-embed.json` if that
+   env var is set).
+5. Unconfigured.
+
+If none of the above resolves a URL, `memory_search` (and any `vector`-kind
+`memory_view_run` query, and `persist_decisions`'s `verifyQuery`) does
+**not** throw. It degrades to full-text-search-only ranking and says so in
+the result: `embedStatus: "unconfigured"`, `searchMode: "fts_only"`, and a
+top-level `note` string. In `fts_only` mode, only the 4 tables that carry a
+full-text-search column (`decisions`, `gotchas`, `findings`, `code_index`)
+are searched — the other 11 tables in the closed enum (`assertions`,
+`agent_exchange`, `research`, `incidents`, `tasks`, `checklist_items`,
+`corpus_files`, `workflow_discovery`, `agent_rewrites`, `policy_sections`,
+`session_chunks`) have no text index to fall back to and become invisible
+for the duration of the degrade — they appear in `skippedTables` with
+`reason: "no_fts_column"`, and the `note` names them. This is strictly
+worse recall, not a partial failure: nothing throws, nothing is corrupted,
+and once an endpoint is configured (see the resolution order above) the
+very next call returns to full hybrid search with no further action
+required.
+
 ## Install
 
 ```

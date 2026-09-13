@@ -513,6 +513,53 @@ knowledge:
     });
   });
 
+  // ─── Section 5: embed-url-from-project-root fix (2026-09-13) ─────────────
+  // Extends resolveConfiguredEmbedEndpointDetailed coverage above with the
+  // NEW tier 0 (explicit override) and the knowledge-section scoping
+  // guarantee (adversary R9). The exhaustive resolver/embedQuery/
+  // memorySearch case list (R1-R11, M1, S1-S5, C1) lives in the dedicated
+  // test/test-embed-url-project-root.js — this section only adds
+  // regression coverage directly against the function this file already
+  // owns.
+
+  console.log('\n=== Section 5: embed-url-from-project-root fix — tier 0 (explicit) + knowledge-section scoping ===');
+
+  await test('resolveConfiguredEmbedEndpointDetailed: tier 0 (opts.vllmUrl) wins over pipeline.yml/env/user-scope', async () => {
+    await withIsolatedHandoffBaseDir(() => {
+      fs.writeFileSync(path.join(process.env.HANDOFF_BASE_DIR, 'handoff-embed.json'), JSON.stringify({ vllm_embed_url: 'http://127.0.0.1:9999' }), 'utf8');
+      const root = makeTmpProjectRoot(`
+knowledge:
+  vllm_embed_url: "http://localhost:9001"
+`.trim());
+      const result = resolveConfiguredEmbedEndpointDetailed({ vllmUrl: 'http://localhost:9000', projectRoot: root, env: { VLLM_EMBED_URL: 'http://localhost:9002' } });
+      assertEqual(result.url, 'http://localhost:9000');
+      assertEqual(result.source, 'explicit');
+    });
+  });
+
+  await test('resolveConfiguredEmbedEndpointDetailed: a vllm_embed_url declared under a NON-knowledge section is never picked up (R9)', async () => {
+    await withIsolatedHandoffBaseDir(() => {
+      const root = makeTmpProjectRoot(`
+project:
+  vllm_embed_url: "http://localhost:7777"
+
+knowledge:
+  tier: "postgres"
+`.trim());
+      const result = resolveConfiguredEmbedEndpointDetailed({ projectRoot: root, env: {} });
+      assert(result.url !== 'http://localhost:7777', 'a vllm_embed_url under project: must not be read as knowledge.vllm_embed_url');
+      assertEqual(result.source, null);
+    });
+  });
+
+  await test('resolveConfiguredEmbedEndpointDetailed: a relative projectRoot is a hard input error (throws)', () => {
+    let threw = null;
+    try {
+      resolveConfiguredEmbedEndpointDetailed({ projectRoot: 'relative/path', env: {} });
+    } catch (err) { threw = err; }
+    assert(threw instanceof Error, 'expected a thrown Error for a relative projectRoot');
+  });
+
   console.log(`\n─── Results ──────────────────────────────────────`);
   console.log(`PASS ${passed}  FAIL ${failed}`);
   process.exit(failed > 0 ? 1 : 0);

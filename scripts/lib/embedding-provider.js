@@ -35,12 +35,24 @@
 
 const fs   = require('fs');
 const path = require('path');
-const { _vllmEmbedRaw, VllmHttpError, VllmTimeoutError, VllmNetworkError, _readPipelineYmlKey } = require('./embed');
+const { _vllmEmbedRaw, VllmHttpError, VllmTimeoutError, VllmNetworkError } = require('./embed');
 // resolveBaseDir is the engine's ONE existing user-scope config root
 // resolution (~/.claude, HANDOFF_BASE_DIR-overridable) — reused BY
 // REFERENCE for the user-scope embed-endpoint default file below, never a
 // second homedir literal (init-embeddability spec, "User-scope default").
 const { resolveBaseDir } = require('./handoff-paths');
+// readPipelineYmlSectionKey is the ONE section-scoped pipeline.yml reader
+// (embed-url-from-project-root fix, 2026-09-13) — reused BY REFERENCE here
+// for tier 1 below instead of embed.js's pre-existing `_readPipelineYmlKey`,
+// which matches ANY indented line in the whole file, not just the
+// `knowledge:` section (see that function's own header for why it stays
+// as-is for the byte-for-byte-unchanged CLI path only).
+// validateEmbeddingModel is the SAME "vLLM is the only supported embedding
+// backend" check loadConfig() applies on the CLI path (shared.js ~186) —
+// reused BY REFERENCE (validation-parity amendment, 2026-09-13) so a model
+// resolved from an explicit project root's pipeline.yml on the MCP path is
+// held to the identical rule, never a second, divergent one.
+const { readPipelineYmlSectionKey, validateEmbeddingModel, isFullyQualifiedPath } = require('./shared');
 
 class EmbeddingProvider {
   /**
@@ -412,14 +424,40 @@ function _readUserScopeEmbedUrl() {
 
 /**
  * resolveConfiguredEmbedEndpointDetailed — single-precedence resolution of
- * the embed endpoint URL, for INIT-TIME SEEDING purposes only, ALSO
- * returning which source won (so callers can log it — spec item 3/T3) and
- * whether a user-scope file was found but unparseable (finding #6).
- * Precedence:
- *   (a) .claude/pipeline.yml `knowledge.vllm_embed_url`, if set (opts.projectRoot)
- *   (b) env.VLLM_EMBED_URL, if set
- *   (c) user-scope `${resolveBaseDir()}/handoff-embed.json` `vllm_embed_url`, if set
- *   (d) NONE -- url: null.
+ * the embed endpoint URL. Originally written for INIT-TIME SEEDING only;
+ * extended 2026-09-13 (embed-url-from-project-root fix, cm incident: a Codex
+ * host launched the MCP server with cwd `.codex-temp` and called
+ * `memory_search` with a DIFFERENT `projectRoot` — the embedder threw
+ * because query-time embedding resolution used to read the SERVER
+ * PROCESS'S cwd, never the tool call's own `projectRoot` argument) into the
+ * ONE resolver every embed-URL caller in this codebase uses — RUNTIME query
+ * embedding (embed.js's embedQuery, via its own resolveEmbedUrl wrapper) AND
+ * init-time seeding (seedLocalEmbeddingProvider, below) both call this
+ * SAME function, never a second copy.
+ *
+ * Precedence (tier 0 is new; tiers 1-3 are the pre-existing (a)/(b)/(c)):
+ *   0. opts.vllmUrl, if it is a non-empty (post-trim) STRING — an explicit
+ *      per-call override; a non-string value is ignored (never coerced),
+ *      never crashes this function. source: 'explicit'.
+ *   1. `<opts.projectRoot>/.claude/pipeline.yml` `knowledge.vllm_embed_url`,
+ *      if set — read via shared.js's readPipelineYmlSectionKey, SCOPED to
+ *      the `knowledge:` section (never embed.js's `_readPipelineYmlKey`,
+ *      which matches any indented line anywhere in the file — a same-named
+ *      key under an unrelated section must NOT be picked up here).
+ *      source: 'pipeline_yml'.
+ *   2. `(opts.env || process.env).VLLM_EMBED_URL`, trimmed; a whitespace-only
+ *      or empty value is rejected (falls through), never returned as a
+ *      truthy-but-blank URL. source: 'env'.
+ *   3. user-scope `${resolveBaseDir()}/handoff-embed.json` `vllm_embed_url`,
+ *      if set (already trimmed by _readUserScopeEmbedUrl). source: 'user_scope'.
+ *   else: { url: null, source: null, reason: 'unconfigured' }.
+ *
+ * NEVER consults process.cwd() or process.env.PROJECT_ROOT anywhere in this
+ * function — `opts.projectRoot`, when the caller supplies it, is the ONLY
+ * source of "which project" this resolution is scoped to. `opts.projectRoot`
+ * MUST be `path.isAbsolute` when provided (a relative path or any non-string
+ * value is a hard input error — thrown immediately, never silently joined
+ * against cwd, which is exactly the class of bug this fix closes).
  *
  * Deliberately NEVER falls back to shared.js/embed.js's own runtime default
  * ('http://localhost:8800') -- that default exists so the RUNTIME embed
@@ -436,23 +474,118 @@ function _readUserScopeEmbedUrl() {
  * WHICH url/source wins; classification and gating happen identically
  * downstream regardless of source.
  *
+ * MODEL RESOLUTION (validation-parity amendment, 2026-09-13 — Codex review of
+ * PR #302): this SAME function also resolves `embedding_model`, mirroring
+ * (a subset of) the URL tiers above, so every caller of the URL resolver
+ * gets a consistent {url, model} pair from ONE call rather than a second,
+ * independently-drifting model lookup (embed.js's embedQuery previously read
+ * `embedding_model` itself, on the MCP path, WITHOUT ever calling
+ * shared.js's validateEmbeddingModel — the exact validation the CLI's
+ * loadConfig() always applies — letting an unsupported model reach vLLM's
+ * HTTP endpoint on the MCP path only):
+ *   0. opts.model, if a non-empty (post-trim) STRING — an explicit per-call
+ *      override (used only by internal/test callers, never exposed as a
+ *      tool parameter). NEVER validated — same posture as the CLI's own
+ *      pre-existing opts.model override in embed.js's embedQuery, which
+ *      also bypasses loadConfig()/validateEmbeddingModel entirely when
+ *      supplied. modelSource: 'explicit'.
+ *   1. `<opts.projectRoot>/.claude/pipeline.yml` `knowledge.embedding_model`,
+ *      if set — read via the SAME readPipelineYmlSectionKey used for tier 1
+ *      of the URL above. VALIDATED via shared.js's validateEmbeddingModel
+ *      (throws the identical message the CLI raises for an unsupported
+ *      value) — this is the "resolved from a project file" case the
+ *      Codex review named as the validation gap. modelSource: 'pipeline_yml'.
+ *   else: model is `null`, modelSource is `null` — never validated (there is
+ *      nothing to validate; loadConfig() itself also treats an absent key as
+ *      the valid "unset" branch of validateEmbeddingModel).
+ * There is no env or user-scope tier for the model (mirrors the pre-existing
+ * CLI behavior, which never reads a model from an env var either).
+ *
  * @param {object} [opts]
- * @param {string} [opts.projectRoot] -- project root to read .claude/pipeline.yml from
+ * @param {string} [opts.vllmUrl] -- tier 0 explicit URL override; non-string ignored
+ * @param {string} [opts.model] -- tier 0 explicit model override; non-string ignored, never validated
+ * @param {string} [opts.projectRoot] -- ABSOLUTE project root to read
+ *   .claude/pipeline.yml from; throws if provided and not path.isAbsolute
  * @param {object} [opts.env] -- env object to read VLLM_EMBED_URL from (default process.env)
- * @returns {{ url: string|null, source: 'pipeline_yml'|'env'|'user_scope'|null,
- *             userScopeCorruptPath: string|null }}
+ * @returns {{ url: string|null, source: 'explicit'|'pipeline_yml'|'env'|'user_scope'|null,
+ *             reason: string|null, userScopeCorruptPath: string|null,
+ *             model: string|null, modelSource: 'explicit'|'pipeline_yml'|null }}
+ * @throws {Error} if opts.projectRoot is provided and not an absolute path
+ *   string, OR if a pipeline.yml-resolved model (tier 1) fails
+ *   validateEmbeddingModel.
  */
 function resolveConfiguredEmbedEndpointDetailed(opts = {}) {
   const { projectRoot } = opts;
   const env = opts.env || process.env;
-  if (projectRoot) {
-    const fromYml = _readPipelineYmlKey(projectRoot, 'vllm_embed_url');
-    if (fromYml) return { url: fromYml, source: 'pipeline_yml', userScopeCorruptPath: null };
+
+  if (projectRoot !== undefined && projectRoot !== null) {
+    // Codex review of PR #302 (r2, finding 6b): path.isAbsolute() alone
+    // accepts a Windows rooted-but-driveless path ('/repo', '\repo') that
+    // resolves against the server process's CURRENT DRIVE, not a fixed
+    // location — isFullyQualifiedPath requires an actual drive letter or
+    // UNC prefix on win32 (a leading '/' on POSIX), by reference to the
+    // SAME helper handoff-mcp.mjs's withProjectDb guard uses.
+    if (typeof projectRoot !== 'string' || !isFullyQualifiedPath(projectRoot)) {
+      throw new Error(
+        `resolveConfiguredEmbedEndpointDetailed: opts.projectRoot must be a fully qualified absolute path string when provided, got ${JSON.stringify(projectRoot)}`
+      );
+    }
   }
-  if (env.VLLM_EMBED_URL) return { url: env.VLLM_EMBED_URL, source: 'env', userScopeCorruptPath: null };
+
+  // ── Model resolution (see header above) — computed once, attached to
+  // every return path below via `modelFields`. ─────────────────────────
+  let model = null;
+  let modelSource = null;
+  if (typeof opts.model === 'string' && opts.model.trim()) {
+    model = opts.model.trim();
+    modelSource = 'explicit';
+  } else if (projectRoot) {
+    const fromYml = readPipelineYmlSectionKey(projectRoot, 'knowledge', 'embedding_model');
+    if (typeof fromYml === 'string' && fromYml.trim()) {
+      model = fromYml.trim();
+      modelSource = 'pipeline_yml';
+      // Validation-parity: the SAME check loadConfig() applies unconditionally
+      // on the CLI path — an unsupported value is a hard error here too,
+      // never a silent pass-through to vLLM's HTTP endpoint.
+      validateEmbeddingModel(model);
+    }
+  }
+  const modelFields = { model, modelSource };
+
+  // Tier 0 -- explicit per-call override. Non-string values are silently
+  // ignored (never coerced via String(...)), matching this resolver's
+  // total-classification discipline for every other tier.
+  if (typeof opts.vllmUrl === 'string') {
+    const trimmed = opts.vllmUrl.trim();
+    if (trimmed) return { url: trimmed, source: 'explicit', reason: null, userScopeCorruptPath: null, ...modelFields };
+  }
+
+  // Tier 1 -- pipeline.yml under the CALLER-SUPPLIED projectRoot, scoped to
+  // the knowledge: section only (never cwd, never PROJECT_ROOT env).
+  if (projectRoot) {
+    const fromYml = readPipelineYmlSectionKey(projectRoot, 'knowledge', 'vllm_embed_url');
+    if (typeof fromYml === 'string' && fromYml.trim()) {
+      return { url: fromYml.trim(), source: 'pipeline_yml', reason: null, userScopeCorruptPath: null, ...modelFields };
+    }
+  }
+
+  // Tier 2 -- env var, trimmed; whitespace-only/empty is treated as absent.
+  if (typeof env.VLLM_EMBED_URL === 'string') {
+    const trimmedEnv = env.VLLM_EMBED_URL.trim();
+    if (trimmedEnv) return { url: trimmedEnv, source: 'env', reason: null, userScopeCorruptPath: null, ...modelFields };
+  }
+
+  // Tier 3 -- user-scope default file (already trimmed internally).
   const userScope = _readUserScopeEmbedUrl();
-  if (userScope.url) return { url: userScope.url, source: 'user_scope', userScopeCorruptPath: null };
-  return { url: null, source: null, userScopeCorruptPath: userScope.corrupt ? userScope.path : null };
+  if (userScope.url) return { url: userScope.url, source: 'user_scope', reason: null, userScopeCorruptPath: null, ...modelFields };
+
+  return {
+    url: null,
+    source: null,
+    reason: userScope.corrupt ? 'user_scope_corrupt' : 'unconfigured',
+    userScopeCorruptPath: userScope.corrupt ? userScope.path : null,
+    ...modelFields,
+  };
 }
 
 /**

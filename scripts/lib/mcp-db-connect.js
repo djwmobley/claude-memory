@@ -47,6 +47,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { createAdapter } = require('./db-seam');
+const { getYmlValueInSection } = require('./shared');
 
 const DB_NAME_RE = /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/;
 
@@ -68,6 +69,26 @@ function projectToDbName(projectName) {
  * `root` instead of findProjectRoot()/process.cwd(). Never reads
  * process.env.PROJECT_ROOT.
  *
+ * Codex review of PR #302 (r2, "new defect introduced by the fix"): this
+ * function used to carry its OWN contiguity-based section/key regex,
+ * forked from shared.js's loadConfig() before that function's reader was
+ * hardened (2026-09-13) against blank lines and comment lines inside a
+ * section. That left CLI (loadConfig) and MCP (this function) reading the
+ * SAME pipeline.yml with two DIFFERENT parsers — a `knowledge:` section
+ * with a blank line before `host`/`database` sent CLI calls to the
+ * configured DB while MCP fell back to defaults, a silent divergence.
+ * RULING (encoded here, not just in a commit message, so it survives a
+ * future re-read of this function): the section/key-scoping fix in
+ * shared.js's getYmlValueInSection is a BUG FIX, applied UNIFORMLY to every
+ * pipeline.yml reader in this codebase — never narrowed to "the CLI path
+ * only" for behavior-preservation's sake. loadConfig()'s own T11/T12 tests
+ * (scripts/test-config-loading.js) asserting the corrected
+ * blank-line/comment-line behavior are correct AS WRITTEN and stay; this
+ * function is fixed to match them, not exempted from them. The duplicate
+ * old parser is deleted outright — one section-scoped reader
+ * (getYmlValueInSection, shared.js), reused by reference here exactly as
+ * embedding-provider.js and embed.js already reuse it, never forked again.
+ *
  * @param {string} root — absolute project root path
  * @returns {{host:string, port:number, database:string, user:string, root:string}}
  */
@@ -84,15 +105,7 @@ function loadConfigForRoot(root) {
   }
   const content = fs.readFileSync(configPath, 'utf8');
 
-  const getSection = (section) => {
-    const match = content.match(new RegExp(`^${section}:.*\\r?\\n((?:[ \\t]+.*\\r?\\n?)*)`, 'm'));
-    return match ? match[1] : '';
-  };
-  const getInSection = (section, key) => {
-    const sectionContent = getSection(section);
-    const match = sectionContent.match(new RegExp(`^\\s*${key}:\\s*"?([^"\\n]+)"?`, 'm'));
-    return match ? match[1].trim() : null;
-  };
+  const getInSection = (section, key) => getYmlValueInSection(content, section, key);
 
   const host = getInSection('knowledge', 'host') || defaults.host;
   const port = parseInt(getInSection('knowledge', 'port') || defaults.port, 10);
