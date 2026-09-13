@@ -28,7 +28,7 @@
 const fs   = require('fs');
 const path = require('path');
 const http = require('http');
-const { loadConfig } = require('./shared');
+const { loadConfig, readPipelineYmlSectionKey } = require('./shared');
 
 const EMBED_DIMS = parseInt(process.env.EMBED_DIMS || '4000', 10);
 
@@ -215,13 +215,69 @@ async function _vllmEmbed(text, vllmUrl, model) {
 }
 
 /**
+ * resolveEmbedUrl — thin wrapper over embedding-provider.js's
+ * resolveConfiguredEmbedEndpointDetailed, re-shaped to the {url, source,
+ * reason} contract this module's own callers (memory-search.js) use.
+ * embedding-provider.js is required LAZILY (inside this function body), not
+ * at module top level — embedding-provider.js requires THIS file
+ * (embed.js) at its own top level for _vllmEmbedRaw/VllmHttpError/etc., so a
+ * top-level require here would be circular.
+ *
+ * Never throws for "nothing configured" — that is the ordinary `url: null`
+ * result, not an exceptional path (a relative/non-string `projectRoot` is
+ * still a hard input error and DOES throw, via resolveConfiguredEmbedEndpointDetailed
+ * itself — this wrapper does not swallow that).
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.projectRoot] — ABSOLUTE project root; never cwd/PROJECT_ROOT
+ * @param {string} [opts.vllmUrl] — explicit per-call override (tier 0)
+ * @returns {{ url: string|null, source: 'explicit'|'pipeline_yml'|'env'|'user_scope'|null, reason: string|null }}
+ */
+function resolveEmbedUrl(opts = {}) {
+  const { resolveConfiguredEmbedEndpointDetailed } = require('./embedding-provider');
+  const detailed = resolveConfiguredEmbedEndpointDetailed({ projectRoot: opts.projectRoot, vllmUrl: opts.vllmUrl });
+  if (detailed.url) {
+    return { url: detailed.url, source: detailed.source, reason: null };
+  }
+  return { url: null, source: null, reason: detailed.reason || 'unconfigured' };
+}
+
+/**
  * Embed a query string and return a vector (Array<number>).
+ *
+ * Two resolution paths for the URL/model, chosen by whether the caller
+ * supplies `opts.projectRoot`:
+ *
+ *   - `opts.projectRoot` ABSENT (every pre-existing CLI caller —
+ *     scripts/handoff.js's resurrect query-embedding seed,
+ *     scripts/smoketest-resurrect-real-vllm.js): BYTE-FOR-BYTE UNCHANGED —
+ *     resolves via loadConfig() (cwd/PROJECT_ROOT-env-based
+ *     findProjectRoot()), exactly as before this fix. This path is correct
+ *     for an in-process CLI whose cwd IS the project root; it is NOT used
+ *     by any MCP tool call site.
+ *   - `opts.projectRoot` PRESENT (the MCP tool call paths, threaded through
+ *     memory-search.js's memorySearch): resolves the URL via
+ *     resolveEmbedUrl({projectRoot, vllmUrl: opts.vllmUrl}) — tier 0
+ *     explicit / tier 1 that project's OWN pipeline.yml / tier 2 env / tier
+ *     3 user-scope default — NEVER this process's cwd. The model, when
+ *     `opts.model` is not supplied, is read from that SAME projectRoot's
+ *     `.claude/pipeline.yml` `knowledge.embedding_model` (never a different
+ *     project's cached value, never loadConfig()'s cwd-resolved config —
+ *     adversary finding F1, "split-brain model from repo A posted to repo
+ *     B's URL").
  *
  * @param {string} text  — text to embed
  * @param {object} [opts]
  * @param {string} [opts.vllmUrl]  — override vLLM base URL
  * @param {string} [opts.model]    — override embedding model name
- * @returns {Promise<Array<number>>}
+ * @param {string} [opts.projectRoot] — ABSOLUTE project root (see above);
+ *   when supplied, resolution NEVER touches cwd/PROJECT_ROOT env
+ * @param {boolean} [opts.softUnconfigured] — when true, an unconfigured URL
+ *   or model resolves to `null` instead of throwing (memory-search.js's
+ *   FTS-only degrade path). Default (omitted/false): throws the same
+ *   messages this function has always thrown — unchanged for every
+ *   existing caller.
+ * @returns {Promise<Array<number>|null>}
  */
 async function embedQuery(text, opts = {}) {
   if (typeof text !== 'string' || !text.trim()) {
@@ -250,7 +306,17 @@ async function embedQuery(text, opts = {}) {
   let vllmUrl = opts.vllmUrl;
   let model   = opts.model;
 
-  if (!vllmUrl || !model) {
+  if (opts.projectRoot) {
+    // NEW path (embed-url-from-project-root fix): resolve strictly against
+    // the CALLER-SUPPLIED projectRoot — never cwd, never PROJECT_ROOT env.
+    if (!vllmUrl) {
+      vllmUrl = resolveEmbedUrl({ projectRoot: opts.projectRoot, vllmUrl: opts.vllmUrl }).url;
+    }
+    if (!model) {
+      model = readPipelineYmlSectionKey(opts.projectRoot, 'knowledge', 'embedding_model') || null;
+    }
+  } else if (!vllmUrl || !model) {
+    // CLI path — UNCHANGED from before this fix.
     let cfg;
     try {
       cfg = loadConfig();
@@ -268,9 +334,11 @@ async function embedQuery(text, opts = {}) {
   }
 
   if (!vllmUrl) {
+    if (opts.softUnconfigured) return null;
     throw new Error('[embed] vLLM URL not configured — set vllm_embed_url in pipeline.yml knowledge section');
   }
   if (!model) {
+    if (opts.softUnconfigured) return null;
     throw new Error('[embed] embedding model not configured — set embedding_model in pipeline.yml knowledge section');
   }
 
@@ -279,6 +347,7 @@ async function embedQuery(text, opts = {}) {
 
 module.exports = {
   embedQuery,
+  resolveEmbedUrl,
   _vllmEmbedRaw,
   VllmHttpError,
   VllmTimeoutError,
@@ -287,6 +356,10 @@ module.exports = {
   // scripts/lib/embedding-provider.js's resolveConfiguredEmbedEndpoint can
   // reuse the SAME pipeline.yml `knowledge.vllm_embed_url` read this file's
   // own embedQuery() uses -- by reference, never forked -- rather than
-  // duplicating the regex.
+  // duplicating the regex. NOTE (2026-09-13): this any-indented-line regex
+  // is used ONLY by the CLI/loadConfig() path above now — the
+  // embed-url-from-project-root fix's new opts.projectRoot path uses
+  // shared.js's section-scoped readPipelineYmlSectionKey instead (see that
+  // function's header for why).
   _readPipelineYmlKey,
 };

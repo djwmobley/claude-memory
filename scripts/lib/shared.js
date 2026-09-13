@@ -85,6 +85,70 @@ function validateEmbeddingModel(value) {
   }
 }
 
+// Extract a YAML section (from "key:" to next top-level key or EOF) out of a
+// raw pipeline.yml file's already-read text content. Pure function of
+// `content` — no I/O — so it can be reused both by loadConfig() (which reads
+// the CWD-resolved project's pipeline.yml) and by any caller that already
+// has a specific, explicitly-known project root's file content in hand and
+// must NOT fall back to cwd/PROJECT_ROOT (see readPipelineYmlSectionKey
+// below — the embed-url-from-project-root fix's single section-scoped
+// reader, reused by reference from scripts/lib/embedding-provider.js and
+// scripts/lib/embed.js rather than forked as a second regex).
+function getYmlSection(content, section) {
+  const match = content.match(new RegExp(`^${section}:.*\\r?\\n((?:[ \\t]+.*\\r?\\n?)*)`, 'm'));
+  return match ? match[1] : '';
+}
+
+// Get a value within a specific section — scoped to that section's own
+// indented lines only (never an any-indented-line match against the whole
+// file), so a same-named key under a DIFFERENT top-level section is never
+// picked up. See getYmlSection above.
+function getYmlValueInSection(content, section, key) {
+  const sectionContent = getYmlSection(content, section);
+  const match = sectionContent.match(new RegExp(`^\\s*${key}:\\s*"?([^"\\n]+)"?`, 'm'));
+  return match ? match[1].trim() : null;
+}
+
+/**
+ * readPipelineYmlSectionKey — read a single key, scoped to a named
+ * top-level section, from `<root>/.claude/pipeline.yml`, given an EXPLICIT
+ * `root` — never cwd, never PROJECT_ROOT env, never findProjectRoot().
+ * Total classification over the file's reachability: no `root`, no file, or
+ * an absent key all resolve to `null` — never a throw (mirrors
+ * embed.js's own pre-existing `_readPipelineYmlKey`'s "never throw"
+ * contract, for the same reason: a caller resolving an OPTIONAL config
+ * value must be able to treat "not configured" as ordinary data, not an
+ * exceptional path).
+ *
+ * This is the ONE section-scoped pipeline.yml reader outside loadConfig()
+ * itself — scripts/lib/embedding-provider.js's resolveConfiguredEmbedEndpointDetailed
+ * (tier 1, `knowledge.vllm_embed_url`) and scripts/lib/embed.js's embedQuery
+ * (the `opts.projectRoot`-driven `knowledge.embedding_model` fallback) both
+ * call this BY REFERENCE rather than forking a second regex — see
+ * embed.js's `_readPipelineYmlKey`'s own header for why that pre-existing,
+ * DIFFERENT (any-indented-line, unscoped) regex is deliberately NOT reused
+ * for either of those two call sites.
+ *
+ * @param {string} root — absolute project root (caller's responsibility to
+ *   validate; this function itself just treats a falsy/unreadable root as
+ *   "no file")
+ * @param {string} section — top-level YAML section name (e.g. 'knowledge')
+ * @param {string} key — key name within that section
+ * @returns {string|null}
+ */
+function readPipelineYmlSectionKey(root, section, key) {
+  if (!root) return null;
+  const configPath = path.join(root, '.claude', 'pipeline.yml');
+  if (!fs.existsSync(configPath)) return null;
+  let content;
+  try {
+    content = fs.readFileSync(configPath, 'utf8');
+  } catch (_) {
+    return null;
+  }
+  return getYmlValueInSection(content, section, key);
+}
+
 function loadConfig() {
   const root = findProjectRoot();
   const configPath = path.join(root, '.claude', 'pipeline.yml');
@@ -107,18 +171,10 @@ function loadConfig() {
     return match ? match[1].trim() : null;
   };
 
-  // Extract a YAML section (from "key:" to next top-level key or EOF)
-  const getSection = (section) => {
-    const match = content.match(new RegExp(`^${section}:.*\\r?\\n((?:[ \\t]+.*\\r?\\n?)*)`, 'm'));
-    return match ? match[1] : '';
-  };
-
-  // Get a value within a specific section
-  const getInSection = (section, key) => {
-    const sectionContent = getSection(section);
-    const match = sectionContent.match(new RegExp(`^\\s*${key}:\\s*"?([^"\\n]+)"?`, 'm'));
-    return match ? match[1].trim() : null;
-  };
+  // Get a value within a specific section (of THIS file's own already-read
+  // content) — thin wrapper over the shared getYmlValueInSection above, kept
+  // as a local closure so every existing call site below is unchanged.
+  const getInSection = (section, key) => getYmlValueInSection(content, section, key);
 
   const resolvedProjectName = getInSection('project', 'name') || defaults.project;
   const tier = getInSection('knowledge', 'tier') || 'files';
@@ -737,4 +793,10 @@ module.exports = {
   findProjectRoot, loadConfig, connect, c, ollamaBlurbDefaults, projectToDbName,
   vllmEmbed, tryEmbed, hasProvenanceColumn, runWinBin, quoteForCmd, vllmRerank,
   ollamaGenerateBlurb, vllmTokenize, vllmTokenEmbed, lateChunkEmbed,
+  // Exported (2026-09-13, embed-url-from-project-root fix) so
+  // scripts/lib/embedding-provider.js and scripts/lib/embed.js can read a
+  // pipeline.yml key scoped to a named section for an EXPLICIT project root
+  // — never cwd/PROJECT_ROOT — by reference to the SAME regex loadConfig()
+  // itself uses, rather than forking a second one.
+  getYmlSection, getYmlValueInSection, readPipelineYmlSectionKey,
 };

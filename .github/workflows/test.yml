@@ -1249,6 +1249,39 @@ jobs:
         #              without the flag still never writes (regression guard).
         # Pure unit test with a fake db — no Postgres/SQLite/network required.
         run: node test/test-embed-endpoint-classify.js
+      - name: Run embed-url-from-project-root fix tests (2026-09-13)
+        # Regression guard for the MCP query-time embed-URL/model resolution
+        # fix: scripts/lib/embedding-provider.js's
+        # resolveConfiguredEmbedEndpointDetailed gains an explicit tier 0
+        # override and NEVER consults process.cwd()/PROJECT_ROOT env;
+        # scripts/lib/embed.js's embedQuery gains opts.projectRoot/
+        # softUnconfigured and exports resolveEmbedUrl; scripts/lib/
+        # memory-search.js's memorySearch degrades to FTS-only
+        # (buildTableQuery's new fts_only mode) when the resolved embed
+        # endpoint is unconfigured for a given projectRoot, rather than
+        # throwing.
+        #   R1-R11  resolver tier precedence + edge cases (explicit wins;
+        #           pipeline.yml/env/user-scope precedence; cwd and
+        #           PROJECT_ROOT env both ignored; relative/non-string
+        #           projectRoot throws; non-knowledge-section key ignored;
+        #           whitespace env value and non-string vllmUrl rejected)
+        #   M1      embedQuery's embedding_model fallback resolves from
+        #           projectRoot's own pipeline.yml, never cwd's (a fake
+        #           local HTTP server stands in for vLLM — no live vLLM
+        #           required)
+        #   S1-S5   memorySearch FTS-only degrade: no throw on an
+        #           unconfigured endpoint, fts_only SQL shape (no vector
+        #           placeholder/embedding filter, deterministic
+        #           score-then-id tiebreak), hasFts:false tables skipped as
+        #           no_fts_column with a top-level note, a resolvable URL
+        #           produces byte-identical hybrid SQL to before this fix,
+        #           an injected embedder bypasses resolution entirely, and
+        #           an embedder's own throw still propagates
+        #   C1      the pre-existing CLI call path (no opts.projectRoot) is
+        #           byte-for-byte unchanged
+        # Pure unit test — no Postgres required; one ephemeral loopback HTTP
+        # server per test that needs a real embed call.
+        run: node test/test-embed-url-project-root.js
       - name: Run init-embeddability tests (pgvector + provider total classification, backfill-embeddings)
         # init-embeddability AUTHOR task: end-to-end + lib-level coverage for
         # scripts/handoff.js's cmdInit changes, scripts/lib/backfill-embeddings.js,

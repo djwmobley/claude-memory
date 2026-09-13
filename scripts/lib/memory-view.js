@@ -159,15 +159,22 @@ async function runRecencyQuery(client, projectId, q) {
  * a single absent table (e.g. agent_exchange on a pre-migrate-13 DB) never
  * fails the whole vector query.
  *
+ * @param {string} [projectRoot] — ABSOLUTE project root (embed-url-from-
+ *   project-root fix, 2026-09-13), threaded through to memorySearch so the
+ *   default embedder resolves the embed endpoint against THIS caller's
+ *   project rather than the MCP server process's cwd. Omitted (the
+ *   pre-existing scripts/handoff.js CLI call site) preserves memorySearch's
+ *   own pre-fix behavior exactly — see that function's doc comment.
  * @returns {Promise<{hits: Array, skippedTables: Array<{table:string, reason:string, detail?:object}>}>}
  */
-async function runVectorQuery(client, projectId, q, embedder) {
+async function runVectorQuery(client, projectId, q, embedder, projectRoot) {
   const result = await memorySearch(client, {
     projectId,
     query: q.query || '',
     tables: q.tables,
     limit: q.limit || 10,
     embedder, // TEST-ONLY passthrough — see memory-search.js's own note
+    projectRoot,
   });
   return { hits: result.hits, skippedTables: result.skippedTables || [] };
 }
@@ -181,7 +188,7 @@ async function runVectorQuery(client, projectId, q, embedder) {
  * @param {(text:string) => Promise<number[]>} [opts.embedder] — TEST-ONLY
  *   passthrough to a 'vector'-type query's underlying memorySearch call.
  */
-async function memoryViewRun(client, { projectId, name }, opts) {
+async function memoryViewRun(client, { projectId, name, projectRoot }, opts) {
   const view = await memoryViewGet(client, { projectId, name });
   if (!view) {
     throw new MemoryViewError('notFound', `memory_view_run: no view named "${name}" for this project (or it exists with kind != 'view').`);
@@ -198,7 +205,7 @@ async function memoryViewRun(client, { projectId, name }, opts) {
     else if (type === 'assertion') rows = await runAssertionQuery(client, projectId, q);
     else if (type === 'recency') rows = await runRecencyQuery(client, projectId, q);
     else if (type === 'vector') {
-      const vr = await runVectorQuery(client, projectId, q, opts && opts.embedder);
+      const vr = await runVectorQuery(client, projectId, q, opts && opts.embedder, projectRoot);
       rows = vr.hits;
       skippedTables = vr.skippedTables;
     }

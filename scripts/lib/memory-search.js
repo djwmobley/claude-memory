@@ -113,7 +113,7 @@
  * skip, so a dead connection is reported once, not fanned out.
  */
 
-const { embedQuery } = require('./embed.js');
+const { embedQuery, resolveEmbedUrl } = require('./embed.js');
 
 // Every table's embedding column has the identical name and pgvector shape
 // (halfvec(4000), Qwen3-Embedding-8B's output dimension) — see the
@@ -291,10 +291,49 @@ class MemorySearchError extends Error {
  * and the ordered list of value KEYS ('vector'|'query'|'projectId'|'limit')
  * so the caller binds the right values in the right position without
  * duplicating this table's hasFts branch.
+ *
+ * @param {string} table
+ * @param {object} [opts]
+ * @param {'hybrid'|'fts_only'} [opts.mode] — default 'hybrid' (the
+ *   pre-existing SQL shape above, byte-for-byte unchanged). 'fts_only'
+ *   (embed-url-from-project-root fix, 2026-09-13 — the degraded-search path
+ *   memorySearch takes when no embed endpoint is configured for a caller's
+ *   projectRoot) drops the vector placeholder AND the `embedding IS NOT
+ *   NULL` filter entirely — this mode never references the embedding column
+ *   at all — and ranks purely on `ts_rank`, ordering `score DESC` with a
+ *   deterministic tiebreak on `id DESC` (every TABLE_DESCRIPTORS entry's
+ *   `idExpr` is the bare `id` column — see the table above — so this
+ *   tiebreak is valid for every table capable of reaching this mode).
+ *   CALLER CONTRACT: fts_only is only ever invoked for a `hasFts: true`
+ *   table (memorySearch filters `hasFts: false` tables out BEFORE calling
+ *   this function in fts_only mode — see its own 'no_fts_column' skip) —
+ *   this function does not re-check `d.hasFts` itself and will build SQL
+ *   referencing a nonexistent `fts_vec` column if misused with a
+ *   `hasFts:false` table's name.
  */
-function buildTableQuery(table) {
+function buildTableQuery(table, opts = {}) {
   const d = TABLE_DESCRIPTORS[table];
   const whereExtra = d.whereExtra ? ` AND ${d.whereExtra}` : '';
+  const mode = opts && opts.mode === 'fts_only' ? 'fts_only' : 'hybrid';
+
+  if (mode === 'fts_only') {
+    const paramKeys = ['query', 'projectId', 'limit'];
+    const ph = {};
+    paramKeys.forEach((k, i) => { ph[k] = `$${i + 1}`; });
+
+    const sql = `
+    SELECT '${table}'::text AS source_table,
+           (${d.idExpr})::text AS id,
+           (${d.labelExpr})::text AS label,
+           ${d.snippetExpr} AS snippet,
+           COALESCE(ts_rank(fts_vec, plainto_tsquery('english', ${ph.query})), 0) AS score
+      FROM "${table}"
+     WHERE project_id = ${ph.projectId}${whereExtra}
+     ORDER BY score DESC, id DESC
+     LIMIT ${ph.limit}`;
+
+    return { sql, paramKeys };
+  }
 
   const paramKeys = d.hasFts ? ['vector', 'query', 'projectId', 'limit'] : ['vector', 'projectId', 'limit'];
   const ph = {};
@@ -440,6 +479,20 @@ async function probeTableAvailability(client, tables) {
 }
 
 /**
+ * buildFtsOnlyNote — the top-level `note` string returned when memorySearch
+ * degrades to fts_only mode (embed-url-from-project-root fix). Named
+ * separately so every return path that can land in fts_only builds the
+ * SAME text, whether or not any hasFts:false tables were actually present
+ * among the candidates.
+ */
+function buildFtsOnlyNote(embedReason, noFtsTableNames) {
+  const base = `embedding endpoint unconfigured (${embedReason || 'unconfigured'}) — search degraded to full-text search only`;
+  return noFtsTableNames.length
+    ? `${base}; the following tables require embeddings and were skipped: ${noFtsTableNames.join(', ')}`
+    : base;
+}
+
+/**
  * memorySearch — §8/§10.1/§10.3.
  *
  * @param {object} client — pg client/pool
@@ -457,25 +510,53 @@ async function probeTableAvailability(client, tables) {
  * @param {number} [args.limit] — default 10, applied per-table AND to the
  *   final merged result (see module header for why fetching `limit` per
  *   table is sufficient to recover the true global top-`limit`)
+ * @param {string} [args.projectRoot] — ABSOLUTE project root (embed-url-
+ *   from-project-root fix, 2026-09-13). Used ONLY to resolve the embed
+ *   endpoint URL/model for the DEFAULT embedder (embed.js's embedQuery) —
+ *   never consulted when `args.embedder` is injected. Omitted entirely (the
+ *   pre-existing CLI call path, scripts/handoff.js's runVectorQuery
+ *   invocation with no projectRoot) preserves the EXACT pre-fix behavior:
+ *   always attempts hybrid search via `embedQuery(query)` with no options,
+ *   which resolves via loadConfig()'s cwd/PROJECT_ROOT-based lookup and
+ *   throws if unconfigured — never degrades to fts_only. Only a caller that
+ *   SUPPLIES `projectRoot` (the MCP tool call paths) gets the new
+ *   resolve-then-degrade-to-FTS-only behavior below.
  * @param {(text:string) => Promise<number[]>} [args.embedder] — TEST-ONLY
  *   injectable embedder seam (same rationale as write-time-embed.js's own
  *   `opts.embedder`) — production call sites never pass this; CI (no live
- *   vLLM) injects a deterministic mock.
+ *   vLLM) injects a deterministic mock. Injecting this BYPASSES embed-URL
+ *   resolution entirely — `args.projectRoot` is ignored, `searchMode` is
+ *   always 'hybrid', `embedStatus` is always 'ok'.
  *
  * AVAILABILITY GATE — see module header. Every candidate table lands in
  * exactly one of: queried (tablesSearched) | table_missing | column_missing
- * | query_error (skippedTables, each `{table, reason, detail}`). A
- * connection-class query error (SQLSTATE class 08/28), a probe-level
- * failure, or an identical SQLSTATE recurring on ≥2 tables escalates to a
- * thrown MemorySearchError('connectionError', ...) instead of fanning out
- * per-table skips — never fatal for an ordinary per-table schema gap, but
- * NOT silently swallowed when the connection itself is the problem.
+ * | query_error | no_fts_column (fts_only mode only) (skippedTables, each
+ * `{table, reason, detail}`). A connection-class query error (SQLSTATE
+ * class 08/28), a probe-level failure, or an identical SQLSTATE recurring
+ * on ≥2 tables escalates to a thrown MemorySearchError('connectionError',
+ * ...) instead of fanning out per-table skips — never fatal for an ordinary
+ * per-table schema gap, but NOT silently swallowed when the connection
+ * itself is the problem.
  *
- * @returns {Promise<{ hits: Array, tablesSearched: string[], skippedTables: Array<{table:string, reason:string, detail?:object}>, allSkipped: boolean }>}
+ * EMBED-URL RESOLUTION / FTS-ONLY DEGRADE (embed-url-from-project-root fix):
+ * when `args.projectRoot` is supplied and the default embedder is in play
+ * (no `args.embedder` injected), the embed endpoint is resolved via
+ * embed.js's resolveEmbedUrl({projectRoot}) BEFORE any table is queried. A
+ * resolved URL -> `embedStatus:'ok'`, `searchMode:'hybrid'` — identical SQL
+ * to before this fix. An unresolved URL -> `embedStatus:'unconfigured'`,
+ * `searchMode:'fts_only'` — every candidate table that survives the
+ * existence/shape probe but has `hasFts:false` is ALSO skipped
+ * (`reason:'no_fts_column'`; the fts_only admitted-table set is therefore a
+ * STRICT SUBSET of hybrid's own admitted set), the remaining tables are
+ * queried via buildTableQuery's fts_only SQL (no vector param, no
+ * `embedding IS NOT NULL`, ts_rank-only scoring), and the default embedder
+ * is NEVER invoked at all — an unconfigured endpoint never throws here.
+ *
+ * @returns {Promise<{ hits: Array, tablesSearched: string[], skippedTables: Array<{table:string, reason:string, detail?:object}>, allSkipped: boolean, embedStatus: 'ok'|'unconfigured', embedSource: string|null, embedReason: string|null, searchMode: 'hybrid'|'fts_only', note?: string }>}
  * @throws {MemorySearchError} 'unknownTable' | 'validation' | 'connectionError'
  */
 async function memorySearch(client, args) {
-  const { projectId, query } = args || {};
+  const { projectId, query, projectRoot } = args || {};
   if (typeof projectId !== 'string' || !projectId.trim()) {
     throw new MemorySearchError('validation', 'memory_search: projectId is required and must be a non-empty string');
   }
@@ -517,32 +598,106 @@ async function memorySearch(client, args) {
   // Order is first-occurrence order (Set preserves insertion order).
   candidateTables = [...new Set(candidateTables)];
 
+  // ── embed-URL resolution / searchMode determination ──────────────────
+  // Deliberately BEFORE the `candidateTables.length === 0` short-circuit and
+  // the availability probe below, so every return path carries the same
+  // additive keys. Cheap and network-free (file/env reads only) — never a
+  // live HTTP call; the actual embed HTTP call (if any) happens later,
+  // only in hybrid mode, only once we know at least one table will be
+  // queried.
+  const usingDefaultEmbedder = !args.embedder;
+  let embedStatus = 'ok';
+  let embedSource = null;
+  let embedReason = null;
+  let searchMode = 'hybrid';
+  let resolvedVllmUrl = null;
+  if (usingDefaultEmbedder && projectRoot) {
+    const resolved = resolveEmbedUrl({ projectRoot });
+    if (resolved.url) {
+      embedSource = resolved.source;
+      resolvedVllmUrl = resolved.url;
+    } else {
+      embedStatus = 'unconfigured';
+      embedSource = resolved.source;
+      embedReason = resolved.reason;
+      searchMode = 'fts_only';
+    }
+  }
+  // NOTE: when `projectRoot` is omitted (the pre-existing CLI call path) OR
+  // `args.embedder` is injected (TEST-ONLY), embedStatus/searchMode stay at
+  // their 'ok'/'hybrid' defaults above and resolveEmbedUrl is never called
+  // at all — see this function's own doc comment.
+
   if (candidateTables.length === 0) {
     // Explicit `tables: []` — zero candidates is not "everything" and not
     // a degraded search either; nothing was requested, so nothing was
     // skipped.
-    return { hits: [], tablesSearched: [], skippedTables: [], allSkipped: false };
+    return {
+      hits: [], tablesSearched: [], skippedTables: [], allSkipped: false,
+      embedStatus, embedSource, embedReason, searchMode,
+      ...(searchMode === 'fts_only' ? { note: buildFtsOnlyNote(embedReason, []) } : {}),
+    };
   }
 
   const skippedTables = [];
   const availability = await probeTableAvailability(client, candidateTables);
-  const tables = [];
+  const okTables = [];
   for (const t of candidateTables) {
     const a = availability.get(t) || { status: 'ok' };
-    if (a.status === 'ok') tables.push(t);
+    if (a.status === 'ok') okTables.push(t);
     else skippedTables.push({ table: t, reason: a.status, detail: a.detail || null });
   }
 
-  if (tables.length === 0) {
-    // Every candidate table is missing or shape-mismatched — nothing to
-    // search. Skip the embed call entirely (no point embedding a query with
-    // no table to run it against) and report every candidate as skipped.
-    return { hits: [], tablesSearched: [], skippedTables, allSkipped: true };
+  // fts_only further narrows okTables to hasFts:true tables only — a
+  // STRICT SUBSET of what hybrid mode would have admitted from this same
+  // okTables list (finding: "the admitted-table set in fts_only is a
+  // strict subset of hybrid's").
+  let tables;
+  const noFtsSkipped = [];
+  if (searchMode === 'fts_only') {
+    tables = [];
+    for (const t of okTables) {
+      if (TABLE_DESCRIPTORS[t].hasFts) {
+        tables.push(t);
+      } else {
+        skippedTables.push({ table: t, reason: 'no_fts_column' });
+        noFtsSkipped.push(t);
+      }
+    }
+  } else {
+    tables = okTables;
   }
 
-  const embedFn = args.embedder || embedQuery; // fail-loud by embed.js's own contract (or the injected mock)
-  const queryVector = await embedFn(query);
-  const vectorLiteral = `[${queryVector.join(',')}]`;
+  const resultExtra = { embedStatus, embedSource, embedReason, searchMode };
+  if (searchMode === 'fts_only') {
+    resultExtra.note = buildFtsOnlyNote(embedReason, noFtsSkipped);
+  }
+
+  if (tables.length === 0) {
+    // Every candidate table is missing, shape-mismatched, or (fts_only
+    // only) lacks a fts_vec column — nothing to search. Skip the embed call
+    // entirely (no point embedding a query with no table to run it
+    // against) and report every candidate as skipped.
+    return { hits: [], tablesSearched: [], skippedTables, allSkipped: true, ...resultExtra };
+  }
+
+  let queryVector = null;
+  if (searchMode === 'hybrid') {
+    if (usingDefaultEmbedder && projectRoot) {
+      // Pass the ALREADY-resolved URL through so embedQuery does not
+      // re-run resolution a second time (and so a same-call result is
+      // internally consistent even if the underlying config changed
+      // between the two reads, however unlikely).
+      queryVector = await embedQuery(query, { projectRoot, vllmUrl: resolvedVllmUrl });
+    } else {
+      // Unchanged: injected test embedder, OR the pre-existing CLI path
+      // with no projectRoot at all — embedQuery(query) with no extra
+      // options, fail-loud by embed.js's own pre-existing contract.
+      const embedFn = args.embedder || embedQuery;
+      queryVector = await embedFn(query);
+    }
+  }
+  const vectorLiteral = searchMode === 'hybrid' ? `[${queryVector.join(',')}]` : null;
 
   // Sequential, not Promise.all: a plain pg Client/PostgresAdapter serves
   // one query at a time on a single connection — concurrent .query() calls
@@ -553,12 +708,14 @@ async function memorySearch(client, args) {
   // slated to become a hard error in pg@9. A loop is the correct shape here
   // regardless of the (non-)concurrency question — result-merge logic
   // (flatten + re-sort + slice) is unchanged.
-  const valuesByKey = { vector: vectorLiteral, query, projectId, limit };
+  const valuesByKey = searchMode === 'fts_only'
+    ? { query, projectId, limit }
+    : { vector: vectorLiteral, query, projectId, limit };
   const perTableResults = [];
   const tablesSearched = [];
   const codeOccurrences = new Map();
   for (const table of tables) {
-    const { sql, paramKeys } = buildTableQuery(table);
+    const { sql, paramKeys } = buildTableQuery(table, searchMode === 'fts_only' ? { mode: 'fts_only' } : undefined);
     const values = paramKeys.map((k) => valuesByKey[k]);
     try {
       const { rows } = await client.query(sql, values);
@@ -613,6 +770,7 @@ async function memorySearch(client, args) {
     tablesSearched,
     skippedTables,
     allSkipped: candidateTables.length > 0 && tablesSearched.length === 0,
+    ...resultExtra,
   };
 }
 

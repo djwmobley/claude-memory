@@ -534,7 +534,10 @@ async function toolPersistDecisions({ projectRoot, rows, verifyQuery }) {
 
       let topHits = null;
       if (typeof verifyQuery === 'string' && verifyQuery.trim()) {
-        const search = await memorySearchLib.memorySearch(db, { projectId, query: verifyQuery, tables: ['decisions'], limit: 3 });
+        // projectRoot threaded through (embed-url-from-project-root fix,
+        // 2026-09-13) so this verify-query embed resolves against THIS
+        // call's own project, never the MCP server process's cwd.
+        const search = await memorySearchLib.memorySearch(db, { projectId, query: verifyQuery, tables: ['decisions'], limit: 3, projectRoot });
         topHits = search.hits;
       }
 
@@ -550,7 +553,14 @@ async function toolPersistDecisions({ projectRoot, rows, verifyQuery }) {
 async function toolMemorySearch({ projectRoot, query, tables, limit }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const result = await memorySearchLib.memorySearch(db, { projectId, query, tables, limit });
+      // projectRoot threaded through (embed-url-from-project-root fix,
+      // 2026-09-13) so the default embedder resolves the embed endpoint
+      // against THIS tool call's own projectRoot, never the MCP server
+      // process's cwd (the incident this fix addresses: a Codex host
+      // launching the server from a different cwd than the calling
+      // project). Unresolvable -> memorySearch degrades to FTS-only
+      // (embedStatus/searchMode/note in the result) rather than throwing.
+      const result = await memorySearchLib.memorySearch(db, { projectId, query, tables, limit, projectRoot });
       return textResult(result);
     });
   } catch (err) {
@@ -613,7 +623,10 @@ async function toolMemoryViewSet({ projectRoot, name, queries }) {
 async function toolMemoryViewRun({ projectRoot, name }) {
   try {
     return await withProjectDb(projectRoot, async (db, projectId) => {
-      const result = await memoryViewLib.memoryViewRun(db, { projectId, name });
+      // projectRoot threaded through to a 'vector'-type query's underlying
+      // memorySearch call (embed-url-from-project-root fix, 2026-09-13) —
+      // see toolMemorySearch's own comment above.
+      const result = await memoryViewLib.memoryViewRun(db, { projectId, name, projectRoot });
       return textResult(result);
     });
   } catch (err) {
