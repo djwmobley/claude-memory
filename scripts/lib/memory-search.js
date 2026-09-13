@@ -389,9 +389,22 @@ function classifyQueryError(err) {
  * candidate exists, skip shape checks" — unchanged legacy behavior for any
  * such caller, same as before this rewrite.
  *
+ * @param {object} [opts]
+ * @param {'hybrid'|'fts_only'} [opts.mode] — default 'hybrid'. In 'fts_only'
+ *   mode (embed-url-from-project-root fix, 2026-09-13 — Codex review of PR
+ *   #302: the fts_only degrade must not require a column it never queries),
+ *   the EMBEDDING_COLUMN is dropped from every table's expected-column list
+ *   (both the existence probe AND the shape check below) — a table that
+ *   carries `fts_vec` but no `embedding` column at all is `ok` in this mode,
+ *   never `column_missing`. `hasFts:false` tables are still probed for their
+ *   OTHER required columns here (id/label/snippet/project_id/whereExtra) —
+ *   memorySearch's own caller-side `no_fts_column` skip (see its own doc
+ *   comment) is what actually excludes them from fts_only's query set, not
+ *   this probe.
  * @returns {Promise<Map<string, {status:'ok'|'table_missing'|'column_missing', detail?:object}>>}
  */
-async function probeTableAvailability(client, tables) {
+async function probeTableAvailability(client, tables, opts = {}) {
+  const mode = opts && opts.mode === 'fts_only' ? 'fts_only' : 'hybrid';
   const result = new Map();
 
   if (typeof client.schemaObjectsExist !== 'function') {
@@ -401,7 +414,10 @@ async function probeTableAvailability(client, tables) {
 
   const columnsExpected = [];
   for (const t of tables) {
-    for (const c of TABLE_DESCRIPTORS[t].requiredColumns) columnsExpected.push({ table: t, column: c });
+    for (const c of TABLE_DESCRIPTORS[t].requiredColumns) {
+      if (mode === 'fts_only' && c === EMBEDDING_COLUMN) continue; // fts_only never queries the embedding column
+      columnsExpected.push({ table: t, column: c });
+    }
   }
 
   const { missing } = await client.schemaObjectsExist({ tables, columns: columnsExpected });
@@ -446,13 +462,18 @@ async function probeTableAvailability(client, tables) {
       const d = TABLE_DESCRIPTORS[t];
       const mismatchedColumns = [];
 
-      const embShape = await client.checkColumnShape(t, EMBEDDING_COLUMN);
-      // checkColumnShape returns null on ANY probe failure (including
-      // "column does not exist", already ruled out above by the column
-      // existence probe) — per its own contract, null is NEVER treated as
-      // a mismatch, only an actual shape disagreement is.
-      if (embShape && (embShape.type !== EMBEDDING_SHAPE.type || embShape.dims !== EMBEDDING_SHAPE.dims)) {
-        mismatchedColumns.push({ column: EMBEDDING_COLUMN, expected: EMBEDDING_SHAPE, actual: embShape });
+      // fts_only never queries the embedding column at all (see this
+      // function's own doc comment) — its shape is irrelevant in this mode,
+      // so it is never probed or treated as a mismatch here.
+      if (mode !== 'fts_only') {
+        const embShape = await client.checkColumnShape(t, EMBEDDING_COLUMN);
+        // checkColumnShape returns null on ANY probe failure (including
+        // "column does not exist", already ruled out above by the column
+        // existence probe) — per its own contract, null is NEVER treated as
+        // a mismatch, only an actual shape disagreement is.
+        if (embShape && (embShape.type !== EMBEDDING_SHAPE.type || embShape.dims !== EMBEDDING_SHAPE.dims)) {
+          mismatchedColumns.push({ column: EMBEDDING_COLUMN, expected: EMBEDDING_SHAPE, actual: embShape });
+        }
       }
 
       if (d.hasFts) {
@@ -640,7 +661,7 @@ async function memorySearch(client, args) {
   }
 
   const skippedTables = [];
-  const availability = await probeTableAvailability(client, candidateTables);
+  const availability = await probeTableAvailability(client, candidateTables, { mode: searchMode });
   const okTables = [];
   for (const t of candidateTables) {
     const a = availability.get(t) || { status: 'ok' };

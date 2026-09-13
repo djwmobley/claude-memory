@@ -170,6 +170,11 @@ async function withProjectDb(projectRoot, fn) {
   if (typeof projectRoot !== 'string' || !projectRoot.trim()) {
     throw new Error('projectRoot is required and must be a non-empty string');
   }
+  // Codex review of PR #302, finding 6a: reject a non-absolute projectRoot
+  // before any cwd-dependent work downstream (connectForRoot/project-marker.js).
+  if (!path.isAbsolute(projectRoot)) {
+    throw new Error(`projectRoot must be an absolute path, got ${JSON.stringify(projectRoot)}`);
+  }
   const db = await connectForRoot(projectRoot);
   try {
     const identity = await ensureProjectIdentity(db, { cwd: projectRoot, silent: true });
@@ -533,15 +538,30 @@ async function toolPersistDecisions({ projectRoot, rows, verifyQuery }) {
       }
 
       let topHits = null;
+      let verifyMeta = null;
       if (typeof verifyQuery === 'string' && verifyQuery.trim()) {
         // projectRoot threaded through (embed-url-from-project-root fix,
         // 2026-09-13) so this verify-query embed resolves against THIS
         // call's own project, never the MCP server process's cwd.
         const search = await memorySearchLib.memorySearch(db, { projectId, query: verifyQuery, tables: ['decisions'], limit: 3, projectRoot });
         topHits = search.hits;
+        // Propagate the SAME degradation metadata memory_search's own MCP
+        // tool result carries (docs/hosts/codex.md's promised
+        // embedStatus/embedSource/embedReason/searchMode/note) — previously
+        // discarded here, so a verify-query run during an FTS-only degrade
+        // looked identical to a normal hybrid verify (Codex review of PR
+        // #302).
+        verifyMeta = {
+          embedStatus: search.embedStatus, embedSource: search.embedSource,
+          embedReason: search.embedReason, searchMode: search.searchMode,
+          note: search.note,
+        };
       }
 
-      return textResult({ projectId, written, embedWarnings: warnings, verify: verifyQuery ? { query: verifyQuery, topHits } : null });
+      return textResult({
+        projectId, written, embedWarnings: warnings,
+        verify: verifyQuery ? { query: verifyQuery, topHits, ...verifyMeta } : null,
+      });
     });
   } catch (err) {
     return libToolError(err);

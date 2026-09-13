@@ -47,7 +47,12 @@ const { resolveBaseDir } = require('./handoff-paths');
 // which matches ANY indented line in the whole file, not just the
 // `knowledge:` section (see that function's own header for why it stays
 // as-is for the byte-for-byte-unchanged CLI path only).
-const { readPipelineYmlSectionKey } = require('./shared');
+// validateEmbeddingModel is the SAME "vLLM is the only supported embedding
+// backend" check loadConfig() applies on the CLI path (shared.js ~186) —
+// reused BY REFERENCE (validation-parity amendment, 2026-09-13) so a model
+// resolved from an explicit project root's pipeline.yml on the MCP path is
+// held to the identical rule, never a second, divergent one.
+const { readPipelineYmlSectionKey, validateEmbeddingModel } = require('./shared');
 
 class EmbeddingProvider {
   /**
@@ -469,13 +474,45 @@ function _readUserScopeEmbedUrl() {
  * WHICH url/source wins; classification and gating happen identically
  * downstream regardless of source.
  *
+ * MODEL RESOLUTION (validation-parity amendment, 2026-09-13 — Codex review of
+ * PR #302): this SAME function also resolves `embedding_model`, mirroring
+ * (a subset of) the URL tiers above, so every caller of the URL resolver
+ * gets a consistent {url, model} pair from ONE call rather than a second,
+ * independently-drifting model lookup (embed.js's embedQuery previously read
+ * `embedding_model` itself, on the MCP path, WITHOUT ever calling
+ * shared.js's validateEmbeddingModel — the exact validation the CLI's
+ * loadConfig() always applies — letting an unsupported model reach vLLM's
+ * HTTP endpoint on the MCP path only):
+ *   0. opts.model, if a non-empty (post-trim) STRING — an explicit per-call
+ *      override (used only by internal/test callers, never exposed as a
+ *      tool parameter). NEVER validated — same posture as the CLI's own
+ *      pre-existing opts.model override in embed.js's embedQuery, which
+ *      also bypasses loadConfig()/validateEmbeddingModel entirely when
+ *      supplied. modelSource: 'explicit'.
+ *   1. `<opts.projectRoot>/.claude/pipeline.yml` `knowledge.embedding_model`,
+ *      if set — read via the SAME readPipelineYmlSectionKey used for tier 1
+ *      of the URL above. VALIDATED via shared.js's validateEmbeddingModel
+ *      (throws the identical message the CLI raises for an unsupported
+ *      value) — this is the "resolved from a project file" case the
+ *      Codex review named as the validation gap. modelSource: 'pipeline_yml'.
+ *   else: model is `null`, modelSource is `null` — never validated (there is
+ *      nothing to validate; loadConfig() itself also treats an absent key as
+ *      the valid "unset" branch of validateEmbeddingModel).
+ * There is no env or user-scope tier for the model (mirrors the pre-existing
+ * CLI behavior, which never reads a model from an env var either).
+ *
  * @param {object} [opts]
- * @param {string} [opts.vllmUrl] -- tier 0 explicit override; non-string ignored
+ * @param {string} [opts.vllmUrl] -- tier 0 explicit URL override; non-string ignored
+ * @param {string} [opts.model] -- tier 0 explicit model override; non-string ignored, never validated
  * @param {string} [opts.projectRoot] -- ABSOLUTE project root to read
  *   .claude/pipeline.yml from; throws if provided and not path.isAbsolute
  * @param {object} [opts.env] -- env object to read VLLM_EMBED_URL from (default process.env)
  * @returns {{ url: string|null, source: 'explicit'|'pipeline_yml'|'env'|'user_scope'|null,
- *             reason: string|null, userScopeCorruptPath: string|null }}
+ *             reason: string|null, userScopeCorruptPath: string|null,
+ *             model: string|null, modelSource: 'explicit'|'pipeline_yml'|null }}
+ * @throws {Error} if opts.projectRoot is provided and not an absolute path
+ *   string, OR if a pipeline.yml-resolved model (tier 1) fails
+ *   validateEmbeddingModel.
  */
 function resolveConfiguredEmbedEndpointDetailed(opts = {}) {
   const { projectRoot } = opts;
@@ -489,12 +526,32 @@ function resolveConfiguredEmbedEndpointDetailed(opts = {}) {
     }
   }
 
+  // ── Model resolution (see header above) — computed once, attached to
+  // every return path below via `modelFields`. ─────────────────────────
+  let model = null;
+  let modelSource = null;
+  if (typeof opts.model === 'string' && opts.model.trim()) {
+    model = opts.model.trim();
+    modelSource = 'explicit';
+  } else if (projectRoot) {
+    const fromYml = readPipelineYmlSectionKey(projectRoot, 'knowledge', 'embedding_model');
+    if (typeof fromYml === 'string' && fromYml.trim()) {
+      model = fromYml.trim();
+      modelSource = 'pipeline_yml';
+      // Validation-parity: the SAME check loadConfig() applies unconditionally
+      // on the CLI path — an unsupported value is a hard error here too,
+      // never a silent pass-through to vLLM's HTTP endpoint.
+      validateEmbeddingModel(model);
+    }
+  }
+  const modelFields = { model, modelSource };
+
   // Tier 0 -- explicit per-call override. Non-string values are silently
   // ignored (never coerced via String(...)), matching this resolver's
   // total-classification discipline for every other tier.
   if (typeof opts.vllmUrl === 'string') {
     const trimmed = opts.vllmUrl.trim();
-    if (trimmed) return { url: trimmed, source: 'explicit', reason: null, userScopeCorruptPath: null };
+    if (trimmed) return { url: trimmed, source: 'explicit', reason: null, userScopeCorruptPath: null, ...modelFields };
   }
 
   // Tier 1 -- pipeline.yml under the CALLER-SUPPLIED projectRoot, scoped to
@@ -502,25 +559,26 @@ function resolveConfiguredEmbedEndpointDetailed(opts = {}) {
   if (projectRoot) {
     const fromYml = readPipelineYmlSectionKey(projectRoot, 'knowledge', 'vllm_embed_url');
     if (typeof fromYml === 'string' && fromYml.trim()) {
-      return { url: fromYml.trim(), source: 'pipeline_yml', reason: null, userScopeCorruptPath: null };
+      return { url: fromYml.trim(), source: 'pipeline_yml', reason: null, userScopeCorruptPath: null, ...modelFields };
     }
   }
 
   // Tier 2 -- env var, trimmed; whitespace-only/empty is treated as absent.
   if (typeof env.VLLM_EMBED_URL === 'string') {
     const trimmedEnv = env.VLLM_EMBED_URL.trim();
-    if (trimmedEnv) return { url: trimmedEnv, source: 'env', reason: null, userScopeCorruptPath: null };
+    if (trimmedEnv) return { url: trimmedEnv, source: 'env', reason: null, userScopeCorruptPath: null, ...modelFields };
   }
 
   // Tier 3 -- user-scope default file (already trimmed internally).
   const userScope = _readUserScopeEmbedUrl();
-  if (userScope.url) return { url: userScope.url, source: 'user_scope', reason: null, userScopeCorruptPath: null };
+  if (userScope.url) return { url: userScope.url, source: 'user_scope', reason: null, userScopeCorruptPath: null, ...modelFields };
 
   return {
     url: null,
     source: null,
     reason: userScope.corrupt ? 'user_scope_corrupt' : 'unconfigured',
     userScopeCorruptPath: userScope.corrupt ? userScope.path : null,
+    ...modelFields,
   };
 }
 

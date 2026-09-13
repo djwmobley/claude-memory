@@ -165,7 +165,19 @@ async function runRecencyQuery(client, projectId, q) {
  *   project rather than the MCP server process's cwd. Omitted (the
  *   pre-existing scripts/handoff.js CLI call site) preserves memorySearch's
  *   own pre-fix behavior exactly — see that function's doc comment.
- * @returns {Promise<{hits: Array, skippedTables: Array<{table:string, reason:string, detail?:object}>}>}
+ * Propagates memorySearch's own degradation metadata (embedStatus/
+ * embedSource/embedReason/searchMode/note) verbatim, in addition to
+ * hits/skippedTables (embed-url-from-project-root fix, 2026-09-13 — Codex
+ * review of PR #302: docs/hosts/codex.md promises these fields for a
+ * vector-kind memory_view_run query too, not just memory_search itself; this
+ * function previously discarded them) — so a caller of a 'vector'-kind
+ * memory_view_run query can tell FTS-only degrade apart from a genuine
+ * hybrid search the same way memory_search's own MCP tool result already
+ * lets a caller tell.
+ *
+ * @returns {Promise<{hits: Array, skippedTables: Array<{table:string, reason:string, detail?:object}>,
+ *   embedStatus: 'ok'|'unconfigured', embedSource: string|null, embedReason: string|null,
+ *   searchMode: 'hybrid'|'fts_only', note?: string}>}
  */
 async function runVectorQuery(client, projectId, q, embedder, projectRoot) {
   const result = await memorySearch(client, {
@@ -176,7 +188,15 @@ async function runVectorQuery(client, projectId, q, embedder, projectRoot) {
     embedder, // TEST-ONLY passthrough — see memory-search.js's own note
     projectRoot,
   });
-  return { hits: result.hits, skippedTables: result.skippedTables || [] };
+  return {
+    hits: result.hits,
+    skippedTables: result.skippedTables || [],
+    embedStatus: result.embedStatus,
+    embedSource: result.embedSource,
+    embedReason: result.embedReason,
+    searchMode: result.searchMode,
+    note: result.note,
+  };
 }
 
 /**
@@ -201,6 +221,7 @@ async function memoryViewRun(client, { projectId, name, projectRoot }, opts) {
     const type = q.type || q.kind;
     let rows;
     let skippedTables;
+    let vectorMeta;
     if (type === 'entity') rows = await runEntityQuery(client, projectId, q);
     else if (type === 'assertion') rows = await runAssertionQuery(client, projectId, q);
     else if (type === 'recency') rows = await runRecencyQuery(client, projectId, q);
@@ -208,12 +229,25 @@ async function memoryViewRun(client, { projectId, name, projectRoot }, opts) {
       const vr = await runVectorQuery(client, projectId, q, opts && opts.embedder, projectRoot);
       rows = vr.hits;
       skippedTables = vr.skippedTables;
+      vectorMeta = {
+        embedStatus: vr.embedStatus, embedSource: vr.embedSource,
+        embedReason: vr.embedReason, searchMode: vr.searchMode, note: vr.note,
+      };
     }
     const entry = { type, rows };
-    // skippedTables only attached for the vector kind (§10.1's own
-    // total-classification existence probe) — never present on the other
-    // 3 query types, which have no per-table fan-out to skip.
+    // skippedTables/embed* only attached for the vector kind (§10.1's own
+    // total-classification existence probe / the embed-url-from-project-root
+    // fix's degradation metadata) — never present on the other 3 query
+    // types, which have no per-table fan-out to skip and no embed call at
+    // all.
     if (skippedTables !== undefined) entry.skippedTables = skippedTables;
+    if (vectorMeta !== undefined) {
+      entry.embedStatus = vectorMeta.embedStatus;
+      entry.embedSource = vectorMeta.embedSource;
+      entry.embedReason = vectorMeta.embedReason;
+      entry.searchMode = vectorMeta.searchMode;
+      if (vectorMeta.note !== undefined) entry.note = vectorMeta.note;
+    }
     results.push(entry);
   }
 

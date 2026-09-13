@@ -28,7 +28,7 @@
 const fs   = require('fs');
 const path = require('path');
 const http = require('http');
-const { loadConfig, readPipelineYmlSectionKey } = require('./shared');
+const { loadConfig } = require('./shared');
 
 const EMBED_DIMS = parseInt(process.env.EMBED_DIMS || '4000', 10);
 
@@ -256,15 +256,20 @@ function resolveEmbedUrl(opts = {}) {
  *     for an in-process CLI whose cwd IS the project root; it is NOT used
  *     by any MCP tool call site.
  *   - `opts.projectRoot` PRESENT (the MCP tool call paths, threaded through
- *     memory-search.js's memorySearch): resolves the URL via
- *     resolveEmbedUrl({projectRoot, vllmUrl: opts.vllmUrl}) — tier 0
- *     explicit / tier 1 that project's OWN pipeline.yml / tier 2 env / tier
- *     3 user-scope default — NEVER this process's cwd. The model, when
- *     `opts.model` is not supplied, is read from that SAME projectRoot's
- *     `.claude/pipeline.yml` `knowledge.embedding_model` (never a different
- *     project's cached value, never loadConfig()'s cwd-resolved config —
- *     adversary finding F1, "split-brain model from repo A posted to repo
- *     B's URL").
+ *     memory-search.js's memorySearch): resolves BOTH the URL and the model
+ *     via embedding-provider.js's ONE
+ *     resolveConfiguredEmbedEndpointDetailed({projectRoot, vllmUrl:
+ *     opts.vllmUrl, model: opts.model}) — tier 0 explicit / tier 1 that
+ *     project's OWN pipeline.yml / tier 2 env / tier 3 user-scope default
+ *     for the URL; tier 0 explicit / tier 1 that SAME project's OWN
+ *     pipeline.yml for the model — NEVER this process's cwd, NEVER a
+ *     different project's cached value (adversary finding F1, "split-brain
+ *     model from repo A posted to repo B's URL"). A model resolved from
+ *     tier 1 (a project file) is validated via shared.js's
+ *     validateEmbeddingModel — the SAME "vLLM is the only supported
+ *     embedding backend" check the CLI's loadConfig() always applies —
+ *     closing the validation-parity gap a project file with an unsupported
+ *     `embedding_model` would otherwise open on this path only.
  *
  * @param {string} text  — text to embed
  * @param {object} [opts]
@@ -309,12 +314,27 @@ async function embedQuery(text, opts = {}) {
   if (opts.projectRoot) {
     // NEW path (embed-url-from-project-root fix): resolve strictly against
     // the CALLER-SUPPLIED projectRoot — never cwd, never PROJECT_ROOT env.
-    if (!vllmUrl) {
-      vllmUrl = resolveEmbedUrl({ projectRoot: opts.projectRoot, vllmUrl: opts.vllmUrl }).url;
-    }
-    if (!model) {
-      model = readPipelineYmlSectionKey(opts.projectRoot, 'knowledge', 'embedding_model') || null;
-    }
+    //
+    // ALWAYS calls the central resolver (validation-parity amendment,
+    // 2026-09-13) — never a `if (!vllmUrl)`/`if (!model)` shortcut. A
+    // shortcut bypasses the resolver's own normalization for an explicit
+    // override too: a whitespace-only opts.vllmUrl ("   ") or a non-string
+    // opts.vllmUrl (e.g. 12345) is truthy and would otherwise skip straight
+    // to `_vllmEmbed` with a garbage URL instead of falling through to the
+    // next tier the way resolveConfiguredEmbedEndpointDetailed's own tier 0
+    // already handles correctly. Passing opts.vllmUrl/opts.model through
+    // UNCONDITIONALLY as tier-0 candidates means an already-valid explicit
+    // value still wins (tier 0 matches first), while a malformed one falls
+    // through exactly like resolveConfiguredEmbedEndpointDetailed's own
+    // tests expect. This also centralizes `embedding_model` resolution (and
+    // its validateEmbeddingModel check) into embedding-provider.js — see
+    // that function's own header — rather than a second read here.
+    const { resolveConfiguredEmbedEndpointDetailed } = require('./embedding-provider');
+    const detailed = resolveConfiguredEmbedEndpointDetailed({
+      projectRoot: opts.projectRoot, vllmUrl: opts.vllmUrl, model: opts.model,
+    });
+    vllmUrl = detailed.url;
+    model = detailed.model;
   } else if (!vllmUrl || !model) {
     // CLI path — UNCHANGED from before this fix.
     let cfg;

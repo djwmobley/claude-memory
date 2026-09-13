@@ -1282,6 +1282,16 @@ jobs:
         # Pure unit test — no Postgres required; one ephemeral loopback HTTP
         # server per test that needs a real embed call.
         run: node test/test-embed-url-project-root.js
+      - name: Run project-identity legacy-root explicit-vs-env precedence tests (2026-09-13)
+        # Codex review of PR #302, finding 6b: scripts/lib/project-identity.js's
+        # _findLegacyRoot used to prefer process.env.PROJECT_ROOT over its own
+        # startDir argument UNCONDITIONALLY, even when ensureProjectIdentity had
+        # already resolved an explicit opts.cwd (e.g. withProjectDb's MCP-tool
+        # projectRoot) in preference to the env var one level up. Fixed via a new
+        # opts.explicitRoot flag (true for every explicit-opts.cwd caller, false
+        # only for the CLI's own no-opts.cwd path, which still honors the env var
+        # by design). Pure unit test — no Postgres, no live DB.
+        run: node scripts/test-project-identity-legacy-root.js
       - name: Run init-embeddability tests (pgvector + provider total classification, backfill-embeddings)
         # init-embeddability AUTHOR task: end-to-end + lib-level coverage for
         # scripts/handoff.js's cmdInit changes, scripts/lib/backfill-embeddings.js,

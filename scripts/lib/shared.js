@@ -85,28 +85,117 @@ function validateEmbeddingModel(value) {
   }
 }
 
-// Extract a YAML section (from "key:" to next top-level key or EOF) out of a
-// raw pipeline.yml file's already-read text content. Pure function of
-// `content` — no I/O — so it can be reused both by loadConfig() (which reads
-// the CWD-resolved project's pipeline.yml) and by any caller that already
-// has a specific, explicitly-known project root's file content in hand and
-// must NOT fall back to cwd/PROJECT_ROOT (see readPipelineYmlSectionKey
-// below — the embed-url-from-project-root fix's single section-scoped
-// reader, reused by reference from scripts/lib/embedding-provider.js and
-// scripts/lib/embed.js rather than forked as a second regex).
-function getYmlSection(content, section) {
-  const match = content.match(new RegExp(`^${section}:.*\\r?\\n((?:[ \\t]+.*\\r?\\n?)*)`, 'm'));
-  return match ? match[1] : '';
+// Escape a string for literal use inside a `new RegExp(...)` pattern.
+function _escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// Get a value within a specific section — scoped to that section's own
-// indented lines only (never an any-indented-line match against the whole
-// file), so a same-named key under a DIFFERENT top-level section is never
-// picked up. See getYmlSection above.
+// Strip a YAML scalar value down to its actual content:
+//   - surrounding matching single OR double quotes are removed (a value
+//     that opens with a quote but never closes it is returned verbatim —
+//     malformed input is never silently corrupted further);
+//   - for an UNQUOTED value, a trailing ` #comment` (a `#` preceded by
+//     whitespace) is stripped, since only a quoted value may contain a
+//     literal `#` as data.
+// Pure function of the raw (already key-stripped) text on the line.
+function _stripYmlScalar(raw) {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return trimmed;
+  const first = trimmed[0];
+  if (first === '"' || first === "'") {
+    const closeIdx = trimmed.indexOf(first, 1);
+    if (closeIdx !== -1) return trimmed.slice(1, closeIdx);
+    return trimmed; // no closing quote found — malformed; best-effort passthrough
+  }
+  const commentMatch = trimmed.match(/\s#/);
+  return commentMatch ? trimmed.slice(0, commentMatch.index).trim() : trimmed;
+}
+
+// Extract a YAML section (from "key:" to the next NON-COMMENT line at
+// indentation 0, or EOF) out of a raw pipeline.yml file's already-read text
+// content. Pure function of `content` — no I/O — so it can be reused both by
+// loadConfig() (which reads the CWD-resolved project's pipeline.yml) and by
+// any caller that already has a specific, explicitly-known project root's
+// file content in hand and must NOT fall back to cwd/PROJECT_ROOT (see
+// readPipelineYmlSectionKey below — the embed-url-from-project-root fix's
+// single section-scoped reader, reused by reference from
+// scripts/lib/embedding-provider.js and scripts/lib/embed.js rather than
+// forked as a second regex).
+//
+// Line-based (never position/contiguity-assuming beyond "this section's own
+// lines"), per project canon on parsers reading human-edited files:
+//   - a BLANK line inside the section never ends it (previously did: the old
+//     regex's `[ \t]+.*` per-line alternation required at least one leading
+//     whitespace char, so an empty line broke the match early);
+//   - a COMMENT line (`#...`) at ANY indentation, including column 0, never
+//     ends the section — only a real (non-comment) line back at column 0
+//     does;
+//   - every other indented line (any depth) is part of the section body,
+//     same as before.
+function getYmlSection(content, section) {
+  const lines = content.split(/\r\n|\r|\n/);
+  const sectionRe = new RegExp(`^${_escapeRegExp(section)}:`);
+  let started = false;
+  const collected = [];
+  for (const line of lines) {
+    if (!started) {
+      if (sectionRe.test(line)) started = true;
+      continue;
+    }
+    if (line.trim() === '') { collected.push(line); continue; } // blank line: never ends the section
+    const leadingWs = line.match(/^[ \t]*/)[0];
+    if (leadingWs.length === 0) {
+      if (line.startsWith('#')) { collected.push(line); continue; } // column-0 comment: never ends the section
+      break; // real, non-comment column-0 content: ends the section
+    }
+    collected.push(line);
+  }
+  return collected.join('\n');
+}
+
+// Get a value within a specific section — scoped to BOTH that section's own
+// lines (see getYmlSection above) AND the section's own first-child
+// indentation level: a key match requires EXACTLY that indentation, never
+// "any indentation" — so a key nested two levels deep under an unrelated
+// sibling mapping inside the same section is never mistaken for a direct
+// child key. Blank lines and comment lines (at any indentation) inside the
+// section are skipped when scanning for both the base indentation and the
+// key itself — they can never establish the base indent and can never match
+// as a key line. Never an any-indented-line match against the whole file, so
+// a same-named key under a DIFFERENT top-level section is never picked up
+// either. Quoted values are unquoted and a trailing unquoted `# comment` is
+// stripped — see _stripYmlScalar above.
 function getYmlValueInSection(content, section, key) {
   const sectionContent = getYmlSection(content, section);
-  const match = sectionContent.match(new RegExp(`^\\s*${key}:\\s*"?([^"\\n]+)"?`, 'm'));
-  return match ? match[1].trim() : null;
+  if (!sectionContent) return null;
+  const lines = sectionContent.split('\n');
+
+  const isCommentLine = (line) => {
+    const leadingWs = line.match(/^[ \t]*/)[0];
+    return line.slice(leadingWs.length).startsWith('#');
+  };
+
+  // The section's base (first-child) indentation is whatever the FIRST
+  // actual (non-blank, non-comment) line's leading whitespace is — every
+  // direct child key must match that exact indentation; anything deeper
+  // (a nested key under a sibling mapping) never matches.
+  let baseIndent = null;
+  for (const line of lines) {
+    if (line.trim() === '' || isCommentLine(line)) continue;
+    baseIndent = line.match(/^[ \t]*/)[0];
+    break;
+  }
+  if (baseIndent === null) return null;
+
+  const keyRe = new RegExp(`^${_escapeRegExp(baseIndent)}${_escapeRegExp(key)}:\\s*(.*)$`);
+  for (const line of lines) {
+    if (line.trim() === '' || isCommentLine(line)) continue;
+    const m = line.match(keyRe);
+    if (!m) continue;
+    const value = _stripYmlScalar(m[1]);
+    return value.length ? value : null;
+  }
+  return null;
 }
 
 /**
@@ -799,4 +888,11 @@ module.exports = {
   // — never cwd/PROJECT_ROOT — by reference to the SAME regex loadConfig()
   // itself uses, rather than forking a second one.
   getYmlSection, getYmlValueInSection, readPipelineYmlSectionKey,
+  // Exported (2026-09-13, embed-url-from-project-root fix, validation-parity
+  // amendment) so scripts/lib/embedding-provider.js's central embed-endpoint/
+  // model resolver can apply the SAME "vLLM is the only supported embedding
+  // backend" validation to a model resolved from an EXPLICIT project root's
+  // pipeline.yml that loadConfig()'s own cwd-scoped path already applies —
+  // never a second, divergent validation rule for the MCP path.
+  validateEmbeddingModel, VLLM_MODEL,
 };
