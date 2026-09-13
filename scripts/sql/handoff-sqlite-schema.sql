@@ -82,12 +82,15 @@ CREATE TABLE IF NOT EXISTS assertions (
   -- PR-B bi-temporal supersession + suppression_kind + pinned-exemption (additive, NULL-tolerant).
   -- Existing rows have NULL for valid_at/invalid_at/suppression_kind; pinned defaults to 0 (false).
   -- No backfill of existing rows (§7 SKIP; honors no-backfill rule).
-  -- suppression_kind values: 'superseded' | 'downvoted_terminal' | 'downvoted_probation' | 'retired' | 'reality_reconciled'
+  -- suppression_kind values: 'superseded' | 'downvoted_terminal' | 'downvoted_probation' | 'retired' | 'reality_reconciled' | 'stale_pointer'
   --   'retired' added by L5 (cmdRetire operator verb); row excluded from retrieval but recoverable.
   --   'reality_reconciled' added by reality-mismatch-reconcile: stale verify-mode row superseded to reality.
+  --   'stale_pointer' added by cm#297 close-time bulk pass (_suppressStaleLegacyPointers):
+  --   every extracted pointer classified IN_REPO_STALE and the predicate is not an intent
+  --   predicate; always paired with invalid_at in the same UPDATE.
   valid_at         TEXT,
   invalid_at       TEXT,
-  suppression_kind TEXT    CHECK (suppression_kind IN ('superseded', 'downvoted_terminal', 'downvoted_probation', 'retired', 'reality_reconciled')),
+  suppression_kind TEXT    CHECK (suppression_kind IN ('superseded', 'downvoted_terminal', 'downvoted_probation', 'retired', 'reality_reconciled', 'stale_pointer')),
   pinned           INTEGER NOT NULL DEFAULT 0,
   -- Two-tier durability: probationary → consolidated (additive, NULL-tolerant).
   -- GRANDFATHER RULE: tier IS NULL = grandfathered; treated as 'consolidated' by all read paths.

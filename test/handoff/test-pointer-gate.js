@@ -44,6 +44,8 @@ const {
   _suppressStaleLegacyPointers,
   validatePointers,
   runPointerGate,
+  // cm#297 TOTAL pointer-scope classification internals.
+  _classifyPointerScope,
 } = require('../../scripts/handoff.js');
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
@@ -599,15 +601,20 @@ async function runTests() {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  // ── T13: Bulk supersession pass ───────────────────────────────────────────────
-  await test('T13: bulk supersession — stale rows suppressed, passing rows anchored, already-suppressed unchanged', async () => {
+  // ── T13: Bulk supersession pass (cm#297 TOTAL classification) ──────────────────
+  //
+  // Rewritten for cm#297: staleness is now decided purely by TOTAL scope
+  // classification (file exists + line in-range), NOT prose-vs-content token
+  // overlap — the prose-overlap heuristic (P-4) stays in the SEPARATE
+  // serve-time validatePointers gate only (cm#297 non-goal). Row A here is
+  // genuinely stale (line 9999 does not exist); Row B cites a real, in-range
+  // line regardless of whether its prose happens to mention matching tokens.
+  await test('T13: bulk supersession — in-range-stale suppressed w/ kind+invalid_at, in-range-valid anchored, already-suppressed unchanged', async () => {
     const fakeRoot = mkFakeRoot(TARGET_DB);
     try {
       const scriptsDir = path.join(fakeRoot, 'scripts');
       fs.mkdirSync(scriptsDir, { recursive: true });
-      // Write a file with lines 42 (unrelated), 50 (realHelper), 99 (anything)
       const lines = Array.from({ length: 102 }, (_, i) => {
-        if (i === 41) return "const unrelated = require('./elsewhere');";
         if (i === 49) return 'function realHelper() {';
         if (i === 50) return '  return true;';
         if (i === 51) return '}';
@@ -628,16 +635,16 @@ async function runTests() {
       const db = await pgConnect(TARGET_DB);
       try {
 
-        // Insert Row A: stale — prose says "semantic-vector-stub" but line 42 is unrelated
+        // Insert Row A: stale — line 9999 does not exist in the 102-line file.
         const rowA = await db.query(
           `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, anchor, suppressed)
-           VALUES ($1, 'semantic-vector-stub', 'is_at', 'scripts/handoff.js:42', 7, 'model_extracted', NULL, false)
+           VALUES ($1, 'dangling-thing', 'is_at', 'scripts/handoff.js:9999', 7, 'model_extracted', NULL, false)
            RETURNING id`,
           [testProjectId]
         );
         const idA = rowA.rows[0].id;
 
-        // Insert Row B: passes — prose "real-helper" overlaps with "realHelper" at line 50
+        // Insert Row B: passes — line 50 is a real, in-range, non-blank line.
         const rowB = await db.query(
           `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, anchor, suppressed)
            VALUES ($1, 'real-helper', 'is_at', 'scripts/handoff.js:50', 7, 'model_extracted', NULL, false)
@@ -656,11 +663,16 @@ async function runTests() {
         const idC = rowC.rows[0].id;
 
         // Run the bulk supersession pass
-        await _suppressStaleLegacyPointers(db, testProjectId, fakeRoot);
+        const result1 = await _suppressStaleLegacyPointers(db, testProjectId, fakeRoot);
+        assert.ok(result1.findings.some((f) => f.kind === 'stale_pointer_suppressed'),
+          `expected a stale_pointer_suppressed finding, got: ${JSON.stringify(result1.findings)}`);
 
-        // Check Row A: should be suppressed, anchor still NULL
-        const afterA = await db.query(`SELECT suppressed, anchor FROM assertions WHERE id = $1`, [idA]);
+        // Check Row A: should be suppressed, with suppression_kind + invalid_at
+        // set in the SAME statement (cm#297's root defect), anchor still NULL.
+        const afterA = await db.query(`SELECT suppressed, suppression_kind, invalid_at, anchor FROM assertions WHERE id = $1`, [idA]);
         assert.strictEqual(afterA.rows[0].suppressed, true, 'Row A must be suppressed');
+        assert.strictEqual(afterA.rows[0].suppression_kind, 'stale_pointer', 'Row A suppression_kind must be stale_pointer');
+        assert.ok(afterA.rows[0].invalid_at !== null, 'Row A invalid_at must be set');
         assert.strictEqual(afterA.rows[0].anchor, null, 'Row A anchor must remain NULL');
 
         // Check Row B: suppressed=false, anchor IS NOT NULL
@@ -668,13 +680,15 @@ async function runTests() {
         assert.strictEqual(afterB.rows[0].suppressed, false, 'Row B must remain unsuppressed');
         assert.ok(afterB.rows[0].anchor !== null, 'Row B must have an anchor derived');
 
-        // Check Row C: unchanged — suppressed=true, anchor still NULL
-        const afterC = await db.query(`SELECT suppressed, anchor FROM assertions WHERE id = $1`, [idC]);
+        // Check Row C: unchanged — suppressed=true, kind/anchor still NULL
+        const afterC = await db.query(`SELECT suppressed, suppression_kind, anchor FROM assertions WHERE id = $1`, [idC]);
         assert.strictEqual(afterC.rows[0].suppressed, true, 'Row C must still be suppressed (unchanged)');
+        assert.strictEqual(afterC.rows[0].suppression_kind, null, 'Row C suppression_kind must remain untouched (NULL)');
         assert.strictEqual(afterC.rows[0].anchor, null, 'Row C anchor must remain NULL');
 
         // Idempotency: run again — no changes
-        await _suppressStaleLegacyPointers(db, testProjectId, fakeRoot);
+        const result2 = await _suppressStaleLegacyPointers(db, testProjectId, fakeRoot);
+        assert.strictEqual(result2.findings.length, 0, 'second run must find nothing left to classify (anchor now set on A/B or already-suppressed on C)');
         const idempA = await db.query(`SELECT suppressed, anchor FROM assertions WHERE id = $1`, [idA]);
         assert.strictEqual(idempA.rows[0].suppressed, true, 'Row A idempotent: still suppressed');
         const idempB = await db.query(`SELECT suppressed, anchor FROM assertions WHERE id = $1`, [idB]);
@@ -715,6 +729,253 @@ async function runTests() {
     assert.ok(derivedAnchors.has(pointer), `derivedAnchors must contain an entry for ${pointer}`);
     const derived = derivedAnchors.get(pointer);
     assert.ok(derived && (derived.symbol || derived.snippet), 'Derived anchor must have symbol or snippet');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // ── T15-T21: cm#297 TOTAL pointer-scope classification (_classifyPointerScope) ──
+  // Unit-level — no DB required. Each is an adversary-hardened fixture from
+  // the cm#297 spec's own worked examples.
+
+  await test('T15: Windows absolute backslash pointer never falls back to bare-filename match, even with a same-named in-repo file', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ptr-gate-t15-'));
+    const scriptsDir = path.join(dir, 'scripts');
+    fs.mkdirSync(scriptsDir, { recursive: true });
+    // A same-named file DOES exist in-repo — the pre-filter must still win.
+    fs.writeFileSync(path.join(scriptsDir, 'a.js'), 'function a() { return 1; }\n', 'utf8');
+
+    const r = _classifyPointerScope(dir, 'C:\\other\\a.js:10');
+    assert.strictEqual(r.scope, 'UNPARSEABLE_OR_EXTERNAL', `expected UNPARSEABLE_OR_EXTERNAL, got ${r.scope}`);
+    assert.strictEqual(r.resolvedAbsPath, null, 'must never resolve to the in-repo same-named file');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await test('T16: UNC path (\\\\server\\share\\x.js:1) classifies UNPARSEABLE_OR_EXTERNAL', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ptr-gate-t16-'));
+    const r = _classifyPointerScope(dir, '\\\\server\\share\\x.js:1');
+    assert.strictEqual(r.scope, 'UNPARSEABLE_OR_EXTERNAL', `expected UNPARSEABLE_OR_EXTERNAL, got ${r.scope}`);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await test('T17: forward-slash drive-letter path (C:/Users/x/other/a.js:10) classifies UNPARSEABLE_OR_EXTERNAL', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ptr-gate-t17-'));
+    const r = _classifyPointerScope(dir, 'C:/Users/x/other/a.js:10');
+    assert.strictEqual(r.scope, 'UNPARSEABLE_OR_EXTERNAL', `expected UNPARSEABLE_OR_EXTERNAL, got ${r.scope}`);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await test('T18: relative pointer that normalizes back inside the repo classifies IN_REPO_RESOLVABLE', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ptr-gate-t18-'));
+    fs.writeFileSync(path.join(dir, 'x.js'), Array.from({ length: 5 }, (_, i) => i === 2 ? 'const y = 1;' : `// ${i}`).join('\n'), 'utf8');
+    const base = path.basename(dir);
+    const r = _classifyPointerScope(dir, `../${base}/x.js:3`);
+    assert.strictEqual(r.scope, 'IN_REPO_RESOLVABLE', `expected IN_REPO_RESOLVABLE, got ${r.scope}`);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await test('T19: relative pointer that resolves outside the repo classifies OUTSIDE_REPO', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ptr-gate-t19-'));
+    const r = _classifyPointerScope(dir, '../other/b.js:3');
+    assert.strictEqual(r.scope, 'OUTSIDE_REPO', `expected OUTSIDE_REPO, got ${r.scope}`);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await test('T20: line-range pointer (x.js:10-12) parses endLine and resolves IN_REPO_RESOLVABLE', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ptr-gate-t20-'));
+    fs.writeFileSync(path.join(dir, 'x.js'), Array.from({ length: 15 }, (_, i) => i === 9 ? 'const z = 1;' : `// ${i}`).join('\n'), 'utf8');
+    const r = _classifyPointerScope(dir, 'x.js:10-12');
+    assert.strictEqual(r.scope, 'IN_REPO_RESOLVABLE', `expected IN_REPO_RESOLVABLE, got ${r.scope}`);
+    assert.strictEqual(r.startLine, 10, 'startLine must be 10');
+    assert.strictEqual(r.endLine, 12, 'endLine must be 12');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await test('T21: x.js#L10 (anchor-style, not a code pointer) classifies NOT_A_POINTER', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ptr-gate-t21-'));
+    const r = _classifyPointerScope(dir, 'x.js#L10');
+    assert.strictEqual(r.scope, 'NOT_A_POINTER', `expected NOT_A_POINTER, got ${r.scope}`);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // ── T22-T25: cm#297 row-decision fixtures (_suppressStaleLegacyPointers) ───────
+
+  await test('T22: row citing two pointers (one stale, one resolvable) is NOT suppressed', async () => {
+    const fakeRoot = mkFakeRoot(TARGET_DB);
+    try {
+      const scriptsDir = path.join(fakeRoot, 'scripts');
+      fs.mkdirSync(scriptsDir, { recursive: true });
+      fs.writeFileSync(path.join(scriptsDir, 'both.js'), Array.from({ length: 10 }, (_, i) => i === 4 ? 'function ok() {}' : `// ${i}`).join('\n'), 'utf8');
+
+      runHelper('init', ['-y'], { fakeRoot });
+      const testProjectId = readMarker(fakeRoot).uuid;
+
+      const db = await pgConnect(TARGET_DB);
+      try {
+        const row = await db.query(
+          `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, anchor, suppressed)
+           VALUES ($1, 'mixed', 'cites', 'see scripts/both.js:5 and scripts/both.js:9999', 7, 'model_extracted', NULL, false)
+           RETURNING id`,
+          [testProjectId]
+        );
+        const id = row.rows[0].id;
+
+        await _suppressStaleLegacyPointers(db, testProjectId, fakeRoot);
+        const after = await db.query(`SELECT suppressed FROM assertions WHERE id = $1`, [id]);
+        assert.strictEqual(after.rows[0].suppressed, false, 'row with a mixed stale/resolvable pointer set must NOT be suppressed');
+      } finally {
+        await db.end();
+      }
+    } finally {
+      fs.rmSync(fakeRoot, { recursive: true, force: true });
+    }
+  });
+
+  await test('T23: intent row (session_tldr) citing only a stale in-repo pointer survives with annotation, never suppressed', async () => {
+    const fakeRoot = mkFakeRoot(TARGET_DB);
+    try {
+      runHelper('init', ['-y'], { fakeRoot });
+      const testProjectId = readMarker(fakeRoot).uuid;
+
+      const db = await pgConnect(TARGET_DB);
+      try {
+        const row = await db.query(
+          `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, anchor, suppressed)
+           VALUES ($1, 'ptr-gate-test', 'session_tldr', 'see scripts/nope.js:9999 for detail', 7, 'model_extracted', NULL, false)
+           RETURNING id`,
+          [testProjectId]
+        );
+        const id = row.rows[0].id;
+
+        const result = await _suppressStaleLegacyPointers(db, testProjectId, fakeRoot);
+        assert.ok(result.findings.some((f) => f.kind === 'stale_pointer_note' && f.predicate === 'session_tldr'),
+          `expected a stale_pointer_note finding for the intent row, got: ${JSON.stringify(result.findings)}`);
+        const after = await db.query(`SELECT suppressed, suppression_kind FROM assertions WHERE id = $1`, [id]);
+        assert.strictEqual(after.rows[0].suppressed, false, 'session_tldr row must never be suppressed by the bulk pass');
+        assert.strictEqual(after.rows[0].suppression_kind, null, 'suppression_kind must remain NULL on an unsuppressed row');
+      } finally {
+        await db.end();
+      }
+    } finally {
+      fs.rmSync(fakeRoot, { recursive: true, force: true });
+    }
+  });
+
+  await test('T24: out-of-scope pointer (OUTSIDE_REPO) leaves the row untouched with an annotation, never suppressed', async () => {
+    const fakeRoot = mkFakeRoot(TARGET_DB);
+    try {
+      runHelper('init', ['-y'], { fakeRoot });
+      const testProjectId = readMarker(fakeRoot).uuid;
+
+      const db = await pgConnect(TARGET_DB);
+      try {
+        const row = await db.query(
+          `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, anchor, suppressed)
+           VALUES ($1, 't24', 'cites', 'see ../other-repo/b.js:3 for context', 7, 'model_extracted', NULL, false)
+           RETURNING id`,
+          [testProjectId]
+        );
+        const id = row.rows[0].id;
+
+        const result = await _suppressStaleLegacyPointers(db, testProjectId, fakeRoot);
+        assert.ok(result.findings.some((f) => f.kind === 'stale_pointer_note'),
+          `expected a stale_pointer_note finding for the out-of-scope pointer, got: ${JSON.stringify(result.findings)}`);
+        const after = await db.query(`SELECT suppressed FROM assertions WHERE id = $1`, [id]);
+        assert.strictEqual(after.rows[0].suppressed, false, 'a row citing only an OUTSIDE_REPO pointer must never be suppressed');
+      } finally {
+        await db.end();
+      }
+    } finally {
+      fs.rmSync(fakeRoot, { recursive: true, force: true });
+    }
+  });
+
+  await test('T25: after the bulk pass, no row has suppressed=true AND suppression_kind IS NULL', async () => {
+    const fakeRoot = mkFakeRoot(TARGET_DB);
+    try {
+      runHelper('init', ['-y'], { fakeRoot });
+      const testProjectId = readMarker(fakeRoot).uuid;
+
+      const db = await pgConnect(TARGET_DB);
+      try {
+        await db.query(
+          `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, anchor, suppressed)
+           VALUES ($1, 't25', 'cites', 'scripts/gone.js:9999', 7, 'model_extracted', NULL, false)`,
+          [testProjectId]
+        );
+
+        await _suppressStaleLegacyPointers(db, testProjectId, fakeRoot);
+
+        const bad = await db.query(
+          `SELECT COUNT(*) AS n FROM assertions WHERE project_id = $1 AND suppressed = true AND suppression_kind IS NULL`,
+          [testProjectId]
+        );
+        assert.strictEqual(parseInt(bad.rows[0].n, 10), 0, 'every suppression made by the bulk pass must carry a suppression_kind');
+      } finally {
+        await db.end();
+      }
+    } finally {
+      fs.rmSync(fakeRoot, { recursive: true, force: true });
+    }
+  });
+
+  // ── T26: --dry-run parity (spec item 5) ─────────────────────────────────────────
+
+  await test('T26: close --dry-run prints legacy stale-pointer classification prefixed "(dry-run)" and performs zero writes', async () => {
+    const fakeRoot = mkFakeRoot(TARGET_DB);
+    try {
+      runHelper('init', ['-y'], { fakeRoot });
+      const testProjectId = readMarker(fakeRoot).uuid;
+
+      const db = await pgConnect(TARGET_DB);
+      let rowId;
+      try {
+        const row = await db.query(
+          `INSERT INTO assertions (project_id, subject, predicate, object, confidence, source, anchor, suppressed)
+           VALUES ($1, 't26', 'cites', 'scripts/dry-gone.js:9999', 7, 'model_extracted', NULL, false)
+           RETURNING id`,
+          [testProjectId]
+        );
+        rowId = row.rows[0].id;
+      } finally {
+        await db.end();
+      }
+
+      const payload = minimalClosePayload();
+      let out = '';
+      try {
+        out = runHelper('close', ['--dry-run', '--json', '-'], { fakeRoot, stdin: JSON.stringify(payload) });
+      } catch (e) {
+        out = (e.stdout || '') + (e.message || '');
+      }
+      assert.ok(out.includes('(dry-run)'), `expected a "(dry-run)"-prefixed line in dry-run output, got:\n${out}`);
+      assert.ok(/SUPPRESSED/.test(out), `expected a SUPPRESSED classification line in dry-run output, got:\n${out}`);
+
+      const db2 = await pgConnect(TARGET_DB);
+      try {
+        const after = await db2.query(`SELECT suppressed, suppression_kind FROM assertions WHERE id = $1`, [rowId]);
+        assert.strictEqual(after.rows[0].suppressed, false, 'dry-run must perform zero writes — row must remain unsuppressed');
+        assert.strictEqual(after.rows[0].suppression_kind, null, 'dry-run must not set suppression_kind');
+      } finally {
+        await db2.end();
+      }
+    } finally {
+      fs.rmSync(fakeRoot, { recursive: true, force: true });
+    }
+  });
+
+  // ── T27: win32-only case-insensitive path comparison ────────────────────────────
+
+  await test('T27: win32 case-insensitive relative-pointer comparison does not misclassify OUTSIDE_REPO', () => {
+    if (process.platform !== 'win32') {
+      console.log('  (skipped — win32-only, running on ' + process.platform + ')');
+      return;
+    }
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ptr-gate-t27-'));
+    fs.writeFileSync(path.join(dir, 'x.js'), Array.from({ length: 5 }, (_, i) => i === 2 ? 'const q = 1;' : `// ${i}`).join('\n'), 'utf8');
+    const base = path.basename(dir);
+    const upperPointer = `../${base.toUpperCase()}/x.js:3`;
+    const r = _classifyPointerScope(dir, upperPointer);
+    assert.strictEqual(r.scope, 'IN_REPO_RESOLVABLE',
+      `case-differing relative pointer must resolve IN_REPO on win32, got ${r.scope} for ${upperPointer} against root ${dir}`);
     fs.rmSync(dir, { recursive: true, force: true });
   });
 

@@ -118,7 +118,7 @@ const SPECS = {
       '--apply':            { kind: 'boolean', desc: 'Execute the prune (default is dry-run/report-only).' },
       '--include-pinned':   { kind: 'boolean', desc: 'Include pinned rows in the candidate set.' },
       '--suppressed':       { kind: 'boolean', desc: 'Restrict to already-suppressed rows.' },
-      '--suppression-kind': { kind: 'value',   desc: 'Filter by suppression kind (superseded | downvoted_terminal | downvoted_probation | retired | reality_reconciled).' },
+      '--suppression-kind': { kind: 'value',   desc: 'Filter by suppression kind (superseded | downvoted_terminal | downvoted_probation | retired | reality_reconciled | stale_pointer).' },
       '--subject':          { kind: 'value',   desc: 'Filter by subject.' },
       '--older-than':       { kind: 'value',   desc: 'Filter to rows older than N days.' },
     },
