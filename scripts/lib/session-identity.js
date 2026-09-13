@@ -360,14 +360,42 @@ function filterMarkersByHost(markers, handoffHost) {
  * shared resolveSessionIdFromMarker above — a distinct rule for a distinct
  * (stricter) caller.
  */
-async function resolveUsageRecordMarkerDefault(db, projectId, handoffHost) {
+// ── Shared strict-marker-candidate resolution (cm#295 fix A follow-up) ─────
+//
+// Both resolveUsageRecordMarkerDefault (below) and resolveCloseSessionIdFromMarker
+// (scripts/handoff-mcp.mjs's toolHandoffClose/toolHandoffCheckpoint) need the
+// SAME "strictly-parsed, host-filtered candidate markers for this project"
+// computation — split out here (adversary-must-pin-identity-semantics memory:
+// ONE shared normalization function in ONE engine, not two hand-rolled
+// copies) so the zero/one/many classification and the session-id-derivation
+// step are identical for every caller; only the ERROR TEXT differs per
+// caller (usage_record's mentions the env-var attempt that precedes it;
+// close/checkpoint's does not, since FIX A deliberately never falls back to
+// this long-lived MCP server's own env for that default — see
+// resolveCloseSessionIdFromMarker's header comment).
+async function getHostFilteredMarkerCandidates(db, projectId, handoffHost) {
   const { rows } = await db.query(
     `SELECT value FROM project_settings WHERE project_id = $1 AND key = $2`,
     [projectId, 'session_in_progress']
   );
   const raw = rows.length > 0 ? rows[0].value : null;
   const { markers } = parseSessionMarkersStrict(raw);
-  const candidates = filterMarkersByHost(markers, handoffHost);
+  return filterMarkersByHost(markers, handoffHost);
+}
+
+// A candidate's session id, exactly as resolveUsageRecordMarkerDefault has
+// always derived it: session_id when usable, else its ts, then trimmed.
+// Whitespace-only/blank results are returned as '' — callers reject that
+// explicitly rather than silently substituting anything else.
+function deriveMarkerSessionId(candidate) {
+  const derived = (typeof candidate.session_id === 'string' && candidate.session_id.length > 0)
+    ? candidate.session_id
+    : candidate.ts;
+  return typeof derived === 'string' ? derived.trim() : '';
+}
+
+async function resolveUsageRecordMarkerDefault(db, projectId, handoffHost) {
+  const candidates = await getHostFilteredMarkerCandidates(db, projectId, handoffHost);
 
   if (candidates.length === 0) {
     return {
@@ -392,8 +420,7 @@ async function resolveUsageRecordMarkerDefault(db, projectId, handoffHost) {
   }
 
   const only = candidates[0];
-  const derived = (typeof only.session_id === 'string' && only.session_id.length > 0) ? only.session_id : only.ts;
-  const trimmed = typeof derived === 'string' ? derived.trim() : '';
+  const trimmed = deriveMarkerSessionId(only);
   if (trimmed.length === 0) {
     return {
       sessionId: null,
@@ -407,6 +434,81 @@ async function resolveUsageRecordMarkerDefault(db, projectId, handoffHost) {
   return { sessionId: trimmed, markerTs: only.ts, error: null };
 }
 
+/**
+ * resolveCloseSessionIdFromMarker(db, projectId, handoffHost, label) — cm#295
+ * fix A: the MCP-only default sessionId resolution for handoff_close /
+ * handoff_checkpoint when the caller omits `sessionId`. `label` is a short
+ * caller-identifying string ("handoff_close" / "handoff_checkpoint") used
+ * only in error text.
+ *
+ * Deliberately DOES NOT fall back to this server process's own
+ * CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID env vars the way
+ * resolveUsageRecordMarkerDefault's CALLER (toolUsageRecord) does before
+ * calling it. cm#295's root cause IS that env fallback: the MCP server is a
+ * long-lived process that resolves those vars ONCE at spawn time, so after
+ * an interactive host's `/clear` mints a fresh hook-side session and a fresh
+ * session_in_progress marker, the server's own stale spawn-time env id no
+ * longer matches ANY live marker — an env-first default would keep
+ * reproducing exactly the split-identity bug this fix exists to close (see
+ * the PR body's "why the earlier fix-A idea was rejected" section). The
+ * marker store (host-filtered, exactly-one-candidate) is therefore the ONLY
+ * source of truth for this default — same strict candidate resolution as
+ * resolveUsageRecordMarkerDefault (getHostFilteredMarkerCandidates +
+ * deriveMarkerSessionId), just distinct, caller-appropriate error text and no
+ * env-var mention (this path never attempts one).
+ *
+ * Total classification over host-filtered candidate count, identical shape
+ * to resolveUsageRecordMarkerDefault's:
+ *   zero candidates      -> { sessionId: null, markerTs: null, candidateCount: 0, error }
+ *   >1 candidates         -> { sessionId: null, markerTs: null, candidateCount: N, error }
+ *     (error names the count and each candidate's host; never a session id).
+ *   exactly one candidate -> { sessionId, markerTs, candidateCount: 1, error: null }
+ *     (a resulting blank/whitespace-only id is ALSO an actionable error, same
+ *     as resolveUsageRecordMarkerDefault — never silently substituted).
+ */
+async function resolveCloseSessionIdFromMarker(db, projectId, handoffHost, label) {
+  const callerLabel = label || 'handoff_close';
+  const candidates = await getHostFilteredMarkerCandidates(db, projectId, handoffHost);
+
+  if (candidates.length === 0) {
+    return {
+      sessionId: null,
+      markerTs: null,
+      candidateCount: 0,
+      error:
+        `${callerLabel}: sessionId was omitted and no project session marker (session_in_progress) was found` +
+        `${handoffHost ? ` for host "${handoffHost}"` : ''} -- pass sessionId explicitly.`,
+    };
+  }
+
+  if (candidates.length > 1) {
+    const hosts = candidates.map((m) => m.host || 'unknown');
+    return {
+      sessionId: null,
+      markerTs: null,
+      candidateCount: candidates.length,
+      error:
+        `${callerLabel}: ambiguous session markers (${candidates.length}) -- pass sessionId explicitly ` +
+        `(hosts: ${hosts.join(', ')}).`,
+    };
+  }
+
+  const only = candidates[0];
+  const trimmed = deriveMarkerSessionId(only);
+  if (trimmed.length === 0) {
+    return {
+      sessionId: null,
+      markerTs: null,
+      candidateCount: 1,
+      error:
+        `${callerLabel}: the project session marker (session_in_progress) resolved to a blank/whitespace ` +
+        'session id -- pass sessionId explicitly.',
+    };
+  }
+
+  return { sessionId: trimmed, markerTs: only.ts, candidateCount: 1, error: null };
+}
+
 module.exports = {
   resolveSessionIdFromEnv,
   parseSessionMarkersDetailed,
@@ -416,4 +518,5 @@ module.exports = {
   parseSessionMarkersStrict,
   filterMarkersByHost,
   resolveUsageRecordMarkerDefault,
+  resolveCloseSessionIdFromMarker,
 };

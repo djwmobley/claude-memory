@@ -48,7 +48,7 @@ const { ensureProjectIdentity } = require('./lib/project-identity.js');
 // from resolveSessionIdFromMarker (which stays handoff.js's own unchanged
 // third fallback and is no longer used by this file below). See
 // scripts/lib/session-identity.js's header comment for the full rule.
-const { resolveSessionIdFromEnv, resolveUsageRecordMarkerDefault } = require('./lib/session-identity.js');
+const { resolveSessionIdFromEnv, resolveUsageRecordMarkerDefault, resolveCloseSessionIdFromMarker } = require('./lib/session-identity.js');
 // cm#224 (decisions canon fix): the SAME ensureSchemaCurrent handoff.js itself
 // calls from cmdLoaderLoad/cmdClose/cmdInit — never a second implementation.
 // Requiring handoff.js here does NOT run its CLI router: handoff.js's own
@@ -647,6 +647,32 @@ function applySessionId(payload, sessionId) {
   return { ...payload, session_id: trimmed };
 }
 
+// cm#295 FIX A: resolve a default sessionId for close/checkpoint when the
+// caller omits it, from the SAME strict host-filtered marker rule
+// resolveUsageRecordMarkerDefault uses (scripts/lib/session-identity.js:
+// resolveCloseSessionIdFromMarker) — exactly one live project_settings
+// session_in_progress candidate, or refuse naming the count. Deliberately
+// NEVER falls back to this long-lived server's own CLAUDE_CODE_SESSION_ID/
+// CODEX_THREAD_ID env vars first (unlike usage_record's env-then-marker
+// order) — those vars are fixed at THIS process's spawn time, and going
+// stale across every `/clear` in the interactive host is the exact
+// split-identity bug cm#295 reports (see resolveCloseSessionIdFromMarker's
+// header comment for the full "why the earlier fix-A idea was rejected"
+// reasoning). Returns { sessionId, markerTs, error }; sessionId/markerTs are
+// null iff error is non-null.
+// Exported (alongside toolHandoffClose/toolHandoffCheckpoint below) so
+// test/handoff/test-close-session-identity.js can exercise the cm#295 FIX A
+// default-resolution behavior directly against a harness DB, the same way
+// buildServer/libToolError/actionableUsageSchemaError are already exported
+// for test use above — never a second hand-rolled copy of this resolution
+// in a test file.
+export async function resolveDefaultCloseSessionId(subcommand, projectRoot) {
+  const label = subcommand === 'checkpoint' ? 'handoff_checkpoint' : 'handoff_close';
+  return withProjectDb(projectRoot, (db, projectId) =>
+    resolveCloseSessionIdFromMarker(db, projectId, resolveHandoffHost(), label)
+  );
+}
+
 async function runPayloadSubcommand(subcommand, { projectRoot, payload, sessionId }) {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
     return toolError(`payload must be a plain JSON object (not array or primitive) for handoff ${subcommand}.`);
@@ -661,7 +687,33 @@ async function runPayloadSubcommand(subcommand, { projectRoot, payload, sessionI
     return toolError(err.message);
   }
 
-  const effectivePayload = applySessionId(payload, sessionId);
+  // cm#295 FIX A: explicit sessionId always wins (trimmed, non-blank). When
+  // omitted (or blank/whitespace-only), resolve a default from the project's
+  // live session marker — see resolveDefaultCloseSessionId above. A resolved
+  // default is passed EXPLICITLY into the payload below (applySessionId),
+  // exactly like a caller-supplied id — this tool never lets the spawned
+  // child fall through to its own (stripped) env.
+  const trimmedExplicit = typeof sessionId === 'string' ? sessionId.trim() : '';
+  let resolvedSessionId = trimmedExplicit;
+  let sessionIdSource = trimmedExplicit.length > 0 ? 'explicit' : null;
+  let markerTs = null;
+
+  if (resolvedSessionId.length === 0) {
+    let defaulted;
+    try {
+      defaulted = await resolveDefaultCloseSessionId(subcommand, projectRoot);
+    } catch (err) {
+      return toolError(`handoff ${subcommand}: failed to resolve a default sessionId from the project session marker: ${err.message}`);
+    }
+    if (defaulted.error) {
+      return toolError(defaulted.error);
+    }
+    resolvedSessionId = defaulted.sessionId;
+    markerTs = defaulted.markerTs;
+    sessionIdSource = 'marker';
+  }
+
+  const effectivePayload = applySessionId(payload, resolvedSessionId);
   const tempFile = writeTempJson(`handoff-mcp-${subcommand}`, effectivePayload);
   try {
     const stdinText = fs.readFileSync(tempFile, 'utf8');
@@ -675,30 +727,41 @@ async function runPayloadSubcommand(subcommand, { projectRoot, payload, sessionI
       return toolError(`handoff ${subcommand} exited with code ${code}`, { stdout, stderr });
     }
     const summary = parseWriteSummary(stdout);
+    summary.session_id_source = sessionIdSource;
+    if (sessionIdSource === 'marker') summary.marker_ts = markerTs;
     return textResult({ ...summary, tempFile, stdoutTail: stdout.split(/\r?\n/).filter(Boolean).slice(-10) });
   } finally {
     cleanupTemp(tempFile);
   }
 }
 
-async function toolHandoffCheckpoint(args) {
+export async function toolHandoffCheckpoint(args) {
   return runPayloadSubcommand('checkpoint', args);
 }
 
-async function toolHandoffClose(args) {
+export async function toolHandoffClose(args) {
   return runPayloadSubcommand('close', args);
 }
 
 // fix(close): shared description snippet for the optional sessionId param on
 // both handoff_checkpoint and handoff_close — see applySessionId.
+// cm#295 FIX A: when omitted, a default is now resolved from the project's
+// live session_in_progress marker (host-filtered, exactly-one-candidate) —
+// see resolveDefaultCloseSessionId — NEVER from this MCP server's own
+// CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID env vars (those are fixed at this
+// long-lived process's spawn time and go stale across every `/clear`).
 const SESSION_ID_PARAM_DESCRIPTION =
   'Optional explicit session id for this close/checkpoint\'s attribution and session_in_progress-marker ' +
   'reconciliation. When supplied it is placed into the payload\'s session_id BEFORE the write, taking priority ' +
-  'over any value the engine subprocess would otherwise resolve from its own environment (this MCP server\'s ' +
-  'spawned child never receives CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID — this server\'s own ambient values are ' +
-  'stripped before spawn, so a caller\'s true identity must be passed here or it will not reach the engine at ' +
-  'all). Codex callers SHOULD pass their CODEX_THREAD_ID here so a close truthfully reports whether it cleared ' +
-  'ITS OWN session_in_progress marker rather than a sibling session\'s.';
+  'over any other resolution. When OMITTED (or blank), a default is resolved from the project\'s live ' +
+  'session_in_progress marker in Postgres (host-filtered by this server\'s HANDOFF_HOST env, requiring EXACTLY ' +
+  'ONE surviving candidate) — never from this MCP server\'s own CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID env vars, ' +
+  'since those are fixed at this long-lived server process\'s spawn time and go stale across every `/clear` in ' +
+  'an interactive host (this was the root cause of a spurious "marker left in place" / implicit-close split — ' +
+  'cm#295). Zero or more than one surviving marker is refused with an actionable error naming the count — pass ' +
+  'sessionId explicitly in that case. The result payload\'s session_id_source field reports "explicit" or ' +
+  '"marker" accordingly. Codex callers MAY still pass their CODEX_THREAD_ID here explicitly if they want to ' +
+  'bypass the marker default.';
 
 async function toolHandoffInit({ projectRoot, name }) {
   // fix/mcp-stale-engine-gate: see toolHandoffStatus's identical checks.

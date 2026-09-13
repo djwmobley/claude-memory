@@ -357,6 +357,61 @@ desync check (every identifier textually present) but produces broken SQL
 surfaces as a `heal_failed:<sqlstate>` DEGRADED row, not a classification
 error, on the next touch that needs to heal it.
 
+## `handoff_close` / `handoff_checkpoint` — sessionId default resolution (cm#295)
+
+Both tools take an optional `sessionId`. When supplied (trimmed, non-blank)
+it always wins, placed into the payload's `session_id` before the write.
+
+**When omitted (cm#295 fix A):** a default is resolved from the project's
+live `session_in_progress` marker in Postgres —
+`scripts/lib/session-identity.js`'s `resolveCloseSessionIdFromMarker`, the
+SAME host-filtered/exactly-one-candidate classification
+`resolveUsageRecordMarkerDefault` (`usage_record`'s own default) uses, split
+into a shared `getHostFilteredMarkerCandidates`/`deriveMarkerSessionId` pair
+so there is one normalization engine, not two hand-rolled copies. Total
+classification over host-filtered candidates: zero → refused (actionable
+error, no candidate to name); more than one → refused, naming the count and
+each candidate's host; exactly one → that marker's `session_id` (or its `ts`
+for a legacy marker with no `session_id`), used verbatim.
+
+**Why this NEVER falls back to this server's own env vars first (unlike
+`usage_record`'s env-then-marker order).** `handoff-mcp.mjs` is a long-lived
+process — it resolves `CLAUDE_CODE_SESSION_ID`/`CODEX_THREAD_ID` (via
+`resolveSessionIdFromEnv`) ONCE, at spawn time. An interactive host's
+`/clear` mints a fresh hook-side session id and a fresh
+`session_in_progress` marker without restarting the MCP server, so the
+server's own env values go stale relative to every marker written after
+that `/clear` — an env-first default (`usage_record`'s own shape) would keep
+resolving to the SAME stale id and reproduce cm#295 exactly: an explicit
+close issued through the MCP server would fail the engine's exact-equality
+marker match, leave the marker in place, and let the next SessionEnd for the
+(different) live hook-side id record a spurious `implicit_close_recorded`
+even though a real explicit close just ran. The marker store — never this
+process's env — is therefore the only source of truth for this default.
+
+**Pinned identity semantics** (every key this resolution touches, per the
+adversary-must-pin-identity-semantics lesson): session id equality is exact,
+case-sensitive string comparison only, everywhere in this path; `host` is
+an advisory filter over candidate markers, never a clearing/matching
+authority on its own; a marker's `ts` is parsed with `Date.parse` and an
+unparseable value fails closed — it never satisfies any freshness test (see
+`scripts/handoff.js`'s late-close sweep, which sweeps such a marker as
+stale rather than leaving it in place as "fresh").
+
+The result payload reports `session_id_source` (`"explicit"` or `"marker"`)
+and, for the marker branch, `marker_ts` — provenance, never a second
+identity rule for a caller to reimplement.
+
+**Engine-side hardening (fix B).** `clearSessionMarkerForClose` (the
+function both tools' spawned `handoff.js close`/`checkpoint` subprocess
+calls) now (1) writes its `last_explicit_close` breadcrumb inside the SAME
+`withSessionMarkerLock` critical section/transaction as the marker delete
+it records, closing a narrow TOCTOU window between the two; (2) returns an
+explicit `outcome` field on every branch — `no_matching_marker` is now
+distinct from every other `deleted:0` case (a resolved session id that
+matched no live marker), and its message names the surviving marker count,
+so a caller never has to infer that distinction from `deleted:0` alone.
+
 ## `memory_search` — hybrid vector+FTS, project-scoped
 
 Runs the same `ts_rank * 0.3 + cosine * 0.7` scoring formula the engine's
