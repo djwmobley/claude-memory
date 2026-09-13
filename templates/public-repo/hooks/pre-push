@@ -1,0 +1,31 @@
+#!/bin/sh
+# pre-push — public-lift sanitize gate local backstop.
+# docs/specs/public-sanitize-gate.md: this hook is a FAST LOCAL BACKSTOP,
+# NOT a substitute for CI. The GitHub Actions "Sanitize gate" required
+# status check is authoritative — a bypassed/uninstalled local hook does
+# not weaken the gate, because CI still blocks merge on main.
+#
+# Installed by the installer's --hooks step. Requires
+# SANITIZE_PRIVATE_TERMS_FILE to point at a local, gitignored terms file.
+
+set -eu
+
+if [ -z "${SANITIZE_PRIVATE_TERMS_FILE:-}" ]; then
+  echo "pre-push: SANITIZE_PRIVATE_TERMS_FILE is not set — skipping local" \
+       "sanitize check. CI will still run the authoritative gate on push." >&2
+  exit 0
+fi
+
+node scripts/sanitize-gate.js \
+  --manifest PUBLIC-MANIFEST.json \
+  --root . \
+  --commit HEAD \
+  --json
+
+status=$?
+if [ "$status" -ne 0 ]; then
+  echo "pre-push: sanitize gate FAILED (exit $status). Push blocked locally." >&2
+  echo "This is a backstop only; do not attempt to bypass it — CI is" \
+       "authoritative and will independently block the merge." >&2
+fi
+exit "$status"

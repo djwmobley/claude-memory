@@ -1704,3 +1704,10 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run public-lift sanitize gate tests
+        # docs/specs/public-sanitize-gate.md: total-classification gate for
+        # the eventual claude-memory -> memory-manager public lift. Covers
+        # 8 scanner canaries, 14 adversary fixtures (A1-F1), a >=30-case
+        # totality table, and missing/empty private-terms fail-closed
+        # behavior. No Postgres required; spawns real temp git repos.
+        run: node test/test-sanitize-gate.js

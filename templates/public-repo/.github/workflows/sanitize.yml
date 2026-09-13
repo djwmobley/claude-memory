@@ -1,0 +1,43 @@
+name: Sanitize gate
+# Public-lift sanitize gate — docs/specs/public-sanitize-gate.md.
+# Required status check on main (branch protection must require this job
+# before it is added to protection — see the spec's Bootstrap order note).
+#
+# The private-terms file is NEVER committed to this repo. It is supplied at
+# run time from a repo secret (SANITIZE_PRIVATE_TERMS) written to a temp
+# path outside the checkout and passed via SANITIZE_PRIVATE_TERMS_FILE.
+permissions:
+  contents: read
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  sanitize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Write private terms file from secret
+        env:
+          SANITIZE_PRIVATE_TERMS: ${{ secrets.SANITIZE_PRIVATE_TERMS }}
+        run: |
+          if [ -z "$SANITIZE_PRIVATE_TERMS" ]; then
+            echo "SANITIZE_PRIVATE_TERMS secret is not set — gate cannot run." >&2
+            exit 3
+          fi
+          printf '%s\n' "$SANITIZE_PRIVATE_TERMS" > "$RUNNER_TEMP/sanitize-private-terms.txt"
+      - name: Run sanitize gate
+        env:
+          SANITIZE_PRIVATE_TERMS_FILE: ${{ runner.temp }}/sanitize-private-terms.txt
+          SANITIZE_LIFT_COMMIT_IDENTITY: ${{ vars.SANITIZE_LIFT_COMMIT_IDENTITY }}
+        run: |
+          node scripts/sanitize-gate.js \
+            --manifest PUBLIC-MANIFEST.json \
+            --root . \
+            --commit "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --json
