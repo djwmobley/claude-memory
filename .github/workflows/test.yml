@@ -854,6 +854,20 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run MCP process-lifecycle tests
+        # test/test-mcp-process-lifecycle.js — regression coverage for the
+        # fix/mcp-process-lifecycle PR: (T1) scripts/handoff-mcp.mjs exits
+        # within 3s of a clean stdin 'end' (a host closing its write end
+        # cleanly used to leave this process running forever -- the SDK's
+        # StdioServerTransport only ever closed itself on a stdin read
+        # ERROR, never on a clean end); (T2) exits within 3s of SIGTERM;
+        # (T3) scripts/handoff-mcp-selftest.mjs's runWithClient() helper
+        # still calls client.close() when the wrapped selftest body throws,
+        # so a failing selftest run never orphans its spawned server child.
+        # No live Postgres needed -- buildServer() registers tools
+        # synchronously and never connects to a DB until a tool is actually
+        # called.
+        run: node test/test-mcp-process-lifecycle.js
       - name: Run memory-search per-table availability gate tests (2026-09-09)
         # scripts/test-memory-search-gate.js — regression coverage for the
         # memory_search per-table gate rewrite: (A) a static drift test
@@ -1455,6 +1469,39 @@ jobs:
         # per accepted adversary finding (#1, #3, #5-#10). Every fixture is
         # its own throwaway DB/dir; never touches claude_memory_eval_test.
         run: node test/test-schema-heal.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: Run MCP stale-engine epoch-guard tests (fix/mcp-stale-engine-gate)
+        # Incident 2026-09-13: withProjectDb's old blanket "run init/resume"
+        # remedy for every ensureSchemaCurrent heal failure would have told a
+        # stale-engine caller to force the database BACKWARD for reason:
+        # 'ahead'. scripts/lib/schema-epoch-guard.js's classifyEpochDrift now
+        # separates that bare reason string into 4 branches (stale_engine /
+        # engine_checkout_inconsistent / engine_behind_db / heal_failed) --
+        # 13 tests: the 4 named branches + their exact messages, a T8
+        # totality matrix (loaded x disk x reason x db, cross-checked
+        # against an independently written reference classifier, 441
+        # combinations, never throws), readDiskSchemaEpoch's no-memoization
+        # contract, and a T13 live stdio MCP regression against a real
+        # handoff-mcp.mjs process running from a throwaway engine copy whose
+        # on-disk schema-manifest.json is bumped AFTER the server starts.
+        # Pure/filesystem-only -- no live Postgres required (the guard
+        # rejects before any database connection is opened).
+        run: node test/test-mcp-epoch-guard.js
+      - name: Run engine-revision tests (feat/status-engine-revision)
+        # Owner ruling 2026-09-13: handoff_status reports the engine
+        # revision/schema-epoch three ways -- LOADED (module-import
+        # snapshot, frozen), DISK (fresh read every call), DB (the project
+        # DB's own stored epoch) -- and a schema-epoch-guard.js drift
+        # verdict. T1-T4 (readDiskRevision total classification: git
+        # checkout / VERSION-file / empty dir / manifest-only dir) and T5
+        # (LOADED never changes; a fresh call reflects a post-import
+        # VERSION rewrite) are pure/filesystem-only. T6 spins up its own
+        # throwaway Postgres DB/project (never claude_memory_eval_test) and
+        # asserts `handoff.js status --json`'s `engine` object shape.
+        run: node test/test-engine-revision.js
         env:
           PGHOST: localhost
           PGUSER: postgres

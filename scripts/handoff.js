@@ -120,6 +120,13 @@ const {
   latestSessionMarker,
   resolveSessionIdFromMarker,
 } = require('./lib/session-identity');
+// feat/status-engine-revision: LOADED is captured once at THIS process's
+// module-import time; readDiskRevision is called again fresh on every
+// cmdStatus touch (see cmdStatus below) for the "DISK" half of the owner
+// ruling. No second implementation of "what revision/epoch does the on-disk
+// checkout declare" — schema-epoch-guard.js's readDiskSchemaEpoch backs both.
+const { readDiskRevision, LOADED: ENGINE_LOADED } = require('./lib/engine-revision.js');
+const { classifyEpochDrift } = require('./lib/schema-epoch-guard.js');
 
 process.on('exit', () => {
   const ms = Number(process.hrtime.bigint() - __startNs) / 1e6;
@@ -3768,7 +3775,18 @@ async function ensureSchemaCurrentCore(db, projectId, { silent } = {}) {
   if (cmp === 'ahead') {
     // Stored epoch is newer than this engine build knows about — refuse to
     // apply (would be a downgrade), warn persistently, continue non-fatally.
-    const detail = { stored, current: currentFingerprint, note: 'stored schema_fingerprint epoch is newer than this engine build — refusing to apply; upgrade the engine' };
+    // fix/mcp-stale-engine-gate: stored_epoch/current_epoch are added as
+    // parsed INTEGER fields (not just the raw "<epoch>:<hash>" strings above)
+    // so scripts/lib/schema-epoch-guard.js's classifyEpochDrift can read
+    // dbEpoch (the DATABASE's stored epoch) directly off this detail object
+    // without re-parsing the fingerprint string itself.
+    const storedParsed = _parseSchemaFingerprint(stored);
+    const currentParsed = _parseSchemaFingerprint(currentFingerprint);
+    const detail = {
+      stored, current: currentFingerprint,
+      stored_epoch: storedParsed.epoch, current_epoch: currentParsed.epoch,
+      note: 'stored schema_fingerprint epoch is newer than this engine build — refusing to apply; upgrade the engine',
+    };
     await recordSchemaDegradation(db, projectId, 'fingerprint_ahead', detail, { silent });
     return { applied: false, reason: 'ahead', detail };
   }
@@ -4855,6 +4873,59 @@ async function cmdStatus(args = []) {
     process.stderr.write('[handoff] schema heal check failed (non-fatal): ' + schemaHealErr.message + '\n');
   }
 
+  // feat/status-engine-revision, owner ruling 2026-09-13: report the engine
+  // revision + schema epoch three ways — LOADED (module-import snapshot,
+  // frozen), DISK (fresh read of THIS engine checkout, right now), and DB
+  // (the project DB's own stored epoch) — plus a drift verdict, so a caller
+  // (human or Codex) can tell "this MCP server is stale" apart from "this
+  // engine build is older than the database" apart from "the database's
+  // schema state itself could not be classified", without guessing from a
+  // bare boolean.
+  //
+  // dbSchemaEpoch is read directly off project_settings.schema_fingerprint
+  // (via the SAME _parseSchemaFingerprint parser ensureSchemaCurrentCore's
+  // own 'ahead' branch uses — never a second parser) rather than reused only
+  // from schemaHealResult.detail.stored_epoch, because that detail field is
+  // populated ONLY on the 'ahead' branch — every other reason ('current',
+  // 'applied', 'degraded', 'unknown', ...) would otherwise leave db.schema_epoch
+  // permanently null even when the DB's own stored fingerprint is perfectly
+  // readable. null here (row absent, or a fingerprint string
+  // _parseSchemaFingerprint cannot parse) is itself meaningful input to
+  // classifyEpochDrift below — never coerced to a fake number.
+  let dbSchemaEpoch = null;
+  try {
+    const rawSchemaFingerprint = await getSetting(db, projectId, 'schema_fingerprint', null);
+    if (rawSchemaFingerprint) {
+      dbSchemaEpoch = _parseSchemaFingerprint(rawSchemaFingerprint).epoch;
+    }
+  } catch (_) {
+    dbSchemaEpoch = null;
+  }
+
+  // Fresh, request-time read of the checkout on disk — engineDisk is
+  // recomputed on EVERY cmdStatus call (per the owner ruling); ENGINE_LOADED
+  // (module-top require) is the frozen, captured-once-at-import snapshot.
+  const engineDisk = readDiskRevision(_ENGINE_ROOT);
+
+  // classifyEpochDrift's loadedEpoch is the real in-process SCHEMA_EPOCH
+  // literal (the same value every other call site of this classifier in
+  // this codebase passes — checkEngineEpochOrThrow, main()'s CLI-entry
+  // self-consistency gate) — deliberately NOT ENGINE_LOADED.schema_epoch,
+  // which is itself a manifest-file read captured at import time and would
+  // silently mask a real "code literal disagrees with its own manifest"
+  // drift (both numbers would just be whatever the manifest said at
+  // import, never the literal). ENGINE_LOADED is still the correct value
+  // to REPORT as `engine.loaded` below (that field's whole contract is "the
+  // import-time snapshot"); it is just not the right input for this
+  // classification. classifyEpochDrift itself is reused verbatim — no fork.
+  const engineDriftClassification = classifyEpochDrift({
+    loadedEpoch: SCHEMA_EPOCH,
+    diskEpoch: engineDisk.schema_epoch,
+    dbEpoch: dbSchemaEpoch,
+    healReason: schemaHealResult ? schemaHealResult.reason : undefined,
+    healDetail: schemaHealResult ? schemaHealResult.detail : undefined,
+  });
+
   // Counts — cm#232: getLiveCounts is the single shared query behind every
   // entity/assertion/edge count status reports (prose, --json, and the Done
   // line all derive from this one call — see getLiveCounts above).
@@ -5077,6 +5148,18 @@ async function cmdStatus(args = []) {
       session_active: sipDisplay.active,
       session_id:     sipDisplay.id,
       packaging:      packagingState,
+      // feat/status-engine-revision, owner ruling 2026-09-13: LOADED (frozen
+      // at this process's module-import time) and DISK (fresh, this call)
+      // are BOTH always reported — never just one — plus the DB's own
+      // stored epoch and a total-classification drift verdict/remedy reused
+      // verbatim from schema-epoch-guard.js's classifyEpochDrift.
+      engine: {
+        loaded: ENGINE_LOADED,
+        disk:   engineDisk,
+        db:     { schema_epoch: dbSchemaEpoch },
+        drift:  engineDriftClassification.branch,
+        remedy: engineDriftClassification.message,
+      },
       schema_heal:    schemaHealedLine,
       schema_apply_degraded: schemaDegraded,
       embedding_readiness: embeddingReadiness,
@@ -5114,6 +5197,10 @@ async function cmdStatus(args = []) {
   console.log(`  contracts:        ${contracts}`);
   console.log(`  session_active:   ${sipDisplay.prose}`);
   console.log(`  last SessionEnd (loader-stop): ${lastLoaderStop ? `${lastLoaderStop.ts} ${lastLoaderStop.outcome}${lastLoaderStop.session_id ? ` [session ${lastLoaderStop.session_id}]` : ''}` : 'never'}`);
+  // feat/status-engine-revision: LOADED (frozen at module-import) and DISK
+  // (fresh, this call) are always both printed — never just one.
+  console.log(`  engine (loaded):  schema_epoch=${ENGINE_LOADED.schema_epoch != null ? ENGINE_LOADED.schema_epoch : '?'} revision=${ENGINE_LOADED.revision} (${ENGINE_LOADED.source})`);
+  console.log(`  engine (disk):    schema_epoch=${engineDisk.schema_epoch != null ? engineDisk.schema_epoch : '?'} revision=${engineDisk.revision} (${engineDisk.source}); db schema_epoch=${dbSchemaEpoch != null ? dbSchemaEpoch : '?'}; drift=${engineDriftClassification.branch}`);
   if (packagingLine) console.log(packagingLine);
   if (schemaHealedLine) {
     console.log(`  schema_heal:      ${schemaHealedLine}`);
@@ -11400,6 +11487,79 @@ async function main() {
     process.exit(2);
   }
 
+  // P1b (Codex review 2026-09-13, fix/mcp-stale-engine-gate follow-up):
+  // engine self-consistency at the CLI entry point, NOT at module require
+  // time — a process spawned from a half-updated checkout (a partial git
+  // checkout, an interrupted rebase, or a stray local edit to SCHEMA_EPOCH
+  // with no matching schema-manifest.json bump) previously had no way to
+  // detect that on its own before running a real command. This is the same
+  // "does THIS checkout agree with itself" question
+  // scripts/lib/schema-epoch-guard.js's classifyEpochDrift asks for the long-
+  // lived MCP server process (its engine_checkout_inconsistent branch) —
+  // reused here (readDiskSchemaEpoch, no second implementation) for a
+  // one-shot CLI process instead. Deliberately NOT run at require() time so
+  // `require('./handoff.js')` from a test or another module never exits the
+  // host process — only main()'s own CLI dispatch (require.main === module)
+  // reaches this.
+  //
+  // ONE downgrade only (Codex review r2 finding 2, 2026-09-13: the PRIOR
+  // "--help/-h" exemption is REMOVED — this check now runs on EVERY
+  // invocation that reaches this line, whether or not the caller also
+  // passed --help/-h). Mirrors the SAME read-only-vs-write split
+  // scripts/lib/cli-args.js's own WRITE_SUBCOMMANDS already draws:
+  //   - loader-hook/loader-stop: the SessionStart/SessionEnd hook entry
+  //     points install.js wires into EVERY Claude Code / Codex session
+  //     automatically (hooks/hooks.json, install.js's EVENT_FOR_VERB) —
+  //     never an explicit user/agent action. These are deliberately
+  //     designed as fast, best-effort no-ops that must not hard-fail a
+  //     session's start/end over an engine-checkout problem a human hasn't
+  //     even asked this process to look at (Codex's own loader-stop
+  //     TIMEOUT_OVERRIDE is 3 SECONDS — there is no budget here to surface
+  //     anything beyond the inert/no-marker fast path). Still WARN (single
+  //     stderr line, never stdout — loader-hook's stdout is injected into
+  //     the session context by the host and must stay clean) so a broken
+  //     checkout is visible without hard-failing the hook. A genuinely
+  //     broken checkout still fails loud on every OTHER subcommand (status,
+  //     resume, and every write command) — this downgrade narrows WHERE the
+  //     check hard-fails, never whether a broken checkout eventually
+  //     surfaces.
+  //     Regression proof: scripts/test-plugin-packaging.js's P2 spawns
+  //     `loader-hook` against a synthetic CLAUDE_PLUGIN_ROOT fixture that
+  //     intentionally has no scripts/sql/schema-manifest.json at all (it
+  //     tests asset-path resolution, not schema state) — that fixture now
+  //     warns on stderr instead of being skipped, and must still pass.
+  //
+  // Why the --help exemption was wrong: it let e.g. `status --help` or
+  // `resume -h` skip this check entirely and fall through to
+  // enforceTotalClassification (below), whose own total classification
+  // returns immediately for an uncovered command+flag combination rather
+  // than blocking it — so the subcommand's REAL handler (cmdStatus,
+  // cmdResume, ...) still ran against a checkout this guard exists to
+  // reject. There is no side-effect-free "--help" fast path anywhere below
+  // this line for an already-dispatched subcommand, so there is nothing
+  // for the exemption to safely protect. (A bare `handoff.js --help` with
+  // NO valid subcommand at all never reaches this line in the first place —
+  // the router's own `!subcommands[sub]` usage check above already printed
+  // usage and called `process.exit(2)`; that is pre-existing router
+  // behavior this guard does not touch either way.)
+  const CLI_SELF_CONSISTENCY_WARN_ONLY_SUBCOMMANDS = new Set(['loader-hook', 'loader-stop']);
+  {
+    const { readDiskSchemaEpoch } = require('./lib/schema-epoch-guard.js');
+    const diskResult = readDiskSchemaEpoch(_ENGINE_ROOT);
+    if (!diskResult.ok || diskResult.epoch !== SCHEMA_EPOCH) {
+      const disk = diskResult.ok ? diskResult.epoch : `unreadable (${diskResult.error})`;
+      const message =
+        `engine checkout is internally inconsistent (scripts/handoff.js declares schema epoch ` +
+        `${SCHEMA_EPOCH}, scripts/sql/schema-manifest.json declares ${disk}); restore a clean engine checkout.`;
+      if (CLI_SELF_CONSISTENCY_WARN_ONLY_SUBCOMMANDS.has(sub)) {
+        process.stderr.write(`handoff: WARNING ${message}\n`);
+      } else {
+        console.error(`handoff: ${message}`);
+        process.exit(1);
+      }
+    }
+  }
+
   // Total-classification argv check for write subcommands (scripts/lib/cli-args.js).
   // MUST run before subcommands[sub]() is invoked — this is what guarantees
   // "reject before any DB connection or file write" for every write command,
@@ -11474,6 +11634,11 @@ if (require.main === module) {
     checkPgvectorGatedObjects,
     reportPgvectorGatedDegradation,
     SCHEMA_EPOCH,
+    // fix/mcp-stale-engine-gate: exposed so scripts/handoff-mcp.mjs can
+    // resolve the SAME engine-root scripts/lib/schema-epoch-guard.js reads
+    // scripts/sql/schema-manifest.json against — no second, independently-
+    // computed "where is this checkout rooted" path.
+    _ENGINE_ROOT,
     // cm#185-schema-heal FK extension — exposed for test/test-schema-heal.js
     // (no test-side reimplementation of the FK identity/classification rules).
     _collectExpectedFks,
