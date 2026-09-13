@@ -11421,13 +11421,37 @@ async function main() {
   // scripts/lib/schema-epoch-guard.js's classifyEpochDrift asks for the long-
   // lived MCP server process (its engine_checkout_inconsistent branch) —
   // reused here (readDiskSchemaEpoch, no second implementation) for a
-  // one-shot CLI process instead. Skipped for a bare --help/-h invocation
-  // (cli-args.js's own no-op detection below) — a diagnostic no-op with no
-  // side effect should still work against a broken checkout. Deliberately
-  // NOT run at require() time so `require('./handoff.js')` from a test or
-  // another module never exits the host process — only main()'s own CLI
-  // dispatch (require.main === module) reaches this.
-  if (!rest.includes('--help') && !rest.includes('-h')) {
+  // one-shot CLI process instead. Deliberately NOT run at require() time so
+  // `require('./handoff.js')` from a test or another module never exits the
+  // host process — only main()'s own CLI dispatch (require.main === module)
+  // reaches this.
+  //
+  // Two exemptions, both no-op/non-write shapes, mirroring the SAME
+  // read-only-vs-write split scripts/lib/cli-args.js's own WRITE_SUBCOMMANDS
+  // already draws (that module's header: "Read-only subcommands (status,
+  // resume, loader-load, loader-hook, loader-stop, resurrect) ... --help/-h
+  // consistency for those is a non-mandatory nice-to-have"):
+  //   - a bare --help/-h invocation: a diagnostic no-op with no side effect
+  //     should still work against a broken checkout.
+  //   - loader-hook/loader-stop: the SessionStart/SessionEnd hook entry
+  //     points install.js wires into EVERY Claude Code / Codex session
+  //     automatically (hooks/hooks.json, install.js's EVENT_FOR_VERB) —
+  //     never an explicit user/agent action. These are deliberately
+  //     designed as fast, best-effort no-ops that must not hard-fail a
+  //     session's start/end over an engine-checkout problem a human hasn't
+  //     even asked this process to look at (Codex's own loader-stop
+  //     TIMEOUT_OVERRIDE is 3 SECONDS — there is no budget here to surface
+  //     anything beyond the inert/no-marker fast path). A genuinely broken
+  //     checkout still fails loud on every OTHER subcommand (status,
+  //     resume, and every write command) — this exemption narrows WHERE the
+  //     check fires, never whether a broken checkout eventually surfaces.
+  //     Regression proof: scripts/test-plugin-packaging.js's P2 spawns
+  //     `loader-hook` against a synthetic CLAUDE_PLUGIN_ROOT fixture that
+  //     intentionally has no scripts/sql/schema-manifest.json at all (it
+  //     tests asset-path resolution, not schema state) — this exemption is
+  //     what keeps that established, in-scope test passing.
+  const CLI_SELF_CONSISTENCY_EXEMPT_SUBCOMMANDS = new Set(['loader-hook', 'loader-stop']);
+  if (!rest.includes('--help') && !rest.includes('-h') && !CLI_SELF_CONSISTENCY_EXEMPT_SUBCOMMANDS.has(sub)) {
     const { readDiskSchemaEpoch } = require('./lib/schema-epoch-guard.js');
     const diskResult = readDiskSchemaEpoch(_ENGINE_ROOT);
     if (!diskResult.ok || diskResult.epoch !== SCHEMA_EPOCH) {
