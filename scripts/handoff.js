@@ -11411,6 +11411,35 @@ async function main() {
     process.exit(2);
   }
 
+  // P1b (Codex review 2026-09-13, fix/mcp-stale-engine-gate follow-up):
+  // engine self-consistency at the CLI entry point, NOT at module require
+  // time — a process spawned from a half-updated checkout (a partial git
+  // checkout, an interrupted rebase, or a stray local edit to SCHEMA_EPOCH
+  // with no matching schema-manifest.json bump) previously had no way to
+  // detect that on its own before running a real command. This is the same
+  // "does THIS checkout agree with itself" question
+  // scripts/lib/schema-epoch-guard.js's classifyEpochDrift asks for the long-
+  // lived MCP server process (its engine_checkout_inconsistent branch) —
+  // reused here (readDiskSchemaEpoch, no second implementation) for a
+  // one-shot CLI process instead. Skipped for a bare --help/-h invocation
+  // (cli-args.js's own no-op detection below) — a diagnostic no-op with no
+  // side effect should still work against a broken checkout. Deliberately
+  // NOT run at require() time so `require('./handoff.js')` from a test or
+  // another module never exits the host process — only main()'s own CLI
+  // dispatch (require.main === module) reaches this.
+  if (!rest.includes('--help') && !rest.includes('-h')) {
+    const { readDiskSchemaEpoch } = require('./lib/schema-epoch-guard.js');
+    const diskResult = readDiskSchemaEpoch(_ENGINE_ROOT);
+    if (!diskResult.ok || diskResult.epoch !== SCHEMA_EPOCH) {
+      const disk = diskResult.ok ? diskResult.epoch : `unreadable (${diskResult.error})`;
+      console.error(
+        `handoff: engine checkout is internally inconsistent (scripts/handoff.js declares schema epoch ` +
+        `${SCHEMA_EPOCH}, scripts/sql/schema-manifest.json declares ${disk}); restore a clean engine checkout.`
+      );
+      process.exit(1);
+    }
+  }
+
   // Total-classification argv check for write subcommands (scripts/lib/cli-args.js).
   // MUST run before subcommands[sub]() is invoked — this is what guarantees
   // "reject before any DB connection or file write" for every write command,

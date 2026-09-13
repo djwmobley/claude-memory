@@ -52,13 +52,14 @@
  * that fixes a broken checkout), an actual downgrade attempt (3), or a
  * guess unsupported by the evidence (4).
  *
- * KNOWN RESIDUAL GAP (documented, not fixed here — see handoff-mcp.mjs's
- * own comment at its call sites): this guard validates the SERVER
- * PROCESS's OWN engine identity only (the handoff.js it required at
- * startup, and that same handoff.js's own _ENGINE_ROOT). A deployment
- * where HANDOFF_MCP_ENGINE_PATH points a runNode-spawned child at a
- * DIFFERENT checkout than the one this server required is invisible to
- * this guard — see handoff-mcp.mjs.
+ * NOTE on HANDOFF_MCP_ENGINE_PATH (Codex review P1a, 2026-09-13): this
+ * module's own two exports (readDiskSchemaEpoch, classifyEpochDrift) are
+ * root-parameterized and reason about whatever engineRoot is handed to
+ * them — they have no opinion on WHICH checkout that is. The caller
+ * (handoff-mcp.mjs) is responsible for calling them once for its own
+ * required checkout (_ENGINE_ROOT) and, separately, once more for
+ * HANDOFF_MCP_ENGINE_PATH's checkout when that override diverges from
+ * _ENGINE_ROOT — see handoff-mcp.mjs's checkSpawnEngineEpochOrThrow.
  */
 
 const fs = require('fs');
@@ -105,12 +106,38 @@ function readDiskSchemaEpoch(engineRoot) {
 // eslint-disable-next-line no-useless-escape
 const NAMES_INIT_OR_RESUME = /\b(init|resume)\b/i;
 
+// Codex review P2b (2026-09-13): JSON.stringify escapes a real newline/tab/
+// carriage-return inside a string value as the TWO literal characters
+// backslash+letter (e.g. the four characters \, n for a real "\n"). Against
+// the RAW string "Fix: run\ninit" that is a genuine word boundary (a real
+// newline), but against the SERIALIZED string "Fix: run\\ninit" the "n" of
+// the escape and the "n" of "init" are adjacent WORD characters with no
+// boundary between them, so \binit\b silently fails to match. Normalize
+// those three escape sequences to a real space before testing so a remedy
+// word split across an escaped whitespace character cannot slip through.
+function normalizeEscapedWhitespace(str) {
+  return str.replace(/\\[ntr]/g, ' ');
+}
+
+function namesInitOrResume(str) {
+  return NAMES_INIT_OR_RESUME.test(normalizeEscapedWhitespace(str));
+}
+
 /**
- * If `detail` (as JSON) mentions "init" or "resume" anywhere (e.g. a
- * lower-level error message that itself suggested `handoff.js init`),
- * replace it with a redaction stub that keeps only its top-level key names
- * — never the remedy-shaped text — before it is interpolated into a
- * report-only message.
+ * If `detail` (or any of its own top-level key names) mentions "init" or
+ * "resume" anywhere — e.g. a lower-level error message that itself
+ * suggested `handoff.js init`, OR a key literally named after one of those
+ * verbs — replace the ENTIRE detail with a bare redaction stub (no key
+ * list, no fragment of the original content) before it is interpolated
+ * into a report-only message. Codex review P2b (2026-09-13): the prior
+ * version's `{redacted: true, keys}` shape copied the original UNSANITIZED
+ * key names into the replacement, which could itself contain the remedy
+ * text (a key literally named "run handoff.js init"). There is no safe
+ * subset of a matching detail to preserve, so a match redacts everything.
+ * Serialization failure (BigInt, a circular reference, or anything else
+ * JSON.stringify cannot handle) is treated as its OWN redaction reason —
+ * P2c requires this function to never throw and never pass an
+ * unserializable value through.
  */
 function redactDetailIfNamesRemedy(detail) {
   if (detail === undefined || detail === null) return detail;
@@ -118,16 +145,26 @@ function redactDetailIfNamesRemedy(detail) {
   try {
     asString = JSON.stringify(detail);
   } catch (_err) {
-    return detail;
+    return { redacted: true, reason: 'unserializable' };
   }
-  if (typeof asString !== 'string' || !NAMES_INIT_OR_RESUME.test(asString)) return detail;
+  if (typeof asString !== 'string') return { redacted: true, reason: 'unserializable' };
+
+  if (namesInitOrResume(asString)) return { redacted: true };
+
+  // Defense in depth: also scan each own top-level key independently (the
+  // whole-string scan above already covers this in the common case, since
+  // JSON.stringify emits key names as quoted substrings of asString, but a
+  // key scan makes the "any key" requirement explicit and keeps working
+  // even if the whole-string scan's normalization ever diverges).
   let keys = [];
   try {
     if (typeof detail === 'object' && !Array.isArray(detail)) keys = Object.keys(detail);
   } catch (_err) {
     keys = [];
   }
-  return { redacted: true, keys };
+  if (keys.some((k) => namesInitOrResume(k))) return { redacted: true };
+
+  return detail;
 }
 
 /**
@@ -145,87 +182,137 @@ function redactDetailIfNamesRemedy(detail) {
  */
 function healFailedMessage(reason, detail) {
   const safeDetail = redactDetailIfNamesRemedy(detail);
-  const detailSuffix = safeDetail !== undefined && safeDetail !== null
-    ? `, detail: ${JSON.stringify(safeDetail)}`
-    : '';
+  let detailSuffix = '';
+  if (safeDetail !== undefined && safeDetail !== null) {
+    // P2c: redactDetailIfNamesRemedy already guarantees safeDetail is either
+    // the original (proven-serializable, non-remedy-naming) detail or a
+    // trivially-serializable {redacted:true[, reason]} stub — but stringify
+    // it defensively anyway so this function itself can never throw.
+    try {
+      detailSuffix = `, detail: ${JSON.stringify(safeDetail)}`;
+    } catch (_err) {
+      detailSuffix = ', detail: {"redacted":true,"reason":"unserializable"}';
+    }
+  }
   return (
     `handoff MCP: schema is not current for this project DB and the automatic bring-forward did not ` +
     `succeed (reason: ${reason}${detailSuffix}). Report-only: no command is offered; this state needs a maintainer.`
   );
 }
 
+const GENERIC_CLASSIFICATION_FAILURE_MESSAGE =
+  'handoff MCP: schema-epoch classification failed unexpectedly. Report-only: no command is offered; this state needs a maintainer.';
+
+function isPositiveSafeInteger(n) {
+  return Number.isSafeInteger(n) && n >= 1;
+}
+
 /**
- * Pure, total classifier over the four branches described in the module
- * header. No I/O, never throws, every combination of inputs maps to exactly
- * one branch (see test/test-mcp-epoch-guard.js T8 for the exhaustive proof).
+ * Pure, total classifier over the six branches described in the module
+ * header. No I/O, NEVER throws (P2c — the entire body is wrapped so any
+ * unexpected exception still returns a branch, never propagates), and every
+ * combination of inputs maps to exactly one branch (see
+ * test/test-mcp-epoch-guard.js T8 for the exhaustive proof).
  *
  * Rules, evaluated IN ORDER (first match wins):
- *   1. loadedEpoch not a positive safe integer         -> heal_failed
- *   2. diskEpoch is null/undefined (manifest unreadable) -> annotate_only
- *   3. loadedEpoch < diskEpoch                          -> stale_engine
- *   4. loadedEpoch > diskEpoch                          -> engine_checkout_inconsistent
+ *   1. loadedEpoch not a positive safe integer          -> heal_failed
+ *   2. diskEpoch not a positive safe integer (manifest
+ *      unreadable OR malformed — NaN/fractional/string/
+ *      negative/Infinity all count) AND healReason is
+ *      undefined (pre-connect call, no heal has run yet) -> annotate_only
+ *   2b. same disk-epoch condition, but healReason IS
+ *       present (post-heal call — Codex review P2a: an
+ *       unreadable/malformed manifest must not silently
+ *       out-rank an already-observed heal failure)        -> heal_failed
+ *   3. loadedEpoch < diskEpoch                            -> stale_engine
+ *   4. loadedEpoch > diskEpoch                            -> engine_checkout_inconsistent
  *   5. healReason in {current, applied, degraded, undefined} -> proceed
  *   6. healReason === 'ahead' and dbEpoch is a positive safe
- *      integer with diskEpoch < dbEpoch                 -> engine_behind_db
- *      (otherwise, which should be unreachable)          -> heal_failed
- *   7. any other healReason                             -> heal_failed
+ *      integer with diskEpoch < dbEpoch                   -> engine_behind_db
+ *      (otherwise, which should be unreachable)            -> heal_failed
+ *   7. any other healReason                               -> heal_failed
  *
  * @param {object} args
  * @param {*} args.loadedEpoch  - SCHEMA_EPOCH from the running process's own required handoff.js.
- * @param {number|null|undefined} args.diskEpoch - readDiskSchemaEpoch(...).epoch, or null/undefined if unreadable.
+ * @param {*} args.diskEpoch    - readDiskSchemaEpoch(...).epoch when ok, or null/undefined/anything else when unreadable or malformed.
  * @param {*} [args.dbEpoch]    - the DATABASE's stored epoch (ensureSchemaCurrentCore's 'ahead' detail.stored_epoch).
- * @param {string} [args.healReason] - ensureSchemaCurrent's {reason}.
+ * @param {string} [args.healReason] - ensureSchemaCurrent's {reason}. undefined means "no heal has run yet" (pre-connect call).
  * @param {object} [args.healDetail] - ensureSchemaCurrent's {detail}.
  * @returns {{branch: string, message: string|null}}
  */
-function classifyEpochDrift({ loadedEpoch, diskEpoch, dbEpoch, healReason, healDetail } = {}) {
-  if (!Number.isSafeInteger(loadedEpoch) || loadedEpoch < 1) {
-    return { branch: 'heal_failed', message: healFailedMessage(healReason, healDetail) };
-  }
+function classifyEpochDrift(args) {
+  try {
+    const { loadedEpoch, diskEpoch, dbEpoch, healReason, healDetail } = args || {};
 
-  if (diskEpoch === null || diskEpoch === undefined) {
-    return { branch: 'annotate_only', message: null };
-  }
+    if (!isPositiveSafeInteger(loadedEpoch)) {
+      return { branch: 'heal_failed', message: healFailedMessage(healReason, healDetail) };
+    }
 
-  if (loadedEpoch < diskEpoch) {
-    return {
-      branch: 'stale_engine',
-      message: `handoff MCP: this server is running a stale engine build (loaded schema epoch ${loadedEpoch}, on disk ${diskEpoch}). Restart the MCP server so it reloads scripts/handoff.js, then retry. No database change is needed.`,
-    };
-  }
-  if (loadedEpoch > diskEpoch) {
-    return {
-      branch: 'engine_checkout_inconsistent',
-      message: `handoff MCP: the engine checkout is internally inconsistent (scripts/handoff.js declares schema epoch ${loadedEpoch}, scripts/sql/schema-manifest.json declares ${diskEpoch}). The checkout is broken or half-updated; restore a clean engine checkout and restart the MCP server.`,
-    };
-  }
+    if (!isPositiveSafeInteger(diskEpoch)) {
+      // Codex review P2a/P2c: a positive-safe-integer check here (not a
+      // bare null/undefined check) also catches every malformed on-disk
+      // value (NaN, 5.5, '5', -1, Infinity, {}, ...) — none of those is
+      // evidence the checkout is either behind or ahead, so none of them
+      // may reach the loadedEpoch/diskEpoch comparisons below. Whether that
+      // "no epoch signal available" state is annotate_only (silent,
+      // pre-connect — the engine's own ensureSchemaCurrent call will
+      // independently hit the same unreadable file moments later) or
+      // heal_failed (report-only, post-heal — a heal was already attempted
+      // and already failed; a merely-unreadable manifest must not
+      // out-rank and hide that observed failure) depends ONLY on whether a
+      // heal has run yet, signaled by healReason being present.
+      if (healReason === undefined) {
+        return { branch: 'annotate_only', message: null };
+      }
+      return { branch: 'heal_failed', message: healFailedMessage(healReason, healDetail) };
+    }
 
-  // loadedEpoch === diskEpoch from here on — this checkout is internally
-  // consistent; whatever happens next is about the DATABASE, not this build.
-  if (healReason === 'current' || healReason === 'applied' || healReason === 'degraded' || healReason === undefined) {
-    return { branch: 'proceed', message: null };
-  }
-
-  if (healReason === 'ahead') {
-    if (Number.isSafeInteger(dbEpoch) && dbEpoch >= 1 && diskEpoch < dbEpoch) {
+    if (loadedEpoch < diskEpoch) {
       return {
-        branch: 'engine_behind_db',
-        message: `handoff MCP: the engine checkout is older than the database (engine schema epoch ${diskEpoch}, database ${dbEpoch}). Upgrade the engine checkout to the build that wrote epoch ${dbEpoch}, then restart the MCP server. Refusing to apply a downgrade.`,
+        branch: 'stale_engine',
+        message: `handoff MCP: this server is running a stale engine build (loaded schema epoch ${loadedEpoch}, on disk ${diskEpoch}). Restart the MCP server so it reloads scripts/handoff.js, then retry. No database change is needed.`,
       };
     }
-    // Should be unreachable: ensureSchemaCurrentCore only ever returns
-    // reason:'ahead' when it itself found the DB's stored epoch strictly
-    // newer than its own current one. If dbEpoch was not threaded through
-    // (or is otherwise malformed) there is no evidence-backed remedy to
-    // offer — fall back to the same report-only treatment as any other
-    // unclassifiable heal failure, rather than guessing.
-    return { branch: 'heal_failed', message: healFailedMessage(healReason, healDetail) };
-  }
+    if (loadedEpoch > diskEpoch) {
+      return {
+        branch: 'engine_checkout_inconsistent',
+        message: `handoff MCP: the engine checkout is internally inconsistent (scripts/handoff.js declares schema epoch ${loadedEpoch}, scripts/sql/schema-manifest.json declares ${diskEpoch}). The checkout is broken or half-updated; restore a clean engine checkout and restart the MCP server.`,
+      };
+    }
 
-  // manifest_error, classification_error, lock_acquire_failed, apply_failed,
-  // integrity_index_failed, verification_failed, verification_probe_failed,
-  // unknown, or anything not enumerated above.
-  return { branch: 'heal_failed', message: healFailedMessage(healReason, healDetail) };
+    // loadedEpoch === diskEpoch from here on — this checkout is internally
+    // consistent; whatever happens next is about the DATABASE, not this build.
+    if (healReason === 'current' || healReason === 'applied' || healReason === 'degraded' || healReason === undefined) {
+      return { branch: 'proceed', message: null };
+    }
+
+    if (healReason === 'ahead') {
+      if (isPositiveSafeInteger(dbEpoch) && diskEpoch < dbEpoch) {
+        return {
+          branch: 'engine_behind_db',
+          message: `handoff MCP: the engine checkout is older than the database (engine schema epoch ${diskEpoch}, database ${dbEpoch}). Upgrade the engine checkout to the build that wrote epoch ${dbEpoch}, then restart the MCP server. Refusing to apply a downgrade.`,
+        };
+      }
+      // Should be unreachable: ensureSchemaCurrentCore only ever returns
+      // reason:'ahead' when it itself found the DB's stored epoch strictly
+      // newer than its own current one. If dbEpoch was not threaded through
+      // (or is otherwise malformed) there is no evidence-backed remedy to
+      // offer — fall back to the same report-only treatment as any other
+      // unclassifiable heal failure, rather than guessing.
+      return { branch: 'heal_failed', message: healFailedMessage(healReason, healDetail) };
+    }
+
+    // manifest_error, classification_error, lock_acquire_failed, apply_failed,
+    // integrity_index_failed, verification_failed, verification_probe_failed,
+    // unknown, or anything not enumerated above.
+    return { branch: 'heal_failed', message: healFailedMessage(healReason, healDetail) };
+  } catch (_err) {
+    // P2c: total means NEVER throws, even against an input shape nothing
+    // above anticipated (e.g. a getter that throws, a Proxy, a hostile
+    // dbEpoch). No detail is echoed here — it may be the very thing that
+    // caused the exception, so its own JSON.stringify could throw again.
+    return { branch: 'heal_failed', message: GENERIC_CLASSIFICATION_FAILURE_MESSAGE };
+  }
 }
 
 module.exports = {

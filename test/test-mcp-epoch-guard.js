@@ -21,21 +21,37 @@
  *   T6  engine_behind_db message names no init/resume subcommand.
  *   T7  heal_failed message names no init/resume subcommand.
  *   T8  totality matrix: every combination of loaded/disk/healReason/dbEpoch
- *       maps to exactly one branch (cross-checked against an independently
- *       written reference classifier) and classifyEpochDrift never throws.
+ *       (disk now including malformed values — NaN/fractional/string/
+ *       negative/Infinity, not just null/undefined) maps to exactly one
+ *       branch (cross-checked against an independently written reference
+ *       classifier) and classifyEpochDrift never throws.
+ *   T8b non-serializable healDetail (a top-level BigInt field, a circular
+ *       object) never throws and still returns a string message; malformed
+ *       disk epochs re-checked in isolation for both a pre-heal
+ *       (annotate_only) and post-heal (heal_failed, never proceed) call.
  *   T9  readDiskSchemaEpoch: missing file, invalid JSON, non-integer/
  *       fractional/zero/negative schema_epoch -> ok:false; valid -> ok:true.
  *   T10 readDiskSchemaEpoch has no memoization — a rewrite between two calls
  *       is reflected on the very next call.
  *   T11 engine_checkout_inconsistent (loaded 6, disk 5).
- *   T12 a healDetail object naming "init" is redacted (keys preserved, verbs
- *       and remedy text are not) before it reaches the heal_failed message.
+ *   T12 a healDetail object naming "init"/"resume" — in its value, in a KEY
+ *       name, split across an escaped newline, or nested inside a child
+ *       object — is redacted to the bare `{redacted:true}` stub (no key
+ *       list, no fragment of the original content survives a match) before
+ *       it reaches the heal_failed message.
  *   T13 live stdio MCP regression: a real handoff-mcp.mjs process, running
  *       from a throwaway copy of the engine whose on-disk schema-manifest.json
  *       is bumped AFTER the server starts (so the server's in-memory
  *       SCHEMA_EPOCH is frozen "stale" relative to its own checkout on
  *       disk), rejects a tool call with the stale_engine message — never
- *       spawns a child, never touches a database. Requires the repo's own
+ *       spawns a child, never touches a database (proven by pointing the
+ *       call's projectRoot at a fixture whose own .claude/pipeline.yml
+ *       targets an unreachable host:port, then asserting the response
+ *       carries no pg-connection-error vocabulary). The child's own env is
+ *       built explicitly with CLAUDE_PLUGIN_ROOT/HANDOFF_MCP_ENGINE_PATH
+ *       stripped, so this test process's own ambient overrides (if any)
+ *       can never point the guard at a checkout other than the scratch copy
+ *       this test just built and is about to bump. Requires the repo's own
  *       scripts/node_modules to exist (see "Install dependencies" in
  *       .github/workflows/test.yml, working-directory: scripts); SKIPs with
  *       a clear reason if that directory is absent.
@@ -159,15 +175,23 @@ function testT7_HealFailedNamesNoSubcommand() {
 
 /** Independently re-derived from the SAME ordered rules classifyEpochDrift
  * documents (not a call into that function) — a regression proof that the
- * shipped implementation matches the spec's rule order, not just itself. */
+ * shipped implementation matches the spec's rule order, not just itself.
+ * Codex review P2a (2026-09-13) fix: a manifest-unreadable/malformed disk
+ * value is annotate_only ONLY when no heal has run yet (reason ===
+ * undefined) — the earlier reference classifier unconditionally returned
+ * annotate_only for a missing disk epoch, including post-heal calls, which
+ * is exactly the bug T8 was supposed to catch and did not. */
+function isPosIntRef(n) {
+  return Number.isSafeInteger(n) && n >= 1;
+}
 function referenceBranch({ loaded, disk, reason, db }) {
-  if (!(Number.isSafeInteger(loaded) && loaded >= 1)) return 'heal_failed';
-  if (disk === null || disk === undefined) return 'annotate_only';
+  if (!isPosIntRef(loaded)) return 'heal_failed';
+  if (!isPosIntRef(disk)) return reason === undefined ? 'annotate_only' : 'heal_failed';
   if (loaded < disk) return 'stale_engine';
   if (loaded > disk) return 'engine_checkout_inconsistent';
   if (reason === 'current' || reason === 'applied' || reason === 'degraded' || reason === undefined) return 'proceed';
   if (reason === 'ahead') {
-    if (Number.isSafeInteger(db) && db >= 1 && disk < db) return 'engine_behind_db';
+    if (isPosIntRef(db) && disk < db) return 'engine_behind_db';
     return 'heal_failed';
   }
   return 'heal_failed';
@@ -182,7 +206,14 @@ const NULL_MESSAGE_BRANCHES = new Set(['proceed', 'annotate_only']);
 function testT8_TotalityMatrix() {
   const label = 'T8: totality matrix (loaded x disk x reason x db) — one branch each, never throws';
   const loadedValues = [null, '5', 5.5, 0, 4, 5, 6];
-  const diskValues = [null, 4, 5];
+  // Codex review P2a/P2c (2026-09-13): malformed on-disk values (NaN,
+  // fractional, string, negative, Infinity) now included alongside
+  // null/undefined-shaped unreadability — classifyEpochDrift's own
+  // isPositiveSafeInteger gate must treat every one of these the same way
+  // a genuinely unreadable manifest is treated (annotate_only pre-heal,
+  // heal_failed post-heal), never falling through to the loaded/disk
+  // numeric comparisons below.
+  const diskValues = [null, 4, 5, NaN, 5.5, '5', -1, Infinity];
   const reasonValues = [undefined, 'current', 'degraded', 'ahead', 'apply_failed', 'unknown', 'bogus'];
   const dbValues = [null, 5, 6];
   let checked = 0;
@@ -229,6 +260,40 @@ function testT8_TotalityMatrix() {
   } catch (err) {
     fail(label, err.message);
   }
+}
+
+// ── T8b: non-serializable healDetail never throws (Codex review P2c) ──────
+
+function testT8b_NonSerializableDetailNeverThrows() {
+  const label = 'T8b: non-serializable healDetail (BigInt, circular) never throws; correct branch';
+  try {
+    // A top-level BigInt field: JSON.stringify throws TypeError on this.
+    const bigintDetail = { value: 1n };
+    const r1 = classifyEpochDrift({ loadedEpoch: 5, diskEpoch: 5, healReason: 'apply_failed', healDetail: bigintDetail });
+    assertEqual(r1.branch, 'heal_failed');
+    assertTrue(typeof r1.message === 'string', 'BigInt detail must still produce a string message');
+    assertNoMatch(r1.message, NAMES_A_SUBCOMMAND);
+
+    // A circular object: JSON.stringify throws "Converting circular structure to JSON".
+    const circular = { note: 'boom' };
+    circular.self = circular;
+    const r2 = classifyEpochDrift({ loadedEpoch: 5, diskEpoch: 5, healReason: 'apply_failed', healDetail: circular });
+    assertEqual(r2.branch, 'heal_failed');
+    assertTrue(typeof r2.message === 'string', 'circular detail must still produce a string message');
+    assertNoMatch(r2.message, NAMES_A_SUBCOMMAND);
+
+    // Malformed disk epochs directly, cross-checked one more time in
+    // isolation (not just buried inside T8's matrix) — never throws,
+    // correct branch for both a pre-heal (annotate_only) and post-heal
+    // (heal_failed) call.
+    for (const disk of [NaN, Infinity, '5', -1, 5.5]) {
+      const pre = classifyEpochDrift({ loadedEpoch: 5, diskEpoch: disk });
+      assertEqual(pre.branch, 'annotate_only', `disk=${JSON.stringify(disk)} pre-heal must be annotate_only`);
+      const post = classifyEpochDrift({ loadedEpoch: 5, diskEpoch: disk, healReason: 'current' });
+      assertEqual(post.branch, 'heal_failed', `disk=${JSON.stringify(disk)} post-heal (reason:'current') must be heal_failed, not proceed`);
+    }
+    pass(label);
+  } catch (err) { fail(label, err.message); }
 }
 
 // ── T9: readDiskSchemaEpoch ──────────────────────────────────────────────
@@ -333,13 +398,46 @@ function testT11_EngineCheckoutInconsistent() {
 // ── T12: detail redaction ────────────────────────────────────────────────
 
 function testT12_DetailRedaction() {
-  const label = 'T12: healDetail naming "init" is redacted (keys kept, remedy text is not)';
+  const label = 'T12: healDetail naming "init"/"resume" is fully redacted (no key list, no remedy text survives)';
   try {
     const detail = { message: 'try node scripts/handoff.js init to fix this', code: 'X1' };
     const { message } = classifyEpochDrift({ loadedEpoch: 5, diskEpoch: 5, healReason: 'apply_failed', healDetail: detail });
+    // Codex review P2b (2026-09-13): the old `{redacted:true, keys:[...]}`
+    // shape copied the ORIGINAL unsanitized key names into the replacement
+    // — no key list survives a match now, only the bare stub.
     assertMatch(message, /"redacted":true/);
-    assertMatch(message, /"keys":\["message","code"\]/);
+    assertNoMatch(message, /"keys"/);
     assertNoMatch(message, /try node scripts\/handoff\.js init/);
+    assertNoMatch(message, /"message"/);
+    assertNoMatch(message, /"code"/);
+
+    // A key NAME (not the value) containing "init" must also be redacted —
+    // the prior `keys:[...]` shape would have echoed this key verbatim.
+    const keyNamedDetail = { 'run handoff.js init': 'unrelated value', code: 'X1b' };
+    const keyMsg = healFailedMessage('apply_failed', keyNamedDetail);
+    assertMatch(keyMsg, /"redacted":true/);
+    assertNoMatch(keyMsg, /run handoff\.js init/);
+    assertNoMatch(keyMsg, /"keys"/);
+
+    // Codex review P2b: a value containing a remedy word split across an
+    // ESCAPED newline (JSON.stringify renders a real "\n" as the two
+    // literal characters backslash+n, so a naive \binit\b test against the
+    // raw serialized string sees "...run\ninit..." with no word boundary
+    // between the escape's "n" and "init"'s "i" — this must still match).
+    const escapedNewlineDetail = { message: 'Fix: run\ninit' };
+    const escapedMsg = healFailedMessage('apply_failed', escapedNewlineDetail);
+    assertMatch(escapedMsg, /"redacted":true/);
+    assertNoMatch(escapedMsg, /Fix: run/);
+
+    // A NESTED object containing "resume" must be caught too — the
+    // whole-string scan covers arbitrary nesting depth since
+    // JSON.stringify recurses through the whole structure.
+    const nestedDetail = { code: 'X3', inner: { hint: 'try handoff.js resume next' } };
+    const nestedMsg = healFailedMessage('apply_failed', nestedDetail);
+    assertMatch(nestedMsg, /"redacted":true/);
+    assertNoMatch(nestedMsg, /handoff\.js resume/);
+    assertNoMatch(nestedMsg, /"inner"/);
+
     // Also exercise healFailedMessage directly (the same function
     // classifyEpochDrift uses internally — no second implementation).
     const direct = healFailedMessage('apply_failed', detail);
@@ -380,7 +478,39 @@ function buildScratchEngineCopy() {
   return { scratchRoot, scratchScripts, manifestPath: path.join(scratchScripts, 'sql', 'schema-manifest.json') };
 }
 
-async function connectMcp(serverPath) {
+// Codex review T13 finding (2026-09-13): a fixture project root with its OWN
+// .claude/pipeline.yml pointing `knowledge.host`/`port` at an address
+// nothing listens on. If checkEngineEpochOrThrow ever failed to run BEFORE
+// withProjectDb's connectForRoot (a regression this test must catch), the
+// tool call would instead surface a pg connection failure (ECONNREFUSED /
+// timeout) — a message shape entirely distinct from the guard's own
+// "stale engine build" text — making "did the DB layer get touched at all"
+// directly observable from the tool's error text, not just inferred.
+// 127.0.0.1:1 (tcpmux) is loopback-only and essentially never bound,
+// so a real connection attempt refuses immediately rather than hanging.
+function buildUnreachableDbProjectRoot() {
+  const root = path.join(os.tmpdir(), `epoch-guard-t13-project-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  fs.mkdirSync(path.join(root, '.claude'), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, '.claude', 'pipeline.yml'),
+    [
+      'project:',
+      '  name: epoch-guard-t13-unreachable',
+      '',
+      'knowledge:',
+      '  tier: "postgres"',
+      '  host: "127.0.0.1"',
+      '  port: 1',
+      '  database: "epoch_guard_t13_unreachable"',
+      '  user: "postgres"',
+      '',
+    ].join('\n'),
+    'utf8'
+  );
+  return root;
+}
+
+async function connectMcp(serverPath, childEnv) {
   const { Client: SdkClient } = require(
     path.join(PROJECT_ROOT, 'scripts', 'node_modules', '@modelcontextprotocol', 'sdk', 'dist', 'cjs', 'client', 'index.js')
   );
@@ -390,7 +520,7 @@ async function connectMcp(serverPath) {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [serverPath],
-    env: { ...process.env },
+    env: childEnv,
   });
   const client = new SdkClient({ name: 'test-mcp-epoch-guard', version: '0.1.0' }, { capabilities: {} });
   await client.connect(transport);
@@ -405,10 +535,24 @@ async function testT13_LiveStdioStaleEngine() {
     return;
   }
   let scratch = null;
+  let unreachableProjectRoot = null;
   let client = null;
   try {
     scratch = buildScratchEngineCopy();
-    client = await connectMcp(path.join(scratch.scratchScripts, 'handoff-mcp.mjs'));
+    unreachableProjectRoot = buildUnreachableDbProjectRoot();
+
+    // Codex review T13 finding: build the child's env EXPLICITLY and strip
+    // CLAUDE_PLUGIN_ROOT/HANDOFF_MCP_ENGINE_PATH rather than spreading
+    // process.env verbatim — this test's OWN process could be running
+    // under either (e.g. as a Claude Code plugin, or with a developer's
+    // local override set), and either one would let the guard read a
+    // checkout OTHER than the throwaway scratch copy this test just built
+    // and is about to bump, silently defeating the manifest-bump below.
+    const childEnv = { ...process.env };
+    delete childEnv.CLAUDE_PLUGIN_ROOT;
+    delete childEnv.HANDOFF_MCP_ENGINE_PATH;
+
+    client = await connectMcp(path.join(scratch.scratchScripts, 'handoff-mcp.mjs'), childEnv);
 
     // The server just required scratch handoff.js — its in-memory
     // SCHEMA_EPOCH is now frozen at whatever the real repo's SCHEMA_EPOCH
@@ -422,7 +566,12 @@ async function testT13_LiveStdioStaleEngine() {
 
     const res = await client.callTool({
       name: 'handoff_status',
-      arguments: { projectRoot: PROJECT_ROOT },
+      // projectRoot points at the unreachable-DB fixture, NOT PROJECT_ROOT —
+      // if checkEngineEpochOrThrow's pre-connect placement ever regressed,
+      // connectForRoot would attempt a real TCP connect to 127.0.0.1:1 and
+      // this test would see a connection-refused error instead of the
+      // guard's own message (asserted below).
+      arguments: { projectRoot: unreachableProjectRoot },
     });
     if (!res.isError) {
       fail(label, `expected an isError tool result, got success: ${JSON.stringify(res).slice(0, 300)}`);
@@ -432,12 +581,18 @@ async function testT13_LiveStdioStaleEngine() {
     assertMatch(text, /stale engine build/i);
     assertMatch(text, new RegExp(`loaded schema epoch ${loadedEpoch}`));
     assertMatch(text, new RegExp(`on disk ${loadedEpoch + 1}`));
+    // The distinguishing proof: no sign of a database connection attempt
+    // (pg's own error vocabulary for a refused/unreachable TCP connect)
+    // anywhere in the tool's error text — the rejection happened before
+    // connectForRoot ever ran, not merely before the query printed here.
+    assertNoMatch(text, /ECONNREFUSED|ETIMEDOUT|ENOTFOUND|connect ECONNREFUSED|Connection terminated|client password/i);
     pass(label);
   } catch (err) {
     fail(label, err.message);
   } finally {
     if (client) { try { await client.close(); } catch (_err) { /* best-effort */ } }
     if (scratch) { try { fs.rmSync(scratch.scratchRoot, { recursive: true, force: true }); } catch (_err) { /* best-effort */ } }
+    if (unreachableProjectRoot) { try { fs.rmSync(unreachableProjectRoot, { recursive: true, force: true }); } catch (_err) { /* best-effort */ } }
   }
 }
 
@@ -453,6 +608,7 @@ async function main() {
   testT6_EngineBehindDbNamesNoSubcommand();
   testT7_HealFailedNamesNoSubcommand();
   testT8_TotalityMatrix();
+  testT8b_NonSerializableDetailNeverThrows();
   testT9_ReadDiskSchemaEpoch();
   testT10_NoMemoization();
   testT11_EngineCheckoutInconsistent();

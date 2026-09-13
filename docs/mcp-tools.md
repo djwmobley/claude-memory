@@ -93,9 +93,11 @@ force the database backward. `scripts/lib/schema-epoch-guard.js`'s
 `classifyEpochDrift()` now separates that bare `reason` string into four
 branches, checked at two call sites (before `connectForRoot` in
 `withProjectDb`, and again after `ensureSchemaCurrent()` returns a non-
-proceeding reason — plus the same before-spawn check on the four
-child-process tools, `handoff_status`/`handoff_resume`/
-`handoff_checkpoint`/`handoff_close`/`handoff_init`):
+proceeding reason — plus the same before-spawn check, `checkEngineEpochOrThrow`,
+on the five spawn-based tools, `handoff_status`/`handoff_resume`/
+`handoff_checkpoint`/`handoff_close`/`handoff_init`). Those same five tools
+also run a SECOND, separate before-spawn check, `checkSpawnEngineEpochOrThrow`
+— see the `HANDOFF_MCP_ENGINE_PATH` divergence rule below:
 
 | Branch | Condition | Remedy |
 |---|---|---|
@@ -105,15 +107,37 @@ child-process tools, `handoff_status`/`handoff_resume`/
 | `heal_failed` | every other non-proceeding `ensureSchemaCurrent` reason (`manifest_error`, `classification_error`, `lock_acquire_failed`, `apply_failed`, `integrity_index_failed`, `verification_failed`, `verification_probe_failed`, `unknown`, or anything unlisted) | Report-only — no command is offered. This state needs a maintainer. |
 
 No branch's message ever names `init` or `resume` as a fix (a `heal_failed`
-message's interpolated `detail` is scanned and redacted to `{redacted:true,
-keys:[...]}` if it happens to mention either word). See
-`scripts/lib/schema-epoch-guard.js`'s header comment for the full incident
-writeup and `test/test-mcp-epoch-guard.js` for the totality-matrix proof
-that every `(loadedEpoch, diskEpoch, healReason, dbEpoch)` combination maps
-to exactly one of these branches. Known residual gap: this guard validates
-the SERVER PROCESS's OWN engine identity only — a deployment where
-`HANDOFF_MCP_ENGINE_PATH` points a spawned child at a DIFFERENT checkout
-than the one this server itself required is invisible to it.
+message's interpolated `detail` is scanned — the whole serialized value AND
+every one of its own top-level key names — and, on any match, replaced
+wholesale with the bare stub `{redacted:true}`; no fragment of the original
+content, including its key names, survives a match, since a key can itself
+be named after the remedy text). See `scripts/lib/schema-epoch-guard.js`'s
+header comment for the full incident writeup and `test/test-mcp-epoch-guard.js`
+for the totality-matrix proof that every `(loadedEpoch, diskEpoch,
+healReason, dbEpoch)` combination maps to exactly one of these branches.
+
+**`HANDOFF_MCP_ENGINE_PATH` divergence rule (Codex review P1a,
+2026-09-13).** The table above and `checkEngineEpochOrThrow` both validate
+only the checkout THIS server process required at startup (`_ENGINE_ROOT`).
+Every spawn-based tool (`handoff_status`/`handoff_resume`/
+`handoff_checkpoint`/`handoff_close`/`handoff_init`) launches `ENGINE_PATH`
+instead, which is `HANDOFF_MCP_ENGINE_PATH` when that env var is set — a
+completely independent checkout this server never required. A SEPARATE
+pre-spawn check, `checkSpawnEngineEpochOrThrow`, covers that case: when
+`HANDOFF_MCP_ENGINE_PATH`'s directory resolves to the SAME root as
+`_ENGINE_ROOT` it is a no-op (already covered above); when it resolves to a
+DIFFERENT root, that checkout's own on-disk `schema_epoch` is read fresh
+and compared against this server's own loaded `SCHEMA_EPOCH` — if the
+manifest is unreadable/malformed OR the epoch differs in EITHER direction,
+the call is rejected with an explicit "point the override at the same
+engine build as the server, or unset it and restart the MCP server" error,
+before any temp file is written or child process is spawned. Unlike the
+four-branch table above (which arbitrates a loaded/disk/database
+three-way using the database's stored epoch as independent evidence), this
+check has no third source of truth to arbitrate two DIFFERENT engine
+checkouts against each other, so it does not sub-classify the mismatch —
+any divergence is rejected outright and the caller must reconcile the two
+checkouts (or unset the override) itself.
 
 **pgvector-gated columns — loud, not silent.** `assertions.embedding` and
 `decisions.embedding` (and their HNSW indexes) are wrapped in `DO $$ ...
