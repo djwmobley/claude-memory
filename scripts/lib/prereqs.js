@@ -4,9 +4,10 @@
  * scripts/lib/prereqs.js — installer prerequisite checker
  * (docs/specs/package-and-installer.md §3).
  *
- * Implements the total, five-outcome classification the spec requires:
+ * Implements the total, six-outcome classification the spec requires:
  * PRESENT_OK / PRESENT_TOO_OLD / ABSENT / UNKNOWN / AMBIGUOUS_PG (postgres
- * row only). Findings this file specifically closes (see the spec section
+ * row only) / ABSENT_BUT_AVAILABLE (pgvector row only, round 2 H4 below).
+ * Findings this file specifically closes (see the spec section
  * of the same letter for the full rationale):
  *
  *   A1/G1 — classifyVersion parses a STRICT ^v?\d+\.\d+\.\d+$ token; any
@@ -44,6 +45,55 @@
  *   G2    — gh's nonzero-non-ENOENT exit classifies UNKNOWN (via the same
  *           A2 rule), never ABSENT, and probeAll marks it required: false.
  *
+ * Round 2 fixes (Codex review of PR #309, r1 -- 6 blockers):
+ *   H1 (git prefix family) — real `git --version` output carries a
+ *      platform-specific packaging suffix the strict three-part rule
+ *      rejects: `git version 2.49.0.windows.1` (Windows) never matches
+ *      `^v?\d+\.\d+\.\d+$`. classifyVersion's family registry now also
+ *      carries `family: 'git'`, using GIT_VERSION_TOKEN_RE — a three-part
+ *      numeric PREFIX match that requires the character immediately after
+ *      the numeral to be either end-of-token or a literal `.` (so a real
+ *      packaging suffix like `.windows.1`/`.msysgit.1` is accepted and
+ *      ignored, while a merged-garbage or prerelease shape like
+ *      `2.49.0-rc1`/`2.49.0abc` still has no matching token and is
+ *      UNKNOWN, same as every other family's rule). macOS git
+ *      (`git version 2.39.3 (Apple Git-146)`) and Linux git already passed
+ *      under the strict rule (their token has no suffix) and are unaffected.
+ *      Every family's version rule is now a documented, named entry in
+ *      VERSION_FAMILY_RULES rather than an inline ternary — "no family" /
+ *      an unrecognized family name falls back to the strict default, never
+ *      silently matches everything.
+ *   H2 (classifyProbe spawn-error totality) — a truthy `result.error` used
+ *      to become ABSENT unconditionally, which is correct only for a
+ *      confirmed ENOENT (nothing resolves at that name) and wrong for
+ *      EACCES/EPERM/any other spawn-level error code (something IS there
+ *      but could not be launched — permissions, AV block, broken
+ *      interpreter shebang). Only `error.code === 'ENOENT'` is ABSENT now;
+ *      every other spawn-error code is UNKNOWN with the code embedded in
+ *      the reason (`spawn_error_<code>`), never silently coerced to
+ *      ENOENT's confident absence. The win32 exit-9009 "not recognized"
+ *      signal is a SEPARATE, pre-existing UNKNOWN path reached only when
+ *      the process DID spawn (see classifyVersion) — it never surfaces as
+ *      result.error at all, so it is unaffected by this fix.
+ *   H3 (codex sibling must be a file) — classifyCodexFunctional's
+ *      `codex-code-mode-host*` sibling match now requires fs.statSync(...)
+ *      .isFile() (which follows symlinks, so a symlink resolving to a
+ *      regular file still counts) on every name match, not just a
+ *      directory-entry NAME match — a directory happening to be named
+ *      `codex-code-mode-host` no longer satisfies the check.
+ *   H4 (pgvector probe is read-only) — probeAll's pgvector row used to run
+ *      `psql -c "CREATE EXTENSION IF NOT EXISTS vector;"`, which can WRITE
+ *      to the connected database despite `--check-only`'s documented
+ *      "writes nothing" contract. It now runs two read-only queries —
+ *      `SELECT 1 FROM pg_extension WHERE extname='vector'` (is it
+ *      installed?) and, only when that returns no row,
+ *      `SELECT * FROM pg_available_extensions WHERE name='vector'` (is it
+ *      installable?) — never CREATE EXTENSION. This adds a SIXTH total
+ *      outcome, ABSENT_BUT_AVAILABLE (installable but not yet installed;
+ *      still gates as failing, same as ABSENT/UNKNOWN, but with distinct,
+ *      more useful remediation text — see classifyPgvectorProbe and
+ *      assistFor's `extension_available_not_installed` branch).
+ *
  * Design: every classify* function is pure (no I/O) and takes an
  * execFile-shaped result object, so tests never spawn real processes.
  * probeAll() is the only function that touches the outside world, and even
@@ -72,6 +122,31 @@ const VERSION_TOKEN_RE = /^v?(\d+)\.(\d+)\.(\d+)$/;
 // (16.2); pre-10 reported three-part (9.6.24). A dev/beta build
 // (17devel, 18beta2) has no "." in its token and never matches.
 const PG_VERSION_TOKEN_RE = /^(\d+)\.(\d+)(?:\.(\d+))?$/;
+
+// Git-family version token (H1) — a three-part numeric PREFIX, requiring
+// whatever immediately follows the numeral to be either end-of-token or a
+// literal "." (never an arbitrary character). Real `git --version` output
+// carries a platform packaging suffix the strict rule rejects:
+// `git version 2.49.0.windows.1` (Windows), `git version 2.43.0` (Linux,
+// no suffix, already matches the strict rule too). The end-of-token-or-dot
+// guard is what keeps this a PREFIX match rather than an unanchored one: a
+// prerelease/garbage shape like `2.49.0-rc1` or `2.49.0abc` has no
+// character-after-numeral that is "." or end-of-token, so it still has no
+// matching token and is UNKNOWN, exactly like every other family's rule.
+const GIT_VERSION_TOKEN_RE = /^(\d+)\.(\d+)\.(\d+)(?=\.|$)/;
+
+// Per-family version-token rule registry (H1) — every prerequisite's rule
+// is a named, documented entry here, never an inline ternary. An
+// unrecognized/omitted family name falls back to VERSION_TOKEN_RE (the
+// strict default), never silently matches everything.
+const VERSION_FAMILY_RULES = {
+  postgres: PG_VERSION_TOKEN_RE,
+  git: GIT_VERSION_TOKEN_RE,
+};
+
+function versionRuleFor(family) {
+  return VERSION_FAMILY_RULES[family] || VERSION_TOKEN_RE;
+}
 
 // B1: prereqs whose real-world install command is elevated on every
 // supported platform (Docker Desktop, a system Postgres, the pgvector
@@ -120,13 +195,14 @@ function parseMin(min) {
  * outcome is one of PRESENT_OK / PRESENT_TOO_OLD / UNKNOWN. Never ABSENT —
  * that outcome requires a confirmed spawn-level failure this function
  * never sees (see classifyProbe).
- * opts.family: 'postgres' swaps the strict three-part token rule for
- * PG_VERSION_TOKEN_RE (B3) — every other prerequisite keeps the strict
- * rule (the default when opts/opts.family is omitted).
+ * opts.family: looks up the named rule in VERSION_FAMILY_RULES (H1) —
+ * 'postgres' selects PG_VERSION_TOKEN_RE (B3), 'git' selects
+ * GIT_VERSION_TOKEN_RE (H1) — every other prerequisite (including an
+ * omitted or unrecognized family) keeps the strict VERSION_TOKEN_RE rule.
  */
 function classifyVersion(stdout, exitCode, min, opts) {
   opts = opts || {};
-  const versionRe = opts.family === 'postgres' ? PG_VERSION_TOKEN_RE : VERSION_TOKEN_RE;
+  const versionRe = versionRuleFor(opts.family);
   const minVer = parseMin(min);
   const minStr = fmtVersion(minVer);
 
@@ -166,8 +242,10 @@ function classifyVersion(stdout, exitCode, min, opts) {
  * rule) with the spawn-level outcomes. result is execFile-shaped:
  * { error, status, stdout, stderr, timedOut }. A timeout is UNKNOWN (the
  * process may still be running -- never silently ABSENT). A real spawn
- * error (ENOENT-shaped: result.error set, no numeric status) is the ONLY
- * path to ABSENT.
+ * error with error.code === 'ENOENT' (H2: confirmed "nothing resolves at
+ * this name") is the ONLY path to ABSENT. Any OTHER spawn-error code
+ * (EACCES, EPERM, etc. — something IS there but could not be launched) is
+ * UNKNOWN, with the code embedded in the reason.
  * rule: { min, family } for a version rule (family: 'postgres' selects the
  * B3 two-or-three-part rule, see classifyVersion), or { functional: fn(result) }
  * to delegate entirely (used for docker info / host-CLI functional checks).
@@ -179,7 +257,17 @@ function classifyProbe(result, rule) {
     return { outcome: 'UNKNOWN', reason: 'timeout', version: null };
   }
   if (result.error) {
-    return { outcome: 'ABSENT', reason: 'not_found', version: null };
+    // H2: only a confirmed ENOENT ("nothing resolves at this name") is
+    // ABSENT. EACCES/EPERM/any other spawn-error code means something IS
+    // there but could not be launched -- ambiguous, never a confident
+    // absence. The win32 exit-9009 "not recognized" signal is a SEPARATE
+    // path (classifyVersion, reached only when the process DID spawn) and
+    // never surfaces as result.error, so it is untouched here.
+    const code = result.error && result.error.code;
+    if (code === 'ENOENT') {
+      return { outcome: 'ABSENT', reason: 'not_found', version: null };
+    }
+    return { outcome: 'UNKNOWN', reason: `spawn_error_${code || 'unknown'}`, version: null };
   }
   if (typeof rule.functional === 'function') {
     return rule.functional(result);
@@ -211,7 +299,20 @@ function classifyCodexFunctional(result, opts) {
   } catch (_) {
     return { outcome: 'UNKNOWN', reason: 'resolved_dir_unreadable', version: versionOutcome.version, min: versionOutcome.min };
   }
-  const hasHost = entries.some((f) => /^codex-code-mode-host/i.test(f));
+  // H3: a directory-entry NAME match is not sufficient -- a directory
+  // (or a broken/unreadable path) named `codex-code-mode-host` must never
+  // satisfy this check. fs.statSync follows symlinks, so a symlink that
+  // resolves to a regular file still counts; a name-matching entry whose
+  // stat throws (broken symlink, permission, race) is treated as not a
+  // match rather than aborting the whole check.
+  const hasHost = entries.some((f) => {
+    if (!/^codex-code-mode-host/i.test(f)) return false;
+    try {
+      return fs.statSync(path.join(dir, f)).isFile();
+    } catch (_) {
+      return false;
+    }
+  });
   if (!hasHost) {
     return { outcome: 'UNKNOWN', reason: 'missing_code_mode_host', version: versionOutcome.version, min: versionOutcome.min };
   }
@@ -272,6 +373,71 @@ function classifyPostgresRow(opts) {
   return { outcome: 'ABSENT', reason: 'neither_resolved' };
 }
 
+// ─── pgvector: read-only 6-way total classification (H4) ─────────────────
+
+/**
+ * classifyPsqlBooleanQuery(result) — pure classification of one read-only
+ * `psql -tAc "<boolean-shaped SELECT>"` probe result (execFile-shaped, same
+ * as classifyProbe's `result` param). Returns { state: 'yes'|'no'|'unknown',
+ * reason }. 'yes' means the query returned at least one row (non-empty
+ * `-tAc` stdout); 'no' means it ran cleanly and returned zero rows; every
+ * other case (timeout, spawn error, no exit code, nonzero exit) is
+ * 'unknown' -- never coerced to a confident yes/no.
+ */
+function classifyPsqlBooleanQuery(result) {
+  result = result || {};
+  if (result.timedOut) return { state: 'unknown', reason: 'timeout' };
+  if (result.error) {
+    const code = result.error && result.error.code;
+    // H2 parity: a confirmed ENOENT (psql itself not on PATH) is still
+    // "unknown" here, never ABSENT -- this probe classifies the VECTOR
+    // EXTENSION's state, not psql's own presence (that is a separate,
+    // undeclared prerequisite outside this file's §3 row list).
+    return { state: 'unknown', reason: code === 'ENOENT' ? 'psql_not_found' : `spawn_error_${code || 'unknown'}` };
+  }
+  if (typeof result.status !== 'number') return { state: 'unknown', reason: 'no_exit_code' };
+  if (result.status !== 0) return { state: 'unknown', reason: 'nonzero_exit' };
+  const out = String(result.stdout || '').trim();
+  return { state: out.length > 0 ? 'yes' : 'no', reason: null };
+}
+
+/**
+ * classifyPgvectorProbe(presentResult, availableResult) — H4: replaces the
+ * old write-capable `CREATE EXTENSION IF NOT EXISTS vector` probe with two
+ * READ-ONLY queries. `presentResult` is the result of
+ * `SELECT 1 FROM pg_extension WHERE extname='vector'`; `availableResult`
+ * (only consulted when `presentResult` classifies 'no' -- may be `null`
+ * otherwise) is the result of
+ * `SELECT * FROM pg_available_extensions WHERE name='vector'`. This is a
+ * total classification over both queries' outcomes:
+ *   present=yes                       -> PRESENT_OK
+ *   present=unknown                   -> UNKNOWN
+ *   present=no, available=yes         -> ABSENT_BUT_AVAILABLE (new outcome;
+ *                                         installable but not installed --
+ *                                         still gates as failing, like
+ *                                         ABSENT/UNKNOWN, but with distinct
+ *                                         remediation text, see assistFor)
+ *   present=no, available=no          -> ABSENT
+ *   present=no, available=unknown     -> UNKNOWN
+ */
+function classifyPgvectorProbe(presentResult, availableResult) {
+  const present = classifyPsqlBooleanQuery(presentResult);
+  if (present.state === 'unknown') {
+    return { outcome: 'UNKNOWN', reason: present.reason };
+  }
+  if (present.state === 'yes') {
+    return { outcome: 'PRESENT_OK', reason: null };
+  }
+  const available = classifyPsqlBooleanQuery(availableResult);
+  if (available.state === 'unknown') {
+    return { outcome: 'UNKNOWN', reason: `availability_${available.reason}` };
+  }
+  if (available.state === 'yes') {
+    return { outcome: 'ABSENT_BUT_AVAILABLE', reason: 'extension_available_not_installed' };
+  }
+  return { outcome: 'ABSENT', reason: 'extension_unavailable' };
+}
+
 // ─── remediation text (B1) ────────────────────────────────────────────────
 
 const REMEDIATION = {
@@ -327,6 +493,15 @@ function assistFor(prereq, outcome, platform) {
       text: `claude: the resolved binary printed a version but not the CLI's own ` +
         `signature text -- this may be a desktop-app launcher stub, not the ` +
         `Claude Code CLI. Re-check PATH ordering; see docs/troubleshooting.md.`,
+      mayAutoRun: false,
+    };
+  }
+  if (outcome.reason === 'extension_available_not_installed') {
+    return {
+      text: `pgvector: the vector extension is available on the connected Postgres ` +
+        `server but not yet installed in this database. Run \`CREATE EXTENSION ` +
+        `vector;\` as a database superuser (see PREREQS.md) -- this checker never ` +
+        `runs it for you, even under --yes.`,
       mayAutoRun: false,
     };
   }
@@ -442,10 +617,10 @@ async function probeAll(opts) {
     const r = await exec('node', ['--version'], DEFAULT_TIMEOUT_MS);
     rows.push({ prereq: 'node', required: true, ...classifyProbe(r, { min: opts.nodeMin || '22.0.0' }) });
   }
-  // git
+  // git (H1: family: 'git' handles real Windows/macOS/Linux version banners)
   {
     const r = await exec('git', ['--version'], DEFAULT_TIMEOUT_MS);
-    rows.push({ prereq: 'git', required: true, ...classifyProbe(r, { min: '0.0.0' }) });
+    rows.push({ prereq: 'git', required: true, ...classifyProbe(r, { min: '0.0.0', family: 'git' }) });
   }
   // gh (G2, optional -- never gates)
   {
@@ -492,12 +667,17 @@ async function probeAll(opts) {
     if (opts.dockerImageShipsVector) {
       rows.push({ prereq: 'pgvector', required: true, outcome: 'PRESENT_OK', reason: 'docker_image_ships_vector', version: null });
     } else {
-      const r = await exec('psql', ['-c', 'CREATE EXTENSION IF NOT EXISTS vector;'], DEFAULT_TIMEOUT_MS);
-      let outcome;
-      if (r && r.timedOut) outcome = { outcome: 'UNKNOWN', reason: 'timeout' };
-      else if (r && r.error) outcome = { outcome: 'ABSENT', reason: 'not_found' };
-      else if (r && r.status === 0) outcome = { outcome: 'PRESENT_OK', reason: null };
-      else outcome = { outcome: 'UNKNOWN', reason: 'nonzero_exit' };
+      // H4: read-only. Never CREATE EXTENSION. `presentR` alone decides
+      // PRESENT_OK/UNKNOWN; `availableR` is only fetched (a second
+      // round-trip) when `presentR` classifies 'no', to distinguish
+      // ABSENT_BUT_AVAILABLE from a genuine ABSENT.
+      const presentR = await exec('psql', ['-tAc', "SELECT 1 FROM pg_extension WHERE extname='vector'"], DEFAULT_TIMEOUT_MS);
+      const presentState = classifyPsqlBooleanQuery(presentR);
+      let availableR = null;
+      if (presentState.state === 'no') {
+        availableR = await exec('psql', ['-tAc', "SELECT * FROM pg_available_extensions WHERE name='vector'"], DEFAULT_TIMEOUT_MS);
+      }
+      const outcome = classifyPgvectorProbe(presentR, availableR);
       rows.push({ prereq: 'pgvector', required: true, version: null, ...outcome });
     }
   }
@@ -522,6 +702,8 @@ async function probeAll(opts) {
 module.exports = {
   VERSION_TOKEN_RE,
   PG_VERSION_TOKEN_RE,
+  GIT_VERSION_TOKEN_RE,
+  VERSION_FAMILY_RULES,
   ELEVATED_PREREQS,
   REQUIRED_PREREQS_DEFAULT,
   parseVersionToken,
@@ -531,6 +713,8 @@ module.exports = {
   classifyCodexFunctional,
   classifyClaudeFunctional,
   classifyPostgresRow,
+  classifyPsqlBooleanQuery,
+  classifyPgvectorProbe,
   assistFor,
   probeAll,
   defaultExec,

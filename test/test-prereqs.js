@@ -364,6 +364,170 @@ asyncTest('G2 -- gh row is marked required: false so it never gates --check-only
   assertEqual(result.ok, true, 'gh being UNKNOWN must never fail the overall required-only gate');
 });
 
+// ─── Round 2 fixtures (H1-H4: Codex review of PR #309, r1, 6 blockers) ────
+
+console.log('== Round 2 fixtures (H1-H4) ==');
+
+test('H1 -- real git Windows banner (git version 2.49.0.windows.1) classifies PRESENT_OK under family: git', () => {
+  const c = classifyVersion('git version 2.49.0.windows.1\n', 0, '0.0.0', { family: 'git' });
+  assertEqual(c.outcome, 'PRESENT_OK');
+  assertEqual(c.version, '2.49.0');
+});
+
+test('H1 -- real git Windows banner from THIS machine (git version 2.52.0.windows.1) classifies PRESENT_OK', () => {
+  const c = classifyVersion('git version 2.52.0.windows.1\n', 0, '0.0.0', { family: 'git' });
+  assertEqual(c.outcome, 'PRESENT_OK');
+  assertEqual(c.version, '2.52.0');
+});
+
+test('H1 -- real git macOS Apple banner (git version 2.39.3 (Apple Git-146)) classifies PRESENT_OK under family: git', () => {
+  const c = classifyVersion('git version 2.39.3 (Apple Git-146)\n', 0, '0.0.0', { family: 'git' });
+  assertEqual(c.outcome, 'PRESENT_OK');
+  assertEqual(c.version, '2.39.3');
+});
+
+test('H1 -- real gh banner (gh version 2.55.0 (2024-08-20)) classifies PRESENT_OK under the DEFAULT strict rule (gh is not a git-family row)', () => {
+  const c = classifyVersion('gh version 2.55.0 (2024-08-20)\n', 0, '0.0.0');
+  assertEqual(c.outcome, 'PRESENT_OK');
+  assertEqual(c.version, '2.55.0');
+});
+
+test('H1 -- real node banner (v22.11.0) classifies PRESENT_OK under the DEFAULT strict rule', () => {
+  const c = classifyVersion('v22.11.0\n', 0, '22.0.0');
+  assertEqual(c.outcome, 'PRESENT_OK');
+  assertEqual(c.version, '22.11.0');
+});
+
+test('H1 -- a git-family token with a real prerelease/garbage suffix (never seen in the wild but must stay UNKNOWN) is UNKNOWN, not silently prefix-accepted', () => {
+  const c1 = classifyVersion('git version 2.49.0-rc1\n', 0, '0.0.0', { family: 'git' });
+  assertEqual(c1.outcome, 'UNKNOWN', 'a "-rc1" suffix has no char-after-numeral of "." or end -- must not match');
+  const c2 = classifyVersion('git version 2.49.0abc\n', 0, '0.0.0', { family: 'git' });
+  assertEqual(c2.outcome, 'UNKNOWN', 'merged garbage immediately after the numeral must not match');
+});
+
+asyncTest('H1 -- git prefix rule wired through probeAll (family: git) end to end', async () => {
+  const exec = async (cmd) => {
+    if (cmd === 'node') return r({ stdout: 'v22.9.0\n' });
+    if (cmd === 'git') return r({ stdout: 'git version 2.43.0.windows.1\n' });
+    return r({ error: { code: 'ENOENT' } });
+  };
+  const result = await probeAll({ exec, httpProbe: async () => false, embedderDeclined: true, dockerImageShipsVector: true });
+  const gitRow = result.rows.find((row) => row.prereq === 'git');
+  assertEqual(gitRow.outcome, 'PRESENT_OK', 'a real Windows git banner must classify PRESENT_OK through probeAll, not UNKNOWN');
+  assertEqual(gitRow.version, '2.43.0');
+});
+
+test('H2 -- classifyProbe: EACCES is UNKNOWN with the code embedded in the reason, never ABSENT', () => {
+  const c = classifyProbe(r({ error: { code: 'EACCES' }, status: null }), { min: '0.0.0' });
+  assertEqual(c.outcome, 'UNKNOWN');
+  assertEqual(c.reason, 'spawn_error_EACCES');
+});
+
+test('H2 -- classifyProbe: EPERM is UNKNOWN with the code embedded in the reason, never ABSENT', () => {
+  const c = classifyProbe(r({ error: { code: 'EPERM' }, status: null }), { min: '0.0.0' });
+  assertEqual(c.outcome, 'UNKNOWN');
+  assertEqual(c.reason, 'spawn_error_EPERM');
+});
+
+test('H2 -- classifyProbe: ENOENT is still the ONLY spawn-error path to ABSENT (regression guard)', () => {
+  const c = classifyProbe(r({ error: { code: 'ENOENT' }, status: null }), { min: '0.0.0' });
+  assertEqual(c.outcome, 'ABSENT');
+  assertEqual(c.reason, 'not_found');
+});
+
+test('H2 -- classifyProbe: a spawn error with no .code at all is UNKNOWN with "unknown" in the reason, never ABSENT', () => {
+  const c = classifyProbe(r({ error: {}, status: null }), { min: '0.0.0' });
+  assertEqual(c.outcome, 'UNKNOWN');
+  assertEqual(c.reason, 'spawn_error_unknown');
+});
+
+test('H3 -- codex functional check: a DIRECTORY named codex-code-mode-host does not satisfy the sibling check', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'prereqs-h3-'));
+  try {
+    fs.mkdirSync(path.join(tmp, 'codex-code-mode-host-windows'));
+    const c = classifyCodexFunctional(
+      { status: 0, stdout: 'codex-cli 0.153.4\n' },
+      { min: '0.100.0', resolvedDir: tmp }
+    );
+    assertEqual(c.outcome, 'UNKNOWN', 'a directory-named match must never satisfy the sibling-FILE check');
+    assertEqual(c.reason, 'missing_code_mode_host');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('H3 -- codex functional check: a REGULAR FILE named codex-code-mode-host satisfies the sibling check', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'prereqs-h3-'));
+  try {
+    fs.writeFileSync(path.join(tmp, 'codex-code-mode-host-windows.exe'), 'stub');
+    const c = classifyCodexFunctional(
+      { status: 0, stdout: 'codex-cli 0.153.4\n' },
+      { min: '0.100.0', resolvedDir: tmp }
+    );
+    assertEqual(c.outcome, 'PRESENT_OK', 'a real sibling FILE must satisfy the check');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('H4 -- classifyPgvectorProbe: extension already installed is PRESENT_OK from the presence query alone', () => {
+  const c = prereqs.classifyPgvectorProbe(r({ status: 0, stdout: '1\n' }), null);
+  assertEqual(c.outcome, 'PRESENT_OK');
+});
+
+test('H4 -- classifyPgvectorProbe: not installed but available is ABSENT_BUT_AVAILABLE, a NEW total outcome, never CREATE EXTENSION', () => {
+  const c = prereqs.classifyPgvectorProbe(r({ status: 0, stdout: '' }), r({ status: 0, stdout: 'vector|1.7.4|1.7.4|...\n' }));
+  assertEqual(c.outcome, 'ABSENT_BUT_AVAILABLE');
+  assertEqual(c.reason, 'extension_available_not_installed');
+  const assist = assistFor('pgvector', c, 'win32');
+  assertEqual(assist.mayAutoRun, false, 'never auto-run CREATE EXTENSION, even under --yes');
+  assert(/CREATE EXTENSION/i.test(assist.text), 'remediation must still name the CREATE EXTENSION action for the human to run');
+});
+
+test('H4 -- classifyPgvectorProbe: not installed and not available is ABSENT', () => {
+  const c = prereqs.classifyPgvectorProbe(r({ status: 0, stdout: '' }), r({ status: 0, stdout: '' }));
+  assertEqual(c.outcome, 'ABSENT');
+  assertEqual(c.reason, 'extension_unavailable');
+});
+
+test('H4 -- classifyPgvectorProbe: presence query inconclusive (nonzero exit) is UNKNOWN, availability never even consulted', () => {
+  const c = prereqs.classifyPgvectorProbe(r({ status: 1, stdout: '' }), null);
+  assertEqual(c.outcome, 'UNKNOWN');
+  assertEqual(c.reason, 'nonzero_exit');
+});
+
+test('H4 -- classifyPgvectorProbe: presence "no" but availability query times out is UNKNOWN, never a silent ABSENT', () => {
+  const c = prereqs.classifyPgvectorProbe(r({ status: 0, stdout: '' }), r({ timedOut: true }));
+  assertEqual(c.outcome, 'UNKNOWN');
+  assertEqual(c.reason, 'availability_timeout');
+});
+
+asyncTest('H4 -- probeAll never runs CREATE EXTENSION: pgvector row is wired through the two-query read-only probe end to end', async () => {
+  const seenArgs = [];
+  const exec = async (cmd, args) => {
+    if (cmd === 'psql' && Array.isArray(args)) seenArgs.push(args.join(' '));
+    if (cmd === 'node') return r({ stdout: 'v22.9.0\n' });
+    if (cmd === 'git') return r({ stdout: 'git version 2.43.0\n' });
+    if (cmd === 'pg_dump') return r({ stdout: 'pg_dump (PostgreSQL) 18.0\n' });
+    if (cmd === 'claude') return r({ stdout: '2.1.270 (Claude Code)\n' });
+    if (cmd === 'docker') return r({ stdout: 'Docker Compose version v2.29.0\n' });
+    if (cmd === 'psql' && args && args[1] && args[1].includes('pg_extension')) return r({ status: 0, stdout: '' });
+    if (cmd === 'psql' && args && args[1] && args[1].includes('pg_available_extensions')) return r({ status: 0, stdout: 'vector\n' });
+    if (cmd === 'psql') return r({ status: 0, stdout: '1\n' }); // the unrelated "SELECT 1" external-postgres probe
+    return r({ error: { code: 'ENOENT' } });
+  };
+  const result = await probeAll({ exec, httpProbe: async () => false, embedderDeclined: true });
+  const pgvectorRow = result.rows.find((row) => row.prereq === 'pgvector');
+  assertEqual(pgvectorRow.outcome, 'ABSENT_BUT_AVAILABLE');
+  assert(!seenArgs.some((a) => /CREATE\s+EXTENSION/i.test(a)), `pgvector probe must never issue CREATE EXTENSION -- saw: ${JSON.stringify(seenArgs)}`);
+  assert(seenArgs.some((a) => /pg_extension/.test(a)), 'must query pg_extension');
+  assert(seenArgs.some((a) => /pg_available_extensions/.test(a)), 'must query pg_available_extensions when not already installed');
+});
+
 // ─── 2. Generated totality table (>=40 cases) ────────────────────────────
 
 console.log('== Totality table: classifyProbe / classifyVersion (generated) ==');

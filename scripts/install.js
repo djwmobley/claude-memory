@@ -58,6 +58,7 @@ const USAGE = `
 Usage: node scripts/install.js [--dry-run] [--force] [--non-interactive]
                                 [--hooks-scope user|project|auto]
                                 [--host claude|codex] [--force-skills] [--help|-h]
+                                [--check-only [--no-embedder]]
 
 Copies /handoff:* slash commands to ~/.claude/commands/handoff/ and wires
 SessionStart + SessionEnd hooks into a Claude Code settings file. Existing
@@ -76,8 +77,12 @@ Flags:
   --force-skills     (codex host only) overwrite a user-authored skill file
                       that lacks the managed-by marker, after backing it up.
   --check-only       Run the §3 prerequisite checker (docs/specs/package-and-
-                      installer.md) and exit; writes nothing. Exit 0 only if
+                      installer.md) and exit; writes nothing (read-only --
+                      never CREATE EXTENSION, never installs). Exit 0 only if
                       every required row is PRESENT_OK (gh is optional).
+  --no-embedder      (with --check-only) explicitly decline the embedder
+                      prerequisite -- reports PRESENT_OK/degraded FTS-only
+                      instead of probing/requiring a vLLM/Ollama URL.
   --help, -h         Print this message and exit.
 `.trim();
 
@@ -122,8 +127,12 @@ function resolveConfig() {
   // path below. Read-only by construction (probeAll never writes), so it
   // is deliberately allowed to run from a worktree checkout, unlike every
   // other flag in this file.
+  // --no-embedder (round 2, blocker 2): the user's explicit decline of the
+  // embedder prerequisite -- reported PRESENT_OK/declined_degraded_fts_only
+  // per §3, never inferred from an unconfigured URL (silence != decline).
   if (args.includes('--check-only')) {
-    return { checkOnly: true, host };
+    const embedderDeclined = args.includes('--no-embedder');
+    return { checkOnly: true, host, embedderDeclined };
   }
 
   const scopeFlagIdx = args.indexOf('--hooks-scope');
@@ -225,15 +234,67 @@ function resolveConfig() {
 // ─── --check-only: prerequisite table (package-and-installer.md §3) ─────────
 
 /**
+ * resolveHostDir(host) — round 2, blocker 3: probeAll's `resolveHostDir`
+ * seam needs a REAL implementation for `--check-only` to ever classify the
+ * codex host row as anything but UNKNOWN/no_resolved_dir. Reuses the
+ * engine's ONE existing codex-binary resolver
+ * (lib/codex-install.js's discoverCodex, the same PATH/PATHEXT walk +
+ * HANDOFF_CODEX_BIN override used by the real `--host codex` install path)
+ * rather than inventing a second one. `claude` has no equivalent
+ * functional check that consumes a resolved directory (classifyClaudeFunctional
+ * never takes one), so this returns null for every host but 'codex' —
+ * never a wrong guess.
+ */
+function resolveHostDir(host) {
+  if (host !== 'codex') return null;
+  try {
+    const { discoverCodex } = require('./lib/codex-install');
+    const discovery = discoverCodex(process.env);
+    if (!discovery.found || !discovery.command) return null;
+    return path.dirname(discovery.command);
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
  * Print the §3 prerequisite table and a final single-line JSON summary,
  * then exit 0 only when every REQUIRED row is PRESENT_OK (gh is the only
  * optional row; AMBIGUOUS_PG and UNKNOWN both count as failing). Never
  * writes anything — probeAll() is read-only I/O (spawns --version/probe
- * commands, no installs, no file writes).
+ * commands, no installs, no file writes; the pgvector probe is two
+ * read-only SELECTs, never CREATE EXTENSION — see lib/prereqs.js H4).
+ *
+ * `embedderDeclined` (round 2, blocker 2): the user's explicit --no-embedder
+ * decline, threaded straight through to probeAll — never inferred from an
+ * unconfigured URL. When not declined, the embedder URL is resolved via
+ * the SAME resolver the MCP/CLI embed path uses (lib/embed.js's
+ * resolveEmbedUrl, itself a thin wrapper over lib/embedding-provider.js's
+ * tier 0 explicit / tier 1 this project's pipeline.yml knowledge section /
+ * tier 2 VLLM_EMBED_URL env / tier 3 user-scope default resolver) against
+ * this project's root (lib/shared.js's findProjectRoot: PROJECT_ROOT env,
+ * else the nearest .git ancestor of cwd) — never invented here.
  */
-async function runCheckOnly(host) {
+async function runCheckOnly(host, embedderDeclined) {
   const { probeAll, assistFor } = require('./lib/prereqs');
-  const result = await probeAll({ host });
+  const { resolveEmbedUrl } = require('./lib/embed');
+  const { findProjectRoot } = require('./lib/shared');
+
+  let embedderUrl = null;
+  if (!embedderDeclined) {
+    try {
+      const projectRoot = findProjectRoot();
+      const resolved = resolveEmbedUrl({ projectRoot });
+      embedderUrl = resolved.url; // null when unconfigured -- probeAll reports ABSENT/not_configured, never a false PRESENT_OK
+    } catch (_) {
+      // A malformed PROJECT_ROOT (non-fully-qualified) is a resolver input
+      // error, not a "checker crashed" condition -- fall through with
+      // embedderUrl still null, same as "unconfigured".
+      embedderUrl = null;
+    }
+  }
+
+  const result = await probeAll({ host, embedderDeclined, embedderUrl, resolveHostDir });
 
   console.log(`Prerequisite check (--host ${host}):`);
   for (const row of result.rows) {
@@ -1304,7 +1365,7 @@ module.exports = {
 if (require.main === module) {
   const cfg = resolveConfig();
   if (cfg && cfg.checkOnly) {
-    runCheckOnly(cfg.host).catch((err) => {
+    runCheckOnly(cfg.host, cfg.embedderDeclined).catch((err) => {
       console.error('Error:', err.message);
       process.exit(1);
     });

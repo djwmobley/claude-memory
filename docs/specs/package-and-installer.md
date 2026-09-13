@@ -15,6 +15,11 @@ Revision note: §3, §6 and §7 below were rewritten after an adversary pass
 gaps in the original draft. See each subsection for the specific finding it
 closes.
 
+Round-2 revision note: an independent implementation review of PR #309
+(the §3 code) found 6 further blockers (labeled H1-H4 below; H4 covers two
+of the six, both in the pgvector probe). See each subsection for the
+specific finding it closes.
+
 ## 1. Zip contents
 
 ```
@@ -49,10 +54,13 @@ existing `scripts/install.js` unmodified as its host-wiring step
 (`--host claude|codex`). Flags:
 
 - `--host claude|codex|both` — `both` runs each host path independently.
-- `--check-only` — run §3; exit 0 only if every REQUIRED row lands
-  `PRESENT_OK` (`gh` is optional and never gates; `AMBIGUOUS_PG` and
-  `UNKNOWN` both count as a failing, non-zero-exit row — never silently
-  treated as OK). Writes nothing.
+- `--check-only [--no-embedder]` — run §3; exit 0 only if every REQUIRED
+  row lands `PRESENT_OK` (`gh` is optional and never gates;
+  `AMBIGUOUS_PG`, `UNKNOWN`, and `ABSENT_BUT_AVAILABLE` all count as a
+  failing, non-zero-exit row — never silently treated as OK). Writes
+  nothing (read-only by construction — see H4 in §3 for the pgvector
+  probe specifically). `--no-embedder` records an explicit decline of the
+  embedder prerequisite (degraded FTS-only).
 - `--upgrade` — §6. `--uninstall [--purge-data]` — §7.
 - `--offline` — skip dependency download; requires the offline zip, fails loudly otherwise.
 - `--yes` — accepts §3 ASSIST prompts and §5-§7 confirmations non-interactively;
@@ -61,8 +69,8 @@ existing `scripts/install.js` unmodified as its host-wiring step
 
 ## 3. Prerequisite check — total classification
 
-Every prerequisite row lands in exactly one of five outcomes — this set is
-closed and every row in the table below (and the `postgres` row
+Every prerequisite row lands in exactly one of six outcomes — this set is
+closed and every row in the table below (and the `postgres`/`pgvector` rows
 specifically) must land in one of them, with no other exit:
 
 - **`PRESENT_OK`** — probed, parsed, meets the minimum.
@@ -70,16 +78,25 @@ specifically) must land in one of them, with no other exit:
   found and required versions and gets the same ASSIST path as `ABSENT`.
 - **`ABSENT`** — a confirmed spawn-level "not found" (the OS could not
   resolve the executable at all, e.g. `ENOENT`). This is the *only* path to
-  `ABSENT` — see A2 below for why a process that DID spawn never lands here.
+  `ABSENT` — see A2/H2 below for why a process that DID spawn, or a spawn
+  that failed for a reason OTHER than a confirmed `ENOENT` (`EACCES`,
+  `EPERM`, or any other spawn-error code), never lands here.
 - **`UNKNOWN`** — the probe ran but produced something the checker cannot
   confidently interpret (timeout, unparseable output, an ambiguous nonzero
-  exit, a launcher-stub signature). **Routed identically to `ABSENT` for
-  gating** (never treated as OK, never silently retried as pass) but kept as
-  a distinct, separately-reported outcome because its remediation differs
-  from a plain "go install this" (see A2/A3/A4).
+  exit, a launcher-stub signature, a spawn error that isn't a confirmed
+  `ENOENT` — H2). **Routed identically to `ABSENT` for gating** (never
+  treated as OK, never silently retried as pass) but kept as a distinct,
+  separately-reported outcome because its remediation differs from a plain
+  "go install this" (see A2/A3/A4/H2).
 - **`AMBIGUOUS_PG`** — the `postgres` row only (B2 below): two valid
   resolutions are simultaneously available and neither may be silently
   auto-picked.
+- **`ABSENT_BUT_AVAILABLE`** — the `pgvector` row only (H4 below): the
+  extension is installable on the connected Postgres server (it appears in
+  `pg_available_extensions`) but is not yet installed in the current
+  database. Gates as failing, exactly like `ABSENT`/`UNKNOWN`, but carries
+  distinct remediation text (`CREATE EXTENSION vector;`, run by a human, not
+  the checker) rather than an OS-level install command.
 
 `--check-only` always runs every row; one row landing in a failing outcome
 never suppresses or short-circuits the rest.
@@ -110,8 +127,27 @@ correctly reads the numeral out of the tool's own `(PostgreSQL) X.Y`
 banner. A dev/beta build (`17devel`, `18beta2`) has no `.` in that token
 and is still `UNKNOWN` by construction, never coerced. This is a second
 total classification selected per prerequisite, not a loosening of the
-rule above for everyone: `node`/`git`/`gh`/`codex`/`claude` keep the
-strict three-part rule unchanged.
+rule above for everyone: `node`/`gh`/`codex`/`claude` keep the strict
+three-part rule unchanged.
+
+**git-family version rule (H1):** the strict three-part rule is also wrong
+for `git` — real `git --version` output carries a platform-specific
+packaging suffix the strict rule rejects outright:
+`git version 2.49.0.windows.1` (Windows Git; `.windows.N`) and, less
+commonly, an `.msysgit` suffix on older MSYS builds. macOS
+(`git version 2.39.3 (Apple Git-146)`) and Linux (`git version 2.43.0`)
+already have no such suffix on the token itself and already pass the
+strict rule unchanged. The `git` row instead parses each token against a
+three-part numeric PREFIX match that requires whatever immediately follows
+the numeral to be either end-of-token or a literal `.` — real packaging
+suffixes are accepted and ignored, while a merged-garbage or
+prerelease/build shape (`2.49.0-rc1`, `2.49.0abc`) has no character
+satisfying that boundary and still has no matching token, so it is
+`UNKNOWN` by construction, exactly like every other family's rule. This is
+a THIRD total classification selected per prerequisite (alongside the
+default strict rule and the postgres-family rule above) — every family's
+rule is a named, documented entry, and an unrecognized/omitted family name
+falls back to the strict default, never silently matches everything.
 
 ### Empty/garbage output and launcher stubs (A2)
 
@@ -129,6 +165,18 @@ shadowing** as the likely cause and directs the user to run `where <cmd>`
 entry, rather than an install command. The checker never auto-installs
 over an `UNKNOWN` row under `--yes`.
 
+**Spawn-level errors: ENOENT vs. everything else (H2):** a spawn that fails
+outright (the process never ran at all) is `ABSENT` **only** when the
+error is a confirmed `ENOENT` — nothing resolves at that name. Any OTHER
+spawn-error code (`EACCES`, `EPERM`, a broken interpreter shebang, an
+antivirus block, or any other OS-level spawn failure) means something IS
+sitting at that name but could not be launched — an ambiguous result,
+never a confident "nothing is installed here." These classify `UNKNOWN`
+with the error code embedded in the reason (`spawn_error_<code>`), routed
+through the same non-gating-but-distinct treatment as every other
+`UNKNOWN` above — never silently coerced to `ABSENT`'s confident absence,
+and never auto-installed over under `--yes`.
+
 ### Host CLI probe — version AND functional (A3/A4)
 
 The host CLI row is not satisfied by version parsing alone:
@@ -142,11 +190,20 @@ The host CLI row is not satisfied by version parsing alone:
   real MCP tool call then fails with "failed to spawn code-mode host").
   Missing the sibling binary is `UNKNOWN` (reason
   `missing_code_mode_host`), with remediation pointing at
-  `HANDOFF_CODEX_BIN` and `docs/hosts/codex.md`, never `PRESENT_OK`.
+  `HANDOFF_CODEX_BIN` and `docs/hosts/codex.md`, never `PRESENT_OK`. The
+  sibling match requires the matching directory entry to be a regular FILE
+  (`fs.statSync(...).isFile()`, which follows symlinks — a symlink
+  resolving to a regular file still counts) — H3: a directory-entry NAME
+  match alone is not sufficient, so a directory that happens to be named
+  `codex-code-mode-host` never satisfies the check.
   Because a `--check-only` run and the later host-wiring step (§5 step 4)
   are two separate points in time, **PATH resolution is re-run at wiring
   time** rather than trusting the `--check-only` result (TOCTOU: PATH, or
-  the binary at that path, can change between the two).
+  the binary at that path, can change between the two). `--check-only`
+  resolves the binary directory via the SAME resolver
+  `scripts/lib/codex-install.js`'s real `--host codex` install path uses
+  (`discoverCodex` — the `HANDOFF_CODEX_BIN`-override-or-PATH/PATHEXT walk,
+  confirmed by a `--version` probe) — never a second, invented resolver.
 - **`claude`**: `claude --version` must parse per the version rule above,
   **and** the resolved binary must not be a desktop-app launcher stub. The
   functional check requires the CLI's own signature text
@@ -183,21 +240,47 @@ a simple pass/fail:
 `--pg-source docker|external` flag under `--yes`) before proceeding — it is
 never resolved by a default preference.
 
-### pgvector extension creatable
+### pgvector extension: read-only, total classification (H4)
 
-`psql -c "CREATE EXTENSION IF NOT EXISTS vector;"`; exit 0 is `PRESENT_OK`.
-The Docker path (`pgvector/pgvector:pg16` image) skips this probe with an
+`--check-only` is documented (§2) as writing nothing — the probe below is
+READ-ONLY by construction, never `CREATE EXTENSION`, which would modify the
+connected database. It runs at most two read-only queries:
+
+1. `SELECT 1 FROM pg_extension WHERE extname='vector'` — is the extension
+   already installed in the current database? A returned row is
+   `PRESENT_OK`.
+2. Only when query 1 returns no row:
+   `SELECT * FROM pg_available_extensions WHERE name='vector'` — is it
+   installable at all? A returned row is `ABSENT_BUT_AVAILABLE` (see §3's
+   outcome list); no row is `ABSENT`.
+
+Either query timing out, erroring (including a confirmed `ENOENT` — no
+`psql` on `PATH`, which is UNKNOWN here, not ABSENT: this row classifies
+the vector extension's state, not `psql`'s own presence), or returning a
+nonzero exit is `UNKNOWN`, never a false `PRESENT_OK`/`ABSENT`. The Docker
+path (`pgvector/pgvector:pg16` image) skips this probe entirely with an
 explicit `docker_image_ships_vector` note — never silently marked pass with
 no note, and never run against a Docker-provisioned Postgres that isn't up
-yet.
+yet. `ABSENT_BUT_AVAILABLE`'s remediation names the exact
+`CREATE EXTENSION vector;` statement for a human (a database superuser) to
+run — the checker itself never runs it, under `--yes` or otherwise (an
+elevated-prerequisite action per B1).
 
 ### Embedder reachable or declined
 
 HTTP probe to the configured vLLM/Ollama URL; 2xx is `PRESENT_OK`. Not
 configured is `ABSENT`. The user may explicitly decline (degraded
-FTS-only, per `docs/hosts/codex.md`) — an explicit decline is recorded and
-reported as `PRESENT_OK` with reason `declined_degraded_fts_only`; it is
-never assumed from silence or from a probe failure.
+FTS-only, per `docs/hosts/codex.md`) via `--no-embedder` — an explicit
+decline is recorded and reported as `PRESENT_OK` with reason
+`declined_degraded_fts_only`; it is never assumed from silence or from a
+probe failure. When not declined, `--check-only` resolves the URL through
+the SAME resolver the engine's own embed path uses
+(`scripts/lib/embed.js`'s `resolveEmbedUrl`, itself a thin wrapper over
+`scripts/lib/embedding-provider.js`'s tier 0 explicit / tier 1 this
+project's `pipeline.yml` `knowledge:` section / tier 2 `VLLM_EMBED_URL` env
+/ tier 3 user-scope default resolver) against this project's root
+(`scripts/lib/shared.js`'s `findProjectRoot`) — never a second, invented
+resolver.
 
 ### git
 
