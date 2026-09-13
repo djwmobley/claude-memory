@@ -360,14 +360,65 @@ function filterMarkersByHost(markers, handoffHost) {
  * shared resolveSessionIdFromMarker above — a distinct rule for a distinct
  * (stricter) caller.
  */
-async function resolveUsageRecordMarkerDefault(db, projectId, handoffHost) {
+// ── Shared strict-marker-candidate resolution (cm#295 fix A follow-up) ─────
+//
+// Both resolveUsageRecordMarkerDefault (below) and resolveCloseSessionIdFromMarker
+// (scripts/handoff-mcp.mjs's toolHandoffClose/toolHandoffCheckpoint) need the
+// SAME "strictly-parsed, host-filtered candidate markers for this project"
+// computation — split out here (adversary-must-pin-identity-semantics memory:
+// ONE shared normalization function in ONE engine, not two hand-rolled
+// copies) so the zero/one/many classification and the session-id-derivation
+// step are identical for every caller; only the ERROR TEXT differs per
+// caller (usage_record's mentions the env-var attempt that precedes it;
+// close/checkpoint's does not, since FIX A deliberately never falls back to
+// this long-lived MCP server's own env for that default — see
+// resolveCloseSessionIdFromMarker's header comment).
+async function getHostFilteredMarkerCandidates(db, projectId, handoffHost) {
   const { rows } = await db.query(
     `SELECT value FROM project_settings WHERE project_id = $1 AND key = $2`,
     [projectId, 'session_in_progress']
   );
   const raw = rows.length > 0 ? rows[0].value : null;
   const { markers } = parseSessionMarkersStrict(raw);
-  const candidates = filterMarkersByHost(markers, handoffHost);
+  return filterMarkersByHost(markers, handoffHost);
+}
+
+// Whether a candidate carries a well-formed session_id at all — i.e. is
+// eligible to be considered for close/checkpoint's default resolution.
+// cm#295 round 2 (review finding): a candidate whose session_id is absent
+// (only a `ts` survived strict parsing) is NOT a usable identity — `ts` is
+// a timestamp, never a session id, and close/checkpoint must never
+// substitute one for the other (unlike resolveUsageRecordMarkerDefault
+// below, which the ts-fallback predates and still deliberately serves —
+// see deriveMarkerSessionId's own comment). This checks presence only
+// (non-empty string); a session_id that is present but whitespace-only is
+// still a "well-formed" candidate here and is instead caught by the
+// existing blank/whitespace check further down each resolver, which is a
+// distinct, already-reported failure mode from "no session_id at all".
+function hasWellFormedSessionId(candidate) {
+  return typeof candidate.session_id === 'string' && candidate.session_id.length > 0;
+}
+
+// A candidate's session id. `allowTsFallback` (default false) governs
+// whether a candidate with no usable session_id may fall back to its `ts`
+// instead — cm#295 round 2: that fallback is a resolveUsageRecordMarkerDefault-
+// only behavior (its caller, toolUsageRecord, has relied on it since before
+// this PR) and must never be reused by resolveCloseSessionIdFromMarker,
+// whose candidates are pre-filtered by hasWellFormedSessionId so the
+// fallback branch below is unreachable for it in practice — the parameter
+// exists so that invariant is enforced at the call site, not just by
+// filtering order, and can't silently regress if the filter is ever
+// removed. Whitespace-only/blank results are returned as '' — callers
+// reject that explicitly rather than silently substituting anything else.
+function deriveMarkerSessionId(candidate, allowTsFallback) {
+  const derived = hasWellFormedSessionId(candidate)
+    ? candidate.session_id
+    : (allowTsFallback ? candidate.ts : '');
+  return typeof derived === 'string' ? derived.trim() : '';
+}
+
+async function resolveUsageRecordMarkerDefault(db, projectId, handoffHost) {
+  const candidates = await getHostFilteredMarkerCandidates(db, projectId, handoffHost);
 
   if (candidates.length === 0) {
     return {
@@ -392,8 +443,9 @@ async function resolveUsageRecordMarkerDefault(db, projectId, handoffHost) {
   }
 
   const only = candidates[0];
-  const derived = (typeof only.session_id === 'string' && only.session_id.length > 0) ? only.session_id : only.ts;
-  const trimmed = typeof derived === 'string' ? derived.trim() : '';
+  // allowTsFallback=true: preserved, unchanged usage_record behavior (cm#295
+  // round 2 — see deriveMarkerSessionId's header comment; NOT the default).
+  const trimmed = deriveMarkerSessionId(only, true);
   if (trimmed.length === 0) {
     return {
       sessionId: null,
@@ -407,13 +459,117 @@ async function resolveUsageRecordMarkerDefault(db, projectId, handoffHost) {
   return { sessionId: trimmed, markerTs: only.ts, error: null };
 }
 
+/**
+ * resolveCloseSessionIdFromMarker(db, projectId, handoffHost, label) — cm#295
+ * fix A: the MCP-only default sessionId resolution for handoff_close /
+ * handoff_checkpoint when the caller omits `sessionId`. `label` is a short
+ * caller-identifying string ("handoff_close" / "handoff_checkpoint") used
+ * only in error text.
+ *
+ * Deliberately DOES NOT fall back to this server process's own
+ * CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID env vars the way
+ * resolveUsageRecordMarkerDefault's CALLER (toolUsageRecord) does before
+ * calling it. cm#295's root cause IS that env fallback: the MCP server is a
+ * long-lived process that resolves those vars ONCE at spawn time, so after
+ * an interactive host's `/clear` mints a fresh hook-side session and a fresh
+ * session_in_progress marker, the server's own stale spawn-time env id no
+ * longer matches ANY live marker — an env-first default would keep
+ * reproducing exactly the split-identity bug this fix exists to close (see
+ * the PR body's "why the earlier fix-A idea was rejected" section). The
+ * marker store (host-filtered, exactly-one-candidate) is therefore the ONLY
+ * source of truth for this default — same strict candidate resolution as
+ * resolveUsageRecordMarkerDefault (getHostFilteredMarkerCandidates +
+ * deriveMarkerSessionId), just distinct, caller-appropriate error text and no
+ * env-var mention (this path never attempts one).
+ *
+ * Total classification over host-filtered candidate count, identical shape
+ * to resolveUsageRecordMarkerDefault's, PLUS a malformedCount field (cm#295
+ * round 2, review finding): a host-filtered candidate whose session_id is
+ * absent (parseSessionMarkersStrict kept only its `ts`) is excluded from
+ * `candidates`/`candidateCount` entirely BEFORE the zero/one/many
+ * classification runs — it is never eligible to be silently promoted to a
+ * session id via a ts fallback the way resolveUsageRecordMarkerDefault's
+ * candidates may be (see deriveMarkerSessionId). Every refusal branch names
+ * the excluded count in its error text as `malformed_markers: N` so a
+ * caller/test can distinguish "genuinely nothing here" from "something here
+ * isn't shaped like a usable marker":
+ *   zero WELL-FORMED candidates -> { sessionId: null, markerTs: null,
+ *     candidateCount: 0, malformedCount: M, error }
+ *   >1 well-formed candidates    -> { sessionId: null, markerTs: null,
+ *     candidateCount: N, malformedCount: M, error }
+ *     (error names the well-formed count and each candidate's host; never a
+ *     session id).
+ *   exactly one well-formed candidate -> { sessionId, markerTs,
+ *     candidateCount: 1, malformedCount: M, error: null }
+ *     (a resulting blank/whitespace-only id — the trimmed string is empty
+ *     even though session_id was present — is ALSO an actionable error,
+ *     same as resolveUsageRecordMarkerDefault — never silently substituted;
+ *     this is a distinct failure mode from "malformed/absent", which is
+ *     already excluded by this point).
+ */
+async function resolveCloseSessionIdFromMarker(db, projectId, handoffHost, label) {
+  const callerLabel = label || 'handoff_close';
+  const allCandidates = await getHostFilteredMarkerCandidates(db, projectId, handoffHost);
+  const candidates = allCandidates.filter(hasWellFormedSessionId);
+  const malformedCount = allCandidates.length - candidates.length;
+  const malformedSuffix = malformedCount > 0 ? ` (malformed_markers: ${malformedCount})` : '';
+
+  if (candidates.length === 0) {
+    return {
+      sessionId: null,
+      markerTs: null,
+      candidateCount: 0,
+      malformedCount,
+      error:
+        `${callerLabel}: sessionId was omitted and no project session marker (session_in_progress) was found` +
+        `${handoffHost ? ` for host "${handoffHost}"` : ''}${malformedSuffix} -- pass sessionId explicitly.`,
+    };
+  }
+
+  if (candidates.length > 1) {
+    const hosts = candidates.map((m) => m.host || 'unknown');
+    return {
+      sessionId: null,
+      markerTs: null,
+      candidateCount: candidates.length,
+      malformedCount,
+      error:
+        `${callerLabel}: ambiguous session markers (${candidates.length}) -- pass sessionId explicitly ` +
+        `(hosts: ${hosts.join(', ')})${malformedSuffix}.`,
+    };
+  }
+
+  const only = candidates[0];
+  // allowTsFallback omitted (defaults false): close/checkpoint never treats
+  // a ts as a session id (cm#295 round 2). `only` is already well-formed
+  // (filtered above), so the fallback branch is unreachable here regardless
+  // — this call keeps the explicit default rather than relying on filtering
+  // order alone, matching deriveMarkerSessionId's own header comment.
+  const trimmed = deriveMarkerSessionId(only);
+  if (trimmed.length === 0) {
+    return {
+      sessionId: null,
+      markerTs: null,
+      candidateCount: 1,
+      malformedCount,
+      error:
+        `${callerLabel}: the project session marker (session_in_progress) resolved to a blank/whitespace ` +
+        'session id -- pass sessionId explicitly.',
+    };
+  }
+
+  return { sessionId: trimmed, markerTs: only.ts, candidateCount: 1, malformedCount, error: null };
+}
+
 module.exports = {
   resolveSessionIdFromEnv,
   parseSessionMarkersDetailed,
   parseSessionMarkers,
   latestSessionMarker,
   resolveSessionIdFromMarker,
+  hasWellFormedSessionId,
   parseSessionMarkersStrict,
   filterMarkersByHost,
   resolveUsageRecordMarkerDefault,
+  resolveCloseSessionIdFromMarker,
 };

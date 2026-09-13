@@ -1625,6 +1625,45 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run cm#295 close/checkpoint session-identity tests
+        # Regression guard for the split-identity bug (MCP server's own
+        # spawn-time CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID going stale across
+        # a `/clear`, leaving the marker in place and causing a spurious
+        # implicit_close_recorded): handoff_close/handoff_checkpoint's
+        # omitted-sessionId default now resolves from the project's live
+        # session_in_progress marker (host-filtered, exactly-one-candidate),
+        # never from this long-lived server's own env vars. Covers: sole
+        # marker resolved + cleared + breadcrumb stamped + no spurious
+        # implicit close afterward; 2/0 host-filtered markers refused naming
+        # the count; an explicit sessionId matching no marker returns
+        # outcome=no_matching_marker with the marker untouched and no
+        # breadcrumb; concurrent markers A/B stay isolated (closing A never
+        # touches B); a legacy marker with an unparseable ts is swept as
+        # stale, never treated as fresh; checkpoint's default agrees with
+        # close's. Reuses claude_memory_eval_test (created by Create handoff
+        # test database step above).
+        run: node test/handoff/test-close-session-identity.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+      - name: Run loader-stop SessionEnd tests
+        # DB-backed regression guard for the "implicit close fires at turn
+        # end, not session end" fix: loader-stop moved from Claude Code's
+        # Stop hook (fires every turn) to SessionEnd (fires once). Covers
+        # own-session close-and-clear, no-marker no-op, SessionStart's
+        # stale-foreign-marker late-close sweep + DIVERGENCE line,
+        # fresh-foreign-marker preservation, source=clear/compact skip,
+        # writeHandoffMd atomicity (no .tmp- residue), and
+        # implicit_close=disabled as a full no-op at both hooks. Run with
+        # CLAUDE_CODE_SESSION_ID unset so marker-based resolution isn't
+        # masked by the env fallback. Reuses claude_memory_eval_test
+        # (created by Create handoff test database step above).
+        run: node test/handoff/test-loader-stop-sessionend.js
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
       - name: Run promote --regenerate tests
         # Coverage for `promote --regenerate [--dry-run]`: target-state total
         # classification (absent/file/directory), "## Durable facts"
