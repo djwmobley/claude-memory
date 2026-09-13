@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **migrate-09 `--dry-run`** — `scripts/migrations/migrate-09-file-memory-markdown.js`
+  gains a read-only plan preview (matching every other writing migrate-NN
+  script's own `--dry-run`). Opens the target through a write-gated client
+  (`makeReadOnlyClient`) that throws on any write statement; no schema DDL,
+  no entity/edge upserts, no manifest rows. Walks enrolled dirs exactly as
+  MIGRATE mode does and re-derives real insert/update/unchanged verdicts by
+  reading the target's live `entities`/`edges` rows (never skipped or
+  stubbed), plus an `entity_type` source breakdown, edges that would be
+  created vs. already present, every `[[link]]` that would not resolve
+  (capped at 50 printed lines), and any skipped files. Ends with
+  `MIGRATION_RESULT: DRY_RUN`; mutually exclusive with `--rollback`.
+
 - **Codex CLI host support (codex-host-adapter)** — OpenAI Codex CLI is now a
   first-class host alongside Claude Code. `node scripts/install.js --host
   codex` registers the MCP server with `codex mcp add` (env var
