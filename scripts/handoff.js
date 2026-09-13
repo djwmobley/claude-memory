@@ -8216,7 +8216,13 @@ async function resolveSessionId(db, projectId, payload) {
  * close already ran this session" (outcome explicit_close_present) from "no
  * marker because none was ever set" (outcome no_marker). One overwritten row,
  * not one row per session — no unbounded growth. Fail-soft: a failure to
- * stamp the breadcrumb never blocks or fails the close itself.
+ * stamp the breadcrumb never blocks or fails the close itself — cm#295
+ * round 2: enforced via db.querySafe's SAVEPOINT wrapping (see the inline
+ * comment at the write site), not a bare try/catch, so a breadcrumb failure
+ * can no longer discard the marker delete it was supposed to be reporting
+ * on. The result's `breadcrumb_written` field is true only when the stamp
+ * itself is confirmed written; a caller that needs the loader-stop signal
+ * to be present should check it rather than assume deleted>0 implies it.
  */
 /**
  * fix(close): dedupe (exact string equality) + cap a list of session ids for
@@ -8296,7 +8302,13 @@ function formatOwnerIds(ids) {
  * vice versa). Deciding the branch from a read taken outside the lock would
  * reopen the exact TOCTOU race the lock exists to close.
  *
- * Returns { branch, outcome, deleted, ownedBy, dropped, coerced, text } — never throws.
+ * Returns { branch, outcome, deleted, ownedBy, dropped, coerced, text,
+ * breadcrumb_written } — never throws. breadcrumb_written is true only when
+ * the last_explicit_close stamp itself is confirmed written (cm#295 round
+ * 2); it is false on every branch that never attempted the write (deleted:0)
+ * AND on a branch that attempted it but the write failed under its
+ * SAVEPOINT (deleted can still be >0 in that case — the delete and the
+ * breadcrumb are no longer coupled by a shared fate).
  */
 async function clearSessionMarkerForClose(db, projectId, payload) {
   const currentSessionId = resolveClearSessionId(payload);
@@ -8311,7 +8323,7 @@ async function clearSessionMarkerForClose(db, projectId, payload) {
         (coerced > 0 ? `; ${coerced} marker entr${coerced === 1 ? 'y' : 'ies'} had a non-string session id (treated as no id)` : '');
 
       if (markers.length === 0) {
-        return { branch: 'F', outcome: 'no_marker', deleted: 0, ownedBy: [], dropped, coerced, text: `no session marker present${suffix}` };
+        return { branch: 'F', outcome: 'no_marker', deleted: 0, ownedBy: [], dropped, coerced, text: `no session marker present${suffix}`, breadcrumb_written: false };
       }
 
       const exactMatches   = currentSessionId ? markers.filter((m) => m.session_id === currentSessionId) : [];
@@ -8364,6 +8376,7 @@ async function clearSessionMarkerForClose(db, projectId, payload) {
           `session id unresolved; owned by ${ownedBy}${legacyNote})${suffix}`;
       }
 
+      let breadcrumbWritten = false;
       if (toDelete.length > 0) {
         const remaining = markers.filter((m) => !toDelete.includes(m));
         await setSessionMarkers(db, projectId, remaining);
@@ -8377,18 +8390,43 @@ async function clearSessionMarkerForClose(db, projectId, payload) {
         // ROLLBACK) — a narrow but real window given the delete and the
         // breadcrumb are supposed to be one atomic "this session explicitly
         // closed" fact. Fail-soft is preserved: a breadcrumb write failure
-        // is swallowed and never blocks the close (a thrown error here WOULD
-        // roll back the whole transaction, including the delete just made,
-        // which fail-soft explicitly avoids).
-        try {
-          await setSetting(db, projectId, 'last_explicit_close', JSON.stringify({
+        // must never block the close.
+        //
+        // cm#295 round 2 (review finding, serious): a bare try/catch around
+        // a plain db.query() does NOT achieve that fail-soft guarantee on
+        // Postgres. Catching the thrown JS error only stops it propagating
+        // out of THIS function — it does nothing to the connection's server-
+        // side transaction state, which Postgres has already flipped to
+        // "aborted" the moment the breadcrumb INSERT failed. Every statement
+        // sent afterwards on that connection (including the marker delete's
+        // own COMMIT, issued by withSessionMarkerLock right after this
+        // function returns) is then silently discarded by Postgres as an
+        // implicit ROLLBACK — so a failed breadcrumb used to throw away the
+        // marker delete too, while this function still reported
+        // outcome:'cleared'/deleted:1 as if nothing had gone wrong.
+        //
+        // Fix: db.querySafe (PostgresAdapter: SAVEPOINT before the write,
+        // RELEASE on success, ROLLBACK TO SAVEPOINT + swallow on error —
+        // exactly the same port method querySafe's own doc comment and
+        // every other in-transaction speculative-write call site in this
+        // codebase already rely on; SQLiteAdapter's querySafe is a plain
+        // try/catch, since SQLite does not abort the whole transaction on a
+        // single statement error) confines a breadcrumb failure to its own
+        // savepoint, leaving the outer transaction — and the delete above —
+        // untouched and still committable. Same two-adapter port method,
+        // same S8 abstraction invariant: no dialect branch here.
+        const bcResult = await db.querySafe(
+          `INSERT INTO project_settings (project_id, key, value) VALUES ($1, $2, $3)
+           ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
+          [projectId, 'last_explicit_close', JSON.stringify({
             session_id: currentSessionId || null,
             ts: new Date().toISOString(),
-          }));
-        } catch (_) { /* fail-soft: breadcrumb loss never blocks close */ }
+          })]
+        );
+        breadcrumbWritten = (bcResult && bcResult.rowCount) > 0;
       }
 
-      return { branch, outcome, deleted: toDelete.length, ownedBy, dropped, coerced, text };
+      return { branch, outcome, deleted: toDelete.length, ownedBy, dropped, coerced, text, breadcrumb_written: breadcrumbWritten };
     });
   } catch (err) {
     result = {
@@ -8399,6 +8437,7 @@ async function clearSessionMarkerForClose(db, projectId, payload) {
       dropped: 0,
       coerced: 0,
       text: `session marker unreadable (${err && err.message ? err.message : 'read failed'}); left as-is`,
+      breadcrumb_written: false,
     };
   }
 

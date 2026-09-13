@@ -412,6 +412,33 @@ distinct from every other `deleted:0` case (a resolved session id that
 matched no live marker), and its message names the surviving marker count,
 so a caller never has to infer that distinction from `deleted:0` alone.
 
+Round 2 hardening on the same function: the breadcrumb write goes through
+`db.querySafe` (SAVEPOINT-wrapped on Postgres, plain try/catch on SQLite —
+the same port method other in-transaction speculative writes in this
+codebase already use), not a bare `try/catch` around `db.query`. A bare
+catch stopped the JS error propagating but left the Postgres connection's
+transaction in the server-side ABORTED state; every statement sent
+afterwards — including the marker delete's own COMMIT — was then silently
+discarded, so a failed breadcrumb used to throw away the marker delete too
+while still reporting `outcome:'cleared'`/`deleted:1`. The result now also
+carries `breadcrumb_written` (true only when the stamp is confirmed
+written) so a caller needing the loader-stop signal doesn't infer it from
+`deleted>0` alone.
+
+**Identity hardening (fix C).** `resolveCloseSessionIdFromMarker`'s
+default-`sessionId` resolution for `handoff_close`/`handoff_checkpoint` no
+longer treats a marker's `ts` as a stand-in session id. A host-filtered
+candidate with no well-formed `session_id` (strict parsing kept only its
+`ts`) is excluded before the zero/one/many candidate classification runs
+and is reported as `malformed_markers: N` in the refusal text — distinct
+from a candidate whose `session_id` is present but blank/whitespace, which
+still hits the existing "resolved to a blank/whitespace session id" error.
+This ts-fallback remains intentional and unchanged for `usage_record`'s own
+default resolution (`resolveUsageRecordMarkerDefault`), which predates and
+still relies on it; the two resolvers now share `deriveMarkerSessionId`
+via an explicit `allowTsFallback` parameter (default `false`) rather than
+diverging behavior silently.
+
 ## `memory_search` — hybrid vector+FTS, project-scoped
 
 Runs the same `ts_rank * 0.3 + cosine * 0.7` scoring formula the engine's

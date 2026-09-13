@@ -392,6 +392,102 @@ async function runTests() {
     assert.strictEqual(direct.sessionId, Y, `expected the shared resolver to agree with checkpoint's own default, got: ${JSON.stringify(direct)}`);
   });
 
+  // ── (h) BLOCKER A round-2 regression: a failing breadcrumb write must
+  //        NOT abort the outer Postgres transaction / discard the marker
+  //        delete it shares a lock with ────────────────────────────────────
+  await test('(h) a failing last_explicit_close write does not abort the marker delete (real SAVEPOINT), reports breadcrumb_written:false', async () => {
+    await clearMarkerRaw(db, projectId);
+    await clearSettingRaw(db, projectId, 'last_explicit_close');
+    const H = 'sess-breadcrumb-fail-h';
+    await setMarkerRaw(db, projectId, [{ session_id: H, ts: new Date().toISOString() }]);
+
+    // A thin proxy over the SAME production db-seam adapter connection:
+    // query()/acquireNamedXactLock() (BEGIN, the advisory lock, the marker
+    // delete, COMMIT -- everything withSessionMarkerLock and the marker
+    // delete itself do) pass straight through to the real engineDb.
+    // querySafe() -- the ONLY call the breadcrumb write makes -- is
+    // redirected to a genuinely-invalid statement so the REAL
+    // PostgresAdapter.querySafe SAVEPOINT/ROLLBACK-TO-SAVEPOINT machinery
+    // fires a real Postgres error and swallows it, rather than a mocked
+    // failure standing in for one.
+    const failingDb = {
+      query: (...a) => engineDb.query(...a),
+      acquireNamedXactLock: (...a) => engineDb.acquireNamedXactLock(...a),
+      querySafe: () => engineDb.querySafe('INSERT INTO cm295_round2_nonexistent_table (x) VALUES ($1)', ['x']),
+    };
+
+    const outcome = await clearSessionMarkerForClose(failingDb, projectId, { session_id: H });
+    assert.strictEqual(outcome.branch, 'A', `got: ${JSON.stringify(outcome)}`);
+    assert.strictEqual(outcome.outcome, 'cleared');
+    assert.strictEqual(outcome.deleted, 1);
+    assert.strictEqual(outcome.breadcrumb_written, false, 'breadcrumb write was forced to fail');
+
+    // The crux of the regression: confirm via a SEPARATE, unrelated
+    // connection that the marker delete genuinely committed. Under the old
+    // bare try/catch, the failed breadcrumb write would have left Postgres'
+    // transaction in the server-side ABORTED state, and the COMMIT issued
+    // right after this function returns would have silently discarded the
+    // delete along with the failed breadcrumb.
+    const markers = await getMarkerRaw(db, projectId);
+    assert.ok(markers === null || markers.length === 0,
+      `marker delete must have committed despite the breadcrumb failure, got: ${JSON.stringify(markers)}`);
+
+    const breadcrumb = await getSettingRaw(db, projectId, 'last_explicit_close');
+    assert.strictEqual(breadcrumb, null, 'no breadcrumb should exist when the write failed');
+  });
+
+  // ── (i) happy-path companion to (h): breadcrumb_written:true when the
+  //        write actually succeeds ───────────────────────────────────────
+  await test('(i) a successful marker clear reports breadcrumb_written:true and stamps last_explicit_close', async () => {
+    await clearMarkerRaw(db, projectId);
+    await clearSettingRaw(db, projectId, 'last_explicit_close');
+    const I = 'sess-breadcrumb-ok-i';
+    await setMarkerRaw(db, projectId, [{ session_id: I, ts: new Date().toISOString() }]);
+
+    const outcome = await clearSessionMarkerForClose(engineDb, projectId, { session_id: I });
+    assert.strictEqual(outcome.branch, 'A');
+    assert.strictEqual(outcome.deleted, 1);
+    assert.strictEqual(outcome.breadcrumb_written, true, `got: ${JSON.stringify(outcome)}`);
+
+    const breadcrumb = JSON.parse(await getSettingRaw(db, projectId, 'last_explicit_close'));
+    assert.strictEqual(breadcrumb.session_id, I);
+  });
+
+  // ── (j) BLOCKER B round-2 regression: a marker with no session_id is
+  //        malformed, never promoted to a session id via its ts ──────────
+  await test('(j) a marker missing session_id is excluded as malformed; resolver picks the sole well-formed marker, never a ts', async () => {
+    await clearMarkerRaw(db, projectId);
+    const J = 'sess-wellformed-j';
+    await setMarkerRaw(db, projectId, [
+      { ts: '2026-09-13T00:00:00.000Z' }, // malformed: no session_id at all
+      { session_id: J, ts: new Date().toISOString() },
+    ]);
+
+    const result = await resolveCloseSessionIdFromMarker(db, projectId, null, 'handoff_close');
+    assert.strictEqual(result.error, null, `expected success, got: ${JSON.stringify(result)}`);
+    assert.strictEqual(result.sessionId, J, 'must resolve the well-formed marker, never the malformed one\'s ts');
+    assert.strictEqual(result.candidateCount, 1, 'the malformed marker must not count as a candidate');
+    assert.strictEqual(result.malformedCount, 1, `got: ${JSON.stringify(result)}`);
+    assert.notStrictEqual(result.sessionId, '2026-09-13T00:00:00.000Z', 'sanity: never the malformed ts value');
+  });
+
+  // ── (k) only malformed (no session_id) markers present -> refused,
+  //        naming malformed_markers in the error text, never a ts fallback ──
+  await test('(k) only malformed markers present -> refused, error names malformed_markers count, never falls back to ts', async () => {
+    await clearMarkerRaw(db, projectId);
+    await setMarkerRaw(db, projectId, [
+      { ts: '2026-09-13T00:00:00.000Z' },
+      { ts: '2026-09-13T00:01:00.000Z' },
+    ]);
+
+    const result = await resolveCloseSessionIdFromMarker(db, projectId, null, 'handoff_close');
+    assert.ok(result.error, 'expected a refusal');
+    assert.strictEqual(result.sessionId, null);
+    assert.strictEqual(result.candidateCount, 0);
+    assert.strictEqual(result.malformedCount, 2, `got: ${JSON.stringify(result)}`);
+    assert.ok(result.error.includes('malformed_markers: 2'), `error text must name the malformed count, got: ${result.error}`);
+  });
+
   await db.end();
   try { await engineDb.end(); } catch (_) { /* best-effort */ }
 
