@@ -806,6 +806,47 @@ async function main() {
     assert(calls.length === 1, `expected zero write calls to reach the underlying adapter, but ${calls.length - 1} extra call(s) got through: ${JSON.stringify(calls.slice(1))}`);
   });
 
+  await run('T13b', 'FIX 3: write gate is a TOTAL-classification ALLOW rule (permitted only: SELECT/SHOW/EXPLAIN/VALUES, single statement, no INTO outside a string) — adversary sweep', async () => {
+    const blocked = [
+      `INSERT INTO entities (project_id, name) VALUES ('p1','x')`,
+      `CREATE TABLE evil (id int)`,
+      `WITH x AS (INSERT INTO entities (project_id, name) VALUES ('p1','x') RETURNING 1) SELECT * FROM x`,
+      `SELECT * INTO new_table FROM entities`,
+      `COPY entities TO STDOUT`,
+      `DO $$ BEGIN PERFORM 1; END $$`,
+      `CALL some_procedure()`,
+      `SELECT 1; DROP TABLE entities`,
+      `-- sneaky leading comment\nINSERT INTO entities (project_id, name) VALUES ('p1','x')`,
+    ];
+    for (const stmt of blocked) {
+      assert(migrate09.isReadOnlyStatement(stmt) === false, `expected BLOCKED (default-refused branch), got allowed: ${stmt}`);
+    }
+
+    const allowed = [
+      `SELECT 1 FROM entities WHERE project_id=$1`,
+      `EXPLAIN SELECT 1 FROM entities`,
+      `  SELECT name FROM entities WHERE project_id=$1`,
+      `-- a read-only leading comment\nSELECT 1`,
+    ];
+    for (const stmt of allowed) {
+      assert(migrate09.isReadOnlyStatement(stmt) === true, `expected ALLOWED, got blocked: ${stmt}`);
+    }
+
+    // Behavioral cross-check through the real gate object (not just the
+    // classifier function in isolation): every blocked shape must also
+    // throw when routed through makeReadOnlyClient, and zero of them may
+    // reach the underlying adapter.
+    const calls = [];
+    const mockClient = { query: async (sql) => { calls.push(sql); return { rows: [] }; } };
+    const guarded = migrate09.makeReadOnlyClient(mockClient);
+    for (const stmt of blocked) {
+      let threw = false;
+      try { await guarded.query(stmt); } catch (err) { threw = true; }
+      assert(threw, `expected makeReadOnlyClient to throw on: ${stmt}`);
+    }
+    assert(calls.length === 0, `expected zero blocked statements to reach the underlying adapter, got ${calls.length}: ${JSON.stringify(calls)}`);
+  });
+
   // 3-file fixture dedicated to the dry-run scenarios: one frontmatter.type,
   // one frontmatter.metadata.type, one with a [[link]] to a missing stem.
   const dryRunRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'mm09-dryrun-'));
@@ -901,6 +942,111 @@ async function main() {
     } finally {
       await client.end();
     }
+  });
+
+  await run('T17', 'BLOCKER FIX 1: dry-run overlay — two enrolled dirs sharing one project_id classify in MIGRATE mode\'s own sequential order, exactly one insert + one update (never two inserts), cross-checked against a real MIGRATE run on the identical fixture', async () => {
+    const overlapRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'mm09-overlap-'));
+    const sharedProjectId = 'proj-overlap-test';
+    const dirAName = 'C--Users-example-dev-proj-overlap-a';
+    const dirBName = 'C--Users-example-dev-proj-overlap-b';
+    const dirAMemory = path.join(overlapRoot, dirAName, 'memory');
+    const dirBMemory = path.join(overlapRoot, dirBName, 'memory');
+    fs.mkdirSync(dirAMemory, { recursive: true });
+    fs.mkdirSync(dirBMemory, { recursive: true });
+    // Same stem in both dirs, DIFFERENT entity_type, so the second dir's
+    // write is unambiguously an 'update' (never masked as 'unchanged').
+    fs.writeFileSync(path.join(dirAMemory, 'shared_topic.md'), '---\ntype: user\n---\n\nDir A body.', 'utf8');
+    fs.writeFileSync(path.join(dirBMemory, 'shared_topic.md'), '---\ntype: project\n---\n\nDir B body.', 'utf8');
+    const overlapCfgPath = path.join(overlapRoot, 'enrollment-config.json');
+    fs.writeFileSync(overlapCfgPath, JSON.stringify({
+      enrolled_dirs: [
+        { dir_name: dirAName, project_id: sharedProjectId },
+        { dir_name: dirBName, project_id: sharedProjectId },
+      ],
+      test_artifact_patterns: [],
+    }, null, 2), 'utf8');
+
+    // Reproduce the REAL script's own enumeration/classification order for
+    // these two dirs using the SAME exported primitives it uses internally
+    // -- this test asserts against that actual order, never an assumed one.
+    const enrollmentConfig = migrate09.loadEnrollmentConfig(overlapCfgPath);
+    const memoryBearingDirs = migrate09.enumerateMemoryBearingDirs(overlapRoot);
+    const orderedEnrolled = [];
+    for (const dir of memoryBearingDirs) {
+      const cls = migrate09.classifyProjectDir(dir.dirName, enrollmentConfig);
+      if (cls.bucket === 'enrolled') orderedEnrolled.push({ projectId: cls.projectId, dirName: dir.dirName, memoryDirPath: dir.memoryDirPath });
+    }
+    assert(orderedEnrolled.length === 2, `fixture setup: expected exactly 2 enrolled dirs, got ${JSON.stringify(orderedEnrolled)}`);
+    const secondDirName = orderedEnrolled[1].dirName;
+    const secondDirType = secondDirName === dirAName ? 'user' : 'project';
+
+    const client = await pgConnect(dbName);
+    try {
+      const overlay = migrate09.makeDryRunOverlay();
+      let totalInsert = 0, totalUpdate = 0, totalUnchanged = 0;
+      for (const proj of orderedEnrolled) {
+        const plan = migrate09.buildDryRunPlan(proj.memoryDirPath);
+        const r = await migrate09.computeEntityPlanCounts(client, proj.projectId, plan.entities, overlay);
+        totalInsert += r.counts.insert; totalUpdate += r.counts.update; totalUnchanged += r.counts.unchanged;
+      }
+      assert(totalInsert === 1, `expected exactly 1 insert across both dirs sharing a project_id (2 would be the double-counting bug), got insert=${totalInsert}`);
+      assert(totalUpdate === 1, `expected exactly 1 update (the second dir's overlapping stem, seen via the overlay), got update=${totalUpdate} unchanged=${totalUnchanged}`);
+      assert(totalUnchanged === 0, `dir A and dir B set DIFFERENT entity_type, so the overlay-seen second write must be a real change, got unchanged=${totalUnchanged}`);
+    } finally {
+      await client.end();
+    }
+
+    // Cross-check: an ACTUAL MIGRATE run on the identical fixture also ends
+    // with exactly ONE live row, whose entity_type is whichever dir the
+    // real script processed SECOND (last-write-wins) -- proving the
+    // overlay's classification matches the real write path's outcome, not
+    // just its own internal consistency.
+    const migrateResult = runMigrate09(['--db', dbName, '--projects-root', overlapRoot, '--enrollment-config', overlapCfgPath]);
+    assert(migrateResult.status === 0, `expected exit 0, got ${migrateResult.status}; stderr=${migrateResult.stderr}`);
+    assert(/MIGRATION_RESULT: PASS/.test(migrateResult.stdout), `expected PASS, got: ${migrateResult.stdout}`);
+
+    const client2 = await pgConnect(dbName);
+    try {
+      const { rows } = await client2.query(`SELECT entity_type FROM entities WHERE project_id=$1 AND name='shared_topic'`, [sharedProjectId]);
+      assert(rows.length === 1, `expected exactly 1 live row for the shared stem (no duplicate insert), got ${rows.length}`);
+      assert(rows[0].entity_type === secondDirType, `expected entity_type from whichever dir was processed SECOND ("${secondDirType}"), got ${JSON.stringify(rows[0])}`);
+    } finally {
+      await client2.end();
+    }
+
+    // The dry-run CLI's plan header must also name this duplicate
+    // project_id (report-only, never a failure).
+    const dryRunCli = runMigrate09(['--db', dbName, '--projects-root', overlapRoot, '--enrollment-config', overlapCfgPath, '--dry-run']);
+    assert(dryRunCli.status === 0, `expected exit 0, got ${dryRunCli.status}; stderr=${dryRunCli.stderr}`);
+    assert(new RegExp(`DUPLICATE-PROJECT-ID.*project_id="${sharedProjectId}"`).test(dryRunCli.stdout), `expected a DUPLICATE-PROJECT-ID report line naming "${sharedProjectId}", got: ${dryRunCli.stdout}`);
+
+    fs.rmSync(overlapRoot, { recursive: true, force: true });
+  });
+
+  await run('T18', 'BLOCKER FIX 2: dry-run reports self-links under their own reason="self-link" label, parity with MIGRATE mode\'s printEvents (never silently dropped)', async () => {
+    const selfLinkRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'mm09-selflink-'));
+    const selfLinkDirName = 'C--Users-example-dev-proj-selflink';
+    const selfLinkMemory = path.join(selfLinkRoot, selfLinkDirName, 'memory');
+    fs.mkdirSync(selfLinkMemory, { recursive: true });
+    fs.writeFileSync(path.join(selfLinkMemory, 'self_ref_topic.md'), '---\ntype: user\n---\n\nA link to itself: [[self_ref_topic]].', 'utf8');
+    const cfgPath = path.join(selfLinkRoot, 'enrollment-config.json');
+    fs.writeFileSync(cfgPath, JSON.stringify({
+      enrolled_dirs: [{ dir_name: selfLinkDirName, project_id: 'proj-selflink-test' }],
+      test_artifact_patterns: [],
+    }, null, 2), 'utf8');
+
+    const dryRunResult = runMigrate09(['--db', dbName, '--projects-root', selfLinkRoot, '--enrollment-config', cfgPath, '--dry-run']);
+    assert(dryRunResult.status === 0, `expected exit 0, got ${dryRunResult.status}; stderr=${dryRunResult.stderr}`);
+    assert(/UNRESOLVED-LINK.*reason="self-link"/.test(dryRunResult.stdout), `expected a self-link reported under reason="self-link" in dry-run output (parity with MIGRATE mode's printEvents), got: ${dryRunResult.stdout}`);
+    assert(/unresolved_links=1/.test(dryRunResult.stdout), `expected unresolved_links=1 to count the self-link, got: ${dryRunResult.stdout}`);
+
+    // Cross-check MIGRATE mode reports the identical self-link line --
+    // dry-run must match, never diverge by silently dropping it.
+    const migrateResult = runMigrate09(['--db', dbName, '--projects-root', selfLinkRoot, '--enrollment-config', cfgPath]);
+    assert(migrateResult.status === 0, `expected exit 0, got ${migrateResult.status}; stderr=${migrateResult.stderr}`);
+    assert(/UNRESOLVED-LINK.*reason="self-link"/.test(migrateResult.stdout), `expected MIGRATE mode to ALSO report the self-link (parity baseline), got: ${migrateResult.stdout}`);
+
+    fs.rmSync(selfLinkRoot, { recursive: true, force: true });
   });
 
   // ── Cleanup ──────────────────────────────────────────────────────────────

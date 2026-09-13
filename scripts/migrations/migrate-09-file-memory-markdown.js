@@ -694,14 +694,87 @@ function parseProjectMemoryDir(memoryDirPath) {
 // ─── DRY-RUN PLAN (read-only — no writes reach the target) ─────────────────
 
 // Write-statement gate: the ONE choke point every dry-run DB call passes
-// through. Total classification, not an allow-list: any statement matching
-// this leading-keyword pattern is refused; everything else (SELECT, and
-// nothing else is ever issued in dry-run mode) passes through untouched.
-const WRITE_STATEMENT_RE = /^\s*(INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|TRUNCATE|BEGIN|COMMIT|ROLLBACK|GRANT|REVOKE)\b/i;
+// through. TOTAL classification via an ALLOW rule, not a denylist: a
+// statement is permitted only if, after stripping leading whitespace and
+// leading comments, it (1) starts with SELECT, SHOW, EXPLAIN, or VALUES;
+// (2) contains no `INTO` clause outside a string literal (blocks
+// `SELECT ... INTO`, a write hiding in a read-shaped statement); and (3) is
+// a single statement — no `;` outside a string literal, which would let an
+// unchecked second statement ride along after the first. Every other shape
+// — WITH (may wrap a data-modifying CTE, e.g. `WITH x AS (INSERT ...)
+// SELECT ...`), COPY, DO, CALL, INSERT/UPDATE/DELETE/DDL/transaction
+// control, a leading-comment-then-write, an empty string, or anything
+// unrecognized — falls through to the same default-refused branch. Nothing
+// here is a name this gate has to specifically recognize in order to
+// block it; failure/unknown IS the refused branch.
+const READ_ONLY_LEADING_KEYWORD_RE = /^(SELECT|SHOW|EXPLAIN|VALUES)\b/i;
+
+/**
+ * Strips leading whitespace and leading line (`--`) or block (`/`+`*` ...
+ * `*`+`/`) comments, repeatedly, so a comment-then-keyword shape (e.g.
+ * `-- hi\nINSERT ...`) can't hide a write behind a leading comment and slip
+ * past the leading-keyword check below.
+ */
+function stripLeadingWhitespaceAndComments(sql) {
+  let s = String(sql);
+  for (;;) {
+    const stripped = s.replace(/^\s+/, '');
+    if (stripped !== s) { s = stripped; continue; }
+    if (s.startsWith('--')) {
+      const nl = s.indexOf('\n');
+      s = nl === -1 ? '' : s.slice(nl + 1);
+      continue;
+    }
+    if (s.startsWith('/*')) {
+      const end = s.indexOf('*/');
+      s = end === -1 ? '' : s.slice(end + 2);
+      continue;
+    }
+    return s;
+  }
+}
+
+/**
+ * Blanks out the CONTENTS of single-quoted string literals (SQL's `''`
+ * escaped-quote convention honored) so the `;`/`INTO` checks below never
+ * false-trip on those two substrings when they legitimately appear inside
+ * a quoted value rather than as real SQL syntax.
+ */
+function blankStringLiterals(sql) {
+  const s = String(sql);
+  let out = '';
+  let i = 0;
+  while (i < s.length) {
+    if (s[i] === "'") {
+      out += ' ';
+      i++;
+      while (i < s.length) {
+        if (s[i] === "'" && s[i + 1] === "'") { out += '  '; i += 2; continue; }
+        if (s[i] === "'") { out += ' '; i++; break; }
+        out += ' ';
+        i++;
+      }
+      continue;
+    }
+    out += s[i];
+    i++;
+  }
+  return out;
+}
+
+/** The gate's total classification, exposed standalone so it is directly testable. */
+function isReadOnlyStatement(sql) {
+  const body = stripLeadingWhitespaceAndComments(sql);
+  if (!READ_ONLY_LEADING_KEYWORD_RE.test(body)) return false; // default branch: refused
+  const withoutLiterals = blankStringLiterals(body);
+  if (/;/.test(withoutLiterals)) return false; // must be a single statement
+  if (/\bINTO\b/i.test(withoutLiterals)) return false; // SELECT ... INTO writes a new table
+  return true;
+}
 
 function assertReadOnlyStatement(sql) {
-  if (WRITE_STATEMENT_RE.test(sql)) {
-    throw new Error(`INTERNAL: --dry-run attempted a write statement (all writes must be gated) — refused: ${String(sql).trim().slice(0, 160)}`);
+  if (!isReadOnlyStatement(sql)) {
+    throw new Error(`INTERNAL: --dry-run attempted a non-read-only statement (only a single bare SELECT/SHOW/EXPLAIN/VALUES statement, with no INTO clause, is ever allowed) — refused: ${String(sql).trim().slice(0, 160)}`);
   }
 }
 
@@ -833,8 +906,64 @@ function classifyEntityPlan(existingRow, entity) {
   return changed ? 'update' : 'unchanged';
 }
 
-/** Batched read-only lookup + classification for one project's entity list. */
-async function computeEntityPlanCounts(dbClient, projectId, entities) {
+/**
+ * I-1 allows MANY enrolled dir_names to share ONE project_id. MIGRATE mode
+ * processes enrolledProjects SEQUENTIALLY, one dir per transaction,
+ * committed before the next dir is even parsed — so if dir A and dir B
+ * share a project_id and both contain a topic file with the same stem, by
+ * the time dir B's upsert runs, dir A's row already exists live: dir B's
+ * write is an update/unchanged, never a second insert. A dry-run that
+ * queries the pre-run DB state independently per dir would see NO existing
+ * row for either A's or B's copy of that stem and report TWO inserts —
+ * double-counting a single real row. This overlay carries every dry-run
+ * tentative write forward across the per-project loop, keyed EXACTLY like
+ * the real upsert identity, so a later dir sees the earlier dir's tentative
+ * result instead of the stale pre-run DB snapshot.
+ */
+function makeDryRunOverlay() {
+  return {
+    entities: new Map(), // `${projectId}::${name}` -> { entity_type, description, source_model }
+    edges: new Set(),    // `${projectId}::${fromEntity}::${edgeType}::${toEntity}` (this script's own tag only)
+  };
+}
+
+function overlayEntityKey(projectId, name) { return `${projectId}::${name}`; }
+function overlayEdgeKey(projectId, edge) { return `${projectId}::${edge.fromEntity}::${edge.edgeType}::${edge.toEntity}`; }
+
+/**
+ * Mirrors upsertEntity()'s CASE-expression precedence, WITHOUT writing:
+ * returns the row shape the overlay should hold AFTER this tentative write
+ * — exactly the row a later dir sharing this project_id would find live if
+ * MIGRATE mode had actually run dir A's transaction first.
+ */
+function simulateEntityWrite(existingRow, entity) {
+  if (!existingRow) {
+    return { entity_type: entity.entityType, description: entity.description, source_model: SOURCE_MODEL_TAG };
+  }
+  const ownedByUs = existingRow.source_model === null || existingRow.source_model === SOURCE_MODEL_TAG;
+  if (ownedByUs) {
+    return { entity_type: entity.entityType, description: entity.description, source_model: SOURCE_MODEL_TAG };
+  }
+  // I-12 additive-only precedence: a foreign-owned row only ever gains a
+  // currently-NULL entity_type; description/source_model never change.
+  return {
+    entity_type: existingRow.entity_type === null ? entity.entityType : existingRow.entity_type,
+    description: existingRow.description,
+    source_model: existingRow.source_model,
+  };
+}
+
+/**
+ * Batched read-only lookup + classification for one project's entity list.
+ * `overlay`, when supplied, takes precedence over the DB-queried row for a
+ * given (project_id, name) — it reflects a tentative write already
+ * simulated earlier in THIS dry-run's own per-project loop, which the live
+ * DB does not (and, being --dry-run, never will) reflect. Every classified
+ * entity's resulting row is folded back into the overlay before returning,
+ * so the NEXT project dir processed (same loop, possibly sharing this
+ * project_id) sees it.
+ */
+async function computeEntityPlanCounts(dbClient, projectId, entities, overlay) {
   const names = entities.map((e) => e.name);
   let existingByName = new Map();
   if (names.length) {
@@ -846,7 +975,10 @@ async function computeEntityPlanCounts(dbClient, projectId, entities) {
   }
   const counts = { insert: 0, update: 0, unchanged: 0 };
   for (const e of entities) {
-    counts[classifyEntityPlan(existingByName.get(e.name) || null, e)]++;
+    const key = overlayEntityKey(projectId, e.name);
+    const existing = (overlay && overlay.entities.has(key)) ? overlay.entities.get(key) : (existingByName.get(e.name) || null);
+    counts[classifyEntityPlan(existing, e)]++;
+    if (overlay) overlay.entities.set(key, simulateEntityWrite(existing, e));
   }
   return { counts };
 }
@@ -856,9 +988,14 @@ async function computeEntityPlanCounts(dbClient, projectId, entities) {
  * "would be created" unless a row with this exact tuple ALREADY carries
  * this script's own source_model tag (the same existence guard
  * edgeAlreadyWrittenByThisScript() checks at write time — edges have no
- * "update" verdict, only insert-or-already-present).
+ * "update" verdict, only insert-or-already-present). `overlay`, when
+ * supplied, is checked ALONGSIDE the DB-queried set (an edge already
+ * tentatively created earlier in this same dry-run run, for a project_id
+ * shared across enrolled dirs, must report unchanged here too) and is
+ * updated with every edge this call classifies as "would create", so a
+ * later dir sharing this project_id sees it.
  */
-async function computeEdgePlanCounts(dbClient, projectId, edges) {
+async function computeEdgePlanCounts(dbClient, projectId, edges, overlay) {
   let existingSet = new Set();
   if (edges.length) {
     const { rows } = await dbClient.query(
@@ -869,10 +1006,35 @@ async function computeEdgePlanCounts(dbClient, projectId, edges) {
   }
   const counts = { wouldCreate: 0, unchanged: 0 };
   for (const edge of edges) {
-    if (existingSet.has(`${edge.fromEntity}::${edge.toEntity}`)) counts.unchanged++;
+    const dbKey = `${edge.fromEntity}::${edge.toEntity}`;
+    const overlayKey = overlayEdgeKey(projectId, edge);
+    const alreadyExists = (overlay && overlay.edges.has(overlayKey)) || existingSet.has(dbKey);
+    if (alreadyExists) counts.unchanged++;
     else counts.wouldCreate++;
+    if (overlay) overlay.edges.add(overlayKey);
   }
   return { counts };
+}
+
+/**
+ * Reports (never fails) every project_id claimed by more than one enrolled
+ * dir_name. This is a legitimate enrollment shape (I-1 allows many
+ * dir_names -> one project_id) — but the dry-run plan for it is only
+ * correct BECAUSE of the sequential overlay above; surfaced loudly in the
+ * plan header so an operator can see which project_ids are affected,
+ * rather than reconstructing it from the counts alone.
+ */
+function findDuplicateEnrolledProjectIds(enrolledProjects) {
+  const dirNamesByProjectId = new Map();
+  for (const p of enrolledProjects) {
+    if (!dirNamesByProjectId.has(p.projectId)) dirNamesByProjectId.set(p.projectId, []);
+    dirNamesByProjectId.get(p.projectId).push(p.dirName);
+  }
+  const duplicates = [];
+  for (const [projectId, dirNames] of dirNamesByProjectId) {
+    if (dirNames.length > 1) duplicates.push({ projectId, dirNames });
+  }
+  return duplicates;
 }
 
 // ─── DB WRITES ──────────────────────────────────────────────────────────────
@@ -1216,17 +1378,28 @@ async function main() {
 
     if (parsed.dryRun) {
       console.log(`  [DRY-RUN] read-only mode: no schema DDL will be applied; no entities/edges/manifest rows will be written.`);
+
+      const duplicateProjectIds = findDuplicateEnrolledProjectIds(enrolledProjects);
+      for (const d of duplicateProjectIds) {
+        console.log(`  [DUPLICATE-PROJECT-ID] project_id="${d.projectId}" claimed by ${d.dirNames.length} enrolled dirs: ${d.dirNames.map((n) => `"${n}"`).join(', ')} — processed sequentially in enrollment order; plan counts below reflect that sequential precedence, matching a real MIGRATE run`);
+      }
+
       let totalFiles = 0;
       const entityCounts = { insert: 0, update: 0, unchanged: 0 };
       const edgeCounts = { wouldCreate: 0, unchanged: 0 };
       const typeBreakdown = { 'frontmatter.type': 0, 'frontmatter.metadata.type': 0, 'filename-prefix-fallback': 0, NULL: 0 };
       const unresolvedLinks = [];
       const skippedFiles = [];
+      // Carries tentative writes across this loop's own iterations so two
+      // enrolled dirs sharing one project_id are classified exactly as
+      // MIGRATE mode's sequential per-project transactions would produce
+      // (see makeDryRunOverlay's header comment).
+      const overlay = makeDryRunOverlay();
 
       for (const proj of enrolledProjects) {
         const plan = buildDryRunPlan(proj.memoryDirPath);
-        const entityResult = await computeEntityPlanCounts(dbClient, proj.projectId, plan.entities);
-        const edgeResult = await computeEdgePlanCounts(dbClient, proj.projectId, plan.edges);
+        const entityResult = await computeEntityPlanCounts(dbClient, proj.projectId, plan.entities, overlay);
+        const edgeResult = await computeEdgePlanCounts(dbClient, proj.projectId, plan.edges, overlay);
 
         entityCounts.insert += entityResult.counts.insert;
         entityCounts.update += entityResult.counts.update;
@@ -1242,7 +1415,11 @@ async function main() {
           else typeBreakdown.NULL++; // unmatched-type / invalid-enum-value -> NULL entity_type
         }
         for (const ev of plan.events) {
-          if (ev.kind === 'unresolved-link' && ev.reason !== 'self-link') {
+          // Parity with MIGRATE mode's own printEvents(), which reports
+          // EVERY unresolved-link event regardless of reason (self-link
+          // included, under its own reason="self-link" label) — dry-run
+          // must not silently drop the one reason MIGRATE mode still logs.
+          if (ev.kind === 'unresolved-link') {
             unresolvedLinks.push(`project_id="${proj.projectId}" from="${ev.fromStem}" raw="[[${ev.raw}]]" reason="${ev.reason}"${ev.target ? ` target="${ev.target}"` : ''}`);
           }
         }
@@ -1348,13 +1525,16 @@ module.exports = {
   rollbackProject,
   verifyProject,
   computeContentFingerprint,
-  WRITE_STATEMENT_RE,
+  isReadOnlyStatement,
   assertReadOnlyStatement,
   makeReadOnlyClient,
   buildDryRunPlan,
   classifyEntityPlan,
   computeEntityPlanCounts,
   computeEdgePlanCounts,
+  makeDryRunOverlay,
+  simulateEntityWrite,
+  findDuplicateEnrolledProjectIds,
   SQL_FILE,
   SQL_FILES,
   SOURCE_TABLE_ENTITIES,
