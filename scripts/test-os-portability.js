@@ -307,6 +307,14 @@ function testP3() {
   //     permutations.js pattern — builds a cross-platform `codex` stub (a plain
   //     POSIX shell/node file with a shebang vs. a win32 .cmd wrapper) for the
   //     codex-host-adapter test suite.
+  //   - build-zip.js (feat/package-compose-zip, docs/specs/package-and-installer.md
+  //     section 1): findArchiver() selects the platform archiver used to build
+  //     the distributable zip — `tar -a -c -f` (bsdtar, ships with Windows 10+)
+  //     on win32 vs. `zip -r` elsewhere. Genuinely different CLI tools with
+  //     different flag grammars, not just an alternate binary name for the same
+  //     invocation shape, so it cannot be folded into runWinBin's
+  //     same-args/multiple-candidate-name retry loop — same justification as
+  //     codex-install.js's discoverCodex() above.
   //
   // We allowlist by file + approximate pattern.
   const ALLOWED = [
@@ -345,6 +353,11 @@ function testP3() {
       // case-sensitive elsewhere. An optional `platformOverride` param lets
       // tests exercise both branches deterministically; every real call
       // site omits it and this line's `process.platform === 'win32'` fires.
+      textRe: /process\.platform\s*===\s*['"]win32['"]/,
+    },
+    {
+      file: path.join(SCRIPTS_DIR, 'build-zip.js'),
+      // findArchiver() — see justification above.
       textRe: /process\.platform\s*===\s*['"]win32['"]/,
     },
   ];

@@ -365,6 +365,88 @@ desync check (every identifier textually present) but produces broken SQL
 surfaces as a `heal_failed:<sqlstate>` DEGRADED row, not a classification
 error, on the next touch that needs to heal it.
 
+## `handoff_close` / `handoff_checkpoint` — sessionId default resolution (cm#295)
+
+Both tools take an optional `sessionId`. When supplied (trimmed, non-blank)
+it always wins, placed into the payload's `session_id` before the write.
+
+**When omitted (cm#295 fix A):** a default is resolved from the project's
+live `session_in_progress` marker in Postgres —
+`scripts/lib/session-identity.js`'s `resolveCloseSessionIdFromMarker`, the
+SAME host-filtered/exactly-one-candidate classification
+`resolveUsageRecordMarkerDefault` (`usage_record`'s own default) uses, split
+into a shared `getHostFilteredMarkerCandidates`/`deriveMarkerSessionId` pair
+so there is one normalization engine, not two hand-rolled copies. Total
+classification over host-filtered candidates: zero → refused (actionable
+error, no candidate to name); more than one → refused, naming the count and
+each candidate's host; exactly one → that marker's `session_id` (or its `ts`
+for a legacy marker with no `session_id`), used verbatim.
+
+**Why this NEVER falls back to this server's own env vars first (unlike
+`usage_record`'s env-then-marker order).** `handoff-mcp.mjs` is a long-lived
+process — it resolves `CLAUDE_CODE_SESSION_ID`/`CODEX_THREAD_ID` (via
+`resolveSessionIdFromEnv`) ONCE, at spawn time. An interactive host's
+`/clear` mints a fresh hook-side session id and a fresh
+`session_in_progress` marker without restarting the MCP server, so the
+server's own env values go stale relative to every marker written after
+that `/clear` — an env-first default (`usage_record`'s own shape) would keep
+resolving to the SAME stale id and reproduce cm#295 exactly: an explicit
+close issued through the MCP server would fail the engine's exact-equality
+marker match, leave the marker in place, and let the next SessionEnd for the
+(different) live hook-side id record a spurious `implicit_close_recorded`
+even though a real explicit close just ran. The marker store — never this
+process's env — is therefore the only source of truth for this default.
+
+**Pinned identity semantics** (every key this resolution touches, per the
+adversary-must-pin-identity-semantics lesson): session id equality is exact,
+case-sensitive string comparison only, everywhere in this path; `host` is
+an advisory filter over candidate markers, never a clearing/matching
+authority on its own; a marker's `ts` is parsed with `Date.parse` and an
+unparseable value fails closed — it never satisfies any freshness test (see
+`scripts/handoff.js`'s late-close sweep, which sweeps such a marker as
+stale rather than leaving it in place as "fresh").
+
+The result payload reports `session_id_source` (`"explicit"` or `"marker"`)
+and, for the marker branch, `marker_ts` — provenance, never a second
+identity rule for a caller to reimplement.
+
+**Engine-side hardening (fix B).** `clearSessionMarkerForClose` (the
+function both tools' spawned `handoff.js close`/`checkpoint` subprocess
+calls) now (1) writes its `last_explicit_close` breadcrumb inside the SAME
+`withSessionMarkerLock` critical section/transaction as the marker delete
+it records, closing a narrow TOCTOU window between the two; (2) returns an
+explicit `outcome` field on every branch — `no_matching_marker` is now
+distinct from every other `deleted:0` case (a resolved session id that
+matched no live marker), and its message names the surviving marker count,
+so a caller never has to infer that distinction from `deleted:0` alone.
+
+Round 2 hardening on the same function: the breadcrumb write goes through
+`db.querySafe` (SAVEPOINT-wrapped on Postgres, plain try/catch on SQLite —
+the same port method other in-transaction speculative writes in this
+codebase already use), not a bare `try/catch` around `db.query`. A bare
+catch stopped the JS error propagating but left the Postgres connection's
+transaction in the server-side ABORTED state; every statement sent
+afterwards — including the marker delete's own COMMIT — was then silently
+discarded, so a failed breadcrumb used to throw away the marker delete too
+while still reporting `outcome:'cleared'`/`deleted:1`. The result now also
+carries `breadcrumb_written` (true only when the stamp is confirmed
+written) so a caller needing the loader-stop signal doesn't infer it from
+`deleted>0` alone.
+
+**Identity hardening (fix C).** `resolveCloseSessionIdFromMarker`'s
+default-`sessionId` resolution for `handoff_close`/`handoff_checkpoint` no
+longer treats a marker's `ts` as a stand-in session id. A host-filtered
+candidate with no well-formed `session_id` (strict parsing kept only its
+`ts`) is excluded before the zero/one/many candidate classification runs
+and is reported as `malformed_markers: N` in the refusal text — distinct
+from a candidate whose `session_id` is present but blank/whitespace, which
+still hits the existing "resolved to a blank/whitespace session id" error.
+This ts-fallback remains intentional and unchanged for `usage_record`'s own
+default resolution (`resolveUsageRecordMarkerDefault`), which predates and
+still relies on it; the two resolvers now share `deriveMarkerSessionId`
+via an explicit `allowTsFallback` parameter (default `false`) rather than
+diverging behavior silently.
+
 ## `memory_search` — hybrid vector+FTS, project-scoped
 
 Runs the same `ts_rank * 0.3 + cosine * 0.7` scoring formula the engine's

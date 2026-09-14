@@ -41,17 +41,17 @@ These rules are canon. They override convenience, time pressure, and apparent co
 
 ## Next session — read first
 
-- feature_usage: code shipped PR #255 (2026-09-06); 2026-09-11 DDL applied to `memory_manager_staging` + migrate-12 backfill 7/7 rows, project_id `pipeline`.
-- feature_usage `cost_usd` is NULL for all 7 rows (source table has no cost column); backups in `Downloads\pg-backups\`, run reports in `Downloads\feature-usage-reports\`.
-- Canon DB `memory_manager` not created — staging-first per runbook §15; feature_usage not yet promoted.
-- 2026-09-12 owner rule: "coordinate with Codex" means the feature must work with Codex as host AND Codex checks the work (`codex exec`, read-only sandbox; working binary under `AppData\Local\OpenAI\Codex\bin`; the `~/.codex/.sandbox-bin` copy lacks the code-mode host).
-- Codex-host gap found: usage tools failed on every engine DB because telemetry DDL was missing from `scripts/sql/schema-manifest.json`.
-- Fix PR #298 (91f58a2): DDL moved to `scripts/sql/usage-telemetry-schema.sql` + `feature-usage-schema.sql`, registered, schema_epoch 5, required_roster, manifest lint T11, fail-soft `model_registry` cost lookup.
-- Fix PR #299 (a878554): MCP annotations on all 35 tools (readOnlyHint false everywhere — heal-on-touch may write), actionable 42P01 errors, `scripts/lib/session-identity.js`, `docs/hosts/codex.md` approval section.
-- Fix PR #300 (44f7638): `usage_record` sessionId falls back to the project session marker (strict: host-filtered, exactly one); markers now record host and keep fields on rewrite.
-- Codex config: `~/.codex/config.toml` now sets `approval_mode="approve"` for `usage_query`/`usage_record` (backup `config.toml.bak-2026-09-12-usage-approval`); `codex exec` rejects MCP calls without such entries.
-- End-to-end verified 2026-09-12 via `codex exec` on main 44f7638: `handoff_status` shows host codex; `usage_query` by feature → empty; `usage_record` without sessionId → written with `session_id_source` marker; `usage_query` by role shows the row; empty sessionId rejected. Verdict: works; probe row deleted.
-- Init-time Q&A: judge PR #20 (`docs/specs/init-routing-qa.md`) OPEN, blocked by judge main red on the session-end worktree guard test (judge-owned fix); author worktree kept.
-- Engine defects filed: cm#295 (hook/MCP session-id split after `/clear` → spurious implicit close; marker left in place), cm#297 (close pointer gate suppresses session_tldr/open_thread citing cross-repo file:line; suppression_kind NULL).
-- NEXT: (1) fix cm#295 and cm#297 (plan → adversary → author → Codex check → approve); (2) judge fixes its red test, merges PR #20, implements init Q&A; (3) promote feature_usage to canon when §15 acceptance runs.
-- NEXT continued: (4) every feature: run through the Codex MCP path + `codex exec` check before done.
+- 2026-09-13 merges: #302 embed URL/model resolved from projectRoot not server cwd; #303 schema-epoch drift gets a four-branch total-classification remedy, not a blanket init/resume; #307 MCP server exits cleanly on host disconnect + parent-liveness watchdog (selftest no longer orphans its child); #308 docker-compose + zip packager + install docs shipped; #309 installer prerequisite checker is a total classification; #310 `handoff_status` reports engine revision + schema epoch (loaded/disk/db/drift) — `handoff-mcp.mjs` needed no code change, it proxies `status --json` verbatim; #311 close/checkpoint sessionId resolves from the live session marker, never this server's own stale env (closes cm#295).
+- Repos: private backlog renamed `memory-manager-backlog`; public `memory-manager` repo created empty.
+- Open PR #305 (Codex review wrapper): round-2 cap hit, 4 in-fence items pending owner round-3 ruling.
+- Open PR #306 (sanitize gate): round-2 cap hit, 5 items pending owner ruling.
+- Open PR #312 (cm#297 pointer gate): round-2 cap hit, 1 item open — drive-relative `C:foo\bar` paths.
+- Open PR #313 (public manifest + lift, stacked on #306): leads — db-seam must LIFT, a manifest self-hash rule, ~140 LIFT files carrying live gate findings, a CLAUDE.md owner decision needed.
+- Owner rulings 2026-09-13: Codex is directed, not consulted; scope fence holds; round cap is 2, then escalate to owner; no rearchitecting; stdio only; zip-only distribution with prereq check + assist; §15 stays a parallel track.
+- Codex leak finding: the Codex desktop app-server spawns a full MCP fleet per thread and never reaps it (observed 7 fleets, 339 procs); `handoff` itself exits cleanly (see #307).
+- CI note: a CONFLICTING PR gets no `tests` check run at all (no merge ref) — missing tests ≠ passing; merge main first before trusting a green/absent check.
+- `db-triage.json`: 81 DBs classified locally, 0 unclassified; 5 flagged for owner review (interview-coach, dentaltalentconnect, judge, ppp, spring).
+- §15 forks pending owner decision: project_id namespace re-key, cm#212 grandfathering, Advisicon absorb.
+- feature_usage: PR #255 shipped, migrate-12 backfill applied to `memory_manager_staging` (project_id `pipeline`, `cost_usd` NULL — source has no cost column); canon DB `memory_manager` not yet created, promotion gated on §15 acceptance.
+- Init-time Q&A: judge PR #20 (`docs/specs/init-routing-qa.md`) was OPEN, blocked by judge main red on the session-end worktree guard test (judge-owned fix); author worktree kept — status not reverified this session, check judge repo before acting.
+- NEXT: (1) owner rulings on #305/#306/#312 round-3 items; (2) round-3 fixes on those PRs; (3) #313 lift work; (4) memory-file migration (migrate-05/migrate-09); (5) §15 batch B.
