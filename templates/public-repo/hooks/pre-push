@@ -1,0 +1,170 @@
+#!/bin/sh
+# pre-push — public-lift sanitize gate local backstop.
+# docs/specs/public-sanitize-gate.md: this hook is a FAST LOCAL BACKSTOP,
+# NOT a substitute for CI. The GitHub Actions "Sanitize gate" required
+# status check is authoritative — a bypassed/uninstalled local hook does
+# not weaken the gate, because CI still blocks merge on main.
+#
+# Installed by the installer's --hooks step. Requires
+# SANITIZE_PRIVATE_TERMS_FILE to point at a local, gitignored terms file.
+#
+# No early-exit on a missing SANITIZE_PRIVATE_TERMS_FILE: the gate itself
+# fails closed (FAIL_GATE_ERROR) when the terms file is unset/unreadable/
+# empty, and this hook must not short-circuit that with its own exit 0 —
+# doing so would silently let a push through the one check that is
+# supposed to run locally before it ever reaches CI.
+#
+# Reads git's pre-push ref-update lines from stdin ("<local ref> <local
+# sha1> <remote ref> <remote sha1>", one per outgoing ref). Every field is
+# stripped of a trailing \r (CRLF-safe) and trailing whitespace before use.
+# Zero stdin lines, or any line that does not parse into exactly the four
+# expected fields, is itself a failure (exit 1) — this hook never falls
+# through to a bare "exit 0" on an error path.
+#
+# Per ref-update line (docs/specs/public-sanitize-gate.md "pre-push hook"
+# (e)):
+#   - all-zero local sha  -> ref deletion, nothing to scan, skip.
+#   - all-zero remote sha -> new branch on the remote: run the gate with
+#     --ref <local short name> and NO --base (the gate derives one per
+#     "Base derivation" (c)).
+#   - otherwise           -> run the gate with --base <remote sha> (the
+#     remote's current tip).
+#   - if the remote ref's short name differs from the local one (a
+#     `git push local:remote` rename), the gate is run a SECOND time to
+#     also scan that name's text. It is passed via --pr-body-file (a small
+#     temp file holding just the remote short name), NOT via --ref: a
+#     remote-only name is typically not itself a resolvable local git ref,
+#     and re-running the gate with --ref <remote short name> would trip
+#     spec (d)'s ref-validation requirement (REF_UNRESOLVED) for the
+#     ordinary, innocent case of a rename push whose remote name simply
+#     isn't also a local branch — defeating the purpose of this scan by
+#     blocking on ref-shape instead of on content. Routing it through the
+#     existing free-text scan channel scans the same bytes with the same
+#     scanners (including PRIVATE_TERM) without that false constraint.
+# The overall exit status is the bitwise OR of every gate invocation's
+# exit code, accumulated — never reassigned — so an earlier BLOCK is never
+# silently discarded by a later PASS on a different ref in the same push.
+
+set -u
+
+overall_status=0
+line_count=0
+
+strip_field() {
+  # Strip a trailing \r (CRLF-safe) and any trailing whitespace.
+  printf '%s' "$1" | tr -d '\r' | sed 's/[[:space:]]*$//'
+}
+
+short_name() {
+  printf '%s' "$1" | sed 's#^refs/heads/##'
+}
+
+is_zero_sha() {
+  case "$1" in
+    0000000000000000000000000000000000000000) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+while read -r raw_local_ref raw_local_sha raw_remote_ref raw_remote_sha; do
+  if [ -z "${raw_local_ref:-}" ] || [ -z "${raw_local_sha:-}" ] || \
+     [ -z "${raw_remote_ref:-}" ] || [ -z "${raw_remote_sha:-}" ]; then
+    echo "pre-push: unparseable ref-update line on stdin, blocking push." >&2
+    exit 1
+  fi
+  line_count=$((line_count + 1))
+
+  local_ref=$(strip_field "$raw_local_ref")
+  local_sha=$(strip_field "$raw_local_sha")
+  remote_ref=$(strip_field "$raw_remote_ref")
+  remote_sha=$(strip_field "$raw_remote_sha")
+
+  if is_zero_sha "$local_sha"; then
+    # Deleting a ref pushes an all-zero local sha; nothing to scan.
+    continue
+  fi
+
+  local_short=$(short_name "$local_ref")
+  remote_short=$(short_name "$remote_ref")
+
+  if is_zero_sha "$remote_sha"; then
+    # New branch on the remote: no prior remote tip to use as --base — let
+    # the gate derive its own base per docs/specs/public-sanitize-gate.md
+    # (c) (git merge-base <ref> origin/main by default).
+    if node scripts/sanitize-gate.js \
+        --manifest PUBLIC-MANIFEST.json \
+        --root . \
+        --commit "$local_sha" \
+        --ref "$local_short" \
+        --json; then
+      rc=0
+    else
+      rc=$?
+    fi
+  else
+    if node scripts/sanitize-gate.js \
+        --manifest PUBLIC-MANIFEST.json \
+        --root . \
+        --commit "$local_sha" \
+        --ref "$local_short" \
+        --base "$remote_sha" \
+        --json; then
+      rc=0
+    else
+      rc=$?
+    fi
+  fi
+
+  if [ "$rc" -ne 0 ]; then
+    echo "pre-push: sanitize gate FAILED for $local_ref ($local_sha, exit $rc). Push blocked locally." >&2
+    echo "This is a backstop only; do not attempt to bypass it — CI is" \
+         "authoritative and will independently block the merge." >&2
+  fi
+  overall_status=$((overall_status | rc))
+
+  if [ "$remote_short" != "$local_short" ]; then
+    # git push local:remote — the remote-side name is never scanned by the
+    # invocation above (which only scans the local name). Scan it as free
+    # text via --pr-body-file, not --ref (see the header comment for why).
+    remote_name_file=$(mktemp 2>/dev/null || printf '/tmp/pre-push-remote-name.%s' "$$")
+    printf '%s' "$remote_short" > "$remote_name_file"
+    if is_zero_sha "$remote_sha"; then
+      if node scripts/sanitize-gate.js \
+          --manifest PUBLIC-MANIFEST.json \
+          --root . \
+          --commit "$local_sha" \
+          --ref "$local_short" \
+          --pr-body-file "$remote_name_file" \
+          --json; then
+        rc2=0
+      else
+        rc2=$?
+      fi
+    else
+      if node scripts/sanitize-gate.js \
+          --manifest PUBLIC-MANIFEST.json \
+          --root . \
+          --commit "$local_sha" \
+          --ref "$local_short" \
+          --base "$remote_sha" \
+          --pr-body-file "$remote_name_file" \
+          --json; then
+        rc2=0
+      else
+        rc2=$?
+      fi
+    fi
+    rm -f "$remote_name_file" 2>/dev/null || true
+    if [ "$rc2" -ne 0 ]; then
+      echo "pre-push: sanitize gate FAILED scanning remote ref name '$remote_short' (exit $rc2). Push blocked locally." >&2
+    fi
+    overall_status=$((overall_status | rc2))
+  fi
+done
+
+if [ "$line_count" -eq 0 ]; then
+  echo "pre-push: no ref-update lines on stdin — refusing to push with an unverified gate run." >&2
+  exit 1
+fi
+
+exit "$overall_status"

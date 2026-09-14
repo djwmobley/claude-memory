@@ -1,0 +1,59 @@
+name: Sanitize gate
+# Public-lift sanitize gate — docs/specs/public-sanitize-gate.md.
+# Required status check on main (branch protection must require this job
+# before it is added to protection — see the spec's Bootstrap order note).
+#
+# The private-terms file is NEVER committed to this repo. It is supplied at
+# run time from a repo secret (SANITIZE_PRIVATE_TERMS) written to a temp
+# path outside the checkout and passed via SANITIZE_PRIVATE_TERMS_FILE.
+permissions:
+  contents: read
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [main]
+jobs:
+  sanitize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Write private terms file from secret
+        env:
+          SANITIZE_PRIVATE_TERMS: ${{ secrets.SANITIZE_PRIVATE_TERMS }}
+        run: |
+          if [ -z "$SANITIZE_PRIVATE_TERMS" ]; then
+            echo "SANITIZE_PRIVATE_TERMS secret is not set — gate cannot run." >&2
+            exit 3
+          fi
+          printf '%s\n' "$SANITIZE_PRIVATE_TERMS" > "$RUNNER_TEMP/sanitize-private-terms.txt"
+      - name: Write PR body (pull_request only)
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.txt"
+      - name: Run sanitize gate
+        env:
+          SANITIZE_PRIVATE_TERMS_FILE: ${{ runner.temp }}/sanitize-private-terms.txt
+          SANITIZE_LIFT_COMMIT_IDENTITY: ${{ vars.SANITIZE_LIFT_COMMIT_IDENTITY }}
+          GATE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          GATE_REF: ${{ github.head_ref || github.ref_name }}
+          GATE_BASE: ${{ github.event.pull_request.base.sha }}
+          GATE_EVENT: ${{ github.event_name }}
+        run: |
+          args="--manifest PUBLIC-MANIFEST.json --root . --commit $GATE_COMMIT --ref $GATE_REF --json"
+          # pull_request: the PR API always has a base sha, pass it
+          # explicitly. push: omit --base entirely and let the gate derive
+          # it itself (git merge-base <ref> origin/main) — no tip-only mode,
+          # docs/specs/public-sanitize-gate.md "Base derivation" (c).
+          if [ "$GATE_EVENT" = "pull_request" ]; then
+            args="$args --base $GATE_BASE --pr-body-file $RUNNER_TEMP/pr-body.txt"
+          fi
+          node scripts/sanitize-gate.js $args
