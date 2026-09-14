@@ -49,12 +49,30 @@ function sha256(buf) {
 
 // ---------------------------------------------------------------------------
 // Temp git repo helper for end-to-end runGate() cases.
+//
+// By default also creates an EMPTY root commit and points
+// `refs/remotes/origin/main` at it, so that runGate()'s round-3 base
+// derivation (`git merge-base <ref> origin/main`, docs/specs/
+// public-sanitize-gate.md "Base derivation" (c)) resolves in a fresh,
+// remote-less local test repo exactly the way it would in a real clone.
+// The root commit is EMPTY (--allow-empty) specifically so it never adds a
+// file to any later commit's tree — an ordinary (non-empty) placeholder
+// commit would leave a stray file in every subsequent `git ls-tree`,
+// silently turning "clean" fixtures into FAIL_UNCLASSIFIED_PATH failures.
+// Pass { withOriginMain: false } for a test that specifically wants NO
+// origin/main present (e.g. asserting BASE_UNRESOLVED).
 // ---------------------------------------------------------------------------
-function mkRepo() {
+function mkRepo(opts) {
+  const withOriginMain = !opts || opts.withOriginMain !== false;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sanitize-gate-test-'));
   execFileSync('git', ['init', '-q'], { cwd: dir });
   execFileSync('git', ['config', 'user.email', 'test-bot@example.com'], { cwd: dir });
   execFileSync('git', ['config', 'user.name', 'Test Bot'], { cwd: dir });
+  if (withOriginMain) {
+    execFileSync('git', ['commit', '--allow-empty', '-q', '-m', 'root'], { cwd: dir });
+    const rootSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
+    execFileSync('git', ['update-ref', 'refs/remotes/origin/main', rootSha], { cwd: dir });
+  }
   return dir;
 }
 
@@ -167,7 +185,7 @@ test('A2: overlapping manifest entries -> FAIL_GATE_ERROR', () => {
   };
   const cls = gate.classifyPaths(['scripts/a.js'], manifest);
   assert(cls.overlap.length === 1, 'expected exactly one overlap entry');
-  const outcome = gate.classifyOutcome({ overlap: cls.overlap });
+  const outcome = gate.deriveResultOutcome({ overlap: cls.overlap });
   assert(outcome.outcome === 'FAIL_GATE_ERROR', `expected FAIL_GATE_ERROR, got ${outcome.outcome}`);
 });
 
@@ -275,7 +293,7 @@ test('E1: workflow template exists standalone (bootstrap-first-commit shape)', (
 test('E2: SANITIZE_SKIP set -> FAIL_GATE_ERROR', () => {
   const found = gate.detectBypassEnv({ SANITIZE_SKIP: '1' });
   assert(found.includes('SANITIZE_SKIP'));
-  const outcome = gate.classifyOutcome({ gateErrors: ['bypass'] });
+  const outcome = gate.deriveResultOutcome({ gateErrors: ['bypass'] });
   assert(outcome.outcome === 'FAIL_GATE_ERROR');
 });
 for (const name of gate.BYPASS_ENV_NAMES) {
@@ -288,7 +306,7 @@ for (const name of gate.BYPASS_ENV_NAMES) {
 test('F1: runGate returns a single well-formed outcome object (no partial state)', () => {
   const manifest = { entries: [{ path: 'a.js', class: 'LEAVE', reason: 'n/a' }] };
   const cls = gate.classifyPaths(['a.js'], manifest);
-  const outcome = gate.classifyOutcome({
+  const outcome = gate.deriveResultOutcome({
     unclassified: cls.unclassified,
     overlap: cls.overlap,
     shapeErrors: cls.shapeErrors,
@@ -379,7 +397,7 @@ test('duplicate literal manifest entries (any class combo) -> FAIL_GATE_ERROR, n
   };
   const cls = gate.classifyPaths(['scripts/a.js'], manifest);
   assert(cls.shapeErrors.some((e) => /duplicate literal/.test(e)), 'expected duplicate-literal shape error');
-  const outcome = gate.classifyOutcome({ shapeErrors: cls.shapeErrors, overlap: cls.overlap, unclassified: cls.unclassified });
+  const outcome = gate.deriveResultOutcome({ shapeErrors: cls.shapeErrors, overlap: cls.overlap, unclassified: cls.unclassified });
   assert(outcome.outcome === 'FAIL_GATE_ERROR', `expected FAIL_GATE_ERROR, got ${outcome.outcome}`);
 });
 
@@ -465,16 +483,16 @@ test('regression: gate reads the committed blob, not a dirtied working tree', ()
 });
 
 // --- Verified remainder: classifyOutcome rejects malformed/unknown state. ---
-test('classifyOutcome(null) -> FAIL_GATE_ERROR, never PASS on unknown state', () => {
-  const outcome = gate.classifyOutcome(null);
+test('deriveResultOutcome(null) -> FAIL_GATE_ERROR, never PASS on unknown state', () => {
+  const outcome = gate.deriveResultOutcome(null);
   assert(outcome.outcome === 'FAIL_GATE_ERROR', `expected FAIL_GATE_ERROR, got ${outcome.outcome}`);
 });
-test('classifyOutcome(undefined) -> FAIL_GATE_ERROR, never PASS on unknown state', () => {
-  const outcome = gate.classifyOutcome(undefined);
+test('deriveResultOutcome(undefined) -> FAIL_GATE_ERROR, never PASS on unknown state', () => {
+  const outcome = gate.deriveResultOutcome(undefined);
   assert(outcome.outcome === 'FAIL_GATE_ERROR', `expected FAIL_GATE_ERROR, got ${outcome.outcome}`);
 });
-test('classifyOutcome({findings:{}}) malformed non-array bucket -> FAIL_GATE_ERROR', () => {
-  const outcome = gate.classifyOutcome({ findings: {} });
+test('deriveResultOutcome({findings:{}}) malformed non-array bucket -> FAIL_GATE_ERROR', () => {
+  const outcome = gate.deriveResultOutcome({ findings: {} });
   assert(outcome.outcome === 'FAIL_GATE_ERROR', `expected FAIL_GATE_ERROR, got ${outcome.outcome}`);
 });
 
@@ -509,11 +527,18 @@ test('--ref is used when supplied, independent of the checkout branch (detached 
     ],
   }));
   const shaFinal = commit(dir, 'init');
+  // Round 3 (spec (d)): --ref must resolve via `git rev-parse --verify
+  // <ref>^{commit}` — a made-up string is REF_UNRESOLVED, not just a text
+  // label. Create the branch for real so this test still exercises "the
+  // supplied --ref is authoritative under detached HEAD", not merely a
+  // branch that happens to be checked out.
+  execFileSync('git', ['branch', 'fix/canaryterm-thing', shaFinal], { cwd: dir });
   execFileSync('git', ['checkout', '--detach', shaFinal], { cwd: dir });
-  const { results } = gate.runGate(
+  const { results, outcome } = gate.runGate(
     ['--manifest', path.join(dir, 'PUBLIC-MANIFEST.json'), '--root', dir, '--commit', shaFinal, '--ref', 'fix/canaryterm-thing', '--terms', TERMS_FILE],
     BASE_ENV
   );
+  assert(outcome.outcome !== 'FAIL_REF_UNRESOLVED', `--ref must resolve against the real branch, got ${outcome.outcome}`);
   assert(results.findings.some((f) => f.label === 'PRIVATE_TERM' && f.location === 'ref'), 'expected ref-name PRIVATE_TERM finding from the supplied --ref');
 });
 
@@ -653,6 +678,337 @@ test('runGate with no --terms and no SANITIZE_PRIVATE_TERMS_FILE -> FAIL_GATE_ER
   );
   assert(outcome.outcome === 'FAIL_GATE_ERROR', `expected FAIL_GATE_ERROR, got ${outcome.outcome}`);
 });
+
+// ===========================================================================
+// 5. Round 3 fixes — decoded scanning (a), classifyOutcome (b), ref/base
+//    resolution (c)/(d), pre-push hook (e). See docs/specs/
+//    public-sanitize-gate.md.
+// ===========================================================================
+
+// --- (a) Decoded scanning: percent-decode fixpoint + plus-as-space. ---
+test('(a) percent-decoded OWNER_PATH survives an unrelated literal "%" elsewhere', () => {
+  const f = scanCanary('x', 'progress=100%;path=C%3A%5CUsers%5Calice');
+  assert(f.some((x) => x.label === 'OWNER_PATH' && x.variant === 'percent'), 'expected a percent-decoded OWNER_PATH finding');
+});
+
+test('(a) double-encoded OWNER_PATH resolves at percent-decode depth 2', () => {
+  const ownerPath = 'C:\\Users\\djwmo\\double-encoded-secret';
+  const singleEncoded = encodeURIComponent(ownerPath);
+  const doubleEncoded = encodeURIComponent(singleEncoded);
+  const f = scanCanary('x', doubleEncoded);
+  const depth2 = f.find((x) => x.label === 'OWNER_PATH' && x.variant === 'percent' && x.depth === 2);
+  assert(depth2, `expected an OWNER_PATH finding at percent-decode depth 2, got ${JSON.stringify(f)}`);
+  assert(!f.some((x) => x.label === 'OWNER_PATH' && x.variant === 'percent' && x.depth === 1), 'depth 1 (still singly-encoded) must not itself match OWNER_PATH');
+});
+
+test('(a) lowercase percent-encoding hex digits decode the same as uppercase', () => {
+  const f = scanCanary('x', 'C%3a%5cUsers%5cbobtest');
+  assert(f.some((x) => x.label === 'OWNER_PATH' && x.variant === 'percent'), 'expected OWNER_PATH finding from lowercase-hex percent decode');
+});
+
+test('(a) unconditional plus-as-space variant is recorded on a finding', () => {
+  const f = scanCanary('x', '/home/bob+smith');
+  assert(f.some((x) => x.label === 'OWNER_PATH' && x.variant === 'plus'), 'expected an OWNER_PATH finding tagged variant "plus"');
+});
+
+// --- (b) classifyOutcome — paranoid validator over an {outcome, findings,
+//     exitCode?} summary payload. Distinct from deriveResultOutcome above. ---
+test('classifyOutcome: Date instance -> BLOCK MALFORMED_OUTCOME (not a plain object)', () => {
+  const outcome = gate.classifyOutcome(new Date());
+  assert(outcome.outcome === 'BLOCK' && outcome.reason === 'MALFORMED_OUTCOME', `expected BLOCK/MALFORMED_OUTCOME, got ${JSON.stringify(outcome)}`);
+});
+
+test('classifyOutcome: Object.create(null) with outcome PASS + findings [] -> PASS', () => {
+  const obj = Object.create(null);
+  obj.outcome = 'PASS';
+  obj.findings = [];
+  const outcome = gate.classifyOutcome(obj);
+  assert(outcome.outcome === 'PASS', `expected PASS, got ${JSON.stringify(outcome)}`);
+});
+
+test('classifyOutcome: outcome defined via a (non-throwing) getter -> BLOCK MALFORMED_OUTCOME', () => {
+  const obj = { findings: [] };
+  Object.defineProperty(obj, 'outcome', { get() { return 'PASS'; }, enumerable: true });
+  const outcome = gate.classifyOutcome(obj);
+  assert(outcome.outcome === 'BLOCK' && outcome.reason === 'MALFORMED_OUTCOME', `expected BLOCK/MALFORMED_OUTCOME, got ${JSON.stringify(outcome)}`);
+});
+
+test('classifyOutcome: findings defined via a THROWING getter -> BLOCK MALFORMED_OUTCOME, getter never invoked', () => {
+  let invoked = false;
+  const obj = { outcome: 'BLOCK' };
+  Object.defineProperty(obj, 'findings', {
+    get() { invoked = true; throw new Error('should never be called'); },
+    enumerable: true,
+  });
+  const outcome = gate.classifyOutcome(obj);
+  assert(outcome.outcome === 'BLOCK' && outcome.reason === 'MALFORMED_OUTCOME', `expected BLOCK/MALFORMED_OUTCOME, got ${JSON.stringify(outcome)}`);
+  assert(!invoked, 'the throwing findings getter must never be invoked');
+});
+
+test("classifyOutcome: outcome 'PASS ' (trailing space) -> BLOCK MALFORMED_OUTCOME", () => {
+  const outcome = gate.classifyOutcome({ outcome: 'PASS ', findings: [] });
+  assert(outcome.outcome === 'BLOCK' && outcome.reason === 'MALFORMED_OUTCOME', `expected BLOCK/MALFORMED_OUTCOME, got ${JSON.stringify(outcome)}`);
+});
+
+test('classifyOutcome: homoglyph outcome string -> BLOCK MALFORMED_OUTCOME', () => {
+  // Cyrillic "А" (U+0410) in place of Latin "A" — looks like "PASS" but is a different string.
+  const homoglyphPass = '\u0410ASS';
+  const outcome = gate.classifyOutcome({ outcome: homoglyphPass, findings: [] });
+  assert(outcome.outcome === 'BLOCK' && outcome.reason === 'MALFORMED_OUTCOME', `expected BLOCK/MALFORMED_OUTCOME, got ${JSON.stringify(outcome)}`);
+});
+
+test('classifyOutcome: ERROR with an extra undocumented key -> BLOCK MALFORMED_OUTCOME', () => {
+  const outcome = gate.classifyOutcome({ outcome: 'ERROR', findings: [], extra: 'nope' });
+  assert(outcome.outcome === 'BLOCK' && outcome.reason === 'MALFORMED_OUTCOME', `expected BLOCK/MALFORMED_OUTCOME, got ${JSON.stringify(outcome)}`);
+});
+
+test('classifyOutcome: well-formed BLOCK payload -> real BLOCK (no reason)', () => {
+  const outcome = gate.classifyOutcome({ outcome: 'BLOCK', findings: [{ label: 'X', location: 'y', snippet: 'z' }] });
+  assert(outcome.outcome === 'BLOCK' && !outcome.reason, `expected real BLOCK, got ${JSON.stringify(outcome)}`);
+});
+
+test('classifyOutcome: well-formed ERROR payload -> ERROR', () => {
+  const outcome = gate.classifyOutcome({ outcome: 'ERROR', findings: [] });
+  assert(outcome.outcome === 'ERROR', `expected ERROR, got ${JSON.stringify(outcome)}`);
+});
+
+test('classifyOutcome: BLOCK with empty findings -> BLOCK MALFORMED_OUTCOME (findings must be non-empty)', () => {
+  const outcome = gate.classifyOutcome({ outcome: 'BLOCK', findings: [] });
+  assert(outcome.outcome === 'BLOCK' && outcome.reason === 'MALFORMED_OUTCOME', `expected BLOCK/MALFORMED_OUTCOME, got ${JSON.stringify(outcome)}`);
+});
+
+test('classifyOutcome: PASS with non-empty findings -> BLOCK MALFORMED_OUTCOME (findings must be empty)', () => {
+  const outcome = gate.classifyOutcome({ outcome: 'PASS', findings: [{ label: 'X', location: 'y', snippet: 'z' }] });
+  assert(outcome.outcome === 'BLOCK' && outcome.reason === 'MALFORMED_OUTCOME', `expected BLOCK/MALFORMED_OUTCOME, got ${JSON.stringify(outcome)}`);
+});
+
+test('classifyOutcome: an Array input -> BLOCK MALFORMED_OUTCOME', () => {
+  const outcome = gate.classifyOutcome(['PASS']);
+  assert(outcome.outcome === 'BLOCK' && outcome.reason === 'MALFORMED_OUTCOME', `expected BLOCK/MALFORMED_OUTCOME, got ${JSON.stringify(outcome)}`);
+});
+
+test('classifyOutcome: null -> BLOCK MALFORMED_OUTCOME', () => {
+  const outcome = gate.classifyOutcome(null);
+  assert(outcome.outcome === 'BLOCK' && outcome.reason === 'MALFORMED_OUTCOME', `expected BLOCK/MALFORMED_OUTCOME, got ${JSON.stringify(outcome)}`);
+});
+
+// --- (c)/(d) ref/base resolution. ---
+test('--base "" (blank) is treated as omitted -> base derivation path runs, not FAIL_BASE_UNRESOLVED', () => {
+  const dir = mkRepo();
+  writeFile(dir, 'README.md', 'hello\n');
+  writeFile(dir, 'PUBLIC-MANIFEST.json', JSON.stringify({
+    entries: [
+      { path: 'README.md', class: 'LEAVE', reason: 'n/a' },
+      { path: 'PUBLIC-MANIFEST.json', class: 'LEAVE', reason: 'self' },
+    ],
+  }));
+  const shaFinal = commit(dir, 'init');
+  const { outcome } = gate.runGate(
+    ['--manifest', path.join(dir, 'PUBLIC-MANIFEST.json'), '--root', dir, '--commit', shaFinal, '--base', '', '--terms', TERMS_FILE],
+    BASE_ENV
+  );
+  assert(outcome.outcome !== 'FAIL_BASE_UNRESOLVED', `blank --base must be treated as omitted (derived), got ${outcome.outcome}`);
+});
+
+test('merge-base(ref, origin/main) == ref itself -> PASS, not FAIL_BASE_UNRESOLVED', () => {
+  const dir = mkRepo(); // root commit + origin/main -> root
+  writeFile(dir, 'README.md', 'hello\n');
+  writeFile(dir, 'PUBLIC-MANIFEST.json', JSON.stringify({
+    entries: [
+      { path: 'README.md', class: 'LEAVE', reason: 'n/a' },
+      { path: 'PUBLIC-MANIFEST.json', class: 'LEAVE', reason: 'self' },
+    ],
+  }));
+  const sha = commit(dir, 'add files');
+  // Move origin/main forward to equal this same commit, so merge-base(local
+  // branch, origin/main) === sha === the ref's own tip — the fast-forward
+  // case spec (c) says is normal, not an error.
+  execFileSync('git', ['update-ref', 'refs/remotes/origin/main', sha], { cwd: dir });
+  const { outcome } = gate.runGate(
+    ['--manifest', path.join(dir, 'PUBLIC-MANIFEST.json'), '--root', dir, '--commit', sha, '--terms', TERMS_FILE],
+    BASE_ENV
+  );
+  assert(outcome.outcome === 'PASS', `expected PASS, got ${outcome.outcome}`);
+});
+
+test('missing origin/main and no explicit --base -> FAIL_BASE_UNRESOLVED', () => {
+  const dir = mkRepo({ withOriginMain: false });
+  writeFile(dir, 'README.md', 'hello\n');
+  writeFile(dir, 'PUBLIC-MANIFEST.json', JSON.stringify({
+    entries: [
+      { path: 'README.md', class: 'LEAVE', reason: 'n/a' },
+      { path: 'PUBLIC-MANIFEST.json', class: 'LEAVE', reason: 'self' },
+    ],
+  }));
+  const sha = commit(dir, 'init');
+  const { outcome, results } = gate.runGate(
+    ['--manifest', path.join(dir, 'PUBLIC-MANIFEST.json'), '--root', dir, '--commit', sha, '--terms', TERMS_FILE],
+    BASE_ENV
+  );
+  assert(outcome.outcome === 'FAIL_BASE_UNRESOLVED', `expected FAIL_BASE_UNRESOLVED, got ${outcome.outcome}`);
+  assert(results.baseUnresolved.length > 0, 'expected a baseUnresolved entry');
+});
+
+test('detached HEAD with no --ref -> FAIL_REF_UNRESOLVED', () => {
+  const dir = mkRepo();
+  writeFile(dir, 'README.md', 'hello\n');
+  writeFile(dir, 'PUBLIC-MANIFEST.json', JSON.stringify({
+    entries: [
+      { path: 'README.md', class: 'LEAVE', reason: 'n/a' },
+      { path: 'PUBLIC-MANIFEST.json', class: 'LEAVE', reason: 'self' },
+    ],
+  }));
+  const sha = commit(dir, 'init');
+  execFileSync('git', ['checkout', '--detach', sha], { cwd: dir });
+  const { outcome, results } = gate.runGate(
+    ['--manifest', path.join(dir, 'PUBLIC-MANIFEST.json'), '--root', dir, '--commit', sha, '--terms', TERMS_FILE],
+    BASE_ENV
+  );
+  assert(outcome.outcome === 'FAIL_REF_UNRESOLVED', `expected FAIL_REF_UNRESOLVED, got ${outcome.outcome}`);
+  assert(results.refUnresolved.length > 0, 'expected a refUnresolved entry');
+});
+
+test('--ref HEAD -> FAIL_REF_UNRESOLVED (reserved ref name unsupported by design)', () => {
+  const dir = mkRepo();
+  writeFile(dir, 'README.md', 'hello\n');
+  writeFile(dir, 'PUBLIC-MANIFEST.json', JSON.stringify({
+    entries: [
+      { path: 'README.md', class: 'LEAVE', reason: 'n/a' },
+      { path: 'PUBLIC-MANIFEST.json', class: 'LEAVE', reason: 'self' },
+    ],
+  }));
+  const sha = commit(dir, 'init');
+  const { outcome } = gate.runGate(
+    ['--manifest', path.join(dir, 'PUBLIC-MANIFEST.json'), '--root', dir, '--commit', sha, '--ref', 'HEAD', '--terms', TERMS_FILE],
+    BASE_ENV
+  );
+  assert(outcome.outcome === 'FAIL_REF_UNRESOLVED', `expected FAIL_REF_UNRESOLVED, got ${outcome.outcome}`);
+});
+
+test('--ref abcdef1 (no such branch) -> FAIL_REF_UNRESOLVED', () => {
+  const dir = mkRepo();
+  writeFile(dir, 'README.md', 'hello\n');
+  writeFile(dir, 'PUBLIC-MANIFEST.json', JSON.stringify({
+    entries: [
+      { path: 'README.md', class: 'LEAVE', reason: 'n/a' },
+      { path: 'PUBLIC-MANIFEST.json', class: 'LEAVE', reason: 'self' },
+    ],
+  }));
+  const sha = commit(dir, 'init');
+  const { outcome } = gate.runGate(
+    ['--manifest', path.join(dir, 'PUBLIC-MANIFEST.json'), '--root', dir, '--commit', sha, '--ref', 'abcdef1', '--terms', TERMS_FILE],
+    BASE_ENV
+  );
+  assert(outcome.outcome === 'FAIL_REF_UNRESOLVED', `expected FAIL_REF_UNRESOLVED, got ${outcome.outcome}`);
+});
+
+// --- (e) pre-push hook: real shell-fixture tests via bash (skipped
+//     gracefully, never silently passed-over without saying so, if bash is
+//     not on PATH). ---
+let BASH_AVAILABLE = false;
+try {
+  execFileSync('bash', ['--version'], { stdio: 'ignore' });
+  BASH_AVAILABLE = true;
+} catch (_e) {
+  BASH_AVAILABLE = false;
+}
+
+const PRE_PUSH_HOOK = path.join(PROJECT_ROOT, 'templates', 'public-repo', 'hooks', 'pre-push');
+
+function mkPrePushFixture() {
+  const dir = mkRepo(); // root commit + origin/main already established
+  fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true });
+  fs.copyFileSync(path.join(PROJECT_ROOT, 'scripts', 'sanitize-gate.js'), path.join(dir, 'scripts', 'sanitize-gate.js'));
+  writeFile(dir, 'README.md', 'hello\n');
+  writeFile(dir, 'PUBLIC-MANIFEST.json', JSON.stringify({
+    entries: [
+      { path: 'README.md', class: 'LEAVE', reason: 'n/a' },
+      { path: 'PUBLIC-MANIFEST.json', class: 'LEAVE', reason: 'self' },
+      { path: 'scripts/sanitize-gate.js', class: 'LEAVE', reason: 'hook copy' },
+    ],
+  }));
+  commit(dir, 'init content');
+  return dir;
+}
+
+function runPrePush(dir, stdinText) {
+  return execFileSync('bash', [PRE_PUSH_HOOK], {
+    cwd: dir,
+    input: stdinText,
+    env: Object.assign({}, process.env, {
+      SANITIZE_PRIVATE_TERMS_FILE: TERMS_FILE,
+      SANITIZE_LIFT_COMMIT_IDENTITY: 'Test Bot <test-bot@example.com>',
+    }),
+  });
+}
+
+if (!BASH_AVAILABLE) {
+  test('(e) pre-push hook shell tests: SKIPPED — bash not found on PATH', () => {
+    assert(true, 'bash unavailable in this environment; pre-push shell fixtures not exercised');
+  });
+} else {
+  test('(e) pre-push: CRLF stdin, new-branch line (all-zero remote sha) -> exit 0', () => {
+    const dir = mkPrePushFixture();
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
+    // A real pre-push invocation always runs while genuinely on the local
+    // branch being pushed, so it is always a resolvable ref (spec (d)) —
+    // create it for real rather than just naming it in the stdin fixture.
+    execFileSync('git', ['branch', 'feature/x', sha], { cwd: dir });
+    const stdin = `refs/heads/feature/x ${sha} refs/heads/feature/x 0000000000000000000000000000000000000000\r\n`;
+    let threw = null;
+    try {
+      runPrePush(dir, stdin);
+    } catch (e) {
+      threw = e;
+    }
+    assert(threw === null, `expected exit 0 for a clean new-branch push, got: ${threw && threw.message}`);
+  });
+
+  test('(e) pre-push: two lines, first BLOCK then PASS -> overall nonzero (bitwise-OR accumulation, never reassigned)', () => {
+    const dir = mkPrePushFixture();
+    const cleanSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
+    execFileSync('git', ['branch', 'clean', cleanSha], { cwd: dir });
+    execFileSync('git', ['checkout', '-q', '-b', 'dirty'], { cwd: dir });
+    writeFile(dir, 'leaky.txt', 'C:\\Users\\djwmo\\leaked-secret-path\n');
+    writeFile(dir, 'PUBLIC-MANIFEST.json', JSON.stringify({
+      entries: [
+        { path: 'README.md', class: 'LEAVE', reason: 'n/a' },
+        { path: 'PUBLIC-MANIFEST.json', class: 'LEAVE', reason: 'self' },
+        { path: 'scripts/sanitize-gate.js', class: 'LEAVE', reason: 'hook copy' },
+        { path: 'leaky.txt', class: 'LIFT', source_sha256: sha256(fs.readFileSync(path.join(dir, 'leaky.txt'))), transform: null },
+      ],
+    }));
+    const dirtySha = commit(dir, 'add leaky content');
+    execFileSync('git', ['checkout', '-q', 'clean'], { cwd: dir }); // leave HEAD resolvable
+    const stdin = `refs/heads/dirty ${dirtySha} refs/heads/dirty 0000000000000000000000000000000000000000\n`
+      + `refs/heads/clean ${cleanSha} refs/heads/clean 0000000000000000000000000000000000000000\n`;
+    let status = 0;
+    try {
+      runPrePush(dir, stdin);
+      status = 0;
+    } catch (e) {
+      status = (e && typeof e.status === 'number') ? e.status : 1;
+    }
+    assert(status !== 0, `expected a nonzero overall exit status when one of two pushed refs BLOCKs, got ${status}`);
+  });
+
+  test('(e) pre-push: local:remote differing ref names also scans the remote name', () => {
+    const dir = mkPrePushFixture();
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
+    execFileSync('git', ['branch', 'localname', sha], { cwd: dir });
+    // remote_sha nonzero (an update, not a new branch) -> --base <remote sha>;
+    // any resolvable sha works here since --base is used as-is once non-blank.
+    const stdin = `refs/heads/localname ${sha} refs/heads/canaryterm-rename ${sha}\n`;
+    let status = 0;
+    try {
+      runPrePush(dir, stdin);
+      status = 0;
+    } catch (e) {
+      status = (e && typeof e.status === 'number') ? e.status : 1;
+    }
+    assert(status !== 0, 'expected the remote-name-only scan to catch the PRIVATE_TERM in "canaryterm-rename" even though local content/name are clean');
+  });
+}
 
 // ---------------------------------------------------------------------------
 console.log(`\n${passed} passed, ${failed} failed`);

@@ -13,11 +13,18 @@
  *
  * Usage:
  *   node scripts/sanitize-gate.js --manifest <path> --root <dir>
- *     [--commit <sha>] [--base <sha>] [--ref <name>] [--source-root <dir>]
- *     [--pr-body-file <path>] [--terms <path>] [--json]
+ *     [--commit <sha>] [--base <sha>] [--public-base <ref>] [--ref <name>]
+ *     [--source-root <dir>] [--pr-body-file <path>] [--terms <path>] [--json]
  *
- * Exit codes: 0 PASS, 2 FAIL_UNCLASSIFIED_PATH|FAIL_HASH_DRIFT|FAIL_CONTENT,
- * 3 FAIL_GATE_ERROR.
+ * Ref/base resolution (docs/specs/public-sanitize-gate.md "Base derivation",
+ * "Ref resolution"): an omitted/blank `--ref` resolves via `git symbolic-ref
+ * --short HEAD` (fails closed under detached HEAD); an omitted/blank `--base`
+ * is DERIVED as `git merge-base <ref> <public-base>` (public-base defaults to
+ * `origin/main`, override via `--public-base`) — there is no tip-only scan
+ * mode; a resolvable base is always required for a PASS.
+ *
+ * Exit codes: 0 PASS, 2 FAIL_UNCLASSIFIED_PATH|FAIL_HASH_DRIFT|FAIL_CONTENT|
+ * FAIL_REF_UNRESOLVED|FAIL_BASE_UNRESOLVED, 3 FAIL_GATE_ERROR.
  *
  * The ONLY authoritative result is the exit code plus the single final JSON
  * line on stdout in --json mode: {"outcome":"...","findings":[...],
@@ -359,18 +366,85 @@ function loadPrivateTerms(termsPath) {
 class GateError extends Error {}
 
 // ---------------------------------------------------------------------------
-// scanText — run every non-recursive scanner over a text string.
-// ctx: { location, termRegexes: RegExp[], _skipBase64 (internal) }
-// Returns findings: [{ label, location, snippet }]
+// percentDecodeOnce / percentDecodeFixpoint (spec "Decoded scanning" (a)) —
+// decode every valid %XX (case-insensitive hex) and %uXXXX escape found
+// ANYWHERE in the string in a single pass; a malformed sequence (bad hex, a
+// bare trailing "%") simply does not match the regex and is left literal.
+// This is regex-driven, not decodeURIComponent-driven, so it can never
+// throw and never needs whitespace-delimited candidate extraction to avoid
+// one malformed run poisoning another — the whole string is decoded in
+// place, every round.
 // ---------------------------------------------------------------------------
-function runPatternSet(label, patterns, text, location, findings) {
+const PERCENT_ESCAPE_RE = /%(?:[0-9A-Fa-f]{2}|[uU][0-9A-Fa-f]{4})/g;
+
+function percentDecodeOnce(str) {
+  return str.replace(PERCENT_ESCAPE_RE, (m) => {
+    const isUnicode = m[1] === 'u' || m[1] === 'U';
+    const hex = isUnicode ? m.slice(2) : m.slice(1);
+    const code = parseInt(hex, 16);
+    return String.fromCharCode(code);
+  });
+}
+
+// Iterates percentDecodeOnce to a fixpoint, capped at maxRounds (default 5)
+// even if a fixpoint has not been reached. Returns one { text, variant:
+// 'percent', depth } entry per round that actually changed the text (a
+// double-encoded owner path resolves fully only at depth 2, etc).
+function percentDecodeFixpoint(str, maxRounds) {
+  const cap = typeof maxRounds === 'number' ? maxRounds : 5;
+  const out = [];
+  let current = str;
+  for (let depth = 1; depth <= cap; depth++) {
+    let next;
+    try {
+      next = percentDecodeOnce(current);
+    } catch (_e) {
+      break; // never throws in practice (regex-driven), but stay fail-safe
+    }
+    if (next === current) break;
+    out.push({ text: next, variant: 'percent', depth });
+    current = next;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// scanText — run every non-recursive scanner over a text string AND over its
+// decoded variants (spec "Decoded scanning" (a)): the raw text, every
+// percent-decode fixpoint round (capped at 5), and an unconditional
+// plus-as-space variant (no query-string detection — "+" is always treated
+// as a possible encoded space). Findings from every variant are unioned;
+// each finding records which variant/depth produced it. No whitespace
+// tokenization gates any of this — every variant is generated from the
+// WHOLE string, never a substring extracted by splitting on whitespace.
+//
+// ctx: { location, termRegexes: RegExp[], _skipBase64 (internal) }
+// Returns findings: [{ label, location, snippet, variant, depth }]
+// ---------------------------------------------------------------------------
+function runPatternSet(label, patterns, text, location, variant, depth, findings) {
   for (const re of patterns) {
     const m = text.match(re);
     if (m) {
-      findings.push({ label, location, snippet: m[0].slice(0, 80) });
+      findings.push({ label, location, snippet: m[0].slice(0, 80), variant, depth });
       break;
     }
   }
+}
+
+function scanCoreVariant(text, location, termRegexes, variant, depth, findings) {
+  runPatternSet('OWNER_PATH', OWNER_PATH_PATTERNS, text, location, variant, depth, findings);
+  runPatternSet('OWNER_EMAIL', OWNER_EMAIL_PATTERNS, text, location, variant, depth, findings);
+  runPatternSet('PRIVATE_DB', PRIVATE_DB_PATTERNS, text, location, variant, depth, findings);
+  for (const re of termRegexes) {
+    const m = text.match(re);
+    if (m) {
+      findings.push({ label: 'PRIVATE_TERM', location, snippet: m[0].slice(0, 80), variant, depth });
+      break;
+    }
+  }
+  runPatternSet('MARKER_UUID', MARKER_UUID_PATTERNS, text, location, variant, depth, findings);
+  runPatternSet('SECRET_KEY', SECRET_KEY_PATTERNS, text, location, variant, depth, findings);
+  runPatternSet('CONN_STRING', CONN_STRING_PATTERNS, text, location, variant, depth, findings);
 }
 
 function scanText(str, ctx) {
@@ -378,43 +452,14 @@ function scanText(str, ctx) {
   const location = (ctx && ctx.location) || 'unknown';
   const termRegexes = (ctx && ctx.termRegexes) || [];
 
-  runPatternSet('OWNER_PATH', OWNER_PATH_PATTERNS, str, location, findings);
-  runPatternSet('OWNER_EMAIL', OWNER_EMAIL_PATTERNS, str, location, findings);
-  runPatternSet('PRIVATE_DB', PRIVATE_DB_PATTERNS, str, location, findings);
-  for (const re of termRegexes) {
-    const m = str.match(re);
-    if (m) {
-      findings.push({ label: 'PRIVATE_TERM', location, snippet: m[0].slice(0, 80) });
-      break;
-    }
-  }
-  runPatternSet('MARKER_UUID', MARKER_UUID_PATTERNS, str, location, findings);
-  runPatternSet('SECRET_KEY', SECRET_KEY_PATTERNS, str, location, findings);
-  runPatternSet('CONN_STRING', CONN_STRING_PATTERNS, str, location, findings);
+  // Variant set: raw + percent-decode fixpoint rounds + plus-as-space.
+  const variants = [{ text: str, variant: 'raw', depth: 0 }];
+  variants.push(...percentDecodeFixpoint(str, 5));
+  const plusText = str.replace(/\+/g, ' ');
+  if (plusText !== str) variants.push({ text: plusText, variant: 'plus', depth: 0 });
 
-  // URL-encoded owner-path forms (A1): decode each percent-encoded CANDIDATE
-  // substring independently. Whole-string decodeURIComponent() throws on
-  // ANY malformed percent sequence anywhere in the string (e.g. a bare "%"
-  // from "100% complete"), which would silently suppress a valid encoded
-  // owner path elsewhere in the same string. Isolate candidates first so one
-  // malformed run never poisons another.
-  {
-    const candidateRe = /[^\s"'<>]*%[0-9A-Fa-f]{2}[^\s"'<>]*/g;
-    const seen = new Set();
-    let cm;
-    while ((cm = candidateRe.exec(str))) {
-      const token = cm[0];
-      if (seen.has(token)) continue;
-      seen.add(token);
-      try {
-        const decoded = decodeURIComponent(token);
-        if (decoded !== token) {
-          runPatternSet('OWNER_PATH', OWNER_PATH_PATTERNS, decoded, location, findings);
-        }
-      } catch (_e) {
-        // this candidate isn't validly percent-encoded; skip only it
-      }
-    }
+  for (const v of variants) {
+    scanCoreVariant(v.text, location, termRegexes, v.variant, v.depth, findings);
   }
 
   // BASE64_DECODE: find base64-looking runs >=64 chars, decode, re-scan
@@ -436,7 +481,7 @@ function scanText(str, ctx) {
           inner16 = scanText(utf16Decoded, { location, termRegexes, _skipBase64: true });
         }
         if (inner.length > 0 || inner16.length > 0) {
-          findings.push({ label: 'BASE64_DECODE', location, snippet: m[0].slice(0, 40) });
+          findings.push({ label: 'BASE64_DECODE', location, snippet: m[0].slice(0, 40), variant: 'base64', depth: 0 });
         }
       } catch (_e) {
         // not valid base64/utf8; ignore
@@ -465,18 +510,27 @@ function scanBytes(buf, ctx) {
 }
 
 // ---------------------------------------------------------------------------
-// classifyOutcome — total classification of the gate's final result from
+// deriveResultOutcome — total classification of the gate's final result from
 // accumulated result buckets. First matching branch wins; unknown internal
 // state defaults to FAIL_GATE_ERROR (never silently PASS). `results` itself
 // (or any of its expected buckets) being malformed — null, not an object, or
 // a bucket present but not an array — is itself unknown state, not a clean
 // empty run, and must not resolve to PASS.
+//
+// (Named distinctly from `classifyOutcome` below, which is a different,
+// narrower function per docs/specs/public-sanitize-gate.md "classifyOutcome
+// total classification" — it validates the gate's FINAL {outcome, findings,
+// exitCode} JSON-line payload against tampering/malformed shape, not the
+// internal accumulator buckets this function reads.)
 // ---------------------------------------------------------------------------
-function classifyOutcome(results) {
+function deriveResultOutcome(results) {
   if (results === null || typeof results !== 'object' || Array.isArray(results)) {
     return { outcome: 'FAIL_GATE_ERROR', exitCode: 3 };
   }
-  const bucketNames = ['gateErrors', 'unclassified', 'overlap', 'shapeErrors', 'hashDrift', 'findings'];
+  const bucketNames = [
+    'gateErrors', 'unclassified', 'overlap', 'shapeErrors', 'hashDrift', 'findings',
+    'refUnresolved', 'baseUnresolved',
+  ];
   for (const name of bucketNames) {
     const v = results[name];
     if (v !== undefined && !Array.isArray(v)) {
@@ -491,9 +545,20 @@ function classifyOutcome(results) {
   const shapeErrors = r.shapeErrors || [];
   const hashDrift = r.hashDrift || [];
   const findings = r.findings || [];
+  const refUnresolved = r.refUnresolved || [];
+  const baseUnresolved = r.baseUnresolved || [];
 
+  // Priority (total and fixed, never configurable per invocation):
+  // FAIL_GATE_ERROR > FAIL_REF_UNRESOLVED > FAIL_BASE_UNRESOLVED >
+  // FAIL_UNCLASSIFIED_PATH > FAIL_HASH_DRIFT > FAIL_CONTENT > PASS.
   if (gateErrors.length > 0 || shapeErrors.length > 0 || overlap.length > 0) {
     return { outcome: 'FAIL_GATE_ERROR', exitCode: 3 };
+  }
+  if (refUnresolved.length > 0) {
+    return { outcome: 'FAIL_REF_UNRESOLVED', exitCode: 2 };
+  }
+  if (baseUnresolved.length > 0) {
+    return { outcome: 'FAIL_BASE_UNRESOLVED', exitCode: 2 };
   }
   if (unclassified.length > 0) {
     return { outcome: 'FAIL_UNCLASSIFIED_PATH', exitCode: 2 };
@@ -505,6 +570,112 @@ function classifyOutcome(results) {
     return { outcome: 'FAIL_CONTENT', exitCode: 2 };
   }
   return { outcome: 'PASS', exitCode: 0 };
+}
+
+// ---------------------------------------------------------------------------
+// classifyOutcome — docs/specs/public-sanitize-gate.md "classifyOutcome
+// total classification" (round 3). A defensive, paranoia-hardened validator
+// for an ALREADY-COMPUTED summary payload shaped like the gate's own final
+// JSON line: { outcome: 'PASS'|'BLOCK'|'ERROR', findings: [...],
+// exitCode?: N }. This is the total classification of "is this payload safe
+// to trust", not a re-derivation of the gate's specific reason code — see
+// `deriveResultOutcome` above for that. Total classification: every input,
+// including a hostile/malformed one, maps to exactly one of PASS / BLOCK /
+// ERROR; anything not exactly matching the PASS/BLOCK/ERROR shape rules
+// below falls to the default BLOCK branch with reason MALFORMED_OUTCOME —
+// never PASS on unknown/exceptional state.
+//
+// Defends against: a non-plain-object input (Array, Date, class instance);
+// extra keys beyond the documented {outcome, findings, exitCode} shape; an
+// `outcome`/`findings` property implemented as an accessor (getter/setter)
+// rather than a plain data property — even a non-throwing getter is
+// rejected outright, since its value cannot be trusted as a stable literal
+// and a throwing getter must never be invoked to find that out; a Proxy
+// trap throwing on ANY of the reflection calls below (prototype lookup,
+// own-key enumeration, property-descriptor lookup); a homoglyph or
+// whitespace-padded string that merely LOOKS like "PASS"/"BLOCK"/"ERROR"
+// (strict `===` never matches those, so they fall through to
+// MALFORMED_OUTCOME on their own, no special-casing needed).
+// ---------------------------------------------------------------------------
+const CLASSIFY_OUTCOME_ALLOWED_KEYS = new Set(['outcome', 'findings', 'exitCode']);
+
+function classifyOutcomeMalformed() {
+  return { outcome: 'BLOCK', reason: 'MALFORMED_OUTCOME' };
+}
+
+function classifyOutcome(input) {
+  try {
+    if (input === null || typeof input !== 'object') {
+      return classifyOutcomeMalformed();
+    }
+    const proto = Object.getPrototypeOf(input);
+    if (proto !== Object.prototype && proto !== null) {
+      return classifyOutcomeMalformed();
+    }
+    if (Array.isArray(input)) {
+      return classifyOutcomeMalformed();
+    }
+
+    const ownKeys = Object.getOwnPropertyNames(input);
+    for (const k of ownKeys) {
+      if (!CLASSIFY_OUTCOME_ALLOWED_KEYS.has(k)) {
+        return classifyOutcomeMalformed();
+      }
+    }
+
+    // Read `outcome` and `findings` ONCE into locals, via their property
+    // descriptors so a getter is detected (and rejected) WITHOUT ever being
+    // invoked — this is what makes a throwing getter harmless here: we never
+    // call it.
+    const outcomeDesc = Object.getOwnPropertyDescriptor(input, 'outcome');
+    if (!outcomeDesc || typeof outcomeDesc.get === 'function' || typeof outcomeDesc.set === 'function') {
+      return classifyOutcomeMalformed();
+    }
+    const outcomeVal = outcomeDesc.value;
+
+    const findingsDesc = Object.getOwnPropertyDescriptor(input, 'findings');
+    if (findingsDesc && (typeof findingsDesc.get === 'function' || typeof findingsDesc.set === 'function')) {
+      return classifyOutcomeMalformed();
+    }
+    const findingsVal = findingsDesc ? findingsDesc.value : undefined;
+
+    const exitCodeDesc = Object.getOwnPropertyDescriptor(input, 'exitCode');
+    if (exitCodeDesc && (typeof exitCodeDesc.get === 'function' || typeof exitCodeDesc.set === 'function')) {
+      return classifyOutcomeMalformed();
+    }
+
+    if (outcomeVal === 'PASS') {
+      if (Array.isArray(findingsVal) && findingsVal.length === 0) {
+        return { outcome: 'PASS' };
+      }
+      return classifyOutcomeMalformed();
+    }
+    if (outcomeVal === 'BLOCK') {
+      if (Array.isArray(findingsVal) && findingsVal.length > 0) {
+        return { outcome: 'BLOCK' };
+      }
+      return classifyOutcomeMalformed();
+    }
+    if (outcomeVal === 'ERROR') {
+      return { outcome: 'ERROR' };
+    }
+    return classifyOutcomeMalformed();
+  } catch (_e) {
+    // Any exception anywhere above (a Proxy trap throwing on prototype
+    // lookup, own-key enumeration, or descriptor lookup) -> malformed, never
+    // PASS/BLOCK(real)/ERROR on an exceptional path.
+    return classifyOutcomeMalformed();
+  }
+}
+
+// Maps a `deriveResultOutcome` specific reason code onto the coarse
+// PASS/BLOCK/ERROR vocabulary `classifyOutcome` validates. FAIL_GATE_ERROR
+// (a gate execution/setup failure) is ERROR; PASS is PASS; every other
+// FAIL_* reason (a real classification/content finding) is BLOCK.
+function coarseOutcomeName(specificOutcome) {
+  if (specificOutcome === 'PASS') return 'PASS';
+  if (specificOutcome === 'FAIL_GATE_ERROR') return 'ERROR';
+  return 'BLOCK';
 }
 
 // ---------------------------------------------------------------------------
@@ -543,12 +714,94 @@ function gitRevList(root, base, commit) {
   return out.split(/\r?\n/).filter((l) => l.length > 0);
 }
 
-function gitRefName(root) {
+// ---------------------------------------------------------------------------
+// Ref resolution (spec "Ref resolution" (d)) — total classification: every
+// input maps to a resolved ref string or a REF_UNRESOLVED error, never a
+// silent empty/`HEAD` fallback. `--ref` explicit-but-blank/whitespace-only
+// is treated as omitted, matching `--base`'s same rule.
+// ---------------------------------------------------------------------------
+const RESERVED_REF_NAMES = new Set(['HEAD', 'FETCH_HEAD', 'ORIG_HEAD']);
+
+function gitCheckRefFormatBranch(name) {
   try {
-    return execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+    execFileSync('git', ['check-ref-format', '--branch', name], { encoding: 'utf8' });
+    return true;
   } catch (_e) {
-    return '';
+    return false;
   }
+}
+
+function gitVerifyCommit(root, ref) {
+  try {
+    execFileSync('git', ['rev-parse', '--verify', `${ref}^{commit}`], { cwd: root, encoding: 'utf8' });
+    return true;
+  } catch (_e) {
+    return false;
+  }
+}
+
+function resolveRef(args, root) {
+  const explicit = typeof args.ref === 'string' ? args.ref.trim() : '';
+  let ref = explicit;
+  if (!ref) {
+    // Omitted/blank --ref: the caller (CI/hook) always knows the real
+    // incoming ref, so this fallback exists only for a plain local
+    // invocation. `git symbolic-ref --short HEAD` fails closed under a
+    // detached HEAD (exactly the state a CI checkout of a PR/push commit is
+    // normally in) instead of silently returning the literal string "HEAD".
+    try {
+      ref = execFileSync('git', ['symbolic-ref', '--short', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+    } catch (_e) {
+      return { ref: null, error: 'REF_UNRESOLVED: HEAD is detached and no --ref was supplied' };
+    }
+    if (!ref) {
+      return { ref: null, error: 'REF_UNRESOLVED: git symbolic-ref returned an empty ref name' };
+    }
+  }
+  if (RESERVED_REF_NAMES.has(ref)) {
+    return { ref: null, error: `REF_UNRESOLVED: "${ref}" is a reserved ref name, unsupported by design` };
+  }
+  if (!gitCheckRefFormatBranch(ref)) {
+    return { ref: null, error: `REF_UNRESOLVED: "${ref}" fails "git check-ref-format --branch"` };
+  }
+  if (!gitVerifyCommit(root, ref)) {
+    return { ref: null, error: `REF_UNRESOLVED: "${ref}" does not resolve to a commit` };
+  }
+  return { ref, error: null };
+}
+
+// ---------------------------------------------------------------------------
+// Base derivation (spec "Base derivation" (c)). Ref validation (d) has
+// already run by the time this is called — `resolveRef`'s result is the
+// `ref` argument here. An explicit, non-blank `--base` is used as-is (no
+// merge-base derivation, independent of whether ref resolution succeeded).
+// An omitted/blank `--base` is DERIVED as `git merge-base <ref>
+// <public-base>` (public-base defaults to origin/main); merge-base ERRORING
+// (missing public-base ref, no common ancestor, invalid ref) is
+// BASE_UNRESOLVED. merge-base succeeding with an output equal to `ref`
+// itself is the normal fast-forward case, NOT an error — the derived base is
+// simply that value, and an empty `base..commit` range is handled by the
+// caller the same way an explicit equal base already is.
+// ---------------------------------------------------------------------------
+function resolveBase(args, root, ref) {
+  const raw = typeof args.base === 'string' ? args.base.trim() : '';
+  if (raw) {
+    return { base: raw, error: null };
+  }
+  if (!ref) {
+    return { base: null, error: 'BASE_UNRESOLVED: no resolved ref to derive a base from (and no explicit --base)' };
+  }
+  const publicBase = (typeof args.publicBase === 'string' && args.publicBase.trim()) || 'origin/main';
+  let out;
+  try {
+    out = execFileSync('git', ['merge-base', ref, publicBase], { cwd: root, encoding: 'utf8' }).trim();
+  } catch (e) {
+    return { base: null, error: `BASE_UNRESOLVED: git merge-base ${ref} ${publicBase} failed: ${e.message}` };
+  }
+  if (!out) {
+    return { base: null, error: `BASE_UNRESOLVED: git merge-base ${ref} ${publicBase} produced no output` };
+  }
+  return { base: out, error: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -563,6 +816,7 @@ function parseArgs(argv) {
     else if (a === '--source-root') args.sourceRoot = argv[++i];
     else if (a === '--commit') args.commit = argv[++i];
     else if (a === '--base') args.base = argv[++i];
+    else if (a === '--public-base') args.publicBase = argv[++i];
     else if (a === '--ref') args.ref = argv[++i];
     else if (a === '--terms') args.terms = argv[++i];
     else if (a === '--pr-body-file') args.prBodyFile = argv[++i];
@@ -573,19 +827,22 @@ function parseArgs(argv) {
 
 function runGate(argv, env) {
   env = env || process.env;
-  const results = { gateErrors: [], shapeErrors: [], unclassified: [], overlap: [], hashDrift: [], findings: [] };
+  const results = {
+    gateErrors: [], shapeErrors: [], unclassified: [], overlap: [], hashDrift: [], findings: [],
+    refUnresolved: [], baseUnresolved: [],
+  };
 
   const bypass = detectBypassEnv(env);
   if (bypass.length > 0) {
     results.gateErrors.push(`bypass env var set: ${bypass.join(', ')}`);
-    const outcome = classifyOutcome(results);
+    const outcome = deriveResultOutcome(results);
     return { outcome, results };
   }
 
   const args = parseArgs(argv);
   if (!args.manifest || !args.root) {
     results.gateErrors.push('missing required --manifest and/or --root');
-    return { outcome: classifyOutcome(results), results };
+    return { outcome: deriveResultOutcome(results), results };
   }
 
   // The gate always evaluates SOME commit under test — an omitted --commit
@@ -613,7 +870,7 @@ function runGate(argv, env) {
     manifest = JSON.parse(fs.readFileSync(args.manifest, 'utf8'));
   } catch (e) {
     results.gateErrors.push(`manifest unreadable/invalid JSON: ${e.message}`);
-    return { outcome: classifyOutcome(results), results };
+    return { outcome: deriveResultOutcome(results), results };
   }
 
   let treePaths;
@@ -621,7 +878,40 @@ function runGate(argv, env) {
     treePaths = gitLsTree(args.root, effectiveCommit);
   } catch (e) {
     results.gateErrors.push(`git ls-tree failed: ${e.message}`);
-    return { outcome: classifyOutcome(results), results };
+    return { outcome: deriveResultOutcome(results), results };
+  }
+
+  // Ref/base resolution (spec (c)/(d) — ref validation runs first). Always
+  // runs, unconditionally: there is no PASS path without a resolved base,
+  // and no tip-only scan mode. `resolvedRef`/`resolvedBase` (when non-null)
+  // are reused below by ref-name scanning and commit-range scanning so
+  // resolution never runs twice or disagrees with itself.
+  let resolvedRef = null;
+  const refResolution = resolveRef(args, args.root);
+  if (refResolution.error) {
+    results.refUnresolved.push(refResolution.error);
+  } else {
+    resolvedRef = refResolution.ref;
+  }
+
+  let resolvedBase = null;
+  if (resolvedRef) {
+    const baseResolution = resolveBase(args, args.root, resolvedRef);
+    if (baseResolution.error) {
+      results.baseUnresolved.push(baseResolution.error);
+    } else {
+      resolvedBase = baseResolution.base;
+    }
+  } else {
+    // No resolved ref: derivation (which needs `git merge-base <ref> ...`)
+    // is impossible, but an explicit, non-blank --base does not need a ref
+    // and can still be honored.
+    const explicitBase = typeof args.base === 'string' ? args.base.trim() : '';
+    if (explicitBase) {
+      resolvedBase = explicitBase;
+    } else {
+      results.baseUnresolved.push('BASE_UNRESOLVED: cannot derive a base without a resolved ref (and no explicit --base)');
+    }
   }
 
   const cls = classifyPaths(treePaths, manifest);
@@ -678,14 +968,11 @@ function runGate(argv, env) {
     const findings = scanText(p, { location: `path:${p}`, termRegexes });
     results.findings.push(...findings);
   }
-  // The ref/branch name under test MUST come from the caller (CI/hook),
-  // which always knows the real incoming ref — falling back to the local
-  // checkout's current branch is wrong whenever that checkout is in
-  // detached HEAD (exactly the state a CI checkout of a PR/push commit is
-  // normally in), silently skipping REF_NAME scanning entirely.
-  const ref = args.ref || gitRefName(args.root);
-  if (ref) {
-    results.findings.push(...scanText(ref, { location: 'ref', termRegexes }));
+  // Scan the already-resolved ref name (spec (d)) — if ref resolution
+  // failed, there is nothing meaningful to scan here; the run already
+  // BLOCKs via results.refUnresolved regardless.
+  if (resolvedRef) {
+    results.findings.push(...scanText(resolvedRef, { location: 'ref', termRegexes }));
   }
 
   // PR body scanning (spec Inputs: "commit messages, PR bodies, ...").
@@ -698,12 +985,16 @@ function runGate(argv, env) {
     }
   }
 
-  // Commit identity + message scanning. When --base is given, evaluate the
-  // FULL incoming commit range (base..commit) — not just the tip — so an
-  // intermediate commit's message/identity can't ride in unchecked behind a
-  // clean final commit. Without --base, only the commit under test itself
-  // is checked (identity + no message scan, matching the single-commit
-  // shape the rest of the gate already assumes).
+  // Commit identity + message scanning. The FULL incoming commit range
+  // (resolvedBase..commit) is always evaluated when a base is resolved — not
+  // just the tip — so an intermediate commit's message/identity can't ride
+  // in unchecked behind a clean final commit. There is no more "no --base ->
+  // tip-only" mode (spec (c)): a resolved base is always required for a
+  // PASS, and an unresolved base already BLOCKs via results.baseUnresolved
+  // independent of what happens here. If base resolution failed, we still
+  // check the tip commit's identity so a resolvable-ref/unresolvable-base
+  // run doesn't ALSO silently skip identity enforcement on top of that
+  // failure.
   if (commitIdentityConfigured) {
     const checkOne = (c) => {
       try {
@@ -722,13 +1013,13 @@ function runGate(argv, env) {
       }
     };
 
-    if (args.base) {
+    if (resolvedBase) {
       let commits;
       try {
-        commits = gitRevList(args.root, args.base, effectiveCommit);
+        commits = gitRevList(args.root, resolvedBase, effectiveCommit);
         if (commits.length === 0) commits = [effectiveCommit];
       } catch (e) {
-        results.gateErrors.push(`git rev-list failed for range ${args.base}..${effectiveCommit}: ${e.message}`);
+        results.gateErrors.push(`git rev-list failed for range ${resolvedBase}..${effectiveCommit}: ${e.message}`);
         commits = [];
       }
       for (const c of commits) {
@@ -745,17 +1036,47 @@ function runGate(argv, env) {
     }
   }
 
-  return { outcome: classifyOutcome(results), results };
+  return { outcome: deriveResultOutcome(results), results };
 }
 
 function main() {
   const { outcome, results } = runGate(process.argv.slice(2), process.env);
   const args = parseArgs(process.argv.slice(2));
   const payload = { outcome: outcome.outcome, findings: results.findings || [], exitCode: outcome.exitCode };
+
+  // Self-check (spec "classifyOutcome total classification" (b)): validate
+  // the FINAL payload's coarse shape before trusting it enough to print. The
+  // check's own findings array must independently reflect why a BLOCK
+  // happened (unclassified paths / hash drift / ref / base failures don't
+  // otherwise land in `results.findings`, which is content-scan-only) so a
+  // real BLOCK is never misclassified as MALFORMED_OUTCOME by this check.
+  const coarseFindings = (results.findings || [])
+    .concat((results.unclassified || []).map((p) => ({ label: 'UNCLASSIFIED_PATH', location: p, snippet: p })))
+    .concat((results.hashDrift || []).map((h) => ({ label: 'HASH_DRIFT', location: h.path, snippet: h.side })))
+    .concat((results.refUnresolved || []).map((m) => ({ label: 'REF_UNRESOLVED', location: 'ref', snippet: String(m).slice(0, 80) })))
+    .concat((results.baseUnresolved || []).map((m) => ({ label: 'BASE_UNRESOLVED', location: 'base', snippet: String(m).slice(0, 80) })));
+  const coarsePayload = { outcome: coarseOutcomeName(outcome.outcome), findings: coarseFindings, exitCode: outcome.exitCode };
+  const selfCheck = classifyOutcome(coarsePayload);
+  let finalPayload = payload;
+  let finalExitCode = outcome.exitCode;
+  if (selfCheck.outcome === 'BLOCK' && selfCheck.reason === 'MALFORMED_OUTCOME') {
+    // The gate's own derived payload failed its own paranoid self-check —
+    // this can only mean an internal bug, never a legitimate PASS. Fail
+    // closed rather than emit a payload we can no longer vouch for.
+    finalPayload = { outcome: 'FAIL_GATE_ERROR', findings: results.findings || [], exitCode: 3 };
+    finalExitCode = 3;
+  }
+
   if (args.json) {
-    process.stdout.write(JSON.stringify(payload) + '\n');
+    process.stdout.write(JSON.stringify(finalPayload) + '\n');
   } else {
-    process.stderr.write(`sanitize-gate: ${outcome.outcome}\n`);
+    process.stderr.write(`sanitize-gate: ${finalPayload.outcome}\n`);
+    if (results.refUnresolved && results.refUnresolved.length) {
+      for (const r of results.refUnresolved) process.stderr.write(`  ref unresolved: ${r}\n`);
+    }
+    if (results.baseUnresolved && results.baseUnresolved.length) {
+      for (const b of results.baseUnresolved) process.stderr.write(`  base unresolved: ${b}\n`);
+    }
     if (results.unclassified && results.unclassified.length) {
       process.stderr.write(`  unclassified: ${results.unclassified.join(', ')}\n`);
     }
@@ -774,9 +1095,9 @@ function main() {
     if (results.shapeErrors && results.shapeErrors.length) {
       for (const s of results.shapeErrors) process.stderr.write(`  shape error: ${s}\n`);
     }
-    process.stdout.write(JSON.stringify(payload) + '\n');
+    process.stdout.write(JSON.stringify(finalPayload) + '\n');
   }
-  process.exitCode = outcome.exitCode;
+  process.exitCode = finalExitCode;
 }
 
 module.exports = {
@@ -785,7 +1106,12 @@ module.exports = {
   scanBytes,
   scanText,
   decodeMaybeUtf16,
+  deriveResultOutcome,
   classifyOutcome,
+  percentDecodeOnce,
+  percentDecodeFixpoint,
+  resolveRef,
+  resolveBase,
   runGate,
   loadPrivateTerms,
   buildTermRegex,

@@ -166,6 +166,27 @@ null-byte-interleave heuristic (≥N alternating null bytes across the first
 UTF-8 text before scanning proceeds; the original bytes are also scanned
 as-is (both passes run — decoding is additive, not a replacement).
 
+**Decoded scanning (a).** Every text scan additionally runs over decoded
+variants of the WHOLE string — never a substring extracted by splitting on
+whitespace first (no whitespace tokenization gates decoding, so a decoded
+owner path is still found even when it is not surrounded by whitespace/
+quotes). Variants:
+
+- Percent-decoding, run to a fixpoint, capped at 5 rounds even if a
+  fixpoint has not been reached. Each round decodes every valid `%XX`
+  (case-insensitive hex) and `%uXXXX` escape found anywhere in the string;
+  a malformed sequence (bad hex, a bare trailing `%`) is left literal and
+  the round never throws. A double-encoded owner path (e.g. `%2543...` →
+  `%43...` → `C...`) resolves fully only at depth 2, and its finding
+  records that depth.
+- An unconditional plus-as-space variant (`+` → ` `) — no query-string
+  detection; `+` is always treated as a possible encoded space regardless
+  of context.
+
+Findings from every variant (raw, each percent-decode round, plus-as-space)
+are unioned; each finding records which `variant` (`raw`/`percent`/`plus`/
+`base64`) and `depth` produced it.
+
 | Label | Pattern intent | Canary example |
 |---|---|---|
 | OWNER_PATH | `C:\Users\<name>`, `C:/Users/<name>`, `/home/<name>`, `/Users/<name>`, `%USERPROFILE%\<...>`, `~/<name-looking-segment>`, and URL-encoded equivalents (`%5C`/`%2F` for the separators, `%7E` for `~`) of all of the above | `C:\Users\testcanary\foo` |
@@ -183,25 +204,101 @@ as-is (both passes run — decoding is additive, not a replacement).
 Each finding is labeled `file:line` (or `ref`/`commit-identity`/`pr-body` for
 non-file sources); any finding → FAIL.
 
+## Ref resolution (d)
+
+The ref under test is resolved BEFORE base derivation (below), since base
+derivation needs it. Total classification, every input maps to exactly one
+branch:
+
+- Explicit `--ref` (blank/whitespace-only is treated as omitted).
+- Otherwise, `git symbolic-ref --short HEAD` — this fails closed under a
+  detached HEAD (exactly the state a CI checkout of a PR/push commit is
+  normally in) instead of silently resolving to the literal string `HEAD`.
+- A resolved candidate is then rejected (`REF_UNRESOLVED`) if it is the
+  literal name `HEAD`, `FETCH_HEAD`, or `ORIG_HEAD`; if it fails `git
+  check-ref-format --branch`; or if `git rev-parse --verify <ref>^{commit}`
+  fails (no such ref).
+- **A branch literally named `HEAD`, `FETCH_HEAD`, or `ORIG_HEAD` is
+  unsupported by design** — these are reserved git meta-refs, not ordinary
+  branch names, and a real incoming ref is never expected to collide with
+  them.
+
+## Base derivation (c)
+
+`--base` absent OR blank/whitespace-only is treated as omitted. An omitted
+base is DERIVED as `git merge-base <ref> <public-base>`, where `<public-base>`
+defaults to `origin/main` (override with `--public-base <ref>`). An explicit,
+non-blank `--base` is used as-is (no derivation).
+
+`BASE_UNRESOLVED` (a BLOCK-class outcome, see below) fires when `git
+merge-base` itself errors — a missing/unresolvable `<public-base>`, no common
+ancestor, or an invalid ref. `merge-base` succeeding with an output equal to
+`<ref>` itself is the **normal fast-forward case, not an error** — the
+incoming range is empty (nothing to diff), so the gate still scans the ref
+name and, if there is any range at all, the commit message(s) in it, then
+resolves PASS on a clean tree.
+
+**There is no tip-only scan mode.** A resolved base (explicit or derived) is
+always required — the round-2 behavior of silently checking only the tip
+commit's identity when `--base` was omitted has been removed from both this
+spec and the implementation.
+
 ## Outcome classification (total)
 
-| Outcome | Condition |
-|---|---|
-| PASS | All entries LIFT/LEAVE with no overlap, no hash drift, zero scanner findings |
-| FAIL_UNCLASSIFIED_PATH | A discovered path has no manifest entry at all |
-| FAIL_HASH_DRIFT | A LIFT file's live sha256 (source- or target-side) ≠ manifest's recorded value |
-| FAIL_CONTENT | ≥1 scanner finding (label attached) |
-| FAIL_GATE_ERROR | Scanner crash; `sanitize-private-terms.txt` missing/unreadable/empty; malformed manifest shape; a discovered path matched by more than one manifest entry (overlap — no implicit precedence, see Classification above); `SANITIZE_LIFT_COMMIT_IDENTITY` unset when required; a skip/bypass env var is set (see below) |
+| Outcome | Class | Condition |
+|---|---|---|
+| PASS | — | All entries LIFT/LEAVE with no overlap, no hash drift, a resolved ref and base, zero scanner findings |
+| FAIL_REF_UNRESOLVED | BLOCK | The ref under test could not be resolved (see "Ref resolution" above) |
+| FAIL_BASE_UNRESOLVED | BLOCK | The base under test could not be resolved/derived (see "Base derivation" above) |
+| FAIL_UNCLASSIFIED_PATH | BLOCK | A discovered path has no manifest entry at all |
+| FAIL_HASH_DRIFT | BLOCK | A LIFT file's live sha256 (source- or target-side) ≠ manifest's recorded value |
+| FAIL_CONTENT | BLOCK | ≥1 scanner finding (label attached) |
+| FAIL_GATE_ERROR | ERROR | Scanner crash; `sanitize-private-terms.txt` missing/unreadable/empty; malformed manifest shape; a discovered path matched by more than one manifest entry (overlap — no implicit precedence, see Classification above); `SANITIZE_LIFT_COMMIT_IDENTITY` unset when required; a skip/bypass env var is set (see below) |
 
 **Priority when multiple conditions hold at once.** `FAIL_GATE_ERROR` takes
 precedence over every other outcome (a run with a gate error cannot be
-trusted to have evaluated the rest correctly), then
-`FAIL_UNCLASSIFIED_PATH`, then `FAIL_HASH_DRIFT`, then `FAIL_CONTENT`, then
-`PASS`. This order is itself total and fixed — it is not configurable per
-invocation.
+trusted to have evaluated the rest correctly), then `FAIL_REF_UNRESOLVED`,
+then `FAIL_BASE_UNRESOLVED`, then `FAIL_UNCLASSIFIED_PATH`, then
+`FAIL_HASH_DRIFT`, then `FAIL_CONTENT`, then `PASS`. This order is itself
+total and fixed — it is not configurable per invocation.
 
 Unknown/unexpected internal state → `FAIL_GATE_ERROR`. The gate never
 resolves to PASS on an exception path.
+
+### `classifyOutcome` total classification
+
+Distinct from the outcome-derivation table above (which reads the gate's
+internal accumulator buckets), `classifyOutcome` is a narrower, paranoia-
+hardened pure function that validates an ALREADY-COMPUTED summary payload
+shaped like the gate's own final JSON line — `{ outcome: 'PASS'|'BLOCK'|
+'ERROR', findings: [...], exitCode?: N }` — against tampering or a malformed
+shape, before that payload is trusted enough to print. It is wired into
+`main()` as a self-check on the gate's own derived payload (belt-and-
+suspenders: an internal bug that ever produces a malformed payload is
+forced to `FAIL_GATE_ERROR` rather than silently trusted).
+
+Total classification — every input maps to exactly one of PASS / BLOCK /
+ERROR, with the default branch for anything not exactly matching the rules
+below being BLOCK with `reason: 'MALFORMED_OUTCOME'`:
+
+- `outcome` and `findings` are read ONCE, inside a single `try`/`catch` —
+  any exception anywhere (a Proxy trap on prototype lookup, own-key
+  enumeration, or property-descriptor lookup) → BLOCK `MALFORMED_OUTCOME`.
+- The input must be a plain object: prototype exactly `Object.prototype` or
+  `null` (excludes arrays, `Date`, class instances, and other exotic
+  objects without needing a separate check for each).
+- No own keys other than `outcome`, `findings`, and the documented optional
+  metadata key `exitCode` — enforced on every branch, including ERROR.
+- `outcome`/`findings`/`exitCode`, when present, must be plain DATA
+  properties — an accessor (getter/setter) on any of them is rejected
+  outright without ever invoking it, which is what makes a throwing getter
+  harmless here (it is detected via its property descriptor, never called).
+- PASS only if `outcome === 'PASS'` exact-byte (a homoglyph or a trailing-
+  space variant is simply a different string and never matches) AND
+  `findings` is `Array.isArray` with length 0.
+- BLOCK only if `outcome === 'BLOCK'` AND `findings` is a non-empty array.
+- ERROR only if `outcome === 'ERROR'` (no `findings` shape constraint).
+- Everything else → BLOCK `MALFORMED_OUTCOME`.
 
 **Sole authoritative result.** The gate's only authoritative output is its
 process exit code together with exactly one final line of JSON written to
@@ -216,13 +313,44 @@ as "no findings."
 
 ## Enforcement points
 
-1. **Pre-push hook**, installed into the public repo by the installer's
-   `--hooks` step; runs the gate against the outgoing ref's diff before
+1. **Pre-push hook** (`templates/public-repo/hooks/pre-push`), installed
+   into the public repo by the installer's `--hooks` step; runs before
    `git push` proceeds. Documented as a fast local backstop — CI (below) is
-   authoritative regardless of what the local hook reports.
-2. **GitHub Actions**, on `pull_request` and `push`; scans the full PR diff
-   (files + PR body via the GH API) and the push's commit messages, author/
-   committer identity, and ref name.
+   authoritative regardless of what the local hook reports. Reads every
+   ref-update line git supplies on stdin (`<local_ref> <local_sha>
+   <remote_ref> <remote_sha>`), stripping a trailing `\r` and whitespace
+   from every field (CRLF-safe); zero stdin lines, or any line that does
+   not parse into exactly those four fields, is itself a failure (exit 1),
+   never a silent exit 0. Per line: an all-zero `local_sha` is a ref
+   deletion and is skipped; an all-zero `remote_sha` (new branch on the
+   remote) runs the gate with `--ref <local branch short name>` and no
+   `--base` (the gate derives one per "Base derivation" above); otherwise
+   the gate runs with `--base <remote_sha>` (the remote's current tip).
+   When the remote ref's short name differs from the local one (a `git push
+   local:remote` rename), the gate is run a second time to also scan that
+   name — via `--pr-body-file` (a temp file holding just the remote short
+   name), not `--ref`: a remote-only name is typically not itself a
+   resolvable local git ref, and passing it as `--ref` would trip the ref-
+   validation requirement above (`REF_UNRESOLVED`) for the ordinary,
+   innocent case of a rename push whose remote name isn't also a local
+   branch — blocking on ref-shape instead of on content. Routing it
+   through the existing free-text scan channel runs the same scanners
+   (including `PRIVATE_TERM`) over the same bytes without that false
+   constraint. The overall exit status is the **bitwise OR** of every gate
+   invocation's exit code, accumulated — never reassigned — so an earlier
+   BLOCK is never silently discarded by a later PASS on a different ref in
+   the same push.
+2. **GitHub Actions** (`templates/public-repo/.github/workflows/sanitize.yml`),
+   on `pull_request` (`opened`/`synchronize`/`reopened`/`edited`) and `push`
+   to `main`; scans the full PR diff (files + PR body via the GH API) and
+   the push's commit messages, author/committer identity, and ref name.
+   Checkout uses `fetch-depth: 0` (full history, needed for `git
+   merge-base`) and, for `pull_request` events, checks out the PR's actual
+   head commit (`github.event.pull_request.head.sha`) rather than the
+   default merge ref. `pull_request` runs pass `--base
+   ${{ github.event.pull_request.base.sha }}` explicitly (the PR API always
+   has one); `push` runs omit `--base` entirely and let the gate derive it
+   via `merge-base(ref, origin/main)`.
 3. CI is authoritative — the pre-push hook is a fast local backstop, not a
    substitute. The Actions check is a **required status check on `main`**;
    branch protection blocks merge without it green.
@@ -300,27 +428,39 @@ fixed in round 2 (none were judged not-a-defect).
 
 ## Blind spots
 
-What this gate cannot detect: semantic leaks in prose (a paraphrased
-description of private infrastructure that names no literal term on the
-list); any private name, path, or project identifier not present in
-`sanitize-private-terms.txt` at scan time; secrets embedded in binary files
-(images, compiled artifacts) where byte-pattern scanning is unreliable or
-skipped, and where UTF-16 decode heuristics do not apply; anything in the
-historical git log of the private `claude-memory` repo itself (the gate
-scans the lift-set snapshot and the public repo's own history going forward,
-not the private repo's past commits); GitHub-side required-check enforcement
-itself is configured via the GitHub API/branch-protection settings, which
-this spec assumes are set correctly and does not itself verify at runtime
-(a misconfigured branch-protection rule that doesn't actually require the
-check is outside what `sanitize-gate.js` can detect from within a CI run);
-when `--base` is supplied, only each intermediate commit's **message** and
-**author/committer identity** are scanned across the range — the byte
-content of intermediate trees is not diff-scanned commit-by-commit (only the
-final tree at the commit under test is), so private bytes introduced and
-then reverted within the same incoming range, without appearing in any
-commit message, would not be caught by this gate (this is a scope line, not
-an oversight — see Non-goals: not a general secret-scanning replacement);
-`--source-root` source-side hash verification for `transform` entries only
-runs when the caller supplies it (the lift step does; ordinary public-repo
-CI/pre-push runs do not have a source tree to check and skip that side,
-relying on the lift step's one-time verification at import).
+What this gate cannot detect, and named limitations of the design:
+
+- **Semantic/paraphrased leaks depend on curation.** Semantic leaks in prose
+  (a paraphrased description of private infrastructure that names no
+  literal term on the list), and any private name, path, or project
+  identifier not present in `sanitize-private-terms.txt` at scan time, are
+  not caught — term curation is a human responsibility this gate depends
+  on, not replaces.
+- Secrets embedded in binary files (images, compiled artifacts) where
+  byte-pattern scanning is unreliable or skipped, and where UTF-16 decode
+  heuristics do not apply.
+- Anything in the historical git log of the private `claude-memory` repo
+  itself — the gate scans the lift-set snapshot and the public repo's own
+  history going forward, not the private repo's past commits.
+- **Branch-protection enforcement is an external operational check.**
+  GitHub-side required-check enforcement is configured via the GitHub
+  API/branch-protection settings, which this spec assumes are set correctly
+  and does not itself verify at runtime — a misconfigured branch-protection
+  rule that doesn't actually require the check is outside what
+  `sanitize-gate.js` can detect from within a CI run.
+- Over the resolved `base..commit` range, only each intermediate commit's
+  **message** and **author/committer identity** are scanned — the byte
+  content of intermediate trees is not diff-scanned commit-by-commit (only
+  the final tree at the commit under test is), so private bytes introduced
+  and then reverted within the same incoming range, without appearing in
+  any commit message, would not be caught by this gate (this is a scope
+  line, not an oversight — see Non-goals: not a general secret-scanning
+  replacement).
+- `--source-root` source-side hash verification for `transform` entries
+  only runs when the caller supplies it (the lift step does; ordinary
+  public-repo CI/pre-push runs do not have a source tree to check and skip
+  that side, relying on the lift step's one-time verification at import).
+- **HEAD-named branches are unsupported by design.** A branch literally
+  named `HEAD`, `FETCH_HEAD`, or `ORIG_HEAD` cannot be scanned as a ref
+  under test — see "Ref resolution" above. This is a deliberate scope line,
+  not an oversight: these names collide with git's own reserved meta-refs.
