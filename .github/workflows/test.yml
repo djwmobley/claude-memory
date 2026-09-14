@@ -1818,6 +1818,15 @@ jobs:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
+      - name: Run Codex-review-contract wrapper tests (owner-anchored markers, structured verdict, git-based fence)
+        # Pure-function regression suite for scripts/codex-review.js against
+        # docs/specs/codex-review-contract.md. Covers owner-gated/anchored
+        # HALT/HALT_CLEAR/ledger markers, a structured codex-verdict block
+        # with per-finding fence bucketing (IN_FENCE/OUT_OF_FENCE-lead/
+        # UNCLASSIFIABLE), post-run ledger re-check precedence, and
+        # NUL-delimited git-diff rename parsing. No gh, no codex, no
+        # network, no Postgres.
+        run: node test/test-codex-review.js
       - name: Run public-lift sanitize gate tests
         # docs/specs/public-sanitize-gate.md: total-classification gate for
         # the eventual claude-memory -> memory-manager public lift. Covers
