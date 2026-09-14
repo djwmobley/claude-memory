@@ -226,7 +226,8 @@ function stripQuotedAndFencedBlocks(body) {
   return out.join('\n');
 }
 
-// ── Structured verdict template parsing (round-3 item c) ────────────────
+// ── Structured verdict template parsing (round-3 item c; round-3b item f
+// restores per-finding fields so fence bucketing is total again) ────────
 
 const CODEX_VERDICT_FENCE_RE = /```codex-verdict\r?\n([\s\S]*?)```/g;
 const VERDICT_LINE_RE = {
@@ -234,6 +235,9 @@ const VERDICT_LINE_RE = {
   scope_request: /^scope_request: (.*)$/,
   findings: /^findings: (.*)$/,
 };
+const FINDING_LINE_RE = /^finding: (.*)$/;
+const FINDING_SEVERITIES = ['BLOCKER', 'MAJOR', 'MINOR'];
+const FINDING_TEXT_MAX_CHARS = 200;
 // Round 2's widening phrases (kept as a belt-and-suspenders prose scan);
 // the primary fix for round-2 item 3 (widening requests in free text a
 // regex can never fully enumerate) is the `scope_request` enum field
@@ -259,15 +263,56 @@ function hasNonAscii(s) {
 }
 
 /**
+ * Round-3b item f: `finding: <severity> | <path> | <text>`, pipe-delimited
+ * (whitespace around `|` is delimiter formatting, trimmed away — not part
+ * of any value). `severity` is matched exact-byte against the enum after
+ * trimming; `text` is capped at 200 chars. Path validity/fence membership
+ * is NOT decided here — that is `classifyFindingPath`'s job, since it
+ * needs the fence.
+ */
+function parseFindingLine(raw) {
+  const parts = String(raw).split('|');
+  if (parts.length !== 3) return { valid: false, reason: 'FINDING_MALFORMED' };
+  const severity = parts[0].trim();
+  const findingPath = parts[1].trim();
+  const text = parts[2].trim();
+  if (!FINDING_SEVERITIES.includes(severity)) return { valid: false, reason: 'FINDING_SEVERITY_UNKNOWN' };
+  if (text.length > FINDING_TEXT_MAX_CHARS) return { valid: false, reason: 'FINDING_TEXT_TOO_LONG' };
+  return { valid: true, finding: { severity, path: findingPath, text } };
+}
+
+/**
+ * Round-3b item f: classify one finding's path against the (d) fence.
+ * UNCLASSIFIABLE (empty/unparseable, non-ASCII, absolute, or containing a
+ * `..` segment) is checked BEFORE fence membership — a total
+ * classification of the path itself, independent of what's in the fence.
+ */
+function classifyFindingPath(rawPath, fence) {
+  if (!rawPath) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_EMPTY' };
+  if (hasNonAscii(rawPath)) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_NON_ASCII' };
+  const slashed = rawPath.replace(/\\/g, '/');
+  if (slashed.startsWith('/')) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_ABSOLUTE' };
+  if (/^[A-Za-z]:/.test(rawPath)) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_ABSOLUTE' };
+  const segments = slashed.split('/');
+  if (segments.some((seg) => seg === '..')) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_DOTDOT' };
+  if (segments.some((seg) => seg === '')) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_EMPTY_SEGMENT' };
+  if (!fence || typeof fence.has !== 'function') return { bucket: 'UNCLASSIFIABLE', reason: 'FENCE_UNAVAILABLE' };
+  return fence.has(rawPath) ? { bucket: 'IN_FENCE' } : { bucket: 'OUT_OF_FENCE' };
+}
+
+/**
  * Field values are matched exact-byte, case-sensitive, no surrounding
  * whitespace, no non-ASCII bytes (which also rejects zero-width
- * characters, since those are non-ASCII).
+ * characters, since those are non-ASCII). Round-3b item f: the number of
+ * `finding:` lines must equal the `findings:` count exactly, else
+ * NEEDS_OWNER — an internal-consistency guard against a garbled response.
  */
 function parseCodexVerdictBlock(blockText) {
   const lines = String(blockText || '')
     .split(/\r\n|\r|\n/)
     .filter((l) => l.length > 0);
   const fields = {};
+  const findingLines = [];
   for (const line of lines) {
     let matched = false;
     for (const key of Object.keys(VERDICT_LINE_RE)) {
@@ -279,7 +324,13 @@ function parseCodexVerdictBlock(blockText) {
         break;
       }
     }
-    if (!matched) return { valid: false, reason: 'UNRECOGNIZED_LINE_IN_VERDICT_BLOCK' };
+    if (matched) continue;
+    const fm = line.match(FINDING_LINE_RE);
+    if (fm) {
+      findingLines.push(fm[1]);
+      continue;
+    }
+    return { valid: false, reason: 'UNRECOGNIZED_LINE_IN_VERDICT_BLOCK' };
   }
   for (const key of Object.keys(VERDICT_LINE_RE)) {
     if (fields[key] === undefined) return { valid: false, reason: `MISSING_FIELD_${key.toUpperCase()}` };
@@ -298,25 +349,43 @@ function parseCodexVerdictBlock(blockText) {
   if (!/^\d+$/.test(fields.findings)) {
     return { valid: false, reason: 'FINDINGS_NOT_INTEGER' };
   }
+  const findingsCount = parseInt(fields.findings, 10);
+  if (findingLines.length !== findingsCount) {
+    return { valid: false, reason: 'FINDINGS_COUNT_MISMATCH' };
+  }
+  const findings = [];
+  for (const raw of findingLines) {
+    const fp = parseFindingLine(raw);
+    if (!fp.valid) return { valid: false, reason: fp.reason };
+    findings.push(fp.finding);
+  }
   return {
     valid: true,
     verdict: fields.verdict,
     scopeRequest: fields.scope_request,
-    findings: parseInt(fields.findings, 10),
+    findingsCount,
+    findings,
   };
 }
 
 /**
- * Round-3 item c, total classification of the structured verdict:
- *   - block missing / duplicated / malformed / unknown-value -> NEEDS_OWNER
- *   - verdict=BLOCK (once validly parsed) -> STRUCTURED_BLOCK, unconditionally
+ * Round-3 item c (structure) + round-3b item f (per-finding fence
+ * bucketing), total classification of the structured verdict:
+ *   - block missing / duplicated / malformed / unknown-value, or any
+ *     finding path UNCLASSIFIABLE -> NEEDS_OWNER
+ *   - verdict=BLOCK requires >=1 IN_FENCE BLOCKER finding -> STRUCTURED_BLOCK;
+ *     BLOCK with zero IN_FENCE BLOCKERs (e.g. only OUT_OF_FENCE ones, which
+ *     are architecture-opinion leads per R1 and never block) -> NEEDS_OWNER,
+ *     never silently auto-blocked and never silently approved.
  *   - verdict=APPROVE -> STRUCTURED_APPROVE only if scope_request=none,
- *     findings=0, no severity word in the remaining prose, and the
- *     widening regex does not fire either; otherwise -> NEEDS_OWNER.
- * The widening/severity scan can only push APPROVE toward NEEDS_OWNER,
- * never move NEEDS_OWNER back to APPROVE.
+ *     zero IN_FENCE BLOCKER findings (OUT_OF_FENCE findings of any
+ *     severity are reported as leads and never block), no severity word in
+ *     the remaining prose, and the widening regex does not fire; otherwise
+ *     -> NEEDS_OWNER.
+ * The widening/severity scan and the fence-based finding checks can only
+ * push APPROVE toward NEEDS_OWNER, never move NEEDS_OWNER back to APPROVE.
  */
-function classifyStructuredVerdict(stdout) {
+function classifyStructuredVerdict(stdout, fence) {
   const text = typeof stdout === 'string' ? stdout : '';
   const blocks = findCodexVerdictBlocks(text);
   if (blocks.length === 0) return { bucket: 'NEEDS_OWNER', reason: 'VERDICT_BLOCK_MISSING' };
@@ -325,16 +394,30 @@ function classifyStructuredVerdict(stdout) {
   const parsed = parseCodexVerdictBlock(blocks[0]);
   if (!parsed.valid) return { bucket: 'NEEDS_OWNER', reason: parsed.reason };
 
+  const findings = [];
+  for (const f of parsed.findings) {
+    const pc = classifyFindingPath(f.path, fence);
+    if (pc.bucket === 'UNCLASSIFIABLE') {
+      return { bucket: 'NEEDS_OWNER', reason: pc.reason };
+    }
+    findings.push(Object.assign({}, f, { fenceBucket: pc.bucket }));
+  }
+  const inFenceBlockers = findings.filter((f) => f.severity === 'BLOCKER' && f.fenceBucket === 'IN_FENCE');
+  const leads = findings.filter((f) => f.fenceBucket === 'OUT_OF_FENCE');
+
   if (parsed.verdict === 'BLOCK') {
-    return { bucket: 'STRUCTURED_BLOCK', reason: null, verdict: parsed };
+    if (inFenceBlockers.length === 0) {
+      return { bucket: 'NEEDS_OWNER', reason: 'BLOCK_WITHOUT_IN_FENCE_BLOCKER' };
+    }
+    return { bucket: 'STRUCTURED_BLOCK', reason: null, verdict: parsed, findings, leads };
   }
 
   // verdict === 'APPROVE'
   if (parsed.scopeRequest !== 'none') {
     return { bucket: 'NEEDS_OWNER', reason: 'SCOPE_REQUEST_NOT_NONE' };
   }
-  if (parsed.findings !== 0) {
-    return { bucket: 'NEEDS_OWNER', reason: 'APPROVE_WITH_FINDINGS' };
+  if (inFenceBlockers.length > 0) {
+    return { bucket: 'NEEDS_OWNER', reason: 'APPROVE_WITH_IN_FENCE_BLOCKER' };
   }
   const withoutVerdictBlock = text.replace(/```codex-verdict\r?\n[\s\S]*?```/g, '');
   const prose = stripQuotedAndFencedBlocks(withoutVerdictBlock);
@@ -344,7 +427,7 @@ function classifyStructuredVerdict(stdout) {
   if (WIDEN_TEXT_RE.test(prose)) {
     return { bucket: 'NEEDS_OWNER', reason: 'WIDENING_TEXT_IN_PROSE' };
   }
-  return { bucket: 'STRUCTURED_APPROVE', reason: null, verdict: parsed };
+  return { bucket: 'STRUCTURED_APPROVE', reason: null, verdict: parsed, findings, leads };
 }
 
 // ── Total classification, preconditions (round-3 items a/b/d retire A1-A4,
@@ -416,34 +499,48 @@ function classify(ctx) {
     };
   }
 
-  return classifyStructuredVerdict(stdout);
+  return classifyStructuredVerdict(stdout, fenceResult && fenceResult.fence);
 }
 
-// ── Ledger (C8-C11; round-3 item b re-anchors HALT/HALT_CLEAR) ──────────
+// ── Ledger (C8-C11; round-3 item b re-anchors HALT/HALT_CLEAR; round-3b
+// item e extends owner-anchoring to ledger-outcome markers themselves) ──
 
 function sha256(s) {
   return crypto.createHash('sha256').update(String(s), 'utf8').digest('hex');
 }
 
 const ROUND_MARKER_RE = /<!--\s*codex-review-round:(\d+)\s+sha:(\S+)\s+hash:(\S+)\s*-->/;
+const ROUND_MARKER_ANCHOR_RE = /^<!--\s*codex-review-round:(\d+)\s+sha:(\S+)\s+hash:(\S+)\s*-->/;
 const VERDICT_BODY_RE = /<!--\s*codex-review-verdict-begin\s*-->\n([\s\S]*?)\n<!--\s*codex-review-verdict-end\s*-->/;
 const HALT_MARKER_ANCHOR_RE = /^<!--\s*codex-review-halt\s+round:(\d+)\s+sha:([0-9a-f]{40})\s*-->/;
 const HALT_CLEARED_MARKER_ANCHOR_RE = /^<!--\s*codex-review-halt-cleared\s+round:(\d+)\s+sha:([0-9a-f]{40})\s*-->/;
 // Any comment carrying one of the wrapper's marker prefixes ANYWHERE in its
 // body, used only to detect a marker-shaped comment that failed full
-// recognition (round-3 item a's UNKNOWN_LEDGER_STATE branch) — never used
-// on its own to grant recognition.
+// recognition (round-3 item a's UNKNOWN_LEDGER_STATE branch, and round-3b
+// item e's FORGED_OR_MALFORMED ledger entries) — never used on its own to
+// grant recognition.
 const WRAPPER_MARKER_PREFIX_RE = /<!--\s*codex-review-(round|halt|halt-cleared)\b/;
+
+/**
+ * Shared anchoring primitive for every wrapper marker kind (HALT,
+ * HALT_CLEAR, and — round-3b item e — the ledger-outcome round marker
+ * itself): after stripping fenced/indented/quoted blocks OUT ENTIRELY,
+ * does the given regex match as the FIRST non-whitespace content of what
+ * remains? HTML comments are never stripped — the markers themselves are
+ * HTML comments.
+ */
+function firstAnchoredMatch(body, anchorRe) {
+  const stripped = stripQuotedAndFencedBlocks(body).replace(/^\s+/, '');
+  return stripped.match(anchorRe);
+}
 
 /**
  * Round-3 item b: a HALT or HALT_CLEAR marker is recognized only when ALL
  * hold: the comment's author is the repo owner (exact, case-sensitive); the
  * comment's body does NOT also contain a ledger-outcome (`codex-review-
  * round:`) marker anywhere (so a ledger comment can never double as a
- * clear); and, after stripping fenced/indented/quoted blocks entirely, the
- * marker (with its round+sha fields) is the FIRST non-whitespace content
- * of what remains. HTML comments are never stripped by this step — the
- * markers themselves are HTML comments.
+ * clear); and the marker (with its round+sha fields) is the FIRST
+ * non-whitespace content per `firstAnchoredMatch`.
  */
 function recognizeAnchoredMarker(comment, ownerLogin, anchorRe) {
   if (!comment) return null;
@@ -451,18 +548,41 @@ function recognizeAnchoredMarker(comment, ownerLogin, anchorRe) {
   const login = comment.author && comment.author.login;
   if (!ownerLogin || login !== ownerLogin) return null;
   if (ROUND_MARKER_RE.test(body)) return null;
-  const stripped = stripQuotedAndFencedBlocks(body).replace(/^\s+/, '');
-  const m = stripped.match(anchorRe);
+  const matched = firstAnchoredMatch(body, anchorRe);
+  if (!matched) return null;
+  return { round: parseInt(matched[1], 10), headSha: matched[2] };
+}
+
+/**
+ * Round-3b item e: a ledger-outcome (`codex-review-round:`) marker is
+ * recognized as a genuine entry only when owner-authored AND anchored as
+ * the FIRST non-whitespace content (same gate as HALT/HALT_CLEAR, applied
+ * symmetrically). Unlike `recognizeAnchoredMarker`, this does NOT exclude
+ * on "body also contains a round marker" — that check exists so a *ledger*
+ * comment can never double as a halt-clear; it is meaningless applied to
+ * the round marker recognizing itself. A round-marker-bearing comment that
+ * fails this gate (forged authorship, or the marker not being the body's
+ * first content) is FORGED_OR_MALFORMED: it is never returned here, so it
+ * never enters `parseLedger`'s `entries` and never satisfies a round
+ * precondition — the caller is responsible for also treating it as an
+ * UNKNOWN_LEDGER_STATE trigger in the post-run re-check (item a).
+ */
+function recognizeAnchoredRoundEntry(comment, ownerLogin) {
+  if (!comment) return null;
+  const body = typeof comment.body === 'string' ? comment.body : '';
+  const login = comment.author && comment.author.login;
+  if (!ownerLogin || login !== ownerLogin) return null;
+  const m = firstAnchoredMatch(body, ROUND_MARKER_ANCHOR_RE);
   if (!m) return null;
-  return { round: parseInt(m[1], 10), headSha: m[2] };
+  return { round: parseInt(m[1], 10), headSha: m[2], storedHash: m[3] };
 }
 
 /**
  * @param {Array} comments - PR comments in chronological (creation) order,
  *   each `{ id, body, author?: { login } }`.
  * @param {{ ownerLogin?: string }} [opts] - the repo owner's login; any
- *   marker authored by anyone else is never recognized (round-3 item b
- *   extends this, previously halt-clear-only, to HALT markers too).
+ *   marker authored by anyone else is never recognized (round-3 item b:
+ *   HALT/HALT_CLEAR; round-3b item e: ledger-outcome round markers too).
  */
 function parseLedger(comments, opts) {
   opts = opts || {};
@@ -480,19 +600,26 @@ function parseLedger(comments, opts) {
   comments.forEach((c, idx) => {
     const body = c && typeof c.body === 'string' ? c.body : '';
 
-    const m = body.match(ROUND_MARKER_RE);
-    if (m) {
-      const round = parseInt(m[1], 10);
-      const headSha = m[2];
-      const storedHash = m[3];
-      const fenced = body.match(VERDICT_BODY_RE);
-      const bodyForHash = fenced ? fenced[1].trim() : '';
-      const recomputed = sha256(bodyForHash);
-      if (recomputed !== storedHash) {
-        tampered = true;
-        tamperReason = tamperReason || 'LEDGER_TAMPERED';
+    // Round-3b item e: only an owner-authored, first-content-anchored
+    // round marker becomes a genuine ledger entry. A round-marker-shaped
+    // comment that fails this (forged authorship, buried in a quote/fence)
+    // is silently excluded here — FORGED_OR_MALFORMED, never entries, never
+    // satisfies a round precondition.
+    if (ROUND_MARKER_RE.test(body)) {
+      const recognized = recognizeAnchoredRoundEntry(c, ownerLogin);
+      if (recognized) {
+        const { round, headSha, storedHash } = recognized;
+        const fenced = body.match(VERDICT_BODY_RE);
+        const bodyForHash = fenced ? fenced[1].trim() : '';
+        const recomputed = sha256(bodyForHash);
+        if (recomputed !== storedHash) {
+          tampered = true;
+          tamperReason = tamperReason || 'LEDGER_TAMPERED';
+        }
+        entries.push({ round, headSha, storedHash, verdictText: bodyForHash });
       }
-      entries.push({ round, headSha, storedHash, verdictText: bodyForHash });
+      // else: FORGED_OR_MALFORMED — excluded; see reclassifyLedgerBeforePosting
+      // for the post-run UNKNOWN_LEDGER_STATE trigger this feeds.
     }
 
     const halt = recognizeAnchoredMarker(c, ownerLogin, HALT_MARKER_ANCHOR_RE);
@@ -715,21 +842,29 @@ function reclassifyLedgerBeforePosting({ owner, repo, prNumber, round, headSha, 
   let sawDup = false;
   let sawUnknown = false;
   for (const c of newComments) {
-    const m = c.body.match(ROUND_MARKER_RE);
-    if (m) {
-      const entryRound = parseInt(m[1], 10);
-      const entrySha = m[2];
-      if (entryRound === round && entrySha === headSha) {
-        sawDup = true;
-      } else if (entryRound === round && entrySha !== headSha) {
-        sawStale = true;
-      } else {
-        // A well-formed ledger marker for some other round appearing
-        // mid-run is outside normal sequential play — default to the
-        // ambiguous/failure branch rather than silently ignoring it.
-        sawUnknown = true;
+    if (ROUND_MARKER_RE.test(c.body)) {
+      // Round-3b item e: only an owner-authored, first-content-anchored
+      // round marker is a genuine entry — never the raw regex match alone
+      // (that was BLOCKING 1 from the independent review: a non-owner
+      // comment with a self-consistent hash was accepted as real). A
+      // marker-shaped comment that fails this recognition is
+      // FORGED_OR_MALFORMED and falls through to the wrapper-prefix
+      // catch-all below, same as any other malformed marker.
+      const recognized = recognizeAnchoredRoundEntry(c, ownerLogin);
+      if (recognized) {
+        if (recognized.round === round && recognized.headSha === headSha) {
+          sawDup = true;
+        } else if (recognized.round === round && recognized.headSha !== headSha) {
+          sawStale = true;
+        } else {
+          // A well-formed, owner-authored ledger marker for some other
+          // round appearing mid-run is outside normal sequential play —
+          // default to the ambiguous/failure branch rather than silently
+          // ignoring it.
+          sawUnknown = true;
+        }
+        continue;
       }
-      continue;
     }
     if (WRAPPER_MARKER_PREFIX_RE.test(c.body)) {
       sawUnknown = true;
@@ -771,7 +906,24 @@ function assemblePrompt({ pr, fence, round, priorVerdict, diff }) {
     lines.push('', '## Round-1 response (verbatim)', priorVerdict.raw);
   }
   lines.push('', '# Required verdict template (output ONLY this fenced block; free-form explanation may precede it, but no BLOCKER/CRITICAL/SECURITY/VULNERAB wording and no request to widen scope)');
-  lines.push('```codex-verdict', 'verdict: APPROVE|BLOCK', 'scope_request: none|widen|another_pass', 'findings: <integer count of BLOCKER findings>', '```');
+  lines.push(
+    '```codex-verdict',
+    'verdict: APPROVE|BLOCK',
+    'scope_request: none|widen|another_pass',
+    'findings: <integer count of finding: lines below, including zero>',
+    'finding: <BLOCKER|MAJOR|MINOR> | <path from the scope fence above> | <remedy, <=200 chars>',
+    '```'
+  );
+  lines.push(
+    '',
+    '# Finding rules',
+    '- Emit one `finding:` line per finding; `findings:` must equal the count of those lines exactly.',
+    '- `path` must be one of the scope-fence paths listed above, repo-relative, no leading `/`, no `..` segment.',
+    '- A finding whose path is outside the scope fence is recorded as a lead about a file you are not',
+    '  reviewing here — it is never grounds to BLOCK on its own (your own architecture preferences about',
+    '  files outside this diff are out of scope, per Role above).',
+    '- `verdict: BLOCK` requires at least one `BLOCKER` finding whose path is inside the scope fence.'
+  );
   lines.push('', '# Diff', diff);
   return lines.join('\n');
 }
@@ -983,11 +1135,14 @@ module.exports = {
   computeDiffContent,
   stripQuotedAndFencedBlocks,
   findCodexVerdictBlocks,
+  parseFindingLine,
+  classifyFindingPath,
   parseCodexVerdictBlock,
   classifyStructuredVerdict,
   classify,
   preconditionBucket,
   recognizeAnchoredMarker,
+  recognizeAnchoredRoundEntry,
   renderLedgerComment,
   renderHaltComment,
   parseLedger,

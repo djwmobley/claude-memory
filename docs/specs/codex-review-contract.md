@@ -44,6 +44,39 @@ per-finding file/text fields the structured verdict no longer carries —
 see "Total classification of wrapper outcomes" and "Adversary findings"
 below for the disposition of each retired finding.
 
+**Round 3b amendment (2026-09-13, owner-approved):** an independent
+reviewer examined round 3 (commit `0e751c2`) before merge and found two
+blocking defects. Both are closed here, without reopening anything round
+3 already fixed:
+
+- **(e) Ledger entries are owner-gated, symmetric with (b).** Round 3's
+  `parseLedger` accepted any comment matching the `codex-review-round:`
+  marker as a genuine entry with no authorship check at all — unlike
+  HALT/HALT_CLEAR, which (b) already gated to the repo owner. The stored
+  hash is a plain `sha256` of the comment's own body: a self-consistency
+  check against post-hoc *edits*, not an authenticity check against
+  *forgery*, since anyone can compute `sha256` of text they wrote
+  themselves. A forged round-1 entry could skip the real round-1 review
+  and prompt-inject fabricated "prior response" content into round 2's
+  actual Codex invocation. Ledger-outcome markers are now recognized only
+  when owner-authored and first-content-anchored, exactly like HALT/
+  HALT_CLEAR; a marker-bearing comment that fails this is
+  `FORGED_OR_MALFORMED` and is excluded, never entered, never trusted.
+- **(f) Per-finding fields restored, with fence bucketing total again.**
+  Retiring per-finding fields in round 3 (item c) closed A3/A4/F17 but
+  reopened a new gap: `STRUCTURED_BLOCK` became unconditional on any
+  parsed `verdict: BLOCK`, with no way to tell an in-scope BLOCKER from
+  Codex's own out-of-scope architectural opinion (R1). The `codex-verdict`
+  block regains repeated `finding:` lines, each independently classified
+  against the (d) fence as `IN_FENCE`, `OUT_OF_FENCE` (a lead, never a
+  block, per R1), or `UNCLASSIFIABLE` (escalates to `NEEDS_OWNER`).
+  `STRUCTURED_BLOCK` now requires at least one `IN_FENCE` `BLOCKER`.
+
+See "Verdict shape", "Total classification of wrapper outcomes", "Round
+ledger", and "Marker anchoring" below for the full mechanics, and "Round-3
+items resurfaced and closed by the round-3b amendment" for the mapping
+back to the reviewer's two findings.
+
 ## Purpose
 
 A scripted, non-interactive way to have Codex review a pull request's diff
@@ -103,7 +136,7 @@ Built in this fixed order, all from data the wrapper already resolved
 5. **The diff** — `git diff <base>...<head>` for the PR, scoped to the
    changed-file list from step 2.
 
-## Verdict shape (round-3 item c)
+## Verdict shape (round-3 item c; round-3b item f restores per-finding lines)
 
 Codex's stdout must contain **exactly one** fenced block labeled
 `codex-verdict`:
@@ -112,7 +145,8 @@ Codex's stdout must contain **exactly one** fenced block labeled
 ```codex-verdict
 verdict: APPROVE|BLOCK
 scope_request: none|widen|another_pass
-findings: <integer count of BLOCKER findings>
+findings: <integer count of finding: lines below, including zero>
+finding: <BLOCKER|MAJOR|MINOR> | <path> | <text>
 ```
 ````
 
@@ -128,8 +162,45 @@ Parsing rules, all enforced byte-exact:
 - `verdict` must be exactly `APPROVE` or `BLOCK`; `scope_request` must be
   exactly `none`, `widen`, or `another_pass`; `findings` must be a
   non-negative integer (ASCII digits only).
-- Any other line inside the block (duplicated field, unrecognized key) is
-  a shape failure.
+- Any other line inside the block that is neither a recognized field line
+  nor a `finding:` line (duplicated field, unrecognized key) is a shape
+  failure.
+- **`finding:` lines (round-3b item f)** — zero or more repeated lines,
+  pipe-delimited: `finding: <severity> | <path> | <text>`. The number of
+  `finding:` lines must equal the `findings:` count exactly, else a shape
+  failure (an internal-consistency guard against a garbled response).
+  `severity` is matched exact-byte against `BLOCKER`/`MAJOR`/`MINOR`
+  after trimming pipe-delimiter whitespace; `text` is capped at 200
+  characters. `path` is NOT validated here — see "Per-finding fence
+  bucketing" below, since that needs the fence.
+
+### Per-finding fence bucketing (round-3b item f)
+
+Each parsed finding's `path` is classified in this fixed order — a total
+classification, `UNCLASSIFIABLE` the catch-all default:
+
+1. `UNCLASSIFIABLE` — the path is empty, contains a non-ASCII byte, is
+   absolute (`/...` or a Windows drive letter like `C:...`), contains a
+   `..` segment, or contains an empty segment (e.g. a doubled slash).
+   Escalates the whole verdict to `NEEDS_OWNER` immediately — never
+   guessed at.
+2. `IN_FENCE` — the (normalized, per "Path fence equality" below) path is
+   in the round's scope fence.
+3. `OUT_OF_FENCE` — a syntactically valid path not in the fence. Recorded
+   as a **lead**, never a block — Codex's opinion about a file outside
+   the reviewed diff is exactly the kind of "architecture preference"
+   Role framing (R1) puts out of scope, so it can inform the human
+   reviewer without being able to halt the PR on its own.
+
+Verdict-level consequences:
+
+- `STRUCTURED_BLOCK` requires `verdict: BLOCK` **and** at least one
+  `IN_FENCE` `BLOCKER` finding. `BLOCK` with zero `IN_FENCE` `BLOCKER`s
+  (e.g. only `OUT_OF_FENCE` ones) is `NEEDS_OWNER` — never
+  auto-converted to a block, never silently approved.
+- `STRUCTURED_APPROVE` additionally requires zero `IN_FENCE` `BLOCKER`
+  findings. `OUT_OF_FENCE` findings of any severity may coexist with an
+  `APPROVE` and are surfaced as leads.
 
 Free-form explanatory prose may appear outside the block, but the wrapper
 scans it (after stripping fenced/indented/quoted blocks) for the severity
@@ -170,17 +241,24 @@ the ones below it:
    content problem). Checked before any parsing of the verdict body
    (D12).
 9. Structured-verdict classification of the `codex-verdict` block
-   (round-3 item c), itself a nested total classification:
-   - `STRUCTURED_BLOCK` — the block parses validly and `verdict: BLOCK`.
-     Unconditional once parsed — no BLOCK verdict is ever further gated
-     on `scope_request`, `findings`, or prose content.
-   - `STRUCTURED_APPROVE` — the block parses validly, `verdict: APPROVE`,
-     `scope_request: none`, `findings: 0`, and the remaining prose
+   (round-3 item c structure; round-3b item f per-finding fence
+   bucketing), itself a nested total classification:
+   - `NEEDS_OWNER` — the block missing, duplicated, or malformed; an
+     unknown field value; a `finding:` line count that disagrees with
+     `findings:`; a malformed `finding:` line; or any finding's `path`
+     UNCLASSIFIABLE (see "Per-finding fence bucketing"). Checked first —
+     shape/path problems are never masked by a verdict-kind branch below.
+   - `STRUCTURED_BLOCK` — `verdict: BLOCK` **and** at least one `IN_FENCE`
+     `BLOCKER` finding. `BLOCK` with zero `IN_FENCE` `BLOCKER`s is
+     `NEEDS_OWNER` instead (see "Per-finding fence bucketing") — never
+     auto-blocked, never silently approved.
+   - `STRUCTURED_APPROVE` — `verdict: APPROVE`, `scope_request: none`,
+     zero `IN_FENCE` `BLOCKER` findings (`OUT_OF_FENCE` findings of any
+     severity may coexist, reported as leads), and the remaining prose
      carries neither a severity word nor scope-widening phrasing.
-   - `NEEDS_OWNER` — every other case: the block missing, duplicated, or
-     malformed; an unknown field value; an APPROVE with `scope_request`
-     ≠ `none` or `findings` > 0; or a severity/widening word in the
-     prose. This is the total-classification default branch — an
+   - Every other APPROVE case (`scope_request` ≠ `none`, an `IN_FENCE`
+     BLOCKER present, or a severity/widening word in the prose) is also
+     `NEEDS_OWNER`. This is the total-classification default branch — an
      unrecognized shape is never silently approved.
 10. `VALID_BLOCK` — `STRUCTURED_BLOCK`, posted directly (round-3 item c
     skips the post-run re-check below for a BLOCK; see "Round ledger").
@@ -235,6 +313,21 @@ comment-id space for snapshot/re-read diffing):
   -->` sentinel lines — not a ``` fence, since the verdict body itself now
   legitimately contains a `codex-verdict`-fenced block (round-3 item c)
   that would break naive backtick-counting re-extraction.
+- **Ledger entries are owner-gated (round-3b item e).** A
+  `codex-review-round:` marker is accepted into `ledger.entries` only
+  when it passes the exact same recognition gate as HALT/HALT_CLEAR (see
+  "Marker anchoring" below): owner-authored, and the marker is the FIRST
+  non-whitespace content of the comment after stripping fenced/indented/
+  quoted blocks. The stored `hash` alone is not sufficient — it detects a
+  post-hoc *edit* to an already-trusted comment, not *forged authorship*
+  of a comment that was never trusted to begin with, since anyone can
+  compute `sha256` of text they wrote themselves. A marker-shaped comment
+  that fails this gate is `FORGED_OR_MALFORMED`: it is silently excluded
+  from `entries` (so it can never satisfy a round precondition or supply
+  a round-2 prompt's "prior response"), and — critically — it is also
+  never trusted for `DUPLICATE`/`STALE_SHA` classification in the
+  post-run re-check below; it instead counts as an
+  `UNKNOWN_LEDGER_STATE` trigger there (friction, never approve).
 - **Pre-run snapshot, post-run re-check (round-3 item a).** Before
   invoking Codex, the wrapper takes a snapshot of every existing PR
   comment id. Immediately before posting an APPROVE, it re-reads ALL PR
@@ -300,28 +393,37 @@ correctly-anchored clear for that exact `round`/`headSha` has since been
 posted (see "Marker anchoring"). No agent may post that clearing marker
 itself; only a human owner action does.
 
-### Marker anchoring (round-3 item b)
+### Marker anchoring (round-3 item b; round-3b item e extends it to the
+### ledger-outcome marker itself)
 
-A HALT or HALT_CLEAR marker is recognized **only** when ALL of the
-following hold — applied identically to both marker kinds, closing the
-round-2 gap where only HALT_CLEAR was owner-gated:
+A HALT, HALT_CLEAR, **or ledger-outcome (`codex-review-round:`)** marker
+is recognized **only** when ALL of the following hold — applied
+identically to all three marker kinds, closing both the round-2 gap
+(only HALT_CLEAR was owner-gated) and the round-3 gap (ledger-outcome
+markers were not gated at all):
 
 - The comment's author login is **exactly** (case-sensitive) the repo
   owner's login. A marker from anyone else is never recognized — this
   also means the wrapper's own halt/ledger comments only work because
   `gh` runs authenticated as the repo owner.
-- The comment's body does **not** also contain a ledger-outcome
-  (`codex-review-round:`) marker anywhere — a ledger comment (posted by
+- For HALT/HALT_CLEAR specifically: the comment's body does **not** also
+  contain a ledger-outcome marker anywhere — a ledger comment (posted by
   the wrapper, always owner-authenticated) can never double as a clear,
   even if a quoted finding inside it happens to contain clear-marker-like
-  text.
+  text. (This check is meaningless applied to the ledger-outcome marker
+  recognizing itself, and is not applied there.)
 - After stripping ``` fences, `~~~` fences, 4-space/tab-indented code
   blocks, and blockquote (`>`) lines OUT ENTIRELY (never unwrapped —
-  removed), the marker with its `round:<n> sha:<40hex>` fields is the
+  removed), the marker with its `round:<n> sha:<...>` fields is the
   FIRST non-whitespace content of what remains. HTML comments are never
   stripped by this step, since the markers themselves are HTML comments.
 - A HALT_CLEAR only lifts the HALT whose `round` and `sha` match exactly;
   a mismatched clear leaves the active halt untouched.
+
+A marker-bearing comment (any of the three kinds) that fails this gate is
+`FORGED_OR_MALFORMED` and is treated as if the marker were not there at
+all for trust purposes — see "Round ledger" for what that means
+specifically for a forged ledger-outcome marker.
 
 Because the marker must be the comment's own first content, and a HALT
 comment's first content is always the HALT marker (never the CLEAR one),
@@ -380,6 +482,16 @@ top of this document) closes all 4 structurally rather than point-wise:
 | 10 | Free-text widening phrases ("please widen the scope", "run a third pass") were never fully enumerable by regex | (c) Structured verdict: `scope_request` enum field is a total classification of intent, not a phrase list |
 | 11 | `gh pr view --json files` never populates `previousPath` on a rename; a synthetic test fixture papered over the real gap | (d) Fence from local `git diff --name-status -M -z`, which reports rename sources natively |
 
+## Round-3 items resurfaced and closed by the round-3b amendment
+
+An independent reviewer examined round 3 (commit `0e751c2`) before merge
+and found two blocking defects the round-3 fixes had not covered:
+
+| Reviewer finding | Gap | Round-3b fix |
+|---|---|---|
+| BLOCKING 1 | `parseLedger`'s `ROUND_MARKER_RE` accepted any comment matching the ledger marker shape with no authorship check — unlike HALT/HALT_CLEAR, which round-3 item (b) already gated. A forged round-1 entry could skip the real round-1 review and prompt-inject fabricated content into round 2. | (e) Ledger-outcome markers now pass through the same owner-authored, first-content-anchored gate as HALT/HALT_CLEAR; a marker-bearing comment that fails is `FORGED_OR_MALFORMED` — excluded from `entries`, and counted as `UNKNOWN_LEDGER_STATE` in the post-run re-check |
+| BLOCKING 2 | Retiring per-finding fields (round-3 item c) made `STRUCTURED_BLOCK` unconditional on any parsed `verdict: BLOCK`, with no way to distinguish an in-scope BLOCKER from Codex's own out-of-scope architectural opinion (R1) | (f) Per-finding `severity \| path \| text` lines restored, each classified against the fence; `STRUCTURED_BLOCK` now requires at least one `IN_FENCE` `BLOCKER` |
+
 ## Blind spots
 
 What this wrapper cannot detect: Codex silently ignoring an instruction in
@@ -399,3 +511,17 @@ the fence relies on; and the residual re-read-then-post TOCTOU race
 documented in "Round ledger" above, which is inherent to any two-step
 check-then-act over a remote API and is caught only after the fact by the
 next invocation.
+
+Round-3b (items e/f) additionally cannot detect: an attacker who controls
+the repo owner's own GitHub account — owner-gating (item e) authenticates
+*who posted*, not that the owner's account itself hasn't been
+compromised, phished, or is being operated by someone with legitimate
+access misusing it; a finding whose `path` is genuinely inside the fence
+but whose `text` remedy actually describes a problem in a *different*
+file than the one named (item f classifies the declared path against the
+fence, not whether the prose is honestly about that path); and Codex
+omitting a real BLOCKER finding entirely rather than misclassifying one —
+a `verdict: APPROVE` / `findings: 0` response for a diff that genuinely
+has a blocking problem is indistinguishable, from the wrapper's side, from
+a correct clean review, since there is nothing in the output shape for
+the wrapper to object to.
