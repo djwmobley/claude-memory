@@ -35,6 +35,7 @@ const {
   computeFence,
   stripQuotedAndFencedBlocks,
   classifyStructuredVerdict,
+  classifyFindingPath,
   classify,
   preconditionBucket,
   recognizeAnchoredMarker,
@@ -549,8 +550,17 @@ test('required: absolute finding path -> NEEDS_OWNER', () => {
   assertEqual(r.reason, 'FINDING_PATH_ABSOLUTE');
 });
 
-test('structured: Windows-style absolute finding path (drive letter) -> NEEDS_OWNER', () => {
+test('structured: Windows-style absolute finding path (drive letter) -> NEEDS_OWNER (non-canonical: backslash)', () => {
   const stdout = blockStdout({ findingsList: [{ severity: 'BLOCKER', path: 'C:\\secrets.txt', text: 'x' }] });
+  const r = classifyStructuredVerdict(stdout, FENCE);
+  assertEqual(r.bucket, 'NEEDS_OWNER');
+  // The backslash check fires before the drive-letter/absolute check --
+  // still UNCLASSIFIABLE either way, just a different specific reason.
+  assertEqual(r.reason, 'FINDING_PATH_BACKSLASH');
+});
+
+test('structured: absolute path via drive letter with no backslash (forward-slash form) -> NEEDS_OWNER (FINDING_PATH_ABSOLUTE)', () => {
+  const stdout = blockStdout({ findingsList: [{ severity: 'BLOCKER', path: 'C:/secrets.txt', text: 'x' }] });
   const r = classifyStructuredVerdict(stdout, FENCE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   assertEqual(r.reason, 'FINDING_PATH_ABSOLUTE');
@@ -591,10 +601,49 @@ test('structured: non-ASCII finding path -> NEEDS_OWNER (UNCLASSIFIABLE)', () =>
   assertEqual(r.reason, 'FINDING_PATH_NON_ASCII');
 });
 
-test('B5/B7: a finding path using backslashes still resolves IN_FENCE after normalization', () => {
-  const stdout = blockStdout({ findingsList: [{ severity: 'BLOCKER', path: IN_FENCE_FILE.replace(/\//g, '\\'), text: 'x' }] });
-  const r = classifyStructuredVerdict(stdout, FENCE);
-  assertEqual(r.bucket, 'STRUCTURED_BLOCK');
+// ── round-3c: finding paths must be exactly canonical, never merely
+// fence-membership-testable — closes the `scripts/./x.js` escape (a
+// non-canonical path that silently failed fence.has() and was classified
+// OUT_OF_FENCE, letting a real in-fence BLOCKER slip through as a lead) ──
+
+const CANONICAL_ESCAPE_PATHS = [
+  'scripts/./x.js',
+  'scripts//x.js',
+  'scripts/x.js/',
+  'scripts\\x.js',
+  ' scripts/x.js',
+  'scripts/../scripts/x.js',
+];
+for (const escapePath of CANONICAL_ESCAPE_PATHS) {
+  test(`required: non-canonical finding path ${JSON.stringify(escapePath)} (BLOCKER, verdict APPROVE) -> NEEDS_OWNER, never OUT_OF_FENCE lead`, () => {
+    const stdout = approveStdout({ findingsList: [{ severity: 'BLOCKER', path: escapePath, text: 'sneaks past the fence' }] });
+    const r = classifyStructuredVerdict(stdout, FENCE);
+    assertEqual(r.bucket, 'NEEDS_OWNER', `path ${JSON.stringify(escapePath)} must never be classified OUT_OF_FENCE/approved`);
+    assert(/^FINDING_PATH_/.test(r.reason), `expected an UNCLASSIFIABLE path reason, got ${r.reason}`);
+  });
+}
+
+test('round-3c: classifyFindingPath direct — a genuinely canonical in-fence path still resolves IN_FENCE', () => {
+  const pc = classifyFindingPath(IN_FENCE_FILE, FENCE);
+  assertEqual(pc.bucket, 'IN_FENCE');
+});
+
+test('round-3c: classifyFindingPath direct — scripts/./x.js is UNCLASSIFIABLE (FINDING_PATH_DOT_SEGMENT), not OUT_OF_FENCE', () => {
+  const pc = classifyFindingPath('scripts/./x.js', FENCE);
+  assertEqual(pc.bucket, 'UNCLASSIFIABLE');
+  assertEqual(pc.reason, 'FINDING_PATH_DOT_SEGMENT');
+});
+
+test('round-3c: classifyFindingPath direct — trailing slash is UNCLASSIFIABLE', () => {
+  const pc = classifyFindingPath('scripts/x.js/', FENCE);
+  assertEqual(pc.bucket, 'UNCLASSIFIABLE');
+  assertEqual(pc.reason, 'FINDING_PATH_TRAILING_SLASH');
+});
+
+test('round-3c: classifyFindingPath direct — leading whitespace is UNCLASSIFIABLE', () => {
+  const pc = classifyFindingPath(' scripts/x.js', FENCE);
+  assertEqual(pc.bucket, 'UNCLASSIFIABLE');
+  assertEqual(pc.reason, 'FINDING_PATH_WHITESPACE');
 });
 
 // small structured totality table (verdict x scope_request x a MAJOR

@@ -270,11 +270,26 @@ function hasNonAscii(s) {
  * is NOT decided here — that is `classifyFindingPath`'s job, since it
  * needs the fence.
  */
+/**
+ * Strips exactly ONE leading and ONE trailing space — the template's own
+ * `| <value> |` delimiter spacing — never a full `.trim()`. Round-3c: the
+ * path field's own leading/trailing whitespace is a canonical-form
+ * violation (`classifyFindingPath`'s `FINDING_PATH_WHITESPACE`), so the
+ * delimiter's formatting space must be removed without also silently
+ * absorbing whitespace that is genuinely part of the value.
+ */
+function stripOneDelimiterSpace(s) {
+  let out = s;
+  if (out.startsWith(' ')) out = out.slice(1);
+  if (out.endsWith(' ')) out = out.slice(0, -1);
+  return out;
+}
+
 function parseFindingLine(raw) {
   const parts = String(raw).split('|');
   if (parts.length !== 3) return { valid: false, reason: 'FINDING_MALFORMED' };
   const severity = parts[0].trim();
-  const findingPath = parts[1].trim();
+  const findingPath = stripOneDelimiterSpace(parts[1]);
   const text = parts[2].trim();
   if (!FINDING_SEVERITIES.includes(severity)) return { valid: false, reason: 'FINDING_SEVERITY_UNKNOWN' };
   if (text.length > FINDING_TEXT_MAX_CHARS) return { valid: false, reason: 'FINDING_TEXT_TOO_LONG' };
@@ -282,20 +297,29 @@ function parseFindingLine(raw) {
 }
 
 /**
- * Round-3b item f: classify one finding's path against the (d) fence.
- * UNCLASSIFIABLE (empty/unparseable, non-ASCII, absolute, or containing a
- * `..` segment) is checked BEFORE fence membership — a total
- * classification of the path itself, independent of what's in the fence.
+ * Round-3b item f (amended, round-3c): classify one finding's path
+ * against the (d) fence. A path is even ELIGIBLE for fence membership
+ * only when it is already in canonical POSIX form — exactly equal to its
+ * own normalized form: no `.` or `..` segment anywhere, no backslashes,
+ * no leading `./` or `/`, no trailing slash, no empty segments, no
+ * leading/trailing whitespace, ASCII only. Any non-canonical path is
+ * UNCLASSIFIABLE, never OUT_OF_FENCE — this closes the `scripts/./x.js`
+ * escape, where a non-canonical-but-membership-testable path silently
+ * failed `fence.has()` and was classified as a harmless lead instead of
+ * being rejected outright, letting a real in-fence BLOCKER finding slip
+ * through as an ignorable OUT_OF_FENCE one.
  */
 function classifyFindingPath(rawPath, fence) {
   if (!rawPath) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_EMPTY' };
   if (hasNonAscii(rawPath)) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_NON_ASCII' };
-  const slashed = rawPath.replace(/\\/g, '/');
-  if (slashed.startsWith('/')) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_ABSOLUTE' };
-  if (/^[A-Za-z]:/.test(rawPath)) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_ABSOLUTE' };
-  const segments = slashed.split('/');
-  if (segments.some((seg) => seg === '..')) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_DOTDOT' };
+  if (rawPath !== rawPath.trim()) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_WHITESPACE' };
+  if (rawPath.includes('\\')) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_BACKSLASH' };
+  if (rawPath.startsWith('/') || /^[A-Za-z]:/.test(rawPath)) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_ABSOLUTE' };
+  if (rawPath.endsWith('/')) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_TRAILING_SLASH' };
+  const segments = rawPath.split('/');
   if (segments.some((seg) => seg === '')) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_EMPTY_SEGMENT' };
+  if (segments.some((seg) => seg === '..')) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_DOTDOT' };
+  if (segments.some((seg) => seg === '.')) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_DOT_SEGMENT' };
   if (!fence || typeof fence.has !== 'function') return { bucket: 'UNCLASSIFIABLE', reason: 'FENCE_UNAVAILABLE' };
   return fence.has(rawPath) ? { bucket: 'IN_FENCE' } : { bucket: 'OUT_OF_FENCE' };
 }

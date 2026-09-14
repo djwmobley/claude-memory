@@ -77,6 +77,19 @@ ledger", and "Marker anchoring" below for the full mechanics, and "Round-3
 items resurfaced and closed by the round-3b amendment" for the mapping
 back to the reviewer's two findings.
 
+**Round 3c amendment (2026-09-13, owner-approved):** closes a path-
+canonicality escape found after round 3b merged main: a finding path
+like `scripts/./x.js` is a valid-looking, in-repo-relative path, but its
+`.` segment is never collapsed by the fence's own `normalizePath`, so
+`fence.has('scripts/./x.js')` simply fails and the finding was classified
+`OUT_OF_FENCE` (a harmless lead) instead of being rejected — letting a
+real in-fence `BLOCKER` finding slip past as an ignorable out-of-scope
+opinion and an otherwise-clean `APPROVE` through. `classifyFindingPath`
+now requires a path to be in exact canonical POSIX form before it is
+even eligible for fence-membership testing; any non-canonical shape is
+`UNCLASSIFIABLE` (`NEEDS_OWNER`), never `OUT_OF_FENCE`. See "Per-finding
+fence bucketing" below.
+
 ## Purpose
 
 A scripted, non-interactive way to have Codex review a pull request's diff
@@ -174,23 +187,36 @@ Parsing rules, all enforced byte-exact:
   characters. `path` is NOT validated here — see "Per-finding fence
   bucketing" below, since that needs the fence.
 
-### Per-finding fence bucketing (round-3b item f)
+### Per-finding fence bucketing (round-3b item f; round-3c tightens
+### UNCLASSIFIABLE to require canonical form)
 
 Each parsed finding's `path` is classified in this fixed order — a total
 classification, `UNCLASSIFIABLE` the catch-all default:
 
-1. `UNCLASSIFIABLE` — the path is empty, contains a non-ASCII byte, is
-   absolute (`/...` or a Windows drive letter like `C:...`), contains a
-   `..` segment, or contains an empty segment (e.g. a doubled slash).
-   Escalates the whole verdict to `NEEDS_OWNER` immediately — never
-   guessed at.
-2. `IN_FENCE` — the (normalized, per "Path fence equality" below) path is
-   in the round's scope fence.
-3. `OUT_OF_FENCE` — a syntactically valid path not in the fence. Recorded
-   as a **lead**, never a block — Codex's opinion about a file outside
-   the reviewed diff is exactly the kind of "architecture preference"
-   Role framing (R1) puts out of scope, so it can inform the human
-   reviewer without being able to halt the PR on its own.
+1. `UNCLASSIFIABLE` — the path is not ALREADY in canonical POSIX form:
+   it is empty; contains a non-ASCII byte; has leading or trailing
+   whitespace; contains a backslash; is absolute (a leading `/` or a
+   Windows drive letter like `C:...`); has a trailing slash; contains an
+   empty segment (e.g. a doubled slash); or contains a `.` or `..`
+   segment anywhere (including a leading `./`). A path is eligible for
+   fence membership ONLY when it is exactly equal to its own normalized
+   form — round-3c closes the `scripts/./x.js` escape, where a
+   non-canonical-but-membership-testable path (a `.` segment the fence's
+   own `normalizePath` never collapses) simply failed `fence.has()` and
+   fell through to `OUT_OF_FENCE`, letting a genuine in-fence BLOCKER
+   finding slip through disguised as a harmless out-of-fence lead.
+   `UNCLASSIFIABLE` escalates the whole verdict to `NEEDS_OWNER`
+   immediately — never guessed at, and never `OUT_OF_FENCE`.
+2. `IN_FENCE` — the (already-canonical) path, compared per "Path fence
+   equality" below (backslash/case handling there is for the fence's OWN
+   entries — from `git diff`, which is always canonical — not a license
+   for a finding's path to be non-canonical), is in the round's scope
+   fence.
+3. `OUT_OF_FENCE` — a canonical path not in the fence. Recorded as a
+   **lead**, never a block — Codex's opinion about a file outside the
+   reviewed diff is exactly the kind of "architecture preference" Role
+   framing (R1) puts out of scope, so it can inform the human reviewer
+   without being able to halt the PR on its own.
 
 Verdict-level consequences:
 
@@ -525,3 +551,18 @@ a `verdict: APPROVE` / `findings: 0` response for a diff that genuinely
 has a blocking problem is indistinguishable, from the wrapper's side, from
 a correct clean review, since there is nothing in the output shape for
 the wrapper to object to.
+
+Round-3c (the canonical-form gate) additionally cannot detect: a
+canonical path that IS genuinely in the fence but whose finding `text`
+is actually about a different file — canonical form only proves the path
+string itself is well-formed and unambiguous, it says nothing about
+whether the prose that follows is honestly describing that same file
+(the same limitation item f already has, just no longer confusable with
+a parsing bug); and case-only path differences on a case-insensitive
+filesystem/`gh`/`git` combination — canonicality here is about segment
+shape (no `.`/`..`/backslash/whitespace/etc.), not about case, so
+`Scripts/x.js` and `scripts/x.js` are two different canonical strings
+that fence membership (`normalizePath`) reconciles only on `win32`, per
+"Path fence equality" — a canonical-but-wrong-case path on a
+case-sensitive platform is a normal `OUT_OF_FENCE` miss, not something
+this gate additionally catches or is meant to.
