@@ -90,6 +90,22 @@ even eligible for fence-membership testing; any non-canonical shape is
 `UNCLASSIFIABLE` (`NEEDS_OWNER`), never `OUT_OF_FENCE`. See "Per-finding
 fence bucketing" below.
 
+**Round 3d amendment (2026-09-13, owner-approved):** round 3c's
+canonical-form check was a deny-list of specific bad characters (non-
+ASCII, leading/trailing whitespace) rather than a closed grammar — a tab
+or NUL byte *inside* a finding path (not at the edges) satisfied every
+round-3c check and reached `fence.has()`, missed, and was demoted to a
+harmless `OUT_OF_FENCE` lead, letting a real BLOCKER through under an
+otherwise-clean `APPROVE`. Two fixes, both required: (1) canonical form
+is now a closed grammar — every byte must be printable ASCII
+`[0x21, 0x7E]`, which excludes ALL whitespace and control bytes in one
+check, not a growing list of specific ones. (2) `OUT_OF_FENCE` is
+redefined to require the canonical path resolve to a REAL file in the
+PR's head tree (`git ls-tree`, computed once per run); a canonical but
+nonexistent path (`scripts/ghost.js`) is `UNCLASSIFIABLE`, not a
+free-pass lead, and a head-tree listing failure escalates the whole run
+to `NEEDS_OWNER`. See "Per-finding fence bucketing" below.
+
 ## Purpose
 
 A scripted, non-interactive way to have Codex review a pull request's diff
@@ -187,24 +203,33 @@ Parsing rules, all enforced byte-exact:
   characters. `path` is NOT validated here — see "Per-finding fence
   bucketing" below, since that needs the fence.
 
-### Per-finding fence bucketing (round-3b item f; round-3c tightens
-### UNCLASSIFIABLE to require canonical form)
+### Per-finding fence bucketing (round-3b item f; round-3c and round-3d
+### tighten UNCLASSIFIABLE and redefine OUT_OF_FENCE)
 
 Each parsed finding's `path` is classified in this fixed order — a total
 classification, `UNCLASSIFIABLE` the catch-all default:
 
-1. `UNCLASSIFIABLE` — the path is not ALREADY in canonical POSIX form:
-   it is empty; contains a non-ASCII byte; has leading or trailing
-   whitespace; contains a backslash; is absolute (a leading `/` or a
-   Windows drive letter like `C:...`); has a trailing slash; contains an
-   empty segment (e.g. a doubled slash); or contains a `.` or `..`
-   segment anywhere (including a leading `./`). A path is eligible for
-   fence membership ONLY when it is exactly equal to its own normalized
-   form — round-3c closes the `scripts/./x.js` escape, where a
-   non-canonical-but-membership-testable path (a `.` segment the fence's
-   own `normalizePath` never collapses) simply failed `fence.has()` and
-   fell through to `OUT_OF_FENCE`, letting a genuine in-fence BLOCKER
-   finding slip through disguised as a harmless out-of-fence lead.
+1. `UNCLASSIFIABLE` — the path is not ALREADY in canonical form. Canonical
+   form (round-3d) is a **closed grammar, not a deny-list**: every byte
+   of the path must be printable ASCII in `[0x21, 0x7E]` (this single
+   range check excludes ALL whitespace and control bytes at once — space,
+   tab, NUL, CR, LF, DEL, and any non-ASCII byte such as a non-breaking
+   space or an accented character — never just the specific bytes someone
+   thought to deny-list), the length must be <= 4096, and it must satisfy
+   the existing segment-shape rules: no backslash; no leading `/` or a
+   Windows drive letter like `C:...`; no trailing `/`; no empty segment
+   (e.g. a doubled slash); no `.` or `..` segment anywhere (including a
+   leading `./`). A path is eligible for fence/head-tree membership ONLY
+   when it is exactly equal to its own normalized form.
+   - Round-3c closed the `scripts/./x.js` escape (a `.` segment the
+     fence's own `normalizePath` never collapses, so `fence.has()` simply
+     returned false and the finding fell through to `OUT_OF_FENCE`).
+   - Round-3d closed a second escape the byte-range-as-deny-list approach
+     left open: a tab, NUL, CR, or DEL byte **inside** the path (not just
+     at the edges) passed a leading/trailing-only whitespace check
+     untouched, missed `fence.has()`, and was likewise demoted to a
+     harmless lead. The closed-grammar range check has no such edge —
+     any disallowed byte anywhere in the string fails it.
    `UNCLASSIFIABLE` escalates the whole verdict to `NEEDS_OWNER`
    immediately — never guessed at, and never `OUT_OF_FENCE`.
 2. `IN_FENCE` — the (already-canonical) path, compared per "Path fence
@@ -212,11 +237,24 @@ classification, `UNCLASSIFIABLE` the catch-all default:
    entries — from `git diff`, which is always canonical — not a license
    for a finding's path to be non-canonical), is in the round's scope
    fence.
-3. `OUT_OF_FENCE` — a canonical path not in the fence. Recorded as a
-   **lead**, never a block — Codex's opinion about a file outside the
-   reviewed diff is exactly the kind of "architecture preference" Role
-   framing (R1) puts out of scope, so it can inform the human reviewer
-   without being able to halt the PR on its own.
+3. `OUT_OF_FENCE` (redefined, round-3d item 2) — a canonical path that is
+   NOT in the fence but DOES resolve to a real blob in the PR's head tree
+   (`git ls-tree -r --name-only <headSha>`, computed once per run by
+   `computeHeadTree` — see "Round ledger" for the analogous once-per-run
+   head-tree failure handling). A canonical-looking path that is neither
+   in the fence NOR a real file anywhere in the repo at head (e.g.
+   `scripts/ghost.js`) is `UNCLASSIFIABLE`, not a free-pass lead — a
+   plausible-but-nonexistent path is exactly the shape an evasion attempt
+   would take, and citing a real file elsewhere in the repo is the only
+   legitimate reason for `OUT_OF_FENCE` to exist at all. Recorded as a
+   **lead**, never a block, when it IS real — Codex's opinion about a
+   real file outside the reviewed diff is exactly the kind of
+   "architecture preference" Role framing (R1) puts out of scope, so it
+   can inform the human reviewer without being able to halt the PR on its
+   own. If the head-tree listing itself fails (a `git` error), that is
+   NOT a per-finding concern — it escalates the WHOLE run to
+   `NEEDS_OWNER` before Codex is ever invoked (see "Total classification"
+   step 3b).
 
 Verdict-level consequences:
 
@@ -251,6 +289,11 @@ the ones below it:
    --name-status -M -z`, an unknown status letter, or a short/malformed
    NUL-delimited record. Never guessed at or silently treated as empty.
    Halts.
+3b. `NEEDS_OWNER` (head-tree-unknown case, round-3d item 2) — resolving
+   the PR's head-tree file listing (`git ls-tree -r --name-only
+   <headSha>`, needed for a real `OUT_OF_FENCE` determination) failed.
+   Computed once per run, checked here — before Codex is ever invoked —
+   exactly like the fence-unknown case above. Halts.
 4. `EMPTY_FENCE` — the fence resolved successfully but is genuinely empty
    (zero changed files) (D13). Halts.
 5. `ROUND_EXCEEDED` (idempotent-abort case) — a ledger marker already
@@ -518,6 +561,15 @@ and found two blocking defects the round-3 fixes had not covered:
 | BLOCKING 1 | `parseLedger`'s `ROUND_MARKER_RE` accepted any comment matching the ledger marker shape with no authorship check — unlike HALT/HALT_CLEAR, which round-3 item (b) already gated. A forged round-1 entry could skip the real round-1 review and prompt-inject fabricated content into round 2. | (e) Ledger-outcome markers now pass through the same owner-authored, first-content-anchored gate as HALT/HALT_CLEAR; a marker-bearing comment that fails is `FORGED_OR_MALFORMED` — excluded from `entries`, and counted as `UNKNOWN_LEDGER_STATE` in the post-run re-check |
 | BLOCKING 2 | Retiring per-finding fields (round-3 item c) made `STRUCTURED_BLOCK` unconditional on any parsed `verdict: BLOCK`, with no way to distinguish an in-scope BLOCKER from Codex's own out-of-scope architectural opinion (R1) | (f) Per-finding `severity \| path \| text` lines restored, each classified against the fence; `STRUCTURED_BLOCK` now requires at least one `IN_FENCE` `BLOCKER` |
 
+## Round-3c items resurfaced and closed by the round-3d amendment
+
+A further reviewer pass on round 3c found one more escape in the
+canonical-form check itself:
+
+| Reviewer finding | Gap | Round-3d fix |
+|---|---|---|
+| Path-canonicality escape (2) | A tab or NUL byte *inside* a finding path (not at the edges) satisfied round-3c's deny-list-style checks (non-ASCII, leading/trailing-only whitespace), missed `fence.has()`, and was demoted to a harmless `OUT_OF_FENCE` lead — letting a real BLOCKER through under an otherwise-clean `APPROVE` | Canonical form is now a closed grammar (every byte printable ASCII `[0x21,0x7E]`, one check, no edge cases) instead of a deny-list; `OUT_OF_FENCE` additionally now requires the path resolve to a real file in the PR's head tree, so a canonical-but-nonexistent path is `UNCLASSIFIABLE` too |
+
 ## Blind spots
 
 What this wrapper cannot detect: Codex silently ignoring an instruction in
@@ -566,3 +618,17 @@ that fence membership (`normalizePath`) reconciles only on `win32`, per
 "Path fence equality" — a canonical-but-wrong-case path on a
 case-sensitive platform is a normal `OUT_OF_FENCE` miss, not something
 this gate additionally catches or is meant to.
+
+Round-3d (the closed-grammar path check and real-file `OUT_OF_FENCE`)
+additionally cannot detect: a real, in-tree, non-fence path whose finding
+`text` is actually about a *fence* file — the head-tree check proves the
+cited path exists somewhere in the repo, it says nothing about whether
+the accompanying remedy text is honestly describing that file rather
+than smuggling a comment about an in-scope file under an out-of-fence
+citation (the same "declared path vs. honest prose" gap item f and
+round-3c already have, just now also covering the head-tree layer); and
+Codex omitting a finding entirely rather than mis-citing its path — a
+`verdict: APPROVE` with `findings: 0` is indistinguishable, from the
+wrapper's side, from a genuinely clean review, since a closed grammar and
+a real-file check both operate on findings Codex actually emitted, not
+ones it silently declined to.

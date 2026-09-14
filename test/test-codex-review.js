@@ -89,6 +89,13 @@ function makeFence(paths, platform) {
 const FENCE_OK = { ok: true, fence: makeFence(FENCE_FILES) };
 const FENCE = FENCE_OK.fence;
 const OUT_OF_FENCE_FILE = 'outside/not-in-fence.js';
+const GHOST_FILE = 'scripts/ghost.js'; // canonical-looking, but not a real file anywhere
+// round-3d: the PR head tree contains the fence files plus a real
+// non-fence file (OUT_OF_FENCE_FILE) and README.md -- deliberately does
+// NOT contain GHOST_FILE, so a canonical-but-nonexistent path is
+// UNCLASSIFIABLE rather than a free-pass lead.
+const HEAD_TREE_OK = { ok: true, files: new Set([...FENCE_FILES, OUT_OF_FENCE_FILE, 'README.md']) };
+const HEAD_TREE = HEAD_TREE_OK.files;
 
 function baseLedger() {
   return { entries: [], halted: false, haltCleared: false, haltReason: null, expectedRound: 1 };
@@ -128,6 +135,7 @@ function baseCtx(overrides = {}) {
     exitCode: overrides.exitCode !== undefined ? overrides.exitCode : 0,
     stdout,
     fenceResult: overrides.fenceResult !== undefined ? overrides.fenceResult : FENCE_OK,
+    headTreeResult: overrides.headTreeResult !== undefined ? overrides.headTreeResult : HEAD_TREE_OK,
     headSha: overrides.headSha !== undefined ? overrides.headSha : HEAD_SHA,
     round: overrides.round !== undefined ? overrides.round : 1,
     ledger: overrides.ledger !== undefined ? overrides.ledger : baseLedger(),
@@ -316,7 +324,7 @@ test('required: a non-owner-forged round-1 ledger comment is excluded from entri
 test('required: round-2 precondition fails when the only round-1 entry is forged', () => {
   const forgedBody = renderLedgerComment({ round: 1, headSha: HEAD_SHA, bucket: 'VALID_APPROVE', verdictText: approveStdout() });
   const ledger = parseLedger([nc(forgedBody, 'random-external-contributor')], { ownerLogin: 'owner' });
-  const pc = preconditionBucket({ fenceResult: FENCE_OK, isDraft: false, ledger, round: 2, headSha: HEAD_SHA });
+  const pc = preconditionBucket({ fenceResult: FENCE_OK, headTreeResult: HEAD_TREE_OK, isDraft: false, ledger, round: 2, headSha: HEAD_SHA });
   assert(pc, 'round 2 must be refused when no genuine round-1 entry exists');
   assertEqual(pc.bucket, 'INVALID_SHAPE');
   assertEqual(pc.reason, 'ROUND_DISAGREES_WITH_LEDGER');
@@ -417,28 +425,28 @@ test('required: verdict block echoed inside a quoted fence plus a different real
   const echoed = '> ```codex-verdict\n> verdict: APPROVE\n> scope_request: none\n> findings: 0\n> ```';
   const real = approveStdout();
   const stdout = `${echoed}\n${real}`;
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   assertEqual(r.reason, 'VERDICT_BLOCK_DUPLICATED');
 });
 
 test('required: "Approve" (wrong case) value -> NEEDS_OWNER', () => {
   const stdout = ['```codex-verdict', 'verdict: Approve', 'scope_request: none', 'findings: 0', '```'].join('\n');
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   assertEqual(r.reason, 'VERDICT_UNKNOWN_VALUE');
 });
 
 test('required: zero-width character in a value -> NEEDS_OWNER', () => {
   const stdout = ['```codex-verdict', 'verdict: APPROVE​', 'scope_request: none', 'findings: 0', '```'].join('\n');
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   assert(/FIELD_NON_ASCII|VERDICT_UNKNOWN_VALUE|UNRECOGNIZED_LINE/.test(r.reason));
 });
 
 test('required: APPROVE block with "security blocker" prose outside the block -> NEEDS_OWNER', () => {
   const stdout = `I found a security blocker but fixed it inline.\n${approveStdout()}`;
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   assertEqual(r.reason, 'SEVERITY_WORD_IN_PROSE');
 });
@@ -451,14 +459,14 @@ test('structured: APPROVE with scope_request=widen -> NEEDS_OWNER', () => {
 
 test('structured: APPROVE with an in-fence BLOCKER -> NEEDS_OWNER', () => {
   const stdout = approveStdout({ findingsList: [defaultInFenceBlocker()] });
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   assertEqual(r.reason, 'APPROVE_WITH_IN_FENCE_BLOCKER');
 });
 
 test('required: APPROVE with an OUT_OF_FENCE MINOR -> STRUCTURED_APPROVE with lead recorded', () => {
   const stdout = approveStdout({ findingsList: [{ severity: 'MINOR', path: OUT_OF_FENCE_FILE, text: 'consider tidying this' }] });
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'STRUCTURED_APPROVE');
   assertEqual(r.leads.length, 1);
   assertEqual(r.leads[0].path, OUT_OF_FENCE_FILE);
@@ -467,41 +475,41 @@ test('required: APPROVE with an OUT_OF_FENCE MINOR -> STRUCTURED_APPROVE with le
 
 test('structured: APPROVE with widening prose ("please run a third pass") -> NEEDS_OWNER', () => {
   const stdout = `Looks fine, but please run a third pass before merging.\n${approveStdout()}`;
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   assertEqual(r.reason, 'WIDENING_TEXT_IN_PROSE');
 });
 
 test('structured: APPROVE with widening prose ("widen the scope of this review") -> NEEDS_OWNER', () => {
   const stdout = `Please widen the scope of this review.\n${approveStdout()}`;
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   assertEqual(r.reason, 'WIDENING_TEXT_IN_PROSE');
 });
 
 test('structured: BLOCK verdict short-circuits regardless of extra severity prose (given a valid in-fence BLOCKER)', () => {
   const stdout = `This has a security vulnerability.\n${blockStdout()}`;
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'STRUCTURED_BLOCK');
 });
 
 test('structured: duplicated field in block -> NEEDS_OWNER', () => {
   const stdout = ['```codex-verdict', 'verdict: APPROVE', 'verdict: APPROVE', 'scope_request: none', 'findings: 0', '```'].join('\n');
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   assert(/DUPLICATE_FIELD/.test(r.reason));
 });
 
 test('structured: unrecognized line inside block -> NEEDS_OWNER', () => {
   const stdout = ['```codex-verdict', 'verdict: APPROVE', 'scope_request: none', 'findings: 0', 'extra: nonsense', '```'].join('\n');
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   assertEqual(r.reason, 'UNRECOGNIZED_LINE_IN_VERDICT_BLOCK');
 });
 
 test('structured: non-integer findings -> NEEDS_OWNER', () => {
   const stdout = ['```codex-verdict', 'verdict: BLOCK', 'scope_request: none', 'findings: many', '```'].join('\n');
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   assertEqual(r.reason, 'FINDINGS_NOT_INTEGER');
 });
@@ -510,49 +518,49 @@ test('structured: non-integer findings -> NEEDS_OWNER', () => {
 
 test('required: findings count mismatch (declared count != number of finding: lines) -> NEEDS_OWNER', () => {
   const stdout = approveStdout({ findingsList: [{ severity: 'MINOR', path: OUT_OF_FENCE_FILE, text: 'note' }], findingsCountOverride: 2 });
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   assertEqual(r.reason, 'FINDINGS_COUNT_MISMATCH');
 });
 
 test('required: BLOCK with only OUT_OF_FENCE blockers -> NEEDS_OWNER (never auto-block, never approve)', () => {
   const stdout = blockStdout({ findingsList: [{ severity: 'BLOCKER', path: OUT_OF_FENCE_FILE, text: 'rearchitect this' }] });
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   assertEqual(r.reason, 'BLOCK_WITHOUT_IN_FENCE_BLOCKER');
 });
 
 test('required: BLOCK with one IN_FENCE blocker -> STRUCTURED_BLOCK', () => {
   const stdout = blockStdout({ findingsList: [defaultInFenceBlocker(), { severity: 'MINOR', path: OUT_OF_FENCE_FILE, text: 'unrelated note' }] });
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'STRUCTURED_BLOCK');
   assertEqual(r.leads.length, 1);
 });
 
 test('structured: BLOCK with zero finding lines at all -> NEEDS_OWNER (no in-fence BLOCKER)', () => {
   const stdout = blockStdout({ findingsList: [] });
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   assertEqual(r.reason, 'BLOCK_WITHOUT_IN_FENCE_BLOCKER');
 });
 
 test('required: finding path with a ".." segment -> NEEDS_OWNER', () => {
   const stdout = blockStdout({ findingsList: [{ severity: 'BLOCKER', path: '../outside/escape.js', text: 'x' }] });
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   assertEqual(r.reason, 'FINDING_PATH_DOTDOT');
 });
 
 test('required: absolute finding path -> NEEDS_OWNER', () => {
   const stdout = blockStdout({ findingsList: [{ severity: 'BLOCKER', path: '/etc/passwd', text: 'x' }] });
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   assertEqual(r.reason, 'FINDING_PATH_ABSOLUTE');
 });
 
 test('structured: Windows-style absolute finding path (drive letter) -> NEEDS_OWNER (non-canonical: backslash)', () => {
   const stdout = blockStdout({ findingsList: [{ severity: 'BLOCKER', path: 'C:\\secrets.txt', text: 'x' }] });
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   // The backslash check fires before the drive-letter/absolute check --
   // still UNCLASSIFIABLE either way, just a different specific reason.
@@ -561,44 +569,44 @@ test('structured: Windows-style absolute finding path (drive letter) -> NEEDS_OW
 
 test('structured: absolute path via drive letter with no backslash (forward-slash form) -> NEEDS_OWNER (FINDING_PATH_ABSOLUTE)', () => {
   const stdout = blockStdout({ findingsList: [{ severity: 'BLOCKER', path: 'C:/secrets.txt', text: 'x' }] });
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   assertEqual(r.reason, 'FINDING_PATH_ABSOLUTE');
 });
 
 test('structured: finding line with wrong number of pipe segments -> NEEDS_OWNER', () => {
   const stdout = ['```codex-verdict', 'verdict: BLOCK', 'scope_request: none', 'findings: 1', 'finding: BLOCKER | not enough segments', '```'].join('\n');
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   assertEqual(r.reason, 'FINDING_MALFORMED');
 });
 
 test('structured: unknown finding severity -> NEEDS_OWNER', () => {
   const stdout = blockStdout({ findingsList: [{ severity: 'URGENT', path: IN_FENCE_FILE, text: 'x' }] });
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   assertEqual(r.reason, 'FINDING_SEVERITY_UNKNOWN');
 });
 
 test('structured: finding text over 200 chars -> NEEDS_OWNER', () => {
   const stdout = blockStdout({ findingsList: [{ severity: 'BLOCKER', path: IN_FENCE_FILE, text: 'x'.repeat(201) }] });
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   assertEqual(r.reason, 'FINDING_TEXT_TOO_LONG');
 });
 
 test('structured: empty finding path -> NEEDS_OWNER (UNCLASSIFIABLE)', () => {
   const stdout = ['```codex-verdict', 'verdict: BLOCK', 'scope_request: none', 'findings: 1', 'finding: BLOCKER |  | some text', '```'].join('\n');
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
   assertEqual(r.reason, 'FINDING_PATH_EMPTY');
 });
 
 test('structured: non-ASCII finding path -> NEEDS_OWNER (UNCLASSIFIABLE)', () => {
   const stdout = blockStdout({ findingsList: [{ severity: 'BLOCKER', path: 'scripts/café.js', text: 'x' }] });
-  const r = classifyStructuredVerdict(stdout, FENCE);
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
   assertEqual(r.bucket, 'NEEDS_OWNER');
-  assertEqual(r.reason, 'FINDING_PATH_NON_ASCII');
+  assertEqual(r.reason, 'FINDING_PATH_NOT_PRINTABLE_ASCII');
 });
 
 // ── round-3c: finding paths must be exactly canonical, never merely
@@ -617,7 +625,7 @@ const CANONICAL_ESCAPE_PATHS = [
 for (const escapePath of CANONICAL_ESCAPE_PATHS) {
   test(`required: non-canonical finding path ${JSON.stringify(escapePath)} (BLOCKER, verdict APPROVE) -> NEEDS_OWNER, never OUT_OF_FENCE lead`, () => {
     const stdout = approveStdout({ findingsList: [{ severity: 'BLOCKER', path: escapePath, text: 'sneaks past the fence' }] });
-    const r = classifyStructuredVerdict(stdout, FENCE);
+    const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
     assertEqual(r.bucket, 'NEEDS_OWNER', `path ${JSON.stringify(escapePath)} must never be classified OUT_OF_FENCE/approved`);
     assert(/^FINDING_PATH_/.test(r.reason), `expected an UNCLASSIFIABLE path reason, got ${r.reason}`);
   });
@@ -643,7 +651,87 @@ test('round-3c: classifyFindingPath direct — trailing slash is UNCLASSIFIABLE'
 test('round-3c: classifyFindingPath direct — leading whitespace is UNCLASSIFIABLE', () => {
   const pc = classifyFindingPath(' scripts/x.js', FENCE);
   assertEqual(pc.bucket, 'UNCLASSIFIABLE');
-  assertEqual(pc.reason, 'FINDING_PATH_WHITESPACE');
+  assertEqual(pc.reason, 'FINDING_PATH_NOT_PRINTABLE_ASCII');
+});
+
+// ── round-3d: canonical form is a CLOSED GRAMMAR (printable ASCII
+// 0x21-0x7E only), not a deny-list of specific bad characters — closes
+// the escape where a tab/NUL/CR/DEL byte INSIDE a path (not just at the
+// edges) passed the old leading/trailing-trim whitespace check, missed
+// fence.has(), and was demoted to a harmless OUT_OF_FENCE lead. Also:
+// OUT_OF_FENCE now additionally requires the path to be a REAL file in
+// the PR head tree — a canonical-looking but nonexistent path
+// (GHOST_FILE) is UNCLASSIFIABLE, not a free-pass lead. ────────────────
+
+const CLOSED_GRAMMAR_ESCAPE_PATHS = [
+  { label: 'tab inside path', path: 'scripts/x\t.js' },
+  { label: 'NUL inside path', path: 'scripts/x\0.js' },
+  { label: 'CR inside path', path: 'scripts/x\r.js' },
+  { label: 'DEL (0x7F) inside path', path: 'scripts/x\x7f.js' },
+  { label: 'non-breaking space (U+00A0) inside path', path: 'scripts/x\u00a0.js' },
+];
+for (const { label, path } of CLOSED_GRAMMAR_ESCAPE_PATHS) {
+  test(`required: ${label} (BLOCKER, verdict APPROVE) -> NEEDS_OWNER, never OUT_OF_FENCE lead`, () => {
+    const stdout = approveStdout({ findingsList: [{ severity: 'BLOCKER', path, text: 'sneaks past the fence' }] });
+    const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
+    assertEqual(r.bucket, 'NEEDS_OWNER', `${label} must never be classified OUT_OF_FENCE/approved`);
+    // A raw CR is itself a line terminator per parseCodexVerdictBlock's own
+    // line-splitting, so it is rejected one layer earlier (a malformed
+    // finding: line) than the other closed-grammar bytes -- still
+    // correctly NEEDS_OWNER, never OUT_OF_FENCE, just via a different
+    // specific reason than the byte-range check itself would give (that
+    // check is covered directly, uncomplicated by line-splitting, below).
+    if (label !== 'CR inside path') {
+      assertEqual(r.reason, 'FINDING_PATH_NOT_PRINTABLE_ASCII');
+    } else {
+      assert(/^(FINDING_PATH_NOT_PRINTABLE_ASCII|UNRECOGNIZED_LINE_IN_VERDICT_BLOCK|FINDINGS_COUNT_MISMATCH)$/.test(r.reason), r.reason);
+    }
+  });
+}
+
+test('round-3d: classifyFindingPath direct — a raw CR inside a path is UNCLASSIFIABLE (FINDING_PATH_NOT_PRINTABLE_ASCII), bypassing block line-splitting entirely', () => {
+  const pc = classifyFindingPath('scripts/x\r.js', FENCE, HEAD_TREE);
+  assertEqual(pc.bucket, 'UNCLASSIFIABLE');
+  assertEqual(pc.reason, 'FINDING_PATH_NOT_PRINTABLE_ASCII');
+});
+
+test('required: a canonical-looking path not in the head tree (scripts/ghost.js), BLOCKER under APPROVE -> NEEDS_OWNER', () => {
+  const stdout = approveStdout({ findingsList: [{ severity: 'BLOCKER', path: GHOST_FILE, text: 'phantom finding' }] });
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
+  assertEqual(r.bucket, 'NEEDS_OWNER');
+  assertEqual(r.reason, 'FINDING_PATH_NOT_IN_HEAD_TREE');
+});
+
+test('round-3d: classifyFindingPath direct — scripts/ghost.js is UNCLASSIFIABLE even though it is canonical', () => {
+  const pc = classifyFindingPath(GHOST_FILE, FENCE, HEAD_TREE);
+  assertEqual(pc.bucket, 'UNCLASSIFIABLE');
+  assertEqual(pc.reason, 'FINDING_PATH_NOT_IN_HEAD_TREE');
+});
+
+test('required: a real non-fence file (README.md), MINOR under APPROVE -> STRUCTURED_APPROVE with lead', () => {
+  const stdout = approveStdout({ findingsList: [{ severity: 'MINOR', path: 'README.md', text: 'consider updating this too' }] });
+  const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
+  assertEqual(r.bucket, 'STRUCTURED_APPROVE', `expected STRUCTURED_APPROVE, got ${r.bucket} (${r.reason})`);
+  assertEqual(r.leads.length, 1);
+  assertEqual(r.leads[0].path, 'README.md');
+  assertEqual(r.leads[0].fenceBucket, 'OUT_OF_FENCE');
+});
+
+test('round-3d: classifyFindingPath direct — README.md (real, non-fence) is OUT_OF_FENCE, not UNCLASSIFIABLE', () => {
+  const pc = classifyFindingPath('README.md', FENCE, HEAD_TREE);
+  assertEqual(pc.bucket, 'OUT_OF_FENCE');
+});
+
+test('required: head-tree git failure -> NEEDS_OWNER for the whole run (classify, precondition level)', () => {
+  const r = classify(baseCtx({ headTreeResult: { ok: false, reason: 'HEAD_TREE_COMMAND_FAILED' } }));
+  assertEqual(r.bucket, 'NEEDS_OWNER');
+  assert(/HEAD_TREE_UNKNOWN_HEAD_TREE_COMMAND_FAILED/.test(r.reason));
+});
+
+test('round-3d: classifyFindingPath direct — missing headTreeSet (not in fence) is UNCLASSIFIABLE, never OUT_OF_FENCE', () => {
+  const pc = classifyFindingPath(OUT_OF_FENCE_FILE, FENCE, undefined);
+  assertEqual(pc.bucket, 'UNCLASSIFIABLE');
+  assertEqual(pc.reason, 'HEAD_TREE_UNAVAILABLE');
 });
 
 // small structured totality table (verdict x scope_request x a MAJOR
@@ -660,7 +748,7 @@ for (const verdict of ['APPROVE', 'BLOCK']) {
         if (verdict === 'BLOCK') findingsList.push(defaultInFenceBlocker());
         if (hasOutOfFenceLead) findingsList.push({ severity: 'MAJOR', path: OUT_OF_FENCE_FILE, text: 'unrelated' });
         const stdout = verdictBlock({ verdict, scopeRequest, findingsList });
-        const r = classifyStructuredVerdict(stdout, FENCE);
+        const r = classifyStructuredVerdict(stdout, FENCE, HEAD_TREE);
         if (verdict === 'BLOCK') {
           assertEqual(r.bucket, 'STRUCTURED_BLOCK', label);
         } else if (scopeRequest !== 'none') {
@@ -692,26 +780,32 @@ test('fence-unknown outranks EMPTY_FENCE (they are mutually exclusive states any
 });
 
 test('D13: zero changed files (fence ok, empty) -> EMPTY_FENCE', () => {
-  const pc = preconditionBucket({ fenceResult: { ok: true, fence: makeFence([]) }, isDraft: false, ledger: baseLedger(), round: 1, headSha: HEAD_SHA });
+  const pc = preconditionBucket({ fenceResult: { ok: true, fence: makeFence([]) }, headTreeResult: HEAD_TREE_OK, isDraft: false, ledger: baseLedger(), round: 1, headSha: HEAD_SHA });
   assertEqual(pc.bucket, 'EMPTY_FENCE');
+});
+
+test('required: head-tree listing failure -> NEEDS_OWNER for the whole run', () => {
+  const pc = preconditionBucket({ fenceResult: FENCE_OK, headTreeResult: { ok: false, reason: 'HEAD_TREE_COMMAND_FAILED' }, isDraft: false, ledger: baseLedger(), round: 1, headSha: HEAD_SHA });
+  assertEqual(pc.bucket, 'NEEDS_OWNER');
+  assert(/HEAD_TREE_UNKNOWN_HEAD_TREE_COMMAND_FAILED/.test(pc.reason));
 });
 
 test('C8/C9: existing marker for same (round, headSha) -> ROUND_EXCEEDED', () => {
   const ledger = { entries: [{ round: 1, headSha: HEAD_SHA }], halted: false, expectedRound: 2 };
-  const pc = preconditionBucket({ fenceResult: FENCE_OK, isDraft: false, ledger, round: 1, headSha: HEAD_SHA });
+  const pc = preconditionBucket({ fenceResult: FENCE_OK, headTreeResult: HEAD_TREE_OK, isDraft: false, ledger, round: 1, headSha: HEAD_SHA });
   assertEqual(pc.bucket, 'ROUND_EXCEEDED');
   assertEqual(pc.reason, 'ROUND_ALREADY_RECORDED');
 });
 
 test('R3: round 0 -> INVALID_SHAPE (ROUND_OUT_OF_RANGE)', () => {
-  const pc = preconditionBucket({ fenceResult: FENCE_OK, isDraft: false, ledger: baseLedger(), round: 0, headSha: HEAD_SHA });
+  const pc = preconditionBucket({ fenceResult: FENCE_OK, headTreeResult: HEAD_TREE_OK, isDraft: false, ledger: baseLedger(), round: 0, headSha: HEAD_SHA });
   assertEqual(pc.bucket, 'INVALID_SHAPE');
   assertEqual(pc.reason, 'ROUND_OUT_OF_RANGE');
 });
 
 test('C11: caller round disagrees with ledger-computed next round -> refused', () => {
   const ledger = { entries: [{ round: 1, headSha: OTHER_SHA }], halted: false, expectedRound: 2 };
-  const pc = preconditionBucket({ fenceResult: FENCE_OK, isDraft: false, ledger, round: 1, headSha: HEAD_SHA });
+  const pc = preconditionBucket({ fenceResult: FENCE_OK, headTreeResult: HEAD_TREE_OK, isDraft: false, ledger, round: 1, headSha: HEAD_SHA });
   assertEqual(pc.bucket, 'INVALID_SHAPE');
   assertEqual(pc.reason, 'ROUND_DISAGREES_WITH_LEDGER');
 });
@@ -956,6 +1050,11 @@ function fakeRunners(opts) {
     if (args[0] === 'diff' && args.includes('--name-status')) {
       return opts.nameStatusResult || { status: 0, stdout: `M\0${IN_FENCE_FILE}\0`, stderr: '' };
     }
+    if (args[0] === 'ls-tree') {
+      if (opts.lsTreeResult) return opts.lsTreeResult;
+      const defaultTree = [IN_FENCE_FILE, OUT_OF_FENCE_FILE, 'README.md'].join('\0') + '\0';
+      return { status: 0, stdout: defaultTree, stderr: '' };
+    }
     return opts.diffResult || { status: 0, stdout: 'diff --git a/x b/x\n+1', stderr: '' };
   };
   const codex = (exe, args, runOpts) => {
@@ -1015,15 +1114,45 @@ test('required (end-to-end): git diff --name-status failure -> NEEDS_OWNER, Code
   assertEqual(calls.codex.length, 0);
 });
 
-test('end-to-end: a rename with a space in the path survives gh-free fence resolution to VALID_BLOCK when cited by its pre-rename path', () => {
+test('end-to-end: a renamed file (fence built from git, not gh) survives to VALID_BLOCK when cited by its pre-rename path', () => {
+  // Note: the fence itself (from `git diff --name-status`) is free to
+  // contain a real filename with a space -- that's proven separately by
+  // "required: rename R087 with a space in the path parsed via -z" and
+  // buildFence's own tests. A CITED finding path, however, must be in
+  // round-3d's closed canonical grammar (no space anywhere), so this
+  // end-to-end fixture uses a space-free rename to exercise the same
+  // previousPath-survives-to-the-fence mechanism through a real BLOCKER
+  // citation.
   const { runners } = fakeRunners({
     prView: BASE_PR_VIEW,
     commentsSequence: [[]],
-    nameStatusResult: { status: 0, stdout: `R087\0old dir/old name.js\0new dir/new name.js\0`, stderr: '' },
-    codexResult: { status: 0, stdout: blockStdout({ findingsList: [{ severity: 'BLOCKER', path: 'old dir/old name.js', text: 'fix on the pre-rename path' }] }), stderr: '' },
+    nameStatusResult: { status: 0, stdout: `R087\0old/name.js\0new/name.js\0`, stderr: '' },
+    codexResult: { status: 0, stdout: blockStdout({ findingsList: [{ severity: 'BLOCKER', path: 'old/name.js', text: 'fix on the pre-rename path' }] }), stderr: '' },
   });
   const r = runReview({ pr: 305, round: 1, repoRoot: '/repo', dryRun: false }, runners);
   assertEqual(r.bucket, 'VALID_BLOCK', `expected VALID_BLOCK, got ${r.bucket} (${r.reason})`);
+});
+
+test('required (end-to-end): head-tree git failure -> NEEDS_OWNER for the whole run, Codex never invoked', () => {
+  const { runners, calls } = fakeRunners({
+    prView: BASE_PR_VIEW,
+    commentsSequence: [[]],
+    lsTreeResult: { status: 128, stdout: '', stderr: 'fatal: not a valid object name' },
+  });
+  const r = runReview({ pr: 305, round: 1, repoRoot: '/repo', dryRun: false }, runners);
+  assertEqual(r.bucket, 'NEEDS_OWNER');
+  assert(/HEAD_TREE_UNKNOWN_HEAD_TREE_COMMAND_FAILED/.test(r.reason));
+  assertEqual(calls.codex.length, 0);
+});
+
+test('required (end-to-end): a real non-fence file (README.md) as a MINOR lead under an otherwise-clean APPROVE -> VALID_APPROVE', () => {
+  const { runners } = fakeRunners({
+    prView: BASE_PR_VIEW,
+    commentsSequence: [[], []],
+    codexResult: { status: 0, stdout: approveStdout({ findingsList: [{ severity: 'MINOR', path: 'README.md', text: 'consider updating this too' }] }), stderr: '' },
+  });
+  const r = runReview({ pr: 305, round: 1, repoRoot: '/repo', dryRun: false }, runners);
+  assertEqual(r.bucket, 'VALID_APPROVE', `expected VALID_APPROVE, got ${r.bucket} (${r.reason})`);
 });
 
 test('end-to-end: an empty diff never reaches Codex -> EMPTY_FENCE', () => {

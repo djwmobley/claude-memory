@@ -161,6 +161,33 @@ function computeFence({ baseRefOid, headSha, repoRoot, runners, platform }) {
 }
 
 /**
+ * Round-3d item 2: the full list of real files in the PR's head tree,
+ * computed once per run via `git ls-tree -r -z --name-only <headSha>`
+ * (NUL-delimited, so a real filename containing a newline is still
+ * handled correctly — mirrors computeFence's own `-z` usage). This is
+ * the authoritative "does this path exist at all in this repo" check
+ * `classifyFindingPath` uses to distinguish a real OUT_OF_FENCE file from
+ * a path that merely LOOKS plausible (`scripts/ghost.js`) but resolves to
+ * nothing — the latter is UNCLASSIFIABLE, never a lead. A git failure
+ * here is NOT a per-finding concern: it escalates the WHOLE run to
+ * `NEEDS_OWNER` before Codex is ever invoked, exactly like a
+ * `computeFence` failure.
+ */
+function computeHeadTree({ headSha, repoRoot, runners }) {
+  if (!headSha || typeof headSha !== 'string') {
+    return { ok: false, reason: 'MISSING_HEAD_SHA' };
+  }
+  const r = runners.git(['ls-tree', '-r', '-z', '--name-only', headSha], { cwd: repoRoot });
+  if (r.status !== 0) {
+    return { ok: false, reason: 'HEAD_TREE_COMMAND_FAILED', stderrTail: String(r.stderr || '').slice(-500) };
+  }
+  const files = String(r.stdout || '')
+    .split('\0')
+    .filter((p) => p.length > 0);
+  return { ok: true, files: new Set(files) };
+}
+
+/**
  * The actual diff CONTENT sent to Codex in the prompt — a separate git
  * invocation from computeFence's `--name-status` listing.
  */
@@ -296,23 +323,47 @@ function parseFindingLine(raw) {
   return { valid: true, finding: { severity, path: findingPath, text } };
 }
 
+const FINDING_PATH_MAX_LEN = 4096;
+
 /**
- * Round-3b item f (amended, round-3c): classify one finding's path
- * against the (d) fence. A path is even ELIGIBLE for fence membership
- * only when it is already in canonical POSIX form — exactly equal to its
- * own normalized form: no `.` or `..` segment anywhere, no backslashes,
- * no leading `./` or `/`, no trailing slash, no empty segments, no
- * leading/trailing whitespace, ASCII only. Any non-canonical path is
- * UNCLASSIFIABLE, never OUT_OF_FENCE — this closes the `scripts/./x.js`
- * escape, where a non-canonical-but-membership-testable path silently
- * failed `fence.has()` and was classified as a harmless lead instead of
- * being rejected outright, letting a real in-fence BLOCKER finding slip
- * through as an ignorable OUT_OF_FENCE one.
+ * Round-3d: canonical form is a CLOSED GRAMMAR, not a deny-list of
+ * specific bad characters — every byte must be printable ASCII in
+ * [0x21, 0x7E]. This single range check subsumes (and replaces) the
+ * former separate non-ASCII and leading/trailing-whitespace checks, and
+ * closes the actual gap those left: a tab, NUL, CR, or DEL byte anywhere
+ * INSIDE the path (not just at the edges) is <= 0x7F and passes a
+ * leading/trailing-`.trim()` check untouched, so it slipped through to
+ * `fence.has()`, missed (tabs/NULs are never real path bytes), and was
+ * demoted to a harmless OUT_OF_FENCE lead instead of being rejected.
  */
-function classifyFindingPath(rawPath, fence) {
+function isPrintableAsciiPath(p) {
+  for (let i = 0; i < p.length; i++) {
+    const code = p.charCodeAt(i);
+    if (code < 0x21 || code > 0x7e) return false;
+  }
+  return true;
+}
+
+/**
+ * Round-3b item f (amended by round-3c/3d): classify one finding's path.
+ * Two conjunctive layers, both required for anything but UNCLASSIFIABLE:
+ *
+ * 1. Canonical grammar: every byte printable ASCII [0x21,0x7E] (round-3d;
+ *    excludes ALL whitespace/control bytes, not just leading/trailing),
+ *    length <= 4096, and the existing segment-shape rules (no backslash,
+ *    no leading `/` or `./`, no trailing `/`, no empty segment, no `.`/
+ *    `..` segment anywhere).
+ * 2. Fence/head-tree membership (round-3d item 2): `IN_FENCE` if the
+ *    canonical path is in the round's scope fence; `OUT_OF_FENCE` only if
+ *    it is NOT in the fence but IS a real blob in the PR head tree
+ *    (`headTreeSet`, computed once per run by `computeHeadTree`) — a
+ *    canonical-looking path that resolves to nothing in either (e.g.
+ *    `scripts/ghost.js`) is UNCLASSIFIABLE, never a free pass as a lead.
+ */
+function classifyFindingPath(rawPath, fence, headTreeSet) {
   if (!rawPath) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_EMPTY' };
-  if (hasNonAscii(rawPath)) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_NON_ASCII' };
-  if (rawPath !== rawPath.trim()) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_WHITESPACE' };
+  if (rawPath.length > FINDING_PATH_MAX_LEN) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_TOO_LONG' };
+  if (!isPrintableAsciiPath(rawPath)) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_NOT_PRINTABLE_ASCII' };
   if (rawPath.includes('\\')) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_BACKSLASH' };
   if (rawPath.startsWith('/') || /^[A-Za-z]:/.test(rawPath)) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_ABSOLUTE' };
   if (rawPath.endsWith('/')) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_TRAILING_SLASH' };
@@ -321,7 +372,10 @@ function classifyFindingPath(rawPath, fence) {
   if (segments.some((seg) => seg === '..')) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_DOTDOT' };
   if (segments.some((seg) => seg === '.')) return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_DOT_SEGMENT' };
   if (!fence || typeof fence.has !== 'function') return { bucket: 'UNCLASSIFIABLE', reason: 'FENCE_UNAVAILABLE' };
-  return fence.has(rawPath) ? { bucket: 'IN_FENCE' } : { bucket: 'OUT_OF_FENCE' };
+  if (fence.has(rawPath)) return { bucket: 'IN_FENCE' };
+  if (!headTreeSet || typeof headTreeSet.has !== 'function') return { bucket: 'UNCLASSIFIABLE', reason: 'HEAD_TREE_UNAVAILABLE' };
+  if (headTreeSet.has(rawPath)) return { bucket: 'OUT_OF_FENCE' };
+  return { bucket: 'UNCLASSIFIABLE', reason: 'FINDING_PATH_NOT_IN_HEAD_TREE' };
 }
 
 /**
@@ -409,7 +463,7 @@ function parseCodexVerdictBlock(blockText) {
  * The widening/severity scan and the fence-based finding checks can only
  * push APPROVE toward NEEDS_OWNER, never move NEEDS_OWNER back to APPROVE.
  */
-function classifyStructuredVerdict(stdout, fence) {
+function classifyStructuredVerdict(stdout, fence, headTreeSet) {
   const text = typeof stdout === 'string' ? stdout : '';
   const blocks = findCodexVerdictBlocks(text);
   if (blocks.length === 0) return { bucket: 'NEEDS_OWNER', reason: 'VERDICT_BLOCK_MISSING' };
@@ -420,7 +474,7 @@ function classifyStructuredVerdict(stdout, fence) {
 
   const findings = [];
   for (const f of parsed.findings) {
-    const pc = classifyFindingPath(f.path, fence);
+    const pc = classifyFindingPath(f.path, fence, headTreeSet);
     if (pc.bucket === 'UNCLASSIFIABLE') {
       return { bucket: 'NEEDS_OWNER', reason: pc.reason };
     }
@@ -458,7 +512,7 @@ function classifyStructuredVerdict(stdout, fence) {
 // B5-B7's per-BLOCKER checks, C8/C9's shape, F17 -- those all depended on
 // per-finding file text that the structured verdict no longer carries) ──
 
-function preconditionBucket({ fenceResult, isDraft, ledger, round, headSha }) {
+function preconditionBucket({ fenceResult, headTreeResult, isDraft, ledger, round, headSha }) {
   // 1. Prior halt not cleared, or ledger tamper-evident-invalid.
   if (ledger && ledger.halted) {
     return { bucket: 'HALTED', reason: ledger.haltReason || 'PRIOR_HALT_UNCLEARED' };
@@ -472,6 +526,13 @@ function preconditionBucket({ fenceResult, isDraft, ledger, round, headSha }) {
   // 3. Fence resolution itself failed (item d) -> escalate, never guess.
   if (!fenceResult || !fenceResult.ok) {
     return { bucket: 'NEEDS_OWNER', reason: `FENCE_UNKNOWN_${(fenceResult && fenceResult.reason) || 'UNKNOWN'}` };
+  }
+
+  // 3b. Round-3d: the head-tree listing (needed for a real OUT_OF_FENCE
+  // determination) failed -> escalate the WHOLE run, exactly like a
+  // fence-resolution failure. Never guessed at, never silently skipped.
+  if (!headTreeResult || !headTreeResult.ok) {
+    return { bucket: 'NEEDS_OWNER', reason: `HEAD_TREE_UNKNOWN_${(headTreeResult && headTreeResult.reason) || 'UNKNOWN'}` };
   }
 
   // 4. Fence resolved but empty (changed-file list is genuinely zero).
@@ -511,9 +572,9 @@ function preconditionBucket({ fenceResult, isDraft, ledger, round, headSha }) {
  */
 function classify(ctx) {
   ctx = ctx || {};
-  const { exitCode, stdout, fenceResult, headSha, round, ledger, isDraft } = ctx;
+  const { exitCode, stdout, fenceResult, headTreeResult, headSha, round, ledger, isDraft } = ctx;
 
-  const pc = preconditionBucket({ fenceResult, isDraft, ledger, round, headSha });
+  const pc = preconditionBucket({ fenceResult, headTreeResult, isDraft, ledger, round, headSha });
   if (pc) return pc;
 
   if (exitCode !== 0 || !stdout || !String(stdout).trim()) {
@@ -523,7 +584,7 @@ function classify(ctx) {
     };
   }
 
-  return classifyStructuredVerdict(stdout, fenceResult && fenceResult.fence);
+  return classifyStructuredVerdict(stdout, fenceResult && fenceResult.fence, headTreeResult && headTreeResult.files);
 }
 
 // ── Ledger (C8-C11; round-3 item b re-anchors HALT/HALT_CLEAR; round-3b
@@ -1063,10 +1124,13 @@ function runReview({ pr, round, repoRoot, dryRun }, runners) {
   const snapshotIds = new Set(initialComments.comments.map((c) => c.id));
 
   const fenceResult = computeFence({ baseRefOid: prView.baseRefOid, headSha, repoRoot, runners });
+  // Round-3d item 2: computed once per run, before Codex ever sees a
+  // prompt -- its failure escalates the whole run, same as fenceResult.
+  const headTreeResult = computeHeadTree({ headSha, repoRoot, runners });
 
   const postArgs = { pr, round, repoRoot, runners, ownerLogin, owner: ownerLogin, repo: repoName, snapshotIds };
 
-  const pre = preconditionBucket({ fenceResult, isDraft, ledger, round, headSha });
+  const pre = preconditionBucket({ fenceResult, headTreeResult, isDraft, ledger, round, headSha });
   if (pre) {
     return finalizeWithPost(pre.bucket, pre.reason, headSha, postArgs);
   }
@@ -1112,6 +1176,7 @@ function runReview({ pr, round, repoRoot, dryRun }, runners) {
     exitCode: run.status,
     stdout: run.stdout,
     fenceResult,
+    headTreeResult,
     headSha,
     round,
     ledger,
@@ -1156,6 +1221,7 @@ module.exports = {
   buildFence,
   parseNameStatusZ,
   computeFence,
+  computeHeadTree,
   computeDiffContent,
   stripQuotedAndFencedBlocks,
   findCodexVerdictBlocks,
